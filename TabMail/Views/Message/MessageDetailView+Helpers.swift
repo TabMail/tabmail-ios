@@ -52,7 +52,7 @@ enum MessageViewHelpers {
 
     /// Shimmer effect for WIP tag (tag assigned but reply not yet generated)
     static func showShimmer(_ message: MessageHeader) -> Bool {
-        message.actionTag != nil && message.cachedReply == nil && AISubscriptionGate.shared.isActive
+        message.actionTag != nil && message.suggestion == nil && AISubscriptionGate.shared.isActive
     }
 }
 

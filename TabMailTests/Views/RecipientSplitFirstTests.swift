@@ -343,11 +343,13 @@ struct RecipientSplitFirstTests {
         ["bob@example.com; carol@example.com"]
     ])
     func replyToolRemovals(removes: [String]) {
-        let result = EmailReplyTool.applyRecipientDelta(
-            base: ["bob@example.com", "carol@example.com", "dave@example.com"], adds: [], removes: removes)
-        #expect(result == ["dave@example.com"])
-        #expect(EmailReplyTool.applyRecipientDelta(base: result, adds: ["e@example.com"], removes: [" * "])
-            == ["e@example.com"])
+        // The reply tool's changes go through the card's own operation (`Recipients.applying`).
+        let base = ComposeDraftGuards.Recipients().filling(
+            to: RecipientEntry(["bob@example.com", "carol@example.com", "dave@example.com"]))
+        let result = base.applying(to: EmailReplyTool.delta(adds: [], removes: removes), cc: nil, bcc: nil)
+        #expect(result.to.tokens == ["dave@example.com"])
+        let cleared = result.applying(to: EmailReplyTool.delta(adds: ["e@example.com"], removes: [" * "]), cc: nil, bcc: nil)
+        #expect(cleared.to.tokens == ["e@example.com"])
     }
 
     // MARK: - At the provider

@@ -150,7 +150,7 @@ actor ActiveAIQueue {
         switch job.jobType {
         case .summary: return summaryDone(message, forChat: job.forChat)
         case .action: return message.actionTag != nil
-        case .reply: return message.cachedReply != nil
+        case .reply: return message.suggestion != nil
         }
     }
 
@@ -541,7 +541,7 @@ actor ActiveAIQueue {
         let rows = try Row.fetchAll(db, sql: """
             WITH recentInbox AS (
                 SELECT id, accountId, bodyComplete, summaryBlurb, actionTag,
-                       cachedReply, date
+                       cachedReply IS NULL AS replyMissing, date
                 FROM messageHeader
                 WHERE isInInbox = 1
                 ORDER BY date DESC, id DESC
@@ -550,7 +550,7 @@ actor ActiveAIQueue {
             SELECT id, accountId FROM recentInbox
             WHERE bodyComplete = 1
               AND (summaryBlurb IS NULL OR summaryBlurb = ''
-                   OR actionTag IS NULL OR cachedReply IS NULL)
+                   OR actionTag IS NULL OR replyMissing)
             ORDER BY date DESC, id DESC
         """, arguments: [SyncConfig.maxRecentEmails])
         return rows.map { ($0["id"] as String, $0["accountId"] as String) }
@@ -1723,7 +1723,7 @@ actor ActiveAIQueue {
         account: Account, target: AIWriteTarget, config: DispatchConfig
     ) async -> Bool {
         // Cache check: if reply already exists, skip LLM
-        if let existing = message.cachedReply, !existing.isEmpty {
+        if let existing = message.suggestion, !existing.body.isEmpty {
             BackgroundSyncLogger.logAIProcessing("Reply cache HIT for \(Self.logId(job.headerId))")
             return false
         }

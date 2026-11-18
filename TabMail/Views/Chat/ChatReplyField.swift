@@ -227,8 +227,8 @@ struct ChatReplyCompose: Equatable {
     let to: [String]
     let cc: [String]
     let bcc: [String]
-    /// The subject the card opens with; nil: the reply's own ("Re: ...").
-    var subject: String? = nil
+    /// The subject the card opens with, exactly: an empty one stays empty.
+    let subject: String
 
     /// THE envelope of the AI Suggestion to `message`, the one builder the ghost's card and the
     /// field's edit of the suggestion both use: the Reply All audience by role, the reply subject,
@@ -247,15 +247,31 @@ struct ChatReplyCompose: Equatable {
         ComposeDraftGuards.Recipients().filling(to: RecipientEntry(to), cc: RecipientEntry(cc), bcc: RecipientEntry(bcc))
     }
 
+    /// A plain reply to only `people` (who the user chose in Reply to), with no Cc or Bcc and the
+    /// reply subject.
+    static func onlyTo(_ people: [String], replying message: MessageHeader) -> ChatReplyCompose {
+        ChatReplyCompose(isReplyAll: false, to: people, cc: [], bcc: [], subject: ThreadUtils.replySubject(for: message.subject))
+    }
+
     /// The envelope with `recipients` and `subject`, exactly: the card shows these fields as they are.
+    /// Its kind follows the final audience: a Reply All only while the recipients (To, Cc and Bcc)
+    /// still hold this envelope's whole Reply All audience (its To and Cc), people added included;
+    /// narrowed, even to one person, it is a plain reply, so the send records a reply on the original.
     func with(recipients: ComposeDraftGuards.Recipients, subject: String) -> ChatReplyCompose {
         func texts(_ field: ComposeDraftGuards.RecipientField) -> [String] {
             field.tokens.map { RecipientEntry.text(name: field.displayNames[$0.lowercased()], address: $0) }
                 + field.rejected
         }
+        let final = Set((recipients.to.tokens + recipients.cc.tokens + recipients.bcc.tokens).map { $0.lowercased() })
+        let audience = Set(RecipientEntry(to + cc).addresses.map { $0.lowercased() })
         return ChatReplyCompose(
-            isReplyAll: isReplyAll, to: texts(recipients.to), cc: texts(recipients.cc), bcc: texts(recipients.bcc),
-            subject: subject)
+            isReplyAll: isReplyAll && final.isSuperset(of: audience),
+            to: texts(recipients.to), cc: texts(recipients.cc), bcc: texts(recipients.bcc), subject: subject)
+    }
+
+    /// The envelope with another subject, its recipients and kind as they are.
+    func with(subject: String) -> ChatReplyCompose {
+        ChatReplyCompose(isReplyAll: isReplyAll, to: to, cc: cc, bcc: bcc, subject: subject)
     }
 
     /// Whether a draft with `recipients` and `subject`, from `accountId`, is this envelope: the same
@@ -266,31 +282,10 @@ struct ChatReplyCompose: Equatable {
             Set(field.tokens.map { $0.lowercased() })
         }
         return accountId == message.accountId
-            && subject == (self.subject ?? ThreadUtils.replySubject(for: message.subject))
+            && subject == self.subject
             && addresses(recipients.to) == addresses(to) && addresses(recipients.cc) == addresses(cc)
             && addresses(recipients.bcc) == addresses(bcc)
             && recipients.to.rejected.isEmpty && recipients.cc.rejected.isEmpty && recipients.bcc.rejected.isEmpty
-    }
-
-    /// The agent's reply, read from its request alone, never from the chat showing the card: whether
-    /// its sheet is open, or who that chat would reply to now, decides nothing. Built once, by the
-    /// reply tool, into the request (`ComposeRequest.reply`), so every host opens the same card.
-    /// - Asked for in the reply field with people chosen (`fieldReply.onlyTo`, as they were when it
-    ///   was sent): a plain reply to only them, with no Cc or Bcc.
-    /// - Otherwise the agent's recipients, a Reply All only when they (To, Cc and Bcc) contain the
-    ///   whole Reply All audience, people the agent added included.
-    static func agentReply(
-        to message: MessageHeader, to: [String], cc: [String], bcc: [String], subject: String?,
-        fieldReply: ChatFieldReply?, accounts: [Account]
-    ) -> ChatReplyCompose {
-        if let only = fieldReply?.onlyTo {
-            return ChatReplyCompose(isReplyAll: false, to: only, cc: [], bcc: [], subject: subject)
-        }
-        let audience = buildReplyAllRecipients(for: message, allAccounts: accounts)
-        // Parsed addresses on both sides: a recipient written with a name is the same person.
-        let addresses = { (list: [String]) in Set(RecipientEntry(list).addresses.map { $0.lowercased() }) }
-        let isReplyAll = addresses(to + cc + bcc).isSuperset(of: addresses(audience.to + audience.cc))
-        return ChatReplyCompose(isReplyAll: isReplyAll, to: to, cc: cc, bcc: bcc, subject: subject)
     }
 
     /// The compose card, opened in this kind, as main's Reply All entries open it.
@@ -313,12 +308,6 @@ struct ChatReplyCompose: Equatable {
 /// THE presenter of the agent's compose card, for every host (the chat, the inbox, the email's
 /// screen): the request carries the card exactly, so where it opens decides nothing.
 extension AgentToolRouter.ComposeRequest {
-    /// A reply's envelope, exactly as the reply tool built it (`ChatReplyCompose.agentReply`, or
-    /// the edited AI Suggestion's envelope).
-    var envelope: ChatReplyCompose {
-        ChatReplyCompose(isReplyAll: isReplyAll, to: to, cc: cc, bcc: bcc, subject: subject)
-    }
-
     /// `account`: the sender a new email opens with.
     @MainActor
     func composeView(account: Account?, onOutcome: @escaping @MainActor (ComposeOutcome) -> Void) -> ComposeView {
@@ -328,7 +317,12 @@ extension AgentToolRouter.ComposeRequest {
                 suggestedBody: body, account: account, prefillTo: to, prefillCc: cc, prefillBcc: bcc,
                 prefillSubject: subject, onAgentOutcome: onOutcome)
         case .reply:
-            envelope.composeView(replyTo: replyTo, suggestedBody: body, draftId: draftId, onAgentOutcome: onOutcome)
+            // The reply tool's envelope exactly (`EmailReplyTool`): its fields, an empty one
+            // included, its subject and its kind.
+            ComposeView(
+                replyTo: replyTo, suggestedBody: body, isReplyAll: isReplyAll,
+                prefillTo: to, prefillCc: cc, prefillBcc: bcc, prefillSubject: subject,
+                prefillDraftId: draftId, onAgentOutcome: onOutcome)
         case .forward:
             ComposeView(
                 replyTo: replyTo, suggestedBody: body, isForward: true, prefillTo: to, prefillCc: cc, prefillBcc: bcc,

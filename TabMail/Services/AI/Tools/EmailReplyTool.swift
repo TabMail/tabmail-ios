@@ -33,7 +33,9 @@ struct EmailReplyTool: AgentTool, Sendable {
             await ComposeView.writeCachedReplyToDB(edit, replacing: shown, replyTo: email, db: AppDatabase.dbPool)
         }
         self.composeEdit = composeEdit ?? { context, subject, body, request in
-            try await AIService.shared.performInlineEdit(
+            // The chat's one AI service, the one the card's edits and Recompute use.
+            let aiService = await MainActor.run { ChatPillState.shared.aiService }
+            return try await aiService.performInlineEdit(
                 currentSubject: subject, currentBody: body, context: context, instruction: request, chatHistory: [])
         }
     }
@@ -138,30 +140,41 @@ struct EmailReplyTool: AgentTool, Sendable {
         let shownSuggestion = composeRequest == nil || fieldRow == nil ? nil : fieldReply?.suggestion
         let account = accounts.first { $0.id == header.accountId }
 
-        // An edit of the shown suggestion: the draft is the suggestion's own envelope
+        // THE draft of this reply, derived once and used for both the model's context and the card:
+        // a plain reply to only the people chosen in the field (this call's recipient changes are
+        // not applied, as the card never applied them), else the AI Suggestion's own envelope
         // (`ChatReplyCompose.suggestionEnvelope`, the ghost's card's builder) with this call's
-        // recipient changes applied by the card's own operation, and its body.
+        // recipient changes applied by the card's own operation. Its kind follows the final
+        // audience (`ChatReplyCompose.with`).
+        let suggestionEnvelope = ChatReplyCompose.suggestionEnvelope(for: header, accounts: accounts)
+        let start: ChatReplyCompose
+        if shownSuggestion == nil, let only = fieldReply?.onlyTo {
+            start = ChatReplyCompose.onlyTo(only, replying: header)
+        } else {
+            start = suggestionEnvelope.with(
+                recipients: suggestionEnvelope.recipients.applying(
+                    to: Self.delta(adds: addTo, removes: removeTo), cc: Self.delta(adds: addCc, removes: removeCc),
+                    bcc: Self.delta(adds: addBcc, removes: removeBcc)),
+                subject: suggestionEnvelope.subject)
+        }
+
+        // An edit of the shown suggestion: the draft is that envelope and the suggestion's body.
         if let shownSuggestion, let composeRequest {
-            let suggestionEnvelope = ChatReplyCompose.suggestionEnvelope(for: header, accounts: accounts)
-            let startRecipients = suggestionEnvelope.recipients.applying(
-                to: Self.delta(adds: addTo, removes: removeTo), cc: Self.delta(adds: addCc, removes: removeCc),
-                bcc: Self.delta(adds: addBcc, removes: removeBcc))
             guard let bodyText = try await relatedBody(of: header, boundTo: fieldRow) else {
                 return ComposeOutcome.failed(
                     "the email changed since the request was sent; the AI Suggestion is unchanged").describeForLLM
             }
             let context = await Self.editContext(
-                recipients: startRecipients, account: account, related: header, relatedBodyText: bodyText)
-            let startSubject = suggestionEnvelope.subject ?? ThreadUtils.replySubject(for: header.subject)
+                recipients: start.recipients, account: account, related: header, relatedBodyText: bodyText)
             let result: InlineEditResult
             do {
-                result = try await composeEdit(context, startSubject, shownSuggestion.body, composeRequest)
+                result = try await composeEdit(context, start.subject, shownSuggestion.body, composeRequest)
             } catch {
                 BackgroundSyncLogger.logDebug("[EmailReplyTool] suggestion edit failed: \(error)")
                 return ComposeOutcome.failed("the AI Suggestion could not be changed; it is unchanged").describeForLLM
             }
             return await Self.finishSuggestionEdit(
-                result, shown: shownSuggestion, startRecipients: startRecipients, startSubject: startSubject,
+                result, shown: shownSuggestion, start: start,
                 suggestionEnvelope: suggestionEnvelope, email: header, rewritesInPlace: rewritesInPlace,
                 store: storeSuggestionEdit,
                 openCard: { envelope, body in
@@ -171,17 +184,10 @@ struct EmailReplyTool: AgentTool, Sendable {
                 })
         }
 
-        // Reply-all defaults from the replied header (sender + original To + original Cc, the
-        // user's own addresses left out), with the overrides applied.
-        let replyAll = buildReplyAllRecipients(for: header, allAccounts: accounts)
-        let to = Self.applyRecipientDelta(base: replyAll.to, adds: addTo, removes: removeTo)
-        let cc = Self.applyRecipientDelta(base: replyAll.cc, adds: addCc, removes: removeCc)
-        let bcc = Self.applyRecipientDelta(base: [], adds: addBcc, removes: removeBcc)
-
         // When a compose instruction is present, run it through performInlineEdit
         // with mode "edit_reply" — matching TB's runComposeEdit() flow.
         // TB wraps the request: "Reply to email with subject '...' with request: ..."
-        var generatedSubject: String?
+        var envelope = start
         var generatedBody: String? = explicitBody
         if let composeRequest {
             guard let bodyText = try await relatedBody(of: header, boundTo: fieldRow) else {
@@ -189,39 +195,32 @@ struct EmailReplyTool: AgentTool, Sendable {
             }
             let wrappedRequest = "Reply to email with subject \"\(header.subject)\" with request: \(composeRequest)"
             let context = await Self.editContext(
-                recipients: ChatReplyCompose(isReplyAll: true, to: to, cc: cc, bcc: bcc).recipients,
-                account: account, related: header, relatedBodyText: bodyText)
+                recipients: start.recipients, account: account, related: header, relatedBodyText: bodyText)
             do {
                 let result = try await composeEdit(context, "", "", wrappedRequest)
-                generatedSubject = result.subject
+                // A subject the edit writes replaces the start's; with none the start's stays.
+                if let subject = result.subject { envelope = start.with(subject: subject) }
                 generatedBody = result.body ?? generatedBody
-                BackgroundSyncLogger.logDebug("[EmailReplyTool] AI generated: subject=\(generatedSubject?.prefix(60) ?? "nil") bodyLen=\(generatedBody?.count ?? 0)")
+                BackgroundSyncLogger.logDebug("[EmailReplyTool] AI generated: subject=\(result.subject?.prefix(60) ?? "nil") bodyLen=\(generatedBody?.count ?? 0)")
             } catch {
-                BackgroundSyncLogger.logDebug("[EmailReplyTool] performInlineEdit failed: \(error) — opening reply with cached/empty content")
+                BackgroundSyncLogger.logDebug("[EmailReplyTool] performInlineEdit failed: \(error) — opening reply with the AI Suggestion or empty content")
             }
         }
 
-        // Fall back to cached AI reply if no request and no explicit body
+        // With no request and no explicit body, the card opens with the AI Suggestion's body.
         if generatedBody == nil {
-            generatedBody = header.cachedReply
+            generatedBody = header.suggestion?.body
         }
 
-        return await openReplyCard(
-            header: header,
-            envelope: ChatReplyCompose.agentReply(
-                to: header, to: to, cc: cc, bcc: bcc, subject: generatedSubject, fieldReply: fieldReply,
-                accounts: accounts),
-            body: generatedBody, fieldReply: fieldReply, draftId: nil)
+        return await openReplyCard(header: header, envelope: envelope, body: generatedBody, fieldReply: fieldReply, draftId: nil)
     }
 
-    /// The email's body for a compose edit's context, read in one snapshot with the check that the
-    /// row the field showed (`boundTo`) is still that email; nil when it is not. Read only where a
-    /// model edit runs.
+    /// The email's body for a compose edit's context (`ComposeEditContext.relatedBodyText`, the one
+    /// identity-checked read), checked against the row the field showed (`boundTo`) when there is
+    /// one, else the row this call read; nil when that row is no longer that email. Read only
+    /// where a model edit runs.
     private func relatedBody(of header: MessageHeader, boundTo shown: MessageHeader?) async throws -> String?? {
-        try await ctx.db.read { db in
-            if let shown, try !AIWriteTarget.stillHolds(shown, db: db) { return nil }
-            return .some(try ComposeEditContext.relatedBodyText(of: header, db: db))
-        }
+        try await ctx.db.read { db in try ComposeEditContext.relatedBodyText(of: shown ?? header, db: db) }
     }
 
     /// The compose edit's context for a reply draft with `recipients`, sent from `account`.
@@ -296,7 +295,9 @@ struct EmailReplyTool: AgentTool, Sendable {
     }
 
     /// The end of a compose edit of the AI Suggestion the field showed (`shown`), from the draft
-    /// `start` (the suggestion's envelope with this call's recipient changes). The edit's recipient
+    /// `start` (the suggestion's envelope with this call's recipient changes). A subject the edit
+    /// writes replaces the start's; with none (the model's subject was blank) the draft keeps the
+    /// start's subject, an empty one included. The edit's recipient
     /// changes apply by the card's own operation (`Recipients.applying`). In place, only when the
     /// edited draft is still the suggestion's envelope (`ChatReplyCompose.holds`): the edit, its
     /// text version and change command replace the suggestion through the one writer, over the
@@ -306,16 +307,16 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// suggestion is unchanged. The outcome says which happened, so the agent tells the user what
     /// they see.
     static func finishSuggestionEdit(
-        _ result: InlineEditResult, shown: ReplyResult, startRecipients: ComposeDraftGuards.Recipients,
-        startSubject: String, suggestionEnvelope: ChatReplyCompose, email: MessageHeader, rewritesInPlace: Bool,
+        _ result: InlineEditResult, shown: ReplyResult, start: ChatReplyCompose,
+        suggestionEnvelope: ChatReplyCompose, email: MessageHeader, rewritesInPlace: Bool,
         store: StoreSuggestionEdit, openCard: (ChatReplyCompose, String) async -> String
     ) async -> String {
         guard let body = result.body, let textMessage = result.textMessage else {
             return ComposeOutcome.failed(
                 "the AI Suggestion could not be changed (\(result.response ?? "no edit")); it is unchanged").describeForLLM
         }
-        let recipients = startRecipients.applying(to: result.toDelta, cc: result.ccDelta, bcc: result.bccDelta)
-        let subject = result.subject ?? startSubject
+        let subject = result.subject ?? start.subject
+        let recipients = start.recipients.applying(to: result.toDelta, cc: result.ccDelta, bcc: result.bccDelta)
         let staysTheSuggestion = suggestionEnvelope.holds(
             recipients: recipients, subject: subject, accountId: email.accountId, of: email)
         guard rewritesInPlace, staysTheSuggestion else {
@@ -331,32 +332,5 @@ struct EmailReplyTool: AgentTool, Sendable {
         }
         return "Changed the AI Suggestion in place (no card opened); it now reads: \(textMessage). "
             + "Nothing was sent: the user taps the suggestion to review and send it."
-    }
-
-    /// Apply an add/remove delta on top of `base`. Matching for removals is case-insensitive
-    /// on the email address. A remove list containing "*" (literal) means "clear all — drop
-    /// everything in `base`". Adds are appended after removes, de-duped case-insensitively
-    /// against whatever's left.
-    static func applyRecipientDelta(base: [String], adds: [String], removes: [String]) -> [String] {
-        // Read the removals as recipient text first (ADR-IOS-092), so
-        // `"Bob" <bob@example.com>` or a list in one string removes each address.
-        let removeEntry = RecipientEntry(removes)
-        var result: [String]
-        if removeEntry.leftovers.contains("*") {
-            result = []
-        } else {
-            let removeSet = Set(removeEntry.addresses.map { $0.lowercased() })
-            result = base.filter { !removeSet.contains($0.lowercased()) }
-        }
-        var seen = Set(result.map { $0.lowercased() })
-        for email in adds {
-            let trimmed = email.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, trimmed != "*" else { continue }
-            let key = trimmed.lowercased()
-            if seen.insert(key).inserted {
-                result.append(trimmed)
-            }
-        }
-        return result
     }
 }

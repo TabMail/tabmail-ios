@@ -22,6 +22,10 @@ struct DynamicIslandChat: View {
     /// version and change command are recorded with each edit, so a resend or rewind puts them back.
     let draftSuggestion: ReplyResult?
     let composeContext: ComposeEditContext?
+    /// A compose edit request's own context, read after admission through the identity-checked
+    /// body read (`ComposeEditContext.relatedBodyText`); nil refuses the request. Absent: the
+    /// request uses `composeContext`.
+    let composeEditContext: (@MainActor () async -> ComposeEditContext?)?
     let draftId: String?
     let draftReplyToId: String?  // MessageHeader.id of the email being replied to (for draft eviction)
     /// The compose's reply-all kind (#915), stored on the row the agent's first
@@ -50,7 +54,9 @@ struct DynamicIslandChat: View {
     @Binding var isExpanded: Bool
     @Binding var isInputFocused: Bool
     @Binding var isWorking: Bool
-    var onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?, String?, String?) -> Void)?
+    /// Applies an edit's result, or a resend's or rewind's restore, to the draft; awaited under the
+    /// compose agent fence, so the draft and the suggestion's write are settled before the next step.
+    var onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?, String?, String?) async -> Void)?
     var onAgentReply: ((String) -> Void)?
     /// The chat view's reply field (`ChatReplyField`): collapsed, this pill is [mic] [field] [Send]
     /// on the thread's newest email instead of the Chat capsule.
@@ -236,6 +242,7 @@ struct DynamicIslandChat: View {
         draftBody: String? = nil,
         draftSuggestion: ReplyResult? = nil,
         composeContext: ComposeEditContext? = nil,
+        composeEditContext: (@MainActor () async -> ComposeEditContext?)? = nil,
         draftId: String? = nil,
         draftReplyToId: String? = nil,
         draftIsReplyAll: Bool = false,
@@ -251,7 +258,7 @@ struct DynamicIslandChat: View {
         isExpanded: Binding<Bool>,
         isInputFocused: Binding<Bool> = .constant(false),
         isWorking: Binding<Bool> = .constant(false),
-        onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?, String?, String?) -> Void)? = nil,
+        onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?, String?, String?) async -> Void)? = nil,
         onAgentReply: ((String) -> Void)? = nil,
         replyField: ChatReplyField? = nil,
         onFieldSend: ((String) -> Void)? = nil
@@ -261,6 +268,7 @@ struct DynamicIslandChat: View {
         self.draftBody = draftBody
         self.draftSuggestion = draftSuggestion
         self.composeContext = composeContext
+        self.composeEditContext = composeEditContext
         self.draftId = draftId
         self.draftReplyToId = draftReplyToId
         self.draftIsReplyAll = draftIsReplyAll
@@ -1477,7 +1485,7 @@ struct DynamicIslandChat: View {
         isWorking = true
         Task { @MainActor in
             await TutorialCoordinator.shared.runPracticeReplyEdit { reply in
-                onDraftUpdate?(nil, reply.body, nil, nil, nil, reply.textMessage, nil)
+                await onDraftUpdate?(nil, reply.body, nil, nil, nil, reply.textMessage, nil)
             }
             isWorking = false
         }
@@ -1593,8 +1601,8 @@ struct DynamicIslandChat: View {
     }
 
     /// `anchor`: a resend or rewind's restored turn. The request edits that turn's draft, as it
-    /// was when first asked, never the view's current one: the restore reaches the view only after
-    /// its fade, so reading the view here would edit the draft being undone.
+    /// was when first asked, never the view's current one, and puts that draft back (awaited)
+    /// before its own result is applied.
     /// The draft a compose edit reads: the restored turn's (`anchor`, a resend or rewind), else the
     /// card's current one, with the suggestion's text version and change command when the draft is
     /// the suggestion. A restore hands its turn here, so the edit never reads the card's draft from
@@ -1682,11 +1690,22 @@ struct DynamicIslandChat: View {
         sessionTurns.append(userTurn)
 
         // Unstructured timeout: cancel editTask if it takes >120s.
+        let contextSource = composeEditContext
         let editTask = Task {
-            try await AIService.shared.performInlineEdit(
+            // The request's context, read now that it is admitted, through the identity-checked
+            // body read: another email seated at the replied email's address refuses it.
+            var requestContext = ctx
+            if let contextSource {
+                guard let read = await contextSource() else {
+                    throw InlineEditFailure(message: "The email this draft answers changed. Close and reopen the draft before editing.")
+                }
+                requestContext = read
+            }
+            // The chat's one AI service, as the pills' agent requests use it (tests install theirs).
+            return try await ChatPillState.shared.aiService.performInlineEdit(
                 currentSubject: currentSubject,
                 currentBody: currentBody,
-                context: ctx,
+                context: requestContext,
                 instruction: instruction,
                 chatHistory: editHistory,
                 onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
@@ -1703,6 +1722,13 @@ struct DynamicIslandChat: View {
 
         activeChatTask = Task {
             defer { composeAgentSendFence?.finishAgent() }
+            // A resend or rewind first puts its turn's draft back, awaited under this request's
+            // admission, so this request's result lands over the restored draft, never before it.
+            if let anchor {
+                // Recipients are not tracked in editHistory — pass nil to keep current values.
+                await onDraftUpdate?(anchor.subjectAtRequest, anchor.bodyAtRequest, nil, nil, nil,
+                                     anchor.textMessageAtRequest, anchor.changeCommandAtRequest)
+            }
             _ = await userTurnPersistence.value
             do {
                 let result = try await editTask.value
@@ -1711,8 +1737,8 @@ struct DynamicIslandChat: View {
                 // Guard: if user pressed stop, don't append result
                 guard !Task.isCancelled else { return }
 
-                // Update draft via callback (with animation)
-                onDraftUpdate?(result.subject, result.body, result.toDelta, result.ccDelta, result.bccDelta, result.textMessage, result.changeCommand)
+                // Update the draft, awaited: its suggestion write lands while this request is admitted.
+                await onDraftUpdate?(result.subject, result.body, result.toDelta, result.ccDelta, result.bccDelta, result.textMessage, result.changeCommand)
 
                 // Show conversational response as chat bubble
                 let responseText = result.response ?? "Done."
@@ -1817,10 +1843,10 @@ struct DynamicIslandChat: View {
                 //
                 // There is exactly ONE caller that sets `skipDraftAutoSave`
                 // (`ComposeView`, `skipDraftAutoSave: showingSuggestion`) and it does
-                // NOT own the save. `applyInlineEdit`'s suggestion branch calls
-                // `persistCachedReply` only `if replyTo != nil && !isForward`, so
+                // NOT own the save. `applyInlineEdit`'s suggestion branch writes
+                // only `if replyTo != nil && !isForward`, so
                 // new-message and forward have no durable writer at all — and even in
-                // reply mode `persistCachedReply` writes `messageHeader.cachedReply`,
+                // reply mode that write stores the header's AI Suggestion,
                 // which is not the `Draft` row this toast's tap resolves. The other
                 // half of `!autoSaveAttempted` is `draftId == nil`, where no durable
                 // draft exists by construction. In every one of those states the
@@ -2819,11 +2845,8 @@ struct DynamicIslandChat: View {
         guard acquireComposeEditAdmission() else { return }
         trimForResendLast(atIndex: index)
         let anchor = editHistory.last
-        if let last = anchor {
-            // Recipients are not tracked in editHistory — pass nil to keep current values.
-            onDraftUpdate?(last.subjectAtRequest, last.bodyAtRequest, nil, nil, nil, last.textMessageAtRequest, last.changeCommandAtRequest)
-            editHistory.removeLast()
-        }
+        if anchor != nil { editHistory.removeLast() }
+        // The request restores the anchor's draft first (`sendComposeEdit(from:)`).
         sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)
     }
 
@@ -2836,11 +2859,8 @@ struct DynamicIslandChat: View {
         // Snapshot on the earliest popped editHistory entry is the pre-edit draft for that turn.
         let editCutoff = min(userMessagesBefore, editHistory.count)
         let anchor = editCutoff < editHistory.count ? editHistory[editCutoff] : nil
-        if let anchor {
-            // Recipients are not tracked in editHistory — pass nil to keep current values.
-            onDraftUpdate?(anchor.subjectAtRequest, anchor.bodyAtRequest, nil, nil, nil, anchor.textMessageAtRequest, anchor.changeCommandAtRequest)
-            editHistory = Array(editHistory.prefix(editCutoff))
-        }
+        if anchor != nil { editHistory = Array(editHistory.prefix(editCutoff)) }
+        // The request restores the anchor's draft first (`sendComposeEdit(from:)`).
         sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)
     }
 

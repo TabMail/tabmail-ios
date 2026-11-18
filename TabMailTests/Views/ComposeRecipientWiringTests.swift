@@ -87,8 +87,9 @@ struct ComposeRecipientWiringTests {
         let start = try #require(text.range(of: "private func applyInlineEdit("))
         let body = text[start.upperBound...]
         let apply = try #require(body.range(of: "setRecipients(recipients.applying(to: toDelta, cc: ccDelta, bcc: bccDelta))"))
-        let fade = try #require(body.range(of: "Task { @MainActor in"))
-        #expect(apply.lowerBound < fade.lowerBound)
+        let save = try #require(body.range(of: "await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: dbPool)"))
+        let fade = try #require(body.range(of: "withAnimation(.easeOut(duration: 0.4)) {"))
+        #expect(apply.lowerBound < save.lowerBound && save.lowerBound < fade.lowerBound)
     }
 
     @Test("A reopened draft, a prefill and an AI edit fill each field from its own role")
@@ -99,7 +100,7 @@ struct ComposeRecipientWiringTests {
         #expect(text.contains(
             "to: prefillTo.map { RecipientEntry($0) }, cc: prefillCc.map { RecipientEntry($0) }, bcc: prefillBcc.map { RecipientEntry($0) }"))
         #expect(text.contains(
-            "onDraftUpdate: { newSubject, newBody, toDelta, ccDelta, bccDelta in applyInlineEdit(subject: newSubject, body: newBody, toDelta: toDelta, ccDelta: ccDelta, bccDelta: bccDelta)"))
+            "onDraftUpdate: { newSubject, newBody, toDelta, ccDelta, bccDelta, textMessage, changeCommand in await applyInlineEdit( subject: newSubject, body: newBody, toDelta: toDelta, ccDelta: ccDelta, bccDelta: bccDelta, textMessage: textMessage, changeCommand: changeCommand)"))
         #expect(text.contains("recipients.applying(to: toDelta, cc: ccDelta, bcc: bccDelta)"))
     }
 

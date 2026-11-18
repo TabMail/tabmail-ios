@@ -613,7 +613,7 @@ extension TutorialChatViewRunTests {
             #expect(ghost(opened) != nil, "control: the seeded AI Suggestion shows")
 
             // "Make it shorter" on the card: the scripted edit reaches compose's own writer, as the
-            // card's edit of the visible suggestion does (`applyInlineEdit`, `persistCachedReply`).
+            // card's edit of the visible suggestion does (`applyInlineEdit`, `writeCachedReplyToDB`).
             var edited: ReplyResult?
             await coordinator.runPracticeReplyEdit { edited = $0 }
             let edit = try #require(edited)
@@ -721,7 +721,7 @@ struct TutorialChatViewWiringTests {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(Self.count("TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)", in: chat) == 1)
         #expect(Self.count("tutorialMove: tutorialMove(thread)", in: chat) == 1)
-        #expect(Self.count("ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) { openSuggestion(on: newest, tutorialMove: move) }", in: chat) == 1)
+        #expect(Self.count("ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) { openSuggestion(shown, on: newest, tutorialMove: move) }", in: chat) == 1)
         #expect(Self.count("if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion { _ = TutorialCoordinator.shared.admits(.other) return }", in: chat) == 1,
                 "in the tutorial only the step that asks for it opens the card")
         #expect(Self.count("TutorialCoordinator.shared.messageOpened(accountId: opened.accountId, messageId: opened.messageId)", in: chat) == 1,

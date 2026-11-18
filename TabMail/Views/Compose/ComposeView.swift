@@ -841,9 +841,8 @@ enum ComposeDraftGuards {
     /// `skipDraftAutoSave` owns the save"*. There is exactly one such caller
     /// (`ComposeView`, `skipDraftAutoSave: showingSuggestion`) and it owns NO
     /// automatic save in any of its three modes for this purpose:
-    /// `applyInlineEdit` calls
-    /// `persistCachedReply` only `if replyTo != nil && !isForward`, so new-message
-    /// and forward have no durable writer at all, and `persistCachedReply` writes
+    /// `applyInlineEdit` writes the suggestion only `if replyTo != nil && !isForward`, so new-message
+    /// and forward have no durable writer at all, and that write stores
     /// `messageHeader.cachedReply` — not the `Draft` row the toast's tap resolves.
     /// The other half of `!autoSaveAttempted` is `draftId == nil`, where no
     /// durable draft exists by construction.
@@ -1744,7 +1743,8 @@ struct ComposeView: View {
                         // Bubble visible → edit the suggestion; otherwise edit the body.
                         draftBody: showingSuggestion ? (currentSuggestion ?? "") : messageBody,
                         draftSuggestion: showingSuggestion ? shownSuggestion : nil,
-                        composeContext: buildComposeEditContext(),
+                        composeContext: buildComposeEditContext(relatedBodyText: nil),
+                        composeEditContext: { await composeEditContextForRequest() },
                         draftId: draftId,
                         draftReplyToId: replyTo?.id,
                         draftIsReplyAll: isReplyAll,
@@ -1768,7 +1768,7 @@ struct ComposeView: View {
                         isExpanded: $chatExpanded,
                         isWorking: $aiWorking,
                         onDraftUpdate: { newSubject, newBody, toDelta, ccDelta, bccDelta, textMessage, changeCommand in
-                            applyInlineEdit(
+                            await applyInlineEdit(
                                 subject: newSubject, body: newBody, toDelta: toDelta, ccDelta: ccDelta, bccDelta: bccDelta,
                                 textMessage: textMessage, changeCommand: changeCommand)
                         },
@@ -2191,6 +2191,8 @@ struct ComposeView: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(isRecomputing)
+                    .accessibilityLabel("Recompute")
+                    .accessibilityIdentifier("composeRecompute")
                 }
 
                 Spacer()
@@ -2259,7 +2261,7 @@ struct ComposeView: View {
                 for: reply, account: account,
                 kbText: PromptStore.shared.kbText(),
                 compositionPrompt: PromptStore.shared.compositionMarkdown(),
-                aiService: .shared, dbPool: dbPool
+                aiService: ChatPillState.shared.aiService, dbPool: dbPool
             ) {
                 // The card closed meanwhile.
                 guard !Task.isCancelled else { return }
@@ -2294,8 +2296,10 @@ struct ComposeView: View {
 
     // MARK: - Inline Edit
 
-    /// Build the compose edit context for the DynamicIslandChat inline editor.
-    private func buildComposeEditContext() -> ComposeEditContext {
+    /// The compose edit context for the DynamicIslandChat inline editor, with `relatedBodyText` as
+    /// the email's body. Built at render without a read (it tells the pill it edits a draft, and
+    /// from which sender); a request's own context comes from `composeEditContextForRequest`.
+    private func buildComposeEditContext(relatedBodyText bodyText: String?) -> ComposeEditContext {
         let mode: String
         if isForward {
             mode = "edit_forward"
@@ -2304,16 +2308,32 @@ struct ComposeView: View {
         } else {
             mode = "edit_new"
         }
-        let bodyText = replyTo.flatMap { reply in
-            try? dbPool.read { db in try ComposeEditContext.relatedBodyText(of: reply, db: db) }
-        }
         return ComposeEditContext.make(
             recipients: recipients, account: resolvedAccount, mode: mode, related: replyTo,
             relatedBodyText: bodyText, compositionPrompt: PromptStore.shared.compositionMarkdown(),
             kbText: PromptStore.shared.kbText())
     }
 
-    /// Apply an inline edit result: dissolve out old text, swap, dissolve in new text.
+    /// A compose edit request's context, read after the request is admitted: the email replied to
+    /// or forwarded with its body, through the one identity-checked read
+    /// (`ComposeEditContext.relatedBodyText`). Nil refuses the request: another email is seated at
+    /// its address (or the read failed), so its body is never sent with this draft.
+    private func composeEditContextForRequest() async -> ComposeEditContext? {
+        guard let reply = replyTo else { return buildComposeEditContext(relatedBodyText: nil) }
+        let read = try? await dbPool.read { db in try ComposeEditContext.relatedBodyText(of: reply, db: db) }
+        guard case .some(let bodyText) = read else {
+            BackgroundSyncLogger.logDebug("[ComposeView] compose edit refused: the row is no longer \(reply.messageId)")
+            return nil
+        }
+        return buildComposeEditContext(relatedBodyText: bodyText)
+    }
+
+    /// Apply an inline edit result, or a resend's or rewind's restore, as one operation awaited by
+    /// its caller under the compose agent fence it holds: the draft (subject, body or shown
+    /// suggestion, recipients) changes at once, then the suggestion's write is awaited, so the next
+    /// request admitted reads this state and an edit's result never compares against a value the
+    /// restore was about to replace. The fade is presentation only: the new text is hidden at once
+    /// and dissolves in, and nothing in it changes the draft.
     /// Recipient deltas (to/cc/bcc) are `nil` when the edit's `add_*`/`remove_*` lists for that
     /// field are empty (keep current). Non-nil deltas are applied as: removes → adds (deduped).
     /// A delta whose `clearsField` is true wipes the field before adding.
@@ -2325,74 +2345,51 @@ struct ComposeView: View {
         bccDelta: RecipientDelta?,
         textMessage: String?,
         changeCommand: String?
-    ) {
+    ) async {
         func desc(_ d: RecipientDelta?) -> String {
             guard let d else { return "nil" }
             return "+\(d.adds.recipients.count)/-\(d.removes.count)\(d.clearsField ? "*" : "")"
         }
         BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: subject=\(newSubject?.prefix(40) ?? "nil") bodyLen=\(newBody?.count ?? 0) to=\(desc(toDelta)) cc=\(desc(ccDelta)) bcc=\(desc(bccDelta))")
-        // Phase 1: fade text out completely
-        withAnimation(.easeIn(duration: 0.25)) {
-            isApplyingEdit = true
-        }
-        if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: fade-out begin instance=\(instanceToken) draftId=\(draftId)")
-        }
-        // Recipients are not part of the text fade. They change now, so the
-        // agent's autosave, which runs right after this call, stores them.
+        // Hidden at once: the new text never shows before its dissolve.
+        isApplyingEdit = true
         setRecipients(recipients.applying(to: toDelta, cc: ccDelta, bcc: bccDelta))
-        // An edit of the suggestion is stored now, while the edit still holds the compose agent
-        // fence (no Recompute runs), over the suggestion it edited: the one shown when it started.
-        // The stored AI Suggestion is the Reply All draft (the chat's ghost). Only an edit of a
-        // reply whose envelope is still that one replaces it; an edit for another audience or
+        // An edit of the suggestion is stored over the suggestion it edited: the one shown when it
+        // started. The stored AI Suggestion is the Reply All draft (the chat's ghost). Only an edit
+        // of a reply whose envelope is still that one replaces it; an edit for another audience or
         // subject stays in this card and its draft. Compose has no source message, and forward
         // would write to the email being forwarded.
         let previous = shownSuggestion
         let edited = newBody.map { ReplyResult(body: $0, textMessage: textMessage, changeCommand: changeCommand) }
-        if showingSuggestion, let edited, let reply = replyTo, !isForward,
-           holdsSuggestionEnvelope(of: reply, subject: newSubject ?? subject) {
-            persistCachedReply(edited, replacing: previous, replyTo: reply)
+        let stored: (ReplyResult, MessageHeader)? = {
+            guard showingSuggestion, let edited, let reply = replyTo, !isForward,
+                  holdsSuggestionEnvelope(of: reply, subject: newSubject ?? subject) else { return nil }
+            return (edited, reply)
+        }()
+        if let s = newSubject {
+            BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating subject to '\(s.prefix(40))'")
+            subject = s
         }
-        Task { @MainActor in
-            // Wait for fade-out to finish
-            try? await Task.sleep(for: .milliseconds(280))
-            // Phase 2: swap text while invisible
-            if let s = newSubject {
-                BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating subject to '\(s.prefix(40))'")
-                subject = s
+        if let b = newBody {
+            if showingSuggestion {
+                BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating suggestion (len=\(b.count))")
+                shownSuggestion = edited
+            } else {
+                BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating body (len=\(b.count))")
+                messageBody = b
             }
-            if let b = newBody {
-                if showingSuggestion {
-                    BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating suggestion (len=\(b.count))")
-                    // A Recompute admitted after the edit, during the fade, is newer: it keeps its own.
-                    if shownSuggestion == previous { shownSuggestion = edited }
-                } else {
-                    BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating body (len=\(b.count))")
-                    messageBody = b
-                }
-            }
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: mutation applied instance=\(instanceToken) draftId=\(draftId)")
-            }
-            // Phase 3: dissolve back in with new text
-            withAnimation(.easeOut(duration: 0.4)) {
-                isApplyingEdit = false
-            }
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: fade-in begin instance=\(instanceToken) draftId=\(draftId)")
-            }
-            BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: done, isApplyingEdit=false")
         }
-    }
-
-    /// Write the edited suggestion to `messageHeader.cachedReply` so reopens see it, with the
-    /// edit's own text version and change command: the chat's AI Suggestion and its field example
-    /// show them, so a card edit updates the suggestion in the chat. A resend or rewind restores the
-    /// ones recorded with the earlier body; an edit with none (history from older builds, a body that
-    /// was not the suggestion) clears them.
-    private func persistCachedReply(_ value: ReplyResult, replacing previous: ReplyResult?, replyTo reply: MessageHeader) {
-        let db = dbPool
-        Task { await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: db) }
+        if let (value, reply) = stored {
+            await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: dbPool)
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: mutation applied instance=\(instanceToken) draftId=\(draftId)")
+        }
+        // The new text dissolves in (presentation only).
+        withAnimation(.easeOut(duration: 0.4)) {
+            isApplyingEdit = false
+        }
+        BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: done, isApplyingEdit=false")
     }
 
     /// Whether this card's draft is still the AI Suggestion's envelope for `reply`
@@ -3322,14 +3319,18 @@ struct ComposeView: View {
         } else if let suggestedBody, !suggestedBody.isEmpty {
             suggestionToShow = ReplyResult(body: suggestedBody, textMessage: nil)
         } else if let reply = replyTo, !isForward {
+            // Only while the row is still the email replied to: another email seated at its
+            // address (a UIDVALIDITY reset) never lends this card its suggestion.
             suggestionToShow = try? dbPool.read { db in
-                try MessageHeader.fetchOne(db, key: reply.id)?.suggestion
+                guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }
+                return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion
             }
         } else {
             suggestionToShow = nil
         }
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ComposeView] suggestion instance=\(instanceToken) draftId=\(draftId) suggestionLen=\(suggestionToShow?.body.count ?? -1)")
+            BackgroundSyncLogger.logDebug("[ComposeView] prepopulate: suggestion \(suggestionToShow.map { "shown, \($0.body.count) chars" } ?? "none") (given \(suggestion != nil), body given \(suggestedBody != nil), reply \(replyTo != nil), forward \(isForward))")
         }
         if let suggested = suggestionToShow, !suggested.body.isEmpty {
             shownSuggestion = suggested

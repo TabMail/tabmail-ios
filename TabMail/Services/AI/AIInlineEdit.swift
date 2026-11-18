@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import SwiftMail
 
 /// Context needed to build a compose edit request, gathered from ComposeView.
 struct ComposeEditContext: Sendable {
@@ -64,11 +65,16 @@ extension ComposeEditContext {
             bodyText: related.map { relatedBodyText ?? $0.snippet } ?? "")
     }
 
-    /// The text of `header`'s body for an edit's context: the primary message only (embedded .eml
-    /// sections stripped, they are other people's emails); nil when no body is stored.
-    static func relatedBodyText(of header: MessageHeader, db: Database) throws -> String? {
-        guard let html = try MessageBody.fetchOne(db, key: header.id)?.htmlContent, !html.isEmpty else { return nil }
-        return EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html))
+    /// THE body read of every compose edit's context: the text of `header`'s body, the primary
+    /// message only (embedded .eml sections stripped, they are other people's emails), read in the
+    /// same snapshot as the check that the row at its address is still that email
+    /// (`AIWriteTarget.stillHolds`). The outer nil refuses: another email is seated at the address
+    /// (a UIDVALIDITY reset), so its body is never sent with this email's context. The inner nil:
+    /// no body is stored (the context then carries the snippet).
+    static func relatedBodyText(of header: MessageHeader, db: Database) throws -> String?? {
+        guard try AIWriteTarget.stillHolds(header, db: db) else { return nil }
+        guard let html = try MessageBody.fetchOne(db, key: header.id)?.htmlContent, !html.isEmpty else { return .some(nil) }
+        return .some(EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html)))
     }
 }
 
@@ -349,7 +355,9 @@ extension AIService {
 
         return InlineEditResult(
             response: nonBlank(edit.response),
-            subject: nonBlank(edit.subject),
+            // A blank subject is no subject from the model (the backend sends '' for one): the draft
+            // keeps the subject the edit started from. Only a written subject replaces it.
+            subject: edit.subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : edit.subject,
             // The body as the backend sends it: the draft outside the edit stays verbatim.
             body: edit.body,
             toDelta: toDelta,
@@ -394,10 +402,12 @@ extension AIService {
         return .some(RecipientDelta(adds: RecipientEntry(addTexts), removes: removals))
     }
 
-    /// The one sendable mailbox `text` names; nil when it names none or several.
+    /// The one sendable mailbox `text` names; nil when it names none or several. Read with
+    /// SwiftMail's one-element parser (`AddressListEntry`), so an item holding two elements, a group
+    /// or the same mailbox twice is malformed, never deduplicated into one.
     private static func singleMailbox(_ text: String) -> String? {
-        let entry = RecipientEntry(text)
-        guard entry.leftovers.isEmpty, entry.recipients.count == 1 else { return nil }
-        return entry.recipients[0].address
+        guard case .mailbox(let mailbox)? = AddressListEntry(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              isValidEmailAddress(mailbox.address) else { return nil }
+        return mailbox.address
     }
 }

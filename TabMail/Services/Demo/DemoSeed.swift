@@ -162,7 +162,7 @@ enum DemoSeed {
         let isFlagged: Bool
         let action: ActionTag?
         let summaryBlurb: String?
-        let cachedReply: String?
+        let replyBody: String?
         let daysAgo: Int
         // Optional email reminder. Stored as a relative offset so the seed
         // produces a sensible "due Friday" / "due tonight" feel regardless of
@@ -173,14 +173,14 @@ enum DemoSeed {
         var reminderContent: String? = nil
         /// The chat view's bubble (`summaryTextMessage`) and AI Suggestion (`replyTextMessage`).
         var textMessage: String? = nil
-        var replyTextMessage: String? = nil
+        var replyText: String? = nil
         var cc: String = ""
         /// Messages of one thread share a key (`computedThreadId`); nil stands alone.
         var thread: String? = nil
         /// The seeded message this one replies to (`demo-msg-<n>`).
         var inReplyTo: String? = nil
         /// The seeded AI Suggestion, one value (`MessageHeader.suggestion`).
-        var suggestion: ReplyResult? { cachedReply.map { ReplyResult(body: $0, textMessage: replyTextMessage) } }
+        var suggestion: ReplyResult? { replyBody.map { ReplyResult(body: $0, textMessage: replyText) } }
         /// Moves the date this many hours back, to order a thread's emails on one day.
         var hoursEarlier: Int = 0
     }
@@ -197,13 +197,13 @@ enum DemoSeed {
             isRead: false, isFlagged: false,
             action: .reply,
             summaryBlurb: "Maya needs your Q1 actuals + Q2 projections by EOD Friday for the leadership sync. She wants headcount, tooling, and contractor numbers.",
-            cachedReply: "Hi Maya,\n\nI'll pull these together and send by Thursday EOD so you have time to review. Will include headcount changes, tooling, and contractor costs broken out by team.\n\nAlex",
+            replyBody: "Hi Maya,\n\nI'll pull these together and send by Thursday EOD so you have time to review. Will include headcount changes, tooling, and contractor costs broken out by team.\n\nAlex",
             daysAgo: 1,
             reminderDaysAhead: 3,
             reminderTime: "17:00",
             reminderContent: "Send Q1 actuals + Q2 projections to Maya",
             textMessage: "Can you send me your team's Q1 actuals and Q2 projections by Friday? Headcount, tooling and contractors.",
-            replyTextMessage: "Sure, I'll send them by Thursday."
+            replyText: "Sure, I'll send them by Thursday."
         ),
         SeededMessage(
             path: "INBOX",
@@ -215,10 +215,10 @@ enum DemoSeed {
             isRead: false, isFlagged: false,
             action: .reply,
             summaryBlurb: "Jordan found two flight options for the weekend — a 5pm or 6:30pm departure, both ~$240. Cabin early check-in confirmed.",
-            cachedReply: "Let's do the earlier flight — earlier arrival means we can grab dinner downtown. I'll book my half tonight.",
+            replyBody: "Let's do the earlier flight — earlier arrival means we can grab dinner downtown. I'll book my half tonight.",
             daysAgo: 2,
             textMessage: "Found two flights for the weekend: 5pm or 6:30pm, both about $240. Which one?",
-            replyTextMessage: "Let's take the 5pm, I'll book my half tonight.",
+            replyText: "Let's take the 5pm, I'll book my half tonight.",
             thread: "trip",
             inReplyTo: "demo-msg-16"
         ),
@@ -232,7 +232,7 @@ enum DemoSeed {
             isRead: true, isFlagged: false,
             action: .archive,
             summaryBlurb: "Receipt — $19.99 monthly subscription charged successfully. No action needed.",
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 3,
             textMessage: "Your $19.99 monthly payment went through."
         ),
@@ -246,10 +246,10 @@ enum DemoSeed {
             isRead: false, isFlagged: false,
             action: .reply,
             summaryBlurb: "Sarah opened PR #1247 to refactor InboxViewModel actor isolation — ready for your review.",
-            cachedReply: "Reviewed — looks great, just left two minor comments on the dispatch order. LGTM after those.",
+            replyBody: "Reviewed — looks great, just left two minor comments on the dispatch order. LGTM after those.",
             daysAgo: 1,
             textMessage: "PR #1247, the actor isolation refactor, is ready for your review.",
-            replyTextMessage: "Reviewed, two small comments. LGTM after those."
+            replyText: "Reviewed, two small comments. LGTM after those."
         ),
         SeededMessage(
             path: "INBOX",
@@ -261,7 +261,7 @@ enum DemoSeed {
             isRead: true, isFlagged: false,
             action: .archive,
             summaryBlurb: "Daily DailyTech digest — a model launch, a startup funding round, autonomous agents.",
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 1,
             textMessage: "Big model launch today, and a coding-tool startup just raised a round."
         ),
@@ -275,13 +275,13 @@ enum DemoSeed {
             isRead: false, isFlagged: false,
             action: .reply,
             summaryBlurb: "Mom asking for a 20-min call — Dad's surgery went well.",
-            cachedReply: "Mom — so glad to hear about Dad. I'll call you tonight around 8 your time. Love you.",
+            replyBody: "Mom — so glad to hear about Dad. I'll call you tonight around 8 your time. Love you.",
             daysAgo: 0,
             reminderDaysAhead: 0,
             reminderTime: "20:00",
             reminderContent: "Call Mom (20 min)",
             textMessage: "Dad's surgery went well! Call me when you have 20 minutes?",
-            replyTextMessage: "So glad! I'll call you tonight around 8."
+            replyText: "So glad! I'll call you tonight around 8."
         ),
         SeededMessage(
             path: "INBOX",
@@ -293,7 +293,7 @@ enum DemoSeed {
             isRead: true, isFlagged: false,
             action: .delete,
             summaryBlurb: "OTP code — 847291. Expires in 10 minutes.",
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 0,
             textMessage: "Your code is 847291. It expires in 10 minutes."
         ),
@@ -307,13 +307,13 @@ enum DemoSeed {
             isRead: false, isFlagged: false,
             action: .reply,
             summaryBlurb: "Priya needs your offsite RSVP by Wednesday and asks you to say a few words on day one. Hotel block expires Friday.",
-            cachedReply: "Hi Priya,\n\nThanks for the agenda. I'm in for the offsite, and I'm happy to say a few words on day one.\n\nBest,\nAlex",
+            replyBody: "Hi Priya,\n\nThanks for the agenda. I'm in for the offsite, and I'm happy to say a few words on day one.\n\nBest,\nAlex",
             daysAgo: 4,
             reminderDaysAhead: 2,
             reminderTime: nil,
             reminderContent: "RSVP for offsite + book hotel",
             textMessage: "Agenda's attached. Can you RSVP by Wednesday and say a few words on day one?",
-            replyTextMessage: "Thanks Priya, I'm in, and happy to say a few words on day one.",
+            replyText: "Thanks Priya, I'm in, and happy to say a few words on day one.",
             cc: samLeeAddress,
             thread: "offsite",
             inReplyTo: "demo-msg-14"
@@ -330,7 +330,7 @@ enum DemoSeed {
             isRead: true, isFlagged: false,
             action: nil,
             summaryBlurb: "Sent — Q4 retro action items: on-call rotation, hybrid search ship, kill deprecated endpoint.",
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 5,
             textMessage: "Notes from the retro: on-call rotation, ship hybrid search, retire the old metrics endpoint."
         ),
@@ -344,7 +344,7 @@ enum DemoSeed {
             isRead: true, isFlagged: false,
             action: nil,
             summaryBlurb: "Sent — revised proposal with feedback incorporated; offered call this week.",
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 7,
             textMessage: "Here's the revised proposal with your team's feedback. Free for a call this week."
         ),
@@ -360,7 +360,7 @@ enum DemoSeed {
             isRead: true, isFlagged: false,
             action: nil,
             summaryBlurb: nil,
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 6
         ),
 
@@ -375,7 +375,7 @@ enum DemoSeed {
             isRead: true, isFlagged: false,
             action: nil,
             summaryBlurb: "HR confirmed all onboarding paperwork is on file.",
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 30,
             textMessage: "All your paperwork is on file. Welcome aboard!"
         ),
@@ -391,7 +391,7 @@ enum DemoSeed {
             isRead: false, isFlagged: false,
             action: nil,
             summaryBlurb: "The Weekly Byte — vertical AI agents as the new SaaS unit of distribution.",
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 2,
             textMessage: "This week: vertical AI agents are the new unit of SaaS distribution."
         ),
@@ -409,7 +409,7 @@ enum DemoSeed {
             isRead: true, isFlagged: false,
             action: ActionTag.none,
             summaryBlurb: "Sam will book a hotel block for the offsite once the dates are final.",
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 6,
             textMessage: "I'll book a hotel block for everyone once the dates are final.",
             cc: "priya@workmail.example",
@@ -427,7 +427,7 @@ enum DemoSeed {
             isRead: true, isFlagged: false,
             action: nil,
             summaryBlurb: "Jordan wants to fly out Saturday and will look at flights tonight.",
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 3,
             textMessage: "Want to fly out Saturday? I'll look at flights tonight.",
             thread: "trip",
@@ -443,7 +443,7 @@ enum DemoSeed {
             isRead: true, isFlagged: false,
             action: nil,
             summaryBlurb: "Sent — yes to Saturday, on a flight after work.",
-            cachedReply: nil,
+            replyBody: nil,
             daysAgo: 3,
             textMessage: "Yes, find something after work.",
             thread: "trip",
@@ -513,7 +513,7 @@ enum DemoSeed {
             // Pre-bake AI cache row so the production short-circuit (which
             // checks MessageAICache via Device Sync probe) finds a match for
             // any path that bypasses the GRDB header check.
-            if m.summaryBlurb != nil || m.action != nil || m.cachedReply != nil,
+            if m.summaryBlurb != nil || m.action != nil || m.suggestion != nil,
                let cacheKey = MessageAICache.cacheKey(
                 accountId: demoAccountId,
                 folderPath: folder.path,
@@ -524,7 +524,7 @@ enum DemoSeed {
                 cache.summaryTextMessage = m.textMessage
                 cache.actionTag = m.action
                 if let reply = m.suggestion { cache.storeSuggestion(reply) }
-                cache.replyGeneratedAt = m.cachedReply != nil ? date : nil
+                cache.replyGeneratedAt = m.suggestion != nil ? date : nil
                 cache.updatedAt = date
                 try cache.insert(db)
             }

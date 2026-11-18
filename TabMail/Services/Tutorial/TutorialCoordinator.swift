@@ -348,12 +348,12 @@ final class TutorialCoordinator {
     /// edited reply, with its text version, to `apply` (the draft) and records the edit. Nothing
     /// happens when the demo run it began in has ended meanwhile (Skip, then a
     /// new run, before the wait is over): the edit belongs to that run alone.
-    func runPracticeReplyEdit(apply: (ReplyResult) -> Void) async {
+    func runPracticeReplyEdit(apply: (ReplyResult) async -> Void) async {
         let admission = DemoModeStore.shared.chatAdmission
         let edited = TutorialChatScript.editedReply(teachesChat: teachesChat)
         try? await Task.sleep(for: TutorialChatScript.editDuration)
         guard DemoModeStore.admits(admission) else { return }
-        apply(edited)
+        await apply(edited)
         practiceReplyEdited()
     }
 

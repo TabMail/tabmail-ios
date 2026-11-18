@@ -181,6 +181,23 @@ struct ParseInlineEditResponseTests {
         #expect(result.toDelta == nil)
     }
 
+    @Test("A blank subject is no subject from the model (the draft keeps its own); a written one is kept as written",
+          arguments: ["", "   "])
+    func blankSubjectIsNoSubject(_ blank: String) throws {
+        let result = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(subject: blank)))
+        #expect(result.subject == nil)
+        // Control: a subject is kept as written.
+        #expect(AIService.parseInlineEditResponse(ComposeEditJSON.make(subject: " Re: Offsite"))?.subject == " Re: Offsite")
+    }
+
+    @Test("One mailbox per item, a display name included, is read")
+    func oneMailboxWithItsName() throws {
+        let result = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            addTo: [["name": "", "email": "Ann <ann@example.com>"]], removeCc: ["\"Doe, Bob\" <Bob@example.com>"])))
+        #expect(result.toDelta?.adds.recipients.map(\.address) == ["ann@example.com"])
+        #expect(result.ccDelta?.removes == ["bob@example.com"])
+    }
+
     @Test("Keys it does not know are ignored")
     func unknownKeysIgnored() throws {
         let result = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(extra: ["tone": "warm", "v": 3])))
@@ -209,6 +226,11 @@ struct ParseInlineEditResponseTests {
         ComposeEditJSON.make(addTo: [["name": "", "email": "Ann"]]),
         ComposeEditJSON.make(removeCc: ["ann@example.com; bob@example.com"]),
         ComposeEditJSON.make(removeCc: ["Ann"]),
+        // The same mailbox twice is still two elements, and a group is not one mailbox.
+        ComposeEditJSON.make(addTo: [["name": "", "email": "ann@example.com, ann@example.com"]]),
+        ComposeEditJSON.make(removeTo: ["ann@example.com, ANN@example.com"]),
+        ComposeEditJSON.make(addCc: [["name": "", "email": "Team: ann@example.com;"]]),
+        ComposeEditJSON.make(removeBcc: ["Team: ann@example.com;"]),
     ])
     func malformedIsAnError(json: String) {
         #expect(AIService.parseInlineEditResponse(json) == nil)

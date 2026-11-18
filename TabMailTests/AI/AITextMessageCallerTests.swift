@@ -639,15 +639,21 @@ struct AITextMessageCallerTests {
             defer { http.close() }
             http.register(path: "/completions/chat", method: "POST") { _ in
                 let call = calls.withLock { value -> Int in value += 1; return value }
-                // The first card's request waits until the second card's reply is stored.
-                if call == 1 { _ = release.wait(timeout: .now() + 10) }
                 let object: [String: Any] = call == 1
                     ? ["subject": "Re: Plans", "body": "First recompute", "text_message": "First text"]
                     : ["subject": "Re: Plans", "body": "Second recompute", "text_message": "Second text"]
                 let assistant = String(decoding: (try? JSONSerialization.data(withJSONObject: object)) ?? Data(), as: UTF8.self)
                 let final = (try? JSONSerialization.data(withJSONObject: ["assistant": assistant])) ?? Data()
-                return .bytes(Data(("event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n").utf8),
-                              contentType: "text/event-stream")
+                let answer = FakeHTTP.CannedResponse.bytes(
+                    Data(("event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n").utf8),
+                    contentType: "text/event-stream")
+                // The first card's request waits, parked off the loader so the second card's
+                // request is served meanwhile, until the second card's reply is stored.
+                guard call == 1 else { return answer }
+                return .parked {
+                    _ = release.wait(timeout: .now() + 10)
+                    return answer
+                }
             }
             let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
             let header = fixture.header

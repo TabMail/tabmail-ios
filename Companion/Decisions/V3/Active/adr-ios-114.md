@@ -963,15 +963,19 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      `Response:`/`+To:`/`Body:` reader and its "whole text is the body" fallback are deleted. This
      build sends the 2.0.0 marker, so it must never ship without this reader: a build with the marker
      and the labelled reader puts the raw JSON into the draft
-     (`ComposeEditMarkerTests.markerAndReader`). Each item is exactly one mailbox, read by the
-     recipient parser (`RecipientEntry`, ADR-IOS-092) and written with its name by
-     `RecipientEntry.text`; nothing joins or splits two items.
+     (`ComposeEditMarkerTests.markerAndReader`, fed the backend producer's own example). Each item
+     is exactly one mailbox, read by SwiftMail's one-element parser (`AddressListEntry`: the same
+     mailbox twice, or a group, is malformed, never deduplicated into one) and written with its
+     name by `RecipientEntry.text`; nothing joins or splits two items. A written `subject`
+     replaces the draft's; a blank one is no subject from the model (the backend sends `''` for
+     one, and refuses a non-string), so the draft keeps the subject the edit started from: "Re: X"
+     stays "Re: X", and a subject the user cleared stays empty.
    - **The field's request edits the suggestion showing.** The field's send snapshots the AI
      Suggestion's full email as it shows then (`ChatReplyField.suggestion`, `ChatFieldSend`,
      `ChatFieldReply.suggestion`: its body, text version and change command as one value, so the
      edit never looks them up again). Only a reply to the exact row the field shows
-     (`ChatFieldReply.emailId`, the row id) takes the field's audience or suggestion; a copy in
-     another folder or account is another row. When the agent answers a reply request on that email with
+     (`ChatFieldReply.email`, the row and its identity) takes the field's suggestion; its audience
+     applies to the same account's copies of that email, never another account's (decision 18). When the agent answers a reply request on that email with
      `email_reply` and a `request`, `EmailReplyTool` runs the compose edit with that email as the
      draft and the user's words as the request, Thunderbird's inline-editor call
      (`compose/modules/inlineEditor.js` -> `runComposeEdit({body, request})`). Questions still go to
@@ -996,7 +1000,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      card carries, `ComposeView.currentSuggestionTexts`), and a resend or rewind that puts that body
      back stores it again, so the ghost stays (it vanished before). The resent request edits the
      restored turn's body and subject (`sendComposeEdit(from:)`), not the card's draft from before
-     the restore reached it. Edit history saved by older builds decodes it as nil and clears it as before.
+     the restore reached it. The restore and the edit's result are applied, and stored, awaited
+     inside the request's compose fence admission (`applyInlineEdit` is async); the text's fade is
+     presentation only. Edit history saved by older builds decodes it as nil and clears it as before.
    - **A superseded recompute never lands over a newer suggestion.** A card's Recompute reads the
      suggestion it replaces as it starts and stores its reply only over that one
      (`ComposeView.recomputedReply` -> `writeCachedReplyToDB(replacing:)`, `cachedReply IS ?` in the
@@ -1057,10 +1063,22 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
       reply card takes its fields exactly: an empty To is never refilled from the reply's Reply-To.
     - **Value boundaries.** The ghost, the "e.g." line and the field's edit read one shown value
       (`ChatReplyField.shown`); the on-device AI cache reads and writes the value whole; the demo
-      and preview seeds go through the same value API. A source fence keeps per-column writes and
-      a second envelope builder out.
+      and preview seeds go through the same value API (the screenshot seed too). A source fence
+      (`SuggestionSinglePathFenceTests`) keeps any read or write of a column outside the value's
+      accessors, any SQL that names a column other than to schedule (`IS [NOT] NULL`), and a second
+      envelope builder out.
+    - **The kind follows the final audience.** A reply card is Reply All only while its To, Cc and Bcc
+      still hold the whole Reply All audience (people added included); narrowed, even to one person,
+      it is a plain reply, so the send records a reply on the original (`ChatReplyCompose.with`).
+      The reply tool derives one start envelope (`ChatReplyCompose.suggestionEnvelope` with the call's
+      recipient changes, or `onlyTo` for people chosen in the field) and uses it for both the model's
+      context and the card; the subject is the edit's when it writes one, else the start's.
     - **Ordering and identity in the card.** Recompute and an inline edit are admitted through the
       compose agent fence, one at a time, and an edit stores over the suggestion it started from.
+      The edit is applied and stored awaited under that admission. Every compose edit's body is read
+      by one identity-checked read (`ComposeEditContext.relatedBodyText`, the card's included, read
+      when the edit is sent); another email seated at the address refuses the edit. The card's edits
+      and Recompute ask the chat's one AI service (`ChatPillState.shared.aiService`).
       A Recompute from another sender than the email's own account stays in its card. A Recompute,
       and a field request about the row the field showed, check that row's identity before any
       read or AI call; another email seated at the address refuses the request.

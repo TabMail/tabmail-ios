@@ -463,6 +463,14 @@ struct ComposeSuggestionPersistTests {
         let body = source[send.upperBound...].prefix(4000)
         #expect(body.contains("Self.editBase(anchor: anchor, draftSubject: draftSubject, draftBody: draftBody,"),
                 "the edit reads the draft the one choice gives")
+        // The restore and the result are both applied, awaited, inside the request's task, which
+        // holds the compose fence admission until it ends: the restore lands before the result.
+        let rest = source[send.upperBound...]
+        let task = try #require(rest.range(of: "activeChatTask = Task {\n            defer { composeAgentSendFence?.finishAgent() }"))
+        let restore = try #require(rest.range(of: "if let anchor {\n"))
+        let result = try #require(rest.range(of: "await onDraftUpdate?(result.subject, result.body,"))
+        #expect(task.lowerBound < restore.lowerBound && restore.lowerBound < result.lowerBound)
+        #expect(rest[restore.upperBound...].prefix(400).contains("await onDraftUpdate?(anchor.subjectAtRequest, anchor.bodyAtRequest,"))
     }
 
     /// The choice itself, without the view: a restored turn wins over the card's draft, which a
@@ -516,11 +524,14 @@ struct ComposeSuggestionPersistTests {
         guard let source = try? String(contentsOf: root.appendingPathComponent("TabMail/Views/Inbox/DynamicIslandChatButton.swift"), encoding: .utf8) else { return nil }
         let signature = restore == "resend"
             ? "private func resendLastUserComposeEdit(" : "private func rewindComposeEditToMessage("
-        guard let start = source.range(of: signature) else { return nil }
-        let tail = source[start.upperBound...]
-        guard let call = tail.range(of: "onDraftUpdate?(") else { return nil }
-        let line = tail[call.lowerBound...].prefix { $0 != "\n" }
-        return String(line)
+        // The restore hands its turn to the request, which puts that turn's draft back first.
+        guard let start = source.range(of: signature),
+              source[start.upperBound...].prefix(1200).contains("sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)"),
+              let send = source.range(of: "private func sendComposeEdit("),
+              let restore = source[send.upperBound...].range(of: "if let anchor {\n") else { return nil }
+        let tail = source[restore.upperBound...]
+        guard let call = tail.range(of: "await onDraftUpdate?("), let end = tail.range(of: "\n            }\n") else { return nil }
+        return String(tail[call.lowerBound..<end.lowerBound])
     }
 
     @Test("Updates cachedReply on messageHeader for the given id")
@@ -752,19 +763,19 @@ struct ComposeSuggestionPersistTests {
     }
 
     /// The edit reaches the writer: an inline edit of the visible suggestion in reply mode (not forward,
-    /// not a new message) saves through `writeCachedReplyToDB` with the message compose opened for.
-    @Test("An inline edit of the visible reply suggestion is saved with the message compose opened for")
+    /// not a new message) saves through `writeCachedReplyToDB` with the message compose opened for,
+    /// awaited inside the edit (so under the chat's compose fence), before the fade that only
+    /// presents it.
+    @Test("An inline edit of the visible reply suggestion is saved, awaited, with the message compose opened for")
     func inlineEditReachesTheWriterWithTheOpenedMessage() throws {
         let source = try composeSource()
-        let persist = try functionBody(
-            "private func persistCachedReply(", before: "static func writeCachedReplyToDB(", in: source)
-        #expect(persist.contains("writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: db)"))
-
-        let edit = try functionBody("private func applyInlineEdit(", before: "private func persistCachedReply(", in: source)
-        let suggestion = try #require(edit.range(of: "if showingSuggestion {"))
-        let gate = try #require(edit.range(of: "if let reply = replyTo, !isForward, holdsSuggestionEnvelope(of: reply) {"))
-        let save = try #require(edit.range(of: "persistCachedReply(edited, replacing: previous, replyTo: reply)"))
-        #expect(suggestion.lowerBound < gate.lowerBound && gate.lowerBound < save.lowerBound)
+        let edit = try functionBody("private func applyInlineEdit(", before: "private func holdsSuggestionEnvelope(", in: source)
+        let gate = try #require(edit.range(of: "guard showingSuggestion, let edited, let reply = replyTo, !isForward,"))
+        let save = try #require(edit.range(of: "await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: dbPool)"))
+        let fade = try #require(edit.range(of: "withAnimation(.easeOut(duration: 0.4)) {"))
+        #expect(gate.lowerBound < save.lowerBound && save.lowerBound < fade.lowerBound)
+        #expect(!edit.contains("Task {"), "the save is awaited by the edit, never detached")
+        #expect(!source.contains("persistCachedReply"), "the retired second writer")
     }
 
     @Test("A user edit clears the reply's text message, which described the AI's body")

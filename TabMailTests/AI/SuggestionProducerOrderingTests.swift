@@ -264,6 +264,44 @@ struct SuggestionProducerOrderingTests {
         }
     }
 
+    @Test("A card's Recompute on a row that now holds another email asks the AI nothing and stores nothing",
+          arguments: [true, false])
+    func recomputeRefusesAnotherEmail(swapped: Bool) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture()
+            let shown = ReplyResult(body: "Shown reply", textMessage: "Shown text")
+            #expect(await ComposeView.writeCachedReplyToDB(shown, replacing: nil, replyTo: fixture.header, db: fixture.pool) == .written,
+                    "control: the card shows a stored suggestion")
+            let backend = HeldBackend()
+            backend.release()
+            defer { backend.close(); fixture.close() }
+            // The card opened on the email under the folder's numbering 111.
+            let id = fixture.header.id, folderId = fixture.header.folderId
+            try await fixture.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 111 WHERE id = ?", arguments: [folderId])
+                try db.execute(sql: "UPDATE messageHeader SET observedUidValidity = 111 WHERE id = ?", arguments: [id])
+            }
+            var opened = fixture.header
+            opened.observedUidValidity = 111
+            if swapped {
+                // A reset seats another email at the same row and UID, under the new numbering.
+                try await fixture.pool.write { db in
+                    try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 222 WHERE id = ?", arguments: [folderId])
+                    try db.execute(sql: "UPDATE messageHeader SET rfc822MessageId = 'other@example.com', observedUidValidity = 222 WHERE id = ?",
+                                   arguments: [id])
+                }
+            }
+            let result = await ComposeView.recomputedReply(
+                for: opened, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            let produced = ReplyResult(body: Self.producedBody, textMessage: Self.producedText)
+            #expect(result == (swapped ? nil : produced))
+            #expect(backend.replyRequests == (swapped ? 0 : 1), "the AI is asked only about the email the card opened")
+            #expect(try fixture.row()?.suggestion == (swapped ? shown : produced))
+        }
+    }
+
     // MARK: - 2. A result from another device carries the stored suggestion whole
 
     @Test("The queue's peer carry keeps the stored suggestion and puts it in the AI cache with its change command")
@@ -279,6 +317,8 @@ struct SuggestionProducerOrderingTests {
             }
             // The row holds an edited suggestion (with a command) and no summary; nothing is cached yet.
             var local = fixture.header
+            local.headerComplete = true
+            local.bodyComplete = true
             let seededOK = local.replaceSuggestion(with: Self.edit, ifStill: nil)
             #expect(seededOK, "control: the edit is seeded")
             let seeded = local
@@ -292,8 +332,10 @@ struct SuggestionProducerOrderingTests {
                 dateMs: Int64(h.date.timeIntervalSince1970 * 1000))])
             try await SearchIndex.shared.updateBody(contentKey: key, body: "Can you send the budget?")
 
+            // The summary job: a reply job ends at once on a row that already holds a suggestion,
+            // before the peer check; the summary job runs the peer check that carries all three.
             await ActiveAIQueue().executeWholeJobForTesting(
-                ActiveAIQueue.AIJob(headerId: h.id, accountId: "acc1", jobType: .reply, windowExempt: true),
+                ActiveAIQueue.AIJob(headerId: h.id, accountId: "acc1", jobType: .summary, windowExempt: true),
                 aiService: backend.peerService)
 
             let row = try #require(try fixture.row())

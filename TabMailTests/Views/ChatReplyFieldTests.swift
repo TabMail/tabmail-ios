@@ -557,7 +557,9 @@ struct ChatReplyFieldTests {
             "add_bcc": .array([.string("hidden@example.com")]),
         ]
         let (chosen, chosenAccounts) = try await Self.agentReplyRequest(widening, from: .field(onlyTo: [Self.david.address]))
-        #expect(chosen.mode == .reply && chosen.bcc == ["hidden@example.com"] && chosen.cc.contains("extra@example.com"))
+        #expect(chosen.mode == .reply && !chosen.isReplyAll && chosen.to == [Self.david.address] && chosen.cc.isEmpty && chosen.bcc.isEmpty,
+                "the request itself is the plain reply to David: the agent's added people are not applied")
+        #expect(chosen.subject == ThreadUtils.replySubject(for: "Plans"), "the reply subject")
         let toChosen = Self.card(agent: chosen, accounts: chosenAccounts)
         #expect(!toChosen.isReplyAll, "Replying only to David is a plain reply")
         #expect(toChosen.prefillTo == [Self.david.address] && toChosen.prefillCc == [] && toChosen.prefillBcc == [],

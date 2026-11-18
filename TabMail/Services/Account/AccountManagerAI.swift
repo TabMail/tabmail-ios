@@ -519,7 +519,7 @@ extension AccountManager {
             return
         }
 
-        let needsReply = current.cachedReply == nil
+        let needsReply = current.suggestion == nil
         guard needsSummary || needsAction || needsReply else { return } // already fully processed
 
         let aiDisabled = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
@@ -569,7 +569,7 @@ extension AccountManager {
         let htmlContent = body.htmlContent
         let hasExistingAction = message.actionTag != nil
         let hasSummary = message.summaryBlurb != nil && message.summaryBlurb?.isEmpty == false
-        let hasReply = message.cachedReply != nil
+        let hasReply = message.suggestion != nil
         let toRecipients = message.to
         // T4.V7: the `folderPath` job-start snapshot is GONE — every AI-cache
         // write-through below keys off the RE-RESOLVED row (`msg.folderPath`), so a
@@ -616,7 +616,7 @@ extension AccountManager {
             // Double-check: fully processed by another path?
             if let msg = try? await dbPool.read({ db in try MessageHeader.fetchOne(db, key: headerId) }),
                msg.summaryBlurb != nil, msg.summaryBlurb?.isEmpty == false,
-               msg.actionTag != nil, msg.cachedReply != nil {
+               msg.actionTag != nil, msg.suggestion != nil {
                 return
             }
 

@@ -1157,10 +1157,10 @@ struct ComposeDraftGuardTests {
     /// `DraftComposePresenter`'s `case .notFound:` arm and dismissed instantly.
     ///
     /// The comment licensing it said *"the caller that set `skipDraftAutoSave`
-    /// owns the save"*. It does not: `ComposeView.applyInlineEdit` calls
-    /// `persistCachedReply` only `if replyTo != nil && !isForward`, so new-message
-    /// and forward have no durable writer at all — and `persistCachedReply` writes
-    /// `messageHeader.cachedReply`, not the `Draft` row the tap resolves.
+    /// owns the save"*. It does not: `ComposeView.applyInlineEdit` stores the
+    /// suggestion (`writeCachedReplyToDB`) only for a reply, never a forward, so
+    /// new-message and forward have no durable writer at all — and that writer
+    /// stores the email's AI Suggestion, not the `Draft` row the tap resolves.
     @Test("A compose-edit turn that attempted no save claims no durable draft")
     func noAttemptedSaveClaimsNoDurableDraft() {
         #expect(ComposeDraftGuards.composeEditGlobalSignal(
