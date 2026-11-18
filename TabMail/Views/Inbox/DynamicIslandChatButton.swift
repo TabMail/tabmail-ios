@@ -69,8 +69,15 @@ struct DynamicIslandChat: View {
     /// The input's words and the reply field's state. `ChatFieldFill.apply` is the only way the words
     /// change; no AI text is ever written into them (`ChatFieldFill`).
     @State private var fieldFill = ChatFieldFill()
-    /// The user's own words in the input (`ChatFieldFill.words`), read-only here.
-    var inputText: String { fieldFill.words }
+    /// The user's own words in the input (`ChatFieldFill.words`), read-only here; none while they
+    /// belong to another chat than this pill's (ADR-IOS-117).
+    var inputText: String { fieldFill.words(in: wordsKey) }
+    /// Where the field's unsent words are kept (`ChatFieldWords`, ADR-IOS-117): the thread chat key
+    /// of the pill's email. Nil for the inbox's chat and a compose's pill, which keep none.
+    private var wordsKey: String? {
+        guard composeContext == nil, let message else { return nil }
+        return ChatFieldWords.key(for: message)
+    }
     @State var fieldPulse = false
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
@@ -658,6 +665,18 @@ struct DynamicIslandChat: View {
         .task(id: message?.id) {
             guard let message else { return }
             await loadThreadChat(about: message)
+        }
+        // The field's unsent words (ADR-IOS-117): the chat's kept words come back as the pill
+        // shows it, and every change is kept until it is sent.
+        .task(id: wordsKey) {
+            guard let key = wordsKey, fieldFill.chat != key else { return }
+            let kept = await ChatFieldWords.shared.words(for: key)
+            guard wordsKey == key, fieldFill.chat != key else { return }
+            fieldFill.apply(.otherChat(key, kept: kept))
+        }
+        .onChange(of: fieldFill.kept) { _, kept in
+            guard let kept else { return }
+            ChatFieldWords.shared.set(kept.words, for: kept.chat)
         }
         .onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }

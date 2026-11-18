@@ -568,10 +568,12 @@ struct ChatReplyFieldTests {
         #expect(Self.count("Binding(get: { inputText }, set: { fieldFill.apply(.put($0)) })", in: text) == 1)
         #expect(Self.count("dictation.isActive || speech.isRecording || speech.isStarting", in: text) == 1)
         // ONE API: the view only reads the words; every change is a `fieldFill.apply`.
-        #expect(Self.count("var inputText: String { fieldFill.words }", in: text) == 1)
+        // The words shown are the pill's chat's (ADR-IOS-117), read with its chat and kept words.
+        #expect(Self.count("var inputText: String { fieldFill.words(in: wordsKey) }", in: text) == 1)
         #expect(Self.count("var inputText", in: text) == 1)
         #expect(Self.count("fieldFill.", in: text)
-                == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text),
+                == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text)
+                    + Self.count("fieldFill.chat", in: text) + Self.count("fieldFill.kept", in: text),
                 "nothing else touches the field's state")
         // Each change, where it happens: typing (above), both dictations, both sends, the
         // completion, a confirmation card, and an Edit.
@@ -587,7 +589,9 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldFill.apply(.put(text)) isTextFieldFocused = true", in: text) == 1)
         // The "e.g." line's change goes in as words and is never sent from here.
         #expect(Self.count("func putExample(_ example: String) { fieldFill.apply(.put(example)) inputSelection = .init(insertionPoint: inputText.endIndex) }", in: text) == 1)
-        #expect(Self.count("fieldFill.apply(", in: text) == 10)
+        // The pill showing a chat takes its kept words (ADR-IOS-117, `ChatFieldWordsTests.pillWiring`).
+        #expect(Self.count("fieldFill.apply(.otherChat(key, kept: kept))", in: text) == 1)
+        #expect(Self.count("fieldFill.apply(", in: text) == 11)
     }
 
     @Test("The field's Send sends the words to the agent; nothing in the field opens compose")

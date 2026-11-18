@@ -113,10 +113,17 @@ struct ChatReplyField: Equatable {
 /// an await. No AI text enters, so no late suggestion can land on the user's words.
 /// The one asynchronous producer that replaces words, the on-device live transcript, enters with
 /// a change-counter compare (`heard`): it is dropped once anything else changed the words.
+///
+/// The words belong to one chat (`chat`, ADR-IOS-117): what is not sent yet (`kept`) is kept for that
+/// chat in `ChatFieldWords`, and a pill that shows another chat takes that chat's kept words
+/// (`otherChat`).
 struct ChatFieldFill {
     /// The user's own words in the input: typed, said, or put there by the app for them (an Edit).
     /// Never AI text.
     private(set) var words = ""
+    /// The chat the words belong to: the pill's thread chat key (`ChatFieldWords.key(for:)`); nil
+    /// until the pill's kept words were read, and for a pill that keeps none.
+    private(set) var chat: String?
     /// The user's words when they last sent, from the field or from the open sheet; nil once that
     /// send completed. An answer or a sent reply completes it, so it empties only those words:
     /// words the user wrote after it are newer and stay.
@@ -148,6 +155,25 @@ struct ChatFieldFill {
         case completed
         /// A confirmation card opened the sheet: the same check, and the send is still open.
         case confirmationCard
+        /// The pill shows the chat `key`, whose kept words are `kept`: the words become them, and
+        /// nothing of another chat carries over (an earlier send's completion included). Words typed
+        /// before the pill's first chat was read are newer, and stay.
+        case otherChat(String, kept: String)
+    }
+
+    /// What is kept for the chat: its words, except the words of a send still in flight (they
+    /// went to the agent). Nil before the chat is known.
+    var kept: Kept? { chat.map { Kept(chat: $0, words: words == atSend ? "" : words) } }
+
+    /// A chat and its unsent words.
+    struct Kept: Equatable {
+        let chat: String
+        let words: String
+    }
+
+    /// The words to show in a pill on the chat `key`: none while they belong to another chat.
+    func words(in key: String?) -> String {
+        chat == nil || chat == key ? words : ""
     }
 
     /// The only way the words change.
@@ -177,6 +203,13 @@ struct ChatFieldFill {
             atSend = nil
         case .confirmationCard:
             if clears { words = "" }
+        case let .otherChat(key, kept):
+            let typedFirst = chat == nil ? words : ""
+            self = ChatFieldFill()
+            chat = key
+            words = typedFirst.isEmpty ? kept : typedFirst
+            if !words.isEmpty { changes = 1 }
+            return
         }
         if words != before { changes += 1 }
     }
