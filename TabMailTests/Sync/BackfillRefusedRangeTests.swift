@@ -309,6 +309,78 @@ struct BackfillRefusedRangeTests {
         #expect(missing.isEmpty, "UIDs \(missing.sorted()) never loaded")
     }
 
+    // MARK: - A FETCH that fails after its SEARCH answered
+
+    /// How a range's FETCH fails in `fetchFailureIsLeftForTheNextCall`.
+    enum FetchFailure: String, CaseIterable, Sendable {
+        /// The server closes the connection on the FETCH.
+        case dropsConnection
+        /// The server answers the FETCH with a tagged NO whose words are
+        /// neither a timeout, a payload error nor a connection error.
+        case otherError
+    }
+
+    /// Words for the tagged NO: none of `isConnectionError`'s, `isSelectFailedError`'s,
+    /// the timeout's or the payload split's.
+    private static let fetchRefusalText = "message temporarily unavailable"
+
+    @Test("A range whose FETCH keeps failing after its SEARCH answered is left pending; the folder is declined for the call, the other folder loads, the next call asks again",
+          arguments: FetchFailure.allCases)
+    func fetchFailureIsLeftForTheNextCall(_ failure: FetchFailure) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        // The other folder's UIDs are none of the failing range's, so its
+        // FETCH never matches the injected fragment.
+        let other = (path: "Invoices", uids: [1, 3])
+        let world = try await Self.makeWorld(accountId: "fetch-\(failure.rawValue)", pool: pool, otherFolder: other)
+        defer { Self.tearDown(world) }
+        let failing = Self.range(Self.refusedRange, chunk: world.chunk)
+        let inRange = world.uids.filter { failing.contains($0) }
+        try #require(inRange.count == 1)
+        let uid = inRange[0]
+        // SEARCH of the range answers (it names the range, not the UID); only
+        // the FETCH of its one UID fails.
+        let fragment = "FETCH \(uid) "
+        switch failure {
+        case .dropsConnection: world.server.killConnectionOnEveryCommand(containing: fragment)
+        case .otherError: world.server.failEveryCommand(containing: fragment, message: Self.fetchRefusalText)
+        }
+
+        #expect(await Self.callEnds(world), "the call did not end: it kept walking the folder whose FETCH fails")
+        let commands = world.server.recordedCommands()
+        #expect(commands.contains { Self.isSearch($0, of: failing) }, "precondition: the range's SEARCH was sent")
+        let workers = await world.imap.poolMaxConnections()
+        let tries = Self.fetches(commands[...]).filter { $0.contains(uid) }.count
+        #expect(tries >= 1 && tries <= workers, "the call fetched the failing UID \(tries) times with \(workers) workers")
+
+        // The other folder was walked in the same call.
+        #expect(try world.local(other.path) == Set(other.uids), "the other folder did not load")
+        #expect(try world.row(other.path).backfillComplete, "the other folder did not complete")
+
+        // Nothing was skipped: the folder stands above the failing range.
+        #expect(!(try world.local()).contains(uid), "precondition: the failing UID did not load")
+        let row = try world.row()
+        #expect(!row.backfillComplete, "the folder completed over a range that never loaded")
+        #expect((row.backfillUidCursor ?? 0) >= failing.upperBound,
+                "the cursor \(String(describing: row.backfillUidCursor)) moved past the failing range")
+        let claim = F.uidPositionClaimsMissingMail(row, local: try world.local(), server: world.uids)
+        #expect(claim == nil, "\(claim ?? "")")
+
+        // The next call asks it again.
+        let before = world.server.recordedCommands().count
+        #expect(await Self.callEnds(world), "the second call did not end")
+        let againTries = Self.fetches(world.server.recordedCommands().dropFirst(before)).filter { $0.contains(uid) }.count
+        #expect(againTries >= 1, "the next call did not fetch the failing UID again")
+        #expect(!(try world.row()).backfillComplete)
+
+        // Once the FETCH answers, the folder completes.
+        world.server.stopFailingCommands(containing: fragment)
+        #expect(await Self.callEnds(world))
+        #expect(try world.row().backfillComplete, "the folder did not complete once the FETCH answered")
+        let missing = Set(world.uids).subtracting(try world.local())
+        #expect(missing.isEmpty, "UIDs \(missing.sorted()) never loaded")
+    }
+
     // MARK: - A FETCH that times out
 
     /// Two UIDs in one range of two: a FETCH timeout splits it into two
