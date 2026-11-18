@@ -506,7 +506,8 @@ struct TutorialChatViewRunTests {
                 try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
                     && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
             })
-            try await HostedAccessibility.withAutomation {
+            // The run ends on every way out, so a failure here leaves no live run for the next test.
+            do { try await HostedAccessibility.withAutomation {
                 let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
                 let window = UIWindow(windowScene: scene)
                 let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) })
@@ -538,6 +539,9 @@ struct TutorialChatViewRunTests {
                 #expect(coach() == nil, "the card goes once the run ends")
                 let without = try #require(scrollTop())
                 #expect(without <= card.minY + 0.5, "the scroll area's top \(without) comes back up past where the card stood \(card)")
+            } } catch {
+                await coordinator.end()
+                throw error
             }
         }
     }

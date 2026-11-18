@@ -22,7 +22,7 @@ import UIKit
 ///     middle (the avatars are above them, level with Back), and the subject line starts below the
 ///     bar, at the default and the largest text size.
 ///  4. The header is the chat's top bar: the scroll view's own safe area covers it at sampled scroll
-///     position, and at rest at the oldest email the first bubble sits below the subject, at the
+///     positions, and at rest at the oldest email the first bubble sits below the subject, at the
 ///     default and the largest text size.
 @Suite("Chat layout", .serialized, .processGlobalState)
 @MainActor
