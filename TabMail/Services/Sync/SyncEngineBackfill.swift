@@ -28,17 +28,19 @@ actor UIDWalkCursor {
     /// Ranges that failed and need retry. Workers drain these before grabbing new ranges.
     private var retryQueue: [(from: Int, to: Int)] = []
 
-    /// Ranges that failed in a way this walk does not retry: `nextRange` never
-    /// serves them again, but they stay PENDING, so the confirmed cursor stops
-    /// at their top and the walk cannot complete. The next walk (a new cursor,
-    /// started from the persisted position) asks them again. In memory only.
-    private var failedThisWalk: [(from: Int, to: Int)] = []
+    /// The top of the highest range that failed in a way this walk does not
+    /// retry. `nextRange` never serves such a range again, but it stays
+    /// PENDING: the confirmed cursor stops at this top and the walk cannot
+    /// complete, so the next walk (a new cursor, started from the persisted
+    /// position) asks it again. Only the highest top matters, because the
+    /// cursor walks downward. In memory only.
+    private var highestFailedThisWalk: Int?
 
     /// The lowest confirmed cursor — only advances when contiguous ranges from the
     /// top are confirmed. This is the value safe to persist to DB.
     private var confirmedCursor: Int
 
-    var isComplete: Bool { cursor < 1 && inFlight.isEmpty && retryQueue.isEmpty && failedThisWalk.isEmpty }
+    var isComplete: Bool { cursor < 1 && inFlight.isEmpty && retryQueue.isEmpty && highestFailedThisWalk == nil }
 
     init(startCursor: Int, chunkSize: Int) {
         self.cursor = startCursor
@@ -95,7 +97,7 @@ actor UIDWalkCursor {
     /// next walk.
     func failRangeForThisWalk(from: Int, to: Int) {
         inFlight.removeAll { $0.from == from && $0.to == to }
-        failedThisWalk.append((from: from, to: to))
+        highestFailedThisWalk = max(highestFailedThisWalk ?? to, to)
         consecutiveSuccesses = 0
     }
 
@@ -117,7 +119,7 @@ actor UIDWalkCursor {
     }
 
     /// Whether any range was set aside for this walk.
-    var hasFailedThisWalk: Bool { !failedThisWalk.isEmpty }
+    var hasFailedThisWalk: Bool { highestFailedThisWalk != nil }
 
     /// Reduce chunk size on PayloadTooLargeError. Affects subsequent new ranges only.
     func reduceChunk() -> Int {
@@ -134,7 +136,7 @@ actor UIDWalkCursor {
     var currentChunkSize: Int { chunkSize }
 
     /// Whether there are still ranges being processed or waiting for retry.
-    var hasPendingWork: Bool { !inFlight.isEmpty || !retryQueue.isEmpty || !failedThisWalk.isEmpty }
+    var hasPendingWork: Bool { !inFlight.isEmpty || !retryQueue.isEmpty || highestFailedThisWalk != nil }
 
     // MARK: - Private
 
@@ -143,7 +145,7 @@ actor UIDWalkCursor {
     /// (not in-flight, not in retry). If any range is still pending, the cursor stops
     /// above it.
     private func updateConfirmedCursor() {
-        if inFlight.isEmpty && retryQueue.isEmpty && failedThisWalk.isEmpty {
+        if inFlight.isEmpty && retryQueue.isEmpty && highestFailedThisWalk == nil {
             // All ranges confirmed — cursor can advance to the speculative position
             confirmedCursor = cursor
         } else {
@@ -151,7 +153,7 @@ actor UIDWalkCursor {
             var highestPending = Int.min
             for range in inFlight { highestPending = max(highestPending, range.to) }
             for range in retryQueue { highestPending = max(highestPending, range.to) }
-            for range in failedThisWalk { highestPending = max(highestPending, range.to) }
+            if let top = highestFailedThisWalk { highestPending = max(highestPending, top) }
             // confirmedCursor = the highest pending range's top (nothing above it is unconfirmed
             // because we walk downward). Actually: everything ABOVE highestPending.to is confirmed.
             // So confirmedCursor should be highestPending.to (we've confirmed everything above it).

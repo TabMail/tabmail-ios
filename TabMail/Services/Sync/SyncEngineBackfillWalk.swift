@@ -1702,7 +1702,8 @@ extension SyncEngine {
                     // the cc/bcc fill is still due (a new account, Smart
                     // Reindex, the database reset), the walk re-FETCHes stored
                     // UIDs on purpose: `insertBackfillBatch` fills their cc/bcc
-                    // from that FETCH. A flip mid-walk applies to the next walk.
+                    // from that FETCH, and is handed this same value so the two
+                    // agree. A flip mid-walk applies to the next walk.
                     let skipStoredUIDs = UserDefaults.standard.bool(forKey: "ccBccBackfillDone")
                     let poolMax = await imapProvider.poolMaxConnections()
                     let workerCount = poolMax < Int.max ? poolMax : SyncConfig.imapMaxConnectionCeiling
@@ -1782,7 +1783,11 @@ extension SyncEngine {
                                             )
                                         }
                                     } catch {
-                                        if Self.isConnectionError(error) || Self.isSelectFailedError(error) {
+                                        // A server refusal is classified first: its
+                                        // text is the server's and can read like a
+                                        // connection error ("timed out", "command failed").
+                                        if !(error is IMAPSearchRefused),
+                                           Self.isConnectionError(error) || Self.isSelectFailedError(error) {
                                             // Return the range for retry; this worker stops.
                                             await cursor.failRange(from: range.from, to: range.to)
                                             BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH connection error: \(error)")
@@ -1830,8 +1835,11 @@ extension SyncEngine {
                                                     epoch: Int(expectedEpoch), among: existingUIDs)
                                             }
                                         } catch {
-                                            await cursor.failRange(from: range.from, to: range.to)
-                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) stored-UID read failed: \(error)")
+                                            // Left for the next call, like a refused
+                                            // range: retrying the read at once would
+                                            // spin on a persistent database error.
+                                            await cursor.failRangeForThisWalk(from: range.from, to: range.to)
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) stored-UID read failed: \(error) — range \(range.from)...\(range.to) left for the next walk")
                                             break
                                         }
                                         uidsToFetch = existingUIDs.filter { !stored.contains(String($0)) }
@@ -1963,7 +1971,8 @@ extension SyncEngine {
                                                 fetchedHeaders, folderId: folderCaptured.id, accountId: folderCaptured.accountId,
                                                 folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox,
                                                 epochPremise: .init(walkWritePremise),
-                                                observedEpoch: fetched.observedEpoch
+                                                observedEpoch: fetched.observedEpoch,
+                                                ccBccFillDue: !skipStoredUIDs
                                             )
                                         else {
                                             await cursor.failRange(from: range.from, to: range.to)
@@ -2180,7 +2189,10 @@ extension SyncEngine {
                             BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) has failed ranges — retry next cycle (cursor at \(finalCursor))")
                         }
                     }
-                    if finalWriteLanded { didWork = true }
+                    // An unchanged cursor (a range left for the next call, with
+                    // nothing new below it) is no work: it would keep the worker
+                    // on its active schedule. Inserts already set `didWork`.
+                    if finalWriteLanded && (isComplete || finalCursor != cursorValue) { didWork = true }
                     await updateBackfillProgressForAccount(account)
                     continue
 

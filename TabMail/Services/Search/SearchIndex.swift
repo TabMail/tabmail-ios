@@ -746,18 +746,6 @@ actor SearchIndex {
         }
     }
 
-    /// TEST ONLY: the indexed cc of a content key, or nil when it is not indexed.
-    func testCc(_ contentKey: ContentKey) throws -> String? {
-        ensureReady()
-        guard let dbPool else { return nil }
-        return try dbPool.read { db in
-            guard let resolved = try resolveRowidAndYear(contentKey, db: db) else { return nil }
-            return try String.fetchOne(
-                db, sql: "SELECT cc FROM \(ftsTableName(year: resolved.year)) WHERE rowid = ?",
-                arguments: [resolved.rowid])
-        }
-    }
-
     /// TEST ONLY: strip a content key's `message_meta`, shard and vector rows while
     /// LEAVING its `message_ids` entry — the exact orphan shape an earlier
     /// partially-failed folder purge leaves behind, and the state

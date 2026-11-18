@@ -7116,9 +7116,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let _ = try await selectMailboxTracked(server, folder: folder)
             var searchSet = MessageIdentifierSet<UID>()
             searchSet.insert(range: Int(from)...Int(to))
-            let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(
-                identifierSet: searchSet, criteria: [.all]
-            )
+            let extResult: ExtendedSearchResult<UID>
+            do {
+                extResult = try await server.extendedSearch(identifierSet: searchSet, criteria: [.all])
+            } catch IMAPError.commandFailed(let reason) where reason.hasPrefix("Extended search failed:") {
+                // The server answered this SEARCH with a refusal: typed here,
+                // at the provider boundary, so the walk never reads the
+                // server's own words as a connection failure.
+                throw IMAPSearchRefused(reason: reason)
+            }
             return extResult.asSet.toArray().map { UInt32($0.value) }
         }
     }
@@ -7834,4 +7840,13 @@ extension IMAPError: ProviderClassifiedError {
         }
         return false
     }
+}
+
+/// A UID SEARCH the server answered with a refusal (a tagged NO or BAD), as
+/// `IMAPProvider.searchExistingUIDs(folder:from:to:)` reports it. Its
+/// description is fixed, so the server's text never reads as a connection
+/// error; the text is kept in `reason`.
+struct IMAPSearchRefused: Error, CustomStringConvertible {
+    let reason: String
+    var description: String { "IMAPSearchRefused" }
 }
