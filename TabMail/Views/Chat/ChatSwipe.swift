@@ -139,7 +139,10 @@ struct ChatSwipeReveal: ViewModifier {
                 }
             }
             .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+            // Only a bubble's own reveal (it opens toward the trailing side, as the back swipe moves)
+            // outranks the back swipe; the whole chat's reveal keeps the system's arbitration.
             .gesture(ChatHorizontalPan(
+                outranksBackSwipe: edge == .leading,
                 holdId: id, shouldBegin: { velocityX in openId == id || (openId == nil && velocityX * sign > 0) },
                 changed: changed, ended: ended))
             // A swipe torn down mid-drag or while it settles lets the data it held through.
@@ -247,6 +250,8 @@ final class ChatSwipeHold {
 /// A horizontal pan that starts only when `shouldBegin` accepts its first motion, so vertical
 /// scrolling stays the scroll view's.
 struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
+    /// Whether the back swipe from anywhere on the screen waits for this pan (a bubble's swipe).
+    let outranksBackSwipe: Bool
     /// What the swipe holds the interaction freeze under (`ChatSwipeHold`): its reveal's id.
     let holdId: String
     let shouldBegin: (CGFloat) -> Bool
@@ -266,7 +271,7 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
-        Coordinator(shouldBegin: shouldBegin)
+        Coordinator(shouldBegin: shouldBegin, outranksBackSwipe: outranksBackSwipe)
     }
 
     func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
@@ -283,6 +288,7 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
 
     func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
         context.coordinator.shouldBegin = shouldBegin
+        context.coordinator.outranksBackSwipe = outranksBackSwipe
     }
 
     func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
@@ -312,9 +318,11 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var shouldBegin: (CGFloat) -> Bool
+        var outranksBackSwipe: Bool
 
-        init(shouldBegin: @escaping (CGFloat) -> Bool) {
+        init(shouldBegin: @escaping (CGFloat) -> Bool, outranksBackSwipe: Bool = false) {
             self.shouldBegin = shouldBegin
+            self.outranksBackSwipe = outranksBackSwipe
         }
 
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
@@ -323,35 +331,34 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
             return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x)
         }
 
-        /// Runs alongside everything but the navigation pop: a drag that starts on a bubble moves
-        /// only the bubble, never the whole screen back (as in Messages).
+        /// A bubble's drag never runs together with the back swipe from anywhere on the screen: a
+        /// drag that starts on a bubble moves only the bubble (Messages). Everything else, the
+        /// screen-edge back swipe included, runs alongside as before.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-            !Self.isNavigationPop(other, near: recognizer.view)
+            !(outranksBackSwipe && Self.isContentPop(other))
         }
 
-        /// The pop from anywhere on the screen waits until the swipe's pan fails, so it takes only
-        /// drags the swipe turned down. The edge back swipe keeps its own start at the screen edge.
+        /// That back swipe waits until a bubble's drag fails, so it takes only the drags the bubble
+        /// turned down (upright, or the wrong way).
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
-            guard let nav = Self.navigationController(of: recognizer.view) else { return false }
-            return other === nav.interactiveContentPopGestureRecognizer
+            outranksBackSwipe && Self.isContentPop(other)
         }
 
-        /// Whether `other` is a back gesture of the navigation controller showing `view`.
-        static func isNavigationPop(_ other: UIGestureRecognizer, near view: UIView?) -> Bool {
-            guard let nav = navigationController(of: view) else { return false }
-            return other === nav.interactiveContentPopGestureRecognizer || other === nav.interactivePopGestureRecognizer
-        }
-
-        /// The nearest navigation controller up `view`'s responder chain.
-        static func navigationController(of view: UIView?) -> UINavigationController? {
-            var responder: UIResponder? = view
+        /// Whether `other` is a navigation controller's back swipe from anywhere on the screen. Read
+        /// from `other` itself, which UIKit installs in its navigation controller's own views, so it
+        /// holds however SwiftUI hosts this pan: the nearest navigation controller up `other`'s
+        /// responder chain is the one that owns it.
+        static func isContentPop(_ other: UIGestureRecognizer) -> Bool {
+            var responder: UIResponder? = other.view
             while let current = responder {
-                if let nav = current as? UINavigationController { return nav }
+                if let nav = current as? UINavigationController {
+                    return other === nav.interactiveContentPopGestureRecognizer
+                }
                 responder = current.next
             }
-            return nil
+            return false
         }
     }
 }

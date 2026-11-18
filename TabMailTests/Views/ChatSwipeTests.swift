@@ -400,56 +400,80 @@ struct ChatSwipeTests {
         #expect(asked.isEmpty)
     }
 
-    /// A pushed screen in a real navigation controller, with a bubble carrying the swipe's pan.
-    /// The coordinator is returned so the test keeps it: a recognizer holds its delegate weakly.
-    private static func pushedBubble() -> (UINavigationController, UIPanGestureRecognizer, UIWindow, ChatHorizontalPan.Coordinator) {
-        let screen = UIViewController()
-        let nav = UINavigationController(rootViewController: UIViewController())
-        nav.pushViewController(screen, animated: false)
+    /// A real navigation controller with a pushed screen, on screen, so its back swipes are live.
+    /// `presented`: the pushed chat lives in a second navigation controller presented as a sheet
+    /// over the first (search opens chats that way).
+    private static func pushedChat(presented: Bool = false) -> (nav: UINavigationController, window: UIWindow) {
+        let root = UINavigationController(rootViewController: UIViewController())
         let window = UIWindow(frame: CGRect(origin: .zero, size: CGSize(width: 400, height: 800)))
-        window.rootViewController = nav
+        window.rootViewController = root
         window.makeKeyAndVisible()
-        // Puts the pushed screen's view in the navigation controller's hierarchy, as on screen.
+        root.view.layoutIfNeeded()
+        var nav = root
+        if presented {
+            nav = UINavigationController(rootViewController: UIViewController())
+            root.present(nav, animated: false)
+        }
+        nav.pushViewController(UIViewController(), animated: false)
         nav.view.layoutIfNeeded()
-        let bubble = UIView()
-        screen.view.addSubview(bubble)
-        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { _ in true })
-        let pan = ChatHorizontalPan.makePan(delegate: coordinator)
-        bubble.addGestureRecognizer(pan)
-        return (nav, pan, window, coordinator)
+        return (nav, window)
+    }
+
+    /// The swipe's pan as `ChatSwipeReveal` builds it, kept alive by the returned coordinator (a
+    /// recognizer holds its delegate weakly). It is attached to no UIKit view, as SwiftUI may host it.
+    private static func pan(outranksBackSwipe: Bool) -> (UIPanGestureRecognizer, ChatHorizontalPan.Coordinator) {
+        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { _ in true }, outranksBackSwipe: outranksBackSwipe)
+        return (ChatHorizontalPan.makePan(delegate: coordinator), coordinator)
     }
 
     // UIKit arbitrates two recognizers on a touch by asking their delegates these questions; a unit
-    // test cannot make a real touch, so it asks them of the real navigation controller's recognizers.
-    @Test("While a pan that started on a bubble is live, the navigation pop never begins")
-    func bubblePanNeverStartsThePop() throws {
-        let (nav, pan, window, coordinator) = Self.pushedBubble()
-        defer { window.isHidden = true; withExtendedLifetime(coordinator) {} }
-        let delegate = try #require(pan.delegate)
+    // test cannot make a real touch, so it asks them about the real navigation controller's own
+    // back-swipe recognizers. A device check covers the gesture itself.
+    @Test("While a bubble's drag is live, the back swipe from anywhere never begins; nothing else changes",
+          arguments: [false, true])
+    func bubblePanNeverStartsThePop(presented: Bool) throws {
+        let (nav, window) = Self.pushedChat(presented: presented)
+        defer { nav.presentingViewController?.dismiss(animated: false); window.isHidden = true }
+        let (pan, coordinator) = Self.pan(outranksBackSwipe: true)
         let contentPop = try #require(nav.interactiveContentPopGestureRecognizer)
         let edgePop = try #require(nav.interactivePopGestureRecognizer)
-        for pop in [contentPop, edgePop] {
-            #expect(delegate.gestureRecognizer?(pan, shouldRecognizeSimultaneouslyWith: pop) == false,
-                    "the bubble's drag and a pop never run together: \(pop)")
+        let scroll = UIScrollView()
+        window.addSubview(scroll)
+        let popDelegate = contentPop.delegate
+
+        #expect(coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: contentPop) == false,
+                "the bubble's drag and the back swipe from anywhere never run together")
+        #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: contentPop) == true,
+                "that back swipe begins only once the bubble's drag has failed")
+        // The screen-edge back swipe and the chat's scroll keep the answers they always had.
+        for other in [edgePop, scroll.panGestureRecognizer] {
+            #expect(coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: other) == true,
+                    "still runs alongside: \(other)")
+            #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: other) == false,
+                    "never waits for the bubble: \(other)")
         }
-        #expect(delegate.gestureRecognizer?(pan, shouldBeRequiredToFailBy: contentPop) == true,
-                "the pop from anywhere on the screen begins only once the bubble's drag has failed")
-        let other = UIPanGestureRecognizer()
-        #expect(delegate.gestureRecognizer?(pan, shouldRecognizeSimultaneouslyWith: other) == true,
-                "control: every other gesture (the chat's scroll) still runs alongside")
+        #expect(contentPop.isEnabled && edgePop.isEnabled, "both back swipes stay on")
+        #expect(contentPop.delegate === popDelegate, "the back swipe keeps its own delegate")
     }
 
-    @Test("An edge pan still pops: the screen-edge back swipe never waits for a bubble")
-    func edgePanStillPops() throws {
-        let (nav, pan, window, coordinator) = Self.pushedBubble()
-        defer { window.isHidden = true; withExtendedLifetime(coordinator) {} }
-        let delegate = try #require(pan.delegate)
-        let edgePop = try #require(nav.interactivePopGestureRecognizer)
-        #expect(edgePop.isEnabled, "the edge back swipe is on")
-        #expect(delegate.gestureRecognizer?(pan, shouldBeRequiredToFailBy: edgePop) != true,
-                "the edge back swipe is never made to wait for the bubble's drag")
-        #expect(nav.viewControllers.count == 2, "control: there is a screen to pop back from")
-        #expect(ChatHorizontalPan.Coordinator.navigationController(of: pan.view) === nav,
-                "control: the bubble's pan finds the navigation controller it would pop")
+    @Test("The whole chat's swipe leaves the back swipes as the system arbitrates them")
+    func wholeChatPanKeepsTheBackSwipe() throws {
+        let (nav, window) = Self.pushedChat()
+        defer { window.isHidden = true }
+        let (pan, coordinator) = Self.pan(outranksBackSwipe: false)
+        for pop in [try #require(nav.interactiveContentPopGestureRecognizer), try #require(nav.interactivePopGestureRecognizer)] {
+            #expect(coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: pop) == true, "\(pop)")
+            #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: pop) == false, "\(pop)")
+        }
+    }
+
+    @Test("Only a bubble's reveal outranks the back swipe: it opens toward the trailing side, as the back swipe moves")
+    func onlyBubbleRevealsOutrankTheBackSwipe() throws {
+        let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
+        #expect(swipe.contains("ChatHorizontalPan( outranksBackSwipe: edge == .leading, holdId: id,"),
+                "the reveal tells its pan whether it outranks the back swipe by its edge")
+        let thread = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        #expect(thread.contains(".modifier(ChatSwipeReveal( id: item.id, edge: .leading,"), "a bubble's reveal is leading")
+        #expect(thread.contains(".modifier(ChatSwipeReveal( id: Self.chatSwipeId, edge: .trailing,"), "the whole chat's is trailing")
     }
 }
