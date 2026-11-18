@@ -66,7 +66,7 @@ struct ChatReplyField: Equatable {
 /// field (it waits as a ghost bubble in the chat). A completed send empties only the words that
 /// were sent. The field and the open chat sheet share the words, so the rule is the same in both.
 ///
-/// ONE API (owner 2026-11-08, the ADR-035 shape): `apply` is the only way the words change, for
+/// ONE API (the ADR-035 shape): `apply` is the only way the words change, for
 /// typing, dictation, a send, a completion and the app's own edits, and the view cannot write them
 /// any other way (`words` is `private(set)`). Every change is synchronous on the main actor, so the
 /// main actor is the FIFO lock: each change runs whole, in arrival order, and none is held across
@@ -265,7 +265,7 @@ struct ChatAgentCard: Identifiable {
 
 /// A reply in the outbox the chat does not show as an email yet, shown as the user's bubble at the
 /// bottom of the chat whose email it answers. Read from the database and the chat's own emails,
-/// with nothing kept in memory (owner 2026-11-09): every outbox row whose In-Reply-To is the
+/// with nothing kept in memory: every outbox row whose In-Reply-To is the
 /// Message-ID of an email in the chat, from any account (the reply may go out from another account
 /// than the email it answers). A failed row reads "Not sent", with Retry and Delete; any other
 /// "Sending". Its text is the summary made at Send (`SentEmailSummary`), "Summarizing" until then.

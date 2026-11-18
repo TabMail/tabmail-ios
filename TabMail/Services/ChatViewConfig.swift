@@ -39,9 +39,9 @@ enum ChatViewConfig {
         enabledByUser && aiOn
     }
 
-    /// The bound on a thread's AI work, one number (owner 2026-11-06): an open chat asks for the
+    /// The bound on a thread's AI work, one number: an open chat asks for the
     /// summaries of its newest this many emails, and the background walk takes each thread's newest
-    /// this many. An older email asks for its own when it comes on screen (owner 2026-11-09).
+    /// this many. An older email asks for its own when it comes on screen.
     static let summaryWindow = 10
 }
 

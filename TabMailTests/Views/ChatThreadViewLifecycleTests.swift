@@ -13,7 +13,7 @@ import UIKit
 
 /// ADR-IOS-114 decision 9: the chat screen, opened for real in a window.
 ///
-/// THE SYSTEM PROPERTIES pinned here (owner rule 2026-11-09):
+/// THE SYSTEM PROPERTIES pinned here:
 ///  1. The open lands where it asks: the bottom when every email is read, the Unread line when
 ///     some are not, the opened email when it came from search or a notification.
 ///  2. Every email of the thread is marked read in the database once the chat shows it.

@@ -232,7 +232,7 @@ struct ChatSuggestionBubble: View {
 /// email's summary once it is made ("Summarizing" until then), and under it "Sending", as under
 /// every email of the user's. A send that failed for good reads "Not sent", with the red mark beside
 /// the bubble as in Messages; touch and hold offers Retry and Delete, which are the Outbox's own
-/// Retry and Discard for the same row (owner 2026-11-07).
+/// Retry and Discard for the same row.
 struct ChatUnsentReplyBubble: View {
     let reply: ChatUnsentReply
     let retry: () -> Void

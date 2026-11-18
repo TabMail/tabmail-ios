@@ -10,8 +10,8 @@ import UIKit
 @testable import TabMail
 
 /// A reply in the outbox, from the queue write to its email in the chat, through the real outbox,
-/// AI cache, send path and hosted chat. The bubble is read from the database alone (owner
-/// 2026-11-09): nothing about a send is kept in memory.
+/// AI cache, send path and hosted chat. The bubble is read from the database alone:
+/// nothing about a send is kept in memory.
 ///
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. The queued email has its own Message-ID from the queue write, and the send uses it.
@@ -25,7 +25,7 @@ import UIKit
 ///     another chat show nothing.
 ///  5. A queued (not deduplicated) send summarizes at once, through the real `queueSend`, only with
 ///     the chat view on and AI allowed; the gate is driven through each of its real inputs.
-///  6. A send that failed for good shows the red mark beside its bubble (owner 2026-11-07); the
+///  6. A send that failed for good shows the red mark beside its bubble; the
 ///     mark's Retry puts the same outbox row back in the queue and the bubble back to "Sending",
 ///     and its Delete removes the row and the bubble. Driven through the hosted chat's own actions.
 @Suite("Sending bubble", .serialized, .processGlobalState)

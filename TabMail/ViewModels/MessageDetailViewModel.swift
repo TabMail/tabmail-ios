@@ -22,6 +22,8 @@ final class MessageDetailViewModel {
     nonisolated static let notificationTapIdPrefix = "notifTap::"
 
     private(set) var messageId: String
+    /// The opened header. Written ONLY by `publishOpened` (a source fence pins it): every read of
+    /// it takes a ticket in one newest-only order, so an older read never replaces a newer one.
     private(set) var message: MessageHeader?
     private(set) var messageBody: MessageBody?
     private(set) var bodyReloadToken = 0
@@ -420,7 +422,7 @@ final class MessageDetailViewModel {
             }
             if var m = stagedRow?.toMessageHeader() {
                 applyOverlay(to: &m)
-                self.message = m
+                publishOpened(m, ticket: nil)
                 self.messageId = m.id
             } else {
                 self.pendingProviderTapId = providerId
@@ -431,7 +433,7 @@ final class MessageDetailViewModel {
             // markReadOnOpenIfNeeded can durably mark read BEFORE loadBody
             // re-resolves — never seed it from a folder-blind fuzzy match.
             applyOverlay(to: &m)
-            self.message = m
+            publishOpened(m, ticket: nil)
         }
     }
 
@@ -583,7 +585,7 @@ final class MessageDetailViewModel {
     /// only), so move/read tests that need a focused message set it here
     /// instead of driving the full async `loadBody` resolve.
     func _testSeedMessage(_ msg: MessageHeader) {
-        self.message = msg
+        publishOpened(msg, ticket: beginOpenedRead())
     }
     #endif
 
@@ -756,8 +758,8 @@ final class MessageDetailViewModel {
         }
         guard var m = seeded else { return }
         applyOverlay(to: &m)
-        // Skeleton → content: dissolve (same rule as loadBody's assignment).
-        withAnimation(Theme.detailContentDissolve) { message = m }
+        // Skeleton → content: dissolve (`publishOpened`). Fills only an empty screen.
+        guard publishOpened(m, ticket: nil) else { return }
         messageId = m.id
         pendingProviderTapId = nil
         pendingTapAccountId = nil
@@ -875,7 +877,7 @@ final class MessageDetailViewModel {
         let rid = self.resolvedId
         let ticket = beginOpenedRead()
         if var updated = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) }),
-           ticket == openedRefreshGeneration {
+           mayPublishOpened(ticket) {
             // Freeze re-check at the mutation site: a preview can begin
             // during the awaited read above. Re-buffer instead of mutating
             // @Observable state under the frozen gate.
@@ -884,7 +886,7 @@ final class MessageDetailViewModel {
                 return
             }
             applyOverlay(to: &updated)
-            self.message = updated
+            publishOpened(updated, ticket: ticket)
         }
     }
 
@@ -898,6 +900,35 @@ final class MessageDetailViewModel {
     /// nothing is on screen yet (the newer read still replaces it when it lands).
     private func mayPublishOpened(_ ticket: Int) -> Bool {
         ticket == openedRefreshGeneration || message == nil
+    }
+
+    /// The ONE writer of `message`. `ticket` is the read's place in the newest-only order
+    /// (`beginOpenedRead`; the current `openedRefreshGeneration` for an edit of what is shown);
+    /// nil is a seed, which only fills an empty screen. Skeleton → content dissolves
+    /// (withAnimation at the mutation site, NEVER .animation(_:value:) on the List's
+    /// ancestors: feedback-loop hang, see UX rules); later writes assign without animation.
+    /// Returns whether it published.
+    /// A local edit of the shown header (a gesture's optimistic state): published in the
+    /// current place of the order, so a read already started still replaces it.
+    private func editOpened(_ change: (inout MessageHeader) -> Void) {
+        guard var shown = message else { return }
+        change(&shown)
+        publishOpened(shown, ticket: openedRefreshGeneration)
+    }
+
+    @discardableResult
+    private func publishOpened(_ header: MessageHeader?, ticket: Int?) -> Bool {
+        if let ticket {
+            guard mayPublishOpened(ticket) else { return false }
+        } else {
+            guard message == nil else { return false }
+        }
+        if message == nil, header != nil {
+            withAnimation(Theme.detailContentDissolve) { message = header }
+        } else {
+            message = header
+        }
+        return true
     }
 
     /// Field-level preserve for a locally-moved thread bubble
@@ -1052,13 +1083,14 @@ final class MessageDetailViewModel {
     @MainActor
     private func recoverHeaderIfMissing() async {
         guard message == nil, pendingProviderTapId == nil else { return }
+        let ticket = beginOpenedRead()
         guard var m = await resolveMessageAsync(compositeId: messageId) else { return }
         // Re-check across the await: a concurrent path (staged-publish seed,
         // merge-commit refresh) may have set the header while we read.
         guard message == nil else { return }
         applyOverlay(to: &m)
-        // Skeleton → content dissolve, same as loadBody/seedFromStagedPublish.
-        withAnimation(Theme.detailContentDissolve) { message = m }
+        // Skeleton → content dissolve (`publishOpened`).
+        guard publishOpened(m, ticket: ticket) else { return }
         messageNotFound = false
         BootProfiler.mark("detail header recovered via poll \(m.id.prefix(24))")
         if DebugModeManager.isLoggingEnabled() {
@@ -1276,6 +1308,7 @@ final class MessageDetailViewModel {
                     // server fetch just wrote durably; no reason to block behind
                     // an in-flight merge. Matches loadBody's post-fetch reads.
                     let freshBody = try? await self.dbPool.pool.read({ db in try MessageBody.fetchOne(db, key: rid) })
+                    let headerTicket = self.beginOpenedRead()
                     let freshHeader = try? await self.dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
                     guard !self.isRefetchingBody else { continue }
                     if let freshBody {
@@ -1283,12 +1316,11 @@ final class MessageDetailViewModel {
                         self.isLoading = false
                         self.error = nil
                         // Header refresh (AI processing may have updated it)
-                        if var refreshed = freshHeader {
-                            self.applyOverlay(to: &refreshed)
-                            self.message = refreshed
-                        } else {
-                            self.message = nil
-                        }
+                        // Replaces the header only if no newer read of it started (a nil
+                        // included: it never blanks a newer header).
+                        var refreshed = freshHeader
+                        if refreshed != nil { self.applyOverlay(to: &refreshed!) }
+                        self.publishOpened(refreshed, ticket: headerTicket)
                         self.loadThreadMessagesAsync()
                         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[MessageDetail] Body fetched via poll for \(rid.prefix(40))") }
                         BootProfiler.mark("detail body via poll SERVER fetch \(rid.prefix(24))")
@@ -1502,14 +1534,7 @@ final class MessageDetailViewModel {
         var displayMsg = msg
         applyOverlay(to: &displayMsg)
         // The body load below uses `msg` either way; only the header's publication is ordered.
-        if message == nil {
-            // Skeleton → content: dissolve (withAnimation at the mutation site,
-            // NEVER .animation(_:value:) on the List's ancestors — feedback-loop
-            // hang, see UX rules). Later refreshes assign without animation.
-            withAnimation(Theme.detailContentDissolve) { message = displayMsg }
-        } else if mayPublishOpened(openedTicket) {
-            message = displayMsg
-        }
+        publishOpened(displayMsg, ticket: openedTicket)
 
         // User tap on a message body counts as "accessed" — bump LRU on every
         // asset (kind=0 inline images + kind=1 attachments) belonging to this
@@ -1687,14 +1712,9 @@ final class MessageDetailViewModel {
         let postFetchId = resolvedId
         let postFetchTicket = beginOpenedRead()
         let postFetchHeader = try? await dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: postFetchId) })
-        if mayPublishOpened(postFetchTicket) {
-            if var refreshed = postFetchHeader {
-                applyOverlay(to: &refreshed)
-                message = refreshed
-            } else {
-                message = nil
-            }
-        }
+        var refreshed = postFetchHeader
+        if refreshed != nil { applyOverlay(to: &refreshed!) }
+        publishOpened(refreshed, ticket: postFetchTicket)
         messageBody = try? await dbPool.pool.read { db in try MessageBody.fetchOne(db, key: postFetchId) }
         loadThreadMessagesAsync()
 
@@ -1750,7 +1770,7 @@ final class MessageDetailViewModel {
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Refetch] Resolved message: id=\(msg.id.prefix(40)) folderPath=\(msg.folderPath) messageId=\(msg.messageId.prefix(30))") }
         applyOverlay(to: &msg)
         // The body fetch below uses `msg` either way; only the header's publication is ordered.
-        if mayPublishOpened(openedTicket) { message = msg }
+        publishOpened(msg, ticket: openedTicket)
 
         isLoading = messageBody == nil
         error = nil
@@ -1819,7 +1839,7 @@ final class MessageDetailViewModel {
         guard let message else { return }
         let wasRead = message.isRead
         let newIsRead = !wasRead
-        self.message?.isRead = newIsRead
+        editOpened { $0.isRead = newIsRead }
         // Gesture intents on the same id coalesce to the NET target
         // (ADR-IOS-057) — see `InboxViewModel.toggleRead`'s doc comment.
         manager.registerGestureIntent(id: message.id, .isRead(target: newIsRead, baseline: wasRead))
@@ -1871,7 +1891,7 @@ final class MessageDetailViewModel {
     /// Called only when the action's own snapshot of the setting is on.
     private func markReadOnArchiveDeleteInMemory(_ msg: MessageHeader) {
         guard !msg.isRead else { return }
-        if msg.id == message?.id { message?.isRead = true }
+        if msg.id == message?.id { editOpened { $0.isRead = true } }
         if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
             threadMessages[idx].isRead = true
         }
@@ -2116,7 +2136,7 @@ final class MessageDetailViewModel {
     /// own id and never by Message-ID (ADR-IOS-068 D4), in whichever account: the rows `source`
     /// takes, except sent copies and drafts, which stay where they are, and rows already in their
     /// destination. A copy filed elsewhere (a Gmail label, an IMAP folder) stays where it is unless
-    /// `source` takes it. Each email goes to `destination` in its own account (owner 2026-11-06);
+    /// `source` takes it. Each email goes to `destination` in its own account;
     /// an account without one keeps its emails where they are. The move is one action with one
     /// undo entry; Undo puts each email back in its own folder. Returns the ids it moved: empty
     /// when nothing moved, so the chat stays open. A row whose folder role cannot be read (no
@@ -2197,8 +2217,10 @@ final class MessageDetailViewModel {
         TutorialCoordinator.shared.discovered(.retag)
         // Optimistic UI update
         if msg.id == message?.id {
-            message?.actionTag = tag
-            message?.tagSortOrder = tag?.sortOrder ?? 99
+            editOpened {
+                $0.actionTag = tag
+                $0.tagSortOrder = tag?.sortOrder ?? 99
+            }
         }
         if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
             threadMessages[idx].actionTag = tag
@@ -2294,7 +2316,7 @@ final class MessageDetailViewModel {
             // same witness check as the resolved one below. Refusing leaves the
             // message unread; one more open fixes it.
             guard markReadPermitted(for: msg) else { return }
-            self.message?.isRead = true
+            editOpened { $0.isRead = true }
             // Guarded `!msg.isRead` above, so baseline `false` is exact — the
             // visualized state (ADR-IOS-057 coalescing).
             manager.registerGestureIntent(id: msg.id, .isRead(target: true, baseline: false))
@@ -2307,6 +2329,7 @@ final class MessageDetailViewModel {
         // body-load path's timing. A pending notification tap resolves its
         // provider id first (shares loadBody's single-flight ladder).
         guard await resolveTapIfNeeded() else { return }
+        let ticket = beginOpenedRead()
         guard let msg = await resolveMessageAsync(compositeId: messageId) else { return }
         guard !msg.isRead else { return }
         // C3 — this resolve is the one the opening gesture's proof was discarded
@@ -2322,11 +2345,10 @@ final class MessageDetailViewModel {
         var displayMsg = msg
         applyOverlay(to: &displayMsg)
         displayMsg.isRead = true
-        if self.message == nil {
-            // Skeleton → content dissolve (same rule as loadBody's assignment).
-            withAnimation(Theme.detailContentDissolve) { self.message = displayMsg }
-        } else {
-            self.message = displayMsg
+        // A newer read of the header replaces this one: it keeps the newer header and only
+        // shows it read.
+        if !publishOpened(displayMsg, ticket: ticket), self.message?.id == msg.id {
+            editOpened { $0.isRead = true }
         }
         // Guarded `!msg.isRead` above on the RAW resolved header (this path's
         // overlay layering happens after that guard, unlike the fast path's
@@ -2369,7 +2391,7 @@ final class MessageDetailViewModel {
         let messageIds = Set(msgs.compactMap(\.rfc822MessageId).filter { !$0.isEmpty })
         let copies = threadCopies.filter { copy in copy.rfc822MessageId.map(messageIds.contains) ?? false }
         for msg in msgs + copies {
-            if msg.id == message?.id { message?.isRead = isRead }
+            if msg.id == message?.id { editOpened { $0.isRead = isRead } }
             if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
                 threadMessages[idx].isRead = isRead
             }

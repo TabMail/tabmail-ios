@@ -5,7 +5,7 @@
 import Foundation
 import GRDB
 
-/// The summary of an email the user just sent, made when it is queued (owner 2026-11-07): the
+/// The summary of an email the user just sent, made when it is queued: the
 /// chat's Sending bubble shows it while the email is still going out, and the email's Sent copy
 /// takes it from the AI cache when it arrives, so the two never differ. It is the ordinary summary
 /// call on the final email (`isSentByUser`), written under the Sent folder and the email's own
@@ -79,8 +79,8 @@ enum SentEmailSummary {
         }
     }
 
-    /// The demo account's own sends, which make no AI call (the guided tutorial is scripted, owner
-    /// 2026-10-21, and has no TabMail session): the summary is the email's own words, without the
+    /// The demo account's own sends, which make no AI call (the guided tutorial is scripted
+    /// and has no TabMail session): the summary is the email's own words, without the
     /// quoted email, written exactly as `summarize` writes, so its Sending bubble and Sent copy
     /// carry a text message like every other email's.
     static func summarizeLocally(outboxId: String) async {

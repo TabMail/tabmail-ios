@@ -202,7 +202,7 @@ struct ChatThreadView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 // Forward the newest email, in today's forward compose. The tutorial's mail
-                // actions are off (owner 2026-10-21).
+                // actions are off.
                 Button {
                     guard TutorialCoordinator.shared.admits(.other) else { return }
                     forwardMessage = thread.newest
@@ -516,7 +516,7 @@ struct ChatThreadView: View {
         }
     }
 
-    // MARK: - Summaries (owner 2026-11-09)
+    // MARK: - Summaries
 
     /// What the summary observation follows: the chat's emails, once the open has landed, while the
     /// chat is on screen. A change restarts it, and its first value checks every row in scope again.
