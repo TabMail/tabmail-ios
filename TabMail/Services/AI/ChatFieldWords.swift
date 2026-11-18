@@ -5,6 +5,7 @@
 import Foundation
 import GRDB
 import Observation
+import Synchronization
 import SwiftUI
 
 /// The unsent words of a chat's field, kept on this iPhone like Messages keeps them (ADR-IOS-117):
@@ -27,12 +28,45 @@ final class ChatFieldWords {
     /// The app's store. A test installs a new one to start as a new app run would.
     static var shared = ChatFieldWords()
 
+    /// A chat's words to write, with what decides whether they may still be written.
+    struct Write: Sendable {
+        /// "" deletes the chat's row.
+        let words: String
+        /// The demo run the words were typed in (`DemoModeStore.chatAdmission`); nil outside one.
+        let admission: DemoModeStore.Admission?
+        /// The store's record of removed accounts.
+        let lifetimes: Lifetimes
+
+        /// Whether the words may still be written: a removed account's never, an ended demo's never.
+        func admits(_ key: String) -> Bool { lifetimes.admits(key, admission: admission) }
+    }
+
+    /// The accounts removed in this run: their chats' words are never written again
+    /// (`retireAccount`). Checked inside the write's own transaction, so a write either lands
+    /// before the account's row-delete transaction (and is deleted by it) or is refused.
+    final class Lifetimes: Sendable {
+        private let removed = Mutex<Set<String>>([])
+
+        func retire(_ accountId: String) { removed.withLock { _ = $0.insert(accountId) } }
+        func reactivate(_ accountId: String) { removed.withLock { _ = $0.remove(accountId) } }
+
+        /// Whether the chat `key`'s words may be written or shown: its account is not removed,
+        /// and a demo chat's run (`admission`) is the current one and still open.
+        func admits(_ key: String, admission: DemoModeStore.Admission?) -> Bool {
+            if let accountId = ChatThreadKey.parse(key)?.accountId, removed.withLock({ $0.contains(accountId) }) {
+                return false
+            }
+            return DemoModeStore.admits(sessionId: key, admission: admission)
+        }
+    }
+
     /// Where the words are read from and written to.
     struct Storage: Sendable {
         /// The words stored for a key; nil when none.
         let read: @Sendable (String) async throws -> String?
-        /// Writes each key's words; "" deletes the key's row.
-        let write: @Sendable ([String: String]) async throws -> Void
+        /// Writes each key's words; "" deletes the key's row. Words a removed account or an ended
+        /// demo typed are refused (`Write.admits`).
+        let write: @Sendable ([String: Write]) async throws -> Void
 
         /// The app's database (tests install their own).
         static func database(_ database: @escaping @Sendable () -> PrioritizedDatabase) -> Storage {
@@ -49,11 +83,11 @@ final class ChatFieldWords {
                 write: { batch in
                     let now = Date()
                     try await database().write { db in
-                        for (key, words) in batch {
-                            if words.isEmpty {
+                        for (key, write) in batch {
+                            if write.words.isEmpty {
                                 try ChatFieldWordsRecord.filter(key: key).deleteAll(db)
-                            } else {
-                                try ChatFieldWordsRecord(sessionId: key, words: words, updatedAt: now).save(db)
+                            } else if write.admits(key) {
+                                try ChatFieldWordsRecord(sessionId: key, words: write.words, updatedAt: now).save(db)
                             }
                         }
                     }
@@ -71,7 +105,9 @@ final class ChatFieldWords {
     /// The read in progress of each chat. Its id tells the chat's current read from an obsolete one.
     @ObservationIgnored private var reading: [String: (id: UUID, task: Task<String?, Error>)] = [:]
     /// Chats whose words changed since they were last written, with the words to write.
-    @ObservationIgnored private var unwritten: [String: String] = [:]
+    @ObservationIgnored private var unwritten: [String: Write] = [:]
+    /// The accounts removed in this run (`retireAccount`).
+    private let lifetimes = Lifetimes()
     /// The write in progress, if any; it writes until `unwritten` is empty.
     @ObservationIgnored private var writer: Task<Void, Never>?
 
@@ -97,6 +133,9 @@ final class ChatFieldWords {
     /// The only way a chat's words change (`ChatFieldFill.apply`), from any pill on it. What is
     /// not sent (`ChatFieldFill.unsent`) is kept whenever it changes; "" keeps nothing.
     func apply(_ change: ChatFieldFill.Change, to key: String) {
+        // A removed account's chat, or an ended demo's, keeps nothing.
+        let admission = DemoModeStore.shared.chatAdmission
+        guard lifetimes.admits(key, admission: admission) else { return }
         let before = fill(for: key)
         var after = before
         after.apply(change)
@@ -104,7 +143,7 @@ final class ChatFieldWords {
         fills[key] = after
         changed.insert(key)
         guard after.unsent != before.unsent else { return }
-        unwritten[key] = after.unsent
+        unwritten[key] = Write(words: after.unsent, admission: admission, lifetimes: lifetimes)
         guard writer == nil else { return }
         writer = Task { await writeUnwritten() }
     }
@@ -154,11 +193,31 @@ final class ChatFieldWords {
     /// next demo's chats have the same keys.
     func forgetDemo() {
         let isDemo = { (key: String) in key.hasPrefix(Self.demoPrefix) }
-        fills = fills.filter { !isDemo($0.key) }
-        changed = changed.filter { !isDemo($0) }
-        read = read.filter { !isDemo($0) }
-        reading = reading.filter { !isDemo($0.key) }
-        unwritten = unwritten.filter { !isDemo($0.key) }
+        forget(where: isDemo)
+    }
+
+    /// Forget the words of the account `accountId`'s chats, real and demo, and never write them
+    /// again in this run, a write in progress or a failed write's retry included. Account removal
+    /// calls it before its row-delete transaction (`AccountManager.removeAccount`), as it does
+    /// `AccountFieldPersistenceStore.discardAccount`; `reactivateAccount` if that transaction fails.
+    func retireAccount(_ accountId: String) {
+        lifetimes.retire(accountId)
+        forget { ChatThreadKey.parse($0)?.accountId == accountId }
+    }
+
+    /// The account `accountId` was not removed after all: its chats' words are kept again.
+    func reactivateAccount(_ accountId: String) {
+        lifetimes.reactivate(accountId)
+    }
+
+    /// Forget every chat `matches` names: its fill, its reads (a read in progress lands nowhere),
+    /// and its words not yet written.
+    private func forget(where matches: (String) -> Bool) {
+        fills = fills.filter { !matches($0.key) }
+        changed = changed.filter { !matches($0) }
+        read = read.filter { !matches($0) }
+        reading = reading.filter { !matches($0.key) }
+        unwritten = unwritten.filter { !matches($0.key) }
     }
 
     private nonisolated static let demoPrefix = "demo:"
@@ -170,8 +229,9 @@ final class ChatFieldWords {
             do {
                 try await storage.write(batch)
             } catch {
-                // Kept in memory for this run; the next change writes them again.
-                for (key, words) in batch where unwritten[key] == nil { unwritten[key] = words }
+                // Kept in memory for this run; the next change writes them again. A removed
+                // account's, or an ended demo's, are not: they were forgotten while this wrote.
+                for (key, write) in batch where unwritten[key] == nil && write.admits(key) { unwritten[key] = write }
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[ChatFieldWords] write failed: \(type(of: error))")
                 }

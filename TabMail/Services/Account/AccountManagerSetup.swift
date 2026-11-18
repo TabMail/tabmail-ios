@@ -617,6 +617,8 @@ extension AccountManager {
         // Await any write already admitted to GRDB, fence queued closures, and
         // purge retry/overlay state before the row-delete transaction begins.
         await AccountFieldPersistenceStore.production.discardAccount(acctId)
+        // The account's chats' unsent words, in memory and any write still to come (ADR-IOS-117).
+        await ChatFieldWords.shared.retireAccount(acctId)
         // The account's calendar operations, whose saved put-back files (#718) go with it. They are
         // counted again inside the delete: a drain may have saved more since the user was warned
         // (a file is saved before its record is kept, so a record kept before this transaction has
@@ -634,6 +636,7 @@ extension AccountManager {
             }
         } catch {
             await AccountFieldPersistenceStore.production.reactivateAccount(acctId)
+            await ChatFieldWords.shared.reactivateAccount(acctId)
             await push.cancelPreparedRemovedAccountCleanup(generation: cleanupGeneration)
             // The DB row is still authoritative. Re-derive both maps rather
             // than restoring a possibly stale captured Account snapshot.

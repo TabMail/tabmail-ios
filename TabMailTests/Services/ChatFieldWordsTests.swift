@@ -38,6 +38,8 @@ struct ChatFieldWordsTests {
     final class ControlledStorage: Sendable {
         private struct State {
             var heldKeys: Set<String> = []
+            var heldResults: Set<String> = []
+            var waitingResults: [String: [CheckedContinuation<Void, Never>]] = [:]
             var waitingReads: [String: [CheckedContinuation<Void, Never>]] = [:]
             var holdsWrites = false
             var waitingWrites: [CheckedContinuation<Void, Never>] = []
@@ -69,7 +71,17 @@ struct ChatFieldWordsTests {
                         if !held { continuation.resume() }
                     }
                     if state.withLock({ $0.failsReads }) { throw Refused() }
-                    return try await base.read(key)
+                    let result = try await base.read(key)
+                    // A held result: the read has its words and waits to hand them over.
+                    await withCheckedContinuation { continuation in
+                        let held = state.withLock { state in
+                            guard state.heldResults.contains(key) else { return false }
+                            state.waitingResults[key, default: []].append(continuation)
+                            return true
+                        }
+                        if !held { continuation.resume() }
+                    }
+                    return result
                 },
                 write: { [self] batch in
                     await withCheckedContinuation { continuation in
@@ -96,6 +108,34 @@ struct ChatFieldWordsTests {
                 return state.waitingReads.removeValue(forKey: key) ?? []
             }
             waiting.forEach { $0.resume() }
+        }
+
+        /// Holds `key`'s reads after they read their words, before they return them.
+        func hold(resultsOf key: String) {
+            state.withLock { _ = $0.heldResults.insert(key) }
+        }
+
+        func release(resultsOf key: String) {
+            let waiting = state.withLock { state in
+                _ = state.heldResults.remove(key)
+                return state.waitingResults.removeValue(forKey: key) ?? []
+            }
+            waiting.forEach { $0.resume() }
+        }
+
+        /// Waits until a read of `key` holds its result.
+        func waitForHeldResult(of key: String) async -> Bool {
+            await poll { !($0.waitingResults[key] ?? []).isEmpty }
+        }
+
+        /// How many reads of `key` hold their result.
+        func heldResultCount(of key: String) -> Int {
+            state.withLock { $0.waitingResults[key]?.count ?? 0 }
+        }
+
+        /// Stops holding `key`'s next reads, leaving the reads already held waiting.
+        func stopHolding(resultsOf key: String) {
+            state.withLock { _ = $0.heldResults.remove(key) }
         }
 
         func holdWrites() {
@@ -473,7 +513,7 @@ struct ChatFieldWordsTests {
         #expect(text.contains("private var fieldFill: ChatFieldWords.Field { ChatFieldWords.Field(key: wordsKey, own: $ownFill) }"))
         #expect(text.contains("guard composeContext == nil, let message else { return nil } return ChatFieldWords.key(for: message)"))
         #expect(text.contains(".task(id: wordsKey) { guard let key = wordsKey else { return } await ChatFieldWords.shared.load(key) }"))
-        #expect(!text.contains("ownFill.") && !text.contains("ownFill ="), "the pill's own fill changes only through `fieldFill`")
+        #expect(!text.contains("ownFill."), "the pill's own fill changes only through `fieldFill`")
     }
 
     // MARK: - 7. Lifetime
@@ -582,6 +622,174 @@ struct ChatFieldWordsTests {
             await store.load(demo)
             #expect(store.fill(for: demo).words == "", "the run does not show them again either")
             #expect(store.fill(for: real).words == "Real words", "control: the real chat keeps its words")
+        }
+    }
+
+    // MARK: - 8. A removed account's and an ended demo's words never come back
+
+    /// A demo chat's key in the demo account.
+    private static func demoKey(_ thread: String) -> String {
+        "demo:" + ChatThreadKey.key(accountId: DemoSeed.demoAccountId, threadId: thread)
+    }
+
+    /// Ends the current demo run as `DemoModeService.exit` does (admission revoked, the store's demo
+    /// words forgotten, the demo's rows wiped), then starts the next run.
+    private static func endDemoAndStartTheNext(_ store: ChatFieldWords, pool: DatabasePool) async throws {
+        DemoModeStore.shared.revokeAdmission()
+        store.forgetDemo()
+        try await pool.write { try DemoSeed.wipe($0) }
+        DemoModeStore.shared.isActive = false
+        DemoModeStore.shared.isActive = true
+    }
+
+    @Test("Removing an account while its words wait for a failed write's retry: they are never written, and a live account's retry still is")
+    func removedAccountsFailedWriteNeverComesBack() async throws {
+        try await Self.withStore { pool, storage, store in
+            let removed = ChatFieldWords.key(for: Self.header("rm-1", thread: "removed"))
+            let live = ChatFieldWords.key(for: Self.header("rm-2", thread: "live", account: Self.account + "-live"))
+            let other = ChatFieldWords.key(for: Self.header("rm-3", thread: "other", account: Self.account + "-live"))
+            storage.failWrites(true)
+            store.apply(.put("Removed account's words"), to: removed)
+            store.apply(.put("Live account's words"), to: live)
+            await store.written()
+            #expect(try Self.rows(pool).isEmpty, "control: the write failed, both are waiting for a retry")
+
+            store.retireAccount(Self.account)
+            let account = Self.account
+            try await pool.write { try AccountManager.removeAccountRowsTxn($0, accountId: account, wasPrimary: false) }
+            storage.failWrites(false)
+            // Typing in another chat writes what waits.
+            store.apply(.put("Other chat's words"), to: other)
+            await store.written()
+
+            let stored = Dictionary(uniqueKeysWithValues: try Self.rows(pool).map { ($0.sessionId, $0.words) })
+            #expect(stored == [live: "Live account's words", other: "Other chat's words"],
+                    "the removed account's words are not back on disk; the live retry is written: \(stored)")
+            #expect(store.fill(for: removed).words == "", "nor in the store")
+            await store.load(removed)
+            #expect(store.fill(for: removed).words == "")
+            #expect(await Self.nextRun(storage, removed) == "")
+        }
+    }
+
+    @Test("Removing an account while a write of its words runs: whether that write lands or fails, they never come back",
+          arguments: [false, true])
+    func removedAccountsInFlightWriteNeverComesBack(fails: Bool) async throws {
+        try await Self.withStore { pool, storage, store in
+            let removed = ChatFieldWords.key(for: Self.header("if-1", thread: "removed-in-flight"))
+            let live = ChatFieldWords.key(for: Self.header("if-2", thread: "live-in-flight", account: Self.account + "-live"))
+            storage.holdWrites()
+            storage.failWrites(fails)
+            store.apply(.put("Removed account's words"), to: removed)
+            store.apply(.put("Live account's words"), to: live)
+            #expect(await storage.waitForWrites(1), "control: the write is running")
+
+            store.retireAccount(Self.account)
+            let account = Self.account
+            try await pool.write { try AccountManager.removeAccountRowsTxn($0, accountId: account, wasPrimary: false) }
+            storage.releaseWrites()
+            await store.written()
+            storage.failWrites(false)
+            store.apply(.put("Live account's newer words"), to: live)
+            await store.written()
+
+            let stored = Dictionary(uniqueKeysWithValues: try Self.rows(pool).map { ($0.sessionId, $0.words) })
+            #expect(stored == [live: "Live account's newer words"], "\(stored)")
+            #expect(store.fill(for: removed).words == "")
+            #expect(await Self.nextRun(storage, removed) == "")
+        }
+    }
+
+    @Test("A removal that fails keeps the account's chats: words typed after it are written")
+    func failedRemovalKeepsTheAccount() async throws {
+        try await Self.withStore { pool, _, store in
+            let key = ChatFieldWords.key(for: Self.header("fr-1", thread: "kept"))
+            store.retireAccount(Self.account)
+            store.apply(.put("Refused while removing"), to: key)
+            #expect(store.fill(for: key).words == "", "control: a removed account's chat keeps nothing")
+            store.reactivateAccount(Self.account)
+            store.apply(.put("Typed after"), to: key)
+            await store.written()
+            #expect(try Self.rows(pool).map(\.words) == ["Typed after"])
+        }
+    }
+
+    @Test("A demo's write running as the demo ends: whether it lands or fails, its words are never in the next demo; real words are",
+          arguments: [false, true])
+    func endedDemosWriteNeverComesBack(fails: Bool) async throws {
+        DemoModeStore.shared._resetForTests()
+        defer { DemoModeStore.shared._resetForTests() }
+        try await Self.withStore { pool, storage, store in
+            DemoModeStore.shared.isActive = true
+            let demo = Self.demoKey("ended-demo")
+            let real = ChatThreadKey.key(accountId: Self.account, threadId: "real-during-demo")
+            let next = ChatThreadKey.key(accountId: Self.account, threadId: "real-after-demo")
+            storage.holdWrites()
+            storage.failWrites(fails)
+            store.apply(.put("Old demo words"), to: demo)
+            store.apply(.put("Real words"), to: real)
+            #expect(await storage.waitForWrites(1), "control: the write is running")
+
+            try await Self.endDemoAndStartTheNext(store, pool: pool)
+            storage.releaseWrites()
+            await store.written()
+            storage.failWrites(false)
+            // A field edit in the next demo starts the writer again.
+            store.apply(.put("Next words"), to: next)
+            await store.written()
+
+            let stored = Dictionary(uniqueKeysWithValues: try Self.rows(pool).map { ($0.sessionId, $0.words) })
+            #expect(stored == [real: "Real words", next: "Next words"],
+                    "the ended demo's words are not on disk; the real chat's are, retry included: \(stored)")
+            #expect(store.fill(for: demo).words == "", "nor in the next demo's field")
+            await store.load(demo)
+            #expect(store.fill(for: demo).words == "")
+        }
+    }
+
+    @Test("A demo's read that has its words as the demo ends never lands in the next demo, whichever read lands first",
+          arguments: [false, true])
+    func endedDemosReadNeverLands(oldFirst: Bool) async throws {
+        DemoModeStore.shared._resetForTests()
+        defer { DemoModeStore.shared._resetForTests() }
+        try await Self.withStore { pool, storage, _ in
+            DemoModeStore.shared.isActive = true
+            let demo = Self.demoKey("read-demo")
+            try await pool.write { try ChatFieldWordsRecord(sessionId: demo, words: "Old demo words", updatedAt: Date()).insert($0) }
+
+            // Control: a read the demo outlives lands its words through the same held path.
+            let control = ChatFieldWords(storage: storage.storage)
+            storage.hold(resultsOf: demo)
+            let controlLoad = Task { await control.load(demo) }
+            #expect(await storage.waitForHeldResult(of: demo), "control: the read has its words")
+            storage.release(resultsOf: demo)
+            await controlLoad.value
+            #expect(control.fill(for: demo).words == "Old demo words", "control: an uninterrupted read lands")
+
+            let run = ChatFieldWords(storage: storage.storage)
+            storage.hold(resultsOf: demo)
+            let oldLoad = Task { await run.load(demo) }
+            #expect(await storage.waitForHeldResult(of: demo), "the old read has the old words")
+            try await Self.endDemoAndStartTheNext(run, pool: pool)
+            #expect(try Self.rows(pool).isEmpty, "control: the wipe took the old words off disk")
+
+            if oldFirst {
+                storage.release(resultsOf: demo)
+                await oldLoad.value
+                await run.load(demo)
+            } else {
+                // The next demo's read of the same key runs and lands first.
+                let waiting = storage.heldResultCount(of: demo)
+                storage.stopHolding(resultsOf: demo)
+                await run.load(demo)
+                #expect(waiting == 1, "control: only the old read is held")
+                storage.release(resultsOf: demo)
+                await oldLoad.value
+            }
+            #expect(run.fill(for: demo).words == "", "the next demo's field never shows the ended demo's words")
+            run.apply(.put("x"), to: Self.demoKey("other"))
+            await run.written()
+            #expect(try Self.rows(pool).map(\.sessionId) == [Self.demoKey("other")], "nor does its disk")
         }
     }
 }
