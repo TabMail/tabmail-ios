@@ -171,8 +171,8 @@ struct ChatBubbleView: View {
 }
 
 /// The ready AI Suggestion: a ghost of the user's next message, where it lands once sent
-/// (the newest outgoing place, under the last email). A dashed accent outline on a clear bubble,
-/// accent text, and "AI Suggestion · Tap to use" under it, so it reads plainly as not sent. A tap
+/// (the newest outgoing place, under the last email). A dashed accent outline on a faded accent
+/// fill, dark-blue text (V1a, `Palette.chatSuggestion*`), and "AI Suggestion · Tap to use" under it, so it reads plainly as not sent. A tap
 /// on the bubble or its caption opens the compose card with the suggestion written out; nothing is sent from here.
 struct ChatSuggestionBubble: View {
     /// The suggestion's text version (`MessageHeader.replyTextMessage`).
@@ -187,13 +187,17 @@ struct ChatSuggestionBubble: View {
             VStack(alignment: .trailing, spacing: 4) {
                 Text(text)
                     .font(.body)
-                    .foregroundStyle(Theme.accent)
+                    .foregroundStyle(Palette.chatSuggestionText)
                     .multilineTextAlignment(.leading)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
+                    .background(
+                        RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                            .fill(Palette.chatSuggestionFill)
+                    )
                     .overlay(
                         RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
-                            .stroke(Theme.accent, style: StrokeStyle(
+                            .stroke(Palette.chatSuggestionStroke, style: StrokeStyle(
                                 lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))
                     )
                     .overlay {

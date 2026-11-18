@@ -413,7 +413,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
         // Who the reply goes to and whose turn it is decide whether the suggestion shows.
         #expect(Self.count("let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty", in: text) == 1)
-        #expect(Self.count("guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking else { return nil }", in: text) == 1,
+        #expect(Self.count("guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking, context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }", in: text) == 1,
                 "no suggestion before the thread and accounts load, or while the agent works")
         #expect(Self.count("ChatReplyField.suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)", in: text) == 1)
         #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1,
@@ -430,13 +430,14 @@ struct ChatReplyFieldTests {
                 "a failed send's Retry and Delete act on its own row")
     }
 
-    @Test("The ghost is dashed and captioned in one button; the e.g. line hides while dictating; compose's stored edits refresh the chat")
+    @Test("The ghost is dashed on a faded fill and captioned in one button; the e.g. line hides while dictating; compose's stored edits refresh the chat")
     func suggestionLookWiring() throws {
         let bubble = try Self.source("TabMail/Views/Chat/ChatBubbleView.swift")
         let ghost = try #require(bubble.range(of: "struct ChatSuggestionBubble: View {")
             .flatMap { start in bubble[start.lowerBound...].range(of: "struct ChatUnsentReplyBubble").map { String(bubble[start.lowerBound..<$0.lowerBound]) } })
-        #expect(Self.count("lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))", in: ghost) == 1, "a dashed outline")
-        #expect(Self.count(".background(", in: ghost) == 0 && Self.count(".fill(", in: ghost) == 0, "on a clear bubble")
+        #expect(Self.count(".stroke(Palette.chatSuggestionStroke, style: StrokeStyle( lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))", in: ghost) == 1, "a dashed outline")
+        #expect(Self.count(".fill(Palette.chatSuggestionFill)", in: ghost) == 1, "on a faded fill")
+        #expect(Self.count(".foregroundStyle(Palette.chatSuggestionText)", in: ghost) == 1, "dark-blue text")
         #expect(Self.count("Text(ChatSuggestionConfig.statusLine)", in: ghost) == 1, "the caption shows")
         // The caption sits inside the button's label, so it takes the tap too.
         let button = try #require(ghost.range(of: "Button(action: onTap) {"))

@@ -864,8 +864,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
 16. **The AI Suggestion as a ghost bubble (amendment 2026-11-18; supersedes the parts of decisions
    10 and 13 that put the ready reply in the field).** The ready reply no longer sits in the reply
    field. It shows as a ghost of the user's next message, where the reply lands once sent (after the
-   last email and any outbox bubble): `ChatSuggestionBubble`, a dashed accent outline on a clear
-   bubble with accent text (`ChatViewLayout.suggestionStrokeWidth`, `suggestionDash`), with "AI
+   last email and any outbox bubble): `ChatSuggestionBubble`, look V1a (owner 2026-11-18, replacing V1b's
+   clear bubble): a dashed 1.5 pt accent outline (75% light, 85% dark) on a faded accent fill (14%
+   light, 22% dark) with dark-blue text (`Palette.chatSuggestionStroke`, `chatSuggestionFill`,
+   `chatSuggestionText`; `ChatViewLayout.suggestionStrokeWidth`, `suggestionDash`), with "AI
    Suggestion · Tap to use" under it. The name is "AI Suggestion", the one compose's suggestion box
    uses (`ChatSuggestionConfig.label`); "AI Reply" is gone from the chat view's strings. Its text is
    the reply's text message, read from the email's row (`ChatReplyField.suggestionText`), so a new
@@ -878,11 +880,18 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      and the field's words stay (the card is not a send from the field); Close goes back with the
      ghost still there. An edit or a Recompute in the card that is stored on the row posts
      `.messageDataDidChange`, so the ghost under the card follows it; a thread reload that read
-     its rows before such a refresh keeps the refreshed row (`MessageDetailViewModel.refreshedRows`),
-     for the suggestion and the summary alike. The card saves to a draft of its own
+     its rows before such a change never shows them: the change starts a new load and the existing
+     load generation drops every older one (`MessageDetailViewModel.applyRefresh`), for the
+     suggestion and the summary alike. The check compares a load's generation with
+     `threadLoadGeneration`, the newest load STARTED (it was `lastAppliedThreadGeneration`, the last
+     applied, which let an older load land after a newer change). Removed with it: an older load that
+     succeeded used to apply when the newest one threw; now a failed newest load is an internal read
+     failure, the screen keeps its last good state until the next load, and there is no retry layer
+     (`ThreadReloadOrderingTests.failedNewestKeepsTheScreen`). The card saves to a draft of its own
      (`Draft.separateReplyKey`, the parent in its tail as a reply key's): the chat ignores saved
      drafts, so a reply draft already saved for the email stays as it is in Drafts, never opened,
-     saved over or deleted by the card. The ghost shows only once the thread and its accounts have
+     saved over or deleted by the card; each card has its own key, so two cards' drafts never
+     overwrite each other. The ghost shows only once the thread and the email's own account have
      loaded, and not while the agent works on a request from the field. In the tutorial only the step that asks for it
      (`FieldMove.tapSuggestion`, ringed by `TutorialPulseRing`) opens the card; elsewhere the
      locked notice shows.

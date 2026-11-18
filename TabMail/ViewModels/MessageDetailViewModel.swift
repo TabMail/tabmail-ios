@@ -173,23 +173,20 @@ final class MessageDetailViewModel {
     @ObservationIgnored private var pendingThreadRefreshOnRelease = false
 
     /// Monotonic token for `loadThreadMessagesAsync` runs. Each call bumps it;
-    /// a completion may apply only if it is newer than the last APPLIED run
-    /// (`lastAppliedThreadGeneration`). Needed because detached-query
+    /// a completion may apply only if it is the NEWEST run started (its
+    /// generation equals this counter). Needed because detached-query
     /// completions are unordered and an empty result now CLEARS
     /// `threadMessages` — a stale pre-merge empty completing after the
-    /// merge-triggered reload would wipe the bubbles it just populated.
-    /// Compared against last-APPLIED (not last-started) so that when the
-    /// newest run THROWS (transient read error), an older successful result
-    /// still applies instead of being discarded with nothing to replace it.
+    /// merge-triggered reload would wipe the bubbles it just populated — and
+    /// because an older run read its rows before a later row change, so its
+    /// copy of that row is older than the database's (`applyRefresh` starts a
+    /// new run for such a change). When the newest run THROWS, nothing applies
+    /// until the next run (a later merge, refresh or reopen).
     @ObservationIgnored private var threadLoadGeneration = 0
     /// Generation of the last `loadThreadMessagesAsync` result actually
-    /// assigned to `threadMessages`. See `threadLoadGeneration`.
+    /// assigned to `threadMessages`: below `threadLoadGeneration` while a run
+    /// is still out (`applyRefresh` reads it so). See `threadLoadGeneration`.
     @ObservationIgnored private var lastAppliedThreadGeneration = 0
-    /// Rows `applyRefresh` re-read, each with `threadLoadGeneration` as the refresh began. A
-    /// bulk load of generation `g` started before a refresh stamped `>= g`, so its snapshot of
-    /// that row is older than the refresh's: it keeps the refreshed row, never the snapshot
-    /// (a reload that crossed a Recompute or a summary write put the old row back).
-    @ObservationIgnored private var refreshedRows: [String: Int] = [:]
 
     /// Bubble ids the user moved IN PLACE via `updateThreadMessageFolder`
     /// (archive/delete/move keeps the card visible showing its new location
@@ -848,7 +845,13 @@ final class MessageDetailViewModel {
     /// same logic can be replayed when preview-freeze is released.
     @MainActor
     private func applyRefresh(for updatedId: String) async {
-        refreshedRows[updatedId] = threadLoadGeneration
+        // A thread load running now read its rows before this change: it may hold the row's
+        // older copy (a Recompute or a summary written after it read). A new load reads after
+        // the change, and the generation check drops every load started before it, so an older
+        // copy never comes back. The new load also brings the thread's members.
+        if threadLoadGeneration > lastAppliedThreadGeneration, message != nil {
+            loadThreadMessagesAsync()
+        }
         let originalId = self.messageId
         // Update main message if it matches
         if updatedId == originalId || updatedId == self.message?.id {
@@ -2568,15 +2571,13 @@ final class MessageDetailViewModel {
                         BackgroundSyncLogger.logDebug("[ThreadDebug]   related: id=\(r.id.prefix(40)) rfc822=\(r.rfc822MessageId ?? "nil") inReplyTo=\(r.inReplyTo ?? "nil") folder=\(r.folderPath)")
                     }
                 }
-                // Ordering guard: apply only if newer than the last APPLIED
-                // run. Detached completions are unordered, and clear-on-empty
-                // (below) made ordering destructive — a stale pre-merge empty
-                // result completing after the merge-triggered reload would
-                // wipe the bubbles it just populated, with no further signal
-                // to heal. Compared against last-APPLIED (not last-started):
-                // if the newest run throws, an older successful result still
-                // applies rather than being discarded for nothing.
-                guard generation > self.lastAppliedThreadGeneration else { return }
+                // Ordering guard: apply only the NEWEST run started. Detached
+                // completions are unordered, and clear-on-empty (below) made
+                // ordering destructive — a stale pre-merge empty result
+                // completing after the merge-triggered reload would wipe the
+                // bubbles it just populated; and a run that read before a row
+                // changed would put that row's older copy back (`applyRefresh`).
+                guard generation == self.threadLoadGeneration else { return }
                 // Empty→empty is a no-op for DISPLAY — but still record the
                 // generation: this run successfully observed "no related
                 // messages", and a STALE older in-flight run with a
@@ -2613,19 +2614,6 @@ final class MessageDetailViewModel {
                 // when the move op's queued closure runs completeLocalMove).
                 var overlayed = results
                 self.applyOverlay(to: &overlayed)
-                // A row refreshed after this load began: the load's snapshot of it is older.
-                // Keep the row on screen, or re-read it when none is shown yet.
-                var rereads: [String] = []
-                for i in overlayed.indices {
-                    guard let stamp = self.refreshedRows[overlayed[i].id], stamp >= generation else { continue }
-                    if let current = self.threadMessages.first(where: { $0.id == overlayed[i].id }) {
-                        overlayed[i] = current
-                    } else {
-                        rereads.append(overlayed[i].id)
-                    }
-                }
-                self.refreshedRows = self.refreshedRows.filter { $0.value >= generation }
-                defer { for id in rereads { Task { await self.applyRefresh(for: id) } } }
                 // The pin window is the move OP's lifetime (completeLocalMove
                 // removes it when the op's continuation runs) — no overlay-
                 // based pruning here: the overlay coalesces one entry per id,

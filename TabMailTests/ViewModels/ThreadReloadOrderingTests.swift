@@ -92,7 +92,7 @@ struct ThreadReloadOrderingTests {
         try await Self.waitUntil { row() != nil }
         #expect(row()?.replyTextMessage == "Tuesday works.", "control: the first load shows the newest email")
 
-        // An email joins the thread with no event yet: only the held reload's snapshot has it.
+        // An email joins the thread with no event yet: only the held reload's snapshot has it (and any later load).
         let joined = Self.header("order-3", minutesAgo: 5, inReplyTo: "order-2")
         try await pool.write { db in try joined.insert(db) }
 
@@ -112,15 +112,73 @@ struct ThreadReloadOrderingTests {
         try await Self.waitUntil { row()?.replyTextMessage == "Sorry, not Tuesday." }
         #expect(row()?.replyTextMessage == "Sorry, not Tuesday.", "control: the refresh showed the new row")
 
-        // The held reload lands: its email that joined shows, its older copy of the newest does not.
+        // The held reload lands: the email that joined shows, the older copy of the newest does not.
         hold.release.signal()
         try await Self.waitUntil { vm.threadMessages.contains { $0.id == joined.id } }
-        #expect(vm.threadMessages.contains { $0.id == joined.id }, "control: the held reload applied")
+        #expect(vm.threadMessages.contains { $0.id == joined.id }, "control: the thread's members still apply")
         #expect(!hold.state.withLock { $0.timedOut })
         try await Task.sleep(for: .milliseconds(200))
         let shown = try #require(row())
         #expect(shown.replyTextMessage == "Sorry, not Tuesday." && shown.cachedReply == "Hello Sam,\n\nI can't make Tuesday.",
                 "the AI Suggestion stays the newer one: \(shown.replyTextMessage ?? "nil")")
         #expect(shown.summaryTextMessage == "Sam moved the plans.", "the summary stays the newer one: \(shown.summaryTextMessage ?? "nil")")
+    }
+
+    @Test("When the newest reload fails, an older one that succeeds never applies; the screen keeps its state until the next reload")
+    func failedNewestKeepsTheScreen() async throws {
+        let hold = ReloadHold()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        config.prepareDatabase { db in db.trace { hold.statement("\($0)") } }
+        let pool = try DatabasePool(path: directory.appendingPathComponent("t.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        defer {
+            hold.release.signal()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        _ = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
+        let opened = Self.header("fail-1", minutesAgo: 30)
+        let newest = Self.header("fail-2", minutesAgo: 10, inReplyTo: "fail-1")
+        try await pool.write { db in try opened.insert(db); try newest.insert(db) }
+
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: pool, fetchBodyOverride: { _ in }, observeNotifications: true)
+        defer { vm.cancelBodyPollForTesting() }
+        vm._testSeedMessage(opened)
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
+        try await Self.waitUntil { vm.threadMessages.contains { $0.id == newest.id } }
+        let before = vm.threadMessages.map(\.id)
+        #expect(before == [newest.id], "control: the first load shows the thread: \(before)")
+
+        // An email joins; an older reload reads it and is held.
+        let joined = Self.header("fail-3", minutesAgo: 5, inReplyTo: "fail-2")
+        try await pool.write { db in try joined.insert(db) }
+        hold.arm()
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
+        try await Self.waitUntil { hold.isHeld }
+        #expect(hold.isHeld, "control: the older reload is held mid-read")
+
+        // The newest reload fails: thread detection's first read finds no folder table.
+        try await pool.write { db in try db.execute(sql: "ALTER TABLE folder RENAME TO folder_hidden") }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
+        try await Task.sleep(for: .milliseconds(300))
+
+        // The older reload succeeds, after the newer one started: it never applies.
+        hold.release.signal()
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(!hold.state.withLock { $0.timedOut })
+        #expect(vm.threadMessages.map(\.id) == before, "the screen keeps its state: \(vm.threadMessages.map(\.id))")
+
+        // The next reload applies.
+        try await pool.write { db in try db.execute(sql: "ALTER TABLE folder_hidden RENAME TO folder") }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
+        try await Self.waitUntil { vm.threadMessages.contains { $0.id == joined.id } }
+        #expect(vm.threadMessages.contains { $0.id == joined.id }, "the next reload shows the email that joined")
     }
 }

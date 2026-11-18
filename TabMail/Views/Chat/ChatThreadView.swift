@@ -680,7 +680,10 @@ struct ChatThreadView: View {
     /// are known only then), and none while the agent works on a request from the field (it may
     /// open its own compose card).
     private func suggestionText(on newest: MessageHeader, thread: ChatThread) -> String? {
-        guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking else { return nil }
+        // `isLoaded` is also set when the context read failed: the email's own account, read,
+        // is the proof the audience can leave the user out.
+        guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking,
+              context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }
         let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty
         return ChatReplyField.suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)
     }
