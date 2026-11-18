@@ -94,8 +94,9 @@ struct BackfillRefusedRangeTests {
     }
 
     /// A stamped, non-favourite folder the walk resumes at `cursor`.
-    private static func insertWalkFolder(_ db: Database, path: String, accountId: String, cursor: Int) throws {
-        var folder = Folder(name: path, path: path, role: .custom, accountId: accountId)
+    private static func insertWalkFolder(_ db: Database, path: String, accountId: String, cursor: Int,
+                                         role: FolderRole = .custom) throws {
+        var folder = Folder(name: path, path: path, role: role, accountId: accountId)
         folder.isFavorite = false
         folder.backfillComplete = false
         folder.backfillUidCursor = cursor
@@ -110,7 +111,8 @@ struct BackfillRefusedRangeTests {
     private static func makeWorld(
         accountId: String, pool: DatabasePool,
         uids custom: [Int]? = nil, startCursor: Int? = nil,
-        otherFolder: (path: String, uids: [Int])? = nil
+        otherFolder: (path: String, uids: [Int])? = nil,
+        role: FolderRole = .custom
     ) async throws -> World {
         let path = "Receipts"
         let engine = SyncEngine()
@@ -125,7 +127,8 @@ struct BackfillRefusedRangeTests {
         try server.start()
         let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try await pool.write { db in
-            try Self.insertWalkFolder(db, path: path, accountId: accountId, cursor: startCursor ?? rangeCount * chunk)
+            try Self.insertWalkFolder(db, path: path, accountId: accountId, cursor: startCursor ?? rangeCount * chunk,
+                                      role: role)
             if let otherFolder {
                 try Self.insertWalkFolder(db, path: otherFolder.path, accountId: accountId,
                                           cursor: otherFolder.uids.max() ?? 0)
@@ -504,5 +507,50 @@ struct BackfillRefusedRangeTests {
         #expect(await Self.callEnds(world))
         #expect(try world.row().backfillComplete, "the folder did not complete once the message loaded")
         #expect(try world.local().contains(tooLarge))
+    }
+
+    // MARK: - Stored headers below a pending range
+
+    /// A range left pending holds the cursor above it, so every later call
+    /// walks again each range below it. Those ranges' messages are stored:
+    /// their headers must not be downloaded again. Inbox and Sent, and with
+    /// the old cc/bcc fill key on and off (the key must not matter).
+    @Test("Stored headers below a pending range are not fetched again; a new message there is the only one fetched",
+          arguments: [FolderRole.inbox, FolderRole.sent], [true, false])
+    func storedHeadersAreNotFetchedAgainBelowAPendingRange(_ role: FolderRole, _ ccBccFlag: Bool) async throws {
+        let ccBccKey = "ccBccBackfillDone"
+        let saved = UserDefaults.standard.object(forKey: ccBccKey)
+        defer { UserDefaults.standard.set(saved, forKey: ccBccKey) }
+        UserDefaults.standard.set(ccBccFlag, forKey: ccBccKey)
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let world = try await Self.makeWorld(accountId: "stored-below-\(role.rawValue)-\(ccBccFlag)", pool: pool, role: role)
+        defer { Self.tearDown(world) }
+        let refused = Self.range(0, chunk: world.chunk)
+        world.server.failEveryCommand(
+            containing: "UID \(refused.lowerBound):\(refused.upperBound)", message: Self.refusalText)
+
+        #expect(await Self.callEnds(world))
+        let below = Set(world.uids.filter { !refused.contains($0) })
+        let loaded = try world.local()
+        #expect(loaded == below, "precondition: the ranges below the refused one loaded (\(loaded.sorted()))")
+        #expect(!(try world.row()).backfillComplete, "precondition: the refused range is pending")
+
+        let mark = world.server.recordedCommands().count
+        #expect(await Self.callEnds(world))
+        #expect(await Self.callEnds(world))
+        let refetched = Self.fetches(world.server.recordedCommands().dropFirst(mark)).reduce(Set<Int>()) { $0.union($1) }
+        #expect(refetched.isEmpty, "stored headers were downloaded again: \(refetched.sorted())")
+        #expect(try world.local() == loaded)
+
+        // A new message inside a lower range is the only one fetched.
+        let lower = Self.range(Self.rangeCount - 2, chunk: world.chunk)
+        let newUID = try #require(lower.first { !world.uids.contains($0) })
+        world.server.setMessages(world.server.messages(in: world.path) + [Self.message(uid: newUID)], in: world.path)
+        let mark2 = world.server.recordedCommands().count
+        #expect(await Self.callEnds(world))
+        let fetchedNow = Self.fetches(world.server.recordedCommands().dropFirst(mark2)).reduce(Set<Int>()) { $0.union($1) }
+        #expect(fetchedNow == [newUID], "fetched \(fetchedNow.sorted()), expected only the new UID \(newUID)")
+        #expect(try world.local() == loaded.union([newUID]))
     }
 }
