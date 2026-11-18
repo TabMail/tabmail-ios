@@ -329,6 +329,63 @@ extension ChatThreadViewLifecycleTests {
         }
     }
 
+    /// How the open swipe is closed in `summaryWaitsForTheCloser`: not at all (the control), by a
+    /// tap, or by a drag that lets go.
+    enum CloserGesture: String, CaseIterable { case none, tap, drag }
+
+    @Test("A summary stored while a closing tap or drag settles the swipe shut stays off the chat until it has settled; with no closer it shows at once",
+          arguments: CloserGesture.allCases)
+    func summaryWaitsForTheCloser(gesture: CloserGesture) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await withSummarizingChat { view, newest, summarize, _ in
+                @MainActor func labels() -> [String] { HostedAccessibility.labels(in: view) }
+                @MainActor func summarizing() -> Bool { labels().contains { $0.hasSuffix("said: Dinner 1, summarizing") } }
+                @MainActor func summarized() -> Bool { labels().contains { $0.hasSuffix("said: \(Self.freezeText)") } }
+                defer { ChatSwipeHold.shared.releaseNow(ChatSwipeCloser.holdId) }
+                // The bubble's own swipe holds while the summary is stored, so the update is
+                // waiting when the closer acts, however long the summary takes.
+                Self.swipe(.began, on: newest.id)
+                await summarize()
+                let stored = try await AppDatabase.rawPool.read { try MessageHeader.fetchOne($0, key: newest.id)?.summaryTextMessage }
+                #expect(stored == Self.freezeText, "control: the summary is in the database")
+                #expect(summarizing() && !summarized(), "control: under the swipe, the bubble is unchanged")
+                let open = ChatSwipeOpen()
+                let closer = ChatSwipeCloser.Coordinator(open: open)
+                open.open(newest.id, frame: .zero, buttons: .zero)
+                switch gesture {
+                case .none:
+                    break
+                case .tap:
+                    let tap = FreezeTap()
+                    tap.event = .ended
+                    closer.handle(tap)
+                case .drag:
+                    let pan = FreezePan()
+                    pan.event = .began
+                    closer.handle(pan)
+                    pan.event = .ended
+                    closer.handle(pan)
+                }
+                // The swipe goes away: from here only the closer can hold the update back.
+                ChatSwipeHold.shared.releaseNow(newest.id)
+                guard gesture != .none else {
+                    try await Self.waitFor { summarized() }
+                    #expect(summarized(), "control, no closer: the summary shows: \(labels().prefix(12))")
+                    return
+                }
+                #expect(open.id == nil, "\(gesture.rawValue): the closer closed the swipe")
+                // The main actor runs during the settle interval; the stored summary stays off.
+                try await Task.sleep(for: ChatViewLayout.swipeSettleHold / 3)
+                #expect(PreviewFreezeGate.shared.isFrozen, "\(gesture.rawValue): the closer still settles")
+                #expect(summarizing() && !summarized(), "\(gesture.rawValue): settling shut, the bubble is unchanged: \(labels().prefix(12))")
+                try await Self.waitFor { summarized() }
+                #expect(summarized(), "\(gesture.rawValue): settled, the summary shows: \(labels().prefix(12))")
+                #expect(!PreviewFreezeGate.shared.isFrozen)
+            }
+        }
+    }
+
     @Test("A swipe whose chat goes away mid-drag lets go of the freeze")
     func teardownLetsGo() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
