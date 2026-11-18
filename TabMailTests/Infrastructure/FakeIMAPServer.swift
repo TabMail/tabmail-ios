@@ -938,6 +938,23 @@ final class FakeIMAPServer: @unchecked Sendable {
         releaseHeldCommand(containing: Self.snapshotGateKey(mailbox))
     }
 
+    /// Test seam: hold the next UID SEARCH in `mailbox` AFTER it has read the
+    /// mailbox's messages, before it answers: the answer describes the mailbox
+    /// as it was when read, whatever changes while it is held.
+    func holdNextSearchAfterSnapshot(in mailbox: String) {
+        holdNextCommand(containing: Self.searchSnapshotGateKey(mailbox))
+    }
+
+    func isHoldingSearchAfterSnapshot(in mailbox: String) -> Bool {
+        isHoldingCommand(containing: Self.searchSnapshotGateKey(mailbox))
+    }
+
+    func releaseSearchAfterSnapshot(in mailbox: String) {
+        releaseHeldCommand(containing: Self.searchSnapshotGateKey(mailbox))
+    }
+
+    private static func searchSnapshotGateKey(_ mailbox: String) -> String { "\u{1}SEARCH-SNAPSHOT \(mailbox)" }
+
     private static func snapshotGateKey(_ mailbox: String) -> String { "\u{1}FETCH-SNAPSHOT \(mailbox)" }
 
     /// Wait at the armed gate `key`, if any, until released or the server stops.
@@ -2943,6 +2960,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                 return "* ESEARCH (TAG \"\(tag)\") UID\(data)\r\n\(tag) OK UID SEARCH completed\r\n"
             }
             let all = withState { $0.messagesByMailbox[mailbox] ?? [] }
+            passHeldGate(Self.searchSnapshotGateKey(mailbox))
             let honorsDates = withState { $0.honorsSearchDateCriteria }
             let dateFiltered = honorsDates
                 ? all.filter { Self.matchesSearchDateCriteria($0, args: subargs) }

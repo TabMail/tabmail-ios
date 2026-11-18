@@ -679,4 +679,81 @@ struct ListingCountersTests {
                     "the retry leg's connection carries CONDSTORE")
         }
     }
+
+    // MARK: - Races the owner asked to see end to end
+
+    @Test("A teardown in the middle of a renegotiation: the connection that replaces it starts clean, so its listing's SELECT carries (CONDSTORE) and stores the server's MODSEQ")
+    func teardownMidRenegotiationStartsClean() async throws {
+        try await E.withWorld("lc-reneg-teardown", capabilities: Self.condstoreNoReader, serverUIDs: [1, 2], localUIDs: [1]) { w in
+            _ = try await w.engine.syncMessages(for: try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            #expect(try w.folder().lastKnownHighestModSeq != nil, "precondition: the first session stored the MODSEQ")
+
+            // The next listing's (CONDSTORE) SELECT is refused, so that connection
+            // renegotiates; its ENABLE is held at the server.
+            w.server.failNextCommand(containing: "(CONDSTORE)")
+            w.server.holdNextCommand(containing: "ENABLE")
+            defer { w.server.releaseHeldCommand(containing: "ENABLE") }
+            let folder = try w.folder()
+            let listingA = Task { try? await w.engine.syncMessages(for: folder, provider: w.provider, limit: SyncConfig.syncMessageLimit) }
+            let waitUntil = Date().addingTimeInterval(10)
+            while Date() < waitUntil, !w.server.isHoldingCommand(containing: "ENABLE") {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(w.server.isHoldingCommand(containing: "ENABLE"), "precondition: the renegotiation is in flight")
+
+            // Teardown: the renegotiating connection leaves the pool mid-renegotiation.
+            #expect(await w.provider.evictLRUFolderForTesting(), "precondition: the connection was torn down")
+            w.server.releaseHeldCommand(containing: "ENABLE")
+            _ = await listingA.value
+
+            // The next connection decides for itself.
+            let condSelectBefore = w.server.condStoreSelectCount
+            _ = try await w.engine.syncMessages(for: try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            #expect(w.server.condStoreSelectCount > condSelectBefore,
+                    "the next connection's listing SELECT carries (CONDSTORE): no result carried over from the torn-down one")
+            #expect(try w.folder().lastKnownHighestModSeq == w.server.qresyncHighestModSeq(for: "INBOX"),
+                    "and stores the server's MODSEQ")
+            #expect(try w.uids() == ["1", "2"])
+        }
+    }
+
+    @Test("Two count walks race and the older finishes last: the newer listing's evidence stands, so the next full sync walks the folder and the message the server removed in between is gone")
+    func olderCountWalkFinishingLastLeavesTheNewerEvidence() async throws {
+        try await E.withWorld("lc-walk-race", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: Self.belowWindowServer, localUIDs: Self.belowWindowHeld)
+            let providerB = IMAPProvider(
+                host: "127.0.0.1", port: w.server.port, username: w.server.username, password: w.server.password,
+                smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+            try await providerB.connect()
+            defer { Task { try? await providerB.disconnect() } }
+
+            // The older pass: its walk's SEARCH reads the mailbox, then is held.
+            w.server.holdNextSearchAfterSnapshot(in: Self.archivePath)
+            defer { w.server.releaseSearchAfterSnapshot(in: Self.archivePath) }
+            let older = Task { try await w.engine.fullSync(account: w.account, provider: w.provider) }
+            let waitUntil = Date().addingTimeInterval(10)
+            while Date() < waitUntil, !w.server.isHoldingSearchAfterSnapshot(in: Self.archivePath) {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            #expect(w.server.isHoldingSearchAfterSnapshot(in: Self.archivePath), "precondition: the older walk's answer is in flight")
+
+            // The server removes message 2 (below every listing window); a newer
+            // pass lists the folder and sees more rows held than the server counts,
+            // its own count check out of time.
+            let remaining = Array(3...53)
+            w.server.setMessages(remaining.map(IMAPChangeReaderTests.message), in: Self.archivePath)
+            _ = try await SyncEngine().fullSync(account: w.account, provider: providerB,
+                                                plan: SyncEngine.FullSyncPlan(deadline: Date().addingTimeInterval(-1)))
+
+            // The older walk finishes last, on its answer from before the removal.
+            w.server.releaseSearchAfterSnapshot(in: Self.archivePath)
+            _ = try await older.value
+            #expect(try Self.archive(w).uids.contains("2"), "precondition: the older walk could not see the removal")
+
+            // What the user sees: the next full sync acts on the newer evidence.
+            _ = try await w.engine.fullSync(account: w.account, provider: w.provider)
+            #expect(try Self.archive(w).uids == Set(remaining.map(String.init)),
+                    "the message the server removed is gone; the older walk did not erase the newer evidence")
+        }
+    }
 }
