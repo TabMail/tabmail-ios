@@ -750,6 +750,14 @@ struct ListingCountersTests {
             _ = try await older.value
             #expect(try Self.archive(w).uids.contains("2"), "precondition: the older walk could not see the removal")
 
+            // Force the next full sync to be NOT a deep pass, so only the newer
+            // evidence can make it list the folder: run the cadence through a deep
+            // pass now (which resets it); the next decision is then shallow.
+            let everyN = SyncConfig.fullSyncDeepEveryN
+            try #require(everyN > 1, "a cadence of 1 makes every pass deep: this race cannot be shown")
+            let archiveId = Self.archiveId(w)
+            while !SyncEngine.fullSyncIsDeepPass(folderId: archiveId, everyN: everyN) {}
+
             // What the user sees: the next full sync acts on the newer evidence.
             _ = try await w.engine.fullSync(account: w.account, provider: w.provider)
             #expect(try Self.archive(w).uids == Set(remaining.map(String.init)),
