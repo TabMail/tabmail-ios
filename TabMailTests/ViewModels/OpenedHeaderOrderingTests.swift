@@ -12,7 +12,9 @@ import Testing
 /// older read of it. A read that started before a newer refresh read of the same header and
 /// finishes after it never replaces the newer header (a nil included), on every path that
 /// publishes the header: the body poll, mark-read on open, and the poll's header recovery. When
-/// the older read is still the newest, it publishes.
+/// the older read is still the newest, it publishes. A read that throws keeps what is shown; a
+/// confirmed absence takes the gone path. And the automatic mark-read on open never overrides an
+/// explicit read-state gesture made after the open.
 @Suite("The opened header never goes back to an older read", .serialized, .processGlobalState)
 @MainActor
 struct OpenedHeaderOrderingTests {
@@ -211,6 +213,102 @@ struct OpenedHeaderOrderingTests {
         await vm.markReadOnOpenIfNeeded()
         #expect(vm.message?.replyTextMessage == "v1", "the newest read did not publish")
         #expect(vm.message?.isRead == true)
+    }
+
+    @Test("A body poll's header read that THROWS keeps the last good header")
+    func pollThrowKeepsTheHeader() async throws {
+        let fixture = try Self.makeFixture { _ in }
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.previous, pool: fixture.pool, directory: fixture.directory) }
+        let v1 = Self.header("poll-throw-1", version: "v1")
+        try await fixture.pool.write { db in try v1.insert(db) }
+        let pool = fixture.pool
+        let vm = MessageDetailViewModel(messageId: v1.id, dbPool: pool, fetchBodyOverride: { msg in
+            // The body lands, then the header table cannot be read: the poll's header read throws.
+            try await pool.write { db in
+                try MessageBody(contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>Hi</p>").insert(db)
+                try db.execute(sql: "ALTER TABLE messageHeader RENAME TO messageHeader_hidden")
+            }
+        }, observeNotifications: false)
+        defer { vm.cancelBodyPollForTesting() }
+        vm._testSeedMessage(v1)
+        vm.startBodyPoll()
+        try await Self.waitUntil { vm.messageBody != nil }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(vm.messageBody != nil, "control: the poll landed its body")
+        #expect(vm.message?.replyTextMessage == "v1", "a thrown read changed the header shown")
+        try await pool.write { db in try db.execute(sql: "ALTER TABLE messageHeader_hidden RENAME TO messageHeader") }
+    }
+
+    @Test("A body poll's header read that finds the row GONE takes the gone path")
+    func pollAbsenceIsGone() async throws {
+        // The body stays without its header row.
+        let fixture = try Self.makeFixture(foreignKeys: false) { _ in }
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.previous, pool: fixture.pool, directory: fixture.directory) }
+        let v1 = Self.header("poll-gone-1", version: "v1")
+        try await fixture.pool.write { db in try v1.insert(db) }
+        let pool = fixture.pool
+        let vm = MessageDetailViewModel(messageId: v1.id, dbPool: pool, fetchBodyOverride: { msg in
+            try await pool.write { db in
+                try MessageBody(contentKey: ContentKey(rawValue: msg.id), htmlContent: "<p>Hi</p>").insert(db)
+                _ = try MessageHeader.deleteOne(db, key: msg.id)
+            }
+        }, observeNotifications: false)
+        defer { vm.cancelBodyPollForTesting() }
+        vm._testSeedMessage(v1)
+        vm.startBodyPoll()
+        try await Self.waitUntil { vm.messageBody != nil }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(vm.messageBody != nil, "control: the poll landed its body")
+        #expect(vm.message == nil, "a confirmed absence is the gone path, not a kept header")
+    }
+
+    @Test("The user's last explicit action wins: Unread after the open, then the late open-mark does nothing")
+    func explicitGestureBeatsLateOpenMark() async throws {
+        let hold = HeaderReadHold()
+        let fixture = try Self.makeFixture { hold.statement($0) }
+        defer {
+            hold.release.signal()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.previous, pool: fixture.pool, directory: fixture.directory)
+        }
+        let v1 = Self.header("gesture-1", version: "v1", isRead: false)
+        try await fixture.pool.write { db in try v1.insert(db) }
+        let vm = MessageDetailViewModel(
+            messageId: v1.id, dbPool: fixture.pool, fetchBodyOverride: { _ in }, observeNotifications: true)
+        defer { vm.cancelBodyPollForTesting() }
+        hold.arm()
+        let markRead = Task { await vm.markReadOnOpenIfNeeded() }
+        try await Self.waitUntil { hold.isHeld }
+        #expect(hold.isHeld, "control: the open-mark's read is held")
+        // The header shows (a newer read), and the user marks it Read, then Unread.
+        NotificationCenter.default.post(name: .messageDataDidChange, object: v1.id)
+        try await Self.waitUntil { vm.message != nil }
+        vm.toggleRead()
+        vm.toggleRead()
+        #expect(vm.message?.isRead == false, "control: the user's last gesture is Unread")
+        hold.release.signal()
+        await markRead.value
+        #expect(!hold.timedOut)
+        #expect(vm.message?.isRead == false, "the late open-mark overrode the user's Unread")
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let stored = try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: v1.id) }
+        #expect(stored?.isRead == false, "the late open-mark wrote read")
+    }
+
+    @Test("Control: an open with no gesture is marked read once")
+    func openWithoutGestureMarksRead() async throws {
+        let fixture = try Self.makeFixture { _ in }
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.previous, pool: fixture.pool, directory: fixture.directory) }
+        let v1 = Self.header("gesture-ctl-1", version: "v1", isRead: false)
+        try await fixture.pool.write { db in try v1.insert(db) }
+        let vm = MessageDetailViewModel(
+            messageId: v1.id, dbPool: fixture.pool, fetchBodyOverride: { _ in }, observeNotifications: false)
+        defer { vm.cancelBodyPollForTesting() }
+        await vm.markReadOnOpenIfNeeded()
+        await vm.markReadOnOpenIfNeeded()
+        #expect(vm.message?.isRead == true)
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let stored = try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: v1.id) }
+        #expect(stored?.isRead == true, "the open-mark was not written")
     }
 
     @Test("The poll's header recovery: its older read never replaces a header a newer refresh set")

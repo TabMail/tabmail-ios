@@ -112,17 +112,19 @@ struct ThreadReloadOrderingTests {
         try await Self.waitUntil { hold.isHeld }
         #expect(hold.isHeld, "control: the reload is held mid-read")
 
-        // A Recompute and a summary land on the newest email, and their refresh shows them.
+        // A Recompute and a summary land on the newest email. One scan runs at a time: their
+        // change fences the held scan, and its replacement waits for it.
         try await pool.write { db in
             try db.execute(
                 sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ?, summaryTextMessage = ? WHERE id = ?",
                 arguments: ["Hello Sam,\n\nI can't make Tuesday.", "Sorry, not Tuesday.", "Sam moved the plans.", seededNewest.id])
         }
         NotificationCenter.default.post(name: .messageDataDidChange, object: seededNewest.id)
-        try await Self.waitUntil { row()?.replyTextMessage == "Sorry, not Tuesday." }
-        #expect(row()?.replyTextMessage == "Sorry, not Tuesday.", "control: the refresh showed the new row")
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(row()?.replyTextMessage == "Tuesday works.", "nothing publishes while the only scan is held")
 
-        // The held reload lands: the email that joined shows, the older copy of the newest does not.
+        // The held reload settles and publishes nothing; its replacement reads after the change:
+        // the email that joined shows, and the newest email's newer rows, never the older copy.
         hold.release.signal()
         try await Self.waitUntil { vm.threadMessages.contains { $0.id == joined.id } }
         #expect(vm.threadMessages.contains { $0.id == joined.id }, "control: the thread's members still apply")
@@ -212,6 +214,50 @@ struct ThreadReloadOrderingTests {
         _ = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
         return Fixture(pool: pool, previous: previous, directory: directory)
+    }
+
+    @Test("A burst of changes to a row on screen while a scan is held starts exactly one replacement scan")
+    func overtakenScanStartsOneReplacement() async throws {
+        let scans = ScanCount()
+        let hold = ReloadHold()
+        let fixture = try Self.makeFixture { scans.statement($0); hold.statement($0) }
+        defer {
+            hold.release.signal()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.previous, pool: fixture.pool, directory: fixture.directory)
+        }
+        let opened = Self.header("burst-1", minutesAgo: 30)
+        let newest = Self.header("burst-2", minutesAgo: 10, inReplyTo: "burst-1")
+        try await fixture.pool.write { db in try opened.insert(db); try newest.insert(db) }
+
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: fixture.pool, fetchBodyOverride: { _ in }, observeNotifications: true)
+        defer { vm.cancelBodyPollForTesting() }
+        vm._testSeedMessage(opened)
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
+        try await Self.waitUntil { vm.threadMessages.contains { $0.id == newest.id } }
+        try await Task.sleep(for: .milliseconds(200))
+        let perLoad = scans.value
+        #expect(perLoad > 0, "control: a thread load runs the References probe")
+
+        hold.arm()
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
+        try await Self.waitUntil { hold.isHeld }
+        #expect(hold.isHeld, "control: the scan is held mid-read")
+        for version in 1...4 {
+            try await fixture.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET replyTextMessage = ? WHERE id = ?", arguments: ["r\(version)", newest.id])
+            }
+            NotificationCenter.default.post(name: .messageDataDidChange, object: newest.id)
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(scans.value < 2 * perLoad + 1, "no second scan runs while one is held: \(scans.value)")
+        hold.release.signal()
+        try await Self.waitUntil { vm.threadMessages.first { $0.id == newest.id }?.replyTextMessage == "r4" }
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(!hold.state.withLock { $0.timedOut })
+        #expect(vm.threadMessages.first { $0.id == newest.id }?.replyTextMessage == "r4", "the replacement read after the burst")
+        #expect(scans.value == 3 * perLoad, "the held scan and exactly one replacement: \(scans.value) vs \(3 * perLoad)")
     }
 
     @Test("A row change for another thread never starts a thread scan, with no load out or with one out")

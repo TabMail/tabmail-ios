@@ -890,16 +890,21 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      readers are local store reads): a change to a row on screen asks for a new load at once,
      which fences the running scan in the same main-actor turn (it publishes nothing). At most one
      scan runs (`MessageDetailViewModel.loadThreadMessagesAsync`): a load asked for while one runs
-     waits, and one waiting load covers a whole burst, starting when the running scan returns or
-     throws. A change to a
+     is fenced, and the fenced scan, when it returns or throws, starts exactly one replacement, so
+     one replacement covers a whole burst. A change to a
      row not on screen is kept while a load is out; if that load returns it as a member, the
      load publishes nothing and one more load reads it (a failure there keeps the last good
      screen). A finished or failed load is not pending, so a summary written for another thread
      starts no scan. The opened header is not in the load's results, so it keeps its own reader,
      newest-only: a read that finishes after a newer read of it started does not replace it. Every
      read that publishes it on open, refresh and refetch (`applyRefresh`, `loadBody`, `refetchBody`)
-     takes a ticket in that one order (`openedRefreshGeneration`); the body load goes on with its
-     own read either way. The two
+     takes a ticket in that one order (`openedRefreshGeneration`), and one writer publishes it
+     (`publishOpened`; a source fence pins it): only the newest started read publishes, never an
+     older one, even onto an empty screen. A read that throws changes nothing shown; a confirmed
+     absence (the row is gone) takes the gone path. The body load goes on with its own read
+     either way. The automatic mark-read on open yields to the user's last explicit action: a
+     read-state gesture made after the open makes its late fallback do nothing (no write, no
+     intent) (`OpenedHeaderOrderingTests`). The two
      readers are disjoint: a load whose opened email changed while it ran publishes nothing and
      reads again (`ThreadReloadOrderingTests.openedEmailIsNeverAThreadRow`). Invariant
      (`ThreadReloadOrderingTests.screenNeverGoesBack`, seeded random completion order): what is

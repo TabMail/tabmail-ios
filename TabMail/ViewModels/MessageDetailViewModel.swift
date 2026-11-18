@@ -187,19 +187,20 @@ final class MessageDetailViewModel {
     @ObservationIgnored private var threadLoadGeneration = 0
     /// True while a `loadThreadMessagesAsync` scan runs (from its start until it
     /// returns or throws). At most one scan runs: a load asked for meanwhile fences
-    /// the running one (`threadLoadGeneration`) and waits in `threadReloadPending`.
+    /// the running one (`threadLoadGeneration`), and the fenced scan, when it settles,
+    /// starts exactly one replacement, which reads after every change accepted until then.
     @ObservationIgnored private var threadLoadInFlight = false
-    /// A load was asked for while a scan ran: it starts when that scan settles, and
-    /// reads after every change accepted until then. One pending load covers a burst.
-    @ObservationIgnored private var threadReloadPending = false
     /// Rows changed while the newest run was out that were not on screen: the
     /// run may have read them before the change. When it applies, a member in
     /// this set starts one more run; any other id is dropped (another thread).
     @ObservationIgnored private var changedDuringThreadLoad: Set<String> = []
     /// Newest read of the opened header started (`beginOpenedRead`) by `applyRefresh`,
     /// `loadBody` or `refetchBody`; an older read that finishes after it does not replace
-    /// the header (`mayPublishOpened`).
+    /// the header (`publishOpened`).
     @ObservationIgnored private var openedRefreshGeneration = 0
+    /// Explicit read-state gestures on the opened email (`toggleRead`, `setRead`, archive or
+    /// delete's mark-read). Mark-read on open does nothing once one came after the open.
+    @ObservationIgnored private var readGestures = 0
 
     /// Bubble ids the user moved IN PLACE via `updateThreadMessageFolder`
     /// (archive/delete/move keeps the card visible showing its new location
@@ -422,7 +423,7 @@ final class MessageDetailViewModel {
             }
             if var m = stagedRow?.toMessageHeader() {
                 applyOverlay(to: &m)
-                publishOpened(m, ticket: nil)
+                publishOpened(m, ticket: beginOpenedRead())
                 self.messageId = m.id
             } else {
                 self.pendingProviderTapId = providerId
@@ -433,7 +434,7 @@ final class MessageDetailViewModel {
             // markReadOnOpenIfNeeded can durably mark read BEFORE loadBody
             // re-resolves — never seed it from a folder-blind fuzzy match.
             applyOverlay(to: &m)
-            publishOpened(m, ticket: nil)
+            publishOpened(m, ticket: beginOpenedRead())
         }
     }
 
@@ -759,7 +760,7 @@ final class MessageDetailViewModel {
         guard var m = seeded else { return }
         applyOverlay(to: &m)
         // Skeleton → content: dissolve (`publishOpened`). Fills only an empty screen.
-        guard publishOpened(m, ticket: nil) else { return }
+        guard publishOpened(m, ticket: beginOpenedRead()) else { return }
         messageId = m.id
         pendingProviderTapId = nil
         pendingTapAccountId = nil
@@ -877,7 +878,7 @@ final class MessageDetailViewModel {
         let rid = self.resolvedId
         let ticket = beginOpenedRead()
         if var updated = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) }),
-           mayPublishOpened(ticket) {
+           ticket == openedRefreshGeneration {
             // Freeze re-check at the mutation site: a preview can begin
             // during the awaited read above. Re-buffer instead of mutating
             // @Observable state under the frozen gate.
@@ -896,15 +897,12 @@ final class MessageDetailViewModel {
         return openedRefreshGeneration
     }
 
-    /// Whether a read of the opened header may replace it: no newer read of it started, or
-    /// nothing is on screen yet (the newer read still replaces it when it lands).
-    private func mayPublishOpened(_ ticket: Int) -> Bool {
-        ticket == openedRefreshGeneration || message == nil
-    }
 
     /// The ONE writer of `message`. `ticket` is the read's place in the newest-only order
-    /// (`beginOpenedRead`; the current `openedRefreshGeneration` for an edit of what is shown);
-    /// nil is a seed, which only fills an empty screen. Skeleton → content dissolves
+    /// (`beginOpenedRead`; the current `openedRefreshGeneration` for an edit of what is shown).
+    /// Only the newest read publishes: an older one never fills the screen, even an empty one,
+    /// and the newer read's outcome decides. A read that threw publishes nothing; a confirmed
+    /// absence (nil) is the gone path. Skeleton → content dissolves
     /// (withAnimation at the mutation site, NEVER .animation(_:value:) on the List's
     /// ancestors: feedback-loop hang, see UX rules); later writes assign without animation.
     /// Returns whether it published.
@@ -917,12 +915,8 @@ final class MessageDetailViewModel {
     }
 
     @discardableResult
-    private func publishOpened(_ header: MessageHeader?, ticket: Int?) -> Bool {
-        if let ticket {
-            guard mayPublishOpened(ticket) else { return false }
-        } else {
-            guard message == nil else { return false }
-        }
+    private func publishOpened(_ header: MessageHeader?, ticket: Int) -> Bool {
+        guard ticket == openedRefreshGeneration else { return false }
         if message == nil, header != nil {
             withAnimation(Theme.detailContentDissolve) { message = header }
         } else {
@@ -1309,7 +1303,8 @@ final class MessageDetailViewModel {
                     // an in-flight merge. Matches loadBody's post-fetch reads.
                     let freshBody = try? await self.dbPool.pool.read({ db in try MessageBody.fetchOne(db, key: rid) })
                     let headerTicket = self.beginOpenedRead()
-                    let freshHeader = try? await self.dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
+                    // nil = the read threw (keep what is shown); .some(nil) = the row is gone.
+                    let freshHeader: MessageHeader?? = try? await self.dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
                     guard !self.isRefetchingBody else { continue }
                     if let freshBody {
                         self.messageBody = freshBody
@@ -1317,10 +1312,11 @@ final class MessageDetailViewModel {
                         self.error = nil
                         // Header refresh (AI processing may have updated it)
                         // Replaces the header only if no newer read of it started (a nil
-                        // included: it never blanks a newer header).
-                        var refreshed = freshHeader
-                        if refreshed != nil { self.applyOverlay(to: &refreshed!) }
-                        self.publishOpened(refreshed, ticket: headerTicket)
+                        // included: it never blanks a newer header). A thrown read keeps it.
+                        if case var .some(refreshed) = freshHeader {
+                            if refreshed != nil { self.applyOverlay(to: &refreshed!) }
+                            self.publishOpened(refreshed, ticket: headerTicket)
+                        }
                         self.loadThreadMessagesAsync()
                         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[MessageDetail] Body fetched via poll for \(rid.prefix(40))") }
                         BootProfiler.mark("detail body via poll SERVER fetch \(rid.prefix(24))")
@@ -1711,10 +1707,12 @@ final class MessageDetailViewModel {
         // Matches the header/body-cache reads at the top of `loadBody`.
         let postFetchId = resolvedId
         let postFetchTicket = beginOpenedRead()
-        let postFetchHeader = try? await dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: postFetchId) })
-        var refreshed = postFetchHeader
-        if refreshed != nil { applyOverlay(to: &refreshed!) }
-        publishOpened(refreshed, ticket: postFetchTicket)
+        // nil = the read threw (keep what is shown); .some(nil) = the row is gone.
+        let postFetchHeader: MessageHeader?? = try? await dbPool.pool.read({ db in try MessageHeader.fetchOne(db, key: postFetchId) })
+        if case var .some(refreshed) = postFetchHeader {
+            if refreshed != nil { applyOverlay(to: &refreshed!) }
+            publishOpened(refreshed, ticket: postFetchTicket)
+        }
         messageBody = try? await dbPool.pool.read { db in try MessageBody.fetchOne(db, key: postFetchId) }
         loadThreadMessagesAsync()
 
@@ -1758,7 +1756,15 @@ final class MessageDetailViewModel {
 
         // Refetch message (with fallback)
         let openedTicket = beginOpenedRead()
-        var msg = try? await dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
+        let read: MessageHeader?
+        do {
+            read = try await dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) })
+        } catch {
+            // A read that threw changes nothing shown; pull to refresh again retries.
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Refetch] Header read failed: \(error)") }
+            return
+        }
+        var msg = read
         if msg == nil {
             msg = await resolveMessageAsync(compositeId: messageId)
         }
@@ -1837,6 +1843,7 @@ final class MessageDetailViewModel {
 
     func toggleRead() {
         guard let message else { return }
+        readGestures += 1
         let wasRead = message.isRead
         let newIsRead = !wasRead
         editOpened { $0.isRead = newIsRead }
@@ -1891,7 +1898,10 @@ final class MessageDetailViewModel {
     /// Called only when the action's own snapshot of the setting is on.
     private func markReadOnArchiveDeleteInMemory(_ msg: MessageHeader) {
         guard !msg.isRead else { return }
-        if msg.id == message?.id { editOpened { $0.isRead = true } }
+        if msg.id == message?.id {
+            readGestures += 1
+            editOpened { $0.isRead = true }
+        }
         if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
             threadMessages[idx].isRead = true
         }
@@ -2303,6 +2313,9 @@ final class MessageDetailViewModel {
     func markReadOnOpenIfNeeded() async {
         guard !markReadOnOpenCalled else { return }
         markReadOnOpenCalled = true
+        // The user's last explicit action wins: a read-state gesture on the opened email after
+        // this point supersedes the automatic mark-read (no write, no intent).
+        let gesturesAtOpen = readGestures
 
         // Fast path: `self.message` is already populated — seeded at init from
         // the staged snapshot, or an earlier resolve (loadBody) landed first.
@@ -2338,6 +2351,7 @@ final class MessageDetailViewModel {
         // message that was proved". Refuse rather than mutate; the message stays
         // unread and reopening it heals.
         guard markReadPermitted(for: msg) else { return }
+        guard readGestures == gesturesAtOpen else { return }
         // Layer any concurrent pending mutations (e.g. user just flagged this
         // message in another view before init's resolve raced through nil) on
         // top of the fresh DB header, then force isRead=true. Without this,
@@ -2391,7 +2405,10 @@ final class MessageDetailViewModel {
         let messageIds = Set(msgs.compactMap(\.rfc822MessageId).filter { !$0.isEmpty })
         let copies = threadCopies.filter { copy in copy.rfc822MessageId.map(messageIds.contains) ?? false }
         for msg in msgs + copies {
-            if msg.id == message?.id { editOpened { $0.isRead = isRead } }
+            if msg.id == message?.id {
+                readGestures += 1
+                editOpened { $0.isRead = isRead }
+            }
             if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
                 threadMessages[idx].isRead = isRead
             }
@@ -2554,10 +2571,7 @@ final class MessageDetailViewModel {
         // (it read before this request, so it publishes nothing), and while a scan runs the
         // new load waits for it: one scan at a time, and one pending load covers a burst.
         threadLoadGeneration += 1
-        if threadLoadInFlight {
-            threadReloadPending = true
-            return
-        }
+        if threadLoadInFlight { return }
         let generation = threadLoadGeneration
         // This run reads after every change recorded so far.
         threadLoadInFlight = true
@@ -2732,12 +2746,10 @@ final class MessageDetailViewModel {
         }
     }
 
-    /// A fenced scan returned or threw: the scan slot is free, so the load that waits for it
-    /// starts now and reads after every change accepted while it waited.
+    /// A fenced scan returned or threw: the scan slot is free, so its one replacement starts
+    /// now and reads after every change accepted while it ran.
     private func threadScanSettled() {
         threadLoadInFlight = false
-        guard threadReloadPending else { return }
-        threadReloadPending = false
         loadThreadMessagesAsync()
     }
 }
