@@ -240,7 +240,10 @@ struct ExchangeFolderTreeTests {
         await engine.updateBackfillProgressForAccount(account)
         #expect(await AccountManager.shared._backfillBacking[account.id] == nil, "nothing is published before the folder list")
 
-        await provider.adoptFullSyncFolderList(try await provider.fetchFolders())
+        // The scheduled full sync on a cold provider (no folder list since
+        // launch) lists the folders even when the change read says it applied
+        // one, and the provider takes its total from that list.
+        _ = try? await engine.fullSync(account: account, provider: provider, plan: .init(appliedFolderList: []))
         await engine.updateBackfillProgressForAccount(account)
         let expected = Self.rootChildren.flatMap(\.subtree).filter { !$0.isSearchFolder }
             .reduce(0) { $0 + Self.counts($1.id).total }
@@ -376,6 +379,57 @@ struct ExchangeFolderTreeSyncTests {
         #expect(offered.contains("new-child"), "the new subfolder can be picked as a move target")
         #expect(offered.isDisjoint(with: ["kept", "old-search"]))
         #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "listing writes nothing to the server")
+    }
+
+    @Test("The progress total comes from the scheduled full sync: on a cold provider it lists and adopts the folder tree (search folders left out) and the published progress uses it; a change read's discovery leaves it alone; the next full sync refreshes it")
+    func fullSyncAdoptsTheFolderListTotal() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let account = try FolderEpochTestFixture.makeAccount(id: "folder-tree-progress", provider: .outlook, pool: pool)
+        let wellKnown = ["inbox", "sentitems", "drafts", "deleteditems", "junkemail", "archive"]
+        let keptTotal = Mutex(7)
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: Self.root) { request in
+            let path = request.url.path
+            if path == Self.root {
+                let system = wellKnown.map { "{\"id\":\"sys-\($0)\",\"displayName\":\"\($0)\",\"unreadItemCount\":0,\"totalItemCount\":0,\"childFolderCount\":0}" }
+                let kept = "{\"id\":\"kept\",\"displayName\":\"kept\",\"unreadItemCount\":0,\"totalItemCount\":\(keptTotal.withLock { $0 }),\"childFolderCount\":0}"
+                return Self.page(system + [kept, Self.searchFolder("search")])
+            }
+            if let name = wellKnown.first(where: { path == Self.root + "/" + $0 }) {
+                return .json(raw: "{\"id\":\"sys-\(name)\",\"displayName\":\"\(name)\"}")
+            }
+            if path.hasSuffix("/messages") { return Self.page([]) }
+            return .status(404)
+        }
+        let provider = Self.provider(http)
+        let engine = SyncEngine()
+        await engine.register(accountId: account.id, provider: provider,
+                              workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
+        await AccountManager.shared.clearBackfillProgress(accountId: account.id)
+        #expect(await provider.progressTotal(crawling: true) == .notKnownYet, "precondition: a cold provider")
+
+        // Cold: the change read claimed an applied folder list, but the full
+        // sync still lists the tree, because the provider has no total yet.
+        _ = try await engine.fullSync(account: account, provider: provider, plan: .init(appliedFolderList: []))
+        #expect(await provider.progressTotal(crawling: true) == .messages(7), "the full sync's folder list sets the total")
+        await engine.updateBackfillProgressForAccount(account)
+        let progress = try #require(await AccountManager.shared._backfillBacking[account.id], "progress is published")
+        #expect(progress.totalEmails == 7)
+
+        // A change read's discovery lists the folders without adopting them.
+        keptTotal.withLock { $0 = 11 }
+        _ = try await provider.fetchFolders()
+        #expect(await provider.progressTotal(crawling: true) == .messages(7), "discovery leaves the adopted total alone")
+
+        // The next scheduled full sync adopts the new list.
+        _ = try await engine.fullSync(account: account, provider: provider)
+        #expect(await provider.progressTotal(crawling: true) == .messages(11), "the next full sync refreshes the total")
+        await AccountManager.shared.clearBackfillProgress(accountId: account.id)
     }
 
     @Test("A page that fails, at the root or inside a folder, first or after earlier pages, fails the whole sync and changes nothing stored",

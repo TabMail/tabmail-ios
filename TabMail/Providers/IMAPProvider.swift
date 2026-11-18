@@ -242,7 +242,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// (that is a later item), so only the SYNC and OPEN SELECTs are routed
     /// through it. The tracked set, by `rg -n "selectMailboxTracked" TabMail/`
     /// (five sites in this file today; attack the claim by re-running it):
-    ///  1. `createFolderConnection`'s open-the-folder SELECT (both legs);
+    ///  1. `createFolderConnection`'s open-the-folder SELECT (both legs) —
+    ///     REMOVED 2026-11-18 (#755): the pool now opens no mailbox, and each
+    ///     `withFolderConnection` body's own SELECT is the first;
     ///  2. `fetchMessagesWithObservedEpoch`' SELECT (T1.2b — reached from
     ///     `SyncEngine.runSyncMessages` through `fetchMessages`);
     ///  3. `getUidNextWithEpoch`'s (T1.3 — the backfill walk's walk-start epoch);
@@ -1478,28 +1480,23 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // (the server is logged in), reset before the retry starts its OWN
         // attempt. It lets each catch tell "`createServer()` itself threw —
         // nothing logged in, nothing to clean up" apart from "login succeeded
-        // but the SELECT after it threw before the plant — a live, logged-in
+        // but a step after it threw before the plant — a live, logged-in
         // session this function is about to abandon".
         var createdServer: IMAPServer?
         do {
             let server = try await createServer(diagSite: "folderCreate")
             createdServer = server
             // CONDSTORE for the listings, in the authenticated state, before
-            // the session's first SELECT (RFC 5161 §3.1). The pool's own
-            // open-the-folder SELECT stays plain: a server that refuses the
-            // `(CONDSTORE)` parameter must still open the folder, and only the
-            // listing's own SELECT (which falls back to a plain one) carries it.
+            // the session's first SELECT (RFC 5161 §3.1).
             let condStore = await negotiateListingCondStore(server)
-            // T1.2b: the OPEN-the-folder SELECT — the one a folder-pinned
-            // connection performs once, before any caller has asked for anything.
-            // It is routed through the tracked helper so the mirror describes the
-            // pinned connection's actual selected mailbox from the moment the
-            // connection exists. No test isolates this site: every
-            // `withFolderConnection` caller in this file today re-SELECTs the same
-            // folder before issuing commands (`fetchMessages` directly, the
-            // backfill SEARCHes via `searchDateRange`/`searchBeforeOnly`), so the
-            // observation it makes is currently indistinguishable from the body's.
-            _ = try await selectMailboxTracked(server, folder: folder)
+            // No open-the-folder SELECT here (#755): the connection is handed
+            // over in the authenticated state. Every `withFolderConnection`
+            // body SELECTs its folder before any mailbox command, so a server
+            // that refuses the SELECT answers the caller's own SELECT, where the
+            // listing types the refusal as not listable. A pool-opening SELECT
+            // would throw that refusal untyped, before the caller ran
+            // (fence: `ListingCountersTests.coldFolderConnectionSelectsOnlyInItsCaller`;
+            // invariant: `refusedSelectOnAColdFolderIsNotListable`).
             folderCreating.remove(folder)
             folderListingCondStore[ObjectIdentifier(server)] = condStore
             #if DEBUG
@@ -1523,7 +1520,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             return server
         } catch {
             // T3.7 PORT (D-13 / R11-H2) — `createServer()` succeeded (the
-            // server logged in) but `selectMailboxTracked` threw before the
+            // server logged in) but a later step threw before the
             // plant above. Abandoning that logged-in server without logging it
             // out leaks a live session nothing ever tracks or tears down again
             // — and it still counts against the server's connection cap, so it
@@ -1569,9 +1566,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     let server = try await createServer(diagSite: "folderRetry")
                     createdServer = server
                     let condStore = await negotiateListingCondStore(server)
-                    // T1.2b: the same open-the-folder SELECT as the primary create
-                    // path above, on the connection-limit retry leg.
-                    _ = try await selectMailboxTracked(server, folder: folder)
+                    // No open-the-folder SELECT, as on the primary leg above.
                     folderCreating.remove(folder)
                     folderListingCondStore[ObjectIdentifier(server)] = condStore
                     #if DEBUG
@@ -1587,7 +1582,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     return server
                 } catch {
                     // D-13 again: the retry's own `createServer()` may have
-                    // logged in before this retry's SELECT threw.
+                    // logged in before a later step of this retry threw.
                     if let createdServer {
                         noteLogoutAttempt(createdServer)
                         Task { try? await createdServer.logout() }

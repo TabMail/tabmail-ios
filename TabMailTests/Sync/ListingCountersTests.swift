@@ -481,7 +481,9 @@ struct ListingCountersTests {
             try Self.addArchive(w, serverUIDs: Self.belowWindowServer, localUIDs: Self.belowWindowHeld)
             let start = w.server.recordedCommands().count
             _ = try await w.engine.sync(account: try Self.account(w), deadline: Date().addingTimeInterval(-1))
-            let searches = w.server.recordedCommands().dropFirst(start).filter { $0.uppercased().contains("SEARCH") }
+            // Only the count walk's UID SEARCH counts: the backfill crawl, started
+            // after every sync on its own schedule, sends date SEARCHes.
+            let searches = w.server.recordedCommands().dropFirst(start).filter { $0.uppercased().hasPrefix("UID SEARCH UID") }
             #expect(searches.isEmpty, "no walk past the caller's deadline: \(Array(searches))")
             #expect(try Self.archive(w).uids.contains("1"), "nothing removed")
             #expect(try Self.archiveDue(w), "the owed walk is recorded for the next pass")
@@ -529,7 +531,9 @@ struct ListingCountersTests {
                 #expect(held.uids == ["1", "2", "3"])
             case "selectRefused", "noExists":
                 #expect(stamped, "a folder the server made not listable does not withhold the stamp")
-                #expect(held.uids == ["1", "2"], "nothing listed, nothing removed")
+                // Superset, not equality: the post-full-sync self-heal adds the
+                // server's UID 3 on its own; the property is that nothing is removed.
+                #expect(held.uids.isSuperset(of: ["1", "2"]), "nothing removed")
                 #expect(held.folder.totalCount == 2 && held.folder.lastKnownUidNext == 3, "its counters stay unwritten")
             default:
                 #expect(!stamped, "a started listing that failed to prove its window withholds the stamp: the full sync stays due")
@@ -559,24 +563,31 @@ struct ListingCountersTests {
         }
     }
 
-    @Test("A listing whose connection dies is retried once: a retry that proves the whole window stamps the full sync; a short retry withholds it, and the failed attempt wrote no row or counter",
+    @Test("A full-sync listing whose connection dies is retried once: a retry that proves the whole window lists the folder and drops none (the stamp's input); a short retry drops it, and the failed attempt wrote no row or counter",
           arguments: [true, false])
     func connectionLossRetryDecidesTheStamp(_ retryProves: Bool) async throws {
         try await E.withWorld("lc-retry-\(retryProves)", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
             try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1, 2])
-            w.server.killConnectionOnNextCommand(containing: "FETCH")
+            // Driven through `fullSync` itself: in a foreground pass the change
+            // pass's untracked refresh lists the Archive first and takes the
+            // killed FETCH (it has no retry; its unproven state withholds the
+            // pass, ADR-IOS-111 A1), so the full sync's retry is never reached.
+            w.server.killConnectionOnNextCommand(containing: "FETCH 1:3")
             if !retryProves { w.server.suppressFetchRecord(in: Self.archivePath, uids: [3]) }
-            _ = try await w.engine.sync(account: try Self.account(w))
+            let listing = try await w.engine.fullSync(account: w.account, provider: w.provider)
             let archiveSelects = w.server.recordedCommands().filter {
                 ($0.hasPrefix("SELECT") || $0.hasPrefix("EXAMINE")) && $0.contains(Self.archivePath)
             }
-            #expect(archiveSelects.count >= 2, "precondition: the Archive's listing lost its connection and was retried")
+            #expect(w.server.consumedInjectedFailureCount() == 1, "precondition: the Archive listing's FETCH lost its connection")
+            #expect(archiveSelects.count >= 2, "precondition: the Archive's listing was retried")
             let held = try Self.archive(w)
             if retryProves {
-                #expect(try Self.fullSyncStamp(w) != nil, "the retry proved the window: the folder counts as proven")
+                #expect(!listing.droppedFolder && listing.listedFolderIds.contains(Self.archiveId(w)),
+                        "the retry proved the window: the folder counts as listed, so the stamp is not withheld")
                 #expect(held.uids == ["1", "2", "3"])
             } else {
-                #expect(try Self.fullSyncStamp(w) == nil, "the retry was short: the folder is unproven and the stamp withheld")
+                #expect(listing.droppedFolder && !listing.listedFolderIds.contains(Self.archiveId(w)),
+                        "the retry was short: the folder is dropped and the stamp withheld")
                 #expect(held.uids == ["1", "2"], "nothing removed, nothing half-written")
                 #expect(held.folder.totalCount == 2 && held.folder.lastKnownUidNext == 3,
                         "neither the failed attempt nor the short retry wrote the counters")
@@ -603,6 +614,68 @@ struct ListingCountersTests {
                 _ = try await w.engine.sync(account: try Self.account(w))
                 #expect(w.server.recordedCommands().count > before, "pass \(pass) reached the server")
                 #expect(try Self.fullSyncStamp(w) == first, "pass \(pass) runs no full sync: the stamp is the first pass's")
+            }
+        }
+    }
+
+    /// The SELECTs of the Archive on each connection, in order.
+    static func archiveSelectsByConnection(_ w: E.World) -> [Int32: [String]] {
+        w.server.commandLogByConnection.compactMapValues { log in
+            let selects = log.filter { $0.uppercased().hasPrefix("SELECT") && $0.contains(archivePath) }
+            return selects.isEmpty ? nil : selects
+        }
+    }
+
+    @Test("Invariant: a cold folder whose SELECT the server refuses counts as not listable (the refusal answers the listing's own SELECT), so the full sync is stamped and not due again on each later pass")
+    func refusedSelectOnAColdFolderIsNotListable() async throws {
+        try await E.withWorld("lc-cold-select-refused", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1, 2])
+            Self.refuseArchiveSelect(w)
+            #expect(Self.archiveSelectsByConnection(w).isEmpty, "precondition: no connection has opened the Archive: it is cold")
+            #expect(try Self.fullSyncStamp(w) == nil, "precondition: the full sync is due")
+            _ = try await w.engine.sync(account: try Self.account(w))
+            // The refusal answers the listing's own SELECT: on every connection
+            // the first Archive SELECT carries (CONDSTORE), which only the
+            // listing's SELECT sends on this server (its plain fallback follows).
+            let byConnection = Self.archiveSelectsByConnection(w)
+            #expect(!byConnection.isEmpty, "precondition: the Archive's SELECT reached the server")
+            for (_, selects) in byConnection {
+                #expect(selects.first?.uppercased().contains("(CONDSTORE)") == true,
+                        "the connection's first Archive SELECT is the listing's, not a pool-opening one: \(selects)")
+            }
+            let first = try Self.fullSyncStamp(w)
+            #expect(first != nil, "a refused SELECT makes the folder not listable: the full sync is stamped")
+            let held = try Self.archive(w)
+            #expect(held.uids == ["1", "2"], "nothing listed, nothing removed")
+            #expect(held.folder.totalCount == 2 && held.folder.lastKnownUidNext == 3, "its counters stay unwritten")
+            for pass in 2...3 {
+                let id = w.account.id
+                try await w.pool.write { db in
+                    try db.execute(sql: "UPDATE account SET lastSyncedAt = NULL WHERE id = ?", arguments: [id])
+                }
+                let before = w.server.recordedCommands().count
+                _ = try await w.engine.sync(account: try Self.account(w))
+                #expect(w.server.recordedCommands().count > before, "pass \(pass) reached the server")
+                #expect(try Self.fullSyncStamp(w) == first, "pass \(pass): the full sync is not due again")
+            }
+        }
+    }
+
+    @Test("Fence: the folder pool opens no mailbox. On a cold folder connection the first SELECT is the caller's own: one SELECT of the folder before its FETCH, carrying the listing's (CONDSTORE)")
+    func coldFolderConnectionSelectsOnlyInItsCaller() async throws {
+        try await E.withWorld("lc-pool-opens-no-mailbox", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1])
+            let outcome = await w.engine.listFolder(try Self.archive(w).folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            if case .proven = outcome {} else { Issue.record("precondition: the listing proves its window: \(outcome)") }
+            let logs = w.server.commandLogByConnection.values.filter { log in
+                log.contains { $0.uppercased().hasPrefix("SELECT") && $0.contains(Self.archivePath) }
+            }
+            #expect(logs.count == 1, "precondition: one connection opened the Archive")
+            for log in logs {
+                let firstFetch = log.firstIndex { $0.uppercased().contains("FETCH") } ?? log.endIndex
+                let selects = log[..<firstFetch].filter { $0.uppercased().hasPrefix("SELECT") }
+                #expect(selects.count == 1, "one SELECT before the listing's FETCH, no pool-opening SELECT: \(log)")
+                #expect(selects.allSatisfy { $0.uppercased().contains("(CONDSTORE)") }, "and it is the listing's: \(log)")
             }
         }
     }
@@ -680,13 +753,13 @@ struct ListingCountersTests {
         }
     }
 
-    @Test("A cold folder connection to a server that refuses the (CONDSTORE) SELECT parameter still opens: the pool's open-the-folder SELECT is plain, and the listing's own SELECT falls back to a plain one and lists the folder")
+    @Test("A cold folder connection to a server that refuses the (CONDSTORE) SELECT parameter still lists: the listing's own SELECT, the connection's first, falls back to a plain one and lists the folder")
     func coldConnectionRefusingCondStoreSelectStillLists() async throws {
         try await E.withWorld("lc-cold-condstore-refused", capabilities: Self.condstoreNoEnableNoReader, serverUIDs: [1], localUIDs: [1]) { w in
             try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1])
             // The server refuses the first (CONDSTORE) SELECT it sees. With no
             // ENABLE advertised the session decides `selectParameter`; the first
-            // SELECT on the cold Archive connection must not be that one.
+            // SELECT on the cold Archive connection is the listing's, which falls back.
             w.server.failNextCommand(containing: "(CONDSTORE)")
             let outcome = await w.engine.listFolder(try Self.archive(w).folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
             if case .proven = outcome {} else { Issue.record("the folder opens and lists despite the refused parameter: \(outcome)") }
@@ -860,18 +933,34 @@ struct ListingCountersTests {
         }
     }
 
-    @Test("Two folders in one pass: the first listing proves nothing, the second proves its window; the pass's unproven state survives the later folder, so the stamp stays withheld")
+    @Test("A pass's untracked refresh that proves nothing withholds that pass's stamp even when the server recovers and every full-sync listing of the same pass proves its window; a later wholly proven pass stamps")
     func unprovenStateOnlyGrowsWithinAPass() async throws {
-        try await E.withWorld("lc-unproven-acc", capabilities: Self.condstoreNoReader, serverUIDs: [1, 2], localUIDs: [1]) { w in
+        try await E.withWorld("lc-unproven-acc", capabilities: E.condstoreOnly, serverUIDs: [1, 2], localUIDs: [1]) { w in
             try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1, 2])
-            w.server.suppressFetchRecord(in: Self.archivePath, uids: [2])
+            // One failed answer only: the change pass's refresh of the Archive
+            // sees EXISTS 0 against held mail, its confirming SEARCH finds UIDs,
+            // so that listing is unproven. Every later SELECT answers truly.
+            w.server.setSelectExists(0, forNext: 1, of: Self.archivePath)
+            let archiveSelects = { w.server.recordedCommands().filter { $0.uppercased().hasPrefix("SELECT") && $0.contains(Self.archivePath) }.count }
+            let searchesBefore = w.server.recordedCommands().filter { $0.uppercased().contains("SEARCH") }.count
             _ = try await w.engine.sync(account: try Self.account(w))
+            #expect(w.server.recordedCommands().filter { $0.uppercased().contains("SEARCH") }.count > searchesBefore,
+                    "precondition: the refresh's confirming SEARCH ran, so the unproven refresh was reached")
+            #expect(archiveSelects() >= 2, "precondition: the Archive was listed again by the full sync after the refresh")
+            #expect(try Self.archive(w).uids == ["1", "2", "3"], "precondition: the full sync's own Archive listing proved its window")
             #expect(try w.uids() == ["1", "2"], "precondition: the Inbox listing proved its window")
-            #expect(try Self.fullSyncStamp(w) == nil, "the Archive's unproven listing withholds the pass's stamp")
+            #expect(try Self.fullSyncStamp(w) == nil, "the pass's unproven refresh withholds its stamp although the full sync's listings proved")
+
+            let id = w.account.id
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE account SET lastSyncedAt = NULL WHERE id = ?", arguments: [id])
+            }
+            _ = try await w.engine.sync(account: try Self.account(w))
+            #expect(try Self.fullSyncStamp(w) != nil, "a later pass with every listing proven stamps")
         }
     }
 
-    @Test("An unproven on-demand listing makes its folder due: the next pass lists it although STATUS shows nothing changed, and nothing was published from the failed listing")
+    @Test("An unproven on-demand listing makes its folder due: its positive records are merged but no row is removed and no counter written; once the server answers again, the next full sync lists the folder although STATUS shows nothing changed, and clears the due bit")
     func unprovenOnDemandListingMakesTheFolderDue() async throws {
         try await E.withWorld("lc-ondemand-due", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
             try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1, 2])
@@ -881,15 +970,29 @@ struct ListingCountersTests {
             guard case .unproven = outcome else { Issue.record("precondition: unproven: \(outcome)"); return }
             let after = try Self.archive(w)
             #expect(try Self.listingDue(w, path: Self.archivePath), "the folder is due")
-            #expect(after.uids == before.uids && after.folder.totalCount == before.folder.totalCount
-                    && after.folder.lastKnownUidNext == before.folder.lastKnownUidNext, "nothing published")
-            #expect(SyncEngine.untrackedFolderChanged(
-                observation: UntrackedObservation(messageCount: after.folder.totalCount, uidNext: after.folder.lastKnownUidNext ?? 0,
-                                                  highestModSeq: after.folder.lastKnownHighestModSeq, uidValidity: nil),
-                lastKnownUidNext: after.folder.lastKnownUidNext, totalCount: after.folder.totalCount,
-                lastKnownHighestModSeq: after.folder.lastKnownHighestModSeq,
-                listingDue: try Self.listingDue(w, path: Self.archivePath)),
-                    "an unchanged STATUS does not skip a due folder")
+            // Positive records are merged even from an unproven listing; absence
+            // and counters need the proof.
+            #expect(after.uids == ["1", "2", "3"], "the held rows stay and the returned UID 3 is merged: \(after.uids.sorted())")
+            #expect(after.folder.totalCount == before.folder.totalCount
+                    && after.folder.lastKnownUidNext == before.folder.lastKnownUidNext
+                    && after.folder.lastKnownHighestModSeq == before.folder.lastKnownHighestModSeq, "no counter written")
+
+            // The stored counters now match STATUS exactly, so only the due bit
+            // can make the next full sync list the folder.
+            let folderId = Self.archiveId(w)
+            let modSeq = w.server.qresyncHighestModSeq(for: Self.archivePath)
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET totalCount = 3, lastKnownUidNext = 4, lastKnownHighestModSeq = ? WHERE id = ?",
+                               arguments: [modSeq, folderId])
+            }
+            w.server.suppressFetchRecord(in: Self.archivePath, uids: [])
+            let next = try await w.engine.fullSync(account: w.account, provider: w.provider)
+            #expect(next.listedFolderIds.contains(folderId), "the due folder is listed although STATUS is unchanged")
+            #expect(try !Self.listingDue(w, path: Self.archivePath), "the proven listing clears the due bit")
+            #expect(try Self.archive(w).uids == ["1", "2", "3"])
+            // Control: not due and unchanged, the next full sync skips it.
+            let control = try await w.engine.fullSync(account: w.account, provider: w.provider)
+            #expect(!control.listedFolderIds.contains(folderId), "without the due bit an unchanged folder is skipped")
         }
     }
 

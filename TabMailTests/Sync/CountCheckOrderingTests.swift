@@ -48,12 +48,13 @@ struct CountCheckOrderingTests {
         }
     }
 
-    @Test("A local-only draft (never uploaded) is not a held server row: a folder whose server rows all agree with the server's count is not made due, and the count check sees agreement")
+    @Test("A local-only draft (never uploaded) is not a held server row: a Drafts folder whose server rows agree with the server's count is not made due by the listing, its count check (phase 2) sees agreement, does not walk and keeps it not due on the next unchanged pass; a real ghost still makes it due")
     func localOnlyDraftNeverMakesAHealthyFolderDue() async throws {
         try await ChangeApplyTests.withWorld { w in
-            let folderId = w.archiveId
-            for uid in ["1", "2"] { try w.insertRow(uid, in: folderId, path: "Archive") }
-            // A draft that never reached the server, and its placeholder row.
+            let folderId = w.draftsId
+            for uid in ["1", "2"] { try w.insertRow(uid, in: folderId, path: "Drafts") }
+            // A draft that never reached the server, and its placeholder row, as
+            // `DraftStore` and `AccountManager.queueDraftSave` leave them before upload.
             let draftId = UUID().uuidString
             let epoch = "E-\(UUID().uuidString)"
             let placeholder = PendingOperation.draftPlaceholderMessageId(draftId: draftId, instanceEpoch: epoch)
@@ -69,16 +70,34 @@ struct CountCheckOrderingTests {
                 draft.instanceEpoch = epoch
                 try draft.insert(db)
             }
-            try w.insertRow(placeholder, in: folderId, path: "Archive")
+            try w.insertRow(placeholder, in: folderId, path: "Drafts")
 
             let held = try await w.pool.read { db in try SyncEngine.heldServerRowCount(folderId: folderId, accountId: w.accountId, db: db) }
             #expect(held == 2, "the placeholder is not a server row")
             try await w.pool.write { db in try SyncEngine.armListingDueIfHeldExceeds(2, folderId: folderId, db: db) }
             #expect(try !w.state(folderId).listingDue, "the server's count matches every server row: not due")
-            // Control: one real ghost still makes it due.
-            try w.insertRow("3", in: folderId, path: "Archive")
+
+            // Phase 2, the count check after a listing, on the same healthy
+            // folder: no walk, not due, nothing removed; twice (the next
+            // unchanged pass). No work queue is registered, so a walk, had it
+            // started, could not finish and would leave the folder due.
+            let engine = SyncEngine()
+            for run in 1...2 {
+                let folder = try #require(try await w.pool.read { db in try Folder.fetchOne(db, key: folderId) })
+                await engine.reconcileDeletionsAfterListing(folder: folder, provider: w.mock, serverCount: 2, logPrefix: "[Test]")
+                #expect(try !w.state(folderId).listingDue, "run \(run): the count check sees agreement and leaves the folder not due")
+                for id in ["1", "2", placeholder] {
+                    #expect(try w.row(id, in: folderId) != nil, "run \(run): \(id) is kept")
+                }
+            }
+
+            // Control: one real ghost still makes it due, in both places.
+            try w.insertRow("3", in: folderId, path: "Drafts")
             try await w.pool.write { db in try SyncEngine.armListingDueIfHeldExceeds(2, folderId: folderId, db: db) }
             #expect(try w.state(folderId).listingDue, "a held server row the server does not count makes it due")
+            let folder = try #require(try await w.pool.read { db in try Folder.fetchOne(db, key: folderId) })
+            await engine.reconcileDeletionsAfterListing(folder: folder, provider: w.mock, serverCount: 2, logPrefix: "[Test]")
+            #expect(try w.state(folderId).listingDue, "the count check with a real ghost it cannot walk leaves the folder due")
         }
     }
 

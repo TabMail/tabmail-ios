@@ -23,7 +23,9 @@ struct ProgressTotalSourceTests {
         http.register(path: "/gmail/v1/users/me/profile") { _ in
             let n = step.withLock { value -> Int in value += 1; return value }
             switch n {
-            case 1: return .status(403)
+            // 400, not 403: the Gmail request layer retries 403 as a rate limit,
+            // which would spend the next scripted answer inside the same read.
+            case 1: return .status(400)
             case 2: return .json(raw: #"{"emailAddress":"user@example.com","messagesTotal":0,"historyId":"1"}"#)
             default: return .json(raw: #"{"emailAddress":"user@example.com","messagesTotal":42,"historyId":"1"}"#)
             }
@@ -32,6 +34,7 @@ struct ProgressTotalSourceTests {
         #expect(await provider.progressTotal(crawling: false) == .none)
         #expect(step.withLock { $0 } == 0, "not crawling: no profile request")
         #expect(await provider.progressTotal(crawling: true) == .none, "a failed read answers none")
+        #expect(step.withLock { $0 } == 1, "the failed read was one request")
         #expect(await provider.progressTotal(crawling: true) == .none, "a zero total answers none")
         #expect(await provider.progressTotal(crawling: true) == .messages(42))
         let asked = step.withLock { $0 }
