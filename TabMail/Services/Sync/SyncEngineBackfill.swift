@@ -28,11 +28,19 @@ actor UIDWalkCursor {
     /// Ranges that failed and need retry. Workers drain these before grabbing new ranges.
     private var retryQueue: [(from: Int, to: Int)] = []
 
+    /// The top of the highest range that failed in a way this walk does not
+    /// retry. `nextRange` never serves such a range again, but it stays
+    /// PENDING: the confirmed cursor stops at this top and the walk cannot
+    /// complete, so the next walk (a new cursor, started from the persisted
+    /// position) asks it again. Only the highest top matters, because the
+    /// cursor walks downward. In memory only.
+    private var highestFailedThisWalk: Int?
+
     /// The lowest confirmed cursor — only advances when contiguous ranges from the
     /// top are confirmed. This is the value safe to persist to DB.
     private var confirmedCursor: Int
 
-    var isComplete: Bool { cursor < 1 && inFlight.isEmpty && retryQueue.isEmpty }
+    var isComplete: Bool { cursor < 1 && inFlight.isEmpty && retryQueue.isEmpty && highestFailedThisWalk == nil }
 
     init(startCursor: Int, chunkSize: Int) {
         self.cursor = startCursor
@@ -84,6 +92,35 @@ actor UIDWalkCursor {
         consecutiveSuccesses = 0
     }
 
+    /// Set aside a range this walk will not ask again: it stays pending (the
+    /// cursor stays above it, the walk does not complete) and is retried by the
+    /// next walk.
+    func failRangeForThisWalk(from: Int, to: Int) {
+        inFlight.removeAll { $0.from == from && $0.to == to }
+        highestFailedThisWalk = max(highestFailedThisWalk ?? to, to)
+        consecutiveSuccesses = 0
+    }
+
+    /// Return a failed range for retry SMALLER: its two halves, which together
+    /// cover exactly the original range, go back into the retry queue. A range
+    /// of one UID cannot be split, so it is set aside for this walk instead.
+    /// Never serves a failed range again at its own size.
+    func failRangeSmaller(from: Int, to: Int) {
+        guard to > from else {
+            failRangeForThisWalk(from: from, to: to)
+            return
+        }
+        inFlight.removeAll { $0.from == from && $0.to == to }
+        let mid = from + (to - from) / 2
+        // Upper half first: the walk runs downward.
+        retryQueue.append((from: mid + 1, to: to))
+        retryQueue.append((from: from, to: mid))
+        consecutiveSuccesses = 0
+    }
+
+    /// Whether any range was set aside for this walk.
+    var hasFailedThisWalk: Bool { highestFailedThisWalk != nil }
+
     /// Reduce chunk size on PayloadTooLargeError. Affects subsequent new ranges only.
     func reduceChunk() -> Int {
         chunkSize = max(1, chunkSize / 2)
@@ -99,7 +136,7 @@ actor UIDWalkCursor {
     var currentChunkSize: Int { chunkSize }
 
     /// Whether there are still ranges being processed or waiting for retry.
-    var hasPendingWork: Bool { !inFlight.isEmpty || !retryQueue.isEmpty }
+    var hasPendingWork: Bool { !inFlight.isEmpty || !retryQueue.isEmpty || highestFailedThisWalk != nil }
 
     // MARK: - Private
 
@@ -108,7 +145,7 @@ actor UIDWalkCursor {
     /// (not in-flight, not in retry). If any range is still pending, the cursor stops
     /// above it.
     private func updateConfirmedCursor() {
-        if inFlight.isEmpty && retryQueue.isEmpty {
+        if inFlight.isEmpty && retryQueue.isEmpty && highestFailedThisWalk == nil {
             // All ranges confirmed — cursor can advance to the speculative position
             confirmedCursor = cursor
         } else {
@@ -116,6 +153,7 @@ actor UIDWalkCursor {
             var highestPending = Int.min
             for range in inFlight { highestPending = max(highestPending, range.to) }
             for range in retryQueue { highestPending = max(highestPending, range.to) }
+            if let top = highestFailedThisWalk { highestPending = max(highestPending, top) }
             // confirmedCursor = the highest pending range's top (nothing above it is unconfirmed
             // because we walk downward). Actually: everything ABOVE highestPending.to is confirmed.
             // So confirmedCursor should be highestPending.to (we've confirmed everything above it).

@@ -993,6 +993,16 @@ final class FakeIMAPServer: @unchecked Sendable {
         }
     }
 
+    /// Like `killConnectionOnNextCommand`, but for every command containing
+    /// `fragment`, until `stopFailingCommands(containing:)`: a link that drops
+    /// each time the client asks that one thing.
+    func killConnectionOnEveryCommand(containing fragment: String) {
+        withState { state in
+            state.injectedFailureCountdowns[fragment.uppercased(), default: []]
+                .append(InjectedFailure(skip: 0, message: "", killConnection: true, persistent: true))
+        }
+    }
+
     /// Owner-directed adversarial fuzzer addendum — see `State
     /// .latencyInjection`'s doc comment. `maxMilliseconds` bounds every
     /// injected delay (a fuzzer keeps this small — tens of ms — so a whole

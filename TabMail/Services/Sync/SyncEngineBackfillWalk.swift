@@ -59,6 +59,10 @@ private struct BackfillWorkerOutcome: Sendable {
     /// A write chunk of this worker's batch failed, so the range was failed
     /// rather than confirmed (`BackfillBatchOutcome.landed`'s `allLanded`).
     var insertFailed = false
+    /// This worker stopped on a SEARCH or FETCH failure (a lost connection, a
+    /// failed SELECT, or a FETCH error the walk has no retry for) and left its
+    /// range pending (`UIDWalkCursor.failRange`).
+    var stoppedOnFailure = false
 }
 
 /// The IMAP UID walk's hold on its folder's walk position: the
@@ -1707,6 +1711,7 @@ extension SyncEngine {
                     let expectedEpoch = walkEpoch
                     var epochMovedMidWalk = false
                     var insertFailedMidWalk = false
+                    var workerStoppedOnFailure = false
                     await withTaskGroup(of: BackfillWorkerOutcome.self) { group in
                         for workerIndex in 0..<workerCount {
                             group.addTask { [self] in
@@ -1754,13 +1759,27 @@ extension SyncEngine {
                                             )
                                         }
                                     } catch {
-                                        // SEARCH failed — return range for retry
-                                        await cursor.failRange(from: range.from, to: range.to)
-                                        if Self.isConnectionError(error) || Self.isSelectFailedError(error) {
+                                        // A server refusal is classified first: its
+                                        // text is the server's and can read like a
+                                        // connection error ("timed out", "command failed").
+                                        if !(error is IMAPSearchRefused),
+                                           Self.isConnectionError(error) || Self.isSelectFailedError(error) {
+                                            // Return the range for retry; this worker stops,
+                                            // and the pass declines the folder for the call.
+                                            await cursor.failRange(from: range.from, to: range.to)
+                                            outcome.stoppedOnFailure = true
                                             BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH connection error: \(error)")
                                             break
                                         }
-                                        BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH error: \(error)")
+                                        // The server refused this range's SEARCH, or
+                                        // ended it without an answer. This walk does
+                                        // not ask it again (asking at once would spin
+                                        // on a server that keeps doing so) and moves
+                                        // on to the other ranges; the
+                                        // range stays pending, so the cursor never
+                                        // passes it, and the next walk asks it again.
+                                        await cursor.failRangeForThisWalk(from: range.from, to: range.to)
+                                        BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH error: \(error) — range \(range.from)...\(range.to) left for the next walk")
                                         continue
                                     }
 
@@ -1833,29 +1852,24 @@ extension SyncEngine {
                                         let desc = "\(error)"
                                         let isPayloadError = desc.contains("PayloadTooLargeError") || desc.contains("IMAPDecoderError")
                                         let isTimeout = desc.contains("timed out")
-                                        if isPayloadError {
-                                            let currentChunk = await cursor.currentChunkSize
-                                            if currentChunk <= 1 {
-                                                // Single UID too large — confirm anyway (can't split further)
-                                                BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) single UID too large — skipping")
-                                                await cursor.confirmRange(from: range.from, to: range.to)
-                                                continue
-                                            }
-                                            await cursor.failRange(from: range.from, to: range.to)
+                                        if isPayloadError || isTimeout {
+                                            // Never ask this range again at the same
+                                            // size in this walk: its halves go back
+                                            // for retry. A one-UID range is set aside
+                                            // for the next walk, never confirmed: its
+                                            // message did not load.
+                                            await cursor.failRangeSmaller(from: range.from, to: range.to)
                                             let newChunk = await cursor.reduceChunk()
-                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) payload too large, chunk → \(newChunk)")
-                                            continue
-                                        } else if isTimeout {
-                                            await cursor.failRange(from: range.from, to: range.to)
-                                            let newChunk = await cursor.reduceChunk()
-                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) timeout, chunk → \(newChunk)")
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) \(isTimeout ? "timeout" : "payload too large") on \(range.from)...\(range.to), chunk → \(newChunk)")
                                             continue
                                         } else if Self.isConnectionError(error) || Self.isSelectFailedError(error) {
                                             await cursor.failRange(from: range.from, to: range.to)
+                                            outcome.stoppedOnFailure = true
                                             BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) connection error: \(error)")
                                             break
                                         } else {
                                             await cursor.failRange(from: range.from, to: range.to)
+                                            outcome.stoppedOnFailure = true
                                             BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) error: \(error)")
                                             BackgroundSyncLogger.logError("\(folderCaptured.name) w\(workerIndex) error: \(error)", source: "backfill")
                                             break
@@ -1973,6 +1987,7 @@ extension SyncEngine {
                             if workerResult.didWork { didWork = true }
                             if workerResult.epochDisagreed { epochMovedMidWalk = true }
                             if workerResult.insertFailed { insertFailedMidWalk = true }
+                            if workerResult.stoppedOnFailure { workerStoppedOnFailure = true }
                         }
                     }
 
@@ -2073,6 +2088,23 @@ extension SyncEngine {
                     if insertFailedMidWalk {
                         epochDeclinedFolderIds.insert(folder.id)
                     }
+                    // A range this walk set aside: the next walk of this CALL
+                    // would start above it and ask it straight back, the same
+                    // spin one level up. Decline the folder for the rest of the
+                    // call; the next call asks the range again.
+                    if await cursor.hasFailedThisWalk {
+                        epochDeclinedFolderIds.insert(folder.id)
+                    }
+                    // A worker stopped on a lost connection, a failed SELECT or
+                    // a FETCH error with no retry: its range stays pending (the
+                    // cursor stays above it), and the workers' failures never
+                    // reach the call's backoff. Walking the folder again in this
+                    // call would ask the same range at network rate while the
+                    // folders behind it wait; decline it for the rest of the
+                    // call, like a refused range. The next call asks again.
+                    if workerStoppedOnFailure {
+                        epochDeclinedFolderIds.insert(folder.id)
+                    }
                     // Both final writes are guarded and re-read the folder row inside
                     // their own transaction (NB4), and both report whether they
                     // actually landed. A write that did NOT land leaves the folder
@@ -2121,7 +2153,10 @@ extension SyncEngine {
                             BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) has failed ranges — retry next cycle (cursor at \(finalCursor))")
                         }
                     }
-                    if finalWriteLanded { didWork = true }
+                    // An unchanged cursor (a range left for the next call, with
+                    // nothing new below it) is no work: it would keep the worker
+                    // on its active schedule. Inserts already set `didWork`.
+                    if finalWriteLanded && (isComplete || finalCursor != cursorValue) { didWork = true }
                     await updateBackfillProgressForAccount(account)
                     continue
 
