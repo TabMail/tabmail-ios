@@ -905,7 +905,7 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      `.messageDataDidChange`, so the ghost under the card follows it. How a thread reload
      is ordered against such a refresh (a reload that read its rows before the change and finishes
      after it puts the older row back, #992) is not decided here: it is superseded by "one display
-     read at a time", fixed on its own. The card saves to a draft of its own
+     read at a time", fixed on its own (ADR-IOS-049's #992 amendment, `MessageDetailViewModel.inDisplayTurn`). The card saves to a draft of its own
      (`Draft.separateReplyKey`, the parent in its tail as a reply key's): the chat ignores saved
      drafts, so a reply draft already saved for the email stays as it is in Drafts, never opened,
      saved over or deleted by the card; each card has its own key, so two cards' drafts never
