@@ -340,7 +340,7 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
         }
 
         /// That back swipe waits until a bubble's drag fails, so it takes only the drags the bubble
-        /// turned down (upright, or the wrong way).
+        /// turned down (upright, or the wrong way), under UIKit's own rules for the back swipe.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
             outranksBackSwipe && Self.isContentPop(other)
