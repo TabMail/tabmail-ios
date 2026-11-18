@@ -905,6 +905,27 @@ extension SyncEngine {
         return db.changesCount > 0
     }
 
+    /// Which of `uids` the folder already stores under `epoch`: rows whose
+    /// `observedUidValidity` is that epoch. A row of another epoch, or of an
+    /// unproven one (nil), is not counted, so its UID is fetched again.
+    nonisolated static func storedUIDs(
+        _ db: Database, folderId: String, epoch: Int, among uids: [UInt32]
+    ) throws -> Set<String> {
+        let ids = uids.map { String($0) }
+        var found = Set<String>()
+        let chunkSize = SyncConfig.backfillInsertChunkSize
+        for start in stride(from: 0, to: ids.count, by: chunkSize) {
+            let chunk = Array(ids[start..<min(start + chunkSize, ids.count)])
+            found.formUnion(try String.fetchSet(db,
+                MessageHeader
+                    .select(Column("messageId"))
+                    .filter(Column("folderId") == folderId
+                        && Column("observedUidValidity") == epoch
+                        && chunk.contains(Column("messageId")))))
+        }
+        return found
+    }
+
     /// The IMAP UID walk's bookkeeping write for one folder: `assignments`
     /// (its cursor, its completion, and with them `lastKnownUidNext`) land only
     /// while the folder still holds `premiseEpoch` (`crawlWalkWriteAllowed`, the
@@ -1676,6 +1697,13 @@ extension SyncEngine {
                     let walkWritePremise = premiseEpoch
 
                     let cursor = UIDWalkCursor(startCursor: cursorValue, chunkSize: limit)
+                    // Snapshot at walk start, read once: whether this walk
+                    // skips the FETCH of UIDs the folder already stores. While
+                    // the cc/bcc fill is still due (a new account, Smart
+                    // Reindex, the database reset), the walk re-FETCHes stored
+                    // UIDs on purpose: `insertBackfillBatch` fills their cc/bcc
+                    // from that FETCH. A flip mid-walk applies to the next walk.
+                    let skipStoredUIDs = UserDefaults.standard.bool(forKey: "ccBccBackfillDone")
                     let poolMax = await imapProvider.poolMaxConnections()
                     let workerCount = poolMax < Int.max ? poolMax : SyncConfig.imapMaxConnectionCeiling
                     let folderCaptured = folder
@@ -1754,13 +1782,20 @@ extension SyncEngine {
                                             )
                                         }
                                     } catch {
-                                        // SEARCH failed — return range for retry
-                                        await cursor.failRange(from: range.from, to: range.to)
                                         if Self.isConnectionError(error) || Self.isSelectFailedError(error) {
+                                            // Return the range for retry; this worker stops.
+                                            await cursor.failRange(from: range.from, to: range.to)
                                             BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH connection error: \(error)")
                                             break
                                         }
-                                        BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH error: \(error)")
+                                        // The server refused this range's SEARCH. This
+                                        // walk does not ask it again (asking at once
+                                        // would spin on a server that keeps refusing
+                                        // it) and moves on to the other ranges; the
+                                        // range stays pending, so the cursor never
+                                        // passes it, and the next walk asks it again.
+                                        await cursor.failRangeForThisWalk(from: range.from, to: range.to)
+                                        BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH error: \(error) — range \(range.from)...\(range.to) left for the next walk")
                                         continue
                                     }
 
@@ -1781,8 +1816,32 @@ extension SyncEngine {
                                         break
                                     }
 
-                                    if existingUIDs.isEmpty {
-                                        // No messages in this range — confirmed empty, safe to advance
+                                    // The UIDs to FETCH: all the SEARCH found, less
+                                    // those already stored under the epoch this walk
+                                    // accounts for (a row of an older or unproven
+                                    // epoch does not count) when this walk skips them.
+                                    let uidsToFetch: [UInt32]
+                                    if skipStoredUIDs, let expectedEpoch, !existingUIDs.isEmpty {
+                                        let stored: Set<String>
+                                        do {
+                                            stored = try await AppDatabase.backgroundPool.read { db in
+                                                try Self.storedUIDs(
+                                                    db, folderId: folderCaptured.id,
+                                                    epoch: Int(expectedEpoch), among: existingUIDs)
+                                            }
+                                        } catch {
+                                            await cursor.failRange(from: range.from, to: range.to)
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) stored-UID read failed: \(error)")
+                                            break
+                                        }
+                                        uidsToFetch = existingUIDs.filter { !stored.contains(String($0)) }
+                                    } else {
+                                        uidsToFetch = existingUIDs
+                                    }
+
+                                    if uidsToFetch.isEmpty {
+                                        // No messages in this range, or every one is
+                                        // already stored — confirmed, safe to advance
                                         await cursor.confirmRange(from: range.from, to: range.to)
                                         if await lastProgressUpdate.shouldUpdate() {
                                             let snapshotCursor = await cursor.currentCursor
@@ -1825,7 +1884,7 @@ extension SyncEngine {
                                     do {
                                         fetched = try await workQueue.execute(priority: .headerFetch) {
                                             try await imapProvider.fetchMessageHeadersWithObservedEpoch(
-                                                folder: folderCaptured.path, uids: existingUIDs,
+                                                folder: folderCaptured.path, uids: uidsToFetch,
                                                 batchSize: batchSize, interBatchDelay: interBatchDelay
                                             )
                                         }
@@ -1833,22 +1892,15 @@ extension SyncEngine {
                                         let desc = "\(error)"
                                         let isPayloadError = desc.contains("PayloadTooLargeError") || desc.contains("IMAPDecoderError")
                                         let isTimeout = desc.contains("timed out")
-                                        if isPayloadError {
-                                            let currentChunk = await cursor.currentChunkSize
-                                            if currentChunk <= 1 {
-                                                // Single UID too large — confirm anyway (can't split further)
-                                                BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) single UID too large — skipping")
-                                                await cursor.confirmRange(from: range.from, to: range.to)
-                                                continue
-                                            }
-                                            await cursor.failRange(from: range.from, to: range.to)
+                                        if isPayloadError || isTimeout {
+                                            // Never ask this range again at the same
+                                            // size in this walk: its halves go back
+                                            // for retry. A one-UID range is set aside
+                                            // for the next walk, never confirmed: its
+                                            // message did not load.
+                                            await cursor.failRangeSmaller(from: range.from, to: range.to)
                                             let newChunk = await cursor.reduceChunk()
-                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) payload too large, chunk → \(newChunk)")
-                                            continue
-                                        } else if isTimeout {
-                                            await cursor.failRange(from: range.from, to: range.to)
-                                            let newChunk = await cursor.reduceChunk()
-                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) timeout, chunk → \(newChunk)")
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) \(isTimeout ? "timeout" : "payload too large") on \(range.from)...\(range.to), chunk → \(newChunk)")
                                             continue
                                         } else if Self.isConnectionError(error) || Self.isSelectFailedError(error) {
                                             await cursor.failRange(from: range.from, to: range.to)
@@ -2071,6 +2123,13 @@ extension SyncEngine {
                     // the next call walks the range again (the insert skips what
                     // did land).
                     if insertFailedMidWalk {
+                        epochDeclinedFolderIds.insert(folder.id)
+                    }
+                    // A range this walk set aside: the next walk of this CALL
+                    // would start above it and ask it straight back, the same
+                    // spin one level up. Decline the folder for the rest of the
+                    // call; the next call asks the range again.
+                    if await cursor.hasFailedThisWalk {
                         epochDeclinedFolderIds.insert(folder.id)
                     }
                     // Both final writes are guarded and re-read the folder row inside
