@@ -69,7 +69,8 @@ struct ChatThreadView: View {
     @State private var showsOnlyList = false
     @State private var forwardMessage: MessageHeader?
     /// The one open swipe: the chat's, or a bubble's id.
-    @State private var openSwipeId: String?
+    /// What is open among the chat's swipes (`ChatSwipeOpen`).
+    @State private var swipeOpen = ChatSwipeOpen()
     @State private var showsMove = false
     @Environment(\.dismiss) private var dismiss
 
@@ -332,13 +333,15 @@ struct ChatThreadView: View {
                 // everywhere else never trashes.
                 .modifier(ChatSwipeReveal(
                     id: Self.chatSwipeId, edge: .trailing, buttons: chatSwipeButtons(offersArchive: offersArchive),
-                    allowsFullSwipe: offersArchive, openId: $openSwipeId))
+                    allowsFullSwipe: offersArchive, open: swipeOpen))
                 .accessibilityActions {
                     ForEach(chatSwipeButtons(offersArchive: offersArchive)) { button in
                         Button(button.title, action: button.action)
                     }
                 }
             }
+            // While a swipe is open, a drag or tap anywhere else on the screen only closes it.
+            .background(ChatSwipeCloser(open: swipeOpen))
             // A bar inset, not a plain one: the navigation bar's scroll edge reaches under the
             // subject and the tutorial card, so the chat scrolls under the whole header, never
             // through it (Messages).
@@ -390,7 +393,7 @@ struct ChatThreadView: View {
             onOpen: { cardMessage = item.header })
         .modifier(ChatSwipeReveal(
             id: item.id, edge: .leading, buttons: bubbleSwipeButtons(item, thread: thread),
-            allowsFullSwipe: false, openId: $openSwipeId))
+            allowsFullSwipe: false, open: swipeOpen))
         .id(item.id)
         // Shown by one rule for every height (`ChatRowVisibility`), measured against the scroll
         // view, so a row taller than the screen is shown too.

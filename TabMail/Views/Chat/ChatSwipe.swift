@@ -63,34 +63,18 @@ enum ChatSwipe {
         return .closed
     }
 
-    /// What one reveal does with a sideways drag that reaches it.
-    enum DragOutcome: Equatable {
-        /// It lets the drag go: the back swipe, or the other reveal, may take it.
-        case declines
-        /// It slides its content with the drag, opening it.
-        case moves
-        /// A reveal is open: the drag only closes it, and never goes back.
-        case closes
-    }
-
-    /// The one rule for a sideways drag, from what is open and where the drag starts. `sign` is the
-    /// reveal's (`sign` -1 opens leftward); `velocityX` is the drag's first sideways
+    /// Whether a reveal's pan takes a sideways drag, from what is open and where the drag starts.
+    /// `sign` is the reveal's opening direction (-1 leftward); `velocityX` the drag's first sideways
     /// speed; `startsAtScreenEdge` whether it began in the back swipe's zone at the screen's left edge.
-    ///  - Anything open: any drag, wherever it starts (the screen edge included), only closes it.
-    ///    Every reveal under the drag answers the same, so no two of them move at once.
-    ///  - Nothing open: a reveal opens toward its buttons, except that a drag from the screen's left
-    ///    edge is the back swipe's, so a bubble (which opens rightward) leaves it alone.
-    /// The back swipe runs only when every reveal under the drag declines (`backSwipeRuns`).
-    static func dragOutcome(openId: String?, sign: CGFloat, velocityX: CGFloat,
-                            startsAtScreenEdge: Bool) -> DragOutcome {
-        if openId != nil { return .closes }
-        guard velocityX * sign > 0 else { return .declines }
-        return sign > 0 && startsAtScreenEdge ? .declines : .moves
-    }
-
-    /// Whether the back swipe takes a drag: only when every reveal under it declines.
-    static func backSwipeRuns(_ outcomes: [DragOutcome]) -> Bool {
-        outcomes.allSatisfy { $0 == .declines }
+    ///  - Its own reveal is open: it takes the drag either way (further open, a full swipe, or shut).
+    ///  - Another is open: it lets the drag go; the chat's closer (`ChatSwipeCloser`) only closes.
+    ///  - Nothing open: it opens toward its buttons, except that a rightward drag from the screen's
+    ///    left edge is the back swipe's.
+    static func takesDrag(id: String, openId: String?, sign: CGFloat, velocityX: CGFloat,
+                          startsAtScreenEdge: Bool) -> Bool {
+        if let openId { return openId == id }
+        guard velocityX * sign > 0 else { return false }
+        return !(sign > 0 && startsAtScreenEdge)
     }
 
     /// Keeps a drag between closed and fully open (the whole width when a full swipe can run).
@@ -125,6 +109,49 @@ struct ChatSwipeDrag: Equatable {
     }
 }
 
+/// What is open in one chat: the one reveal whose buttons show, and where it sits in the window.
+/// Its owner is the chat screen; every reveal and the chat's closer read it.
+@MainActor
+@Observable
+final class ChatSwipeOpen {
+    /// The open reveal's id, or nil.
+    private(set) var id: String?
+    /// The open reveal's frame in window coordinates: drags and taps inside it stay its own.
+    private(set) var frame: CGRect = .null
+    /// Told whenever something opens or nothing is open any more (the chat's closer).
+    @ObservationIgnored var openChanged: ((Bool) -> Void)?
+
+    func open(_ id: String, frame: CGRect) {
+        self.id = id
+        self.frame = frame
+        openChanged?(true)
+    }
+
+    /// The open reveal moved (a scroll, a layout change).
+    func moved(_ id: String, frame: CGRect) {
+        guard self.id == id else { return }
+        self.frame = frame
+    }
+
+    func close() {
+        let wasOpen = id != nil
+        id = nil
+        frame = .null
+        if wasOpen { openChanged?(false) }
+    }
+
+    /// A reveal's view left the chat (its email moved away, or the chat closed): if it was the open
+    /// one, nothing is open any more, so the next drag works.
+    func left(_ id: String) {
+        if self.id == id { close() }
+    }
+
+    /// Whether a touch at `point` (window coordinates) belongs to the open reveal.
+    func owns(_ point: CGPoint) -> Bool {
+        id != nil && frame.contains(point)
+    }
+}
+
 /// One revealed swipe button, as today's iOS 26 list swipes: a round tinted button, label below.
 struct ChatSwipeButton: Identifiable {
     let title: String
@@ -135,7 +162,8 @@ struct ChatSwipeButton: Identifiable {
 }
 
 /// Slides its content to reveal buttons at `edge`. Only one reveal is open at a time:
-/// `openId` names it, and while one is open any drag only closes it (`ChatSwipe.dragOutcome`). VoiceOver's actions for the
+/// `open` names it; while one is open only it takes drags, and the chat's closer closes it on any
+/// drag or tap elsewhere (`ChatSwipe.takesDrag`, `ChatSwipeCloser`). VoiceOver's actions for the
 /// buttons are named by the call site, on the element they belong to: actions on a view of several
 /// elements (a bubble and its chips) reorder what VoiceOver reads in it.
 struct ChatSwipeReveal: ViewModifier {
@@ -144,10 +172,11 @@ struct ChatSwipeReveal: ViewModifier {
     /// Left to right on screen. A full swipe runs the one at `edge`.
     let buttons: [ChatSwipeButton]
     let allowsFullSwipe: Bool
-    @Binding var openId: String?
+    let open: ChatSwipeOpen
 
     @State private var drag = ChatSwipeDrag()
     @State private var width: CGFloat = 0
+    @State private var frame: CGRect = .null
 
     private var sign: CGFloat { edge == .trailing ? -1 : 1 }
     private var revealWidth: CGFloat { CGFloat(buttons.count) * ChatViewLayout.swipeButtonWidth }
@@ -169,19 +198,23 @@ struct ChatSwipeReveal: ViewModifier {
                 }
             }
             .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
-            // What a drag does is decided by `ChatSwipe.dragOutcome`, from what is open and where
-            // the drag starts; the back swipes wait for this decision and take only declined drags.
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame = $0; open.moved(id, frame: $0) }
+            // Whether this reveal takes a drag is decided by `ChatSwipe.takesDrag`, from what is open
+            // and where the drag starts; the back swipes wait for that decision.
             .gesture(ChatHorizontalPan(
                 holdId: id,
-                outcome: { velocityX, atEdge in
-                    ChatSwipe.dragOutcome(openId: openId, sign: sign, velocityX: velocityX,
-                                          startsAtScreenEdge: atEdge)
+                shouldBegin: { velocityX, atEdge in
+                    ChatSwipe.takesDrag(id: id, openId: open.id, sign: sign, velocityX: velocityX,
+                                        startsAtScreenEdge: atEdge)
                 },
-                closeOpen: { openId = nil },
                 changed: changed, ended: ended))
-            // A swipe torn down mid-drag or while it settles lets the data it held through.
-            .onDisappear { ChatSwipeHold.shared.releaseNow(id) }
-            .onChange(of: openId) { _, now in
+            // A swipe torn down mid-drag or while it settles lets the data it held through, and an
+            // open reveal whose view leaves the chat is no longer open.
+            .onDisappear {
+                ChatSwipeHold.shared.releaseNow(id)
+                open.left(id)
+            }
+            .onChange(of: open.id) { _, now in
                 if now != id, drag.offset != 0 { withAnimation(Self.spring) { drag.offset = 0 } }
             }
     }
@@ -197,7 +230,7 @@ struct ChatSwipeReveal: ViewModifier {
             close()
             edgeButton?.action()
         case .open:
-            openId = id
+            open.open(id, frame: frame)
             withAnimation(Self.spring) { drag.offset = sign * revealWidth }
         case .closed:
             close()
@@ -205,7 +238,7 @@ struct ChatSwipeReveal: ViewModifier {
     }
 
     private func close() {
-        if openId == id { openId = nil }
+        open.left(id)
         withAnimation(Self.spring) { drag.offset = 0 }
     }
 
@@ -281,15 +314,14 @@ final class ChatSwipeHold {
     }
 }
 
-/// A horizontal pan that starts only when `outcome` takes its first motion (`ChatSwipe.dragOutcome`),
+/// A horizontal pan that starts only when `shouldBegin` takes its first motion (`ChatSwipe.takesDrag`),
 /// so vertical scrolling stays the scroll view's, and the back swipes take only drags it declines.
 struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     /// What the swipe holds the interaction freeze under (`ChatSwipeHold`): its reveal's id.
     let holdId: String
-    /// What the drag does, from its first sideways speed and whether it starts at the screen's edge.
-    let outcome: (CGFloat, Bool) -> ChatSwipe.DragOutcome
-    /// Closes whatever reveal is open, for a drag whose outcome is `.closes`.
-    let closeOpen: () -> Void
+    /// Whether the pan takes the drag, from its first sideways speed and whether it starts at the
+    /// screen's left edge.
+    let shouldBegin: (CGFloat, Bool) -> Bool
     let changed: (CGFloat) -> Void
     /// The drag's last velocity, and whether the user finished it (false when the system cancelled
     /// or failed it).
@@ -306,7 +338,7 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
-        Coordinator(outcome: outcome)
+        Coordinator(shouldBegin: shouldBegin)
     }
 
     func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
@@ -322,14 +354,10 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
-        context.coordinator.outcome = outcome
+        context.coordinator.shouldBegin = shouldBegin
     }
 
     func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
-        if context.coordinator.current == .closes {
-            if recognizer.state == .began { closeOpen() }
-            return
-        }
         Self.handle(recognizer, holding: holdId, changed: changed, ended: ended)
     }
 
@@ -355,15 +383,13 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
-        var outcome: (CGFloat, Bool) -> ChatSwipe.DragOutcome
-        /// What the drag under way does, decided once as it starts.
-        private(set) var current: ChatSwipe.DragOutcome = .declines
+        var shouldBegin: (CGFloat, Bool) -> Bool
         /// Whether the touch that starts the drag landed in the back swipe's zone at the screen's
         /// left edge.
         private(set) var startsAtScreenEdge = false
 
-        init(outcome: @escaping (CGFloat, Bool) -> ChatSwipe.DragOutcome) {
-            self.outcome = outcome
+        init(shouldBegin: @escaping (CGFloat, Bool) -> Bool) {
+            self.shouldBegin = shouldBegin
         }
 
         /// Where the drag starts, read from its first touch in the window's coordinates.
@@ -379,23 +405,20 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
         }
 
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
-            current = .declines
             guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
             let velocity = pan.velocity(in: pan.view)
-            guard abs(velocity.x) > abs(velocity.y) else { return false }
-            current = outcome(velocity.x, startsAtScreenEdge)
-            return current != .declines
+            return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x, startsAtScreenEdge)
         }
 
-        /// A chat drag never runs together with a back swipe: the two never both act on one drag.
-        /// Everything else (the chat's scroll, the other reveal) runs alongside as before.
+        /// A swipe runs alone: once it has the drag, nothing else acts on it (a back swipe, the
+        /// scroll, or the bubble's own tap, which would open its card under the swipe).
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-            !Self.isBackSwipe(other)
+            false
         }
 
-        /// Both back swipes wait for this drag's decision (`ChatSwipe.dragOutcome`) and take the drag
-        /// only once every reveal under it has declined (`ChatSwipe.backSwipeRuns`).
+        /// Both back swipes wait for this pan's decision (`ChatSwipe.takesDrag`): they take the drag
+        /// only once it has declined.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
             Self.isBackSwipe(other)
@@ -415,6 +438,141 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
                 responder = current.next
             }
             return false
+        }
+    }
+}
+
+/// The chat's closer: while a reveal is open, any sideways drag or tap anywhere on the chat's screen
+/// outside that reveal (another bubble, empty space, the reply field, the header, the navigation
+/// bar, the screen's edge) only closes it, as in Mail. It is a pair of recognizers on the navigation
+/// controller's own view, not a view over the chat, so VoiceOver and every control see the chat as
+/// before; they take no touch at all while nothing is open. Every other recognizer on such a touch
+/// waits for them, so the drag or tap does nothing else. The screen-edge back swipe is a system
+/// recognizer that starts on its own, so it is off while something is open, and on again once
+/// nothing is.
+struct ChatSwipeCloser: UIViewRepresentable {
+    let open: ChatSwipeOpen
+    /// What the closing drag holds the interaction freeze under (`ChatSwipeHold`).
+    static let holdId = "chat-swipe-closer"
+
+    func makeCoordinator() -> Coordinator { Coordinator(open: open) }
+
+    func makeUIView(context: Context) -> Anchor {
+        let anchor = Anchor()
+        anchor.coordinator = context.coordinator
+        return anchor
+    }
+
+    func updateUIView(_ anchor: Anchor, context: Context) {
+        if context.coordinator.open !== open {
+            context.coordinator.open = open
+            open.openChanged = { [weak coordinator = context.coordinator] isOpen in coordinator?.setEdgePop(enabled: !isOpen) }
+        }
+    }
+
+    static func dismantleUIView(_ anchor: Anchor, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    /// An empty view that installs the closer on its navigation controller once it is on screen.
+    final class Anchor: UIView {
+        weak var coordinator: Coordinator?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard let coordinator else { return }
+            if window == nil {
+                coordinator.uninstall()
+                return
+            }
+            var responder: UIResponder? = self
+            while let current = responder, !(current is UINavigationController) { responder = current.next }
+            let nav = responder as? UINavigationController
+            coordinator.install(on: nav?.view ?? window, edgePop: nav?.interactivePopGestureRecognizer)
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var open: ChatSwipeOpen
+        let pan = UIPanGestureRecognizer()
+        let tap = UITapGestureRecognizer()
+        private weak var host: UIView?
+        /// The navigation controller's screen-edge back swipe, off while something is open.
+        private weak var edgePop: UIGestureRecognizer?
+
+        init(open: ChatSwipeOpen) {
+            self.open = open
+            super.init()
+            open.openChanged = { [weak self] isOpen in self?.setEdgePop(enabled: !isOpen) }
+            for recognizer in [pan, tap] as [UIGestureRecognizer] {
+                recognizer.delegate = self
+                recognizer.addTarget(self, action: #selector(handle(_:)))
+            }
+        }
+
+        func install(on view: UIView?, edgePop: UIGestureRecognizer?) {
+            guard let view, host !== view else { return }
+            uninstall()
+            view.addGestureRecognizer(pan)
+            view.addGestureRecognizer(tap)
+            host = view
+            self.edgePop = edgePop
+            edgePop?.isEnabled = open.id == nil
+        }
+
+        func setEdgePop(enabled: Bool) {
+            edgePop?.isEnabled = enabled
+        }
+
+        func uninstall() {
+            host?.removeGestureRecognizer(pan)
+            host?.removeGestureRecognizer(tap)
+            host = nil
+            edgePop?.isEnabled = true
+            edgePop = nil
+        }
+
+        /// A touch is the closer's only while something is open, and only outside the open reveal
+        /// (whose own drags and buttons stay its own).
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            open.id != nil && !open.owns(touch.location(in: nil))
+        }
+
+        func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+            guard open.id != nil else { return false }
+            guard recognizer === pan else { return true }
+            let velocity = pan.velocity(in: pan.view)
+            return abs(velocity.x) > abs(velocity.y)
+        }
+
+        /// Everything else on a touch the closer took waits for it: the drag or tap only closes.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+            other !== pan && other !== tap
+        }
+
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            false
+        }
+
+        /// Closes what is open, holding the interaction freeze from the moment the closer takes the
+        /// finger until the reveal has settled shut, as every swipe does (`ChatSwipeHold`).
+        @objc func handle(_ recognizer: UIGestureRecognizer) {
+            switch recognizer.state {
+            case .began:
+                ChatSwipeHold.shared.begin(ChatSwipeCloser.holdId)
+                open.close()
+            case .ended where recognizer is UITapGestureRecognizer:
+                ChatSwipeHold.shared.begin(ChatSwipeCloser.holdId)
+                open.close()
+                ChatSwipeHold.shared.release(ChatSwipeCloser.holdId, after: ChatViewLayout.swipeSettleHold)
+            case .ended, .cancelled, .failed:
+                ChatSwipeHold.shared.release(ChatSwipeCloser.holdId, after: ChatViewLayout.swipeSettleHold)
+            default:
+                break
+            }
         }
     }
 }

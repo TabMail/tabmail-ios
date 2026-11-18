@@ -37,6 +37,45 @@ extension ChatThreadViewLifecycleTests {
         ChatHorizontalPan.handle(pan, holding: id, changed: { _ in }, ended: { _, _ in })
     }
 
+    /// A tap whose event the test sets.
+    final class FreezeTap: UITapGestureRecognizer {
+        var event: UIGestureRecognizer.State = .possible
+        override var state: UIGestureRecognizer.State {
+            get { event }
+            set { event = newValue }
+        }
+    }
+
+    @Test("A drag or tap that only closes an open swipe holds the freeze until the swipe has settled shut")
+    func closingHoldsTheFreeze() async throws {
+        let gate = PreviewFreezeGate.shared
+        #expect(!gate.isFrozen, "control: nothing holds the freeze")
+        // A closing drag: held from its first motion, through the let-go, until settled.
+        let open = ChatSwipeOpen()
+        open.open("unit-bubble", frame: .zero)
+        let closer = ChatSwipeCloser.Coordinator(open: open)
+        let pan = FreezePan()
+        pan.event = .began
+        closer.handle(pan)
+        #expect(open.id == nil, "the drag closed it")
+        #expect(gate.isFrozen, "the closing drag took the finger")
+        pan.event = .ended
+        closer.handle(pan)
+        #expect(gate.isFrozen, "let go, the swipe still settles shut")
+        try await Task.sleep(for: Self.settled)
+        #expect(!gate.isFrozen, "settled, the data goes through")
+
+        // A closing tap: held while the swipe settles shut.
+        open.open("unit-bubble", frame: .zero)
+        let tap = FreezeTap()
+        tap.event = .ended
+        closer.handle(tap)
+        #expect(open.id == nil, "the tap closed it")
+        #expect(gate.isFrozen, "held while the swipe settles shut")
+        try await Task.sleep(for: Self.settled)
+        #expect(!gate.isFrozen)
+    }
+
     /// Longer than a let-go swipe keeps holding.
     static var settled: Duration { ChatViewLayout.swipeSettleHold + .milliseconds(400) }
 
