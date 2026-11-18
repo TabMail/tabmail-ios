@@ -878,37 +878,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      `ChatReplyCompose.make(replyAllTo:)`); Send there sends and the Sent bubble replaces the ghost,
      and the field's words stay (the card is not a send from the field); Close goes back with the
      ghost still there. An edit or a Recompute in the card that is stored on the row posts
-     `.messageDataDidChange`, so the ghost under the card follows it; a thread reload that read
-     its rows before such a change never shows them: the change starts a new load and the existing
-     load generation drops every older one (`MessageDetailViewModel.applyRefresh`), for the
-     suggestion and the summary alike. The check compares a load's generation with
-     `threadLoadGeneration`, the newest load STARTED (it was `lastAppliedThreadGeneration`, the last
-     applied, which let an older load land after a newer change). Removed with it: an older load that
-     succeeded used to apply when the newest one threw; now a failed newest load is an internal read
-     failure, the screen keeps its last good state until the next load, and there is no retry layer
-     (`ThreadReloadOrderingTests.failedNewestKeepsTheScreen`). A thread row has ONE reader, the thread load (both
-     readers are local store reads): a change to a row on screen asks for a new load at once,
-     which fences the running scan in the same main-actor turn (it publishes nothing). At most one
-     scan runs (`MessageDetailViewModel.loadThreadMessagesAsync`): a load asked for while one runs
-     is fenced, and the fenced scan, when it returns or throws, starts exactly one replacement, so
-     one replacement covers a whole burst. A change to a
-     row not on screen is kept while a load is out; if that load returns it as a member, the
-     load publishes nothing and one more load reads it (a failure there keeps the last good
-     screen). A finished or failed load is not pending, so a summary written for another thread
-     starts no scan. The opened header is not in the load's results, so it keeps its own reader,
-     newest-only: a read that finishes after a newer read of it started does not replace it. Every
-     read that publishes it on open, refresh and refetch (`applyRefresh`, `loadBody`, `refetchBody`)
-     takes a ticket in that one order (`openedRefreshGeneration`), and one writer publishes it
-     (`publishOpened`; a source fence pins it): only the newest started read publishes, never an
-     older one, even onto an empty screen. A read that throws changes nothing shown; a confirmed
-     absence (the row is gone) takes the gone path. The body load goes on with its own read
-     either way. The automatic mark-read on open yields to the user's last explicit action: a
-     read-state gesture made after the open makes its late fallback do nothing (no write, no
-     intent) (`OpenedHeaderOrderingTests`). The two
-     readers are disjoint: a load whose opened email changed while it ran publishes nothing and
-     reads again (`ThreadReloadOrderingTests.openedEmailIsNeverAThreadRow`). Invariant
-     (`ThreadReloadOrderingTests.screenNeverGoesBack`, seeded random completion order): what is
-     on screen for a row never goes back to an older version. The card saves to a draft of its own
+     `.messageDataDidChange`, so the ghost under the card follows it. How a thread reload
+     is ordered against such a refresh (a reload that read its rows before the change and finishes
+     after it puts the older row back, #992) is not decided here: it is superseded by "one display
+     read at a time", fixed on its own. The card saves to a draft of its own
      (`Draft.separateReplyKey`, the parent in its tail as a reply key's): the chat ignores saved
      drafts, so a reply draft already saved for the email stays as it is in Drafts, never opened,
      saved over or deleted by the card; each card has its own key, so two cards' drafts never
