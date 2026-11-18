@@ -658,6 +658,12 @@ struct ChatReplyFieldTests {
         let header = try Self.source("TabMail/Views/Chat/ChatHeaderView.swift")
         #expect(Self.count(".background(.bar)", in: header) == 0)
         #expect(Self.count("Text(subject)", in: header) == 1, "the subject only in the thin line")
+        // The bar holds who the chat is with: the chat never hides it, not even while the opened
+        // pill has focus. The inbox and the email screen keep their rule.
+        let hide = ".toolbarVisibility(chatExpanded && chatInputFocused ? .hidden : .automatic, for: .navigationBar)"
+        #expect(Self.count(".toolbarVisibility(", in: chat) == 0)
+        #expect(Self.count(hide, in: try Self.source("TabMail/Views/Inbox/InboxView.swift")) == 1)
+        #expect(Self.count(hide, in: try Self.source("TabMail/Views/Message/MessageDetailView.swift")) == 1)
     }
 
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
