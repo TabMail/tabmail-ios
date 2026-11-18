@@ -174,13 +174,17 @@ struct EmailComposeTool: AgentTool, Sendable {
         // Each recipient keeps its role: `recipients` (recipients_json) is the To list, as in
         // TB's buildComposeEditChat, and Cc goes to ccRecipients (original_cc), so the AI
         // does not address a copied recipient as a primary one.
+        // Recipients may be mailbox text (`Name <email>`); give the AI the addresses and
+        // their names separately, as ComposeView's own edit context does.
+        let toEntry = RecipientEntry(to)
+        let ccEntry = RecipientEntry(cc)
         let context = ComposeEditContext(
-            recipients: to,
-            toRecipients: to,
-            ccRecipients: cc,
+            recipients: toEntry.addresses,
+            toRecipients: toEntry.addresses,
+            ccRecipients: ccEntry.addresses,
             bccRecipients: [],
-            toDisplayNames: [:],
-            ccDisplayNames: [:],
+            toDisplayNames: Self.displayNames(toEntry),
+            ccDisplayNames: Self.displayNames(ccEntry),
             bccDisplayNames: [:],
             senderName: account?.displayName ?? "",
             senderEmail: account?.emailAddress ?? "",
@@ -211,9 +215,19 @@ struct EmailComposeTool: AgentTool, Sendable {
 
     // MARK: - Helpers
 
+    /// Display names by address, for the entry's recipients that carry one.
+    static func displayNames(_ entry: RecipientEntry) -> [String: String] {
+        var names: [String: String] = [:]
+        for recipient in entry.recipients {
+            if let name = recipient.name, !name.isEmpty { names[recipient.address] = name }
+        }
+        return names
+    }
+
     /// Parse a JSON value as a string array.
-    /// Handles: array of strings, array of `{"email": "..."}` objects (tool schema format),
-    /// or a single string. Extracts the `email` field from object items.
+    /// Handles: array of strings, array of `{"name": "...", "email": "..."}` objects (tool
+    /// schema format), or a single string. An object item becomes `Name <email>` when it
+    /// carries a name, else the bare `email`.
     static func parseStringArray(_ value: JSONValue?) -> [String]? {
         guard let value else { return nil }
         switch value {
@@ -221,7 +235,16 @@ struct EmailComposeTool: AgentTool, Sendable {
             let strings = arr.compactMap { item -> String? in
                 if case .string(let s) = item { return s }
                 if case .dictionary(let dict) = item,
-                   case .string(let email) = dict["email"], !email.isEmpty { return email }
+                   case .string(let email) = dict["email"], !email.isEmpty {
+                    // Keep the display name the model gave, as TB's compose draft does
+                    // (`name <email>`), rendered as a mailbox `RecipientEntry` reads back.
+                    var name: String?
+                    if case .string(let n) = dict["name"] {
+                        let trimmed = n.trimmingCharacters(in: .whitespacesAndNewlines)
+                        name = trimmed.isEmpty ? nil : trimmed
+                    }
+                    return RecipientEntry.text(name: name, address: email)
+                }
                 return nil
             }
             return strings.isEmpty ? nil : strings

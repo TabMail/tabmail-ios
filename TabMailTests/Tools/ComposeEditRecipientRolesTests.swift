@@ -104,6 +104,25 @@ struct ComposeEditRecipientRolesTests {
         expectBccNotToOrCc(contexts)
     }
 
+    @Test("email_compose: recipient display names reach the edit request with bare addresses")
+    func composeKeepsDisplayNames() async throws {
+        let (ctx, _, _, router) = try makeContext()
+        let tool = EmailComposeTool(context: ctx)
+        let contexts = try await captureEditContexts(router: router) {
+            try await tool.execute(arguments: [
+                "recipients": .array([.dictionary(["name": .string("Sam Lee"), "email": .string(Self.primary)])]),
+                "cc": .array([.dictionary(["name": .string("Pat Kim"), "email": .string(Self.copied)])]),
+                "request": .string("Ask about moving the offsite to Friday"),
+            ])
+        }
+        #expect(contexts.count == 1)
+        guard contexts.count == 1 else { return }
+        #expect(contexts[0].toRecipients == [Self.primary])
+        #expect(contexts[0].ccRecipients == [Self.copied])
+        #expect(contexts[0].toDisplayNames == [Self.primary: "Sam Lee"])
+        #expect(contexts[0].ccDisplayNames == [Self.copied: "Pat Kim"])
+    }
+
     @Test("email_forward: To Sam, Cc Pat, Bcc Lee reaches the edit request as To Sam, Cc Pat")
     func forwardKeepsCcAsCc() async throws {
         let (ctx, db, translator, router) = try makeContext()

@@ -21,14 +21,34 @@ struct EmailComposeToolParseTests {
         #expect(result == ["a@b.com", "c@d.com"])
     }
 
-    @Test("Array of objects with 'email' key extracts emails")
-    func arrayOfEmailObjects() {
+    /// Re-scoped (issue 1015): this test was "Array of objects with 'email' key extracts
+    /// emails" and expected `["x@y.com", "a@b.com"]`, which blessed dropping the name.
+    @Test("Array of {name, email} objects keeps each address and its display name")
+    func arrayOfEmailObjects() throws {
         let value: JSONValue = .array([
             .dictionary(["email": .string("x@y.com"), "name": .string("X Y")]),
             .dictionary(["email": .string("a@b.com")])
         ])
-        let result = EmailComposeTool.parseStringArray(value)
-        #expect(result == ["x@y.com", "a@b.com"])
+        let result = try #require(EmailComposeTool.parseStringArray(value))
+        let entry = RecipientEntry(result)
+        #expect(entry.leftovers.isEmpty)
+        #expect(entry.addresses == ["x@y.com", "a@b.com"])
+        #expect(entry.recipients.map(\.name) == ["X Y", nil])
+        #expect(result[1] == "a@b.com")
+    }
+
+    @Test("A tool recipient's display name reaches the compose draft card")
+    func nameReachesDraftCard() throws {
+        let value: JSONValue = .array([
+            .dictionary(["name": .string("Lee, Sam"), "email": .string("sam@example.com")]),
+            .dictionary(["name": .string(""), "email": .string("pat@example.com")]),
+        ])
+        let result = try #require(EmailComposeTool.parseStringArray(value))
+        // ComposeView fills a prefilled field exactly this way (`prefillTo` -> fieldState).
+        let field = ComposeDraftGuards.fieldState(RecipientEntry(result))
+        #expect(field.tokens == ["sam@example.com", "pat@example.com"])
+        #expect(field.rejected.isEmpty)
+        #expect(field.displayNames == ["sam@example.com": "Lee, Sam"])
     }
 
     @Test("Single string returns array with one element")
