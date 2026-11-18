@@ -183,10 +183,20 @@ final class MessageDetailViewModel {
     /// new run for such a change). When the newest run THROWS, nothing applies
     /// until the next run (a later merge, refresh or reopen).
     @ObservationIgnored private var threadLoadGeneration = 0
-    /// Generation of the last `loadThreadMessagesAsync` result actually
-    /// assigned to `threadMessages`: below `threadLoadGeneration` while a run
-    /// is still out (`applyRefresh` reads it so). See `threadLoadGeneration`.
-    @ObservationIgnored private var lastAppliedThreadGeneration = 0
+    /// True from the start of the newest `loadThreadMessagesAsync` run until it
+    /// ends (applied, unchanged, discarded under a preview freeze, or thrown).
+    /// A finished or failed run is not pending, so a row change after it never
+    /// starts another scan.
+    @ObservationIgnored private var threadLoadInFlight = false
+    /// Rows changed while the newest run was out that were not on screen: the
+    /// run may have read them before the change. When it applies, a member in
+    /// this set starts one more run; any other id is dropped (another thread).
+    @ObservationIgnored private var changedDuringThreadLoad: Set<String> = []
+    /// Newest single-row read started per row (`applyRefresh`), keyed by the
+    /// opened header's key or the thread row's id. A read that finishes after a
+    /// newer one for the same row started is dropped, so an older copy never
+    /// lands over a newer one.
+    @ObservationIgnored private var rowRefreshGeneration: [String: Int] = [:]
 
     /// Bubble ids the user moved IN PLACE via `updateThreadMessageFolder`
     /// (archive/delete/move keeps the card visible showing its new location
@@ -845,18 +855,28 @@ final class MessageDetailViewModel {
     /// same logic can be replayed when preview-freeze is released.
     @MainActor
     private func applyRefresh(for updatedId: String) async {
-        // A thread load running now read its rows before this change: it may hold the row's
-        // older copy (a Recompute or a summary written after it read). A new load reads after
-        // the change, and the generation check drops every load started before it, so an older
-        // copy never comes back. The new load also brings the thread's members.
-        if threadLoadGeneration > lastAppliedThreadGeneration, message != nil {
-            loadThreadMessagesAsync()
-        }
+        // A thread load running now may have read this row before the change (a Recompute or a
+        // summary written after it read). For a row on screen a new load starts, which reads
+        // after the change; the generation check drops every older load. A row not on screen
+        // may be a member the running load is about to bring, so it is kept until that load
+        // returns its members. Nothing runs when no load is out.
         let originalId = self.messageId
+        let isOpened = updatedId == originalId || updatedId == self.message?.id
+        if threadLoadInFlight, message != nil {
+            if isOpened || threadMessages.contains(where: { $0.id == updatedId }) {
+                loadThreadMessagesAsync()
+            } else {
+                changedDuringThreadLoad.insert(updatedId)
+            }
+        }
         // Update main message if it matches
-        if updatedId == originalId || updatedId == self.message?.id {
+        if isOpened {
             let rid = self.resolvedId
-            if var updated = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) }) {
+            let rowKey = "opened:" + rid
+            let ticket = (rowRefreshGeneration[rowKey] ?? 0) + 1
+            rowRefreshGeneration[rowKey] = ticket
+            if var updated = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: rid) }),
+               rowRefreshGeneration[rowKey] == ticket {
                 // Freeze re-check at the mutation site: a preview can begin
                 // during the awaited read above. Re-buffer instead of mutating
                 // @Observable state under the frozen gate.
@@ -872,7 +892,11 @@ final class MessageDetailViewModel {
         // Update thread message if it matches (fixes "Analyzing..." stuck forever
         // when AI completes after thread detection snapshot was taken)
         if self.threadMessages.contains(where: { $0.id == updatedId }) {
-            if var updated = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: updatedId) }) {
+            let rowKey = "member:" + updatedId
+            let ticket = (rowRefreshGeneration[rowKey] ?? 0) + 1
+            rowRefreshGeneration[rowKey] = ticket
+            if var updated = try? await self.dbPool.read({ db in try MessageHeader.fetchOne(db, key: updatedId) }),
+               rowRefreshGeneration[rowKey] == ticket {
                 if PreviewFreezeGate.shared.isFrozen {
                     self.pendingRefreshIds.insert(updatedId)
                     return
@@ -2517,6 +2541,9 @@ final class MessageDetailViewModel {
         guard let msg = message else { return }
         threadLoadGeneration += 1
         let generation = threadLoadGeneration
+        // This run reads after every change recorded so far.
+        threadLoadInFlight = true
+        changedDuringThreadLoad.removeAll()
         if DebugModeManager.isLoggingEnabled() {
             let refsStr = msg.references.isEmpty ? "[]" : "[\(msg.references.joined(separator: ", "))]"
             BackgroundSyncLogger.logDebug("[ThreadDebug] Finding related for: id=\(msg.id.prefix(40)) rfc822=\(msg.rfc822MessageId ?? "nil") inReplyTo=\(msg.inReplyTo ?? "nil") threadId=\(msg.threadId ?? "nil") computedThreadId=\(msg.computedThreadId) references=\(refsStr) folder=\(msg.folderPath)")
@@ -2578,14 +2605,18 @@ final class MessageDetailViewModel {
                 // bubbles it just populated; and a run that read before a row
                 // changed would put that row's older copy back (`applyRefresh`).
                 guard generation == self.threadLoadGeneration else { return }
-                // Empty→empty is a no-op for DISPLAY — but still record the
-                // generation: this run successfully observed "no related
-                // messages", and a STALE older in-flight run with a
-                // pre-removal non-empty snapshot must not pass the guard
-                // afterwards and resurrect bubbles for deleted messages.
+                // The newest run is back: nothing is pending. A row changed during it that
+                // turns out to be a member may be older in these results, so one more run
+                // reads it; changes to other threads' rows are dropped.
+                self.threadLoadInFlight = false
+                let rerun = !self.changedDuringThreadLoad.isDisjoint(with: results.map(\.id))
+                self.changedDuringThreadLoad.removeAll()
+                defer { if rerun { self.loadThreadMessagesAsync() } }
+                // Empty→empty is a no-op for DISPLAY: this run observed "no
+                // related messages", and an older run is already dropped by
+                // the newest-only guard above.
                 if results.isEmpty && self.threadMessages.isEmpty
                     && copies.isEmpty && self.threadCopies.isEmpty {
-                    self.lastAppliedThreadGeneration = generation
                     self.hasLoadedThread = true
                     return
                 }
@@ -2646,18 +2677,19 @@ final class MessageDetailViewModel {
                 // the thread view for nothing (merges fire 2 posts on every
                 // push/foreground/boot). Full-value equality — never a field
                 // subset, which could silently drop a real thread update.
-                // Still record the generation so a later stale run can't apply
-                // over this confirmed-current set.
                 guard overlayed != self.threadMessages else {
-                    self.lastAppliedThreadGeneration = generation
                     self.hasLoadedThread = true
                     return
                 }
                 self.threadMessages = overlayed
                 self.recomputeThreadSplit()
-                self.lastAppliedThreadGeneration = generation
                 self.hasLoadedThread = true
             } catch {
+                // A failed newest run is not pending: later row changes start no scan.
+                if generation == self.threadLoadGeneration {
+                    self.threadLoadInFlight = false
+                    self.changedDuringThreadLoad.removeAll()
+                }
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[ThreadDebug] Failed to load thread messages: \(error)")
                 }

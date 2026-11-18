@@ -35,7 +35,7 @@ enum Palette {
     static let accentColor = Color(light: Color(hex: 0x0060DF), dark: Color(hex: 0x0A84FF))
 
     // MARK: - Chat view
-    /// The AI Suggestion ghost (V1a): a faded accent fill, a dashed accent outline, dark-blue text.
+    /// The AI Suggestion ghost: a faded accent fill, a dashed accent outline, dark-blue text.
     static let chatSuggestionFill = Color(light: Color(hex: 0x0060DF).opacity(0.14), dark: Color(hex: 0x0A84FF).opacity(0.22))
     static let chatSuggestionStroke = Color(light: Color(hex: 0x0060DF).opacity(0.75), dark: Color(hex: 0x0A84FF).opacity(0.85))
     static let chatSuggestionText = Color(light: Color(hex: 0x1D3F73), dark: Color(hex: 0xD6E6FB))

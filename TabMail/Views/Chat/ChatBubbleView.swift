@@ -172,7 +172,7 @@ struct ChatBubbleView: View {
 
 /// The ready AI Suggestion: a ghost of the user's next message, where it lands once sent
 /// (the newest outgoing place, under the last email). A dashed accent outline on a faded accent
-/// fill, dark-blue text (V1a, `Palette.chatSuggestion*`), and "AI Suggestion · Tap to use" under it, so it reads plainly as not sent. A tap
+/// fill, dark-blue text (`Palette.chatSuggestion*`), and "AI Suggestion · Tap to use" under it, so it reads plainly as not sent. A tap
 /// on the bubble or its caption opens the compose card with the suggestion written out; nothing is sent from here.
 struct ChatSuggestionBubble: View {
     /// The suggestion's text version (`MessageHeader.replyTextMessage`).

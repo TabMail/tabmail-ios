@@ -864,8 +864,7 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
 16. **The AI Suggestion as a ghost bubble (amendment 2026-11-18; supersedes the parts of decisions
    10 and 13 that put the ready reply in the field).** The ready reply no longer sits in the reply
    field. It shows as a ghost of the user's next message, where the reply lands once sent (after the
-   last email and any outbox bubble): `ChatSuggestionBubble`, look V1a (owner 2026-11-18, replacing V1b's
-   clear bubble): a dashed 1.5 pt accent outline (75% light, 85% dark) on a faded accent fill (14%
+   last email and any outbox bubble): `ChatSuggestionBubble`, drawn as a filled bubble, not a clear one: a dashed 1.5 pt accent outline (75% light, 85% dark) on a faded accent fill (14%
    light, 22% dark) with dark-blue text (`Palette.chatSuggestionStroke`, `chatSuggestionFill`,
    `chatSuggestionText`; `ChatViewLayout.suggestionStrokeWidth`, `suggestionDash`), with "AI
    Suggestion · Tap to use" under it. The name is "AI Suggestion", the one compose's suggestion box
@@ -887,7 +886,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      applied, which let an older load land after a newer change). Removed with it: an older load that
      succeeded used to apply when the newest one threw; now a failed newest load is an internal read
      failure, the screen keeps its last good state until the next load, and there is no retry layer
-     (`ThreadReloadOrderingTests.failedNewestKeepsTheScreen`). The card saves to a draft of its own
+     (`ThreadReloadOrderingTests.failedNewestKeepsTheScreen`). Only a load still out restarts:
+     a change to a row on screen starts a new load; a change to a row not on screen is kept until
+     the running load returns its members, and starts one more load only if that row is one of
+     them. A finished or failed load is not pending, so a summary written for another thread
+     starts no scan. A single-row refresh is newest-only too: per row (the opened header, each
+     thread row) a read that finishes after a newer read of that row started is dropped. The card saves to a draft of its own
      (`Draft.separateReplyKey`, the parent in its tail as a reply key's): the chat ignores saved
      drafts, so a reply draft already saved for the email stays as it is in Drafts, never opened,
      saved over or deleted by the card; each card has its own key, so two cards' drafts never
