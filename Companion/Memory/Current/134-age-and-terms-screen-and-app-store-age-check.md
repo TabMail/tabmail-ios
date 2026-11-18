@@ -89,7 +89,9 @@ ADR-034.
   major.minor makes no unasked call and returns `.offerBanner`; RootView shows
   `SignificantUpdateBanner` (SignInAgainBanner shape, above `MailNavigationView` beside
   `DeletionBanner`), whose tap calls Apple through the same marker path (`userAsked: true`). A marker
-  for another version is ignored. Killing the app mid-notice also yields the banner (accepted). The
+  for another version is ignored. The tap asks `isRegulated` first; where the rules no longer apply
+  the marker clears and nothing is shown or recorded (#972 rule). The banner state is RootView
+  `@State` set from the ZStack `.task`, so it appears when onboarding ends without a relaunch. Killing the app mid-notice also yields the banner (accepted). The
   marker is app state, not user data. Tests: `SignificantUpdateStuckNoticeTests`.
 
 Tests: `AgeAndTermsConsentTests`, `AppStoreAgeCheckSimulationTests` (simulated App Store answers),

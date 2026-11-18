@@ -273,7 +273,9 @@ enum AppStoreAgeCheck {
     /// A marker still set for THIS major.minor means an earlier notice never
     /// came back, so unless `userAsked` (the banner was tapped) Apple is not
     /// called and `.offerBanner` is returned. A marker for another version is
-    /// ignored. No time limit is involved.
+    /// ignored. A tap still asks whether the age rules apply first; where they
+    /// no longer do, the marker is cleared and nothing is shown or recorded.
+    /// No time limit is involved.
     @MainActor
     @discardableResult
     static func acknowledge(
@@ -305,7 +307,13 @@ enum AppStoreAgeCheck {
                 // fail to draw while its full-screen host takes every tap. The
                 // version is not recorded there, so a device the rules apply to
                 // later is still shown this version's notice.
-                guard try await isRegulated() else { return }
+                guard try await isRegulated() else {
+                    // The rules no longer apply (Apple Account removed, region
+                    // changed): a stuck notice is not offered again either.
+                    // Nothing is recorded, as above.
+                    if inProgress != nil { markInProgress(nil) }
+                    return .none
+                }
                 if try await requiresNotice() {
                     markInProgress(version)
                     defer { markInProgress(nil) }

@@ -428,6 +428,29 @@ struct SignificantUpdateStuckNoticeTests {
         await first.value
     }
 
+    /// The banner's tap asks whether the age rules still apply before Apple's
+    /// notice. Where they no longer do, the marker clears and the banner goes,
+    /// with nothing shown and nothing recorded (the #972 rule).
+    @Test func aTapWhereTheRulesNoLongerApplyClearsTheMarkerAndShowsNothing() async {
+        let store = Store()
+        store.acknowledged = "1.7"
+        store.inProgress = "1.8"
+        var regionAsked = 0
+        let outcome = await AppStoreAgeCheck.acknowledge(
+            acknowledged: store.acknowledged, current: "1.8.1",
+            inProgress: store.inProgress, userAsked: true,
+            isRegulated: { regionAsked += 1; return false }, requiresNotice: { true },
+            show: { store.shown.append($0) },
+            record: { store.acknowledged = $0 },
+            markInProgress: { store.inProgress = $0 }
+        )
+        #expect(regionAsked == 1, "the tap asks the rules question before any notice")
+        #expect(outcome == .none, "the banner is removed")
+        #expect(store.shown.isEmpty)
+        #expect(store.acknowledged == "1.7", "nothing recorded")
+        #expect(store.inProgress == nil, "the marker is cleared, so the next launch shows no banner")
+    }
+
     @Test func aFailedNoticeClearsTheMarker() async {
         struct Failure: Error {}
         let store = Store()
