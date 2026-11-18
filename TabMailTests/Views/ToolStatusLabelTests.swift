@@ -71,7 +71,7 @@ struct ToolStatusLabelTests {
             let call = calls.withLock { $0 += 1; return $0 }
             return .bytes(Data((call == 1 ? toolRound : answer).utf8), contentType: "text/event-stream", statusCode: 200)
         }
-        let client = BackendClient(llmSession: http.session)
+        let client = BackendClient(llmSession: http.session, isAIOff: { false })
         let events = Mutex<[CompletionsSSEEvent]>([])
         let request = CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil)
 

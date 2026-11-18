@@ -39,9 +39,15 @@ actor AIService {
     /// When true, allows the `search_web` server-side tool. Default: false (matching TB).
     static let webSearchEnabledKey = "privacy_web_search_enabled"
 
+    /// Whether AI is turned off (Settings → Opt Out of AI). Read live: `BackendClient`
+    /// checks it right before every AI request it sends.
+    static var isAIOff: Bool {
+        optOutStore.bool(forKey: optOutAllAIKey)
+    }
+
     /// Whether AI backend calls are disabled (privacy opt-out).
     var disableLLMCalls: Bool {
-        Self.optOutStore.bool(forKey: Self.optOutAllAIKey)
+        Self.isAIOff
     }
 
     /// Whether web search is enabled for the agent chat.
@@ -226,48 +232,19 @@ actor AIService {
 
     // MARK: - Tool-Enabled Completions (for chat, reply precompute, etc.)
 
-    /// Send a completions request with full tool execution support.
-    /// Used by features that need multi-turn tool loops (agent chat, reply precompute).
-    /// Summary/action classification continue using the simpler `sendCompletions` path.
+    /// Send a completions request with full tool execution support, bypassing the LLM
+    /// semaphore. Use for user-initiated calls (agent chat, inline edit) that should not
+    /// wait behind background AI processing.
     ///
     /// The `onSSEEvent` callback allows callers to observe server-side tool progress
-    /// (e.g., for displaying activity bubbles in the chat UI).
-    func sendWithTools(
-        messages: [CompletionsMessage],
-        disableTools: Bool = false,
-        onSSEEvent: BackendClient.SSEEventHandler? = nil,
-        invocation: ToolInvocation = .noninteractive
-    ) async throws -> CompletionsResponse {
-        guard !disableLLMCalls else {
-            return CompletionsResponse(assistant: nil, token_usage: nil, error: "AI calls disabled")
-        }
-
-        // `web_search_enabled` is stamped centrally by BackendClient.augmentRequestWithDefaults.
-        let request = CompletionsRequest(
-            messages: messages,
-            client_timezone: TimeZone.current.identifier,
-            disable_tools: disableTools ? true : nil
-        )
-
-        return try await backendClient.sendCompletionsWithTools(
-            request,
-            onSSEEvent: onSSEEvent,
-            invocation: invocation
-        )
-    }
-
-    /// Direct variant — bypasses the LLM semaphore. Use for user-initiated calls
-    /// (agent chat, inline edit) that should not wait behind background AI processing.
+    /// (e.g., for displaying activity bubbles in the chat UI). With AI turned off, the
+    /// backend client refuses each request with `AIOffError`, which reaches the caller.
     func sendWithToolsDirect(
         messages: [CompletionsMessage],
         disableTools: Bool = false,
         onSSEEvent: BackendClient.SSEEventHandler? = nil,
         invocation: ToolInvocation = .noninteractive
     ) async throws -> CompletionsResponse {
-        guard !disableLLMCalls else {
-            return CompletionsResponse(assistant: nil, token_usage: nil, error: "AI calls disabled")
-        }
-
         // `web_search_enabled` is stamped centrally by BackendClient.augmentRequestWithDefaults.
         let request = CompletionsRequest(
             messages: messages,
@@ -292,9 +269,6 @@ actor AIService {
         onSSEEvent: BackendClient.SSEEventHandler? = nil,
         invocation: ToolInvocation = .noninteractive
     ) async throws -> CompletionsResponse {
-        guard !disableLLMCalls else {
-            return CompletionsResponse(assistant: nil, token_usage: nil, error: "AI calls disabled")
-        }
-        return try await backendClient.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent, invocation: invocation)
+        try await backendClient.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent, invocation: invocation)
     }
 }

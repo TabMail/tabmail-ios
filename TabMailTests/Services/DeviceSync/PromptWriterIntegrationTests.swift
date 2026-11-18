@@ -108,6 +108,38 @@ struct PromptWriterIntegrationTests {
         }
     }
 
+    @Test("A manual compaction refused after its check is skipped as with AI off at the start, and the rules stay as they were")
+    func refusedCompactionIsSkipped() async {
+        quiet()
+        await withAIEnabled {
+            let tag = PromptStoreTestCleanup.tag()
+            #expect(await store.edit("writer test edit") { try $0.addBullet(tag, to: .archiveRules) } == .saved)
+            let backend = Backend(patch("ADD\ndelete\n\(tag) merged"))
+            // The entry check reads the setting on; the backend client finds it off when it would send.
+            let off = AIService(backendClient: BackendClient(llmSession: backend.http.session, isAIOff: { true }))
+            let before = persisted(.action)
+            #expect(before.contains(tag))
+
+            let result = await off.compactActionRulesNow()
+            guard case .skipped(let reason) = result else {
+                Issue.record("not skipped: \(result)")
+                await PromptStoreTestCleanup.remove(tag: tag, from: store)
+                return
+            }
+            #expect(reason == "AI is disabled")
+            #expect(persisted(.action) == before, "the rules are unchanged")
+            #expect(backend.http.recordedCalls().isEmpty)
+
+            // Control: with the client finding AI on, the same compaction is sent and applied.
+            let on = AIService(backendClient: BackendClient(llmSession: backend.http.session, isAIOff: { false }))
+            if case .applied = await on.compactActionRulesNow() {} else { Issue.record("control not applied") }
+            #expect(backend.http.recordedCalls().count == 1)
+            #expect(persisted(.action).contains("\(tag) merged"))
+            await PromptStoreTestCleanup.remove(tag: "\(tag) merged", from: store)
+            await PromptStoreTestCleanup.remove(tag: tag, from: store)
+        }
+    }
+
     @Test("A knowledge base refinement persists the refined text it was given (DS-REFINE)")
     func knowledgeBaseRefinementPersists() async {
         quiet()
