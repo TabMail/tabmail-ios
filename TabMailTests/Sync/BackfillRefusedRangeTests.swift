@@ -7,20 +7,22 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-/// The IMAP UID walk and a range the server refuses:
+/// The IMAP UID walk and a range it cannot load:
 /// - a range whose SEARCH is refused is asked at most once per worker in a
 ///   walk, the walk moves on and loads every other range, the range is never
 ///   claimed (the cursor stays above it, the folder does not complete), and
 ///   the next call asks it again;
-/// - a range whose FETCH times out is retried smaller, never at its own size,
-///   down to one UID, which is then left for the next call;
-/// - while the cc/bcc fill is done, a walk does not FETCH a UID the folder
-///   already stores under the walk's epoch; while it is due, it does (the
-///   FETCH fills the stored rows' cc/bcc), and the choice is read once per walk.
+/// - a range whose SEARCH drops the connection each time ends the workers
+///   that ask it, stays pending, and declines its folder for the rest of the
+///   call, so the call ends and the other folders are walked; the next call
+///   asks it again;
+/// - a range whose FETCH times out (the client's own command timeout, as
+///   production meets it) is retried smaller, never at its own size, down to
+///   one UID, which is then left for the next call.
 ///
-/// `.serialized, .processGlobalState` — replaces `AppDatabase.shared`, writes
-/// the `ccBccBackfillDone` default, binds a listening socket via `FakeIMAPServer`.
-@Suite("Backfill walk — a refused range is left for the next call, and stored UIDs are not fetched again", .serialized, .processGlobalState)
+/// `.serialized, .processGlobalState` — replaces `AppDatabase.shared`, binds a
+/// listening socket via `FakeIMAPServer`.
+@Suite("Backfill walk — a range that cannot load is left for the next call", .serialized, .processGlobalState)
 struct BackfillRefusedRangeTests {
     private typealias F = BackfillPageWalkFixture
 
@@ -31,7 +33,9 @@ struct BackfillRefusedRangeTests {
     private static let refusedRange = 2
     /// How long a call may take before the test calls it a spin.
     private static let spinBoundSeconds: TimeInterval = 15
-    private static let ccFlagKey = "ccBccBackfillDone"
+    /// SwiftMail's deadline for a header FETCH (`FetchMessageInfoCommand.timeoutSeconds`):
+    /// the time each FETCH timeout in these tests costs.
+    private static let fetchTimeoutSeconds: TimeInterval = 10
     /// A refusal whose words read like a connection error, as some servers word it.
     private static let refusalText = "command failed: search timed out"
     /// `FakeIMAPServer.defaultCapabilities` minus `UIDPLUS`, as in `BackfillInsertFailureTests`.
@@ -82,36 +86,51 @@ struct BackfillRefusedRangeTests {
 
         var folderId: String { "\(account.id):\(path)" }
         func row() throws -> Folder { try #require(try F.folder(account.id, path, pool: pool)) }
-        func local() throws -> Set<Int> {
+        func row(_ path: String) throws -> Folder { try #require(try F.folder(account.id, path, pool: pool)) }
+        func local() throws -> Set<Int> { try local(path) }
+        func local(_ path: String) throws -> Set<Int> {
             Set(try F.messageIds(account.id, path, pool: pool).compactMap { Int($0) })
         }
     }
 
-    private static func makeWorld(accountId: String, pool: DatabasePool, oneWorker: Bool = false) async throws -> World {
+    /// A stamped, non-favourite folder the walk resumes at `cursor`.
+    private static func insertWalkFolder(_ db: Database, path: String, accountId: String, cursor: Int) throws {
+        var folder = Folder(name: path, path: path, role: .custom, accountId: accountId)
+        folder.isFavorite = false
+        folder.backfillComplete = false
+        folder.backfillUidCursor = cursor
+        folder.lastKnownUidValidity = epoch
+        try folder.insert(db)
+    }
+
+    /// The walked folder holds `uids` (default: `serverUIDs`) and resumes at
+    /// `startCursor` (default: the top of `rangeCount` ranges). `otherFolder`,
+    /// when given, is a second walked folder with its own UIDs, resumed at its
+    /// highest UID.
+    private static func makeWorld(
+        accountId: String, pool: DatabasePool,
+        uids custom: [Int]? = nil, startCursor: Int? = nil,
+        otherFolder: (path: String, uids: [Int])? = nil
+    ) async throws -> World {
         let path = "Receipts"
         let engine = SyncEngine()
         let chunk = await engine.getBackfillProfile().backfillChunkSize
-        let uids = serverUIDs(chunk: chunk)
-        let server = FakeIMAPServer(
-            capabilities: capabilities,
-            mailboxes: ["INBOX": [], path: uids.map(message(uid:))])
+        let uids = custom ?? serverUIDs(chunk: chunk)
+        var mailboxes: [String: [FakeIMAPServer.Message]] = ["INBOX": [], path: uids.map(message(uid:))]
+        if let otherFolder { mailboxes[otherFolder.path] = otherFolder.uids.map(message(uid:)) }
+        let server = FakeIMAPServer(capabilities: capabilities, mailboxes: mailboxes)
         server.setUidValidity(epoch, for: path)
+        if let otherFolder { server.setUidValidity(epoch, for: otherFolder.path) }
         server.honorSearchUIDSetCriterion()
         try server.start()
         let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try await pool.write { db in
-            var folder = Folder(name: path, path: path, role: .custom, accountId: accountId)
-            folder.isFavorite = false
-            folder.backfillComplete = false
-            folder.backfillUidCursor = rangeCount * chunk
-            folder.lastKnownUidValidity = epoch
-            try folder.insert(db)
+            try Self.insertWalkFolder(db, path: path, accountId: accountId, cursor: startCursor ?? rangeCount * chunk)
+            if let otherFolder {
+                try Self.insertWalkFolder(db, path: otherFolder.path, accountId: accountId,
+                                          cursor: otherFolder.uids.max() ?? 0)
+            }
         }
-        // One worker walks the ranges strictly top-down, for the tests whose
-        // check depends on the order of range decisions.
-        let limitKey = IMAPProvider.serverLimitDefaultsKey(host: "127.0.0.1", username: server.username)
-        if oneWorker { UserDefaults.standard.set(1, forKey: limitKey) }
-        defer { if oneWorker { UserDefaults.standard.removeObject(forKey: limitKey) } }
         let imap = IMAPProvider(
             host: "127.0.0.1", port: server.port, username: server.username, password: server.password,
             smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
@@ -123,41 +142,28 @@ struct BackfillRefusedRangeTests {
                      path: path, chunk: chunk, uids: uids)
     }
 
-    /// Stored rows for `uids`, written as the walk writes them under `epoch`
-    /// (nil: an unproven epoch, as an older build left them), with no cc.
-    private static func seedRows(_ world: World, uids: [Int], epoch: Int?) throws {
-        try FolderEpochTestFixture.insertHeaders(accountId: world.account.id, path: world.path, uids: uids, pool: world.pool)
-        let folderId = world.folderId
-        try world.pool.write { db in
-            for uid in uids {
-                try db.execute(sql: "UPDATE messageHeader SET observedUidValidity = ? WHERE folderId = ? AND messageId = ?",
-                               arguments: [epoch, folderId, "\(uid)"])
-            }
-        }
-    }
-
     private static func tearDown(_ world: World) {
         let imap = world.imap
         Task { try? await imap.disconnect() }
         world.server.stop()
     }
 
-    /// Run one backfill call; false when it had not ended by `spinBoundSeconds`
+    /// Run one backfill call; false when it had not ended by `bound` seconds
     /// (it is then cancelled, so the test can report the spin and go on).
-    private static func callEnds(_ world: World) async -> Bool {
+    private static func callEnds(_ world: World, bound: TimeInterval = spinBoundSeconds) async -> Bool {
         let engine = world.engine, account = world.account
         let call = Task { await engine.runBackfillWalk(account: account, deadline: F.deadline()) }
-        return await callEnds(call)
+        return await callEnds(call, bound: bound)
     }
 
-    /// Whether `call` ended by itself within `spinBoundSeconds`. When the timer
+    /// Whether `call` ended by itself within `bound` seconds. When the timer
     /// wins, the walk is cancelled INSIDE the group (its workers stop on
     /// cancellation), so the group can drain and the test reports the spin.
-    private static func callEnds(_ call: Task<Bool, Never>) async -> Bool {
+    private static func callEnds(_ call: Task<Bool, Never>, bound: TimeInterval = spinBoundSeconds) async -> Bool {
         await withTaskGroup(of: Bool.self) { group in
             group.addTask { _ = await call.value; return true }
             group.addTask {
-                try? await Task.sleep(for: .seconds(spinBoundSeconds))
+                try? await Task.sleep(for: .seconds(bound))
                 call.cancel()
                 return false
             }
@@ -200,249 +206,174 @@ struct BackfillRefusedRangeTests {
         commands.map(fetchedUIDs).filter { !$0.isEmpty }
     }
 
-    private static func withCcFlag<T>(_ value: Bool, _ body: () async throws -> T) async rethrows -> T {
-        let saved = UserDefaults.standard.object(forKey: ccFlagKey)
-        defer { UserDefaults.standard.set(saved, forKey: ccFlagKey) }
-        UserDefaults.standard.set(value, forKey: ccFlagKey)
-        return try await body()
-    }
-
     // MARK: - A refused SEARCH
 
     @Test("A range whose SEARCH is always refused is left for the next call; every other range loads")
     func refusedSearchRangeIsLeftForTheNextCall() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try await Self.withCcFlag(true) {
-            let world = try await Self.makeWorld(accountId: "refused-search", pool: pool)
-            defer { Self.tearDown(world) }
-            let refused = Self.range(Self.refusedRange, chunk: world.chunk)
-            world.server.failEveryCommand(
-                containing: "UID \(refused.lowerBound):\(refused.upperBound)", message: Self.refusalText)
+        let world = try await Self.makeWorld(accountId: "refused-search", pool: pool)
+        defer { Self.tearDown(world) }
+        let refused = Self.range(Self.refusedRange, chunk: world.chunk)
+        world.server.failEveryCommand(
+            containing: "UID \(refused.lowerBound):\(refused.upperBound)", message: Self.refusalText)
 
-            let ended = await Self.callEnds(world)
-            #expect(ended, "the call did not end: the walk kept asking the refused range")
-            let workers = await world.imap.poolMaxConnections()
-            let asked = world.server.recordedCommands().filter { Self.isSearch($0, of: refused) }.count
-            #expect(asked >= 1 && asked <= workers,
-                    "the call asked the refused range \(asked) times with \(workers) workers")
+        let ended = await Self.callEnds(world)
+        #expect(ended, "the call did not end: the walk kept asking the refused range")
+        let workers = await world.imap.poolMaxConnections()
+        let asked = world.server.recordedCommands().filter { Self.isSearch($0, of: refused) }.count
+        #expect(asked >= 1 && asked <= workers,
+                "the call asked the refused range \(asked) times with \(workers) workers")
 
-            let outside = world.uids.filter { !refused.contains($0) }
-            let missing = Set(outside).subtracting(try world.local())
-            #expect(missing.isEmpty, "UIDs \(missing.sorted()) outside the refused range did not load")
-            let row = try world.row()
-            #expect(!row.backfillComplete, "the folder completed over a range that never loaded")
-            #expect((row.backfillUidCursor ?? 0) >= refused.upperBound,
-                    "the cursor \(String(describing: row.backfillUidCursor)) moved past the refused range")
-            let claim = F.uidPositionClaimsMissingMail(row, local: try world.local(), server: world.uids)
-            #expect(claim == nil, "\(claim ?? "")")
+        let outside = world.uids.filter { !refused.contains($0) }
+        let missing = Set(outside).subtracting(try world.local())
+        #expect(missing.isEmpty, "UIDs \(missing.sorted()) outside the refused range did not load")
+        let row = try world.row()
+        #expect(!row.backfillComplete, "the folder completed over a range that never loaded")
+        #expect((row.backfillUidCursor ?? 0) >= refused.upperBound,
+                "the cursor \(String(describing: row.backfillUidCursor)) moved past the refused range")
+        let claim = F.uidPositionClaimsMissingMail(row, local: try world.local(), server: world.uids)
+        #expect(claim == nil, "\(claim ?? "")")
 
-            // The next call asks it again, and it is still not claimed.
-            let before = world.server.recordedCommands().count
-            #expect(await Self.callEnds(world), "the second call did not end")
-            let askedAgain = world.server.recordedCommands().dropFirst(before).filter { Self.isSearch($0, of: refused) }.count
-            #expect(askedAgain >= 1, "the next call did not ask the refused range again")
-            #expect(!(try world.row()).backfillComplete)
-        }
+        // The next call asks it again, and it is still not claimed.
+        let before = world.server.recordedCommands().count
+        #expect(await Self.callEnds(world), "the second call did not end")
+        let askedAgain = world.server.recordedCommands().dropFirst(before).filter { Self.isSearch($0, of: refused) }.count
+        #expect(askedAgain >= 1, "the next call did not ask the refused range again")
+        #expect(!(try world.row()).backfillComplete)
     }
 
     @Test("A range whose SEARCH is refused once loads on the next call")
     func searchRefusedOnceLoadsOnTheNextCall() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try await Self.withCcFlag(true) {
-            let world = try await Self.makeWorld(accountId: "refused-search-once", pool: pool)
-            defer { Self.tearDown(world) }
-            let refused = Self.range(Self.refusedRange, chunk: world.chunk)
-            world.server.failNextCommand(
-                containing: "UID \(refused.lowerBound):\(refused.upperBound)", message: Self.refusalText)
+        let world = try await Self.makeWorld(accountId: "refused-search-once", pool: pool)
+        defer { Self.tearDown(world) }
+        let refused = Self.range(Self.refusedRange, chunk: world.chunk)
+        world.server.failNextCommand(
+            containing: "UID \(refused.lowerBound):\(refused.upperBound)", message: Self.refusalText)
 
-            #expect(await Self.callEnds(world))
-            #expect(!(try world.row()).backfillComplete, "precondition: the first call left the refused range")
-            #expect(await Self.callEnds(world))
-            #expect(try world.row().backfillComplete, "the folder did not complete once the range answered")
-            let missing = Set(world.uids).subtracting(try world.local())
-            #expect(missing.isEmpty, "UIDs \(missing.sorted()) never loaded")
-        }
+        #expect(await Self.callEnds(world))
+        #expect(!(try world.row()).backfillComplete, "precondition: the first call left the refused range")
+        #expect(await Self.callEnds(world))
+        #expect(try world.row().backfillComplete, "the folder did not complete once the range answered")
+        let missing = Set(world.uids).subtracting(try world.local())
+        #expect(missing.isEmpty, "UIDs \(missing.sorted()) never loaded")
+    }
+
+    // MARK: - A SEARCH that drops the connection
+
+    @Test("A range whose SEARCH drops the connection every time is left pending; the call ends, the other folder loads, and the next call asks again")
+    func searchThatDropsTheConnectionIsLeftForTheNextCall() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        // The other folder's one range (1...3) is far below the dropped one,
+        // so the drop never matches its SEARCH; its UIDs (and so its
+        // Message-IDs) are none of the walked folder's.
+        let other = (path: "Invoices", uids: [1, 3])
+        let world = try await Self.makeWorld(accountId: "dropped-search", pool: pool, otherFolder: other)
+        defer { Self.tearDown(world) }
+        let dropped = Self.range(Self.refusedRange, chunk: world.chunk)
+        world.server.killConnectionOnEveryCommand(containing: "UID \(dropped.lowerBound):\(dropped.upperBound)")
+
+        #expect(await Self.callEnds(world), "the call did not end: it kept walking the folder whose range drops the connection")
+        let workers = await world.imap.poolMaxConnections()
+        let asked = world.server.recordedCommands().filter { Self.isSearch($0, of: dropped) }.count
+        #expect(asked >= 1 && asked <= workers,
+                "the call asked the dropped range \(asked) times with \(workers) workers")
+
+        // The other folder was walked in the same call.
+        #expect(try world.local(other.path) == Set(other.uids), "the other folder did not load")
+        #expect(try world.row(other.path).backfillComplete, "the other folder did not complete")
+
+        // Nothing was skipped: the folder stands above the dropped range.
+        let row = try world.row()
+        #expect(!row.backfillComplete, "the folder completed over a range that never loaded")
+        #expect((row.backfillUidCursor ?? 0) >= dropped.upperBound,
+                "the cursor \(String(describing: row.backfillUidCursor)) moved past the dropped range")
+        let claim = F.uidPositionClaimsMissingMail(row, local: try world.local(), server: world.uids)
+        #expect(claim == nil, "\(claim ?? "")")
+
+        // The next call asks it again.
+        let before = world.server.recordedCommands().count
+        #expect(await Self.callEnds(world), "the second call did not end")
+        let askedAgain = world.server.recordedCommands().dropFirst(before).filter { Self.isSearch($0, of: dropped) }.count
+        #expect(askedAgain >= 1, "the next call did not ask the dropped range again")
+        #expect(!(try world.row()).backfillComplete)
+
+        // Once the link holds, the folder completes.
+        world.server.stopFailingCommands(containing: "UID \(dropped.lowerBound):\(dropped.upperBound)")
+        #expect(await Self.callEnds(world))
+        #expect(try world.row().backfillComplete, "the folder did not complete once the range answered")
+        let missing = Set(world.uids).subtracting(try world.local())
+        #expect(missing.isEmpty, "UIDs \(missing.sorted()) never loaded")
     }
 
     // MARK: - A FETCH that times out
+
+    /// Two UIDs in one range of two: a FETCH timeout splits it into two
+    /// one-UID ranges, the upper first. Small on purpose: every timeout costs
+    /// the client's full FETCH deadline.
+    private static let timeoutUIDs = [1, 2]
+    /// The highest of `timeoutUIDs`: the walk's start cursor, and the UID that
+    /// keeps timing out (the upper half is asked first).
+    private static let timeoutTop = 2
+
+    /// Hold the answer to `count` FETCHes naming `uid` past the client's
+    /// deadline, so the client's own command timeout (`IMAPError.timeout`)
+    /// ends each one: the first is the whole range's FETCH (its set written
+    /// `low:high` or `low,high`; both are held), the rest name `uid` alone.
+    private static func holdFetches(of uid: Int, count: Int, on server: FakeIMAPServer) {
+        let hold = fetchTimeoutSeconds * 2
+        let (low, high) = (timeoutUIDs.min() ?? uid, timeoutUIDs.max() ?? uid)
+        for fragment in ["FETCH \(low):\(high) ", "FETCH \(low),\(high) "] {
+            server.stallNextCommandWatchingClient(containing: fragment, seconds: hold)
+        }
+        for _ in 1..<count {
+            server.stallNextCommandWatchingClient(containing: "FETCH \(uid) ", seconds: hold)
+        }
+    }
 
     @Test("A range whose FETCH always times out shrinks to its one UID, which is left pending; the rest loads")
     func timedOutFetchShrinksToOneUID() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try await Self.withCcFlag(true) {
-            let world = try await Self.makeWorld(accountId: "fetch-timeout", pool: pool)
-            defer { Self.tearDown(world) }
-            let failing = Self.range(Self.refusedRange, chunk: world.chunk).lowerBound + world.chunk / 2
-            world.server.failEveryCommand(containing: "UID FETCH \(failing) ", message: "operation timed out")
+        let uids = Self.timeoutUIDs
+        let world = try await Self.makeWorld(
+            accountId: "fetch-timeout", pool: pool, uids: uids, startCursor: Self.timeoutTop)
+        defer { Self.tearDown(world) }
+        let failing = Self.timeoutTop
+        // Halving the range of two to one UID: two FETCHes name the failing UID.
+        let steps = Int(log2(Double(uids.count)).rounded(.up)) + 1
+        Self.holdFetches(of: failing, count: steps, on: world.server)
 
-            #expect(await Self.callEnds(world), "the call did not end: the walk kept retrying the range")
-            // Halving from the chunk to one UID takes log2(chunk) steps; each
-            // range in between is asked at most once per worker.
-            let workers = await world.imap.poolMaxConnections()
-            let steps = Int(log2(Double(world.chunk)).rounded(.up)) + 1
-            let tries = Self.fetches(world.server.recordedCommands()[...]).filter { $0.contains(failing) }.count
-            #expect(tries >= steps && tries <= steps * workers,
-                    "the failing UID was fetched \(tries) times; halving needs \(steps)")
-            let missing = Set(world.uids.filter { $0 != failing }).subtracting(try world.local())
-            #expect(missing.isEmpty, "UIDs \(missing.sorted()) did not load")
-            let row = try world.row()
-            #expect(!row.backfillComplete, "the folder completed over a message that never loaded")
-            #expect(row.backfillUidCursor == failing,
-                    "only the failing UID should stay pending: cursor \(String(describing: row.backfillUidCursor)), UID \(failing)")
-        }
+        #expect(await Self.callEnds(world, bound: Double(steps) * Self.fetchTimeoutSeconds + Self.spinBoundSeconds),
+                "the call did not end: the walk kept retrying the range")
+        let tries = Self.fetches(world.server.recordedCommands()[...]).filter { $0.contains(failing) }.count
+        #expect(tries == steps, "the failing UID was fetched \(tries) times; halving needs \(steps)")
+        #expect(try world.local() == Set(uids.filter { $0 != failing }), "the UID that did not time out did not load")
+        let row = try world.row()
+        #expect(!row.backfillComplete, "the folder completed over a message that never loaded")
+        #expect(row.backfillUidCursor == failing,
+                "only the failing UID should stay pending: cursor \(String(describing: row.backfillUidCursor)), UID \(failing)")
     }
 
     @Test("A range whose FETCH times out once loads when retried smaller")
     func fetchTimedOutOnceLoadsSmaller() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try await Self.withCcFlag(true) {
-            let world = try await Self.makeWorld(accountId: "fetch-timeout-once", pool: pool)
-            defer { Self.tearDown(world) }
-            let failing = Self.range(Self.refusedRange, chunk: world.chunk).lowerBound + world.chunk / 2
-            world.server.failNextCommand(containing: "UID FETCH \(failing) ", message: "operation timed out")
+        let uids = Self.timeoutUIDs
+        let world = try await Self.makeWorld(
+            accountId: "fetch-timeout-once", pool: pool, uids: uids, startCursor: Self.timeoutTop)
+        defer { Self.tearDown(world) }
+        Self.holdFetches(of: Self.timeoutTop, count: 1, on: world.server)
 
-            #expect(await Self.callEnds(world))
-            #expect(try world.row().backfillComplete, "the folder did not complete after one timeout")
-            let missing = Set(world.uids).subtracting(try world.local())
-            #expect(missing.isEmpty, "UIDs \(missing.sorted()) never loaded")
-        }
-    }
-
-    // MARK: - Stored UIDs
-
-    /// A first call with the refused range loads the ranges below it; returns
-    /// the UIDs below the refused range.
-    private static func firstCallBelowRefusedRange(_ world: World) async throws -> [Int] {
-        let refused = range(refusedRange, chunk: world.chunk)
-        world.server.failEveryCommand(
-            containing: "UID \(refused.lowerBound):\(refused.upperBound)", message: Self.refusalText)
-        #expect(await callEnds(world))
-        let below = world.uids.filter { $0 < refused.lowerBound }
-        #expect(Set(below).isSubset(of: try world.local()), "precondition: the ranges below loaded")
-        return below
-    }
-
-    @Test("While the cc/bcc fill is done, the next call fetches no UID it already stores; a missing one is fetched alone")
-    func nextCallFetchesOnlyMissingUIDs() async throws {
-        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try await Self.withCcFlag(true) {
-            let world = try await Self.makeWorld(accountId: "stored-uids", pool: pool)
-            defer { Self.tearDown(world) }
-            let below = try await Self.firstCallBelowRefusedRange(world)
-
-            // Second call: everything below is stored, so nothing is fetched.
-            var before = world.server.recordedCommands().count
-            #expect(await Self.callEnds(world))
-            let fetched = Self.fetches(world.server.recordedCommands().dropFirst(before)).reduce(into: Set<Int>()) { $0.formUnion($1) }
-            #expect(fetched.isEmpty, "the call fetched stored UIDs \(fetched.sorted())")
-
-            // Control: one row goes missing; the next call fetches exactly it.
-            let gone = try #require(below.first)
-            let folderId = world.folderId
-            _ = try await pool.write { db in
-                try MessageHeader.filter(Column("folderId") == folderId && Column("messageId") == "\(gone)").deleteAll(db)
-            }
-            before = world.server.recordedCommands().count
-            #expect(await Self.callEnds(world))
-            let refetched = Self.fetches(world.server.recordedCommands().dropFirst(before)).reduce(into: Set<Int>()) { $0.formUnion($1) }
-            #expect(refetched == [gone], "the call fetched \(refetched.sorted()); only \(gone) was missing")
-            #expect(try world.local().contains(gone))
-        }
-    }
-
-    @Test("While the cc/bcc fill is due, the walk fetches stored rows and fills their cc in the database and the search index")
-    func ccFillStillFetchesStoredRows() async throws {
-        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try await Self.withCcFlag(false) {
-            let world = try await Self.makeWorld(accountId: "cc-fill", pool: pool)
-            defer { Self.tearDown(world) }
-            // Stored rows of the walk's own epoch with no cc, indexed with none:
-            // the rows a skip would leave unfilled.
-            let stored = world.uids
-            try Self.seedRows(world, uids: stored, epoch: Self.epoch)
-            let keys = stored.map { ContentKey(rawValue: "\(world.folderId):\($0)") }
-            let records = stored.map { uid in
-                FTSHeaderRecord(contentKey: ContentKey(rawValue: "\(world.folderId):\(uid)"),
-                                headerId: "\(world.folderId):\(uid)", messageId: "\(uid)", subject: "cc fill \(uid)",
-                                from: "sender@example.com", to: "recipient@example.com", cc: "", bcc: "",
-                                dateMs: Int64(Date().timeIntervalSince1970 * 1000))
-            }
-            defer { Task { try? await SearchIndex.shared.removeMessages(contentKeys: keys) } }
-            _ = try await SearchIndex.shared.indexHeaders(records)
-            let byCc = { try await SearchIndex.shared.keywordSearch(query: "cc:copied", folderIds: [world.folderId]) }
-            #expect(try await byCc().isEmpty, "precondition: no stored row is indexed with a cc")
-
-            #expect(await Self.callEnds(world))
-            let ccs = try await pool.read { db in
-                try MessageHeader.filter(Column("folderId") == world.folderId).fetchAll(db)
-            }.reduce(into: [Int: String]()) { $0[Int($1.messageId) ?? 0] = $1.cc }
-            for uid in stored {
-                #expect((ccs[uid] ?? "").contains("copied-\(uid)@example.com"), "UID \(uid): cc not filled in the database")
-            }
-            let indexed = Set(try await byCc().map(\.contentKey))
-            #expect(indexed == Set(keys), "cc filled in the search index for \(indexed.count) of \(keys.count) rows")
-        }
-    }
-
-    @Test("While the cc/bcc fill is done, a stored row of an unproven epoch is fetched again; one of the walk's epoch is not")
-    func onlyRowsOfTheWalksEpochCountAsStored() async throws {
-        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try await Self.withCcFlag(true) {
-            let world = try await Self.makeWorld(accountId: "stored-epoch", pool: pool)
-            defer { Self.tearDown(world) }
-            let unproven = world.uids[0], current = world.uids[1]
-            try Self.seedRows(world, uids: [unproven], epoch: nil)
-            try Self.seedRows(world, uids: [current], epoch: Self.epoch)
-            #expect(await Self.callEnds(world))
-            let fetched = Self.fetches(world.server.recordedCommands()[...]).reduce(into: Set<Int>()) { $0.formUnion($1) }
-            #expect(fetched.contains(unproven), "a row of an unproven epoch counted as stored")
-            #expect(!fetched.contains(current), "a row of the walk's epoch was fetched again")
-        }
-    }
-
-    @Test("The stored-UID choice is read once per walk: a flip mid-walk does not change it, and the next walk takes it")
-    func storedUIDChoiceIsSnapshotAtWalkStart() async throws {
-        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try await Self.withCcFlag(true) {
-            // One worker: the ranges are decided top-down, so the ranges below
-            // the first fetch are decided after the flip.
-            let world = try await Self.makeWorld(accountId: "stored-uids-snapshot", pool: pool, oneWorker: true)
-            defer { Self.tearDown(world) }
-            #expect(await world.imap.poolMaxConnections() == 1, "precondition: one walk worker")
-            let below = try await Self.firstCallBelowRefusedRange(world)
-
-            // The highest row below goes missing, so the second walk fetches it
-            // first; the flag flips to "due" just before that fetch lands.
-            let gone = try #require(below.max())
-            let folderId = world.folderId
-            _ = try await pool.write { db in
-                try MessageHeader.filter(Column("folderId") == folderId && Column("messageId") == "\(gone)").deleteAll(db)
-            }
-            let key = Self.ccFlagKey
-            SyncEngine.backfillWalkCheckpointHooksForTesting.withLock {
-                $0[.beforeInsertingFetchedChunk(folderId: folderId)] = { UserDefaults.standard.set(false, forKey: key) }
-            }
-            defer { _ = SyncEngine.backfillWalkCheckpointHooksForTesting.withLock { $0.removeValue(forKey: .beforeInsertingFetchedChunk(folderId: folderId)) } }
-            var before = world.server.recordedCommands().count
-            #expect(await Self.callEnds(world))
-            #expect(UserDefaults.standard.bool(forKey: key) == false, "precondition: the flag flipped during the walk")
-            let fetched = Self.fetches(world.server.recordedCommands().dropFirst(before)).reduce(into: Set<Int>()) { $0.formUnion($1) }
-            #expect(fetched == [gone], "the walk fetched \(fetched.sorted()); the flag flipped mid-walk changed its choice")
-
-            // The next walk takes the new value: the fill is due, so it fetches the stored rows.
-            before = world.server.recordedCommands().count
-            #expect(await Self.callEnds(world))
-            let next = Self.fetches(world.server.recordedCommands().dropFirst(before)).reduce(into: Set<Int>()) { $0.formUnion($1) }
-            #expect(next == Set(below), "the next walk fetched \(next.sorted()); with the fill due it fetches every stored row below")
-        }
+        #expect(await Self.callEnds(world, bound: Self.fetchTimeoutSeconds + Self.spinBoundSeconds))
+        let rangeFetches = Self.fetches(world.server.recordedCommands()[...]).filter { $0 == Set(uids) }.count
+        #expect(rangeFetches == 1, "precondition: the range's FETCH was sent once and timed out (sent \(rangeFetches) times)")
+        #expect(try world.row().backfillComplete, "the folder did not complete after one timeout")
+        let missing = Set(uids).subtracting(try world.local())
+        #expect(missing.isEmpty, "UIDs \(missing.sorted()) never loaded")
     }
 
     // MARK: - Several refused ranges, and no work reported for none done
@@ -451,27 +382,25 @@ struct BackfillRefusedRangeTests {
     func twoRefusedRangesAndAnIdleCall() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try await Self.withCcFlag(true) {
-            let world = try await Self.makeWorld(accountId: "two-refused", pool: pool)
-            defer { Self.tearDown(world) }
-            let high = Self.range(1, chunk: world.chunk), low = Self.range(3, chunk: world.chunk)
-            for r in [high, low] {
-                world.server.failEveryCommand(containing: "UID \(r.lowerBound):\(r.upperBound)", message: Self.refusalText)
-            }
-            let first = await Self.walkResult(world)
-            #expect(first == true, "the first call did work (it loaded the healthy ranges)")
-            let outside = world.uids.filter { !high.contains($0) && !low.contains($0) }
-            let missing = Set(outside).subtracting(try world.local())
-            #expect(missing.isEmpty, "UIDs \(missing.sorted()) outside the refused ranges did not load")
-            let row = try world.row()
-            #expect(!row.backfillComplete)
-            #expect((row.backfillUidCursor ?? 0) >= high.upperBound,
-                    "the cursor \(String(describing: row.backfillUidCursor)) is below the higher refused range")
-
-            // Nothing new: the same ranges are refused, everything else is stored.
-            let second = await Self.walkResult(world)
-            #expect(second == false, "a call that loaded nothing and kept the cursor reported work")
+        let world = try await Self.makeWorld(accountId: "two-refused", pool: pool)
+        defer { Self.tearDown(world) }
+        let high = Self.range(1, chunk: world.chunk), low = Self.range(3, chunk: world.chunk)
+        for r in [high, low] {
+            world.server.failEveryCommand(containing: "UID \(r.lowerBound):\(r.upperBound)", message: Self.refusalText)
         }
+        let first = await Self.walkResult(world)
+        #expect(first == true, "the first call did work (it loaded the healthy ranges)")
+        let outside = world.uids.filter { !high.contains($0) && !low.contains($0) }
+        let missing = Set(outside).subtracting(try world.local())
+        #expect(missing.isEmpty, "UIDs \(missing.sorted()) outside the refused ranges did not load")
+        let row = try world.row()
+        #expect(!row.backfillComplete)
+        #expect((row.backfillUidCursor ?? 0) >= high.upperBound,
+                "the cursor \(String(describing: row.backfillUidCursor)) is below the higher refused range")
+
+        // Nothing new: the same ranges are refused, everything else is stored.
+        let second = await Self.walkResult(world)
+        #expect(second == false, "a call that loaded nothing and kept the cursor reported work")
     }
 
     // MARK: - A FETCH that is too large
@@ -480,30 +409,28 @@ struct BackfillRefusedRangeTests {
     func payloadTooLargeSplitsAndLeavesOneUID() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        try await Self.withCcFlag(true) {
-            let world = try await Self.makeWorld(accountId: "payload", pool: pool)
-            defer { Self.tearDown(world) }
-            // The lowest range holds two UIDs, in different halves of it.
-            let lowest = Self.range(Self.rangeCount - 1, chunk: world.chunk)
-            let inRange = world.uids.filter { lowest.contains($0) }.sorted()
-            try #require(inRange.count == 2)
-            let (kept, tooLarge) = (inRange[0], inRange[1])
-            let message = "PayloadTooLargeError from the fixture"
-            world.server.failEveryCommand(containing: ",\(tooLarge) ", message: message)
-            world.server.failEveryCommand(containing: "FETCH \(tooLarge) ", message: message)
+        let world = try await Self.makeWorld(accountId: "payload", pool: pool)
+        defer { Self.tearDown(world) }
+        // The lowest range holds two UIDs, in different halves of it.
+        let lowest = Self.range(Self.rangeCount - 1, chunk: world.chunk)
+        let inRange = world.uids.filter { lowest.contains($0) }.sorted()
+        try #require(inRange.count == 2)
+        let (kept, tooLarge) = (inRange[0], inRange[1])
+        let message = "PayloadTooLargeError from the fixture"
+        world.server.failEveryCommand(containing: ",\(tooLarge) ", message: message)
+        world.server.failEveryCommand(containing: "FETCH \(tooLarge) ", message: message)
 
-            #expect(await Self.callEnds(world), "the call did not end")
-            #expect(try world.local().contains(kept), "the half without the large message did not load")
-            #expect(!(try world.local()).contains(tooLarge), "precondition: the large message did not load")
-            let row = try world.row()
-            #expect(!row.backfillComplete, "the folder completed over a message that never loaded (confirm-and-skip)")
-            #expect(row.backfillUidCursor == tooLarge, "cursor \(String(describing: row.backfillUidCursor)), expected \(tooLarge)")
+        #expect(await Self.callEnds(world), "the call did not end")
+        #expect(try world.local().contains(kept), "the half without the large message did not load")
+        #expect(!(try world.local()).contains(tooLarge), "precondition: the large message did not load")
+        let row = try world.row()
+        #expect(!row.backfillComplete, "the folder completed over a message that never loaded (confirm-and-skip)")
+        #expect(row.backfillUidCursor == tooLarge, "cursor \(String(describing: row.backfillUidCursor)), expected \(tooLarge)")
 
-            world.server.stopFailingCommands(containing: ",\(tooLarge) ")
-            world.server.stopFailingCommands(containing: "FETCH \(tooLarge) ")
-            #expect(await Self.callEnds(world))
-            #expect(try world.row().backfillComplete, "the folder did not complete once the message loaded")
-            #expect(try world.local().contains(tooLarge))
-        }
+        world.server.stopFailingCommands(containing: ",\(tooLarge) ")
+        world.server.stopFailingCommands(containing: "FETCH \(tooLarge) ")
+        #expect(await Self.callEnds(world))
+        #expect(try world.row().backfillComplete, "the folder did not complete once the message loaded")
+        #expect(try world.local().contains(tooLarge))
     }
 }

@@ -114,13 +114,12 @@ extension SyncEngine {
         folderRole: FolderRole,
         isInInbox: Bool,
         epochPremise: SyncEngine.CrawlEpochPremise,
-        observedEpoch: UInt32?,
-        ccBccFillDue: Bool? = nil
+        observedEpoch: UInt32?
     ) async -> SyncEngine.BackfillBatchOutcome {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
             folderRole: folderRole, isInInbox: isInInbox, epochPremise: epochPremise,
-            observedEpoch: observedEpoch, catchUpReadStartedAt: nil, ccBccFillDue: ccBccFillDue
+            observedEpoch: observedEpoch, catchUpReadStartedAt: nil
         )
         guard !result.refused else { return .refused }
         return .landed(
@@ -166,7 +165,7 @@ extension SyncEngine {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
             folderRole: folderRole, isInInbox: isInInbox, epochPremise: nil,
-            observedEpoch: observedEpoch, catchUpReadStartedAt: catchUpReadStartedAt, ccBccFillDue: nil
+            observedEpoch: observedEpoch, catchUpReadStartedAt: catchUpReadStartedAt
         )
         return (result.inserted, result.ftsRecords, result.ccBccFtsUpdates, result.failed)
     }
@@ -180,8 +179,7 @@ extension SyncEngine {
         isInInbox: Bool,
         epochPremise: SyncEngine.CrawlEpochPremise?,
         observedEpoch: UInt32?,
-        catchUpReadStartedAt: Date?,
-        ccBccFillDue: Bool?
+        catchUpReadStartedAt: Date?
     ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)], refused: Bool, failed: Bool) {
         guard !headers.isEmpty else { return (0, [], [], false, false) }
 
@@ -266,10 +264,7 @@ extension SyncEngine {
                         // a repeated id is the same message: it is skipped.
                         var insertedIds = Set<String>()
 
-                        // The IMAP walk passes the value it snapshotted at walk
-                        // start, so its FETCH choice and this fill agree; other
-                        // callers read the setting here.
-                        let needsCcBccBackfill = ccBccFillDue ?? !UserDefaults.standard.bool(forKey: "ccBccBackfillDone")
+                        let needsCcBccBackfill = !UserDefaults.standard.bool(forKey: "ccBccBackfillDone")
                         for info in chunk {
                             // IOS-IMAP-001 / D3 — a message the server reports with
                             // `\Deleted` is NOT PRESENT for display (RFC 3501 §2.3.2:

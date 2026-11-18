@@ -7120,9 +7120,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             do {
                 extResult = try await server.extendedSearch(identifierSet: searchSet, criteria: [.all])
             } catch IMAPError.commandFailed(let reason) where reason.hasPrefix("Extended search failed:") {
-                // The server answered this SEARCH with a refusal: typed here,
-                // at the provider boundary, so the walk never reads the
-                // server's own words as a connection failure.
+                // The server answered this SEARCH without a result (a refusal,
+                // or an OK with no answer): typed here, at the provider
+                // boundary, so the walk never reads the server's own words as
+                // a connection failure.
                 throw IMAPSearchRefused(reason: reason)
             }
             return extResult.asSet.toArray().map { UInt32($0.value) }
@@ -7842,10 +7843,12 @@ extension IMAPError: ProviderClassifiedError {
     }
 }
 
-/// A UID SEARCH the server answered with a refusal (a tagged NO or BAD), as
-/// `IMAPProvider.searchExistingUIDs(folder:from:to:)` reports it. Its
-/// description is fixed, so the server's text never reads as a connection
-/// error; the text is kept in `reason`.
+/// A UID SEARCH the server answered but did not answer with a result, as
+/// `IMAPProvider.searchExistingUIDs(folder:from:to:)` reports it: a refusal
+/// (a tagged NO or BAD), or a SEARCH the server ended OK without the answer it
+/// was asked for (tabmail-ios #949). SwiftMail reports both with the same
+/// "Extended search failed:" text. Its description is fixed, so the server's
+/// text never reads as a connection error; the text is kept in `reason`.
 struct IMAPSearchRefused: Error, CustomStringConvertible {
     let reason: String
     var description: String { "IMAPSearchRefused" }
