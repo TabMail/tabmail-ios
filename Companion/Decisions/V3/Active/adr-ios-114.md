@@ -569,6 +569,16 @@ same AI result, kept as long as the email itself is shown.
    (`ChatBubbleView.actions`), not of its whole row: actions on a row of several elements made
    VoiceOver read the bubble between its own attachment chips. Tests: `chipsStopAtTheCap`,
    `chatSwipeWiring`.
+   *Amended 2026-11-18 (the back swipe):* iOS 26 goes back on a rightward drag anywhere on the
+   screen, so a bubble's swipe also popped the chat. One rule now decides every sideways drag, from
+   what is open and where the drag starts (`ChatSwipe.dragOutcome`): with nothing open, a drag
+   opens a reveal toward its buttons, except that a rightward drag from the screen's left edge
+   (`ChatViewLayout.backSwipeEdgeWidth`) is the back swipe's; with anything open (a bubble's actions
+   or the chat's buttons), any drag, the edge included, only closes it, and the next drag goes back
+   (as in Mail). Both back swipes wait for the chat's pans and take a drag only when every reveal
+   under it declines (`ChatSwipe.backSwipeRuns`). A stale open id (its bubble gone) is cleared by
+   the next drag the same way. Tests: `rightDragOnABubble`, `edgeDragGoesBack`,
+   `firstDragClosesSecondGoesBack`, `backSwipesWaitForTheRule`, `screenEdgeZone`.
    Archive, Trash and Move act on every email the
    chat shows, wherever it is filed ("always the whole thread", 2026-11-04), except the user's sent
    copies and drafts, which stay in their folders, and emails already at the destination

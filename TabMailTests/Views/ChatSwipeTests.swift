@@ -20,7 +20,11 @@ import UIKit
 ///  5. A let-go swipe opens, closes, or (where allowed) runs the edge button, and a drag never
 ///     goes past closed or fully open. A drag the system cancels or fails closes and runs
 ///     nothing, however far it went.
-///  6. The views wire each of these: hosted SwiftUI views cannot be driven from a unit test, so the
+///  6. A rightward drag that starts on a bubble never goes back: with nothing open it opens the
+///     bubble; with anything open it only closes it. With nothing open, a drag from the screen's
+///     left edge goes back; with something open, the first drag anywhere closes it and the next goes
+///     back. Both back swipes wait for the chat's pans.
+///  7. The views wire each of these: hosted SwiftUI views cannot be driven from a unit test, so the
 ///     wiring is read from the source.
 @Suite("Chat swipes")
 @MainActor
@@ -268,10 +272,10 @@ struct ChatSwipeTests {
         #expect(ended.contains("switch drag.letGo(velocity: velocity, finished: finished, sign: sign, revealWidth: revealWidth, width: width, allowsFull: allowsFullSwipe) {"))
         let changed = try Self.body(of: "private func changed(_ translation: CGFloat) {", in: text)
         #expect(changed.contains("drag.moved(translation, sign: sign, revealWidth: revealWidth, width: width, allowsFull: allowsFullSwipe)"))
-        #expect(text.contains("holdId: id, shouldBegin: { velocityX in openId == id || (openId == nil && velocityX * sign > 0) }, changed: changed, ended: ended))"),
+        #expect(text.contains("closeOpen: { openId = nil }, changed: changed, ended: ended))"),
                 "the reveal hands the pan its drag, held under its id")
-        #expect(text.contains("func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) { Self.handle(recognizer, holding: holdId, changed: changed, ended: ended) }"),
-                "every recognizer event goes through `handle` (the freeze, ChatSwipeFreezeTests) and `deliver`")
+        #expect(text.contains("func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) { if context.coordinator.current == .closes { if recognizer.state == .began { closeOpen() } return } Self.handle(recognizer, holding: holdId, changed: changed, ended: ended) }"),
+                "a closing drag only closes; every other event goes through `handle` (the freeze, ChatSwipeFreezeTests) and `deliver`")
         #expect(text.contains(".onDisappear { ChatSwipeHold.shared.releaseNow(id) }"))
     }
 
@@ -342,12 +346,14 @@ struct ChatSwipeTests {
         #expect(text.contains("if let ids = ChatSwipe.inboxReadIds( rowIsRead: snapshot.isRead, memberIds: group.members.map(\\.id), collapsedThread: group.isThread && !isExpanded, chatActive: ChatViewConfig.isActive) { viewModel.markRead(ids) } else { viewModel.toggleRead(snapshot.id) }"))
     }
 
-    @Test("A reveal opens only toward its buttons, and only while no other reveal is open")
+    @Test("A reveal's drag follows the one rule, from what is open and where it starts")
     func revealWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
-        #expect(text.contains("shouldBegin: { velocityX in openId == id || (openId == nil && velocityX * sign > 0) }"))
-        #expect(text.contains("return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x)"),
+        #expect(text.contains("outcome: { velocityX, atEdge in ChatSwipe.dragOutcome(openId: openId, sign: sign, velocityX: velocityX, startsAtScreenEdge: atEdge) },"))
+        #expect(text.contains("guard abs(velocity.x) > abs(velocity.y) else { return false } current = outcome(velocity.x, startsAtScreenEdge) return current != .declines"),
                 "a vertical drag stays the scroll view's")
+        #expect(text.contains("Coordinator(outcome: outcome)") && text.contains("context.coordinator.outcome = outcome"),
+                "the pan hands the rule to its coordinator when made and on every update")
         #expect(text.contains("if now != id, drag.offset != 0 { withAnimation(Self.spring) { drag.offset = 0 } }"))
     }
 
@@ -356,7 +362,7 @@ struct ChatSwipeTests {
     @Test("The swipe's pan asks its coordinator before it starts, so a vertical drag stays the scroll view's")
     func panAsksItsCoordinator() throws {
         var asked: [CGFloat] = []
-        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { asked.append($0); return true })
+        let coordinator = ChatHorizontalPan.Coordinator(outcome: { velocity, _ in asked.append(velocity); return .moves })
         let pan = ChatHorizontalPan.makePan(delegate: coordinator)
         #expect(pan.delegate === coordinator)
         #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == false,
@@ -373,32 +379,120 @@ struct ChatSwipeTests {
         override func velocity(in view: UIView?) -> CGPoint { speed }
     }
 
-    @Test("A sideways drag starts the swipe when the chat's check allows its direction; an upright drag never asks")
+    @Test("A sideways drag starts the swipe unless the rule declines it; an upright drag never asks")
     func panAdmitsSidewaysMotion() {
         var asked: [CGFloat] = []
-        // The chat's own check: here, only a drag toward the leading edge opens buttons.
-        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { asked.append($0); return $0 < 0 })
+        var answer = ChatSwipe.DragOutcome.moves
+        let coordinator = ChatHorizontalPan.Coordinator(outcome: { velocity, _ in asked.append(velocity); return answer })
         let pan = MovingPan()
         pan.delegate = coordinator
 
-        pan.speed = CGPoint(x: -120, y: 4)
-        #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == true, "a sideways drag in an allowed direction starts")
-        #expect(asked == [-120], "the chat's check is asked with the drag's sideways speed")
+        for (given, starts) in [(ChatSwipe.DragOutcome.moves, true), (.closes, true), (.declines, false)] {
+            answer = given
+            asked.removeAll()
+            pan.speed = CGPoint(x: -120, y: 4)
+            #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == starts, "\(given)")
+            #expect(coordinator.current == given, "the pan remembers what this drag does: \(given)")
+            #expect(asked == [-120], "the rule is asked with the drag's sideways speed")
+        }
 
+        answer = .moves
         asked.removeAll()
-        pan.speed = CGPoint(x: 120, y: 4)
-        #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == false, "the chat's check refuses this direction")
-        #expect(asked == [120])
-
-        asked.removeAll()
-        pan.speed = CGPoint(x: -4, y: 120)
-        #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == false, "an upright drag stays the scroll view's")
-        #expect(asked.isEmpty, "an upright drag never reaches the chat's check")
-
-        pan.speed = CGPoint(x: -40, y: 40)
-        #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == false, "a drag no more sideways than upright does not start")
-        #expect(asked.isEmpty)
+        for speed in [CGPoint(x: -4, y: 120), CGPoint(x: -40, y: 40)] {
+            pan.speed = speed
+            #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == false, "not sideways enough: \(speed)")
+            #expect(coordinator.current == .declines, "a drag that never started does nothing")
+        }
+        #expect(asked.isEmpty, "an upright drag never reaches the rule")
     }
+
+    @Test("A drag starts in the back swipe's zone only within the configured width of the screen's left edge")
+    func screenEdgeZone() {
+        let width = ChatViewLayout.backSwipeEdgeWidth
+        #expect(width > 0)
+        #expect(ChatHorizontalPan.Coordinator.startsAtScreenEdge(0))
+        #expect(ChatHorizontalPan.Coordinator.startsAtScreenEdge(width))
+        #expect(!ChatHorizontalPan.Coordinator.startsAtScreenEdge(width + 1))
+    }
+
+    // MARK: - What a rightward drag does
+
+    /// What is open when the drag starts.
+    enum Open: Sendable, CustomStringConvertible {
+        case nothing, thisBubble, otherBubble, chat
+        var id: String? {
+            switch self {
+            case .nothing: nil
+            case .thisBubble: Self.bubbleId
+            case .otherBubble: "other-bubble"
+            case .chat: Self.chatId
+            }
+        }
+        static let bubbleId = "this-bubble"
+        static let chatId = "chat"
+        var description: String { "\(id ?? "nothing") open" }
+    }
+
+    /// One drag through every reveal under it, as the chat stacks them: the whole chat's reveal
+    /// (opens leftward) always, and the bubble's (opens rightward) when it starts on a bubble.
+    /// Returns whether the chat popped, whether the bubble moved, and what is open afterwards.
+    private static func drag(open: String?, rightward: Bool = true, onBubble: Bool, atEdge: Bool)
+        -> (popped: Bool, bubbleMoved: Bool, openAfter: String?) {
+        let velocity: CGFloat = rightward ? 300 : -300
+        let chat = ChatSwipe.dragOutcome(openId: open, sign: -1, velocityX: velocity, startsAtScreenEdge: atEdge)
+        let bubble = onBubble
+            ? ChatSwipe.dragOutcome(openId: open, sign: 1, velocityX: velocity, startsAtScreenEdge: atEdge)
+            : .declines
+        let closes = [chat, bubble].contains(.closes)
+        // The bubble moves when its own reveal opens, or when it is the one a closing drag shuts.
+        let bubbleMoved = bubble == .moves || (closes && open == Open.bubbleId)
+        let openAfter = closes ? nil : (bubble == .moves ? Open.bubbleId : (chat == .moves ? Open.chatId : open))
+        return (ChatSwipe.backSwipeRuns([chat, bubble]), bubbleMoved, openAfter)
+    }
+
+    @Test("A rightward drag that starts on a bubble never goes back; it moves the bubble only when it opens or closes it",
+          arguments: [Open.nothing, .thisBubble, .otherBubble, .chat])
+    func rightDragOnABubble(open: Open) {
+        let result = Self.drag(open: open.id, onBubble: true, atEdge: false)
+        #expect(!result.popped, "\(open): the chat stays")
+        switch open {
+        case .nothing:
+            #expect(result.bubbleMoved && result.openAfter == Open.bubbleId, "it opens the bubble's actions")
+        case .thisBubble:
+            #expect(result.bubbleMoved && result.openAfter == nil, "it closes the bubble's own actions")
+        case .otherBubble, .chat:
+            #expect(!result.bubbleMoved && result.openAfter == nil, "it only closes what is open")
+        }
+    }
+
+    @Test("With nothing open, a rightward drag from the screen's left edge goes back, on a bubble or off one")
+    func edgeDragGoesBack() {
+        for onBubble in [false, true] {
+            let result = Self.drag(open: nil, onBubble: onBubble, atEdge: true)
+            #expect(result.popped && !result.bubbleMoved, "on a bubble: \(onBubble)")
+        }
+        let off = Self.drag(open: nil, onBubble: false, atEdge: false)
+        #expect(off.popped, "a rightward drag off the bubbles goes back, as before")
+    }
+
+    @Test("With something open, the first rightward drag anywhere only closes it; the next one goes back",
+          arguments: [Open.thisBubble, .otherBubble, .chat])
+    func firstDragClosesSecondGoesBack(open: Open) {
+        for (onBubble, atEdge) in [(false, true), (true, true), (false, false)] {
+            let first = Self.drag(open: open.id, onBubble: onBubble, atEdge: atEdge)
+            #expect(!first.popped && first.openAfter == nil, "\(open), on a bubble \(onBubble), at the edge \(atEdge): it only closes")
+            let second = Self.drag(open: first.openAfter, onBubble: onBubble, atEdge: atEdge)
+            #expect(second.popped == (atEdge || !onBubble), "the next drag goes back unless it opens the bubble")
+        }
+    }
+
+    @Test("A leftward drag with nothing open opens the chat's buttons and never goes back")
+    func leftDragOpensTheChat() {
+        let result = Self.drag(open: nil, rightward: false, onBubble: true, atEdge: false)
+        #expect(!result.popped && !result.bubbleMoved && result.openAfter == Open.chatId)
+    }
+
+    // MARK: - The back swipes wait for the rule
 
     /// A real navigation controller with a pushed screen, on screen, so its back swipes are live.
     /// `presented`: the pushed chat lives in a second navigation controller presented as a sheet
@@ -422,81 +516,45 @@ struct ChatSwipeTests {
 
     /// The swipe's pan as `ChatSwipeReveal` builds it, kept alive by the returned coordinator (a
     /// recognizer holds its delegate weakly). It is attached to no UIKit view, as SwiftUI may host it.
-    private static func pan(outranksBackSwipe: Bool) -> (UIPanGestureRecognizer, ChatHorizontalPan.Coordinator) {
-        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { _ in true }, outranksBackSwipe: outranksBackSwipe)
+    private static func pan() -> (UIPanGestureRecognizer, ChatHorizontalPan.Coordinator) {
+        let coordinator = ChatHorizontalPan.Coordinator(outcome: { _, _ in .moves })
         return (ChatHorizontalPan.makePan(delegate: coordinator), coordinator)
     }
 
     // UIKit arbitrates two recognizers on a touch by asking their delegates these questions; a unit
     // test cannot make a real touch, so it asks them about the real navigation controller's own
     // back-swipe recognizers. A device check covers the gesture itself.
-    @Test("While a bubble's drag is live, the back swipe from anywhere never begins; nothing else changes",
+    @Test("Both back swipes wait for a chat drag's decision and never run with it; nothing else changes",
           arguments: [false, true])
-    func bubblePanNeverStartsThePop(presented: Bool) throws {
+    func backSwipesWaitForTheRule(presented: Bool) throws {
         let (nav, window) = try Self.pushedChat(presented: presented)
         defer { nav.presentingViewController?.dismiss(animated: false); window.isHidden = true }
-        let (pan, coordinator) = Self.pan(outranksBackSwipe: true)
+        let (pan, coordinator) = Self.pan()
         let contentPop = try #require(nav.interactiveContentPopGestureRecognizer)
         let edgePop = try #require(nav.interactivePopGestureRecognizer)
         if presented {
             #expect(nav.presentingViewController != nil && nav.view.window != nil, "control: the second stack is presented, on screen")
         }
-        // The chat's scroll, inside the pushed screen as in the app.
+        let popDelegates = (contentPop.delegate, edgePop.delegate)
+        for pop in [contentPop, edgePop] {
+            #expect(coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: pop) == false, "\(pop)")
+            #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: pop) == true, "\(pop)")
+        }
+        // The chat's scroll, inside the pushed screen as in the app; a recognizer outside any
+        // navigation controller; and one on no view: all keep the answers they always had.
         let scroll = UIScrollView()
         try #require(nav.topViewController).view.addSubview(scroll)
-        let popDelegate = contentPop.delegate
-
-        #expect(coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: contentPop) == false,
-                "the bubble's drag and the back swipe from anywhere never run together")
-        #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: contentPop) == true,
-                "that back swipe begins only once the bubble's drag has failed")
-        // The screen-edge back swipe and the chat's scroll keep the answers they always had.
-        for other in [edgePop, scroll.panGestureRecognizer] {
-            #expect(coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: other) == true,
-                    "still runs alongside: \(other)")
-            #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: other) == false,
-                    "never waits for the bubble: \(other)")
+        let loose = UIView()
+        let looseWindow = UIWindow(windowScene: try #require(window.windowScene))
+        looseWindow.addSubview(loose)
+        let looseTap = UITapGestureRecognizer()
+        loose.addGestureRecognizer(looseTap)
+        for other in [scroll.panGestureRecognizer, looseTap, UIPanGestureRecognizer()] {
+            #expect(coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: other) == true, "\(other)")
+            #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: other) == false, "\(other)")
         }
         #expect(contentPop.isEnabled && edgePop.isEnabled, "both back swipes stay on")
-        #expect(contentPop.delegate === popDelegate, "the back swipe keeps its own delegate")
+        #expect(contentPop.delegate === popDelegates.0 && edgePop.delegate === popDelegates.1, "they keep their own delegates")
     }
 
-    @Test("A bubble's swipe that outranks the back swipe still starts only on a sideways drag the right way")
-    func bubblePanStillAdmitsOnlyItsDrags() {
-        // A closed bubble's reveal opens toward the trailing side: only a rightward drag.
-        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { $0 > 0 }, outranksBackSwipe: true)
-        let pan = MovingPan()
-        pan.delegate = coordinator
-        pan.speed = CGPoint(x: 120, y: 4)
-        #expect(coordinator.gestureRecognizerShouldBegin(pan) == true, "a rightward drag starts it")
-        pan.speed = CGPoint(x: -120, y: 4)
-        #expect(coordinator.gestureRecognizerShouldBegin(pan) == false, "a leftward drag fails it, freeing the back swipe")
-        pan.speed = CGPoint(x: 4, y: 120)
-        #expect(coordinator.gestureRecognizerShouldBegin(pan) == false, "an upright drag fails it, leaving the scroll")
-    }
-
-    @Test("The whole chat's swipe leaves the back swipes as the system arbitrates them")
-    func wholeChatPanKeepsTheBackSwipe() throws {
-        let (nav, window) = try Self.pushedChat()
-        defer { window.isHidden = true }
-        let (pan, coordinator) = Self.pan(outranksBackSwipe: false)
-        for pop in [try #require(nav.interactiveContentPopGestureRecognizer), try #require(nav.interactivePopGestureRecognizer)] {
-            #expect(coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: pop) == true, "\(pop)")
-            #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: pop) == false, "\(pop)")
-        }
-    }
-
-    @Test("Only a bubble's reveal outranks the back swipe: it opens toward the trailing side, as the back swipe moves")
-    func onlyBubbleRevealsOutrankTheBackSwipe() throws {
-        let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
-        #expect(swipe.contains("ChatHorizontalPan( outranksBackSwipe: edge == .leading, holdId: id,"),
-                "the reveal tells its pan whether it outranks the back swipe by its edge")
-        #expect(swipe.contains("Coordinator(shouldBegin: shouldBegin, outranksBackSwipe: outranksBackSwipe)"),
-                "the pan hands it to its coordinator when made")
-        #expect(swipe.contains("context.coordinator.outranksBackSwipe = outranksBackSwipe"),
-                "and again on every update")
-        let thread = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(thread.contains(".modifier(ChatSwipeReveal( id: item.id, edge: .leading,"), "a bubble's reveal is leading")
-        #expect(thread.contains(".modifier(ChatSwipeReveal( id: Self.chatSwipeId, edge: .trailing,"), "the whole chat's is trailing")
-    }
 }

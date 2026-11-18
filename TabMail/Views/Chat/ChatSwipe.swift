@@ -63,6 +63,36 @@ enum ChatSwipe {
         return .closed
     }
 
+    /// What one reveal does with a sideways drag that reaches it.
+    enum DragOutcome: Equatable {
+        /// It lets the drag go: the back swipe, or the other reveal, may take it.
+        case declines
+        /// It slides its content with the drag, opening it.
+        case moves
+        /// A reveal is open: the drag only closes it, and never goes back.
+        case closes
+    }
+
+    /// The one rule for a sideways drag, from what is open and where the drag starts. `sign` is the
+    /// reveal's (`sign` -1 opens leftward); `velocityX` is the drag's first sideways
+    /// speed; `startsAtScreenEdge` whether it began in the back swipe's zone at the screen's left edge.
+    ///  - Anything open: any drag, wherever it starts (the screen edge included), only closes it.
+    ///    Every reveal under the drag answers the same, so no two of them move at once.
+    ///  - Nothing open: a reveal opens toward its buttons, except that a drag from the screen's left
+    ///    edge is the back swipe's, so a bubble (which opens rightward) leaves it alone.
+    /// The back swipe runs only when every reveal under the drag declines (`backSwipeRuns`).
+    static func dragOutcome(openId: String?, sign: CGFloat, velocityX: CGFloat,
+                            startsAtScreenEdge: Bool) -> DragOutcome {
+        if openId != nil { return .closes }
+        guard velocityX * sign > 0 else { return .declines }
+        return sign > 0 && startsAtScreenEdge ? .declines : .moves
+    }
+
+    /// Whether the back swipe takes a drag: only when every reveal under it declines.
+    static func backSwipeRuns(_ outcomes: [DragOutcome]) -> Bool {
+        outcomes.allSatisfy { $0 == .declines }
+    }
+
     /// Keeps a drag between closed and fully open (the whole width when a full swipe can run).
     static func clamp(_ proposed: CGFloat, sign: CGFloat, revealWidth: CGFloat, width: CGFloat,
                       allowsFull: Bool) -> CGFloat {
@@ -105,7 +135,7 @@ struct ChatSwipeButton: Identifiable {
 }
 
 /// Slides its content to reveal buttons at `edge`. Only one reveal is open at a time:
-/// `openId` names it, and a drag elsewhere is ignored until it closes. VoiceOver's actions for the
+/// `openId` names it, and while one is open any drag only closes it (`ChatSwipe.dragOutcome`). VoiceOver's actions for the
 /// buttons are named by the call site, on the element they belong to: actions on a view of several
 /// elements (a bubble and its chips) reorder what VoiceOver reads in it.
 struct ChatSwipeReveal: ViewModifier {
@@ -139,11 +169,15 @@ struct ChatSwipeReveal: ViewModifier {
                 }
             }
             .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
-            // Only a bubble's own reveal (it opens toward the trailing side, as the back swipe moves)
-            // outranks the back swipe; the whole chat's reveal keeps the system's arbitration.
+            // What a drag does is decided by `ChatSwipe.dragOutcome`, from what is open and where
+            // the drag starts; the back swipes wait for this decision and take only declined drags.
             .gesture(ChatHorizontalPan(
-                outranksBackSwipe: edge == .leading,
-                holdId: id, shouldBegin: { velocityX in openId == id || (openId == nil && velocityX * sign > 0) },
+                holdId: id,
+                outcome: { velocityX, atEdge in
+                    ChatSwipe.dragOutcome(openId: openId, sign: sign, velocityX: velocityX,
+                                          startsAtScreenEdge: atEdge)
+                },
+                closeOpen: { openId = nil },
                 changed: changed, ended: ended))
             // A swipe torn down mid-drag or while it settles lets the data it held through.
             .onDisappear { ChatSwipeHold.shared.releaseNow(id) }
@@ -247,14 +281,15 @@ final class ChatSwipeHold {
     }
 }
 
-/// A horizontal pan that starts only when `shouldBegin` accepts its first motion, so vertical
-/// scrolling stays the scroll view's.
+/// A horizontal pan that starts only when `outcome` takes its first motion (`ChatSwipe.dragOutcome`),
+/// so vertical scrolling stays the scroll view's, and the back swipes take only drags it declines.
 struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
-    /// Whether the back swipe from anywhere on the screen waits for this pan (a bubble's swipe).
-    let outranksBackSwipe: Bool
     /// What the swipe holds the interaction freeze under (`ChatSwipeHold`): its reveal's id.
     let holdId: String
-    let shouldBegin: (CGFloat) -> Bool
+    /// What the drag does, from its first sideways speed and whether it starts at the screen's edge.
+    let outcome: (CGFloat, Bool) -> ChatSwipe.DragOutcome
+    /// Closes whatever reveal is open, for a drag whose outcome is `.closes`.
+    let closeOpen: () -> Void
     let changed: (CGFloat) -> Void
     /// The drag's last velocity, and whether the user finished it (false when the system cancelled
     /// or failed it).
@@ -271,7 +306,7 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
-        Coordinator(shouldBegin: shouldBegin, outranksBackSwipe: outranksBackSwipe)
+        Coordinator(outcome: outcome)
     }
 
     func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
@@ -287,11 +322,14 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
-        context.coordinator.shouldBegin = shouldBegin
-        context.coordinator.outranksBackSwipe = outranksBackSwipe
+        context.coordinator.outcome = outcome
     }
 
     func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
+        if context.coordinator.current == .closes {
+            if recognizer.state == .began { closeOpen() }
+            return
+        }
         Self.handle(recognizer, holding: holdId, changed: changed, ended: ended)
     }
 
@@ -317,44 +355,62 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
-        var shouldBegin: (CGFloat) -> Bool
-        var outranksBackSwipe: Bool
+        var outcome: (CGFloat, Bool) -> ChatSwipe.DragOutcome
+        /// What the drag under way does, decided once as it starts.
+        private(set) var current: ChatSwipe.DragOutcome = .declines
+        /// Whether the touch that starts the drag landed in the back swipe's zone at the screen's
+        /// left edge.
+        private(set) var startsAtScreenEdge = false
 
-        init(shouldBegin: @escaping (CGFloat) -> Bool, outranksBackSwipe: Bool = false) {
-            self.shouldBegin = shouldBegin
-            self.outranksBackSwipe = outranksBackSwipe
+        init(outcome: @escaping (CGFloat, Bool) -> ChatSwipe.DragOutcome) {
+            self.outcome = outcome
+        }
+
+        /// Where the drag starts, read from its first touch in the window's coordinates.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            if recognizer.numberOfTouches == 0 {
+                startsAtScreenEdge = Self.startsAtScreenEdge(touch.location(in: nil).x)
+            }
+            return true
+        }
+
+        static func startsAtScreenEdge(_ windowX: CGFloat) -> Bool {
+            windowX <= ChatViewLayout.backSwipeEdgeWidth
         }
 
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+            current = .declines
             guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
             let velocity = pan.velocity(in: pan.view)
-            return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x)
+            guard abs(velocity.x) > abs(velocity.y) else { return false }
+            current = outcome(velocity.x, startsAtScreenEdge)
+            return current != .declines
         }
 
-        /// A bubble's drag never runs together with the back swipe from anywhere on the screen: a
-        /// drag that starts on a bubble moves only the bubble (Messages). Everything else, the
-        /// screen-edge back swipe included, runs alongside as before.
+        /// A chat drag never runs together with a back swipe: the two never both act on one drag.
+        /// Everything else (the chat's scroll, the other reveal) runs alongside as before.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-            !(outranksBackSwipe && Self.isContentPop(other))
+            !Self.isBackSwipe(other)
         }
 
-        /// That back swipe waits until a bubble's drag fails, so it takes only the drags the bubble
-        /// turned down (upright, or the wrong way), under UIKit's own rules for the back swipe.
+        /// Both back swipes wait for this drag's decision (`ChatSwipe.dragOutcome`) and take the drag
+        /// only once every reveal under it has declined (`ChatSwipe.backSwipeRuns`).
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
-            outranksBackSwipe && Self.isContentPop(other)
+            Self.isBackSwipe(other)
         }
 
-        /// Whether `other` is a navigation controller's back swipe from anywhere on the screen. Read
-        /// from `other` itself, which UIKit installs in its navigation controller's own views, so it
-        /// holds however SwiftUI hosts this pan: the nearest navigation controller up `other`'s
-        /// responder chain is the one that owns it.
-        static func isContentPop(_ other: UIGestureRecognizer) -> Bool {
+        /// Whether `other` is a navigation controller's back swipe, from the screen's edge or from
+        /// anywhere. Read from `other` itself, which UIKit installs in its navigation controller's
+        /// own views, so it holds however SwiftUI hosts this pan: the nearest navigation controller
+        /// up `other`'s responder chain is the one that owns it.
+        static func isBackSwipe(_ other: UIGestureRecognizer) -> Bool {
             var responder: UIResponder? = other.view
             while let current = responder {
                 if let nav = current as? UINavigationController {
                     return other === nav.interactiveContentPopGestureRecognizer
+                        || other === nav.interactivePopGestureRecognizer
                 }
                 responder = current.next
             }
