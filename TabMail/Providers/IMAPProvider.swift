@@ -4100,15 +4100,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 selection = try await selectMailboxTracked(
                     server, folder: folder, enablingCondStore: condStore != .off)
             } catch let error as IMAPError where condStore != .off && Self.isCondStoreSelectRefusal(error) {
-                // The connection may have reopened its session on a server that
-                // no longer takes CONDSTORE: the server refused the SELECT, or the
-                // client refused to send `(CONDSTORE)` to a session that no longer
-                // advertises it. Decide again on this session (it is still
-                // authenticated, where ENABLE is allowed) and select once more.
-                condStore = await negotiateListingCondStore(server)
-                setListingCondStore(condStore, for: server)
-                selection = try await selectMailboxTracked(
-                    server, folder: folder, enablingCondStore: condStore != .off)
+                // The server refused the `(CONDSTORE)` SELECT, or the client would
+                // not send it to a session that no longer advertises CONDSTORE (a
+                // reopened transport). No ENABLE here: RFC 5161 §3.1 allows it only
+                // before a session selects, and this one has; CONDSTORE is decided
+                // when a connection opens (`negotiateListingCondStore`), before its
+                // first SELECT. This connection lists without it from now on: no
+                // MODSEQ is stored, and the next connection decides afresh.
+                condStore = .off
+                setListingCondStore(.off, for: server)
+                selection = try await selectMailboxTracked(server, folder: folder, enablingCondStore: false)
             }
             let observed = selection.uidValidity.value
             let observedEpoch: UInt32? = observed != 0 ? observed : nil
@@ -4148,7 +4149,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     throw ProviderListingUnconfirmed(folder: folder, refusal: reason)
                 }
                 let listedEmpty: Bool
-                do { listedEmpty = try found.listed(within: .selectionScope(uidNext: selection.uidNext)).isEmpty } catch is ExtendedSearchUnlisted {
+                do { listedEmpty = try found.listed(within: .anyUID).isEmpty } catch is ExtendedSearchUnlisted {
                     if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] \(folder): SELECT sent EXISTS 0 and UID SEARCH ALL listed no matches — listing fails, nothing removed") }
                     throw ProviderListingUnconfirmed(folder: folder, refusal: nil)
                 }
@@ -4562,7 +4563,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // `after == nil`, so the depth is at most one. `selectMailboxTracked`
         // adds no failure arm — it throws exactly what `server.selectMailbox`
         // throws — so it cannot hold that bound constant.
-        let selection = try await selectMailboxTracked(server, folder: folder)
+        _ = try await selectMailboxTracked(server, folder: folder)
         var criteria: [SearchCriteria] = []
         if !query.isEmpty { criteria.append(.text(query)) }
         if let after { criteria.append(.since(after)) }
@@ -4574,7 +4575,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let results: UIDSet
         do {
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(criteria: criteria, calendar: Self.utcCalendar)
-            results = try extResult.listed(within: .selectionScope(uidNext: selection.uidNext))
+            results = try extResult.listed(within: .anyUID)
         } catch {
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") && after == nil {
@@ -6207,9 +6208,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func currentUIDs(rfc822MessageId: String, folderPath: String) async throws -> [String] {
         try await withFolderConnection(folder: folderPath) { server in
             // T5.3 PORT — `v2final:…:IMAPProvider.currentUIDs` tracks this SELECT.
-            let selection = try await self.selectMailboxTracked(server, folder: folderPath)
+            _ = try await self.selectMailboxTracked(server, folder: folderPath)
             let results = try await self.searchByMessageId(
-                rfc822MessageId, server: server, scope: .selectionScope(uidNext: selection.uidNext))
+                rfc822MessageId, server: server, scope: .anyUID)
             return results.toArray().map { "\($0.value)" }
         }
     }
@@ -6289,7 +6290,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // The action connection's selection reports no UIDNEXT here: the
             // scope is every valid UID.
             let existing = try await self.searchByMessageId(
-                messageId, server: server, scope: .selectionScope(uidNext: UID(0)))
+                messageId, server: server, scope: .anyUID)
             if !existing.isEmpty {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Sent message \(messageId) already exists in \(sentFolderPath) — skipping append") }
                 return true
@@ -7481,12 +7482,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // `selectMailboxTracked` introduces no new arm: it throws exactly what
         // `server.selectMailbox` throws, and a throw exits the recursion entirely
         // rather than re-entering it, so no refusal can hold the variant constant.
-        let selection = try await selectMailboxTracked(server, folder: folder)
+        _ = try await selectMailboxTracked(server, folder: folder)
 
         let results: UIDSet
         do {
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(criteria: [.since(since), .before(before)], calendar: Self.utcCalendar)
-            results = try extResult.listed(within: .selectionScope(uidNext: selection.uidNext))
+            results = try extResult.listed(within: .anyUID)
         } catch {
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") {
@@ -7538,10 +7539,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // SELECT. The `PayloadTooLargeError` leg hands off to `searchDateRange`
         // exactly once and never re-enters this function, so there is no loop
         // here whose variant a refusal could hold constant.
-        let selection = try await selectMailboxTracked(server, folder: folder)
+        _ = try await selectMailboxTracked(server, folder: folder)
         do {
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(criteria: [.before(before)], calendar: Self.utcCalendar)
-            return (try extResult.listed(within: .selectionScope(uidNext: selection.uidNext))).toArray()
+            return (try extResult.listed(within: .anyUID)).toArray()
         } catch {
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") {

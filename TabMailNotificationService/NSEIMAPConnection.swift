@@ -116,7 +116,7 @@ enum NSEIMAPConnection {
             let selection = try await server.selectMailbox(folderPath)
             let value = selection.uidValidity.value
             observedUidValidity = value != 0 ? Int(value) : nil
-            searchScope = .selectionScope(uidNext: selection.uidNext)
+            searchScope = .anyUID
         } catch {
             NSELog.step("NSE IMAP SELECT \(folderPath) failed: \(String(describing: error))")
             return nil

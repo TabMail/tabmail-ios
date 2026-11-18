@@ -1379,7 +1379,7 @@ extension AccountManager {
                                 && Column("role") == FolderRole.sent.rawValue)
                             .fetchOne(db)
                     }) {
-                        try await queue.execute(priority: .userAction) {
+                        _ = try await queue.execute(priority: .userAction) {
                             try await self.syncEngine.syncFolderMessages(
                                 folder: folder, provider: queue.provider)
                         }

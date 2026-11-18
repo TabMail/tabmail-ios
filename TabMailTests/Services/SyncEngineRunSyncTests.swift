@@ -57,7 +57,7 @@ private func makeHeaderInfo(
     )
 }
 
-/// Simulates the core of `SyncEngine.runSyncMessages()` against a DatabaseQueue.
+/// Simulates the core of `SyncEngine.runListing` against a DatabaseQueue.
 /// This replicates the logic from SyncEngineFullSync.swift but accepts DatabaseWriter
 /// so it works with the in-memory DatabaseQueue used by tests.
 ///
@@ -1053,8 +1053,8 @@ struct RunSyncUIDRemapFtsRekeyTests {
                            subject: "Remap target", date: date)
         ])
 
-        let result = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         // ftsRekeys carries the move, with the new provider message id.
         #expect(result.ftsRekeys.count == 1)
@@ -1137,7 +1137,7 @@ struct RunSyncUIDRemapFtsRekeyTests {
                 subject: "Pending AI update", date: date)
         ])
 
-        try await SyncEngine().syncMessages(for: folder, provider: provider, limit: 50)
+        _ = await SyncEngine().listFolder(folder, provider: provider, limit: 50)
 
         let records = published.withLock { $0 }
         #expect(records == [HeaderRekeyRecord(
@@ -1188,9 +1188,9 @@ struct RunSyncUIDRemapFtsRekeyTests {
                 subject: "Same RFC", date: date)
         ])
 
-        let result = try await SyncEngine.runSyncMessages(
+        let result = try await SyncEngine.runListing(
             for: folder, provider: provider, limit: 50,
-            dbPool: PrioritizedDatabase(pool: pool))
+            dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         #expect(result.ftsRekeys.count == 1, "durable/FTS repair remains unchanged")
         #expect(result.headerRekeys.isEmpty,
@@ -1345,8 +1345,8 @@ struct RunSyncDedupReclaimFtsRoutingTests {
         // knowledge stale detection is off and the non-numeric placeholder id is not
         // a UID-stale candidate. Without that the placeholder would be deleted by the
         // stale channel and this leg would never run.
-        let result = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool))
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         // Non-vacuity: the dedup really did replace the placeholder with the server row.
         #expect(try await pool.read { try MessageHeader.fetchOne($0, key: placeholderId) } == nil,
@@ -1409,8 +1409,8 @@ struct RunSyncDedupReclaimFtsRoutingTests {
             makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
         ])
 
-        let result = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool))
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         #expect(try await pool.read { try MessageHeader.fetchOne($0, key: placeholderId) } == nil,
                 "setup: the collision leg deletes the placeholder before returning — got a surviving row")
@@ -1463,8 +1463,8 @@ struct RunSyncDedupReclaimFtsRoutingTests {
             makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
         ])
 
-        let result = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         #expect(try await pool.read { try MessageHeader.fetchOne($0, key: "racc:INBOX:42") } != nil,
                 "setup: the reclaim must have produced the canonical inbox row")
@@ -1539,8 +1539,8 @@ struct RunSyncDedupReclaimFtsRoutingTests {
             makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
         ])
 
-        let result = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool))
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         #expect(try await pool.read { try MessageHeader.fetchOne($0, key: "racc:Drafts:42") } != nil,
                 "setup: the server-addressed row must exist")
@@ -1729,8 +1729,8 @@ struct RunSyncLargeFolderStaleSafetyTests {
             makeHeaderInfo(messageId: "900002", rfc822MessageId: "new-900002@example.com", subject: "New", date: date),
         ])
 
-        let result = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         // FIX C: localCount > threshold → bounded windowed path (UID floor = 900000), so
         // none of the old low-UID rows are candidates → nothing stale-deleted. Without the
@@ -1779,8 +1779,8 @@ struct RunSyncLargeFolderStaleSafetyTests {
             makeHeaderInfo(messageId: "\(uid)", rfc822MessageId: "m-\(uid)@example.com", subject: "Msg \(uid)", date: date)
         })
 
-        let result = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         // localCount (5) <= threshold → complete-knowledge path preserved → UID 5 is stale.
         #expect(result.staleIds.contains("racc:Archive:5"))
@@ -1964,9 +1964,9 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
         let mock = MockEmailProvider(staleWindowMode: .uid)
         await mock.setFetchMessagesResult(remoteMessages)
 
-        let result = try await SyncEngine.runSyncMessages(
+        let result = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: PrioritizedDatabase(pool: pool))
+            dbPool: PrioritizedDatabase(pool: pool)).requireResult()
         return (result, expectedIds)
     }
 
@@ -2010,9 +2010,9 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
         await mock.setMockedBoundFetchEpoch(Self.updateOnlyFetchEpoch, folderPath: folderPath)
         await mock.setFetchMessagesResult([remote])
 
-        let result = try await SyncEngine.runSyncMessages(
+        let result = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: PrioritizedDatabase(pool: pool))
+            dbPool: PrioritizedDatabase(pool: pool)).requireResult()
         return (result, existingId)
     }
 
@@ -2065,9 +2065,9 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
         let mock = MockEmailProvider(staleWindowMode: .date)
         await mock.setFetchMessagesResult(remote)
 
-        let result = try await SyncEngine.runSyncMessages(
+        let result = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: PrioritizedDatabase(pool: pool))
+            dbPool: PrioritizedDatabase(pool: pool)).requireResult()
         return (result, reclaimedId, insertedId)
     }
 
@@ -2122,8 +2122,8 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: date)
         ])
 
-        let result = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool))
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
         return (result, placeholderId, canonicalId)
     }
 
@@ -2194,8 +2194,8 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: date)
         ])
 
-        let result = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
         return (result, [firstDriftedId, secondDriftedId], canonicalId)
     }
 
@@ -2744,10 +2744,13 @@ struct SyncEngineFullSyncUpsertDiagnosticTests {
             let refuser = HeaderCommitRefuser()
             pool.add(transactionObserver: refuser, extent: .databaseLifetime)
 
-            await #expect(throws: HeaderCommitRefuser.CommitRefused.self) {
-                _ = try await SyncEngine.runSyncMessages(
-                    for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-                    dbPool: PrioritizedDatabase(pool: pool))
+            // The refused commit is a failure after the listing started: the one
+            // classifier makes it UNPROVEN with no result, never a published listing.
+            let outcome = await SyncEngine.runListing(
+                for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
+                dbPool: PrioritizedDatabase(pool: pool))
+            if case .unproven(nil, _) = outcome {} else {
+                Issue.record("a refused commit must classify as unproven with no result: \(outcome)")
             }
             // Non-vacuity: the sync reached its header insert and the COMMIT of
             // that very transaction was refused, exactly once.

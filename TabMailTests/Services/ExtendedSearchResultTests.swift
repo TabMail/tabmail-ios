@@ -9,7 +9,7 @@ import SwiftMail
 @Suite("ExtendedSearchResult.listed(within:)")
 struct ExtendedSearchResultAsSetTests {
     /// A whole-mailbox SEARCH whose selection reported no UIDNEXT: every valid UID.
-    static let everyUID = MessageIdentifierSet<UID>.selectionScope(uidNext: UID(0))
+    static let everyUID = MessageIdentifierSet<UID>.anyUID
 
     @Test("Returns .all when ESEARCH populates it")
     func returnsAllWhenPresent() throws {
@@ -112,14 +112,13 @@ struct FakeUIDSearchReplyFormTests {
 }
 
 extension ExtendedSearchResultAsSetTests {
-    @Test("The selection scope: UIDs below UIDNEXT, none for an empty mailbox (UIDNEXT 1), every valid UID when none was reported; an answer above UIDNEXT is refused")
-    func selectionScope() throws {
-        let scope = MessageIdentifierSet<UID>.selectionScope(uidNext: UID(11))
-        #expect(scope.contains(UID(1)) && scope.contains(UID(10)) && !scope.contains(UID(11)))
-        #expect(MessageIdentifierSet<UID>.selectionScope(uidNext: UID(1)).isEmpty)
-        #expect(MessageIdentifierSet<UID>.selectionScope(uidNext: UID(0)).contains(UID(UInt32.max)))
-        var above = MessageIdentifierSet<UID>()
-        above.insert(UID(12))
-        #expect(throws: ExtendedSearchUnlisted.self) { try ExtendedSearchResult<UID>(all: above).listed(within: scope) }
+    @Test("An unrestricted SEARCH's scope is every valid UID: a UID delivered after the SELECT (at or above its UIDNEXT) is new mail and is kept, not refused")
+    func unrestrictedScopeKeepsNewMail() throws {
+        var answer = MessageIdentifierSet<UID>()
+        answer.insert(UID(5))
+        answer.insert(UID(12))   // the SELECT reported UIDNEXT 11; 12 arrived since
+        let listed = try ExtendedSearchResult<UID>(all: answer).listed(within: .anyUID)
+        #expect(listed.contains(UID(12)) && listed.contains(UID(5)))
+        #expect(MessageIdentifierSet<UID>.anyUID.contains(UID(1)) && MessageIdentifierSet<UID>.anyUID.contains(UID(UInt32.max)))
     }
 }

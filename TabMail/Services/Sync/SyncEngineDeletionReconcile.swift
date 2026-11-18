@@ -639,6 +639,11 @@ extension SyncEngine {
                 // connection is checked out per chunk, so user actions
                 // interleave between chunks.
                 try await workQueue.execute(priority: .headerFetch) {
+                    // The deadline is checked again when the chunk is actually sent:
+                    // a wait for a queue slot may outlast it, and a SEARCH sent
+                    // after it is never sent (the chunk fails, nothing is deleted,
+                    // the folder stays due).
+                    if let deadline, Date() >= deadline { throw CancellationError() }
                     // A provider with no presence answer cannot prove an absence:
                     // the chunk fails, and nothing is deleted.
                     guard let answer = try await provider.presentIds(folder: folderPath, uids: chunk) else {

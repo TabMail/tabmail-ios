@@ -599,9 +599,14 @@ extension SyncEngine {
 
     // MARK: - Message Sync
 
-    /// On-demand sync for a single folder (called when user navigates to it).
-    /// Publishes `.checking` phase for the folder's account.
-    func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws {
+    /// On-demand listing of a single folder: opening it, after a send, after a
+    /// move, step 6 of an epoch rebuild. Publishes `.checking` for the account.
+    /// Lists through the one classifier (`listFolder`): the outcome says what
+    /// the server proved, and no listing error escapes it (#755). Returns nil
+    /// when the folder's armed turnover reaction ran instead. Throws only
+    /// `CancellationError`.
+    @discardableResult
+    func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws -> ListingOutcome? {
         // T4.S6 re-drive — the THIRD owner, and the ONLY one that reaches a custom
         // non-favourite folder. `fullSync`'s per-folder loop and `imapDeltaSync`
         // both branch into the reaction for a quarantined folder, but both iterate
@@ -628,44 +633,30 @@ extension SyncEngine {
             await AccountManager.shared.runUidValidityResetReaction(
                 accountId: folder.accountId, folderPath: folder.path
             )
-            return
+            return nil
         }
         Task { @MainActor in AccountManagerState.shared.setSyncPhase(.checking, forAccount: folder.accountId) }
-        try await syncMessages(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit)
-        // Unread recount is now handled inside syncMessages, immediately after header commit.
+        let outcome = await listFolder(folder, provider: provider, limit: SyncConfig.syncMessageLimit)
+        try Task.checkCancellation()
+        // Unread recount is handled when the listing's result is published.
 
         // Self-heal runs during periodic background sync, not on pull-to-refresh.
         // Running a 90-day IMAP SEARCH here blocks the UI spinner unnecessarily.
-    }
-
-    /// Instance wrapper for syncMessages — captures MainActor state and delegates
-    /// to the static method, then handles MainActor-only cleanup (undo protection, FTS).
-    /// Used by syncFolderMessages and delta sync paths that run on MainActor.
-    @discardableResult
-    func syncMessages(
-        for folder: Folder,
-        provider: any EmailProvider,
-        limit: Int
-    ) async throws -> SyncMessagesResult {
-        let result = try await Self.runSyncMessages(
-            for: folder, provider: provider, limit: limit,
-            dbPool: dbPool
-        )
-        await publishListingResult(result, folder: folder)
-        return result
+        return outcome
     }
 
     /// One folder listing through the one classifier (`runListing`), with its
     /// merge result published (unread recount, FTS, body queue).
     func listFolder(_ folder: Folder, provider: any EmailProvider, limit: Int) async -> ListingOutcome {
         let outcome = await Self.runListing(for: folder, provider: provider, limit: limit, dbPool: dbPool)
+        if case .unproven = outcome { unprovenListingAccounts.insert(folder.accountId) }
         if let result = outcome.result { await publishListingResult(result, folder: folder) }
         return outcome
     }
 
     private func publishListingResult(_ result: SyncMessagesResult, folder: Folder) async {
         if !result.uidMigratedOldIds.isEmpty {
-            BackgroundSyncLogger.logDebug("[FullSync] syncMessages — UID migrated \(result.uidMigratedOldIds.count) messages")
+            BackgroundSyncLogger.logDebug("[FullSync] listing — UID migrated \(result.uidMigratedOldIds.count) messages")
         }
 
         await Self.publishHeaderRekeys(result.headerRekeys)
@@ -1146,8 +1137,14 @@ extension SyncEngine {
             // listing's FETCH (another listing may already have stored it) sits above
             // the highest UID this listing returned, and this listing proves nothing
             // about it. Only UIDs inside [lowest, highest] fetched are judged.
+            //
+            // And never above the listing's own SELECT: a UID at or above its
+            // UIDNEXT was allocated after that SELECT (its FETCH may still return
+            // it, e.g. flagged \Deleted, while another listing stores it live), so
+            // it is never evidence for removal (#755).
             let fetchedUIDs = fetched.compactMap({ Int64($0.messageId) })
-            guard let floorUID = fetchedUIDs.min(), let ceilingUID = fetchedUIDs.max() else { return [] }
+            guard let floorUID = fetchedUIDs.min(), let fetchedMax = fetchedUIDs.max() else { return [] }
+            let ceilingUID = coverage.counters?.uidNext.map { min(fetchedMax, Int64($0) - 1) } ?? fetchedMax
             return candidates.filter { row in
                 guard let uid = Int64(row.messageId) else { return false } // non-numeric id → never UID-stale
                 return uid >= floorUID && uid <= ceilingUID && !remoteIds.contains(row.messageId)
@@ -1242,7 +1239,9 @@ extension SyncEngine {
     /// Core message sync logic — runs entirely off the main thread.
     /// Fetches messages from provider, performs stale detection + upsert in a single
     /// DB write transaction. No MainActor state accessed.
-    nonisolated static func runSyncMessages(
+    /// PRIVATE: only the one classifier (`runListing`) calls it, so no route can
+    /// publish a listing's rows or counters without its `ListingOutcome`.
+    private nonisolated static func runSyncMessages(
         for folder: Folder,
         provider: any EmailProvider,
         limit: Int,

@@ -17,6 +17,14 @@ actor SyncEngine {
     let primaryRoles = SyncEngine.syncedPrimaryRoles
     let secondaryRoles = SyncEngine.syncedSecondaryRoles
 
+    /// Per account: a listing in the current foreground pass that proved
+    /// nothing. Only grows during the pass (every unproven `listFolder` and
+    /// full-sync listing adds the account; nothing removes it but the start of
+    /// the next pass), so an error after it, in any later folder or route,
+    /// never loses it; `lastFullSyncAt` is stamped only when the account is not
+    /// in it (#755).
+    var unprovenListingAccounts: Set<String> = []
+
     var headerBackfillTasks: [String: Task<Void, Never>] = [:]
 
     /// When the account's current catch-up slice window ends (ADR-IOS-107, #766):
@@ -541,6 +549,8 @@ actor SyncEngine {
         // makes the full sync due in this pass, and its listings decide which
         // folders become tracked and whether a candidate bookmark is stored.
         var changePass: ChangePassOutcome?
+        // This pass's unproven listings start empty and only grow from here.
+        unprovenListingAccounts.remove(account.id)
         do {
             let deltaResult = try await queue.execute(priority: .headerFetch) {
                 try await self.performChangePass(account: account, provider: provider, deadline: deadline)
@@ -650,7 +660,8 @@ actor SyncEngine {
             // prove its window (#755). A folder the server made not listable
             // (SELECT refused, no usable EXISTS) does not withhold it.
             let now = Date()
-            let fullSyncDone = !listing.droppedFolder && !(changePass?.unprovenListing ?? false)
+            if listing.droppedFolder { unprovenListingAccounts.insert(account.id) }
+            let fullSyncDone = !unprovenListingAccounts.contains(account.id)
             try await dbPool.write { db in
                 _ = try Account.filter(Column("id") == account.id)
                     .updateAll(db, Column("lastSyncedAt").set(to: now))

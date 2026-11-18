@@ -630,8 +630,8 @@ struct SelectSourcedFolderEpochTests {
         await mock.setMockedBoundFetchEpoch(fetchEpoch, folderPath: "INBOX")
         await mock.setMockedUidValidity(mirrorEpoch, folderPath: "INBOX")
 
-        _ = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+        _ = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
         #expect(after?.lastKnownUidValidity == Int(fetchEpoch),

@@ -457,30 +457,14 @@ extension AccountManager {
                     guard let provider else { return }
                     // Pool creates connections on demand via checkout — no explicit connect needed.
                     for folder in accountFolders where !folder.path.isEmpty {
-                        do {
-                            try await syncEngine.syncFolderMessages(folder: folder, provider: provider)
-                        } catch {
-                            if SyncEngine.isSelectFailedError(error) {
-                                BackgroundSyncLogger.logDebug("[SyncFolders] SELECT failed for \(folder.name) — skipping")
-                                continue
-                            }
-                            // A listing whose empty count the server did not confirm
-                            // (#755): this folder only; it is listed again on the next pass.
-                            if error is ProviderListingUnconfirmed {
-                                BackgroundSyncLogger.logDebug("[SyncFolders] listing count unconfirmed for \(folder.name) — skipping")
-                                continue
-                            }
-                            // A 404/410 here is a folder the server no longer has (a label or
-                            // folder deleted elsewhere); a message that is gone is absorbed
-                            // inside the listing (Gmail's per-message read; Outlook lists
-                            // messages inline). Skip the folder so the
-                            // account's other folders still sync, rather than ending the sync
-                            // with a red error banner. The full sync removes a vanished folder.
-                            if isHttpGoneStatus(error) {
-                                BackgroundSyncLogger.logDebug("[SyncFolders] 404/410 for \(folder.name) — skipping (folder gone on the server)")
-                                continue
-                            }
-                            throw error
+                        // Every listing goes through the one classifier: a folder the
+                        // server refused, an unconfirmed empty count, a short FETCH or
+                        // a folder gone on the server is this folder's outcome, never
+                        // an error that ends the refresh; it is listed again next pass
+                        // (#755). Only cancellation leaves here.
+                        let outcome = try await syncEngine.syncFolderMessages(folder: folder, provider: provider)
+                        if case .unproven = outcome {
+                            BackgroundSyncLogger.logDebug("[SyncFolders] listing of \(folder.name) proved nothing — listed again next pass")
                         }
                     }
                     // AI processing is now event-driven via ActiveBodyQueue → ActiveAIQueue.

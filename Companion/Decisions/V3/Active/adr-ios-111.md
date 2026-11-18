@@ -896,8 +896,9 @@ its own SELECT.
    by the connection's identity, never the folder path, and set only while that connection is a live pool
    entry: a renegotiation that resumes after its connection left the pool cannot overwrite the decision of
    the connection that replaced it. A `(CONDSTORE)` SELECT refused by the server, or by the client because a
-   reopened session no longer advertises CONDSTORE (`IMAPProvider.isCondStoreSelectRefusal`), renegotiates
-   on that session. A HIGHESTMODSEQ of 0 (NOMODSEQ) is no value (`SyncEngine.knownModSeq`): it never
+   reopened session no longer advertises CONDSTORE (`IMAPProvider.isCondStoreSelectRefusal`), is selected
+   again plainly and that connection lists without CONDSTORE from then on: no ENABLE after a session has
+   selected (RFC 5161 §3.1); ENABLE is sent only when a connection opens, before its first SELECT. A HIGHESTMODSEQ of 0 (NOMODSEQ) is no value (`SyncEngine.knownModSeq`): it never
    triggers a listing and never proves a folder unchanged.
 3. **Each folder's listing this pass is one of three, by the server's answer** (`SyncEngine.listingProvedItsWindow`):
    - **Proven:** EXISTS in range, a header record back for every message the window holds, and (on EXISTS
@@ -910,7 +911,8 @@ its own SELECT.
      included), a contradicted EXISTS 0, or any other failure after the listing started. It writes no
      counters, runs no stale sweep, certifies no change baseline and drives no phase 2, and it withholds
      the stamp (`FullSyncListing.droppedFolder`; the untracked route's `UntrackedRefresh.unproven`, the
-     change pass's `unprovenListing`). Invariant: `lastFullSyncAt` is never stamped after a pass in which a
+     account's `SyncEngine.unprovenListingAccounts`, which only grows during a pass, so an error in a later
+     folder never loses an earlier folder's). Invariant: `lastFullSyncAt` is never stamped after a pass in which a
      started listing failed to prove its window.
    The records an unproven listing did return are still merged as positive records (inserts and flag
    updates of messages the server showed); only absence is never inferred from it. A connection lost
@@ -922,10 +924,13 @@ its own SELECT.
    retried; the other folders proceed. A SEARCH that the library reports as an empty result without an
    untagged answer is treated as unproven once the library preserves that distinction (tracked separately);
    Tests pin it.
-   **One classifier.** Every route (full sync, untracked refresh, single-folder sync) lists through
-   `SyncEngine.runListing`, which never throws and returns `ListingOutcome` (`.proven`, `.notListable`,
-   `.unproven`); any failure after the SELECT is `.unproven` there, so no caller can rethrow a listing
-   error past it. The full sync records it with `SyncEngine.record`; the untracked route consumes it via
+   **One classifier.** Every route (full sync, untracked refresh, and every on-demand listing: folder
+   open, after a send, after a move, epoch-rebuild step 6, all through `syncFolderMessages` → `listFolder`)
+   lists through `SyncEngine.runListing`, which never throws and returns `ListingOutcome` (`.proven`,
+   `.notListable`, `.unproven`); any failure after the SELECT is `.unproven` there, so no caller can rethrow
+   a listing error past it. The merge (`runSyncMessages`) is private to it; there is no other door
+   (fence: `ListingRouteFenceTests`). An on-demand listing that proves nothing is not an error shown to
+   the user; the folder is listed again next pass. The full sync records it with `SyncEngine.record`; the untracked route consumes it via
    `listFolder`. An unproven listing (the deep pass's included) owes the folder a deep pass
    (`oweDeepListing`), so the next full sync never MODSEQ-skips it. The proof, the rows and the sweep
    bounds read one record set: the requested window's records with a UID, one per UID
@@ -934,13 +939,16 @@ its own SELECT.
    `listed()` is private to it, so every caller must name its request's scope and the compiler finds a new
    one. An answer that does not list its UIDs fails the request, never reads as empty; one naming any UID
    outside the scope is refused, so a set cannot be trimmed into absence. A search over the whole selected
-   mailbox uses `MessageIdentifierSet.selectionScope(uidNext:)` (below UIDNEXT; every valid UID when none
-   was reported). Census: the EXISTS 0 confirmation, `searchOnConnection`, `searchDateRange`,
+   mailbox uses `MessageIdentifierSet.anyUID`: a UID at or above the SELECT's UIDNEXT there is new mail
+   delivered since, kept for app search and the NSE lookup; removal evidence is bounded separately by the
+   listing's own SELECT (item 6). Census: the EXISTS 0 confirmation, `searchOnConnection`, `searchDateRange`,
    `searchBeforeOnly`, `searchByMessageId`, `currentUIDs`, `appendToSentFolder`, the arrivals range,
    the QRESYNC `rereadIds` re-read, `searchExistingUIDs`, `readChangeFolder` and the NSE's `searchMessageId`.
 6. **The stale sweep stays inside the listing's own window (#997).** On IMAP it judges only UIDs from the
    lowest to the highest UID the listing fetched; a whole-folder listing judges only UIDs below its own
    UIDNEXT (or, with none reported, at most the highest UID it saw; with neither it removes nothing). A
+   windowed listing's ceiling is also below its own SELECT's UIDNEXT: a UID allocated after that SELECT
+   that its FETCH still returned is never evidence for removal. A
    message another listing stored after this listing's SELECT is never removed by it. Removals come only
    from this sweep and from the change reader's removal core; phase 2 removes only after its own walk.
 7. **Observations are triggers only.** STATUS and the change read's observation decide whether a folder is
@@ -972,6 +980,6 @@ again next pass. The engine stays provider-blind. No column, no migration (`list
 Keywords: ListingCounters, writeListingCounters, listedCounts, listingProvedItsWindow, short FETCH,
 unproven listing, stale sweep window, upper bound, negotiateListingCondStore, ProviderListingUnconfirmed,
 ExtendedSearchResult.listed, listed(within:), ProviderFolderNotListable, notListable, UntrackedRefresh,
-unprovenListing, invalidateListingCounters, ListingOutcome, runListing, listingCounterColumns, selectionScope,
-inWindow, knownModSeq, NOMODSEQ, listingDueToken, oweDeepListing, answerEpoch, isCondStoreSelectRefusal, answeredInWindow, armListingDueIfHeldExceeds, folderWalkDone, listingDue, progressTotal, ProgressTotal, uidWalkProgress, folder counters one
+invalidateListingCounters, ListingOutcome, runListing, listingCounterColumns,
+inWindow, anyUID, unprovenListingAccounts, ListingRouteFenceTests, syncFolderMessages, knownModSeq, NOMODSEQ, listingDueToken, oweDeepListing, answerEpoch, isCondStoreSelectRefusal, answeredInWindow, armListingDueIfHeldExceeds, folderWalkDone, listingDue, progressTotal, ProgressTotal, uidWalkProgress, folder counters one
 writer, #755, #985, #990, #997.

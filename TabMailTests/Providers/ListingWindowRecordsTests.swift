@@ -36,4 +36,27 @@ struct ListingWindowRecordsTests {
         #expect(!IMAPProvider.isCondStoreSelectRefusal(.timeout))
         #expect(!IMAPProvider.isCondStoreSelectRefusal(.connectionFailed("closed")))
     }
+
+    @Test("A windowed sweep never judges a UID at or above its own SELECT's UIDNEXT, even when its FETCH returned it flagged \\Deleted")
+    func windowedSweepStopsBelowItsOwnUidNext() {
+        func row(_ uid: Int) -> MessageHeader {
+            MessageHeader(
+                messageId: String(uid), subject: "window \(uid)", from: "Sender",
+                fromAddress: "sender@example.com", to: "recipient@example.com",
+                date: Date().addingTimeInterval(-86_400), snippet: "window fixture",
+                folderId: "acct:Archive", accountId: "acct", folderPath: "Archive", isInInbox: false)
+        }
+        // SELECT reported UIDNEXT 10; before the FETCH, UID 10 arrived (and an
+        // older message went), so the FETCH returned 6...10 with 10 \Deleted at
+        // that moment. Another listing has since stored 10 as live.
+        var fetched = (6...10).map { ChangeApplyTests.info(String($0)) }
+        fetched[4].isDeletedOnServer = true
+        let coverage = FetchCoverage(
+            serverRecordCount: 5, spansEntireFolder: false, unmaterialisedIds: [],
+            counters: ListingCounters(messageCount: 5, uidNext: 10, highestModSeq: nil))
+        let stale = SyncEngine.selectStaleHeaders(
+            candidates: [row(7), row(10)], fetched: fetched.filter { $0.messageId != "7" },
+            coverage: coverage, windowMode: .uid)
+        #expect(Set(stale.map(\.messageId)) == ["7"], "10 is above the SELECT: never removal evidence; 7, inside and absent, is")
+    }
 }

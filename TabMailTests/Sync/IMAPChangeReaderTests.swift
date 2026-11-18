@@ -638,21 +638,34 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("Recheck: a compact confirming SEARCH answer spanning millions of UIDs is not expanded; it still decides read-again versus removed")
+    @Test("Recheck: a compact confirming SEARCH answer spanning millions of UIDs beyond the request is refused without being expanded: nothing is removed")
     func recheckCompactConfirmingAnswerIsNotExpanded() async throws {
         try await Self.withWorld(inbox: [1], archive: [10, 11]) { w in
             // The FETCH returns neither 10 (a short FETCH) nor 50000001 (gone);
-            // the confirming SEARCH answers with one compact range holding 10.
+            // the confirming SEARCH, asked about 10 and 50000001 only, answers
+            // with one compact range naming millions of UIDs it was not asked about.
             w.server.suppressFetchRecord(in: Self.archivePath, uids: [10])
             w.server.answerNextUIDSearch(in: Self.archivePath, all: "1:50000000")
             let start = ContinuousClock.now
             let set = try await Self.read(w, recheck: [w.archiveId: ["10", "50000001"]])
             let elapsed = ContinuousClock.now - start
             #expect(w.server.compactUIDSearchAnswersServed() == 1, "setup: the confirming SEARCH got the compact answer")
+            let archive = set.folders.first { $0.folderId == w.archiveId }
+            #expect(archive?.removals.isEmpty ?? true, "an answer outside its request proves no absence: nothing removed")
+            #expect(elapsed < .seconds(5), "bounded work: the answer is never expanded (took \(elapsed))")
+        }
+    }
+
+    @Test("Recheck control: a confirming SEARCH answer inside its request decides read-again versus removed")
+    func recheckInScopeConfirmingAnswerDecides() async throws {
+        try await Self.withWorld(inbox: [1], archive: [10, 11]) { w in
+            w.server.suppressFetchRecord(in: Self.archivePath, uids: [10])
+            w.server.answerNextUIDSearch(in: Self.archivePath, all: "10")
+            let set = try await Self.read(w, recheck: [w.archiveId: ["10", "50000001"]])
+            #expect(w.server.compactUIDSearchAnswersServed() == 1, "setup: the confirming SEARCH got the answer under test")
             let archive = try #require(set.folders.first { $0.folderId == w.archiveId })
             #expect(archive.rereadLater == ["10"], "still on the server: read again, never removed")
             #expect(archive.removals == ["50000001"], "not on the server: removed")
-            #expect(elapsed < .seconds(5), "bounded work: the answer is never expanded (took \(elapsed))")
         }
     }
 

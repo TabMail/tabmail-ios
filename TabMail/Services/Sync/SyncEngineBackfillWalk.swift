@@ -277,7 +277,7 @@ extension SyncEngine {
     /// `InboxView.onAppear` → `InboxViewModel.startSync()` → `performSync()` →
     /// `AccountManager.syncFolders(_:connecting:)` (in `AccountManagerFetch.swift`, which
     /// filters on `!folder.path.isEmpty` alone — no role predicate, no favourite
-    /// predicate) → `SyncEngine.syncFolderMessages` → `syncMessages` →
+    /// predicate) → `SyncEngine.syncFolderMessages` → `listFolder` → `runListing` →
     /// `runSyncMessages`, carrying T1.2b's SELECT-sourced bootstrap.
     /// `SyncEngineFullSync.swift` says so itself, three lines under the
     /// `syncableFolders` construction: *"Custom non-favorited folders sync

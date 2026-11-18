@@ -160,7 +160,7 @@ struct ListingCountersTests {
     @Test("A pooled folder connection with CONDSTORE on serves the body queue's batch after its listing: the same session's FETCH answers carry MODSEQ and the bodies are read")
     func bodyFetchAfterListingOnTheSameConnection() async throws {
         try await E.withWorld("lc-body", capabilities: Self.condstoreNoReader, serverUIDs: [1, 2], localUIDs: [1]) { w in
-            _ = try await w.engine.syncMessages(for: try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            _ = await w.engine.listFolder(try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
             let enabled = w.server.enableCondStoreCountByConnection.filter { $0.value > 0 }.map(\.key)
             #expect(enabled.count == 1, "precondition: the folder's session turned CONDSTORE on")
             let bodies = try await w.provider.fetchMessagesBatch(ids: ["1", "2"], folder: E.path)
@@ -293,7 +293,7 @@ struct ListingCountersTests {
             // UID 4 arrived after that SELECT and a later listing already stored it.
             try Self.addArchive(w, serverUIDs: [1, 3], localUIDs: [1, 2, 3, 4])
             let folder = try Self.archive(w).folder
-            _ = try await w.engine.syncMessages(for: folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            _ = await w.engine.listFolder(folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
             let after = try Self.archive(w)
             #expect(after.uids.contains("4"), "a message above the listing's selection is not judged by it")
             #expect(!after.uids.contains("2"), "a message gone inside the window is removed")
@@ -308,7 +308,7 @@ struct ListingCountersTests {
             // 4 is gone inside that window; 7 arrived after it and is stored.
             try Self.addArchive(w, serverUIDs: [1, 2, 3, 5, 6], localUIDs: [1, 2, 3, 4, 5, 6, 7])
             let folder = try Self.archive(w).folder
-            _ = try await w.engine.syncMessages(for: folder, provider: w.provider, limit: 3)
+            _ = await w.engine.listFolder(folder, provider: w.provider, limit: 3)
             let after = try Self.archive(w)
             #expect(after.uids.contains("7"), "a message above the listing's fetched window is not judged by it")
             #expect(!after.uids.contains("4"), "a message gone inside the window is removed")
@@ -333,7 +333,7 @@ struct ListingCountersTests {
             w.server.holdNextFetchAfterSnapshot(in: Self.archivePath)
             defer { w.server.releaseFetchAfterSnapshot(in: Self.archivePath) }
             let folder = try Self.archive(w).folder
-            let listingA = Task { try await w.engine.syncMessages(for: folder, provider: w.provider, limit: limitA) }
+            let listingA = Task { await w.engine.listFolder(folder, provider: w.provider, limit: limitA) }
             // Wait until A's FETCH has read the mailbox and is held at the server.
             let deadline = Date().addingTimeInterval(10)
             while Date() < deadline, !w.server.isHoldingFetchAfterSnapshot(in: Self.archivePath) {
@@ -342,11 +342,11 @@ struct ListingCountersTests {
             #expect(w.server.isHoldingFetchAfterSnapshot(in: Self.archivePath), "precondition: A's listing FETCH read the mailbox and is held")
 
             w.server.setMessages([1, 3, 4].map(IMAPChangeReaderTests.message), in: Self.archivePath)
-            _ = try await SyncEngine().syncMessages(for: folder, provider: providerB, limit: SyncConfig.syncMessageLimit)
+            _ = await SyncEngine().listFolder(folder, provider: providerB, limit: SyncConfig.syncMessageLimit)
             #expect(try Self.archive(w).uids == ["1", "3", "4"], "after B: the server's rows exactly")
 
             w.server.releaseFetchAfterSnapshot(in: Self.archivePath)
-            _ = try await listingA.value
+            _ = await listingA.value
             let afterA = try Self.archive(w)
             #expect(afterA.uids.isSuperset(of: ["1", "3", "4"]), "A's late write removes no live row, B's arrival 4 included: \(afterA.uids.sorted())")
 
@@ -365,7 +365,7 @@ struct ListingCountersTests {
             try Self.addArchive(w, serverUIDs: withMessages ? [1, 3] : [], localUIDs: [1, 2, 3, 5])
             w.server.suppressSelectUidNext(for: Self.archivePath)
             let folder = try Self.archive(w).folder
-            _ = try await w.engine.syncMessages(for: folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            _ = await w.engine.listFolder(folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
             let after = try Self.archive(w).uids
             if withMessages {
                 #expect(after == ["1", "3", "5"], "the sweep judges only up to UID 3: \(after.sorted())")
@@ -646,13 +646,13 @@ struct ListingCountersTests {
     @Test("The CONDSTORE decision goes with its connection: after eviction, a reconnect to a server that no longer advertises CONDSTORE lists with no (CONDSTORE) and stores no MODSEQ, even if the SELECT reports one")
     func condStoreDecisionDoesNotSurviveReconnect() async throws {
         try await E.withWorld("lc-reconnect", capabilities: Self.condstoreNoReader, serverUIDs: [1, 2], localUIDs: [1]) { w in
-            _ = try await w.engine.syncMessages(for: try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            _ = await w.engine.listFolder(try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
             #expect(try w.folder().lastKnownHighestModSeq != nil, "precondition: the first session stored the MODSEQ")
             w.server.setCapabilities(FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" })
             #expect(await w.provider.evictLRUFolderForTesting(), "precondition: the folder connection was evicted")
             let enableBefore = w.server.enableCondStoreCountByConnection.values.reduce(0, +)
             let condSelectBefore = w.server.condStoreSelectCount
-            _ = try await w.engine.syncMessages(for: try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            _ = await w.engine.listFolder(try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
             #expect(w.server.enableCondStoreCountByConnection.values.reduce(0, +) == enableBefore, "no ENABLE CONDSTORE on the new session")
             #expect(w.server.condStoreSelectCount == condSelectBefore, "no SELECT (CONDSTORE) on the new session")
             #expect(try w.folder().lastKnownHighestModSeq == nil, "no negotiated CONDSTORE: no MODSEQ stored")
@@ -666,12 +666,12 @@ struct ListingCountersTests {
     func connectionLimitRetryLegNegotiatesCondStore() async throws {
         try await E.withWorld("lc-limit-retry", capabilities: Self.condstoreNoReader, serverUIDs: [1, 2], localUIDs: [1]) { w in
             // INBOX's folder connection is the one the retry evicts.
-            _ = try await w.engine.syncMessages(for: try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            _ = await w.engine.listFolder(try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
             try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1])
             w.server.setMaxLoggedInSessions(50)
             w.server.refuseNextLogins(1)
             let archive = try Self.archive(w).folder
-            _ = try await w.engine.syncMessages(for: archive, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            _ = await w.engine.listFolder(archive, provider: w.provider, limit: SyncConfig.syncMessageLimit)
             #expect(w.server.refusedLoginCount() == 1, "precondition: the first LOGIN was refused with the limit wording, so the retry leg ran")
             let after = try Self.archive(w)
             #expect(after.uids == ["1", "2", "3"])
@@ -682,37 +682,30 @@ struct ListingCountersTests {
 
     // MARK: - Races the owner asked to see end to end
 
-    @Test("A teardown in the middle of a renegotiation: the connection that replaces it starts clean, so its listing's SELECT carries (CONDSTORE) and stores the server's MODSEQ")
-    func teardownMidRenegotiationStartsClean() async throws {
+    @Test("A CONDSTORE SELECT refused on a live session sends no ENABLE after it (RFC 5161: only before a session selects); after a teardown the next connection starts clean: its own ENABLE before its SELECT, (CONDSTORE) on that SELECT, the server's MODSEQ stored")
+    func refusedCondStoreSelectThenTeardownStartsClean() async throws {
         try await E.withWorld("lc-reneg-teardown", capabilities: Self.condstoreNoReader, serverUIDs: [1, 2], localUIDs: [1]) { w in
-            _ = try await w.engine.syncMessages(for: try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            _ = await w.engine.listFolder(try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
             #expect(try w.folder().lastKnownHighestModSeq != nil, "precondition: the first session stored the MODSEQ")
 
-            // The next listing's (CONDSTORE) SELECT is refused, so that connection
-            // renegotiates; its ENABLE is held at the server.
+            // On the live, already-selected session the next (CONDSTORE) SELECT is refused.
             w.server.failNextCommand(containing: "(CONDSTORE)")
-            w.server.holdNextCommand(containing: "ENABLE")
-            defer { w.server.releaseHeldCommand(containing: "ENABLE") }
-            let folder = try w.folder()
-            let listingA = Task { try? await w.engine.syncMessages(for: folder, provider: w.provider, limit: SyncConfig.syncMessageLimit) }
-            let waitUntil = Date().addingTimeInterval(10)
-            while Date() < waitUntil, !w.server.isHoldingCommand(containing: "ENABLE") {
-                try await Task.sleep(nanoseconds: 5_000_000)
-            }
-            #expect(w.server.isHoldingCommand(containing: "ENABLE"), "precondition: the renegotiation is in flight")
+            let enableBefore = w.server.enableCondStoreCountByConnection.values.reduce(0, +)
+            let refused = await w.engine.listFolder(try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            #expect(w.server.enableCondStoreCountByConnection.values.reduce(0, +) == enableBefore,
+                    "no ENABLE on a session that has already selected a mailbox")
+            if case .proven = refused {} else { Issue.record("the plain SELECT after the refusal still lists the folder: \(refused)") }
+            #expect(try w.folder().lastKnownHighestModSeq == nil, "a listing without CONDSTORE stores no MODSEQ")
 
-            // Teardown: the renegotiating connection leaves the pool mid-renegotiation.
+            // Teardown: the connection leaves the pool; the next one decides for itself.
             #expect(await w.provider.evictLRUFolderForTesting(), "precondition: the connection was torn down")
-            w.server.releaseHeldCommand(containing: "ENABLE")
-            _ = await listingA.value
-
-            // The next connection decides for itself.
             let condSelectBefore = w.server.condStoreSelectCount
-            _ = try await w.engine.syncMessages(for: try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            _ = await w.engine.listFolder(try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            #expect(w.server.enableCondStoreCountByConnection.values.reduce(0, +) > enableBefore,
+                    "the new connection negotiates its own CONDSTORE before its first SELECT")
             #expect(w.server.condStoreSelectCount > condSelectBefore,
-                    "the next connection's listing SELECT carries (CONDSTORE): no result carried over from the torn-down one")
-            #expect(try w.folder().lastKnownHighestModSeq == w.server.qresyncHighestModSeq(for: "INBOX"),
-                    "and stores the server's MODSEQ")
+                    "its listing SELECT carries (CONDSTORE): nothing carried over from the torn-down session")
+            #expect(try w.folder().lastKnownHighestModSeq == w.server.qresyncHighestModSeq(for: "INBOX"))
             #expect(try w.uids() == ["1", "2"])
         }
     }
@@ -762,6 +755,77 @@ struct ListingCountersTests {
             _ = try await w.engine.fullSync(account: w.account, provider: w.provider)
             #expect(try Self.archive(w).uids == Set(remaining.map(String.init)),
                     "the message the server removed is gone; the older walk did not erase the newer evidence")
+        }
+    }
+
+    @Test("Two folders in one pass: the first listing proves nothing, the second proves its window; the account's unproven state survives the later folder, so the stamp stays withheld")
+    func unprovenStateOnlyGrowsWithinAPass() async throws {
+        try await E.withWorld("lc-unproven-acc", capabilities: Self.condstoreNoReader, serverUIDs: [1, 2], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [1, 2, 3], localUIDs: [1, 2])
+            w.server.suppressFetchRecord(in: Self.archivePath, uids: [2])
+            let first = await w.engine.listFolder(try Self.archive(w).folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            guard case .unproven = first else { Issue.record("precondition: the Archive listing is unproven: \(first)"); return }
+            let second = await w.engine.listFolder(try w.folder(), provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            guard case .proven = second else { Issue.record("precondition: the Inbox listing is proven: \(second)"); return }
+            #expect(await w.engine.unprovenListingAccounts.contains(w.account.id),
+                    "a later folder never clears an earlier folder's unproven listing")
+        }
+    }
+
+    // MARK: - Every on-demand entry point lists through the one classifier
+
+    enum OnDemandEntry: String, CaseIterable, Sendable {
+        /// Opening a folder, after a send (the Sent folder), after a move: all
+        /// three call `SyncEngine.syncFolderMessages` (fenced below).
+        case syncFolderMessages
+        /// Step 6 of an epoch rebuild.
+        case epochRebuildStep6
+    }
+
+    static func runEntry(_ entry: OnDemandEntry, _ w: E.World) async throws {
+        let folder = try Self.archive(w).folder
+        switch entry {
+        case .syncFolderMessages:
+            _ = try await w.engine.syncFolderMessages(folder: folder, provider: w.provider)
+        case .epochRebuildStep6:
+            await AccountManager.shared.uidValidityResetResyncFolder(
+                accountId: w.account.id, folderPath: Self.archivePath, folderId: folder.id, provider: w.provider)
+        }
+    }
+
+    @Test("Every on-demand listing route, on a server answer that proves nothing (short FETCH, no EXISTS, SELECT refused, unconfirmed EXISTS 0), never publishes the folder as listed: the ghost stays, the counters stay as they were",
+          arguments: OnDemandEntry.allCases, ["shortFetch", "noExists", "selectRefused", "contradictedZero"])
+    func onDemandEntryNeverPublishesAnUnprovenListing(_ entry: OnDemandEntry, _ answer: String) async throws {
+        try await E.withWorld("lc-entry-\(entry.rawValue)-\(answer)", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            // Server 2, 3, 4; held 1 (gone on the server), 2, 3. A listing that
+            // proved its window would remove 1 and write the counters 3 / 5.
+            try Self.addArchive(w, serverUIDs: [2, 3, 4], localUIDs: [1, 2, 3])
+            switch answer {
+            case "shortFetch": w.server.suppressFetchRecord(in: Self.archivePath, uids: [3])
+            case "noExists": w.server.suppressSelectExists(true, for: Self.archivePath)
+            case "selectRefused": Self.refuseArchiveSelect(w)
+            default: w.server.setSelectExists(0, for: Self.archivePath)
+            }
+            let before = try Self.archive(w)
+            try await Self.runEntry(entry, w)
+            let after = try Self.archive(w)
+            #expect(after.uids.isSuperset(of: ["1", "2", "3"]), "nothing removed on an unproven answer: \(after.uids.sorted())")
+            #expect(after.folder.totalCount == before.folder.totalCount
+                    && after.folder.lastKnownUidNext == before.folder.lastKnownUidNext
+                    && after.folder.lastKnownHighestModSeq == before.folder.lastKnownHighestModSeq,
+                    "the counters are written only by a proven listing")
+        }
+    }
+
+    @Test("Control: the same routes on a proving answer publish the listing (the ghost removed, the counters written)",
+          arguments: OnDemandEntry.allCases)
+    func onDemandEntryPublishesAProvenListing(_ entry: OnDemandEntry) async throws {
+        try await E.withWorld("lc-entry-proven-\(entry.rawValue)", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: [2, 3, 4], localUIDs: [1, 2, 3])
+            try await Self.runEntry(entry, w)
+            let after = try Self.archive(w)
+            #expect(after.uids == ["2", "3", "4"])
+            #expect(after.folder.totalCount == 3 && after.folder.lastKnownUidNext == 5)
         }
     }
 }

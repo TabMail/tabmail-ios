@@ -206,9 +206,9 @@ struct NeverUploadedDraftPlaceholderSyncTests {
         let drafts = try folderRow(f)
         let mock = MockEmailProvider(staleWindowMode: f.item.windowMode)
         await mock.setFetchMessagesResult(messages)
-        return try await SyncEngine.runSyncMessages(
+        return try await SyncEngine.runListing(
             for: drafts, provider: mock, limit: limit,
-            dbPool: PrioritizedDatabase(pool: f.pool))
+            dbPool: PrioritizedDatabase(pool: f.pool)).requireResult()
     }
 
     // Synchronous reads: GRDB's async `read` overload would win inside an async

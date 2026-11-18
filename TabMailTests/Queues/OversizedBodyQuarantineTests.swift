@@ -2069,8 +2069,7 @@ struct FastSyncKeepAwakeTests {
             return a
         }()
         // `backfillComplete` is what makes `headersDone` true, which also keeps this test
-        // off the `uidTotal == 0 && !headersDone` branch that would ask a provider for a
-        // server total. No provider is registered, and none should be needed.
+        // off the `uidTotal == 0 && !headersDone` branch.
         let folder: Folder = {
             var f = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
             f.backfillComplete = true
@@ -2100,7 +2099,11 @@ struct FastSyncKeepAwakeTests {
             try settled.insert(db)
         }
 
+        // Progress publishes only for a registered provider with a total source
+        // (#755); a provider with no server total counts the stored rows.
         let engine = await AccountManager.shared.syncEngine
+        let mock = MockEmailProvider()
+        await engine.register(accountId: "acc1", provider: mock, workQueue: ProviderWorkQueue(provider: mock, maxConcurrency: 1))
         await engine.updateBackfillProgressForAccount(account)
         // `_backfillBacking`, not `backfillProgressByAccount`: the published dictionary is
         // throttled to one write per second, so reading it would make this test's result a
@@ -2125,6 +2128,7 @@ struct FastSyncKeepAwakeTests {
                 "…and the banner must stay up for it")
 
         await AccountManager.shared.clearBackfillProgress(accountId: "acc1")
+        await engine.remove(accountId: "acc1")
     }
 
     /// The banner's GATE is unchanged — it is still `pendingBodyCount == 0`. What the

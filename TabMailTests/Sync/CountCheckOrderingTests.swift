@@ -5,7 +5,7 @@ import Testing
 
 /// The count check (ADR-IOS-051 phase 2) against newer evidence that lands
 /// before it finishes: the OLDER one always lands last here.
-@Suite("Count check: an older check never undoes newer evidence")
+@Suite("Count check: an older check never undoes newer evidence", .serialized, .processGlobalState)
 struct CountCheckOrderingTests {
 
     @Test("An older check's clear lands after a newer listing marked the folder due: the folder stays due")

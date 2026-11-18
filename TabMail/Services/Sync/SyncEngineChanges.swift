@@ -140,9 +140,6 @@ struct ChangePassOutcome: Sendable {
     var outOfTime = false
     /// Rows were written.
     var hadChanges = false
-    /// An untracked refresh in this pass started a listing that failed to prove
-    /// its window: the pass's full-sync stamp is withheld (#755).
-    var unprovenListing = false
     /// The read carried the folder list and it was applied (the MODSEQ-skippable
     /// paths), so the full sync skips its own discovery.
     var appliedFolderList: Set<String>?
@@ -206,7 +203,9 @@ extension SyncEngine {
                 folderId: changes.folderId, observation: observation, account: account, provider: provider,
                 deadline: deadline) {
             case .listed: outcome.hadChanges = true
-            case .unproven: outcome.unprovenListing = true
+            // Recorded on the account by `listFolder` (`unprovenListingAccounts`),
+            // so an error in a later folder cannot lose it.
+            case .unproven: break
             case .notListed: break
             }
         }

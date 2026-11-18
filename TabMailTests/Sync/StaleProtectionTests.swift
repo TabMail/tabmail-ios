@@ -72,9 +72,9 @@ struct StaleProtectionTests {
         await AccountManager.shared.recordRecentlyCompleted(
             messageIds: ["500", EmailFilter.normalizeMessageId("<new-500@ex.com>")])
         defer { Task { await AccountManager.shared.clearRecentlyCompletedForTesting() } }
-        let result = try await SyncEngine.runSyncMessages(
+        let result = try await SyncEngine.runListing(
             for: folder, provider: missingFetchMock(), limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
 
         #expect(!result.staleIds.contains(headerId),
                 "a protected just-arrived message must not be stale-deleted by a racing sync")
@@ -87,9 +87,9 @@ struct StaleProtectionTests {
         let (folder, headerId) = try seed(pool)
 
         await AccountManager.shared.clearRecentlyCompletedForTesting()  // no protection
-        let result = try await SyncEngine.runSyncMessages(
+        let result = try await SyncEngine.runListing(
             for: folder, provider: missingFetchMock(), limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
 
         #expect(result.staleIds.contains(headerId),
                 "an unprotected message the fetch missed IS stale-deleted — the pre-fix drop race")

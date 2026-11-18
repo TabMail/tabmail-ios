@@ -18,7 +18,7 @@ extension ExtendedSearchResult {
 
     /// The only way to read an answer as a set, for a SEARCH restricted to
     /// `requested` (a criteria-only SEARCH passes its selection's scope,
-    /// `MessageIdentifierSet.selectionScope(uidNext:)`): an answer naming any
+    /// `MessageIdentifierSet.anyUID`): an answer naming any
     /// identifier outside the request cannot be attributed to it and proves
     /// nothing, so it throws `ExtendedSearchUnlisted` rather than being trimmed
     /// to the request (a trimmed answer could read a present identifier as
@@ -76,16 +76,12 @@ struct ExtendedSearchUnlisted: Error, CustomStringConvertible {
 }
 
 extension MessageIdentifierSet<UID> {
-    /// Every UID a selection can hold, the scope of a SEARCH over the whole
-    /// selected mailbox: the UIDs below its UIDNEXT, none when UIDNEXT is 1 (an
-    /// empty mailbox), every valid UID when the selection reported none (0).
-    static func selectionScope(uidNext: UID) -> MessageIdentifierSet<UID> {
-        var scope = MessageIdentifierSet<UID>()
-        switch uidNext.value {
-        case 0: scope.insert(range: 1...Int(UInt32.max))
-        case 1: break
-        default: scope.insert(range: 1...(Int(uidNext.value) - 1))
-        }
-        return scope
+    /// Every valid UID: the scope of a SEARCH with no UID restriction. Its
+    /// domain is the whole mailbox as the server reads it when it answers, so
+    /// a UID at or above the SELECT's UIDNEXT is new mail delivered since, and
+    /// valid here (app search, the NSE lookup). A listing's removal evidence is
+    /// bounded separately, by its own SELECT (`SyncEngine.selectStaleHeaders`).
+    static var anyUID: MessageIdentifierSet<UID> {
+        MessageIdentifierSet<UID>(UID(1)...UID(UInt32.max))
     }
 }

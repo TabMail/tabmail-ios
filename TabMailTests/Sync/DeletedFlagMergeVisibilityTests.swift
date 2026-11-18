@@ -202,9 +202,9 @@ struct DeletedFlagMergeVisibilityTests {
     ) async throws {
         let folder = try #require(
             try FolderEpochTestFixture.readFolder(accountId: accountId, path: folderPath, pool: pool))
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: folder, provider: provider, limit: limit,
-            dbPool: PrioritizedDatabase(pool: pool))
+            dbPool: PrioritizedDatabase(pool: pool)).requireResult()
     }
 
     /// A `SyncEngine` wired to `provider`. The crawl and paging paths reach the

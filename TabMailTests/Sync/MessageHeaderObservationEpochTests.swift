@@ -41,8 +41,8 @@ struct MessageHeaderObservationEpochTests {
         let mock = MockEmailProvider(staleWindowMode: .uid)
         await mock.setMockedBoundFetchEpoch(epoch, folderPath: folder.path)
         await mock.setFetchMessagesResult(infos)
-        _ = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+        _ = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
     }
 
     private static func stored(
