@@ -285,6 +285,11 @@ actor MockEmailProvider: EmailProvider {
         if let error = disconnectThrows { throw error }
     }
 
+    /// What `progressTotal` answers (default: the protocol's `.none`).
+    var progressTotalAnswer: ProgressTotal = .none
+    func setProgressTotalAnswer(_ answer: ProgressTotal) { progressTotalAnswer = answer }
+    func progressTotal(crawling: Bool) async -> ProgressTotal { progressTotalAnswer }
+
     func fetchFolders() async throws -> [FolderInfo] {
         callLog.append("fetchFolders")
         if let error = fetchFoldersThrows { throw error }

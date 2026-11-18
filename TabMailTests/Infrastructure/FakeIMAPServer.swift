@@ -559,6 +559,8 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// `holdNextCommand(containing:)`: armed fragments, and whether one is held now.
         var heldGates: [String: Bool] = [:]
         var heldGateReleased: Set<String> = []
+        /// Set by `stop()`: a held command is let go so its handler can end.
+        var heldGatesAbandoned = false
         /// Like `stalls`, but the hold ends the session as soon as the client
         /// closes the connection. See `stallNextCommandWatchingClient`.
         var watchedStalls: [String: [Double]] = [:]
@@ -1821,6 +1823,7 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     func stop() {
         releaseGreetings()
+        withState { $0.heldGatesAbandoned = true }
         acceptSource?.cancel()
         acceptSource = nil
         shutdownAllClientFds()
@@ -2160,7 +2163,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                     return key
                 }
                 if let heldGate {
-                    while !withState({ $0.heldGateReleased.contains(heldGate) }) { usleep(2_000) }
+                    while !withState({ $0.heldGateReleased.contains(heldGate) || $0.heldGatesAbandoned }) { usleep(2_000) }
                     withState { state in
                         state.heldGates[heldGate] = nil
                         state.heldGateReleased.remove(heldGate)
