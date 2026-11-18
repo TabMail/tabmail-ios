@@ -158,36 +158,75 @@ enum AppStoreAgeCheck {
             return acknowledged == current ? .nothing : .askApple
         }
 
+        /// No active window scene to show the acknowledgment in.
+        struct NoActiveScene: Error {}
+
         static func updateDescription(_ version: String) -> String {
             "TabMail \(version) is a significant update with new features and changes. You can read what\u{2019}s new on TabMail\u{2019}s App Store page."
         }
     }
 
     /// Show Apple's significant update acknowledgment when a new major.minor
-    /// version runs where the law requires it. Called after an `.allowed` age
-    /// check. A failure is logged and asked again on the next foreground.
+    /// version runs where the age rules apply and the law requires it. Called
+    /// after an `.allowed` age check, which also covers regions where the rules
+    /// do not apply, so the region is asked again here. A failure is logged
+    /// and asked again on the next foreground.
     @MainActor
     static func acknowledgeSignificantUpdate() async {
         guard #available(iOS 26.4, *) else { return }
-        guard let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
-              let version = SignificantUpdate.majorMinor(current) else { return }
+        guard let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String else { return }
         let defaults = UserDefaults.standard
-        switch SignificantUpdate.decide(
-            acknowledged: defaults.string(forKey: SignificantUpdate.acknowledgedVersionKey), current: current
-        ) {
+        await acknowledge(
+            acknowledged: defaults.string(forKey: SignificantUpdate.acknowledgedVersionKey),
+            current: current,
+            isRegulated: { try await isInRegulatedRegion() },
+            requiresNotice: { try await requiresSignificantUpdateNotice() },
+            show: { version in
+                guard let scene = UIApplication.shared.connectedScenes
+                    .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene else {
+                    throw SignificantUpdate.NoActiveScene()
+                }
+                try await AgeRangeService.shared.showSignificantUpdateAcknowledgment(
+                    in: scene, updateDescription: SignificantUpdate.updateDescription(version))
+            },
+            record: { version in defaults.set(version, forKey: SignificantUpdate.acknowledgedVersionKey) }
+        )
+    }
+
+    /// The significant update step, given the stored and current versions and
+    /// Apple's three calls: do the age rules apply here, does the law require
+    /// the notice, and show it. A version is recorded only on the first run or
+    /// where the rules apply. `acknowledgeSignificantUpdate` passes Apple's real
+    /// calls; tests pass the answers iOS would give. `record` stores the
+    /// handled major.minor; nothing is recorded when a call fails, so the next
+    /// foreground asks again.
+    @MainActor
+    static func acknowledge(
+        acknowledged: String?,
+        current: String,
+        isRegulated: () async throws -> Bool,
+        requiresNotice: () async throws -> Bool,
+        show: (String) async throws -> Void,
+        record: (String) -> Void
+    ) async {
+        guard let version = SignificantUpdate.majorMinor(current) else { return }
+        switch SignificantUpdate.decide(acknowledged: acknowledged, current: current) {
         case .nothing:
             return
         case .record:
-            defaults.set(version, forKey: SignificantUpdate.acknowledgedVersionKey)
+            record(version)
         case .askApple:
             do {
-                if try await requiresSignificantUpdateNotice() {
-                    guard let scene = UIApplication.shared.connectedScenes
-                        .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene else { return }
-                    try await AgeRangeService.shared.showSignificantUpdateAcknowledgment(
-                        in: scene, updateDescription: SignificantUpdate.updateDescription(version))
+                // Only where Apple says the age rules apply. Elsewhere, such as
+                // on a device with no Apple Account, Apple's acknowledgment can
+                // fail to draw while its full-screen host takes every tap. The
+                // version is not recorded there, so a device the rules apply to
+                // later is still shown this version's notice.
+                guard try await isRegulated() else { return }
+                if try await requiresNotice() {
+                    try await show(version)
                 }
-                defaults.set(version, forKey: SignificantUpdate.acknowledgedVersionKey)
+                record(version)
             } catch {
                 BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] Significant update acknowledgment failed, asking again on next foreground: \(error)")
             }
