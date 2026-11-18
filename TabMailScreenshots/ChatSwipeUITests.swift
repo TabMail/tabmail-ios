@@ -16,6 +16,9 @@ import XCTest
 ///    also in a chat opened inside a presented sheet or, as from a mailbox, from a collapsed split
 ///    view.
 ///  - A bubble whose actions were open and whose email then leaves the chat leaves nothing open.
+///  - The header is the subject AND the tutorial's coach card under it: a drag or tap on the card
+///    only closes the chat's buttons, and once the card goes the chat under where it sat is the
+///    reveal's again.
 /// "Went back" is read from the screen: the fixture's list shows again and the chat is gone.
 @MainActor
 final class ChatSwipeUITests: XCTestCase {
@@ -325,6 +328,56 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(bubbleActionsShow(app), "the next swipe opens another bubble's actions")
     }
 
+    // MARK: - The tutorial's coach card in the header
+
+    /// The header the swipes measure is the whole top bar: the subject and the coach card under it.
+    /// Measured from the subject alone, the card would sit inside the chat's reach, so a drag there
+    /// would carry the open buttons on and a tap on its Skip would run. Once the run moves on and
+    /// the card goes, the band it covered must be the chat's again.
+    func testTutorialCardOpenChatButtonsDragAndTapOnTheCardOnlyClose() {
+        let app = launchIntoChat(host: .tutorialCard)
+        let card = coachCard(in: app)
+        XCTAssertTrue(card.waitForExistence(timeout: 10), "control: the coach card shows under the subject")
+        XCTAssertGreaterThan(card.frame.minY, subject(in: app).frame.minY, "control: the card sits under the subject")
+        let cardY = card.frame.midY
+
+        // A leftward drag on the card: inside the chat's reach it would carry the buttons on.
+        openChatButtons(in: app)
+        dragLeft(atY: cardY, in: app)
+        XCTAssertTrue(isInChat(app), "the chat stays")
+        XCTAssertTrue(app.buttons["Trash"].waitForNonExistence(timeout: 3), "the drag on the card only closed the chat's buttons")
+
+        // A tap on the card's own Skip: it only closes, and the run (so the card) stays.
+        openChatButtons(in: app)
+        app.buttons["tutorial-skip"].tap()
+        XCTAssertTrue(app.buttons["Trash"].waitForNonExistence(timeout: 3), "the tap on the card closed the chat's buttons")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+        XCTAssertTrue(card.exists, "the tap ran no card action: the run and its card stay")
+
+        // The existing header targets still only close: the subject and Forward.
+        openChatButtons(in: app)
+        dragRight(atY: subject(in: app).frame.midY, in: app)
+        XCTAssertTrue(isInChat(app), "never goes back")
+        XCTAssertTrue(app.buttons["Trash"].waitForNonExistence(timeout: 3), "the drag on the subject only closed the chat's buttons")
+        openChatButtons(in: app)
+        app.buttons["Forward"].tap()
+        XCTAssertTrue(app.buttons["Trash"].waitForNonExistence(timeout: 3), "the tap on Forward only closed the chat's buttons")
+        XCTAssertTrue(isInChat(app))
+        XCTAssertTrue(card.exists, "control: the card still shows")
+
+        // The run moves on: the card goes, the chat stays, and where the card sat is the chat's.
+        XCTAssertTrue(card.waitForNonExistence(timeout: 40), "the card goes once the run moves on")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+        XCTAssertGreaterThan(cardY, subject(in: app).frame.maxY, "control: the card's band is below the subject")
+        openChatButtons(in: app)
+        // A short drag further open where the card sat: the chat's own swipe follows it.
+        let dy = cardY / app.frame.height
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: dy))
+            .press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: dy)))
+        XCTAssertTrue(isInChat(app))
+        XCTAssertTrue(app.buttons["Trash"].waitForExistence(timeout: 3), "the chat's buttons stay open: the band is the chat's again")
+    }
+
     // MARK: - Helpers
 
     /// The reply field's placeholder in the fixture, which has no TabMail session.
@@ -335,7 +388,9 @@ final class ChatSwipeUITests: XCTestCase {
 
     /// What the fixture's list sits in: a navigation stack, a presented sheet (as search), or a
     /// collapsed split view's content column (as a mailbox).
-    private enum Host { case stack, sheet, split }
+    /// `tutorialCard`: a navigation stack opening the tutorial's practice chat, whose header holds
+    /// the coach card.
+    private enum Host { case stack, sheet, split, tutorialCard }
 
     private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
@@ -344,9 +399,10 @@ final class ChatSwipeUITests: XCTestCase {
             + (host == .sheet ? ["--chat-swipe-in-sheet"] : [])
             + (host == .split ? ["--chat-swipe-in-split"] : [])
             + (tall ? ["--chat-swipe-tall"] : [])
+            + (host == .tutorialCard ? ["--chat-swipe-tutorial-card"] : [])
         app.launch()
         switch host {
-        case .stack:
+        case .stack, .tutorialCard:
             break
         case .sheet:
             XCTAssertTrue(app.buttons["Show sheet"].waitForExistence(timeout: 20))
@@ -358,9 +414,10 @@ final class ChatSwipeUITests: XCTestCase {
         }
         XCTAssertTrue(app.staticTexts["Chat swipe fixture"].waitForExistence(timeout: 20))
         if armRemoval { app.buttons["Remove a bubble"].tap() }
+        if host == .tutorialCard { app.buttons["Move the tutorial on"].tap() }
         app.buttons["Open chat"].tap()
         XCTAssertTrue(subject(in: app).waitForExistence(timeout: 10))
-        XCTAssertTrue(bubble(3, in: app).waitForExistence(timeout: 10))
+        XCTAssertTrue(bubble(host == .tutorialCard ? nil : 3, in: app).waitForExistence(timeout: 10))
         return app
     }
 
@@ -389,13 +446,23 @@ final class ChatSwipeUITests: XCTestCase {
         app.coordinate(withNormalizedOffset: CGVector(dx: dx, dy: y / app.frame.height)).tap()
     }
 
+    /// The fixture's subject, or in the tutorial variant Priya's practice email's.
     private func subject(in app: XCUIApplication) -> XCUIElement {
-        app.staticTexts["Swipe fixture lunch"].firstMatch
+        let fixture = app.staticTexts["Swipe fixture lunch"].firstMatch
+        if fixture.exists { return fixture }
+        return app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Engineering offsite")).firstMatch
     }
 
-    private func bubble(_ index: Int, in app: XCUIApplication) -> XCUIElement {
-        app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS %@", "Note \(index):")).firstMatch
+    private func coachCard(in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any)["tutorial-coach"].firstMatch
+    }
+
+    /// The fixture's bubble `index`; nil, any bubble (the tutorial's chat, whose bubbles say who said
+    /// what).
+    private func bubble(_ index: Int?, in app: XCUIApplication) -> XCUIElement {
+        let marker = index.map { "Note \($0):" } ?? " said: "
+        return app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@", marker)).firstMatch
     }
 
     private func isInChat(_ app: XCUIApplication) -> Bool {
@@ -419,7 +486,7 @@ final class ChatSwipeUITests: XCTestCase {
     }
 
     private func openChatButtons(in app: XCUIApplication) {
-        dragLeft(on: bubble(2, in: app), in: app)
+        dragLeft(on: bubble(coachCardFixture(app) ? nil : 2, in: app), in: app)
         XCTAssertTrue(app.buttons["Trash"].waitForExistence(timeout: 3), "control: the chat's buttons open")
     }
 
@@ -433,8 +500,17 @@ final class ChatSwipeUITests: XCTestCase {
             .press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: dy)))
     }
 
+    /// Whether the app runs the tutorial variant, whose chat has no numbered bubbles.
+    private func coachCardFixture(_ app: XCUIApplication) -> Bool {
+        app.launchArguments.contains("--chat-swipe-tutorial-card")
+    }
+
     private func dragLeft(on element: XCUIElement, in app: XCUIApplication) {
-        let dy = element.frame.midY / app.frame.height
+        dragLeft(atY: element.frame.midY, in: app)
+    }
+
+    private func dragLeft(atY y: CGFloat, in app: XCUIApplication) {
+        let dy = y / app.frame.height
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: dy))
             .press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: dy)))
     }

@@ -13,7 +13,10 @@ import SwiftUI
 /// with its own navigation stack, as search opens chats. With `--chat-swipe-in-split` the list is the
 /// content column of a collapsed split view, entered from a sidebar, and opens the chat as the app
 /// opens one from a mailbox: the content column's push of `PushedMessageDestination`, through
-/// `MessageOpenView`.
+/// `MessageOpenView`. With `--chat-swipe-tutorial-card` the chat is instead the tutorial's practice
+/// chat (Priya's, from the real tutorial seed) in Part 2, so its coach card sits in the header under
+/// the subject; "Move the tutorial on" moves the run to Part 3 a while later, which takes the card
+/// away while the chat stays open.
 struct ChatSwipeTestScene: View {
     @State private var ready = false
     @State private var status = "Preparing fixture"
@@ -21,10 +24,13 @@ struct ChatSwipeTestScene: View {
     @State private var showsSheet = false
     @State private var mailbox: String?
     @State private var pushedId: String?
+    /// The tutorial variant's chat: Priya's practice email.
+    @State private var practiceId: String?
     private let inSheet = ProcessInfo.processInfo.arguments.contains("--chat-swipe-in-sheet")
     private let inSplit = ProcessInfo.processInfo.arguments.contains("--chat-swipe-in-split")
     /// `--chat-swipe-tall`: the oldest email's text message runs past the screen, so the chat scrolls.
     nonisolated private static let tall = ProcessInfo.processInfo.arguments.contains("--chat-swipe-tall")
+    private let tutorialCard = ProcessInfo.processInfo.arguments.contains("--chat-swipe-tutorial-card")
     nonisolated private static let accountID = "chat-swipe-fixture"
     nonisolated private static let count = 4
     /// The email "Remove a bubble" takes out of the chat.
@@ -32,6 +38,9 @@ struct ChatSwipeTestScene: View {
     /// How long after "Remove a bubble" the email leaves: long enough for a test to open the chat
     /// and that bubble's actions first.
     private static let removalDelay: Duration = .seconds(8)
+    /// How long after "Move the tutorial on" the run leaves Part 2: long enough for a test to open
+    /// the chat and try the card's drag and tap first.
+    private static let moveOnDelay: Duration = .seconds(25)
 
     var body: some View {
         Group {
@@ -67,12 +76,17 @@ struct ChatSwipeTestScene: View {
     private var list: some View {
         VStack(spacing: 24) {
             Text("Chat swipe fixture")
-            if inSplit {
+            if tutorialCard, let practiceId {
+                NavigationLink("Open chat") { ChatThreadView(messageId: practiceId) }
+                Button(armed ? "Move-on armed" : "Move the tutorial on") { armMoveOn() }
+            } else if inSplit {
                 Button("Open chat") { pushedId = Self.headerId(Self.count - 1) }
             } else {
                 NavigationLink("Open chat") { ChatThreadView(messageId: Self.headerId(Self.count - 1)) }
             }
-            Button(armed ? "Removal armed" : "Remove a bubble") { arm() }
+            if !tutorialCard {
+                Button(armed ? "Removal armed" : "Remove a bubble") { arm() }
+            }
         }
         .navigationTitle("Fixture list")
     }
@@ -92,8 +106,46 @@ struct ChatSwipeTestScene: View {
         }
     }
 
+    private func armMoveOn() {
+        armed = true
+        Task {
+            try? await Task.sleep(for: Self.moveOnDelay)
+            // Part 3 starts in the inbox: Priya's chat holds no card for it, and the demo stays.
+            TutorialCoordinator.shared.nextLesson()
+        }
+    }
+
+    /// The tutorial variant: a real chat-view run of Part 2 on the real demo seed, as
+    /// `TutorialChatViewRunTests` starts one.
+    private func seedTutorial() async throws {
+        UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
+        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+        let coordinator = TutorialCoordinator.shared
+        await coordinator.start(.reuseReply, hasTabMailSession: false)
+        try await DemoModeService.shared.completeSetup()
+        coordinator.seedingFinished()
+        guard coordinator.teachesChat, coordinator.step == .replyToPriya else {
+            status = "Fixture setup failed"
+            return
+        }
+        practiceId = try await AppDatabase.dbPool.read { db in
+            try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)?.id
+        }
+        guard practiceId != nil else {
+            status = "Fixture setup failed"
+            return
+        }
+        status = "Fixture ready"
+        ready = true
+    }
+
     private func seed() async {
         do {
+            if tutorialCard {
+                try await seedTutorial()
+                return
+            }
             UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
             // An open goes to the chat only for a subscriber (`MessageOpenView`); the gate persists
             // across launches, so every mode opens it and runs alike.
