@@ -9,15 +9,16 @@ extension ExtendedSearchResult {
     /// The matched identifiers, from whichever field lists them: `.all` when
     /// ESEARCH is supported, `.ordered` when `extendedSearch` falls back to plain
     /// SEARCH. Throws `ExtendedSearchUnlisted` for an answer that reports matches
-    /// without listing them: such an answer proves no identifier present or
-    /// absent, so no caller may read it as a set. This is the only way to read
-    /// an answer as a set.
-    func listed() throws -> MessageIdentifierSet<T> {
+    /// without listing them. Private: every caller reads through
+    /// `listed(within:)`, so no answer is read without the scope it was asked in.
+    private func listed() throws -> MessageIdentifierSet<T> {
         guard let listed = listedMatches else { throw ExtendedSearchUnlisted() }
         return listed
     }
 
-    /// `listed()` for a SEARCH restricted to `requested`: an answer naming any
+    /// The only way to read an answer as a set, for a SEARCH restricted to
+    /// `requested` (a criteria-only SEARCH passes its selection's scope,
+    /// `MessageIdentifierSet.selectionScope(uidNext:)`): an answer naming any
     /// identifier outside the request cannot be attributed to it and proves
     /// nothing, so it throws `ExtendedSearchUnlisted` rather than being trimmed
     /// to the request (a trimmed answer could read a present identifier as
@@ -72,4 +73,19 @@ extension ExtendedSearchResult {
 /// as an empty or partial result.
 struct ExtendedSearchUnlisted: Error, CustomStringConvertible {
     var description: String { "SEARCH answer reported matches without listing them" }
+}
+
+extension MessageIdentifierSet<UID> {
+    /// Every UID a selection can hold, the scope of a SEARCH over the whole
+    /// selected mailbox: the UIDs below its UIDNEXT, none when UIDNEXT is 1 (an
+    /// empty mailbox), every valid UID when the selection reported none (0).
+    static func selectionScope(uidNext: UID) -> MessageIdentifierSet<UID> {
+        var scope = MessageIdentifierSet<UID>()
+        switch uidNext.value {
+        case 0: scope.insert(range: 1...Int(UInt32.max))
+        case 1: break
+        default: scope.insert(range: 1...(Int(uidNext.value) - 1))
+        }
+        return scope
+    }
 }

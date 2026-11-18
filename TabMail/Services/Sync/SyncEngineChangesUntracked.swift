@@ -53,7 +53,7 @@ extension SyncEngine {
         // (a listing on a session without CONDSTORE) proves nothing unchanged:
         // a flag-only change would otherwise stay unseen (#755).
         let modSeqChanged = modSeqIndicatesChange(server: observation.highestModSeq, cached: lastKnownHighestModSeq)
-            || (observation.highestModSeq != nil && lastKnownHighestModSeq == nil)
+            || (knownModSeq(observation.highestModSeq) != nil && knownModSeq(lastKnownHighestModSeq) == nil)
         return uidNextChanged || countChanged || modSeqChanged
     }
 
@@ -97,35 +97,24 @@ extension SyncEngine {
         if newCount > 0 { publishDownloading(newCount, forAccount: account.id) }
         // The listing writes the folder's counters from its own selection, with
         // its rows (`runSyncMessages`); this observation only decided to list.
-        let result: SyncMessagesResult
-        do {
-            result = try await syncMessages(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit)
-        } catch {
-            if error is ProviderFolderNotListable {
-                BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): SELECT failed — skipping")
-                return .notListed
-            }
-            // Any other SELECT-shaped failure after the listing started: unproven.
-            if Self.isSelectFailedError(error) {
-                BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): listing failed — skipping")
-                return .unproven
-            }
-            // A listing whose empty count the server did not confirm: this folder
-            // only. No counters are written, so the next pass lists it again.
-            if error is ProviderListingUnconfirmed {
-                BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): listing count unconfirmed — skipping: \(error)")
-                return .unproven
-            }
-            throw error
-        }
-
+        // One classifier (`listFolder` → `runListing`): no error escapes it.
+        let outcome = await listFolder(folder, provider: provider, limit: SyncConfig.syncMessageLimit)
+        try Task.checkCancellation()
         // ADR-IOS-051 phase 2: the live local count against the count of the
         // listing that just ran, never the observation's. A listing that
         // proved nothing has no count: no phase 2 this pass, and the folder
         // was not listed (the next pass lists it again).
-        guard result.proven, let serverCount = result.listedCounters?.messageCount else {
-            return result.notListable ? .notListed : .unproven
+        let result: SyncMessagesResult
+        switch outcome {
+        case .proven(let proven): result = proven
+        case .notListable:
+            BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): not listable — skipping")
+            return .notListed
+        case .unproven:
+            BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): listing unproven — skipping")
+            return .unproven
         }
+        guard let serverCount = result.listedCounters?.messageCount else { return .unproven }
         // Bounded by the pass's deadline: this runs inside the account's turn.
         await reconcileDeletionsAfterListing(
             folder: folder, provider: provider, serverCount: serverCount, logPrefix: "[Sync] Untracked", deadline: deadline)

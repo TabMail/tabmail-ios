@@ -55,8 +55,16 @@ extension SyncEngine {
     /// nonisolated for unit testing; the epoch (UIDVALIDITY) subtlety is handled safely
     /// upstream because this only gates FETCHING, never deletion.
     nonisolated static func modSeqIndicatesChange(server: Int?, cached: Int?) -> Bool {
-        guard let server, let cached else { return false }
+        guard let server = knownModSeq(server), let cached = knownModSeq(cached) else { return false }
         return server != cached
+    }
+
+    /// A HIGHESTMODSEQ that tracks changes, or nil. RFC 7162 §3.1.2.2: a mailbox
+    /// that does not keep mod-sequences (NOMODSEQ) reports 0 in STATUS, which is
+    /// no value to compare, so 0 normalises to nil like an absent one.
+    nonisolated static func knownModSeq(_ value: Int?) -> Int? {
+        guard let value, value > 0 else { return nil }
+        return value
     }
 
     /// A UIDVALIDITY the server ACTUALLY reported, or nil for "unknown" — the

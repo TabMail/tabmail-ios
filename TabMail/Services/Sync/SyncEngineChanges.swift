@@ -67,6 +67,28 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// a shield protects) set it; a phase 2 that finishes clears it (#755).
     var listingDue: Bool = false
 
+    /// Who set `listingDue` last: a fresh token on every mark. A count check
+    /// clears the bit only while the token is still the one its own mark wrote,
+    /// so an older check landing after a newer listing marked the folder never
+    /// clears the newer mark (#755). Nil when not due.
+    var listingDueToken: String?
+
+    /// Mark the listing due under a fresh token, returned for the clear.
+    @discardableResult
+    mutating func markListingDue() -> String {
+        let token = UUID().uuidString
+        listingDue = true
+        listingDueToken = token
+        return token
+    }
+
+    /// Clear the listing-due bit only when `token` is still the last mark's.
+    mutating func clearListingDue(ifMarkedBy token: String) {
+        guard listingDueToken == token else { return }
+        listingDue = false
+        listingDueToken = nil
+    }
+
     /// The folder is owed a self-heal pass before it is tracked again.
     var selfHealDue: Bool { selfHealOwed > 0 }
 
@@ -75,7 +97,7 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         self.recheck = recheck
     }
 
-    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed, listingDue }
+    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed, listingDue, listingDueToken }
 
     /// `selfHealOwed` is absent from a state stored before it existed.
     init(from decoder: Decoder) throws {
@@ -85,6 +107,7 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         recheck = try container.decode([String].self, forKey: .recheck)
         selfHealOwed = try container.decodeIfPresent(Int.self, forKey: .selfHealOwed) ?? 0
         listingDue = try container.decodeIfPresent(Bool.self, forKey: .listingDue) ?? false
+        listingDueToken = try container.decodeIfPresent(String.self, forKey: .listingDueToken)
     }
 
     /// The stored JSON; unreadable or absent = the untracked default.

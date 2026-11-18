@@ -1157,21 +1157,20 @@ struct ProviderTemporaryRefusal: Error, CustomStringConvertible, LocalizedError 
     var errorDescription: String? { underlying.localizedDescription }
 }
 
-/// A folder listing that proved nothing about the folder's contents (#755):
-/// the server said the folder is empty and did not confirm it (on IMAP, the
-/// `UID SEARCH ALL` that must confirm a SELECT's `EXISTS 0` found messages, or
-/// the server refused it with a NO or BAD). The listing removes nothing and
-/// records no counters. It fails this one folder's listing only: every caller
-/// skips the folder and goes on with the others, and the next pass lists it
-/// again (`SyncEngine.fullSync`, `SyncEngine.refreshUntrackedFolder`,
-/// `AccountManager.syncFolders`). A connection lost on the way is not this
-/// error: it stays a connection error.
 /// The server refused to open the folder for listing (IMAP: SELECT answered NO
 /// or BAD): this pass's answer makes the folder not listable. Content-free.
 struct ProviderFolderNotListable: Error, CustomStringConvertible {
     var description: String { "Listing: the server refused to open a folder" }
 }
 
+/// A folder listing that proved nothing about the folder's contents (#755):
+/// the server said the folder is empty and did not confirm it (on IMAP, the
+/// `UID SEARCH ALL` that must confirm a SELECT's `EXISTS 0` found messages,
+/// listed none, or the server refused it with a NO or BAD). The listing removes
+/// nothing and records no counters. The one classifier
+/// (`SyncEngine.runListing`) makes it UNPROVEN for this folder only; every
+/// route goes on with the other folders and the next pass lists it again. A
+/// connection lost on the way is not this error: it stays a connection error.
 struct ProviderListingUnconfirmed: Error, CustomStringConvertible, CustomDebugStringConvertible {
     let folder: String
     /// The server's refusal text; nil when the server contradicted the empty count.

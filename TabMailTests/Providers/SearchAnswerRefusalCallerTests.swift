@@ -6,8 +6,8 @@ import Foundation
 import Testing
 @testable import TabMail
 
-/// Every SEARCH caller reads its answer through `ExtendedSearchResult.listed()`
-/// (or `listed(within:)`): an answer that reports matches without listing them,
+/// Every SEARCH caller reads its answer through `ExtendedSearchResult.listed(within:)`, the only public read
+/// of a SEARCH answer: an answer that reports matches without listing them,
 /// or names UIDs outside the request, fails that caller. It never reads as
 /// "nothing found". One test per caller, so reverting any one of them to the
 /// old empty-set default fails here even while the shared reader is intact.

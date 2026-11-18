@@ -178,7 +178,7 @@ enum FolderEpochTestFixture {
             folder.lastKnownUidNext = lastKnownUidNext
             folder.lastKnownUidValidity = lastKnownUidValidity
             folder.lastKnownHighestModSeq = lastKnownHighestModSeq
-            try folder.insert(db)
+            try folder.insertWithListingCounters(db)
         }
     }
 

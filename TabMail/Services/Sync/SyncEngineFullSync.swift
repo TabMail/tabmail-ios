@@ -87,7 +87,8 @@ extension SyncEngine {
         guard role != .inbox, !isDeepSync, !listingDue else { return false }
         // A count the server left out of STATUS is unknown, never 0 (#755).
         guard let freshCount else { return false }
-        guard let freshModSeq, let cachedModSeq, freshModSeq == cachedModSeq else { return false }
+        guard let freshModSeq = knownModSeq(freshModSeq), let cachedModSeq = knownModSeq(cachedModSeq),
+              freshModSeq == cachedModSeq else { return false }
         guard let listedUidNext, let freshUidNext, freshUidNext == listedUidNext else { return false }
         return freshCount == listedCount
     }
@@ -324,7 +325,7 @@ extension SyncEngine {
         }
 
         if !skippablePaths.isEmpty {
-            BootProfiler.mark("fullSync[\(acctTag)]: skipped \(skippablePaths.count) MODSEQ-unchanged folder(s) — no re-fetch (reconcile still runs)")
+            BootProfiler.mark("fullSync[\(acctTag)]: skipped \(skippablePaths.count) MODSEQ-unchanged folder(s) — no listing, so no count check either")
         }
 
         BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) folder upsert: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms")
@@ -455,82 +456,29 @@ extension SyncEngine {
                 // read INSIDE `runSyncMessages`'s write transaction — see the note
                 // there and on `AccountManager.liveRecentlyCompleted`.
                 let ft0 = CFAbsoluteTimeGetCurrent()
-                do {
-                    let result = try await Self.runSyncMessages(
-                        for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
-                        dbPool: pool
-                    )
-                    BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(folder.name): \(Int((CFAbsoluteTimeGetCurrent() - ft0) * 1000))ms")
-                    allMigratedIds.append(contentsOf: await processSyncResult(result, folder: folder))
-                    if result.proven {
-                        listing.listedFolderIds.insert(folder.id)
-                        listing.listedCounts[folder.id] = result.listedCounters?.messageCount
-                    } else {
-                        Self.recordUnlisted(result, folderId: folder.id, in: &listing)
-                    }
-                } catch {
-                    if error is ProviderFolderNotListable {
-                        BackgroundSyncLogger.logDebug("[FullSync] SELECT failed for \(folder.name) (\(folder.path)) — skipping: \(error)")
-                        // Not listable this pass: the server refused the folder.
-                        listing.notListableFolderIds.insert(folder.id)
-                        continue
-                    }
-                    // Any other SELECT-shaped failure after the listing started
-                    // (no typed refusal): a started listing that failed to prove
-                    // its window, so the stamp is withheld.
-                    if Self.isSelectFailedError(error) {
-                        BackgroundSyncLogger.logDebug("[FullSync] Listing failed for \(folder.name) — skipping: \(error)")
-                        listing.droppedFolder = true
-                        continue
-                    }
-                    // A listing whose empty count the server did not confirm (#755):
-                    // this folder's failure only. It stays unlisted and the full
-                    // sync stays due; the other folders are listed and committed.
-                    if error is ProviderListingUnconfirmed {
-                        BackgroundSyncLogger.logDebug("[FullSync] Listing count unconfirmed for \(folder.name) — skipping: \(error)")
-                        listing.droppedFolder = true
-                        continue
-                    }
-                    if Self.isConnectionError(error) {
-                        // Connection died mid-sync — retry this folder once.
-                        // Pool self-heals: dead connections discarded on checkin(healthy: false),
-                        // next checkout creates a fresh one.
-                        BackgroundSyncLogger.logDebug("[FullSync] Connection error for \(folder.name): \(error) — retrying")
-                        // The retry's own answer decides the folder. The failed
-                        // attempt committed nothing: `runSyncMessages` writes rows,
-                        // counters and its sweep in one transaction after every
-                        // server read, so a thrown attempt leaves no partial
-                        // write a later proof could be mistaken for.
-                        do {
-                            let retryResult = try await Self.runSyncMessages(
-                                for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
-                                dbPool: pool
-                            )
-                            allMigratedIds.append(contentsOf: await processSyncResult(retryResult, folder: folder))
-                            if retryResult.proven {
-                                listing.listedFolderIds.insert(folder.id)
-                                listing.listedCounts[folder.id] = retryResult.listedCounters?.messageCount
-                            } else {
-                                Self.recordUnlisted(retryResult, folderId: folder.id, in: &listing)
-                            }
-                        } catch {
-                            if error is ProviderFolderNotListable {
-                                listing.notListableFolderIds.insert(folder.id)
-                            } else {
-                                listing.droppedFolder = true
-                            }
-                            if Self.isConnectionError(error) {
-                                // Retry also hit connection error — server unreachable. Skip remaining folders.
-                                BackgroundSyncLogger.logDebug("[FullSync] Retry failed for \(folder.name): \(error) — skipping remaining folders")
-                                break
-                            }
-                            // Non-connection error on retry — skip this folder, continue with rest
-                            BackgroundSyncLogger.logDebug("[FullSync] Retry failed for \(folder.name): \(error) — skipping")
-                        }
-                        continue
-                    }
-                    throw error
+                var outcome = await Self.runListing(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit, dbPool: pool)
+                BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(folder.name): \(Int((CFAbsoluteTimeGetCurrent() - ft0) * 1000))ms")
+                if case .unproven(nil, connectionLost: true) = outcome {
+                    // Connection died mid-listing: retry this folder once. The pool
+                    // self-heals (a dead connection is discarded on checkin). The
+                    // retry's own outcome decides the folder; the failed attempt
+                    // committed nothing (`runSyncMessages` writes in one
+                    // transaction after its server reads).
+                    BackgroundSyncLogger.logDebug("[FullSync] Connection lost listing \(folder.name) — retrying")
+                    outcome = await Self.runListing(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit, dbPool: pool)
                 }
+                try Task.checkCancellation()
+                if let result = outcome.result {
+                    allMigratedIds.append(contentsOf: await processSyncResult(result, folder: folder))
+                }
+                Self.record(outcome, folderId: folder.id, in: &listing)
+                if case .unproven(nil, connectionLost: true) = outcome {
+                    // The retry lost its connection too: the server is unreachable.
+                    BackgroundSyncLogger.logDebug("[FullSync] Retry lost its connection for \(folder.name) — skipping remaining folders")
+                    break
+                }
+                // As before: a listing that reached its merge goes on to anchor the age cutoff.
+                guard outcome.result != nil else { continue }
 
                 // Anchor oldestSyncedDate for the age cutoff in backfill.
                 // Only set if not already set (backfill or Smart Reindex may have set it).
@@ -703,7 +651,19 @@ extension SyncEngine {
             for: folder, provider: provider, limit: limit,
             dbPool: dbPool
         )
+        await publishListingResult(result, folder: folder)
+        return result
+    }
 
+    /// One folder listing through the one classifier (`runListing`), with its
+    /// merge result published (unread recount, FTS, body queue).
+    func listFolder(_ folder: Folder, provider: any EmailProvider, limit: Int) async -> ListingOutcome {
+        let outcome = await Self.runListing(for: folder, provider: provider, limit: limit, dbPool: dbPool)
+        if let result = outcome.result { await publishListingResult(result, folder: folder) }
+        return outcome
+    }
+
+    private func publishListingResult(_ result: SyncMessagesResult, folder: Folder) async {
         if !result.uidMigratedOldIds.isEmpty {
             BackgroundSyncLogger.logDebug("[FullSync] syncMessages — UID migrated \(result.uidMigratedOldIds.count) messages")
         }
@@ -735,7 +695,6 @@ extension SyncEngine {
             BackgroundSyncLogger.logDebug("[Sync] \(folder.name): \(result.newHeaders.count) new messages")
             await ActiveBodyQueue.shared.enqueueBatch(result.newHeaders)
         }
-        return result
     }
 
     // MARK: - Background Sync Helpers
@@ -2588,11 +2547,71 @@ extension SyncEngine {
     /// not listable and does not withhold the full-sync stamp; any other
     /// (a short or empty FETCH under a counted selection, a refused merge) is a
     /// started listing that failed to prove its window and withholds it.
-    nonisolated static func recordUnlisted(_ result: SyncMessagesResult, folderId: String, in listing: inout FullSyncListing) {
-        if result.notListable {
+    /// A folder listing's outcome, classified in one place (`runListing`) by
+    /// this pass's server answer (ADR-IOS-111):
+    /// - `proven`: the listing proved its window; its counters, sweep and count
+    ///   are the folder's this pass.
+    /// - `notListable`: the server refused the folder (typed SELECT refusal) or
+    ///   its SELECT sent no usable EXISTS. Nothing written; the stamp is allowed.
+    /// - `unproven`: anything else after the listing started, a short FETCH, a
+    ///   contradicted EXISTS 0, any error after SELECT. Nothing written; the
+    ///   stamp is withheld. `connectionLost` lets the caller retry once.
+    /// No error escapes the classifier, so no caller can rethrow past it.
+    enum ListingOutcome: Sendable {
+        case proven(SyncMessagesResult)
+        case notListable(SyncMessagesResult?)
+        case unproven(SyncMessagesResult?, connectionLost: Bool)
+
+        /// The merge result, when the listing got as far as its write (returned
+        /// records are merged as positive records even when unproven).
+        var result: SyncMessagesResult? {
+            switch self {
+            case .proven(let r): r
+            case .notListable(let r): r
+            case .unproven(let r, _): r
+            }
+        }
+    }
+
+    /// The one classifier of a folder listing. Never throws: a cancelled pass
+    /// reads as unproven here and the caller checks cancellation itself.
+    nonisolated static func runListing(
+        for folder: Folder, provider: any EmailProvider, limit: Int, dbPool: PrioritizedDatabase
+    ) async -> ListingOutcome {
+        do {
+            let result = try await runSyncMessages(for: folder, provider: provider, limit: limit, dbPool: dbPool)
+            if result.proven { return .proven(result) }
+            return result.notListable ? .notListable(result) : .unproven(result, connectionLost: false)
+        } catch is ProviderFolderNotListable {
+            return .notListable(nil)
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[Listing] \(folder.name) unproven: \(error)")
+            }
+            return .unproven(nil, connectionLost: isConnectionError(error))
+        }
+    }
+
+    /// Record a classified outcome in the full sync's listing.
+    nonisolated static func record(_ outcome: ListingOutcome, folderId: String, in listing: inout FullSyncListing) {
+        switch outcome {
+        case .proven(let result):
+            listing.listedFolderIds.insert(folderId)
+            listing.listedCounts[folderId] = result.listedCounters?.messageCount
+        case .notListable:
             listing.notListableFolderIds.insert(folderId)
-        } else {
+        case .unproven:
             listing.droppedFolder = true
+            oweDeepListing(folderId: folderId)
+        }
+    }
+
+    /// A listing that proved nothing (a short or failed one, the deep pass's
+    /// included) owes the folder a deep pass: the next full sync lists it
+    /// whatever its counters say, never skips it on the MODSEQ (#755).
+    nonisolated static func oweDeepListing(folderId: String) {
+        fullSyncSkipStreak.withLock { streak in
+            streak[folderId] = max(0, SyncConfig.fullSyncDeepEveryN - 1)
         }
     }
 
@@ -2632,9 +2651,11 @@ extension SyncEngine {
         guard let raw = try Row.fetchOne(db, sql: "SELECT changeState FROM folder WHERE id = ?", arguments: [folderId]) else { return }
         var state = FolderChangeState(raw: raw["changeState"])
         // A tracked folder's removals come from its change reader, which runs
-        // no count check (ADR-IOS-051 phase 2 skips it).
-        guard !state.listingDue, !state.tracking else { return }
-        state.listingDue = true
+        // no count check (ADR-IOS-051 phase 2 skips it). An already-due folder
+        // is marked again: this listing's evidence is newer than any count
+        // check still running, which then cannot clear it.
+        guard !state.tracking else { return }
+        state.markListingDue()
         try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
     }
 

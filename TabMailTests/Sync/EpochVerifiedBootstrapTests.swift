@@ -214,7 +214,7 @@ struct EpochVerifiedBootstrapTests {
             folder.totalCount = uids.count
             folder.lastKnownUidNext = (uids.max() ?? 0) + 1
             folder.lastKnownUidValidity = storedEpoch
-            try folder.insert(db)
+            try folder.insertWithListingCounters(db)
             for uid in uids {
                 var header = MessageHeader(
                     messageId: "\(uid)", subject: "verify \(uid)", from: "Sender",

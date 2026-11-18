@@ -6,27 +6,29 @@ import Testing
 import SwiftMail
 @testable import TabMail
 
-@Suite("ExtendedSearchResult.listed()")
+@Suite("ExtendedSearchResult.listed(within:)")
 struct ExtendedSearchResultAsSetTests {
+    /// A whole-mailbox SEARCH whose selection reported no UIDNEXT: every valid UID.
+    static let everyUID = MessageIdentifierSet<UID>.selectionScope(uidNext: UID(0))
 
     @Test("Returns .all when ESEARCH populates it")
     func returnsAllWhenPresent() throws {
         let uids = MessageIdentifierSet<UID>([UID(10), UID(20), UID(30)])
         let result = ExtendedSearchResult<UID>(all: uids)
-        #expect(try result.listed().toArray() == [UID(10), UID(20), UID(30)])
+        #expect(try result.listed(within: Self.everyUID).toArray() == [UID(10), UID(20), UID(30)])
     }
 
     @Test("Falls back to .ordered when .all is nil")
     func fallsBackToOrdered() throws {
         let ordered: [UID] = [UID(5), UID(7), UID(9)]
         let result = ExtendedSearchResult<UID>(ordered: ordered)
-        #expect(try result.listed().toArray() == [UID(5), UID(7), UID(9)])
+        #expect(try result.listed(within: Self.everyUID).toArray() == [UID(5), UID(7), UID(9)])
     }
 
     @Test("An answer with no match lists the empty set")
     func emptyWhenBothNil() throws {
         let result = ExtendedSearchResult<UID>()
-        #expect(try result.listed().isEmpty)
+        #expect(try result.listed(within: Self.everyUID).isEmpty)
     }
 
     @Test("Prefers .all over .ordered when both populated")
@@ -34,7 +36,7 @@ struct ExtendedSearchResultAsSetTests {
         let allSet = MessageIdentifierSet<UID>([UID(1), UID(2)])
         let orderedDifferent: [UID] = [UID(99)]
         let result = ExtendedSearchResult<UID>(all: allSet, ordered: orderedDifferent)
-        #expect(try result.listed().toArray() == [UID(1), UID(2)])
+        #expect(try result.listed(within: Self.everyUID).toArray() == [UID(1), UID(2)])
     }
 
     @Test("An answer that reports matches without listing them is refused, never read as a set",
@@ -45,7 +47,7 @@ struct ExtendedSearchResultAsSetTests {
               ExtendedSearchResult<UID>(count: 2, min: UID(4), max: UID(9)),
           ])
     func unlistedAnswerIsRefused(_ result: ExtendedSearchResult<UID>) {
-        #expect(throws: ExtendedSearchUnlisted.self) { try result.listed() }
+        #expect(throws: ExtendedSearchUnlisted.self) { try result.listed(within: Self.everyUID) }
     }
 
     @Test("An answer to a restricted SEARCH that names an identifier outside the request is refused, never trimmed to the request; one inside it is read as listed")
@@ -70,19 +72,19 @@ struct ExtendedSearchResultAsSetTests {
               ExtendedSearchResult<UID>(max: UID(12), all: MessageIdentifierSet<UID>([UID(4), UID(9)])),
           ])
     func contradictoryAllIsRefused(_ result: ExtendedSearchResult<UID>) {
-        #expect(throws: ExtendedSearchUnlisted.self) { try result.listed() }
+        #expect(throws: ExtendedSearchUnlisted.self) { try result.listed(within: Self.everyUID) }
     }
 
     @Test("An ALL list that agrees with its COUNT, MIN and MAX is read as listed")
     func agreeingAllIsListed() throws {
         let result = ExtendedSearchResult<UID>(count: 2, min: UID(4), max: UID(9),
                                                all: MessageIdentifierSet<UID>([UID(4), UID(9)]))
-        #expect(try result.listed().toArray() == [UID(4), UID(9)])
+        #expect(try result.listed(within: Self.everyUID).toArray() == [UID(4), UID(9)])
     }
 
     @Test("COUNT 0 with no ALL lists the empty set")
     func countZeroIsEmpty() throws {
-        #expect(try ExtendedSearchResult<UID>(count: 0).listed().isEmpty)
+        #expect(try ExtendedSearchResult<UID>(count: 0).listed(within: Self.everyUID).isEmpty)
     }
 }
 
@@ -106,5 +108,18 @@ struct FakeUIDSearchReplyFormTests {
                 == "* ESEARCH (TAG \"A1\") UID COUNT 0\r\nA1 OK UID SEARCH completed\r\n")
         #expect(FakeIMAPServer.uidSearchReply(tag: "A1", uids: ["9", "4"], esearch: true, request: Self.esearchRequest)
                 == "* ESEARCH (TAG \"A1\") UID MIN 4 MAX 9 ALL 4,9 COUNT 2\r\nA1 OK UID SEARCH completed\r\n")
+    }
+}
+
+extension ExtendedSearchResultAsSetTests {
+    @Test("The selection scope: UIDs below UIDNEXT, none for an empty mailbox (UIDNEXT 1), every valid UID when none was reported; an answer above UIDNEXT is refused")
+    func selectionScope() throws {
+        let scope = MessageIdentifierSet<UID>.selectionScope(uidNext: UID(11))
+        #expect(scope.contains(UID(1)) && scope.contains(UID(10)) && !scope.contains(UID(11)))
+        #expect(MessageIdentifierSet<UID>.selectionScope(uidNext: UID(1)).isEmpty)
+        #expect(MessageIdentifierSet<UID>.selectionScope(uidNext: UID(0)).contains(UID(UInt32.max)))
+        var above = MessageIdentifierSet<UID>()
+        above.insert(UID(12))
+        #expect(throws: ExtendedSearchUnlisted.self) { try ExtendedSearchResult<UID>(all: above).listed(within: scope) }
     }
 }

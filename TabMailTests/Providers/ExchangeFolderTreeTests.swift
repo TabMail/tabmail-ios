@@ -358,7 +358,10 @@ struct ExchangeFolderTreeSyncTests {
                 "the new subfolder is stored and the search folder is not: \(folders.map(\.path))")
         let kept = try #require(folders.first { $0.path == "kept" })
         #expect(kept.id == account.id + ":kept", "a known folder keeps its id")
-        #expect(kept.totalCount == 7, "and takes the listing's count")
+        // The folder tree is a trigger only: a folder's counters are written by
+        // its own listing, never by discovery reporting 7 (ADR-IOS-051 amendment).
+        #expect(kept.totalCount == 0 && kept.lastKnownUidNext == nil && kept.lastKnownHighestModSeq == nil,
+                "discovery leaves the stored counters alone")
         #expect(kept.backfillComplete && kept.backfillPageToken == "backfill-cursor", "and keeps its backfill state")
         #expect(Set(state.1.map(\.messageId)) == ["1", "2"], "no stored mail is removed")
         #expect(state.2.count == 1 && state.2.first?.folderPath == "old-search" && state.2.first?.messageIds == ["2"]

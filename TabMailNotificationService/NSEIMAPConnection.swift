@@ -111,10 +111,12 @@ enum NSEIMAPConnection {
         // enforces main-app side. Recording the `0` would make every later
         // comparison `0 == 0`, i.e. vacuously true.
         let observedUidValidity: Int?
+        let searchScope: UIDSet
         do {
             let selection = try await server.selectMailbox(folderPath)
             let value = selection.uidValidity.value
             observedUidValidity = value != 0 ? Int(value) : nil
+            searchScope = .selectionScope(uidNext: selection.uidNext)
         } catch {
             NSELog.step("NSE IMAP SELECT \(folderPath) failed: \(String(describing: error))")
             return nil
@@ -125,7 +127,7 @@ enum NSEIMAPConnection {
         // whitespace / existing brackets in case the IDLE proxy's Message-ID
         // header parser returned something slightly off.
         let normalized = normalizeMessageId(rfc822MessageId)
-        guard let uidSet = await searchMessageId(server: server, normalized: normalized),
+        guard let uidSet = await searchMessageId(server: server, normalized: normalized, scope: searchScope),
               !uidSet.isEmpty,
               let uid = uidSet.toArray().first else {
             NSELog.step("NSE IMAP SEARCH returned no UIDs for message id")
@@ -191,13 +193,13 @@ enum NSEIMAPConnection {
 
     // MARK: - Helpers
 
-    private static func searchMessageId(server: IMAPServer, normalized: String) async -> UIDSet? {
+    private static func searchMessageId(server: IMAPServer, normalized: String, scope: UIDSet) async -> UIDSet? {
         // Bracketed — most servers match on the canonical "<id>" form.
         do {
             let ext: ExtendedSearchResult<UID> = try await server.extendedSearch(
                 criteria: [.header("Message-ID", "<\(normalized)>")]
             )
-            let bracketed: UIDSet = try ext.listed()
+            let bracketed: UIDSet = try ext.listed(within: scope)
             if !bracketed.isEmpty { return bracketed }
         } catch {
             NSELog.step("NSE IMAP SEARCH (bracketed) failed: \(String(describing: error))")
@@ -207,7 +209,7 @@ enum NSEIMAPConnection {
             let ext: ExtendedSearchResult<UID> = try await server.extendedSearch(
                 criteria: [.header("Message-ID", normalized)]
             )
-            return try ext.listed()
+            return try ext.listed(within: scope)
         } catch {
             NSELog.step("NSE IMAP SEARCH (bare) failed: \(String(describing: error))")
             return nil

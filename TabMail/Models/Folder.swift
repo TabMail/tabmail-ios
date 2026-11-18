@@ -267,6 +267,36 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// folder's baseline.
     var changeCursor: String?
 
+    /// The listing counters are not part of the record's persistence: a whole
+    /// record insert, update or save never writes them. Their one writer is the
+    /// column-scoped `SyncEngine.writeListingCounters` (and
+    /// `SyncEngine.invalidateListingCounters` for resets), ADR-IOS-111. Decoding
+    /// reads them as usual. A fence test checks that every other column is
+    /// encoded, so a new field cannot be dropped from here unnoticed.
+    static let listingCounterColumns: Set<String> = ["totalCount", "lastKnownUidNext", "lastKnownHighestModSeq"]
+
+    func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(accountId, forKey: .accountId)
+        try c.encode(name, forKey: .name)
+        try c.encode(path, forKey: .path)
+        try c.encode(role, forKey: .role)
+        try c.encode(unreadCount, forKey: .unreadCount)
+        try c.encode(isFavorite, forKey: .isFavorite)
+        try c.encode(backfillComplete, forKey: .backfillComplete)
+        try c.encodeIfPresent(oldestSyncedDate, forKey: .oldestSyncedDate)
+        try c.encodeIfPresent(backfillUidCursor, forKey: .backfillUidCursor)
+        try c.encodeIfPresent(backfillPageToken, forKey: .backfillPageToken)
+        try c.encodeIfPresent(backfillPageHeldSince, forKey: .backfillPageHeldSince)
+        try c.encode(backfillVersion, forKey: .backfillVersion)
+        try c.encodeIfPresent(lastKnownUidValidity, forKey: .lastKnownUidValidity)
+        try c.encodeIfPresent(uidValidityResetPendingAt, forKey: .uidValidityResetPendingAt)
+        try c.encodeIfPresent(catchUpState, forKey: .catchUpState)
+        try c.encodeIfPresent(changeState, forKey: .changeState)
+        try c.encodeIfPresent(changeCursor, forKey: .changeCursor)
+    }
+
     init(name: String, path: String, role: FolderRole, accountId: String) {
         self.id = "\(accountId):\(path)"
         self.accountId = accountId

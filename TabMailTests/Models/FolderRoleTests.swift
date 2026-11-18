@@ -164,72 +164,59 @@ struct FolderEqualityTests {
 @Suite("Folder Codable")
 struct FolderCodableTests {
 
-    @Test("Folder Codable round-trip preserves all fields")
-    func codableRoundTrip() throws {
+    @Test("Folder encoding carries every field but the listing counters")
+    func encodingOmitsTheListingCounters() throws {
         var folder = Folder(name: "Work Projects", path: "INBOX/Work", role: .custom, accountId: "acc1")
         folder.unreadCount = 42
         folder.totalCount = 150
         folder.isFavorite = true
         folder.backfillComplete = true
-        folder.oldestSyncedDate = Date(timeIntervalSince1970: 1700000000)
         folder.lastKnownUidNext = 5000
+        folder.lastKnownHighestModSeq = 77
         folder.backfillUidCursor = 200
         folder.backfillPageToken = "next-page-xyz"
-
-        let data = try JSONEncoder().encode(folder)
-        let decoded = try JSONDecoder().decode(Folder.self, from: data)
-
-        #expect(decoded.id == folder.id)
-        #expect(decoded.accountId == "acc1")
-        #expect(decoded.name == "Work Projects")
-        #expect(decoded.path == "INBOX/Work")
-        #expect(decoded.role == .custom)
-        #expect(decoded.unreadCount == 42)
-        #expect(decoded.totalCount == 150)
-        #expect(decoded.isFavorite == true)
-        #expect(decoded.backfillComplete == true)
-        #expect(decoded.lastKnownUidNext == 5000)
-        #expect(decoded.backfillUidCursor == 200)
-        #expect(decoded.backfillPageToken == "next-page-xyz")
+        let object = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(folder)) as? [String: Any])
+        #expect(Set(object.keys).isDisjoint(with: Folder.listingCounterColumns), "\(object.keys.sorted())")
+        #expect(object["unreadCount"] as? Int == 42)
+        #expect(object["backfillUidCursor"] as? Int == 200)
+        #expect(object["backfillPageToken"] as? String == "next-page-xyz")
     }
 
-    @Test("Folder Codable round-trip with nil optional fields")
-    func codableRoundTripNils() throws {
-        let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
-
-        let data = try JSONEncoder().encode(folder)
-        let decoded = try JSONDecoder().decode(Folder.self, from: data)
-
-        #expect(decoded.oldestSyncedDate == nil)
-        #expect(decoded.lastKnownUidNext == nil)
-        #expect(decoded.backfillUidCursor == nil)
-        #expect(decoded.backfillPageToken == nil)
-    }
-
-    @Test("Folder GRDB round-trip preserves all fields")
-    func grdbRoundTrip() throws {
+    @Test("Fence: a whole-record Folder save encodes every folder column except the listing counters, and never writes them")
+    func wholeRecordSaveNeverWritesTheListingCounters() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         var folder = try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
-
+        try db.write { db in
+            try SyncEngine.writeListingCounters(ListingCounters(messageCount: 7, uidNext: 8, highestModSeq: 9), folderId: folder.id, db: db)
+        }
         folder.unreadCount = 10
         folder.totalCount = 500
         folder.isFavorite = true
         folder.backfillComplete = true
         folder.oldestSyncedDate = Date(timeIntervalSince1970: 1600000000)
         folder.lastKnownUidNext = 9999
+        folder.lastKnownHighestModSeq = 4242
         folder.backfillUidCursor = 100
         folder.backfillPageToken = "token-abc"
         try db.write { try folder.update($0) }
+        try db.write { try folder.save($0) }
 
-        let fetched = try db.read { try Folder.fetchOne($0, key: folder.id) }
-        #expect(fetched?.unreadCount == 10)
-        #expect(fetched?.totalCount == 500)
-        #expect(fetched?.isFavorite == true)
-        #expect(fetched?.backfillComplete == true)
-        #expect(fetched?.lastKnownUidNext == 9999)
-        #expect(fetched?.backfillUidCursor == 100)
-        #expect(fetched?.backfillPageToken == "token-abc")
+        let fetched = try #require(try db.read { try Folder.fetchOne($0, key: folder.id) })
+        #expect(fetched.unreadCount == 10)
+        #expect(fetched.isFavorite == true)
+        #expect(fetched.backfillComplete == true)
+        #expect(fetched.backfillUidCursor == 100)
+        #expect(fetched.backfillPageToken == "token-abc")
+        #expect(fetched.totalCount == 7 && fetched.lastKnownUidNext == 8 && fetched.lastKnownHighestModSeq == 9,
+                "only the listing writer writes the counters")
+
+        // Every other column of the table is encoded: a new field cannot be
+        // left out of `Folder.encode(to:)` unnoticed.
+        let encoded = Set(try folder.databaseDictionary.keys)
+        let tableColumns = Set(try db.read { try $0.columns(in: Folder.databaseTableName).map(\.name) })
+        #expect(encoded == tableColumns.subtracting(Folder.listingCounterColumns),
+                "missing: \(tableColumns.subtracting(Folder.listingCounterColumns).subtracting(encoded).sorted()), extra: \(encoded.subtracting(tableColumns).sorted())")
     }
 
     @Test("Folder with nested path has correct id")

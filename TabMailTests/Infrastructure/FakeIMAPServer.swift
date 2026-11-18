@@ -922,6 +922,40 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.heldGateReleased.formUnion([fragment.uppercased()]) }
     }
 
+    /// Test seam: hold the next FETCH in `mailbox` AFTER it has read the
+    /// mailbox's messages (its snapshot), before it answers: whatever changes
+    /// while it is held is invisible to that answer, the race a listing whose
+    /// FETCH is overtaken really has. Released by `releaseFetchAfterSnapshot(in:)`.
+    func holdNextFetchAfterSnapshot(in mailbox: String) {
+        holdNextCommand(containing: Self.snapshotGateKey(mailbox))
+    }
+
+    func isHoldingFetchAfterSnapshot(in mailbox: String) -> Bool {
+        isHoldingCommand(containing: Self.snapshotGateKey(mailbox))
+    }
+
+    func releaseFetchAfterSnapshot(in mailbox: String) {
+        releaseHeldCommand(containing: Self.snapshotGateKey(mailbox))
+    }
+
+    private static func snapshotGateKey(_ mailbox: String) -> String { "\u{1}FETCH-SNAPSHOT \(mailbox)" }
+
+    /// Wait at the armed gate `key`, if any, until released or the server stops.
+    private func passHeldGate(_ key: String) {
+        let upperKey = key.uppercased()
+        let armed: Bool = withState { state in
+            guard state.heldGates[upperKey] == false else { return false }
+            state.heldGates[upperKey] = true
+            return true
+        }
+        guard armed else { return }
+        while !withState({ $0.heldGateReleased.contains(upperKey) || $0.heldGatesAbandoned }) { usleep(2_000) }
+        withState { state in
+            state.heldGates[upperKey] = nil
+            state.heldGateReleased.remove(upperKey)
+        }
+    }
+
     /// Test seam: like `stallNextCommand`, but while the answer is held the
     /// server watches the connection, and ends the session the moment the client
     /// closes it (as a real server does), instead of noticing only after the hold.
@@ -3398,6 +3432,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                 recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? []
             )
         }
+        passHeldGate(Self.snapshotGateKey(mailbox))
         let matched = parseSequenceSet(seqStr, uidMode: uidMode, messages: snapshot.messages)
         var response = ""
 

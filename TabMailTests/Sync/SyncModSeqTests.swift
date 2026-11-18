@@ -35,7 +35,7 @@ struct SyncModSeqTests {
 
         var folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
         folder.lastKnownHighestModSeq = 4242
-        try db.write { try folder.insert($0) }
+        try db.write { try folder.insertWithListingCounters($0) }
 
         let read = try db.read { try Folder.fetchOne($0, key: "acc1:INBOX") }
         #expect(read?.lastKnownHighestModSeq == 4242)
@@ -86,5 +86,22 @@ struct SyncModSeqTests {
         #expect(!SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: 3))
         #expect(!SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: 3))
         #expect(SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: 3))
+    }
+
+    @Test("A deep listing that proved nothing is never skipped: the next full sync lists the folder deep again")
+    func shortDeepListingIsNeverSkipped() {
+        let fid = "shortdeep-\(UUID().uuidString)"
+        let everyN = SyncConfig.fullSyncDeepEveryN
+        // Run up to and including the deep pass.
+        while !SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: everyN) {}
+        // That deep listing came back short.
+        var listing = SyncEngine.FullSyncListing()
+        SyncEngine.record(.unproven(nil, connectionLost: false), folderId: fid, in: &listing)
+        #expect(listing.droppedFolder)
+        #expect(SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: everyN),
+                "the pass after a short deep listing is deep again, so no MODSEQ skip hides the folder")
+        if everyN > 1 {
+            #expect(!SyncEngine.fullSyncIsDeepPass(folderId: fid, everyN: everyN), "a proven deep pass resets the cadence")
+        }
     }
 }

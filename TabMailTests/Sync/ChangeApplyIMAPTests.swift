@@ -201,6 +201,27 @@ struct ChangeApplyIMAPTests {
         #expect(f(obs(3, 11, nil), nil, 3, nil), "no stored UIDNEXT: no listing proved the folder unchanged, so it is listed")
         #expect(f(obs(3, 10, 7), 10, 3, nil), "a HIGHESTMODSEQ the server reports while the last listing stored none asks for a listing")
         #expect(f(obs(3, 10, 7), 10, 3, 7, true), "a count check that did not finish asks for a listing")
+        // NOMODSEQ (RFC 7162): STATUS reports HIGHESTMODSEQ 0 and the listing stores
+        // none; an unchanged folder is not listed again on the next poll, or ever.
+        for _ in 0..<3 {
+            #expect(!f(obs(3, 10, 0), 10, 3, nil), "a NOMODSEQ folder never triggers on its modseq")
+            #expect(!f(obs(3, 10, 0), 10, 3, 0), "a stored 0 is no modseq either")
+        }
+        #expect(f(obs(3, 11, 0), 10, 3, nil), "a NOMODSEQ folder still lists on a new UID")
+    }
+
+    @Test("NOMODSEQ: a HIGHESTMODSEQ of 0 never proves a folder unchanged, so the full sync never skips on it")
+    func noModSeqNeverSkips() {
+        func skip(_ fresh: Int?, _ cached: Int?) -> Bool {
+            SyncEngine.shouldSkipFolderFetch(
+                role: .archive, freshModSeq: fresh, cachedModSeq: cached, isDeepSync: false,
+                freshCount: 3, freshUidNext: 10, listedCount: 3, listedUidNext: 10)
+        }
+        #expect(skip(7, 7))
+        #expect(!skip(0, 0), "0 == 0 is no proof: the mailbox keeps no mod-sequences")
+        #expect(!skip(0, nil))
+        #expect(SyncEngine.knownModSeq(0) == nil)
+        #expect(SyncEngine.knownModSeq(5) == 5)
     }
 
     // MARK: - Untracked

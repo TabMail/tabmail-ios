@@ -72,10 +72,10 @@ extension IMAPProvider {
     }
 
     /// The per-folder decision.
-    /// - `freshModSeq` is the folder's latest STATUS HIGHESTMODSEQ
-    ///   (`Folder.lastKnownHighestModSeq`, written by the full sync's folder upsert
-    ///   and by the delta from STATUS before any range runs), nil on a server
-    ///   without CONDSTORE.
+    /// - `freshModSeq` is the HIGHESTMODSEQ the folder's last proven listing
+    ///   stored (`Folder.lastKnownHighestModSeq`, written only by
+    ///   `SyncEngine.writeListingCounters`; STATUS is a trigger and never writes
+    ///   it), nil on a server or session without CONDSTORE.
     /// - On an expensive network only a MODSEQ change may list: that is evidence of
     ///   a change, whereas the full check (and continuing one) waits for a
     ///   non-expensive network — but for no longer than

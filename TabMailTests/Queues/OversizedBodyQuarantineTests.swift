@@ -2095,7 +2095,7 @@ struct FastSyncKeepAwakeTests {
         let settled = header("2", complete: true, oversized: false)
         try await pool.write { db in
             try account.insert(db)
-            try folder.insert(db)
+            try folder.insertWithListingCounters(db)
             try flagged.insert(db)
             try settled.insert(db)
         }

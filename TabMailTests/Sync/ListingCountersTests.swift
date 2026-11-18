@@ -327,24 +327,28 @@ struct ListingCountersTests {
             try await providerB.connect()
             defer { Task { try? await providerB.disconnect() } }
 
-            w.server.holdNextCommand(containing: "FETCH")
+            // A's FETCH is held AFTER the fake has read the mailbox for it: the
+            // expunge and the arrival below are invisible to A's answer, so A
+            // answers with 2 (gone) and without 4 (B's arrival).
+            w.server.holdNextFetchAfterSnapshot(in: Self.archivePath)
+            defer { w.server.releaseFetchAfterSnapshot(in: Self.archivePath) }
             let folder = try Self.archive(w).folder
             let listingA = Task { try await w.engine.syncMessages(for: folder, provider: w.provider, limit: limitA) }
-            // Wait until A's SELECT is answered and its FETCH is held at the server.
+            // Wait until A's FETCH has read the mailbox and is held at the server.
             let deadline = Date().addingTimeInterval(10)
-            while Date() < deadline, !w.server.isHoldingCommand(containing: "FETCH") {
+            while Date() < deadline, !w.server.isHoldingFetchAfterSnapshot(in: Self.archivePath) {
                 try await Task.sleep(nanoseconds: 5_000_000)
             }
-            #expect(w.server.isHoldingCommand(containing: "FETCH"), "precondition: A's listing FETCH is held")
+            #expect(w.server.isHoldingFetchAfterSnapshot(in: Self.archivePath), "precondition: A's listing FETCH read the mailbox and is held")
 
             w.server.setMessages([1, 3, 4].map(IMAPChangeReaderTests.message), in: Self.archivePath)
             _ = try await SyncEngine().syncMessages(for: folder, provider: providerB, limit: SyncConfig.syncMessageLimit)
             #expect(try Self.archive(w).uids == ["1", "3", "4"], "after B: the server's rows exactly")
 
-            w.server.releaseHeldCommand(containing: "FETCH")
+            w.server.releaseFetchAfterSnapshot(in: Self.archivePath)
             _ = try await listingA.value
             let afterA = try Self.archive(w)
-            #expect(afterA.uids.isSuperset(of: ["1", "3", "4"]), "A's late write removes no live row: \(afterA.uids.sorted())")
+            #expect(afterA.uids.isSuperset(of: ["1", "3", "4"]), "A's late write removes no live row, B's arrival 4 included: \(afterA.uids.sorted())")
 
             let next = try await w.engine.fullSync(account: w.account, provider: w.provider)
             #expect(next.listedFolderIds.contains(Self.archiveId(w)), "A's late counters do not suppress the next listing")
@@ -468,6 +472,19 @@ struct ListingCountersTests {
             _ = try await pass.value
             #expect(try Self.archive(w).uids.contains("1"), "an answer that arrived after the deadline removes nothing")
             #expect(try Self.archiveDue(w), "the walk did not finish: the folder stays due")
+        }
+    }
+
+    @Test("Foreground pass, caller's deadline already past: the deadline reaches the full sync through `sync(account:deadline:)`, so phase 2 sends no SEARCH and the folder is left due")
+    func foregroundDeadlineReachesTheCountCheck() async throws {
+        try await E.withWorld("lc-p7-foreground", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: Self.belowWindowServer, localUIDs: Self.belowWindowHeld)
+            let start = w.server.recordedCommands().count
+            _ = try await w.engine.sync(account: try Self.account(w), deadline: Date().addingTimeInterval(-1))
+            let searches = w.server.recordedCommands().dropFirst(start).filter { $0.uppercased().contains("SEARCH") }
+            #expect(searches.isEmpty, "no walk past the caller's deadline: \(Array(searches))")
+            #expect(try Self.archive(w).uids.contains("1"), "nothing removed")
+            #expect(try Self.archiveDue(w), "the owed walk is recorded for the next pass")
         }
     }
 
