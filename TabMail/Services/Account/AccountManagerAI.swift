@@ -396,6 +396,32 @@ extension AccountManager {
 }
 
 extension AccountManager {
+    /// Stores `value` as the AI Suggestion of the email `target` names, by the one rule
+    /// (`MessageHeader.replaceSuggestion`): only while that row is still the captured email and
+    /// still holds `expected`. The row and its AI cache entry are written in this one transaction,
+    /// so a header rebuilt from the cache (`MessageAICache.restoreIfCached`) gets this value.
+    /// `.dropped` when the identity moved or the stored suggestion is no longer `expected`.
+    nonisolated static func storeSuggestion(
+        _ value: ReplyResult, replacing expected: ReplyResult?, target: AIWriteTarget,
+        generatedAt: Date? = nil, db: Database
+    ) throws -> AIWriteOutcome {
+        var replaced = false
+        let outcome = try aiGuardedHeaderWrite(db, target: target) { msg, db in
+            guard msg.replaceSuggestion(with: value, ifStill: expected) else { return }
+            replaced = true
+            try msg.save(db)
+            // The filtered sentinel (an empty body) is not cached: there is nothing to restore.
+            guard !value.body.isEmpty else { return }
+            try MessageAICache.writeThrough(
+                accountId: msg.accountId, folderPath: msg.folderPath, rfc822MessageId: msg.rfc822MessageId,
+                cachedReply: value.body, replyGeneratedAt: generatedAt, replyTextMessage: value.textMessage,
+                replyChangeCommand: value.changeCommand, db: db)
+        }
+        return replaced ? outcome : .dropped
+    }
+}
+
+extension AccountManager {
 
     // MARK: - Direct Path (User-Opened Messages)
 
@@ -648,9 +674,8 @@ extension AccountManager {
                                     }
                                 }
 
-                                if let peerReply, !peerReply.isEmpty, msg.cachedReply == nil {
-                                    msg.cachedReply = peerReply
-                                    msg.replyTextMessage = nil
+                                if let peerReply, !peerReply.isEmpty,
+                                   msg.replaceSuggestion(with: ReplyResult(body: peerReply, textMessage: nil), ifStill: nil) {
                                     if DebugModeManager.isLoggingEnabled() {
                                         print("[AI] Device Sync reply applied for direct path \(messageId)")
                                     }
@@ -671,6 +696,7 @@ extension AccountManager {
                                     actionTag: cacheActionTag,
                                     cachedReply: msg.cachedReply,
                                     replyTextMessage: msg.replyTextMessage,
+                                    replyChangeCommand: msg.replyChangeCommand,
                                     db: db
                                 )
                             }
@@ -793,31 +819,15 @@ extension AccountManager {
                     )
                     if let reply {
                         // T4.V7 site 7.
+                        // This path runs only for a row with no reply stored (`needsReply`), so it
+                        // stores only over none: a reply or an edit stored meanwhile wins.
                         let outcome = (try? await dbPool.write { db in
-                            try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
-                                msg.cachedReply = reply.body
-                                msg.replyTextMessage = reply.textMessage
-                                try msg.save(db)
-                                if !reply.body.isEmpty {
-                                    try MessageAICache.writeThrough(
-                                        accountId: accountId,
-                                        folderPath: msg.folderPath,
-                                        rfc822MessageId: msg.rfc822MessageId,
-                                        cachedReply: reply.body,
-                                        replyGeneratedAt: Date(),
-                                        replyTextMessage: reply.textMessage,
-                                        db: db
-                                    )
-                                    if DebugModeManager.isLoggingEnabled() {
-                                        print("[AI] Reply precomputed for direct path \(messageId)")
-                                    }
-                                } else {
-                                    if DebugModeManager.isLoggingEnabled() {
-                                        print("[AI] Reply filtered (sentinel) for direct path \(messageId)")
-                                    }
-                                }
-                            }
+                            try AccountManager.storeSuggestion(
+                                reply, replacing: nil, target: target, generatedAt: Date(), db: db)
                         }) ?? .dropped
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[AI] Reply \(reply.body.isEmpty ? "filtered (sentinel)" : "precomputed") for direct path \(messageId), stored: \(outcome == .written)")
+                        }
                         guard outcome == .written else {
                             if DebugModeManager.isLoggingEnabled() {
                                 BackgroundSyncLogger.logDebug("[AI] T4.V7 direct reply write dropped for \(messageId)")

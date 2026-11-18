@@ -172,8 +172,8 @@ struct TutorialChatViewContentTests {
         func plain(_ text: String) -> String { text.replacingOccurrences(of: "’", with: "'").lowercased() }
         #expect(TutorialCoordinator.editPrompt(teachesChat: false) == TutorialCoordinator.editPrompt)
         #expect(TutorialCoordinator.editPrompt(teachesChat: true) == TutorialCoordinator.chatViewEditPrompt)
-        #expect(TutorialChatScript.editedReply(teachesChat: false) == TutorialChatScript.declinedReply)
-        #expect(plain(TutorialChatScript.editedReply(teachesChat: true)).contains("i'm in"))
+        #expect(TutorialChatScript.editedReply(teachesChat: false).body == TutorialChatScript.declinedReply)
+        #expect(plain(TutorialChatScript.editedReply(teachesChat: true).body).contains("i'm in"))
     }
 }
 
@@ -391,9 +391,9 @@ struct TutorialChatViewRunTests {
             #expect(coordinator.chatPrompt == nil)
             // The edit keeps the reply a yes.
             #expect(coordinator.composeEditPrompt == TutorialCoordinator.chatViewEditPrompt)
-            var edited: String?
+            var edited: ReplyResult?
             await coordinator.runPracticeReplyEdit { edited = $0 }
-            #expect(edited == TutorialChatScript.shorterReply)
+            #expect(edited?.body == TutorialChatScript.shorterReply)
 
             // The practice reply goes out, as compose sends it.
             let reply = TutorialChatScript.shorterReply
@@ -583,6 +583,101 @@ struct TutorialChatViewRunTests {
     }
 }
 
+// MARK: - The practice reply's edit, then Discard
+
+/// The bug this guards (a release blocker): in the chat view's Part 2 the user taps the AI
+/// Suggestion, asks "Make it shorter" on the compose card, then discards the card. The edit was
+/// stored without a text version, so the chat had no AI Suggestion left while its card still said
+/// "Tap the AI Suggestion": nothing to tap, and the coach waited forever.
+/// THE SYSTEM PROPERTY: on that path the practice chat always has the move its card asks for.
+extension TutorialChatViewRunTests {
+    @Test("After the practice edit and a discarded card, the practice chat still shows the AI Suggestion its card points at")
+    func editThenDiscardLeavesTheSuggestionToTap() async throws {
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        try await withSettings(chatView: true) {
+            let coordinator = TutorialCoordinator.shared
+            let pool = fixture.0
+            try await start(.reuseReply)
+            #expect(coordinator.step == .replyToPriya)
+            func priya() async throws -> MessageHeader {
+                try #require(try await pool.read { db in
+                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                        && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+                })
+            }
+            func ghost(_ header: MessageHeader) -> String? {
+                ChatReplyField.suggestionText(newest: header, usersTurn: false, onlyTo: nil)
+            }
+            let opened = try await priya()
+            #expect(ghost(opened) != nil, "control: the seeded AI Suggestion shows")
+
+            // "Make it shorter" on the card: the scripted edit reaches compose's own writer, as the
+            // card's edit of the visible suggestion does (`applyInlineEdit`, `persistCachedReply`).
+            var edited: ReplyResult?
+            await coordinator.runPracticeReplyEdit { edited = $0 }
+            let edit = try #require(edited)
+            await ComposeView.writeOverCurrent(ReplyResult(body: edit.body, textMessage: edit.textMessage, changeCommand: nil), replyTo: opened, db: pool)
+            #expect(coordinator.replyEdited)
+
+            // Discard: the card closes, nothing is sent, and the step is still the reply.
+            #expect(coordinator.step == .replyToPriya)
+            let after = try await priya()
+            #expect(after.cachedReply == TutorialChatScript.shorterReply)
+            #expect(ghost(after) != nil, "the edited reply still shows as the AI Suggestion")
+            #expect(TutorialCoordinator.chatShowsCard(
+                step: coordinator.step, teachesChat: coordinator.teachesChat,
+                holdsPracticeEmail: true, holdsSourceEmail: false))
+            let card = try #require(TutorialCoachContent.make(
+                step: .replyToPriya, lesson: .reuseReply, host: .chat, flightsAsked: false,
+                replyEdited: coordinator.replyEdited, isSending: false, teachesChat: true))
+            #expect(card.message.contains("Tap the AI Suggestion"))
+            #expect(coordinator.fieldMove(inPracticeChat: true) == .tapSuggestion, "the tap the card asks for is the chat's move")
+            // The tap reopens the card, where Use Suggestion is now admitted, so the run goes on.
+            #expect(coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId,
+                                       messageId: DemoSeed.TutorialFixture.priyaOffsite))
+            await coordinator.end()
+        }
+    }
+}
+
+extension TutorialChatViewContentTests {
+    /// Every state Part 2 can be in, in Priya's chat: the card shown there asks for a move the
+    /// chat offers. With the reply edited or not, that move is the tap on the AI Suggestion, and
+    /// the edited reply the tap needs carries the text version the AI Suggestion shows.
+    @Test("In Priya's chat every Part 2 card asks for a move the chat offers")
+    @MainActor
+    func practiceChatCardsHaveTheirMove() throws {
+        for replyEdited in [false, true] {
+            let card = try #require(TutorialCoachContent.make(
+                step: .replyToPriya, lesson: .reuseReply, host: .chat, flightsAsked: false,
+                replyEdited: replyEdited, isSending: false, teachesChat: true))
+            #expect(card.message.contains("Tap the AI Suggestion"), "replyEdited=\(replyEdited)")
+            #expect(TutorialCoordinator.fieldMove(for: .replyToPriya, inPracticeChat: true, teachesChat: true)
+                    == .tapSuggestion, "replyEdited=\(replyEdited)")
+        }
+        // The card while sending asks for nothing.
+        let sending = try #require(TutorialCoachContent.make(
+            step: .replyToPriya, lesson: .reuseReply, host: .chat, flightsAsked: false,
+            replyEdited: true, isSending: true, teachesChat: true))
+        #expect(sending.showsProgress && sending.buttons.isEmpty)
+        // Both scripted edits are whole compose results: an email and its text version.
+        for teachesChat in [false, true] {
+            let edit = TutorialChatScript.editedReply(teachesChat: teachesChat)
+            #expect(!edit.body.isEmpty)
+            #expect(!(edit.textMessage ?? "").isEmpty, "teachesChat=\(teachesChat)")
+            let header = MessageHeader(
+                messageId: "1", subject: "Offsite", from: "Priya", fromAddress: "priya@company.com",
+                to: "me@example.com", date: Date(), snippet: "", folderId: "acc1:INBOX", accountId: "acc1",
+                folderPath: "INBOX", isInInbox: true)
+            var edited = header
+            edited.cachedReply = edit.body
+            edited.replyTextMessage = edit.textMessage
+            #expect(ChatReplyField.suggestionText(newest: edited, usersTurn: false, onlyTo: nil) != nil)
+        }
+    }
+}
+
 // MARK: - The views' wiring
 
 @Suite("Tutorial in the chat view — the views' wiring")
@@ -618,7 +713,7 @@ struct TutorialChatViewWiringTests {
         let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
         #expect(Self.count("TutorialChatInputBar( prompt: Self.tutorialFieldText(field), isWorking: isWorking, send: { sendTutorialField(field) })", in: field) == 1)
         #expect(Self.count("case .tapSuggestion, nil: break", in: field) == 1, "the field's Send never opens compose")
-        #expect(Self.count("TutorialCoordinator.shared.chatPromptSent(prompt) let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) } sendAgentChat(prompt.rawValue, script: prompt, field: send)", in: field) == 1)
+        #expect(Self.count("TutorialCoordinator.shared.chatPromptSent(prompt) let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) } sendAgentChat(prompt.rawValue, script: prompt, field: send)", in: field) == 1)
         let pill = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count("if let status = script?.workingStatus { enqueueStatus(status) }", in: pill) == 1, "Saving template shows while it works")
         #expect(Self.count("if (isInboxChat || replyField != nil) && TutorialCoordinator.shared.highlightsChatClose {", in: pill) == 1,

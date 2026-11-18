@@ -292,7 +292,7 @@ struct ChatReplyRecoveryTests {
                 #expect(router.composeQueueDepth == 1, "control: the recovered turn asked for a reply")
                 #expect(backend.bodies.count == 2, "control: one recovery request: \(backend.bodies.dropFirst().map { $0.suffix(600) })")
                 let request = try #require(router.firstQueuedRequestForTesting)
-                #expect(request.fieldReply == ChatFieldReply(emailKey: ChatThread.copyKey(chat.email), onlyTo: ["david@example.com"]),
+                #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == ["david@example.com"],
                         "the reply carries the choice made when the request was sent: \(String(describing: request.fieldReply))")
                 let reply = ChatReplyCompose.make(agent: request, accounts: chat.accounts)
                 #expect(reply == ChatReplyCompose(isReplyAll: false, to: ["david@example.com"], cc: [], bcc: []),
@@ -341,7 +341,7 @@ struct ChatReplyRecoveryTests {
                 try await Self.waitUntil { router.composeQueueDepth == 1 }
                 #expect(router.composeQueueDepth == 1, "control: the recovered turn asked for a reply")
                 let request = try #require(router.firstQueuedRequestForTesting)
-                #expect(request.fieldReply == ChatFieldReply(emailKey: ChatThread.copyKey(chat.email), onlyTo: nil),
+                #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == nil,
                         "the reply carries the choice made when the request was sent, nobody: \(String(describing: request.fieldReply))")
                 let reply = ChatReplyCompose.make(agent: request, accounts: chat.accounts)
                 #expect(reply.isReplyAll, "a Reply All: \(reply)")

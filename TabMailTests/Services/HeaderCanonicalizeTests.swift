@@ -151,8 +151,8 @@ struct HeaderCanonicalizeTests {
         let remnant = try insertRemnant(db, messageId: "g2", actionTag: .reply, isRead: true)
         try db.write { dbConn in
             try dbConn.execute(
-                sql: "UPDATE messageHeader SET summaryBlurb = ?, cachedReply = ?, summaryTextMessage = ?, replyTextMessage = ? WHERE id = ?",
-                arguments: ["the blurb", "the reply", "summary text", "reply text", remnant.id]
+                sql: "UPDATE messageHeader SET summaryBlurb = ?, cachedReply = ?, summaryTextMessage = ?, replyTextMessage = ?, replyChangeCommand = ? WHERE id = ?",
+                arguments: ["the blurb", "the reply", "summary text", "reply text", "reply command", remnant.id]
             )
         }
         try TestDatabase.insertMessageBody(db, headerId: remnant.id, htmlContent: "<p>rich</p>")
@@ -175,6 +175,7 @@ struct HeaderCanonicalizeTests {
         // Each text message travels with the result it belongs to.
         #expect(rows[0].summaryTextMessage == "summary text")
         #expect(rows[0].replyTextMessage == "reply text")
+        #expect(rows[0].replyChangeCommand == "reply command", "the change command travels with its reply")
         #expect(rows[0].isRead == true) // OR-merge: remnant was read
         // The remnant's body reattached under the canonical id.
         let body = try db.read { try MessageBody.fetchOne($0, key: "acc1:TRASH:g2") }

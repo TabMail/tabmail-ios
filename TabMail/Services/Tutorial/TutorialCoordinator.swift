@@ -345,10 +345,10 @@ final class TutorialCoordinator {
     var highlightsTemplateCreate: Bool { step == .makeTemplate }
 
     /// The practice reply's scripted edit: after the edit's wait, hands the
-    /// declined reply to `apply` (the draft) and records the edit. Nothing
+    /// edited reply, with its text version, to `apply` (the draft) and records the edit. Nothing
     /// happens when the demo run it began in has ended meanwhile (Skip, then a
     /// new run, before the wait is over): the edit belongs to that run alone.
-    func runPracticeReplyEdit(apply: (String) -> Void) async {
+    func runPracticeReplyEdit(apply: (ReplyResult) -> Void) async {
         let admission = DemoModeStore.shared.chatAdmission
         let edited = TutorialChatScript.editedReply(teachesChat: teachesChat)
         try? await Task.sleep(for: TutorialChatScript.editDuration)

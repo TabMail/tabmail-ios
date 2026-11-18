@@ -52,13 +52,18 @@ enum AIResponseParser {
     struct ReplyResult {
         let body: String
         let textMessage: String?
+        /// A short command that would change this reply (`change_command`), shown as the reply
+        /// field's example while the AI Suggestion shows. Nil when absent.
+        let changeCommand: String?
     }
 
-    /// Parse the precache reply JSON: `{"subject": "..", "body": "..", "text_message": ".."}`. Nil when
+    /// Parse the precache reply JSON: `{"subject": "..", "body": "..", "text_message": "..",
+    /// "change_command": ".."}`. Nil when
     /// it is not that object or has no body; the caller treats that as no reply (retried later).
     static func parseReplyResponse(_ text: String) -> ReplyResult? {
         guard let object = jsonObject(text), let body = (object["body"] as? String).flatMap(nonEmpty) else { return nil }
-        return ReplyResult(body: body, textMessage: (object["text_message"] as? String).flatMap(nonEmpty))
+        return ReplyResult(body: body, textMessage: (object["text_message"] as? String).flatMap(nonEmpty),
+                           changeCommand: (object["change_command"] as? String).flatMap(nonEmpty))
     }
 
     /// The JSON object `text` holds, else nil.

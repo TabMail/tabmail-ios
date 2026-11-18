@@ -34,6 +34,8 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     var replyGeneratedAt: Date?
     /// The reply's text message (`MessageHeader.replyTextMessage`).
     var replyTextMessage: String?
+    /// The reply's change command (`MessageHeader.replyChangeCommand`).
+    var replyChangeCommand: String?
 
     var updatedAt: Date
 
@@ -100,9 +102,10 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         }
 
         // Restore cached reply if header doesn't have one
-        if header.cachedReply == nil, let reply = cached.cachedReply, !reply.isEmpty {
-            header.cachedReply = reply
-            header.replyTextMessage = cached.replyTextMessage
+        if let reply = cached.cachedReply, !reply.isEmpty {
+            _ = header.replaceSuggestion(
+                with: ReplyResult(body: reply, textMessage: cached.replyTextMessage, changeCommand: cached.replyChangeCommand),
+                ifStill: nil)
         }
 
         cached.updatedAt = Date()
@@ -115,7 +118,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     /// Only overwrites non-nil parameters — preserves existing cached fields — except the two
     /// text messages, which belong to their result: a new summary (`summaryBlurb` given) sets
     /// `summaryTextMessage` to the one passed, nil included, and a new reply (`cachedReply` given)
-    /// sets `replyTextMessage` likewise, so a result without one never keeps an older result's.
+    /// sets `replyTextMessage` and `replyChangeCommand` likewise, so a result without one never keeps an older result's.
     /// No-op if rfc822MessageId is nil (skip cache for messages without Message-ID). An existing
     /// entry without a Message-ID takes this one; a stored one is never replaced.
     static func writeThrough(
@@ -132,6 +135,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         cachedReply: String? = nil,
         replyGeneratedAt: Date? = nil,
         replyTextMessage: String? = nil,
+        replyChangeCommand: String? = nil,
         db: Database
     ) throws {
         guard let key = cacheKey(
@@ -161,6 +165,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         if let cachedReply {
             cache.cachedReply = cachedReply
             cache.replyTextMessage = replyTextMessage
+            cache.replyChangeCommand = replyChangeCommand
         }
         if let replyGeneratedAt { cache.replyGeneratedAt = replyGeneratedAt }
         cache.updatedAt = Date()

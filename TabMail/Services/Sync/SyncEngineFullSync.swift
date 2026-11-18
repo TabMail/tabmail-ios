@@ -892,9 +892,8 @@ extension SyncEngine {
             if survivor.reminderDate == nil { survivor.reminderDate = row.reminderDate }
             if survivor.reminderTime == nil { survivor.reminderTime = row.reminderTime }
             if survivor.reminderContent == nil { survivor.reminderContent = row.reminderContent }
-            if survivor.cachedReply == nil {
-                survivor.cachedReply = row.cachedReply
-                survivor.replyTextMessage = row.replyTextMessage
+            if let suggestion = row.suggestion {
+                _ = survivor.replaceSuggestion(with: suggestion, ifStill: nil)
             }
             survivor.isReplied = survivor.isReplied || row.isReplied
             survivor.isForwarded = survivor.isForwarded || row.isForwarded
@@ -2170,9 +2169,8 @@ extension SyncEngine {
                         header.reminderContent = preSync.reminderContent
                         header.summaryTextMessage = preSync.summaryTextMessage
                     }
-                    if header.cachedReply == nil {
-                        header.cachedReply = preSync.cachedReply
-                        header.replyTextMessage = preSync.replyTextMessage
+                    if let suggestion = preSync.suggestion {
+                        _ = header.replaceSuggestion(with: suggestion, ifStill: nil)
                     }
                     header.notified = header.notified || preSync.notified
                     // Migrate MessageBody (FK to old id) before delete.

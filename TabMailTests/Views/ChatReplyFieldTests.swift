@@ -60,6 +60,18 @@ struct ChatReplyFieldTests {
 
     // MARK: - 1. The AI Suggestion
 
+    @Test("The e.g. line offers the suggestion's change command while it shows, else the configured example",
+          arguments: [
+            (true, "ask for Friday" as String?, "ask for Friday" as String?),
+            (true, nil, "politely decline"),
+            (true, "   ", "politely decline"),
+            (false, "ask for Friday", "politely decline"),
+            (false, nil, "politely decline"),
+          ])
+    func exampleLine(_ shows: Bool, _ command: String?, _ expected: String?) {
+        #expect(ChatReplyField.example(suggestionShows: shows, changeCommand: command, configured: "politely decline") == expected)
+    }
+
     @Test("The AI Suggestion shows the reply's text message only for someone else's email with a full reply, to everyone")
     func suggestionText() {
         let ready = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
@@ -516,7 +528,7 @@ struct ChatReplyFieldTests {
         await translator.seed(header.id, as: 1)
         let tool = EmailReplyTool(context: ToolContext(db: db, translator: translator, router: router))
         var fieldReply: ChatFieldReply?
-        if case .field(let onlyTo) = origin { fieldReply = ChatFieldReply(emailKey: ChatThread.copyKey(header), onlyTo: onlyTo) }
+        if case .field(let onlyTo) = origin { fieldReply = ChatFieldReply(email: header, onlyTo: onlyTo) }
         let invocation = ToolInvocation(fieldReply: fieldReply)
         let task = Task { @MainActor () -> String in
             try await tool.execute(
@@ -672,7 +684,7 @@ struct ChatReplyFieldTests {
                 "a new newest email resets the choice, even one whose UID matches the last")
 
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
-        #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) }", in: island) == 1,
+        #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) }", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
         #expect(Self.count("let fieldReply = field?.fieldReply", in: island) == 1)
         #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)", in: island) == 1,

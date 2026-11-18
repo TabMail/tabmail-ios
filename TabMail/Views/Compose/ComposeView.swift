@@ -1121,8 +1121,13 @@ struct ComposeView: View {
     @State private var showFilePicker = false
     @State private var showCamera = false
     @State private var showingSuggestion = false
-    @State private var currentSuggestion: String?
+    /// The AI Suggestion the card shows, as one value (body, text version, change command) from
+    /// where it came: the stored suggestion, a recompute, an edit.
+    @State private var shownSuggestion: ReplyResult?
+    private var currentSuggestion: String? { shownSuggestion?.body }
     @State private var isRecomputing = false
+    /// The card's running recompute: a new one or the card closing cancels it.
+    @State private var recomputeTask: Task<Void, Never>?
     @State private var isApplyingEdit = false
     @State private var aiWorking = false
     @State private var agentToast: String?
@@ -1206,6 +1211,9 @@ struct ComposeView: View {
 
     var replyTo: MessageHeader?
     var suggestedBody: String?
+    /// The reply's stored AI Suggestion as it showed (the chat's ghost), as one value; it wins over
+    /// `suggestedBody`, a body alone (the agent's).
+    var suggestion: ReplyResult?
     var account: Account?
     var isForward: Bool = false
     /// Opened as Reply All (#915). Persisted on the draft row and the outbox row
@@ -1255,6 +1263,7 @@ struct ComposeView: View {
     init(
         replyTo: MessageHeader? = nil,
         suggestedBody: String? = nil,
+        suggestion: ReplyResult? = nil,
         account: Account? = nil,
         isForward: Bool = false,
         isReplyAll: Bool = false,
@@ -1273,6 +1282,7 @@ struct ComposeView: View {
     ) {
         self.replyTo = replyTo
         self.suggestedBody = suggestedBody
+        self.suggestion = suggestion
         self.account = account
         self.isForward = isForward
         self.isReplyAll = isReplyAll
@@ -1733,6 +1743,7 @@ struct ComposeView: View {
                         draftSubject: subject.isEmpty ? "New Message" : subject,
                         // Bubble visible → edit the suggestion; otherwise edit the body.
                         draftBody: showingSuggestion ? (currentSuggestion ?? "") : messageBody,
+                        draftSuggestion: showingSuggestion ? shownSuggestion : nil,
                         composeContext: buildComposeEditContext(),
                         draftId: draftId,
                         draftReplyToId: replyTo?.id,
@@ -1756,8 +1767,10 @@ struct ComposeView: View {
                         skipDraftAutoSave: showingSuggestion,
                         isExpanded: $chatExpanded,
                         isWorking: $aiWorking,
-                        onDraftUpdate: { newSubject, newBody, toDelta, ccDelta, bccDelta in
-                            applyInlineEdit(subject: newSubject, body: newBody, toDelta: toDelta, ccDelta: ccDelta, bccDelta: bccDelta)
+                        onDraftUpdate: { newSubject, newBody, toDelta, ccDelta, bccDelta, textMessage, changeCommand in
+                            applyInlineEdit(
+                                subject: newSubject, body: newBody, toDelta: toDelta, ccDelta: ccDelta, bccDelta: bccDelta,
+                                textMessage: textMessage, changeCommand: changeCommand)
                         },
                         onAgentReply: { reply in
                             showAgentToast(reply)
@@ -2068,6 +2081,7 @@ struct ComposeView: View {
     }
 
     private func performDisappear() {
+        recomputeTask?.cancel()
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ComposeView] onDisappear instance=\(instanceToken) draftId=\(draftId)")
         }
@@ -2236,15 +2250,20 @@ struct ComposeView: View {
         guard let reply = replyTo, let account = resolvedAccount else { return }
         isRecomputing = true
 
-        Task {
-            if let body = await Self.recomputedReply(
+        recomputeTask?.cancel()
+        recomputeTask = Task {
+            if let result = await Self.recomputedReply(
                 for: reply, account: account,
                 kbText: PromptStore.shared.kbText(),
                 compositionPrompt: PromptStore.shared.compositionMarkdown(),
                 aiService: .shared, dbPool: dbPool
             ) {
-                currentSuggestion = body
+                // A newer recompute, or an edit of the suggestion that landed meanwhile, replaced
+                // this one: it owns the suggestion and the spinner.
+                guard !Task.isCancelled else { return }
+                shownSuggestion = result
             }
+            guard !Task.isCancelled else { return }
             isRecomputing = false
         }
     }
@@ -2275,7 +2294,6 @@ struct ComposeView: View {
 
     /// Build the compose edit context for the DynamicIslandChat inline editor.
     private func buildComposeEditContext() -> ComposeEditContext {
-        let account = resolvedAccount
         let mode: String
         if isForward {
             mode = "edit_forward"
@@ -2284,73 +2302,27 @@ struct ComposeView: View {
         } else {
             mode = "edit_new"
         }
-
-        // Build related email info for reply mode
-        let relatedDate: String
-        let relatedSubject: String
-        let relatedFrom: String
-        let relatedTo: String
-        let relatedCc: String
-        let bodyText: String
-
-        if let reply = replyTo {
-            relatedDate = AIService.formatTimestampForAgent(reply.date)
-            relatedSubject = reply.subject
-            let fromFormatted = reply.fromAddress.isEmpty ? reply.from : "\(reply.from) <\(reply.fromAddress)>"
-            relatedFrom = fromFormatted
-            relatedTo = reply.to
-            relatedCc = reply.cc
-
-            let body = try? dbPool.read { db in try MessageBody.fetchOne(db, key: reply.id) }
-            if let html = body?.htmlContent, !html.isEmpty {
-                // Strip embedded .eml sections — AI edit context is the primary
-                // message body, not forwarded-as-attachment emails.
-                bodyText = EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html))
-            } else {
-                bodyText = reply.snippet
-            }
-        } else {
-            relatedDate = ""
-            relatedSubject = ""
-            relatedFrom = ""
-            relatedTo = ""
-            relatedCc = ""
-            bodyText = ""
+        let bodyText = replyTo.flatMap { reply in
+            try? dbPool.read { db in try ComposeEditContext.relatedBodyText(of: reply, db: db) }
         }
-
-        return ComposeEditContext(
-            recipients: recipients.to.tokens,
-            toRecipients: recipients.to.tokens,
-            ccRecipients: recipients.cc.tokens,
-            bccRecipients: recipients.bcc.tokens,
-            toDisplayNames: recipients.to.displayNames,
-            ccDisplayNames: recipients.cc.displayNames,
-            bccDisplayNames: recipients.bcc.displayNames,
-            senderName: account?.displayName ?? "",
-            senderEmail: account?.emailAddress ?? "",
-            mode: mode,
-            compositionPrompt: PromptStore.shared.compositionMarkdown(),
-            kbText: PromptStore.shared.kbText(),
-            relatedDate: relatedDate,
-            relatedSubject: relatedSubject,
-            relatedFrom: relatedFrom,
-            relatedTo: relatedTo,
-            relatedCc: relatedCc,
-            bodyText: bodyText
-        )
+        return ComposeEditContext.make(
+            recipients: recipients, account: resolvedAccount, mode: mode, related: replyTo,
+            relatedBodyText: bodyText, compositionPrompt: PromptStore.shared.compositionMarkdown(),
+            kbText: PromptStore.shared.kbText())
     }
 
     /// Apply an inline edit result: dissolve out old text, swap, dissolve in new text.
-    /// Recipient deltas (to/cc/bcc) are `nil` when the LLM did not emit any `+X:`/`-X:` line for
-    /// that field (keep current). Non-nil deltas are applied as: removes → adds (deduped).
-    /// A delta whose `clearsField` is true wipes the field before adding. See
-    /// email_edit_response_format-v1.5.16.md.
+    /// Recipient deltas (to/cc/bcc) are `nil` when the edit's `add_*`/`remove_*` lists for that
+    /// field are empty (keep current). Non-nil deltas are applied as: removes → adds (deduped).
+    /// A delta whose `clearsField` is true wipes the field before adding.
     private func applyInlineEdit(
         subject newSubject: String?,
         body newBody: String?,
         toDelta: RecipientDelta?,
         ccDelta: RecipientDelta?,
-        bccDelta: RecipientDelta?
+        bccDelta: RecipientDelta?,
+        textMessage: String?,
+        changeCommand: String?
     ) {
         func desc(_ d: RecipientDelta?) -> String {
             guard let d else { return "nil" }
@@ -2378,12 +2350,20 @@ struct ComposeView: View {
             if let b = newBody {
                 if showingSuggestion {
                     BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating suggestion (len=\(b.count))")
-                    currentSuggestion = b
-                    // Only persist to messageHeader.cachedReply in reply mode.
-                    // Compose has no source message; forward would write to the
-                    // wrong target (the email being forwarded, not the draft).
-                    if replyTo != nil && !isForward {
-                        persistCachedReply(b)
+                    // An edit of the suggestion landed: a recompute still running is older, so it
+                    // neither shows nor stores over it.
+                    recomputeTask?.cancel()
+                    isRecomputing = false
+                    let edited = ReplyResult(body: b, textMessage: textMessage, changeCommand: changeCommand)
+                    let previous = shownSuggestion
+                    shownSuggestion = edited
+                    // The stored AI Suggestion is the Reply All draft (the chat's ghost). Only an
+                    // edit of a reply whose envelope is still that one replaces it, over the
+                    // suggestion this card showed; an edit for another audience or subject stays
+                    // in this card and its draft. Compose has no source message, and forward would
+                    // write to the email being forwarded.
+                    if let reply = replyTo, !isForward, holdsSuggestionEnvelope(of: reply) {
+                        persistCachedReply(edited, replacing: previous, replyTo: reply)
                     }
                 } else {
                     BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating body (len=\(b.count))")
@@ -2404,33 +2384,61 @@ struct ComposeView: View {
         }
     }
 
-    /// Write the edited suggestion to `messageHeader.cachedReply` so reopens see it. The reply's
-    /// text message described the AI's body, not the user's edit, so it is cleared.
-    private func persistCachedReply(_ text: String) {
-        guard let reply = replyTo else { return }
-        Task { await Self.writeCachedReplyToDB(text, replyTo: reply, db: dbPool.pool) }
+    /// Write the edited suggestion to `messageHeader.cachedReply` so reopens see it, with the
+    /// edit's own text version and change command: the chat's AI Suggestion and its field example
+    /// show them, so a card edit updates the suggestion in the chat. A resend or rewind restores the
+    /// ones recorded with the earlier body; an edit with none (history from older builds, a body that
+    /// was not the suggestion) clears them.
+    private func persistCachedReply(_ value: ReplyResult, replacing previous: ReplyResult?, replyTo reply: MessageHeader) {
+        let db = dbPool
+        Task { await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: db) }
     }
 
-    /// Internal for testability — exact SQL used by `persistCachedReply`.
+    /// Whether this card's draft is still the AI Suggestion's envelope for `reply`
+    /// (`ChatReplyCompose.suggestionEnvelope`, the one builder): same sender, subject and audience.
+    private func holdsSuggestionEnvelope(of reply: MessageHeader) -> Bool {
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: reply, accounts: navigationStore.accounts)
+        return envelope.holds(
+            recipients: recipients.pendingCommitted, subject: subject,
+            accountId: selectedAccount?.id ?? reply.accountId, of: reply)
+    }
+
+    /// Stores `value` as the AI Suggestion of `reply`, the email compose opened for, only over
+    /// `expected` (`AccountManager.storeSuggestion`, the one writer). Internal for testability.
     ///
-    /// `reply` is the email compose opened for. Its id is an address, not an identity: a UIDVALIDITY
-    /// reset can purge the email while compose is open and a resync can seat a different one at the
-    /// same address. The edit is stored only while the row at that address is still the email compose
-    /// opened for (`AIWriteTarget` captured from `reply`, one transaction); on any doubt nothing is
-    /// written. The edit stays in the open compose, and the cache is a convenience for reopening, so
-    /// a refused write costs that convenience, while the alternative stores it on another email.
-    static func writeCachedReplyToDB(_ text: String, replyTo reply: MessageHeader, db: any DatabaseWriter) async {
-        let outcome = (try? await db.write { db -> AIWriteOutcome in
+    /// `reply`'s id is an address, not an identity: a UIDVALIDITY reset can purge the email while
+    /// compose is open and a resync can seat a different one at the same address. The value is
+    /// stored only while the row at that address is still the email compose opened for
+    /// (`AIWriteTarget` captured from `reply`, one transaction); on any doubt nothing is written.
+    /// `expected` is the suggestion the writer started from (the card's shown suggestion, the
+    /// field's, a recompute's read): a newer one stored meanwhile wins, even one that changed only
+    /// the text or command. Production goes through the prioritized writer (`PrioritizedDatabase`).
+    @discardableResult
+    static func writeCachedReplyToDB(
+        _ value: ReplyResult, replacing expected: ReplyResult?, replyTo reply: MessageHeader, db: PrioritizedDatabase
+    ) async -> AIWriteOutcome {
+        await storeSuggestion(value, replacing: expected, replyTo: reply) { body in try await db.write(body) }
+    }
+
+    /// The same write into a plain writer, for tests' own databases.
+    @discardableResult
+    static func writeCachedReplyToDB(
+        _ value: ReplyResult, replacing expected: ReplyResult?, replyTo reply: MessageHeader, db: any DatabaseWriter
+    ) async -> AIWriteOutcome {
+        await storeSuggestion(value, replacing: expected, replyTo: reply) { body in try await db.write(body) }
+    }
+
+    private static func storeSuggestion(
+        _ value: ReplyResult, replacing expected: ReplyResult?, replyTo reply: MessageHeader,
+        write: (@escaping @Sendable (Database) throws -> AIWriteOutcome) async throws -> AIWriteOutcome
+    ) async -> AIWriteOutcome {
+        let outcome = (try? await write { db in
             guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return .dropped }
-            return try AccountManager.aiGuardedHeaderWrite(db, target: target) { _, db in
-                try db.execute(
-                    sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = NULL WHERE id = ?",
-                    arguments: [text, reply.id]
-                )
-            }
+            return try AccountManager.storeSuggestion(value, replacing: expected, target: target, db: db)
         }) ?? .dropped
         // An open chat shows the row's AI Suggestion: it reloads the row, as after the AI's own writes.
         if outcome == .written { await postMessageDataDidChange(reply.id) }
+        return outcome
     }
 
     /// Tells open views the row at `id` changed, on the main actor as the AI queue's writers do.
@@ -2439,13 +2447,17 @@ struct ComposeView: View {
     }
 
     /// What `recomputeReply` does, without the view: ask for a new reply to `reply` and store
-    /// it with its text message. Returns the reply for the suggestion, or nil when there is
-    /// none. Internal for testability.
+    /// it with its text message and change command. Returns the reply for the suggestion, or nil
+    /// when there is none. Internal for testability.
     nonisolated static func recomputedReply(
         for reply: MessageHeader, account: Account, kbText: String, compositionPrompt: String,
         aiService: AIService, dbPool: PrioritizedDatabase
-    ) async -> String? {
-        let body = try? await dbPool.read { db in try MessageBody.fetchOne(db, key: reply.id) }
+    ) async -> ReplyResult? {
+        // The email's body, and the suggestion this recompute replaces, read together as it starts.
+        let read = try? await dbPool.read { db -> (MessageBody?, ReplyResult?) in
+            (try MessageBody.fetchOne(db, key: reply.id), try MessageHeader.fetchOne(db, key: reply.id)?.suggestion)
+        }
+        let body = read?.0
         let bodyText: String
         if let html = body?.htmlContent, !html.isEmpty {
             // Strip embedded .eml sections so the reply context is only the
@@ -2474,19 +2486,17 @@ struct ComposeView: View {
             if let result, !result.body.isEmpty {
                 // The row at `reply.id` can hold a different email by now (a UIDVALIDITY
                 // reset reuses the address), so the result is stored only while that row
-                // is still the email being replied to. The suggestion is shown either way:
-                // it answers the email on screen.
-                let outcome = (try? await dbPool.write { db -> AIWriteOutcome in
-                    guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return .dropped }
-                    return try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
-                        msg.cachedReply = result.body
-                        msg.replyTextMessage = result.textMessage
-                        try msg.update(db)
-                    }
-                }) ?? .dropped
+                // is still the email being replied to, and only over the suggestion this
+                // recompute started from: a newer one (a later recompute that finished first)
+                // wins. A recompute its card cancelled stores nothing. Only a stored result is
+                // shown, so the card never shows a suggestion the chat does not hold.
+                // Without the start's read there is nothing to store over.
+                var outcome = AIWriteOutcome.dropped
+                if let read, !Task.isCancelled {
+                    outcome = await writeCachedReplyToDB(result, replacing: read.1, replyTo: reply, db: dbPool)
+                }
                 BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId), stored: \(outcome == .written)")
-                if outcome == .written { await postMessageDataDidChange(reply.id) }
-                return result.body
+                return outcome == .written ? result : nil
             }
             BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")
         } catch {
@@ -2861,7 +2871,6 @@ struct ComposeView: View {
             currentSuggestion: currentSuggestion))
         messageBody = accepted.messageBody
         showingSuggestion = accepted.showingSuggestion
-        currentSuggestion = accepted.currentSuggestion
     }
 
     /// PORT — v2final `ComposeView.closeCompose` + `applyCloseDecision`, routed
@@ -3290,25 +3299,28 @@ struct ComposeView: View {
             currentSignature = resolvedAccount?.signature ?? ""
         }
 
-        // Unified suggestion-bubble setup. Caller-supplied suggestedBody (agent
+        // Unified suggestion-bubble setup. The caller's suggestion, else its suggestedBody (agent
         // paths) always wins. For reply mode, fall back to fresh cachedReply
         // from DB — protects against caller-side staleness when background AI,
         // P2P sync, or a prior in-place edit updated cachedReply after the
         // caller's snapshot was captured.
-        let suggestionToShow = ComposeDraftGuards.suggestionToShow(
-            suggestedBody: suggestedBody, isReply: replyTo != nil && !isForward,
-            freshCachedReply: {
-                guard let reply = replyTo else { return nil }
-                let freshHeader = try? dbPool.read { db in
-                    try MessageHeader.fetchOne(db, key: reply.id)
-                }
-                return freshHeader?.cachedReply
-            })
-        if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[ComposeView] suggestion instance=\(instanceToken) draftId=\(draftId) suggestionLen=\(suggestionToShow?.count ?? -1)")
+        let suggestionToShow: ReplyResult?
+        if let suggestion, !suggestion.body.isEmpty {
+            suggestionToShow = suggestion
+        } else if let suggestedBody, !suggestedBody.isEmpty {
+            suggestionToShow = ReplyResult(body: suggestedBody, textMessage: nil)
+        } else if let reply = replyTo, !isForward {
+            suggestionToShow = try? dbPool.read { db in
+                try MessageHeader.fetchOne(db, key: reply.id)?.suggestion
+            }
+        } else {
+            suggestionToShow = nil
         }
-        if let suggested = suggestionToShow, !suggested.isEmpty {
-            currentSuggestion = suggested
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] suggestion instance=\(instanceToken) draftId=\(draftId) suggestionLen=\(suggestionToShow?.body.count ?? -1)")
+        }
+        if let suggested = suggestionToShow, !suggested.body.isEmpty {
+            shownSuggestion = suggested
             withAnimation(.easeInOut(duration: 0.3)) {
                 showingSuggestion = true
             }

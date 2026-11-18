@@ -249,27 +249,30 @@ struct RecipientSplitFirstTests {
     // MARK: - AI edits
 
     /// The bug this guards: the AI's line was pre-parsed by taking the first
-    /// `<...>` of each comma piece, so a list in another separator added or
-    /// removed only its first mailbox, and a removed Bcc recipient was sent.
-    @Test("An AI add or removal covers every mailbox its line names", arguments: [", ", "; ", " "])
-    func aiLineCoversEveryMailbox(separator: String) throws {
-        let list = "First <first@example.com>" + separator + "Second <second@example.com>"
-        let added = AIService.parseInlineEditResponse("+Bcc: \(list)\nBody: Body")
+    /// `<...>` of each comma piece, so a list added or removed only its first
+    /// mailbox, and a removed Bcc recipient was sent. Each item of the compose
+    /// edit's lists is one recipient.
+    @Test("An AI add or removal covers every recipient it lists")
+    func aiListCoversEveryRecipient() throws {
+        let added = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            addBcc: [["name": "First", "email": "first@example.com"], ["name": "Second", "email": "second@example.com"]])))
         let addedBcc = ComposeDraftGuards.applying(try #require(added.bccDelta), to: .init())
         #expect(addedBcc.tokens == ["first@example.com", "second@example.com"])
         #expect(addedBcc.displayNames == ["first@example.com": "First", "second@example.com": "Second"])
         #expect(addedBcc.input.isEmpty)
 
-        let removed = AIService.parseInlineEditResponse("-Bcc: \(list)\nBody: Body")
+        let removed = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            removeBcc: ["first@example.com", "second@example.com"])))
         let removedBcc = ComposeDraftGuards.applying(try #require(removed.bccDelta), to: addedBcc)
         #expect(ComposeDraftGuards.sendRecipients(
             to: Self.to, cc: .init(), bcc: ComposeDraftGuards.pendingCommitted(removedBcc))
             == .send(to: ["intended@example.com"], cc: [], bcc: []))
     }
 
-    @Test("Text in an AI add that names no address stays visible, and Send refuses it")
+    @Test("An AI add item that names no address stays visible, and Send refuses it")
     func aiAddKeepsText() throws {
-        let parsed = AIService.parseInlineEditResponse("+Bcc: First <first@example.com>; unfinished\nBody: Body")
+        let parsed = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            addBcc: [["name": "First", "email": "first@example.com"], ["name": "", "email": "unfinished"]])))
         let bcc = ComposeDraftGuards.applying(try #require(parsed.bccDelta), to: .init())
         #expect(bcc.tokens == ["first@example.com"])
         #expect(bcc.rejected == ["unfinished"])
@@ -352,15 +355,15 @@ struct RecipientSplitFirstTests {
 
     // MARK: - At the provider
 
-    @Test("A removed Bcc recipient is not on the message the provider sends", arguments: ["; ", " "])
-    func removedBccNotSent(separator: String) async throws {
+    @Test("A removed Bcc recipient is not on the message the provider sends")
+    func removedBccNotSent() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: "/messages/send", method: "POST", response: .json(raw: #"{"id":"sent-test"}"#))
         let provider = GmailProvider(userEmail: "sender@example.com", accessToken: { _ in "tok" }, session: http.session)
         let start = ComposeDraftGuards.RecipientField(tokens: ["first@example.com", "second@example.com"])
-        let parsed = AIService.parseInlineEditResponse(
-            "-Bcc: First <first@example.com>\(separator)Second <second@example.com>\nBody: Body")
+        let parsed = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            removeBcc: ["first@example.com", "second@example.com"])))
         let bcc = ComposeDraftGuards.applying(try #require(parsed.bccDelta), to: start)
         guard case .send(let to, let cc, let bccs) = ComposeDraftGuards.sendRecipients(
             to: Self.to, cc: .init(), bcc: ComposeDraftGuards.pendingCommitted(bcc)) else {

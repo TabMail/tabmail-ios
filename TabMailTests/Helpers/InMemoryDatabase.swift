@@ -114,3 +114,13 @@ enum TestDatabase {
         return body
     }
 }
+
+extension ComposeView {
+    /// Tests: stores `value` through the one writer over whatever `reply`'s row holds now, the
+    /// expectation of a card that just showed that suggestion.
+    @discardableResult
+    static func writeOverCurrent(_ value: ReplyResult, replyTo reply: MessageHeader, db: any DatabaseWriter) async -> AIWriteOutcome {
+        let current = try? await db.read { try MessageHeader.fetchOne($0, key: reply.id)?.suggestion }
+        return await writeCachedReplyToDB(value, replacing: current ?? nil, replyTo: reply, db: db)
+    }
+}

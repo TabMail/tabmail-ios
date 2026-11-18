@@ -30,7 +30,7 @@ struct AITextMessageStorageTests {
         let order = [
             "v103_addFolderChangeCursor", "v104_addReplyAllAndMarkSentAt",
             "v105_addAITextMessages", "v106_repairAICacheMessageIds",
-            "v107_rekeyChatSessionsByThread",
+            "v107_rekeyChatSessionsByThread", "v108_addReplyChangeCommand",
         ]
         #expect(applied.filter { order.contains($0) } == order)
     }
@@ -78,6 +78,46 @@ struct AITextMessageStorageTests {
         #expect(after?.summaryBlurb == "Peer")
         #expect(after?.summaryTextMessage == nil)
         #expect(after?.actionTag == .reply)
+    }
+
+    @Test("v108 adds the change command column to messageHeader and messageAICache")
+    func migrationAddsChangeCommand() throws {
+        let db = try TestDatabase.make()
+        for table in ["messageHeader", "messageAICache"] {
+            #expect(try columns(db, table).contains("replyChangeCommand"), "\(table)")
+        }
+    }
+
+    @Test("The change command follows its reply through the cache: stored, kept, replaced, restored")
+    func changeCommandFollowsReply() throws {
+        let db = try TestDatabase.make()
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "c@example.com",
+                                            cachedReply: "Body one", replyTextMessage: "Text one",
+                                            replyChangeCommand: "say no", db: $0)
+        }
+        #expect(try entry(db, "c@example.com")?.replyChangeCommand == "say no")
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "c@example.com",
+                                            summaryBlurb: "Summary", db: $0)
+        }
+        #expect(try entry(db, "c@example.com")?.replyChangeCommand == "say no", "a summary leaves the reply's command")
+
+        var header = MessageHeader(
+            messageId: "9", subject: "S", from: "a@example.com", fromAddress: "a@example.com",
+            to: "b@example.com", date: Date(), snippet: "", folderId: "acc1:INBOX",
+            accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        header.rfc822MessageId = "c@example.com"
+        try db.write { try MessageAICache.restoreIfCached(into: &header, accountId: "acc1", folderPath: "INBOX", db: $0) }
+        #expect(header.cachedReply == "Body one")
+        #expect(header.replyChangeCommand == "say no")
+
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "c@example.com",
+                                            cachedReply: "Body two", db: $0)
+        }
+        #expect(try entry(db, "c@example.com")?.replyChangeCommand == nil, "a new reply never keeps an older reply's command")
     }
 
     @Test("writeThrough stores the text message with its reply and replaces it with the next reply")

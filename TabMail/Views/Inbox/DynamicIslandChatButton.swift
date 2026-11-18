@@ -18,6 +18,9 @@ struct DynamicIslandChat: View {
     let message: MessageHeader?
     let draftSubject: String?
     let draftBody: String?
+    /// The AI Suggestion shown as the draft, as one value; nil when the draft is not it. Its text
+    /// version and change command are recorded with each edit, so a resend or rewind puts them back.
+    let draftSuggestion: ReplyResult?
     let composeContext: ComposeEditContext?
     let draftId: String?
     let draftReplyToId: String?  // MessageHeader.id of the email being replied to (for draft eviction)
@@ -47,7 +50,7 @@ struct DynamicIslandChat: View {
     @Binding var isExpanded: Bool
     @Binding var isInputFocused: Bool
     @Binding var isWorking: Bool
-    var onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?) -> Void)?
+    var onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?, String?, String?) -> Void)?
     var onAgentReply: ((String) -> Void)?
     /// The chat view's reply field (`ChatReplyField`): collapsed, this pill is [mic] [field] [Send]
     /// on the thread's newest email instead of the Chat capsule.
@@ -231,6 +234,7 @@ struct DynamicIslandChat: View {
         message: MessageHeader? = nil,
         draftSubject: String? = nil,
         draftBody: String? = nil,
+        draftSuggestion: ReplyResult? = nil,
         composeContext: ComposeEditContext? = nil,
         draftId: String? = nil,
         draftReplyToId: String? = nil,
@@ -247,7 +251,7 @@ struct DynamicIslandChat: View {
         isExpanded: Binding<Bool>,
         isInputFocused: Binding<Bool> = .constant(false),
         isWorking: Binding<Bool> = .constant(false),
-        onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?) -> Void)? = nil,
+        onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?, String?, String?) -> Void)? = nil,
         onAgentReply: ((String) -> Void)? = nil,
         replyField: ChatReplyField? = nil,
         onFieldSend: ((String) -> Void)? = nil
@@ -255,6 +259,7 @@ struct DynamicIslandChat: View {
         self.message = message
         self.draftSubject = draftSubject
         self.draftBody = draftBody
+        self.draftSuggestion = draftSuggestion
         self.composeContext = composeContext
         self.draftId = draftId
         self.draftReplyToId = draftReplyToId
@@ -1472,7 +1477,7 @@ struct DynamicIslandChat: View {
         isWorking = true
         Task { @MainActor in
             await TutorialCoordinator.shared.runPracticeReplyEdit { reply in
-                onDraftUpdate?(nil, reply, nil, nil, nil)
+                onDraftUpdate?(nil, reply.body, nil, nil, nil, reply.textMessage, nil)
             }
             isWorking = false
         }
@@ -1543,7 +1548,7 @@ struct DynamicIslandChat: View {
         onFieldSend?(text)
         // Who the reply goes to, as chosen now, travels with the send (its words and the agent's
         // compose card), whatever the chat shows when the card arrives or the send is retried.
-        let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) }
+        let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) }
         Task { @MainActor in
             MessageChatCollapseTip.hasStartedMessageChat = true
             sendAgentChat(text, field: send)
@@ -1587,7 +1592,25 @@ struct DynamicIslandChat: View {
         return true
     }
 
-    private func sendComposeEdit(_ instruction: String, agentAdmissionAcquired: Bool = false) {
+    /// `anchor`: a resend or rewind's restored turn. The request edits that turn's draft, as it
+    /// was when first asked, never the view's current one: the restore reaches the view only after
+    /// its fade, so reading the view here would edit the draft being undone.
+    /// The draft a compose edit reads: the restored turn's (`anchor`, a resend or rewind), else the
+    /// card's current one, with the suggestion's text version and change command when the draft is
+    /// the suggestion. A restore hands its turn here, so the edit never reads the card's draft from
+    /// before the restore reached it.
+    nonisolated static func editBase(
+        anchor: InlineEditTurn?, draftSubject: String?, draftBody: String?, draftSuggestion: ReplyResult?
+    ) -> (subject: String, body: String, atRequest: (textMessage: String?, changeCommand: String?)) {
+        if let anchor {
+            return (anchor.subjectAtRequest, anchor.bodyAtRequest,
+                    (anchor.textMessageAtRequest, anchor.changeCommandAtRequest))
+        }
+        return (draftSubject ?? "", draftBody ?? "",
+                (draftSuggestion?.textMessage, draftSuggestion?.changeCommand))
+    }
+
+    private func sendComposeEdit(_ instruction: String, agentAdmissionAcquired: Bool = false, from anchor: InlineEditTurn? = nil) {
         guard composeMutationAllowed else {
             if agentAdmissionAcquired { composeAgentSendFence?.finishAgent() }
             chatMessages.append(ChatMessage(
@@ -1613,9 +1636,13 @@ struct DynamicIslandChat: View {
             guard acquireComposeEditAdmission() else { return }
         }
 
-        // Capture current draft state from parent (values are up-to-date via SwiftUI re-render)
-        let currentSubject = draftSubject ?? ""
-        let currentBody = draftBody ?? ""
+        // The draft this request edits: the restored turn's, or the parent's current one (values
+        // are up-to-date via SwiftUI re-render), with the suggestion's text version and command.
+        let base = Self.editBase(anchor: anchor, draftSubject: draftSubject, draftBody: draftBody,
+                                 draftSuggestion: draftSuggestion)
+        let currentSubject = base.subject
+        let currentBody = base.body
+        let atRequest = base.atRequest
         // Snapshot — state may flip during the network round-trip.
         let skipSave = skipDraftAutoSave
 
@@ -1685,7 +1712,7 @@ struct DynamicIslandChat: View {
                 guard !Task.isCancelled else { return }
 
                 // Update draft via callback (with animation)
-                onDraftUpdate?(result.subject, result.body, result.toDelta, result.ccDelta, result.bccDelta)
+                onDraftUpdate?(result.subject, result.body, result.toDelta, result.ccDelta, result.bccDelta, result.textMessage, result.changeCommand)
 
                 // Show conversational response as chat bubble
                 let responseText = result.response ?? "Done."
@@ -1723,7 +1750,9 @@ struct DynamicIslandChat: View {
                     userRequest: instruction,
                     bodyAtRequest: currentBody,
                     subjectAtRequest: currentSubject,
-                    assistantResponse: result.raw
+                    assistantResponse: result.raw,
+                    textMessageAtRequest: atRequest.textMessage,
+                    changeCommandAtRequest: atRequest.changeCommand
                 ))
 
                 // Persist assistant turn to GRDB
@@ -2789,12 +2818,13 @@ struct DynamicIslandChat: View {
     private func resendLastUserComposeEdit(text: String, afterIndex index: Int) {
         guard acquireComposeEditAdmission() else { return }
         trimForResendLast(atIndex: index)
-        if let last = editHistory.last {
+        let anchor = editHistory.last
+        if let last = anchor {
             // Recipients are not tracked in editHistory — pass nil to keep current values.
-            onDraftUpdate?(last.subjectAtRequest, last.bodyAtRequest, nil, nil, nil)
+            onDraftUpdate?(last.subjectAtRequest, last.bodyAtRequest, nil, nil, nil, last.textMessageAtRequest, last.changeCommandAtRequest)
             editHistory.removeLast()
         }
-        sendComposeEdit(text, agentAdmissionAcquired: true)
+        sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)
     }
 
     /// Rewind compose-edit chat to an earlier user message. In addition to the standard trim,
@@ -2805,13 +2835,13 @@ struct DynamicIslandChat: View {
         let userMessagesBefore = trimForRewind(atIndex: index)
         // Snapshot on the earliest popped editHistory entry is the pre-edit draft for that turn.
         let editCutoff = min(userMessagesBefore, editHistory.count)
-        if editCutoff < editHistory.count {
-            let anchor = editHistory[editCutoff]
+        let anchor = editCutoff < editHistory.count ? editHistory[editCutoff] : nil
+        if let anchor {
             // Recipients are not tracked in editHistory — pass nil to keep current values.
-            onDraftUpdate?(anchor.subjectAtRequest, anchor.bodyAtRequest, nil, nil, nil)
+            onDraftUpdate?(anchor.subjectAtRequest, anchor.bodyAtRequest, nil, nil, nil, anchor.textMessageAtRequest, anchor.changeCommandAtRequest)
             editHistory = Array(editHistory.prefix(editCutoff))
         }
-        sendComposeEdit(text, agentAdmissionAcquired: true)
+        sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)
     }
 
     /// Fork a new session from an earlier user message. Creates a new session on the __new__

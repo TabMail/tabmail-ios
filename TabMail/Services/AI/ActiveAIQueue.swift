@@ -1306,9 +1306,8 @@ actor ActiveAIQueue {
                             changed = true
                             BackgroundSyncLogger.logAIProcessing("DeviceSync action HIT for \(Self.logId(job.headerId)): \(tag.rawValue)")
                         }
-                        if let pr = cached.reply, !pr.isEmpty, msg.cachedReply == nil {
-                            msg.cachedReply = pr
-                            msg.replyTextMessage = nil
+                        if let pr = cached.reply, !pr.isEmpty,
+                           msg.replaceSuggestion(with: ReplyResult(body: pr, textMessage: nil), ifStill: nil) {
                             changed = true
                             BackgroundSyncLogger.logAIProcessing("DeviceSync reply HIT for \(Self.logId(job.headerId))")
                         }
@@ -1327,6 +1326,7 @@ actor ActiveAIQueue {
                             actionTag: msg.actionTag,
                             cachedReply: msg.cachedReply,
                             replyTextMessage: msg.replyTextMessage,
+                            replyChangeCommand: msg.replyChangeCommand,
                             db: db
                         )
                     }
@@ -1751,37 +1751,22 @@ actor ActiveAIQueue {
             )
             if let reply {
                 // T4.V7 site 4.
+                // Stored only over what this job read as it started (none, or the filtered
+                // sentinel): a reply or an edit stored while it waited wins.
+                let expected = message.suggestion
                 let outcome = (try? await dbPool.write { db in
-                    try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
-                        msg.cachedReply = reply.body
-                        msg.replyTextMessage = reply.textMessage
-                        try msg.save(db)
-                        if !reply.body.isEmpty {
-                            try MessageAICache.writeThrough(
-                                accountId: account.id,
-                                folderPath: msg.folderPath,
-                                rfc822MessageId: msg.rfc822MessageId,
-                                cachedReply: reply.body,
-                                replyGeneratedAt: Date(),
-                                replyTextMessage: reply.textMessage,
-                                db: db
-                            )
-                            let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-                            if DebugModeManager.isLoggingEnabled() {
-                                print("[ActiveAI] Reply precomputed for \(message.messageId)")
-                            }
-                            BackgroundSyncLogger.logAIProcessing("Reply precomputed for \(Self.logId(job.headerId)) in \(elapsed)ms")
-                        } else {
-                            if DebugModeManager.isLoggingEnabled() {
-                                print("[ActiveAI] Reply filtered (sentinel) for \(message.messageId)")
-                            }
-                        }
-                    }
+                    try AccountManager.storeSuggestion(
+                        reply, replacing: expected, target: target, generatedAt: Date(), db: db)
                 }) ?? .dropped
                 guard outcome == .written else {
-                    BackgroundSyncLogger.logAIProcessing("Reply write DROPPED (captured identity moved) for \(Self.logId(job.headerId))")
+                    BackgroundSyncLogger.logAIProcessing("Reply write DROPPED (identity moved or a newer suggestion stored) for \(Self.logId(job.headerId))")
                     return false
                 }
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ActiveAI] Reply \(reply.body.isEmpty ? "filtered (sentinel)" : "precomputed") for \(message.messageId)")
+                }
+                let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+                BackgroundSyncLogger.logAIProcessing("Reply \(reply.body.isEmpty ? "filtered (sentinel)" : "precomputed") for \(Self.logId(job.headerId)) in \(elapsed)ms")
                 NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
                 await AISubscriptionGate.shared.openGate()
             }

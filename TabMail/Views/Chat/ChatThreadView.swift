@@ -278,7 +278,7 @@ struct ChatThreadView: View {
             // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
             // suggestion through the outbox.
             ready.compose.composeView(
-                replyTo: ready.message, suggestedBody: ready.message.cachedReply, draftId: ready.draftId,
+                replyTo: ready.message, suggestion: ready.message.suggestion, draftId: ready.draftId,
                 onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
@@ -799,11 +799,14 @@ struct ChatThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    example: example,
+                    example: ChatReplyField.example(
+                        suggestionShows: suggestionText(on: newest, thread: thread) != nil,
+                        changeCommand: newest.replyChangeCommand, configured: example),
                     isNoReply: isNoReply,
                     clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
-                    tutorialMove: tutorialMove(thread)),
+                    tutorialMove: tutorialMove(thread),
+                    suggestion: suggestionText(on: newest, thread: thread) == nil ? nil : newest.suggestion),
                 onFieldSend: { _ in fieldComposeOpened = false })
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
@@ -880,7 +883,14 @@ struct ChatThreadView: View {
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
                 onAgentOutcome: onOutcome)
         case .reply:
-            card.reply.composeView(replyTo: req.replyTo, suggestedBody: req.body, onAgentOutcome: onOutcome)
+            // A field edit of the AI Suggestion opens on a draft of its own, as the ghost's card does:
+            // the reply draft saved for this email is never loaded over the edited envelope.
+            card.reply.composeView(
+                replyTo: req.replyTo, suggestedBody: req.body,
+                draftId: req.fieldReply?.suggestion == nil ? nil : req.replyTo.map {
+                    Draft.separateReplyKey(replyTo: "\($0.accountId):\($0.stableId)")
+                },
+                onAgentOutcome: onOutcome)
         case .forward:
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body, isForward: true,

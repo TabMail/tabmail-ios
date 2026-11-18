@@ -4506,6 +4506,23 @@ final class AppDatabase: Sendable {
         ) { db in
             try rekeyChatSessionsByThread(db)
         }
+
+        // Chat view: a reply result also carries a short command that would change it
+        // (`replyChangeCommand`), the reply field's example while the AI Suggestion shows. On-device
+        // AI cache, the same class as `replyTextMessage`. NULLABLE and NO BACKFILL: a reply computed
+        // before this version has none, and the field shows a configured example instead.
+        // Convergence: a fresh install and an upgraded DB both end with the two columns, NULL on
+        // every pre-existing row.
+        migrator.registerTimedMigration(
+            "v108_addReplyChangeCommand", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "replyChangeCommand", .text)
+            }
+            try db.alter(table: "messageAICache") { t in
+                t.add(column: "replyChangeCommand", .text)
+            }
+        }
     }
 
     /// Move per-email chat turns to their thread's key (v107). Shared by the migration and its

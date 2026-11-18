@@ -23,6 +23,9 @@ struct ChatReplyField: Equatable {
     var onlyTo: [ChatThread.Person]? = nil
     /// In the tutorial, what the read-only field holds and sends (part 2); nil holds nothing.
     var tutorialMove: TutorialCoordinator.FieldMove? = nil
+    /// The full email of the AI Suggestion the chat shows now (`cachedReply`); nil when no ghost
+    /// shows. A request sent while it shows is a compose edit of it (`ChatFieldReply.suggestion`).
+    var suggestion: ReplyResult? = nil
 
     var placeholder: String { isNoReply ? "Ask anything" : "Reply or ask anything" }
 
@@ -35,6 +38,17 @@ struct ChatReplyField: Equatable {
               let reply = newest.cachedReply, !reply.isEmpty,
               let text = newest.replyTextMessage, !text.isEmpty else { return nil }
         return text
+    }
+
+    /// The "e.g." line's change: while the AI Suggestion shows, the change command that came with
+    /// it (`MessageHeader.replyChangeCommand`), so the example fits the reply on screen; otherwise,
+    /// or when the suggestion has none, the chat's configured example (`ChatSuggestionConfig.randomExample`).
+    static func example(suggestionShows: Bool, changeCommand: String?, configured: String?) -> String? {
+        if suggestionShows, let command = changeCommand?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !command.isEmpty {
+            return command
+        }
+        return configured
     }
 
     /// The agent's message for words typed or said in the field: today's Chat pill message on the
@@ -172,10 +186,21 @@ struct ChatReplyTarget: Equatable {
 /// (`ToolInvocation.fieldReply`, then `ComposeRequest.fieldReply` on a reply to that email), so the
 /// chat that shows the compose card never decides who it goes to from its own state at that moment.
 struct ChatFieldReply: Sendable, Equatable {
-    /// The email the field replies to (`ChatThread.copyKey`: copies of one email are one).
-    let emailKey: String
+    /// The email the field showed, as it showed it: its row and that row's identity. Its AI
+    /// Suggestion belongs to this row alone, and only while the row is still this email.
+    let email: MessageHeader
     /// The addresses chosen in Reply to; nil: Reply All.
     let onlyTo: [String]?
+    /// The AI Suggestion showing when the request was sent: its full email, text version and
+    /// change command, as shown; nil when none showed. The agent's reply to that email with a
+    /// request edits it (`EmailReplyTool`), stored only over this same suggestion.
+    var suggestion: ReplyResult? = nil
+
+    /// Whether the user's choice in Reply to applies to a reply to `header`: the email the field
+    /// showed in the same account, any copy of it (another folder's), never another account's copy.
+    func audienceApplies(to header: MessageHeader) -> Bool {
+        header.accountId == email.accountId && ChatThread.copyKey(header) == ChatThread.copyKey(email)
+    }
 }
 
 /// A send from the chat's reply field, read once as it starts: the email it is about, who the user
@@ -185,9 +210,11 @@ struct ChatFieldSend {
     let message: MessageHeader
     let onlyTo: [ChatThread.Person]?
     let isNoReply: Bool
+    /// The AI Suggestion showing as the send started (`ChatReplyField.suggestion`).
+    var suggestion: ReplyResult? = nil
 
     var fieldReply: ChatFieldReply {
-        ChatFieldReply(emailKey: ChatThread.copyKey(message), onlyTo: onlyTo?.map(\.address))
+        ChatFieldReply(email: message, onlyTo: onlyTo?.map(\.address), suggestion: suggestion)
     }
 }
 
@@ -200,12 +227,58 @@ struct ChatReplyCompose: Equatable {
     let to: [String]
     let cc: [String]
     let bcc: [String]
+    /// The subject the card opens with; nil: the reply's own ("Re: ...").
+    var subject: String? = nil
+    /// The fields are exactly as given, an empty one included: an edit that removed everyone from
+    /// To opens with To empty, never refilled with the sender. False: an empty field takes the
+    /// reply's default, as a reply opened from the email does.
+    var exact = false
 
     /// The AI Suggestion to `message`: a Reply All to its people. The suggestion shows only while
     /// nobody is chosen in Reply to (`ChatReplyField.suggestionText`).
     static func make(replyAllTo message: MessageHeader, accounts: [Account]) -> ChatReplyCompose {
         let audience = buildReplyAllRecipients(for: message, allAccounts: accounts)
         return ChatReplyCompose(isReplyAll: true, to: audience.to, cc: audience.cc, bcc: [])
+    }
+
+    /// THE envelope of the AI Suggestion to `message`, the one builder the ghost's card and the
+    /// field's edit of the suggestion both use: the Reply All audience by role, the reply subject,
+    /// from the email's own account. The suggestion slot holds a body for this envelope only.
+    static func suggestionEnvelope(for message: MessageHeader, accounts: [Account]) -> ChatReplyCompose {
+        var envelope = make(replyAllTo: message, accounts: accounts)
+        envelope.subject = ThreadUtils.replySubject(for: message.subject)
+        return envelope
+    }
+
+    /// The fields as compose holds them (`ComposeDraftGuards.Recipients`), so an edit's recipient
+    /// changes apply by the card's own operation (`Recipients.applying`).
+    var recipients: ComposeDraftGuards.Recipients {
+        ComposeDraftGuards.Recipients().filling(to: RecipientEntry(to), cc: RecipientEntry(cc), bcc: RecipientEntry(bcc))
+    }
+
+    /// The envelope with `recipients` and `subject`, exactly: the card shows these fields as they are.
+    func with(recipients: ComposeDraftGuards.Recipients, subject: String) -> ChatReplyCompose {
+        func texts(_ field: ComposeDraftGuards.RecipientField) -> [String] {
+            field.tokens.map { RecipientEntry.text(name: field.displayNames[$0.lowercased()], address: $0) }
+                + field.rejected
+        }
+        return ChatReplyCompose(
+            isReplyAll: isReplyAll, to: texts(recipients.to), cc: texts(recipients.cc), bcc: texts(recipients.bcc),
+            subject: subject, exact: true)
+    }
+
+    /// Whether a draft with `recipients` and `subject`, from `accountId`, is this envelope: the same
+    /// subject, exactly, and the same addresses in each role. Names and order do not count.
+    func holds(recipients: ComposeDraftGuards.Recipients, subject: String, accountId: String, of message: MessageHeader) -> Bool {
+        func addresses(_ list: [String]) -> Set<String> { Set(RecipientEntry(list).addresses.map { $0.lowercased() }) }
+        func addresses(_ field: ComposeDraftGuards.RecipientField) -> Set<String> {
+            Set(field.tokens.map { $0.lowercased() })
+        }
+        return accountId == message.accountId
+            && subject == (self.subject ?? ThreadUtils.replySubject(for: message.subject))
+            && addresses(recipients.to) == addresses(to) && addresses(recipients.cc) == addresses(cc)
+            && addresses(recipients.bcc) == addresses(bcc)
+            && recipients.to.rejected.isEmpty && recipients.cc.rejected.isEmpty && recipients.bcc.rejected.isEmpty
     }
 
     /// The agent's reply, read from its request alone, never from the chat showing the card: whether
@@ -220,23 +293,26 @@ struct ChatReplyCompose: Equatable {
             return ChatReplyCompose(isReplyAll: false, to: only, cc: [], bcc: [])
         }
         let audience = req.replyTo.map { buildReplyAllRecipients(for: $0, allAccounts: accounts) }
-        let addresses = { (list: [String]) in Set(list.map { $0.lowercased() }) }
+        // Parsed addresses on both sides: a recipient written with a name is the same person.
+        let addresses = { (list: [String]) in Set(RecipientEntry(list).addresses.map { $0.lowercased() }) }
         let toWholeAudience = audience.map { addresses(req.to + req.cc + req.bcc).isSuperset(of: addresses($0.to + $0.cc)) } == true
         let isReplyAll = toWholeAudience && (req.fieldReply != nil || req.isReplyAll)
-        return ChatReplyCompose(isReplyAll: isReplyAll, to: req.to, cc: req.cc, bcc: req.bcc)
+        return ChatReplyCompose(
+            isReplyAll: isReplyAll, to: req.to, cc: req.cc, bcc: req.bcc, subject: req.subject, exact: true)
     }
 
     /// The compose card, opened in this kind, as main's Reply All entries open it.
     /// `draftId`: the draft it saves to; nil, the reply's usual one.
     @MainActor
     func composeView(
-        replyTo message: MessageHeader?, suggestedBody: String? = nil, draftId: String? = nil,
-        onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
+        replyTo message: MessageHeader?, suggestedBody: String? = nil, suggestion: ReplyResult? = nil,
+        draftId: String? = nil, onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
     ) -> ComposeView {
-        ComposeView(
-            replyTo: message, suggestedBody: suggestedBody, isReplyAll: isReplyAll,
-            prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,
-            prefillBcc: bcc.isEmpty ? nil : bcc, prefillDraftId: draftId, onAgentOutcome: onAgentOutcome)
+        func field(_ list: [String]) -> [String]? { exact || !list.isEmpty ? list : nil }
+        return ComposeView(
+            replyTo: message, suggestedBody: suggestedBody, suggestion: suggestion, isReplyAll: isReplyAll,
+            prefillTo: field(to), prefillCc: field(cc), prefillBcc: field(bcc), prefillSubject: subject,
+            prefillDraftId: draftId, onAgentOutcome: onAgentOutcome)
     }
 }
 

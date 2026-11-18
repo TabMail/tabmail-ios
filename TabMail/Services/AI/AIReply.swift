@@ -9,6 +9,9 @@ import Foundation
 struct ReplyResult: Sendable, Equatable {
     let body: String
     let textMessage: String?
+    /// A short command that would change this reply, the reply field's example
+    /// (`MessageHeader.replyChangeCommand`). Nil when none came with it.
+    var changeCommand: String? = nil
 
     /// The quality filters' sentinel: no reply wanted (an empty body), distinct from nil (error, retried).
     static let filtered = ReplyResult(body: "", textMessage: nil)
@@ -136,7 +139,7 @@ extension AIService {
         BackgroundSyncLogger.logDebug("[AIService]   text message: \(parsed.textMessage ?? "nil")")
         BackgroundSyncLogger.logDebug("[AIService] generateReply: === END PARSED BODY ===")
         #endif
-        return ReplyResult(body: parsed.body, textMessage: parsed.textMessage)
+        return ReplyResult(body: parsed.body, textMessage: parsed.textMessage, changeCommand: parsed.changeCommand)
     }
 
     // MARK: - Reply Processing (standalone step, called after summary+action)
