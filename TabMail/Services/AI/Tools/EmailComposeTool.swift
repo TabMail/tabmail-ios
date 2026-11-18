@@ -61,7 +61,8 @@ struct EmailComposeTool: AgentTool, Sendable {
         if let composeRequest {
             do {
                 let result = try await Self.runComposeEdit(
-                    recipients: to + cc,
+                    to: to,
+                    cc: cc,
                     subject: subject,
                     body: body,
                     request: composeRequest,
@@ -95,12 +96,18 @@ struct EmailComposeTool: AgentTool, Sendable {
 
     // MARK: - Compose Edit (TB Parity)
 
+    /// Per-task replacement for the backend edit call: receives the edit context and
+    /// instruction `runComposeEdit` built. `@TaskLocal`, so a test's override reaches only
+    /// the tool calls made inside its own `withValue` scope.
+    @TaskLocal static var inlineEditOverride: (@Sendable (ComposeEditContext, String) async throws -> InlineEditResult)?
+
     /// Shared compose edit flow matching TB's `runComposeEdit()`.
     /// Resolves account/prompts, builds `ComposeEditContext`, and calls `performInlineEdit()`.
     /// Used by email_compose (mode "edit_new"), email_reply (mode "edit_reply"),
     /// and email_forward (mode "edit_forward") tools for full TB parity.
     static func runComposeEdit(
-        recipients: [String],
+        to: [String],
+        cc: [String],
         subject: String?,
         body: String?,
         request: String,
@@ -164,10 +171,13 @@ struct EmailComposeTool: AgentTool, Sendable {
             bodyText = ""
         }
 
+        // Each recipient keeps its role: `recipients` (recipients_json) is the To list, as in
+        // TB's buildComposeEditChat, and Cc goes to ccRecipients (original_cc), so the AI
+        // does not address a copied recipient as a primary one.
         let context = ComposeEditContext(
-            recipients: recipients,
-            toRecipients: recipients,
-            ccRecipients: [],
+            recipients: to,
+            toRecipients: to,
+            ccRecipients: cc,
             bccRecipients: [],
             toDisplayNames: [:],
             ccDisplayNames: [:],
@@ -185,8 +195,11 @@ struct EmailComposeTool: AgentTool, Sendable {
             bodyText: bodyText
         )
 
-        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] runComposeEdit: mode=\(mode) recipients=\(recipients.count) request=\(request.prefix(80))") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] runComposeEdit: mode=\(mode) to=\(to.count) cc=\(cc.count) request=\(request.prefix(80))") }
 
+        if let inlineEditOverride {
+            return try await inlineEditOverride(context, request)
+        }
         return try await AIService.shared.performInlineEdit(
             currentSubject: subject ?? "",
             currentBody: body ?? "",

@@ -98,7 +98,8 @@ struct EmailReplyTool: AgentTool, Sendable {
                     return EmailFilter.htmlToPlainText(html)
                 }
                 let result = try await EmailComposeTool.runComposeEdit(
-                    recipients: to + cc,
+                    to: to,
+                    cc: cc,
                     subject: nil,
                     body: nil,
                     request: wrappedRequest,
