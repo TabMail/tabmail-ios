@@ -21,8 +21,10 @@ import UIKit
 ///     goes past closed or fully open. A drag the system cancels or fails closes and runs
 ///     nothing, however far it went.
 ///  6. With nothing open a reveal takes a drag toward its buttons, but a bubble leaves the screen's
-///     left edge to the back swipe; while one is open only it takes drags, and the closer takes a
-///     touch only outside it. Both back swipes wait for the pans. Real drags: ChatSwipeUITests.
+///     left edge to the back swipe; while one is open only it takes sideways drags on itself, and the
+///     closer takes every other touch (a vertical drag anywhere, scrolling alongside), the screen's
+///     recognizers waiting for it and the window's (the keyboard-dismiss tap) running alongside.
+///     Both back swipes wait for the pans. Real drags: ChatSwipeUITests.
 ///  7. The views wire each of these: hosted SwiftUI views cannot be driven from a unit test, so the
 ///     wiring is read from the source.
 @Suite("Chat swipes")
@@ -271,18 +273,21 @@ struct ChatSwipeTests {
         #expect(ended.contains("switch drag.letGo(velocity: velocity, finished: finished, sign: sign, revealWidth: revealWidth, width: width, allowsFull: allowsFullSwipe) {"))
         let changed = try Self.body(of: "private func changed(_ translation: CGFloat) {", in: text)
         #expect(changed.contains("drag.moved(translation, sign: sign, revealWidth: revealWidth, width: width, allowsFull: allowsFullSwipe)"))
+        #expect(text.contains(".gesture(ChatHorizontalPan( holdId: id, shouldBegin: { velocityX, atEdge in"),
+                "the pan holds the freeze under its reveal's id, the one the reveal releases when its view leaves")
         #expect(text.contains("startsAtScreenEdge: atEdge) }, changed: changed, ended: ended))"),
-                "the reveal hands the pan its drag, held under its id")
+                "the reveal hands the pan its drag")
         #expect(text.contains("func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) { Self.handle(recognizer, holding: holdId, changed: changed, ended: ended) }"),
                 "every recognizer event goes through `handle` (the freeze, ChatSwipeFreezeTests) and `deliver`")
-        #expect(text.contains(".onDisappear { ChatSwipeHold.shared.releaseNow(id) }"))
+        #expect(text.contains(".onDisappear { ChatSwipeHold.shared.releaseNow(id) open.left(id) }"),
+                "a reveal torn down mid-drag lets go of the id it held")
     }
 
     @Test("The chat slides left for Trash then Archive, with a full swipe, acting on the whole chat; with no Inbox copy, Trash only and no full swipe")
     func chatSwipeWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(text.contains("let offersArchive = viewModel.chatHasInboxCopy"))
-        #expect(text.contains("id: Self.chatSwipeId, edge: .trailing, buttons: chatSwipeButtons(offersArchive: offersArchive), allowsFullSwipe: offersArchive, openId: $openSwipeId"),
+        #expect(text.contains("id: Self.chatSwipeId, edge: .trailing, buttons: chatSwipeButtons(offersArchive: offersArchive), allowsFullSwipe: offersArchive, open: swipeOpen))"),
                 "the full swipe runs only while Archive is at the edge")
         #expect(text.contains("actions: bubbleSwipeButtons(item, thread: thread) + chatSwipeButtons(offersArchive: offersArchive).map { button in ChatSwipeButton(title: \"\\(button.title) chat\", systemImage: button.systemImage, tint: button.tint, action: button.action) },"),
                 "VoiceOver's actions are the swipe's buttons, on the bubble")
@@ -290,7 +295,8 @@ struct ChatSwipeTests {
         // reorder what VoiceOver reads in it (the bubble came between its own chips).
         let bubble = try Self.source("TabMail/Views/Chat/ChatBubbleView.swift")
         #expect(bubble.contains(".accessibilityAddTraits(.isButton) .accessibilityActions { ForEach(actions) { action in Button(action.title, action: action.action) } }"))
-        #expect(!text.contains("allowsFullSwipe: false, openId: $openSwipeId)) .accessibilityActions"), "no actions on the whole row")
+        #expect(text.contains("allowsFullSwipe: false, open: swipeOpen)) .id(item.id)"), "control: the bubble's row, as the next check reads it")
+        #expect(!text.contains("allowsFullSwipe: false, open: swipeOpen)) .accessibilityActions"), "no actions on the whole row")
         let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
         #expect(!swipe.contains(".accessibilityActions"), "the reveal names no actions on what it slides")
         let buttons = try Self.body(of: "private func chatSwipeButtons(offersArchive: Bool) -> [ChatSwipeButton] {", in: text)
@@ -316,7 +322,7 @@ struct ChatSwipeTests {
     @Test("A bubble slides right for its read action and Move, and the read action moves the Unread line")
     func bubbleSwipeWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(text.contains("id: item.id, edge: .leading, buttons: bubbleSwipeButtons(item, thread: thread), allowsFullSwipe: false, openId: $openSwipeId"))
+        #expect(text.contains("id: item.id, edge: .leading, buttons: bubbleSwipeButtons(item, thread: thread), allowsFullSwipe: false, open: swipeOpen))"))
         let buttons = try Self.body(of: "private func bubbleSwipeButtons(_ item: ChatThread.Item, thread: ChatThread) -> [ChatSwipeButton] {", in: text)
         #expect(buttons.contains("let action = ChatSwipe.ReadAction(for: item.header)"))
         #expect(buttons.contains("setRead(action, at: item, thread: thread)"))
@@ -484,7 +490,7 @@ struct ChatSwipeTests {
         override func location(in view: UIView?) -> CGPoint { readIn = view; return point }
     }
 
-    @Test("The closer takes a touch only while something is open and only where it is not the open reveal's, read in its anchor")
+    @Test("The closer takes a touch only while something is open; a tap only off the open reveal's buttons, read in its anchor")
     func closerTakesOnlyTouchesOutsideTheOpenReveal() throws {
         let (nav, window) = try Self.pushedChat()
         defer { window.isHidden = true }
@@ -504,14 +510,60 @@ struct ChatSwipeTests {
         #expect(touch.readIn === anchor, "read in the space the frames are measured in")
         #expect(closer.gestureRecognizerShouldBegin(closer.tap))
         touch.point = CGPoint(x: 200, y: 120)
-        #expect(!closer.gestureRecognizer(closer.pan, shouldReceive: touch), "a drag on the open reveal continues it")
         #expect(closer.gestureRecognizer(closer.tap, shouldReceive: touch), "a tap on its content only closes")
+        #expect(closer.gestureRecognizer(closer.pan, shouldReceive: touch), "a drag on it is decided once it moves")
         touch.point = CGPoint(x: 10, y: 120)
         #expect(!closer.gestureRecognizer(closer.tap, shouldReceive: touch), "its buttons stay tappable")
-        let other = UIPanGestureRecognizer()
-        #expect(closer.gestureRecognizer(closer.pan, shouldBeRequiredToFailBy: other), "another recognizer waits for the closer")
+    }
+
+    @Test("A drag off the open reveal closes it whichever way it goes; on the open reveal only a vertical one does")
+    func closerTakesEveryDragButTheOpenRevealsOwn() {
+        let sideways = CGPoint(x: 300, y: 20)
+        let vertical = CGPoint(x: 20, y: -300)
+        #expect(ChatSwipeCloser.Coordinator.closes(velocity: sideways, startsOnTheOpenReveal: false))
+        #expect(ChatSwipeCloser.Coordinator.closes(velocity: vertical, startsOnTheOpenReveal: false),
+                "a vertical drag elsewhere closes it, and the chat scrolls alongside")
+        #expect(!ChatSwipeCloser.Coordinator.closes(velocity: sideways, startsOnTheOpenReveal: true),
+                "a sideways drag on the open reveal is its own")
+        #expect(!ChatSwipeCloser.Coordinator.closes(velocity: CGPoint(x: -300, y: 20), startsOnTheOpenReveal: true))
+        #expect(ChatSwipeCloser.Coordinator.closes(velocity: vertical, startsOnTheOpenReveal: true),
+                "a vertical drag on the open reveal closes it too")
+    }
+
+    // UIKit arbitrates by asking the delegates; the keyboard UI test covers the real touch.
+    @Test("The screen's recognizers wait for the closer; a scroll view's pan scrolls alongside its drag; the window's own recognizers, the keyboard-dismiss tap among them, run alongside it")
+    func closerBeatsOnlyTheScreensRecognizers() throws {
+        let (nav, window) = try Self.pushedChat()
+        defer { window.isHidden = true }
+        let open = ChatSwipeOpen()
+        let closer = ChatSwipeCloser.Coordinator(open: open)
+        let screen: UIView = try #require(nav.topViewController).view
+        let bubble = UIView()
+        screen.addSubview(bubble)
+        let bubbleTap = UITapGestureRecognizer()
+        bubble.addGestureRecognizer(bubbleTap)
+        let scroll = UIScrollView()
+        screen.addSubview(scroll)
+        let contentPop = try #require(nav.interactiveContentPopGestureRecognizer)
+        // As `dismissKeyboardOnTap` installs it: a tap on the window itself.
+        let windowTap = UITapGestureRecognizer()
+        window.addGestureRecognizer(windowTap)
+        defer { window.removeGestureRecognizer(windowTap) }
+        for recognizer in [closer.pan, closer.tap] as [UIGestureRecognizer] {
+            for other in [bubbleTap, contentPop, UIPanGestureRecognizer()] as [UIGestureRecognizer] {
+                #expect(closer.gestureRecognizer(recognizer, shouldBeRequiredToFailBy: other), "waits for the closer: \(other)")
+                #expect(!closer.gestureRecognizer(recognizer, shouldRecognizeSimultaneouslyWith: other), "\(other)")
+            }
+            #expect(!closer.gestureRecognizer(recognizer, shouldBeRequiredToFailBy: windowTap), "the keyboard-dismiss tap never waits")
+            #expect(closer.gestureRecognizer(recognizer, shouldRecognizeSimultaneouslyWith: windowTap),
+                    "a closing tap also drops the keyboard")
+        }
+        #expect(!closer.gestureRecognizer(closer.pan, shouldBeRequiredToFailBy: scroll.panGestureRecognizer), "the scroll never waits for a closing drag")
+        #expect(closer.gestureRecognizer(closer.pan, shouldRecognizeSimultaneouslyWith: scroll.panGestureRecognizer),
+                "a vertical drag both closes and scrolls")
+        #expect(closer.gestureRecognizer(closer.tap, shouldBeRequiredToFailBy: scroll.panGestureRecognizer))
         #expect(!closer.gestureRecognizer(closer.pan, shouldBeRequiredToFailBy: closer.tap))
-        #expect(!closer.gestureRecognizer(closer.pan, shouldRecognizeSimultaneouslyWith: other))
+        #expect(!closer.gestureRecognizer(closer.tap, shouldBeRequiredToFailBy: closer.pan))
     }
 
     @Test("The closer installs on the navigation controller's own view, the bar included; the edge back swipe is off only while something is open")

@@ -50,20 +50,32 @@ extension ChatThreadViewLifecycleTests {
     func closingHoldsTheFreeze() async throws {
         let gate = PreviewFreezeGate.shared
         #expect(!gate.isFrozen, "control: nothing holds the freeze")
-        // A closing drag: held from its first motion, through the let-go, until settled.
+        // A closing drag: held from its first motion, through the let-go, until settled; one the
+        // system cancels or fails lets go the same way.
         let open = ChatSwipeOpen()
-        open.open("unit-bubble", frame: .zero, buttons: .zero)
         let closer = ChatSwipeCloser.Coordinator(open: open)
-        let pan = FreezePan()
-        pan.event = .began
-        closer.handle(pan)
-        #expect(open.id == nil, "the drag closed it")
-        #expect(gate.isFrozen, "the closing drag took the finger")
-        pan.event = .ended
-        closer.handle(pan)
-        #expect(gate.isFrozen, "let go, the swipe still settles shut")
-        try await Task.sleep(for: Self.settled)
-        #expect(!gate.isFrozen, "settled, the data goes through")
+        for end in [UIGestureRecognizer.State.ended, .cancelled, .failed] {
+            open.open("unit-bubble", frame: .zero, buttons: .zero)
+            let pan = FreezePan()
+            pan.event = .began
+            closer.handle(pan)
+            #expect(open.id == nil, "\(end.rawValue): the drag closed it")
+            #expect(gate.isFrozen, "\(end.rawValue): the closing drag took the finger")
+            pan.event = end
+            closer.handle(pan)
+            #expect(gate.isFrozen, "\(end.rawValue): let go, the swipe still settles shut")
+            try await Task.sleep(for: Self.settled)
+            #expect(!gate.isFrozen, "\(end.rawValue): settled, the data goes through")
+        }
+
+        // A closer torn down mid-drag lets go at once.
+        open.open("unit-bubble", frame: .zero, buttons: .zero)
+        let torn = FreezePan()
+        torn.event = .began
+        closer.handle(torn)
+        #expect(gate.isFrozen, "control: the closing drag holds")
+        closer.uninstall()
+        #expect(!gate.isFrozen, "the closer's teardown released it")
 
         // A closing tap: held while the swipe settles shut.
         open.open("unit-bubble", frame: .zero, buttons: .zero)

@@ -68,7 +68,6 @@ struct ChatThreadView: View {
     @State private var showsReplyTo = false
     @State private var showsOnlyList = false
     @State private var forwardMessage: MessageHeader?
-    /// The one open swipe: the chat's, or a bubble's id.
     /// What is open among the chat's swipes (`ChatSwipeOpen`).
     @State private var swipeOpen = ChatSwipeOpen()
     /// Where the header ends and the reply field starts, in the swipes' space (`ChatSwipeOpen.reach`).

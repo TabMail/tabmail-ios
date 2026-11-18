@@ -480,14 +480,16 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 }
 
-/// The chat's closer: while a reveal is open, any sideways drag or tap anywhere on the chat's screen
-/// outside that reveal (another bubble, empty space, the reply field, the header, the navigation
-/// bar, the screen's edge) only closes it, as in Mail. It is a pair of recognizers on the navigation
-/// controller's own view, not a view over the chat, so VoiceOver and every control see the chat as
-/// before; they take no touch at all while nothing is open. Every other recognizer on such a touch
-/// waits for them, so the drag or tap does nothing else. The screen-edge back swipe is a system
-/// recognizer that starts on its own, so it is off while something is open, and on again once
-/// nothing is.
+/// The chat's closer: while a reveal is open, any drag or tap anywhere on the chat's screen outside
+/// that reveal (another bubble, empty space, the reply field, the header, the navigation bar, the
+/// screen's edge), and a vertical drag anywhere, closes it, as in Mail. It is a pair of recognizers
+/// on the navigation controller's own view, not a view over the chat, so VoiceOver and every control
+/// see the chat as before; they take no touch at all while nothing is open. The screen's own
+/// recognizers on such a touch wait for them, so a sideways drag or a tap does nothing else; a
+/// vertical drag also scrolls the chat (the scroll views' pans run alongside), and the window's own
+/// recognizers, the keyboard-dismiss tap among them, run alongside too, so a closing tap also drops
+/// the keyboard. The screen-edge back swipe is a system recognizer that starts on its own, so it is
+/// off while something is open, and on again once nothing is.
 struct ChatSwipeCloser: UIViewRepresentable {
     let open: ChatSwipeOpen
     /// What the closing drag holds the interaction freeze under (`ChatSwipeHold`).
@@ -501,12 +503,7 @@ struct ChatSwipeCloser: UIViewRepresentable {
         return anchor
     }
 
-    func updateUIView(_ anchor: Anchor, context: Context) {
-        if context.coordinator.open !== open {
-            context.coordinator.open = open
-            open.openChanged = { [weak coordinator = context.coordinator] isOpen in coordinator?.setEdgePop(enabled: !isOpen) }
-        }
-    }
+    func updateUIView(_ anchor: Anchor, context: Context) {}
 
     static func dismantleUIView(_ anchor: Anchor, coordinator: Coordinator) {
         coordinator.uninstall()
@@ -532,7 +529,7 @@ struct ChatSwipeCloser: UIViewRepresentable {
 
     @MainActor
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
-        var open: ChatSwipeOpen
+        let open: ChatSwipeOpen
         let pan = UIPanGestureRecognizer()
         let tap = UITapGestureRecognizer()
         private weak var host: UIView?
@@ -566,39 +563,66 @@ struct ChatSwipeCloser: UIViewRepresentable {
             edgePop?.isEnabled = enabled
         }
 
+        /// Torn down, even mid-drag: the closer holds nothing more.
         func uninstall() {
             host?.removeGestureRecognizer(pan)
             host?.removeGestureRecognizer(tap)
             host = nil
             edgePop?.isEnabled = true
             edgePop = nil
+            ChatSwipeHold.shared.releaseNow(ChatSwipeCloser.holdId)
         }
 
-        /// A touch is the closer's only while something is open, and only where it is not the open
-        /// reveal's: a drag on the reveal continues it, a tap on its buttons runs them. Read in the
-        /// anchor, the space every reveal's frame is measured in.
+        /// A touch is the closer's only while something is open; a tap only where it is not on the
+        /// open reveal's buttons, which run. Whether a drag is the closer's is decided once it moves
+        /// (`closes(velocity:startsOnTheOpenReveal:)`). Read in the anchor, the space every reveal's
+        /// frame is measured in.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
             guard open.id != nil else { return false }
-            let point = touch.location(in: anchor)
-            return recognizer === tap ? !open.ownsTap(point) : !open.ownsDrag(point)
+            guard recognizer === tap else { return true }
+            return !open.ownsTap(touch.location(in: anchor))
         }
 
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
             guard open.id != nil else { return false }
             guard recognizer === pan else { return true }
-            let velocity = pan.velocity(in: pan.view)
-            return abs(velocity.x) > abs(velocity.y)
+            let location = pan.location(in: anchor)
+            let translation = pan.translation(in: anchor)
+            let start = CGPoint(x: location.x - translation.x, y: location.y - translation.y)
+            return Self.closes(velocity: pan.velocity(in: anchor), startsOnTheOpenReveal: open.ownsDrag(start))
         }
 
-        /// Everything else on a touch the closer took waits for it: the drag or tap only closes.
+        /// Whether a drag closes what is open: any drag that starts off the open reveal, and a
+        /// vertical one anywhere. A sideways drag on the open reveal is its own (it continues it).
+        static func closes(velocity: CGPoint, startsOnTheOpenReveal: Bool) -> Bool {
+            !startsOnTheOpenReveal || abs(velocity.y) >= abs(velocity.x)
+        }
+
+        /// The screen's recognizers on a touch the closer took wait for it, so a sideways drag or a
+        /// tap only closes: the bubbles' taps and swipes, the reply field, the bar's buttons and both
+        /// back swipes. Two exceptions run alongside it instead (`shouldRecognizeSimultaneouslyWith`):
+        /// a scroll view's pan, so a vertical drag also scrolls, and the window's own recognizers.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
-            other !== pan && other !== tap
+            guard other !== pan, other !== tap, Self.isTheScreens(other) else { return false }
+            return !(recognizer === pan && Self.isScroll(other))
         }
 
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-            false
+            !Self.isTheScreens(other) || (recognizer === pan && Self.isScroll(other))
+        }
+
+        /// Whether `other` is one of the screen's recognizers, not one the window itself holds. The
+        /// window's are app-wide: the keyboard-dismiss tap (`dismissKeyboardOnTap`), which must still
+        /// drop the keyboard on a closing tap, and the system's own.
+        static func isTheScreens(_ other: UIGestureRecognizer) -> Bool {
+            !(other.view is UIWindow)
+        }
+
+        /// Whether `other` is a scroll view's own pan (the chat's, or a text view's).
+        static func isScroll(_ other: UIGestureRecognizer) -> Bool {
+            (other.view as? UIScrollView)?.panGestureRecognizer === other
         }
 
         /// Closes what is open, holding the interaction freeze from the moment the closer takes the

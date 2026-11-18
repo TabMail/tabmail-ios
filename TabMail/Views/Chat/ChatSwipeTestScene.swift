@@ -10,13 +10,21 @@ import SwiftUI
 /// account with a four-email chat, opened from a plain list screen so a back swipe has somewhere to
 /// go. `ChatThreadView` owns every swipe; the scene only seeds data and, when armed, takes one email
 /// out of the chat as a sync would. With `--chat-swipe-in-sheet` the list sits in a presented sheet
-/// with its own navigation stack, as search opens chats.
+/// with its own navigation stack, as search opens chats. With `--chat-swipe-in-split` the list is the
+/// content column of a collapsed split view, entered from a sidebar, and opens the chat as the app
+/// opens one from a mailbox: the content column's push of `PushedMessageDestination`, through
+/// `MessageOpenView`.
 struct ChatSwipeTestScene: View {
     @State private var ready = false
     @State private var status = "Preparing fixture"
     @State private var armed = false
     @State private var showsSheet = false
+    @State private var mailbox: String?
+    @State private var pushedId: String?
     private let inSheet = ProcessInfo.processInfo.arguments.contains("--chat-swipe-in-sheet")
+    private let inSplit = ProcessInfo.processInfo.arguments.contains("--chat-swipe-in-split")
+    /// `--chat-swipe-tall`: the oldest email's text message runs past the screen, so the chat scrolls.
+    nonisolated private static let tall = ProcessInfo.processInfo.arguments.contains("--chat-swipe-tall")
     nonisolated private static let accountID = "chat-swipe-fixture"
     nonisolated private static let count = 4
     /// The email "Remove a bubble" takes out of the chat.
@@ -34,6 +42,18 @@ struct ChatSwipeTestScene: View {
                             .navigationTitle("Fixture root")
                     }
                     .sheet(isPresented: $showsSheet) { NavigationStack { list } }
+                } else if inSplit {
+                    NavigationSplitView {
+                        List(selection: $mailbox) {
+                            NavigationLink("Fixture inbox", value: "inbox")
+                        }
+                        .navigationTitle("Fixture mailboxes")
+                    } content: {
+                        list
+                            .navigationDestination(item: $pushedId) { id in PushedMessageDestination(messageId: id) }
+                    } detail: {
+                        Text("No message")
+                    }
                 } else {
                     NavigationStack { list }
                 }
@@ -47,7 +67,11 @@ struct ChatSwipeTestScene: View {
     private var list: some View {
         VStack(spacing: 24) {
             Text("Chat swipe fixture")
-            NavigationLink("Open chat") { ChatThreadView(messageId: Self.headerId(Self.count - 1)) }
+            if inSplit {
+                Button("Open chat") { pushedId = Self.headerId(Self.count - 1) }
+            } else {
+                NavigationLink("Open chat") { ChatThreadView(messageId: Self.headerId(Self.count - 1)) }
+            }
             Button(armed ? "Removal armed" : "Remove a bubble") { arm() }
         }
         .navigationTitle("Fixture list")
@@ -71,6 +95,9 @@ struct ChatSwipeTestScene: View {
     private func seed() async {
         do {
             UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
+            // An open goes to the chat only for a subscriber (`MessageOpenView`); the gate persists
+            // across launches, so every mode opens it and runs alike.
+            AISubscriptionGate.shared.openGate()
             let accountID = Self.accountID
             let now = Date()
             try await AppDatabase.dbPool.write { db in
@@ -95,7 +122,9 @@ struct ChatSwipeTestScene: View {
                     header.bodyComplete = true
                     header.isRead = true
                     header.summaryBlurb = "Note \(index)"
-                    header.summaryTextMessage = "Note \(index): a short line."
+                    header.summaryTextMessage = index == 0 && Self.tall
+                        ? "Note 0: " + String(repeating: "A long line that fills the screen. ", count: 80)
+                        : "Note \(index): a short line."
                     try header.save(db)
                 }
             }
