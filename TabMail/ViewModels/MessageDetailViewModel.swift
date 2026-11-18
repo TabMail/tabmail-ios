@@ -185,6 +185,11 @@ final class MessageDetailViewModel {
     /// Generation of the last `loadThreadMessagesAsync` result actually
     /// assigned to `threadMessages`. See `threadLoadGeneration`.
     @ObservationIgnored private var lastAppliedThreadGeneration = 0
+    /// Rows `applyRefresh` re-read, each with `threadLoadGeneration` as the refresh began. A
+    /// bulk load of generation `g` started before a refresh stamped `>= g`, so its snapshot of
+    /// that row is older than the refresh's: it keeps the refreshed row, never the snapshot
+    /// (a reload that crossed a Recompute or a summary write put the old row back).
+    @ObservationIgnored private var refreshedRows: [String: Int] = [:]
 
     /// Bubble ids the user moved IN PLACE via `updateThreadMessageFolder`
     /// (archive/delete/move keeps the card visible showing its new location
@@ -843,6 +848,7 @@ final class MessageDetailViewModel {
     /// same logic can be replayed when preview-freeze is released.
     @MainActor
     private func applyRefresh(for updatedId: String) async {
+        refreshedRows[updatedId] = threadLoadGeneration
         let originalId = self.messageId
         // Update main message if it matches
         if updatedId == originalId || updatedId == self.message?.id {
@@ -2607,6 +2613,19 @@ final class MessageDetailViewModel {
                 // when the move op's queued closure runs completeLocalMove).
                 var overlayed = results
                 self.applyOverlay(to: &overlayed)
+                // A row refreshed after this load began: the load's snapshot of it is older.
+                // Keep the row on screen, or re-read it when none is shown yet.
+                var rereads: [String] = []
+                for i in overlayed.indices {
+                    guard let stamp = self.refreshedRows[overlayed[i].id], stamp >= generation else { continue }
+                    if let current = self.threadMessages.first(where: { $0.id == overlayed[i].id }) {
+                        overlayed[i] = current
+                    } else {
+                        rereads.append(overlayed[i].id)
+                    }
+                }
+                self.refreshedRows = self.refreshedRows.filter { $0.value >= generation }
+                defer { for id in rereads { Task { await self.applyRefresh(for: id) } } }
                 // The pin window is the move OP's lifetime (completeLocalMove
                 // removes it when the op's continuation runs) — no overlay-
                 // based pruning here: the overlay coalesces one entry per id,

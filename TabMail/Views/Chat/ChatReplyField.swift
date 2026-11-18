@@ -231,15 +231,16 @@ struct ChatReplyCompose: Equatable {
     }
 
     /// The compose card, opened in this kind, as main's Reply All entries open it.
+    /// `draftId`: the draft it saves to; nil, the reply's usual one.
     @MainActor
     func composeView(
-        replyTo message: MessageHeader?, suggestedBody: String? = nil,
+        replyTo message: MessageHeader?, suggestedBody: String? = nil, draftId: String? = nil,
         onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
     ) -> ComposeView {
         ComposeView(
             replyTo: message, suggestedBody: suggestedBody, isReplyAll: isReplyAll,
             prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,
-            prefillBcc: bcc.isEmpty ? nil : bcc, onAgentOutcome: onAgentOutcome)
+            prefillBcc: bcc.isEmpty ? nil : bcc, prefillDraftId: draftId, onAgentOutcome: onAgentOutcome)
     }
 }
 
@@ -247,7 +248,16 @@ struct ChatReplyCompose: Equatable {
 struct ChatReadyReply: Identifiable {
     let message: MessageHeader
     let compose: ChatReplyCompose
+    /// A draft of its own: the chat leaves the reply draft already saved for this email alone
+    /// (it stays in Drafts), so the card never opens, saves over or deletes it.
+    let draftId: String
     var id: MessageHeader.ID { message.id }
+
+    init(message: MessageHeader, compose: ChatReplyCompose) {
+        self.message = message
+        self.compose = compose
+        draftId = Draft.separateReplyKey(replyTo: "\(message.accountId):\(message.stableId)")
+    }
 }
 
 /// A compose card the agent opens in the chat, with how a reply opens, read as it opened.

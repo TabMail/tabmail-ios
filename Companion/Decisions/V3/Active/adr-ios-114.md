@@ -877,7 +877,13 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      `ChatReplyCompose.make(replyAllTo:)`); Send there sends and the Sent bubble replaces the ghost,
      and the field's words stay (the card is not a send from the field); Close goes back with the
      ghost still there. An edit or a Recompute in the card that is stored on the row posts
-     `.messageDataDidChange`, so the ghost under the card follows it. In the tutorial only the step that asks for it
+     `.messageDataDidChange`, so the ghost under the card follows it; a thread reload that read
+     its rows before such a refresh keeps the refreshed row (`MessageDetailViewModel.refreshedRows`),
+     for the suggestion and the summary alike. The card saves to a draft of its own
+     (`Draft.separateReplyKey`, the parent in its tail as a reply key's): the chat ignores saved
+     drafts, so a reply draft already saved for the email stays as it is in Drafts, never opened,
+     saved over or deleted by the card. The ghost shows only once the thread and its accounts have
+     loaded, and not while the agent works on a request from the field. In the tutorial only the step that asks for it
      (`FieldMove.tapSuggestion`, ringed by `TutorialPulseRing`) opens the card; elsewhere the
      locked notice shows.
    - **The field** holds only the user's words (`ChatFieldFill`: `shown`, `emptiedOn` and

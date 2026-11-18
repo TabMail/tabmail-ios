@@ -265,7 +265,8 @@ struct ChatThreadView: View {
             // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
             // suggestion through the outbox.
             ready.compose.composeView(
-                replyTo: ready.message, suggestedBody: ready.message.cachedReply, onAgentOutcome: { _ in })
+                replyTo: ready.message, suggestedBody: ready.message.cachedReply, draftId: ready.draftId,
+                onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
         .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
@@ -674,8 +675,12 @@ struct ChatThreadView: View {
     /// The ready AI Suggestion's text on the newest email. None on the user's turn (their email is
     /// the newest, or a reply of theirs is still in the outbox below it), and none while the reply
     /// goes only to people chosen in Reply to: the suggestion was written for everyone, and the
-    /// field has the agent write one for the people chosen.
+    /// field has the agent write one for the people chosen. None until the thread and its accounts
+    /// have loaded (the newest email and the Reply All audience, without the user's own address,
+    /// are known only then), and none while the agent works on a request from the field (it may
+    /// open its own compose card).
     private func suggestionText(on newest: MessageHeader, thread: ChatThread) -> String? {
+        guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking else { return nil }
         let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty
         return ChatReplyField.suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)
     }

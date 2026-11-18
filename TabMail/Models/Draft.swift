@@ -217,14 +217,33 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         return "new:\(newId ?? UUID().uuidString)"
     }
 
+    /// The prefix of a reply draft of its own (`separateReplyKey`).
+    static let separateReplyPrefix = "reply-new:"
+
+    /// A reply's key that is not the reply's usual one: a compose opened with it never finds,
+    /// saves over or deletes the reply draft already saved for that email (the chat's AI
+    /// Suggestion opens this way: a saved draft stays as it is, in Drafts). Its tail after the
+    /// uuid names the parent as a reply key's does (`replyKeyTail`).
+    static func separateReplyKey(replyTo parentKey: String) -> String {
+        "\(separateReplyPrefix)\(UUID().uuidString):\(parentKey)"
+    }
+
     /// The `{accountId}:{stableId}` tail naming a reply's parent: after the prefix of
     /// a TabMail reply or forward key, or after the uuid of an adopted reply's key
-    /// (`ExternalDraftAdoption.adoptedKey`). Nil for any other key.
+    /// (`ExternalDraftAdoption.adoptedKey`) or of a separate reply's key (`separateReplyKey`).
+    /// Nil for any other key.
     static func replyKeyTail(draftKey: String, isForward: Bool) -> Substring? {
         let prefix = isForward ? "forward:" : "reply:"
         if draftKey.hasPrefix(prefix) { return draftKey.dropFirst(prefix.count) }
-        guard ExternalDraftAdoption.isAdoptedKey(draftKey) else { return nil }
-        let rest = draftKey.dropFirst(ExternalDraftAdoption.draftKeyPrefix.count)
+        let uuidPrefix: String
+        if ExternalDraftAdoption.isAdoptedKey(draftKey) {
+            uuidPrefix = ExternalDraftAdoption.draftKeyPrefix
+        } else if !isForward, draftKey.hasPrefix(separateReplyPrefix) {
+            uuidPrefix = separateReplyPrefix
+        } else {
+            return nil
+        }
+        let rest = draftKey.dropFirst(uuidPrefix.count)
         guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
         return rest[rest.index(after: colonIdx)...]
     }

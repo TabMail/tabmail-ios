@@ -151,6 +151,12 @@ struct ChatSuggestionBubbleTests {
         try await withChat { chat in
             let ghost = try #require(Self.ghost(in: chat.view))
             #expect(chat.controller.presentedViewController == nil, "control: nothing open yet")
+            // The row's reply changes under the ghost with no refresh yet: the card still holds the
+            // reply the user tapped, never a later read of the row.
+            try await chat.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
+                               arguments: ["Hello Sam,\n\nA different reply.", chat.email.id])
+            }
             #expect(ghost.accessibilityActivate(), "the ghost takes a tap")
             try await Self.waitUntil { chat.controller.presentedViewController != nil }
             let card = try #require(chat.controller.presentedViewController?.view, "the compose card opened")
@@ -160,12 +166,58 @@ struct ChatSuggestionBubbleTests {
                 return found.contains { $0.contains("Yes, Tuesday works for me.") }
             }
             #expect(found.contains { $0.contains("Hello Sam") }, "the full email is on the card: \(found)")
+            #expect(!found.contains { $0.contains("A different reply") }, "never the row's later reply: \(found)")
             let queued = try await chat.pool.read { try OutboxMessage.fetchCount($0) }
             #expect(queued == 0, "nothing was sent")
             chat.controller.dismiss(animated: false)
             try await Self.waitUntil { chat.controller.presentedViewController == nil }
             #expect(Self.ghost(in: chat.view) != nil, "Close goes back with the ghost still there")
         }
+    }
+
+    @Test("A saved reply draft stays as it is: the ghost's card shows the suggestion, and the draft keeps its words")
+    func savedDraftStaysInDrafts() async throws {
+        try await withChat { chat in
+            let now = Date().timeIntervalSince1970
+            let key = Draft.draftKey(replyTo: "\(chat.email.accountId):\(chat.email.stableId)", isForward: false, newId: nil)
+            let saved = Draft(
+                id: key, accountId: Self.account,
+                toJSON: "[\"sam@example.com\"]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Re: Lunch plans", body: "My own words, not sent yet",
+                replyToId: chat.email.id, isForward: false, editHistoryJSON: nil,
+                createdAt: now, updatedAt: now,
+                serverDraftId: nil, serverPushStatus: nil,
+                rfc822MessageId: nil, attachmentsDirName: nil)
+            try await chat.pool.write { db in try saved.insert(db) }
+            let ghost = try #require(Self.ghost(in: chat.view))
+            #expect(ghost.accessibilityActivate(), "the ghost takes a tap")
+            try await Self.waitUntil { chat.controller.presentedViewController != nil }
+            let card = try #require(chat.controller.presentedViewController?.view, "the compose card opened")
+            var found: [String] = []
+            try await Self.waitUntil {
+                found = HostedAccessibility.labels(in: card) + Self.fieldTexts(card)
+                return found.contains { $0.contains("Yes, Tuesday works for me.") }
+            }
+            #expect(found.contains { $0.contains("Yes, Tuesday works for me.") }, "the card holds the suggestion: \(found)")
+            #expect(!found.contains { $0.contains("My own words") }, "never the saved draft: \(found)")
+            chat.controller.dismiss(animated: false)
+            try await Self.waitUntil { chat.controller.presentedViewController == nil }
+            let after = try await chat.pool.read { try Draft.fetchOne($0, key: key) }
+            #expect(after?.body == "My own words, not sent yet" && after?.updatedAt == now, "the saved draft is untouched")
+            let drafts = try await chat.pool.read { try Draft.fetchCount($0) }
+            #expect(drafts >= 1)
+        }
+    }
+
+    @Test("A separate reply key names the same parent as the reply's usual key, and never collides with it")
+    func separateReplyKeyNamesTheParent() {
+        let parent = "acc-1:<a@example.com>"
+        let usual = Draft.draftKey(replyTo: parent, isForward: false, newId: nil)
+        let own = Draft.separateReplyKey(replyTo: parent)
+        #expect(own != usual && own != Draft.separateReplyKey(replyTo: parent), "a key of its own, every time")
+        #expect(Draft.replyKeyTail(draftKey: own, isForward: false).map(String.init) == parent)
+        #expect(Draft.replyKeyParent(draftKey: own, isForward: false)?.stableId == "<a@example.com>")
+        #expect(Draft.replyKeyTail(draftKey: own, isForward: true) == nil, "never a forward")
     }
 
     // MARK: - 3. One copy, rewritten in place

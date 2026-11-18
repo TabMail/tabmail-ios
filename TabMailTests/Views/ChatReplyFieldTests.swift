@@ -406,13 +406,15 @@ struct ChatReplyFieldTests {
         #expect(Self.count("composeEnded(.", in: text) == 0 && Self.count("{ _ in composeEnded", in: text) == 0)
         // The AI Suggestion's card is not a send from the field: its outcome leaves the field's
         // words alone (a completion with no field send would empty them).
-        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestedBody: ready.message.cachedReply, onAgentOutcome: { _ in })", in: text) == 1,
+        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestedBody: ready.message.cachedReply, draftId: ready.draftId, onAgentOutcome: { _ in })", in: text) == 1,
                 "the card holds the tapped row's reply and never completes the field")
         #expect(Self.count("@State private var example = ChatSuggestionConfig.randomExample()", in: text) == 1,
                 "one example per chat open, kept across redraws")
         #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
         // Who the reply goes to and whose turn it is decide whether the suggestion shows.
         #expect(Self.count("let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty", in: text) == 1)
+        #expect(Self.count("guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking else { return nil }", in: text) == 1,
+                "no suggestion before the thread and accounts load, or while the agent works")
         #expect(Self.count("ChatReplyField.suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)", in: text) == 1)
         #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1,
                 "an agent compose hands on its outcome")
