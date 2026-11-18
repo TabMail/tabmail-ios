@@ -3757,10 +3757,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     func fetchFolders() async throws -> [FolderInfo] {
         let folders = try await listFoldersWithStatus()
-        let listed = Dictionary(
-            folders.compactMap { info in info.uidNext.map { (info.path, $0) } },
-            uniquingKeysWith: { first, _ in first })
-        lastFolderListUidNext = (lastFolderListUidNext ?? [:]).merging(listed) { _, new in new }
+        // Only folders in this list: a folder gone from it drops out. A listed
+        // folder whose STATUS gave no UIDNEXT keeps its previous value.
+        let previous = lastFolderListUidNext ?? [:]
+        var next: [String: Int] = [:]
+        for info in folders where next[info.path] == nil {
+            if let uidNext = info.uidNext ?? previous[info.path] { next[info.path] = uidNext }
+        }
+        lastFolderListUidNext = next
         return folders
     }
 
@@ -3954,11 +3958,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     /// The listing's own selection's counters, the one source of the folder's
     /// stored counters. UIDNEXT 0 is SwiftMail's "not reported".
-    nonisolated static func listingCounters(_ selection: Mailbox.Selection, count: Int) -> ListingCounters {
+    /// A HIGHESTMODSEQ counts only when this session turned CONDSTORE on: one
+    /// the server sent unasked is not a value the listing negotiated.
+    nonisolated static func listingCounters(_ selection: Mailbox.Selection, count: Int, condStore: ListingCondStore) -> ListingCounters {
         let uidNext = selection.uidNext.value
         return ListingCounters(
             messageCount: count, uidNext: uidNext != 0 ? Int(uidNext) : nil,
-            highestModSeq: selection.highestModificationSequenceValue.flatMap { Int(exactly: $0) })
+            highestModSeq: condStore == .off ? nil : selection.highestModificationSequenceValue.flatMap { Int(exactly: $0) })
     }
 
     nonisolated static func coverage(
@@ -3968,6 +3974,21 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             serverRecordCount: rawRecordCount,
             spansEntireFolder: serverMessageCount <= limit && rawRecordCount == serverMessageCount,
             unmaterialisedIds: unmaterialisedIds)
+    }
+
+    /// How many distinct messages of the sequence window `lower...upper` the
+    /// FETCH answered with a UID: a record outside the window, one without a
+    /// UID, or a second record for the same message or UID adds nothing.
+    nonisolated static func answeredInWindow(_ infos: [MessageInfo], from lower: Int, through upper: Int) -> Int {
+        guard lower <= upper else { return 0 }
+        var sequences = Set<UInt32>()
+        var uids = Set<UInt32>()
+        for info in infos {
+            guard let uid = info.uid, (lower...upper).contains(Int(info.sequenceNumber.value)) else { continue }
+            sequences.insert(info.sequenceNumber.value)
+            uids.insert(uid.value)
+        }
+        return min(sequences.count, uids.count)
     }
 
     /// The ids of records the server NAMED that `mapMessageInfo` refused. Derived
@@ -4018,6 +4039,18 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func fetchMessagesWithObservedEpoch(
         folder: String, limit: Int, offset: Int
     ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) {
+        do {
+            return try await listFolderWindow(folder: folder, limit: limit)
+        } catch IMAPError.selectFailed {
+            // The server refused the folder's SELECT: not listable this pass,
+            // a typed answer at the provider boundary (#755).
+            throw ProviderFolderNotListable()
+        }
+    }
+
+    private func listFolderWindow(
+        folder: String, limit: Int
+    ) async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) {
         try await withFolderConnection(folder: folder) { server in
             // T1.2b: the SYNC path's own SELECT. `SyncEngine.runSyncMessages`
             // reaches the server through here (`provider.fetchMessages`), and that
@@ -4034,9 +4067,21 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // it: a SELECT parameter is an enabling command on every session, so
             // a session the connection opened again inside a command (after an
             // acknowledged ENABLE on the earlier one) still gets MODSEQ.
-            let condStore = folderListingCondStore[folder] ?? .off
-            let selection = try await selectMailboxTracked(
-                server, folder: folder, enablingCondStore: condStore != .off)
+            var condStore = folderListingCondStore[folder] ?? .off
+            let selection: Mailbox.Selection
+            do {
+                selection = try await selectMailboxTracked(
+                    server, folder: folder, enablingCondStore: condStore != .off)
+            } catch IMAPError.selectFailed where condStore != .off {
+                // The connection may have reopened its session on a server that
+                // no longer takes CONDSTORE: decide again on this session (a
+                // failed SELECT leaves it authenticated, where ENABLE is allowed)
+                // and select once more with that decision.
+                condStore = await negotiateListingCondStore(server)
+                folderListingCondStore[folder] = condStore
+                selection = try await selectMailboxTracked(
+                    server, folder: folder, enablingCondStore: condStore != .off)
+            }
             let observed = selection.uidValidity.value
             let observedEpoch: UInt32? = observed != 0 ? observed : nil
             // An EXISTS no UID or sequence number can carry (above UInt32.max) is
@@ -4085,7 +4130,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 }
                 return ([], observedEpoch,
                         FetchCoverage(serverRecordCount: 0, spansEntireFolder: true, unmaterialisedIds: [],
-                                      counters: Self.listingCounters(selection, count: 0)))
+                                      counters: Self.listingCounters(selection, count: 0, condStore: condStore)))
             }
 
             // No representable range over a non-empty mailbox: we asked nothing,
@@ -4102,13 +4147,18 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // COVERAGE is measured on `infos` and `selection.messageCount` —
                 // the two things the SERVER said — never on `mapped`. See
                 // `IMAPProvider.coverage(rawRecordCount:serverMessageCount:limit:unmaterialisedIds:)`.
+                // The proof counts the requested window's messages that were
+                // answered, each once: a repeated or unsolicited FETCH response
+                // never stands in for a message that went unanswered (#755).
+                let answered = Self.answeredInWindow(
+                    infos, from: max(1, selection.messageCount - limit + 1), through: selection.messageCount)
                 var coverage = Self.coverage(
-                    rawRecordCount: infos.count,
+                    rawRecordCount: answered,
                     serverMessageCount: selection.messageCount,
                     limit: limit,
                     unmaterialisedIds: Self.unmaterialisedIds(raw: infos, mapped: mapped))
                 // A count the mailbox cannot hold is no count: nothing is written.
-                coverage.counters = selection.reportedMessageCount.map { Self.listingCounters(selection, count: $0) }
+                coverage.counters = selection.reportedMessageCount.map { Self.listingCounters(selection, count: $0, condStore: condStore) }
                 return (mapped, observedEpoch, coverage)
             } catch {
                 let msg = "\(error)"
@@ -7265,9 +7315,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // a connection failure.
                 throw IMAPSearchRefused(reason: reason)
             }
-            // Membership of each requested UID, never the answer's own set: a
-            // compact ESEARCH answer can name a range far wider than the request.
-            let listed = try extResult.listed()
+            // Membership of each requested UID, never the answer's own set. An
+            // answer naming a UID outside the request is not this request's
+            // answer and proves nothing (`listed(within:)` throws).
+            let listed = try extResult.listed(within: searchSet)
             return (from...to).compactMap { uid in
                 UInt32(exactly: uid).flatMap { listed.contains(UID($0)) ? $0 : nil }
             }
@@ -7303,9 +7354,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(
                 identifierSet: searchSet, criteria: [.all]
             )
-            // Membership of each requested UID (bounded by the request), never
-            // an expansion of the answer.
-            let listed = try extResult.listed()
+            // Membership of each requested UID, never an expansion of the
+            // answer; an answer naming a UID outside the request proves nothing.
+            let listed = try extResult.listed(within: searchSet)
             return UIDExistenceResult(
                 found: Set(uids.filter { listed.contains(UID($0)) }),
                 uidValidity: selection.uidValidity.value

@@ -240,6 +240,13 @@ extension SyncEngine {
                 continue
             }
             outcome.searchedChunks += 1
+            // An answer that arrives after the deadline is not acted on: no
+            // deletion and no turnover evidence from it. The folder stays due.
+            if outOfTime() {
+                outcome.aborted = true
+                outcome.abortReason = "out of time"
+                break
+            }
 
             // UIDVALIDITY guard — 0 means the SELECT did not report a value.
             // A changed (or unknowable) UIDVALIDITY invalidates every local
@@ -517,10 +524,19 @@ extension SyncEngine {
             }
         }
         do {
+            let wasDue = try await dbPool.read { db in
+                FolderChangeState(raw: try String.fetchOne(db, sql: "SELECT changeState FROM folder WHERE id = ?", arguments: [folderId])).listingDue
+            }
             let before = try await localCount()
-            var walkFinished = true
-            if Self.shouldReconcileDeletions(
-                localCount: before, serverCount: serverCount, tolerance: SyncConfig.deletionReconcileCountTolerance) {
+            let mismatch = Self.shouldReconcileDeletions(
+                localCount: before, serverCount: serverCount, tolerance: SyncConfig.deletionReconcileCountTolerance)
+            // An owed check (set by a walk cut short, or armed by a listing that
+            // saw more rows held than the server counts) is walked even when the
+            // counts now agree: a different row moving away can make them agree
+            // while the ghost is still held. Nothing owed and nothing to walk:
+            // finished.
+            var walkFinished = !(wasDue || mismatch)
+            if wasDue || mismatch {
                 try await writeDue(true)
                 if let deadline, Date() >= deadline {
                     walkFinished = false
@@ -529,7 +545,7 @@ extension SyncEngine {
                         BackgroundSyncLogger.logDebug("\(logPrefix) \(folder.name): local=\(before) > server=\(serverCount) — reconciling external deletions")
                     }
                     walkFinished = await reconcileExternallyDeletedMessages(
-                        folder: folder, provider: provider, expectedGhosts: before - serverCount, deadline: deadline)
+                        folder: folder, provider: provider, expectedGhosts: max(0, before - serverCount), deadline: deadline)
                 }
             }
             let after = try await localCount()
@@ -616,7 +632,7 @@ extension SyncEngine {
             BackgroundSyncLogger.logDebug("[Reconcile] \(folder.name): walk DONE — deleted=\(outcome.deletedCount) searchedChunks=\(outcome.searchedChunks) failedChunks=\(outcome.failedChunks) aborted=\(outcome.aborted)\(outcome.abortReason.map { " (\($0))" } ?? "")")
         }
         if outcome.deletedCount > 0 || outcome.aborted {
-            BackgroundSyncLogger.log("reconcileWalk: \(folder.name) deleted=\(outcome.deletedCount) failed=\(outcome.failedChunks) aborted=\(outcome.aborted)")
+            BackgroundSyncLogger.log("reconcileWalk: role=\(folder.role.rawValue) deleted=\(outcome.deletedCount) failed=\(outcome.failedChunks) aborted=\(outcome.aborted)")
         }
         // T4.S6 — the walk REFUSED to delete because the epoch moved under it. That
         // refusal is the "stop" half; the reaction is the "recover" half. Without

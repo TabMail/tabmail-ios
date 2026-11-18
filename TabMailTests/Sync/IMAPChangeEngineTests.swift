@@ -116,6 +116,14 @@ struct IMAPChangeEngineTests {
     func untrackedUnchangedFolderIsNotListed() async throws {
         try await Self.withWorld("eng-quiet", capabilities: Self.condstoreOnly,
                                  serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3]) { w in
+            // Unchanged means the folder holds the server's whole tuple from an
+            // earlier listing: count, UIDNEXT and MODSEQ.
+            let folderId = w.folderId
+            let modSeq = w.server.qresyncHighestModSeq(for: Self.path)
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET totalCount = 3, lastKnownUidNext = 4, lastKnownHighestModSeq = ? WHERE id = ?",
+                               arguments: [modSeq, folderId])
+            }
             let start = w.server.recordedCommands().count
             _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
             let fetches = w.server.recordedCommands().dropFirst(start).filter { $0.uppercased().contains("FETCH") }

@@ -882,31 +882,52 @@ its own SELECT.
    listing result (`FetchCoverage.counters`, `ListingCounters`) and written in the listing's own
    transaction (`SyncEngine.writeListingCounters`). `applyFolderList`, `applyFolderUpdates`, the untracked
    refresh and the crawl write no counters. The UIDVALIDITY bootstrap (ADR-IOS-061) is unchanged.
+   Resets (Settings resets, the startup migration, the UIDVALIDITY reaction) clear counters only through
+   the same owner (`SyncEngine.invalidateListingCounters`).
 2. **The listing's MODSEQ.** The listing's connection decides CONDSTORE once per session
    (`IMAPProvider.negotiateListingCondStore`): with ENABLE, only an acknowledged `ENABLE CONDSTORE`; without
    ENABLE, CONDSTORE if advertised. The decision belongs to the pooled connection and goes with it. With
    CONDSTORE on, the listing's SELECT carries `(CONDSTORE)` (through `IMAPChangeCommands`). With it off, or
    on a NOMODSEQ folder, the listing clears the stored MODSEQ and never fails for it.
-3. **A listing that proves nothing writes nothing and is not the folder's listing**
-   (`SyncEngine.listingProvedItsWindow`): unproven coverage, EXISTS not sent or out of range, or a positive
-   EXISTS whose header FETCH returned fewer records than the window holds (an expunge between SELECT and
-   FETCH included). It writes no counters, runs no stale sweep, certifies no change baseline, drives no
-   phase 2, keeps the full sync due (`FullSyncListing.droppedFolder`), and the untracked refresh reports the
-   folder not listed. It is retried on the next pass and is never an error shown to the user.
+3. **Each folder's listing this pass is one of three, by the server's answer** (`SyncEngine.listingProvedItsWindow`):
+   - **Proven:** EXISTS in range, a header record back for every message the window holds, and (on EXISTS
+     0) a confirming SEARCH. It writes the counters, may sweep, counts toward the full-sync stamp.
+   - **Not listable:** the server refused the SELECT (`ProviderFolderNotListable`, mapped from the IMAP
+     SELECT refusal at the provider boundary) or the SELECT sent no usable EXISTS
+     (`FetchCoverage.notListable`). Nothing is written or swept; the folder does not withhold the stamp, so
+     a folder the server always refuses does not keep the full sync due on every pass.
+   - **Unproven:** a short or empty FETCH against a positive EXISTS (an expunge between SELECT and FETCH
+     included), a contradicted EXISTS 0, or any other failure after the listing started. It writes no
+     counters, runs no stale sweep, certifies no change baseline and drives no phase 2, and it withholds
+     the stamp (`FullSyncListing.droppedFolder`; the untracked route's `UntrackedRefresh.unproven`, the
+     change pass's `unprovenListing`). Invariant: `lastFullSyncAt` is never stamped after a pass in which a
+     started listing failed to prove its window.
+   The records an unproven listing did return are still merged as positive records (inserts and flag
+   updates of messages the server showed); only absence is never inferred from it. A connection lost
+   mid-listing is retried once; the retry's own answer classifies the folder, and the failed attempt wrote
+   nothing (`runSyncMessages` writes in one transaction after its server reads). Never an error shown to the
+   user; the folder is listed again next pass.
 4. **An EXISTS 0** empties a folder only when a `UID SEARCH ALL` on the same selection reads as empty;
    otherwise that folder's listing fails (`ProviderListingUnconfirmed`, content-free description) and is
-   retried; the other folders proceed.
+   retried; the other folders proceed. A SEARCH that the library reports as an empty result without an
+   untagged answer is treated as unproven once the library preserves that distinction (tracked separately);
+   Tests pin it.
 5. **SEARCH answers (RFC 4731) have one reader,** `ExtendedSearchResult.listed()`: an answer that does not
-   list its UIDs fails the request, never reads as empty.
+   list its UIDs fails the request, never reads as empty. `listed(within:)` refuses an answer naming any UID
+   outside the request, so a set cannot be trimmed into absence.
 6. **The stale sweep stays inside the listing's own window (#997).** On IMAP it judges only UIDs from the
    lowest to the highest UID the listing fetched; a whole-folder listing judges only UIDs below its own
-   UIDNEXT. A message another listing stored after this listing's SELECT is never removed by it.
+   UIDNEXT (or, with none reported, at most the highest UID it saw; with neither it removes nothing). A
+   message another listing stored after this listing's SELECT is never removed by it. Removals come only
+   from this sweep and from the change reader's removal core; phase 2 removes only after its own walk.
 7. **Observations are triggers only.** STATUS and the change read's observation decide whether a folder is
    listed. The full sync's MODSEQ skip (`shouldSkipFolderFetch`) needs MODSEQ, MESSAGES and UIDNEXT all equal
    to the stored listing counters and no due listing.
 8. **Phase 2 runs only on the count of a listing in the same pass** (`FullSyncListing.listedCounts`; the
    untracked refresh uses its own listing's result). A phase 2 that does not finish sets
-   `FolderChangeState.listingDue`; only a finished walk whose counts agree clears it. Phase 2 honours the
+   `FolderChangeState.listingDue`, as does a listing whose server count is below the rows held (armed in the
+   listing's transaction, `armListingDueIfHeldExceeds`); a due folder is listed and walked again and is left
+   out of the change baseline; only a finished walk whose counts agree clears it. Phase 2 honours the
    pass's deadline (`FullSyncPlan.deadline`, the foreground pass's own).
 9. **Backfill progress has its own source,** `EmailProvider.progressTotal(crawling:)`, needed because the
    STATUS writers that fed it are gone: Gmail its profile total, Exchange the sum of `totalItemCount` over its
@@ -921,5 +942,6 @@ again next pass. The engine stays provider-blind. No column, no migration (`list
 
 Keywords: ListingCounters, writeListingCounters, listedCounts, listingProvedItsWindow, short FETCH,
 unproven listing, stale sweep window, upper bound, negotiateListingCondStore, ProviderListingUnconfirmed,
-ExtendedSearchResult.listed, listingDue, progressTotal, ProgressTotal, uidWalkProgress, folder counters one
+ExtendedSearchResult.listed, listed(within:), ProviderFolderNotListable, notListable, UntrackedRefresh,
+unprovenListing, invalidateListingCounters, answeredInWindow, armListingDueIfHeldExceeds, folderWalkDone, listingDue, progressTotal, ProgressTotal, uidWalkProgress, folder counters one
 writer, #755, #985, #990, #997.

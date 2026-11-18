@@ -650,7 +650,7 @@ actor SyncEngine {
             // prove its window (#755). A folder the server made not listable
             // (SELECT refused, no usable EXISTS) does not withhold it.
             let now = Date()
-            let fullSyncDone = !listing.droppedFolder
+            let fullSyncDone = !listing.droppedFolder && !(changePass?.unprovenListing ?? false)
             try await dbPool.write { db in
                 _ = try Account.filter(Column("id") == account.id)
                     .updateAll(db, Column("lastSyncedAt").set(to: now))
@@ -980,6 +980,7 @@ actor SyncEngine {
     /// Not a connection error — the connection is fine, just this folder can't be opened.
     /// Callers should skip the folder and continue with the next one.
     nonisolated static func isSelectFailedError(_ error: Error) -> Bool {
+        if error is ProviderFolderNotListable { return true }
         let msg = "\(error)"
         return msg.contains("Select mailbox failed")
     }

@@ -984,12 +984,10 @@ struct DeletedFlagMergeVisibilityTests {
     /// every message the server counted — separates a complete read from a partial
     /// one, and without it the rows below the fetch's floor are swept.
     ///
-    /// Accepted residual, stated rather than asserted: within the covered slice a
-    /// message whose record never arrived still reads as absent, because the client
-    /// was never told its id. That is the ordinary windowed-branch semantics
-    /// (ADR-IOS-042) and it is recoverable — the row is inside the newest-window and
-    /// comes straight back on the next pass.
-    @Test("A short FETCH never turns a whole-folder window into complete knowledge")
+    /// A short listing proves nothing about absence, inside its slice or below it:
+    /// it removes no row at all. The next listing that returns every counted record
+    /// removes what the server no longer holds.
+    @Test("A short FETCH never turns a whole-folder window into complete knowledge: it removes nothing, and the next complete listing sweeps")
     func aShortFetchDoesNotManufactureCompleteKnowledge() async throws {
         let server = FakeIMAPServer(
             capabilities: Self.nonUidplusCapabilities,
@@ -1033,10 +1031,19 @@ struct DeletedFlagMergeVisibilityTests {
                 """)
         #expect(listed.contains("10") && listed.contains("12"),
                 "the records that DID arrive must stay listed")
-        #expect(!listed.contains("11"), """
-                non-vacuity, two-sided: UID 11 is inside the covered slice and the server does \
-                not have it, so the windowed sweep must still remove it
+        #expect(listed.contains("11"), """
+                a short listing proves no message absent, not even inside the slice it \
+                returned: UID 11 stays until a listing proves its window. Surviving: \
+                \(listed.sorted())
                 """)
+
+        // Non-vacuity: once every counted record arrives, the sweep removes the
+        // rows the server no longer holds.
+        server.suppressFetchRecord(in: "Archive", uids: [])
+        try await Self.merge(
+            folderPath: "Archive", accountId: accountId, provider: provider, pool: pool, limit: 5)
+        let proven = try Self.listedUIDs(accountId: accountId, path: "Archive", pool: pool)
+        #expect(proven == ["10", "12", "13"], "a complete listing sweeps 5 and 11: \(proven.sorted())")
     }
 
     /// The anchor that stops the two tests above passing by disabling the sweep:

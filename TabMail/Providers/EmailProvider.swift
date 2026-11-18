@@ -1166,6 +1166,12 @@ struct ProviderTemporaryRefusal: Error, CustomStringConvertible, LocalizedError 
 /// again (`SyncEngine.fullSync`, `SyncEngine.refreshUntrackedFolder`,
 /// `AccountManager.syncFolders`). A connection lost on the way is not this
 /// error: it stays a connection error.
+/// The server refused to open the folder for listing (IMAP: SELECT answered NO
+/// or BAD): this pass's answer makes the folder not listable. Content-free.
+struct ProviderFolderNotListable: Error, CustomStringConvertible {
+    var description: String { "Listing: the server refused to open a folder" }
+}
+
 struct ProviderListingUnconfirmed: Error, CustomStringConvertible, CustomDebugStringConvertible {
     let folder: String
     /// The server's refusal text; nil when the server contradicted the empty count.

@@ -379,8 +379,7 @@ extension SyncEngine {
         let folders = (try? await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId && Column("path") != "").fetchAll(db)
         })
-        let incompleteFolders = folders.map { $0.filter { !$0.backfillComplete }.count } ?? 1
-        let headersDone = incompleteFolders == 0
+        let headersDone = Self.folderWalkDone(folders)
 
         // The provider is the source (#755): Gmail keeps its profile total,
         // Exchange answers its latest folder list's sum, IMAP its folder lists'
@@ -472,14 +471,19 @@ extension SyncEngine {
     /// wake lock, the crawl) on a count it could not read.
     func isFolderWalkComplete(account: Account) async -> Bool {
         let accountId = account.id
-        let incompleteFolders = (try? await dbPool.read { db in
-            try Folder.filter(
-                Column("accountId") == accountId &&
-                Column("backfillComplete") == false &&
-                Column("path") != ""
-            ).fetchCount(db)
-        }) ?? 1
-        return incompleteFolders == 0
+        let folders = try? await dbPool.read { db in
+            try Folder.filter(Column("accountId") == accountId && Column("path") != "").fetchAll(db)
+        }
+        return Self.folderWalkDone(folders)
+    }
+
+    /// The account's header walk is done: its folders were read (nil = the read
+    /// failed), at least one real folder is known (none = not discovered yet),
+    /// and every one of them finished its walk. Fails closed.
+    nonisolated static func folderWalkDone(_ folders: [Folder]?) -> Bool {
+        guard let folders else { return false }
+        let real = folders.filter { !$0.path.isEmpty }
+        return !real.isEmpty && real.allSatisfy(\.backfillComplete)
     }
 
 }

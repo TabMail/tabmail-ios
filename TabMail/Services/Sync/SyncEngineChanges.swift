@@ -117,6 +117,9 @@ struct ChangePassOutcome: Sendable {
     var outOfTime = false
     /// Rows were written.
     var hadChanges = false
+    /// An untracked refresh in this pass started a listing that failed to prove
+    /// its window: the pass's full-sync stamp is withheld (#755).
+    var unprovenListing = false
     /// The read carried the folder list and it was applied (the MODSEQ-skippable
     /// paths), so the full sync skips its own discovery.
     var appliedFolderList: Set<String>?
@@ -176,10 +179,12 @@ extension SyncEngine {
         // Folders no bookmark can cover: listed here when they changed.
         for changes in changeSet.folders {
             guard case .untracked(let observation) = changes.status else { continue }
-            if try await refreshUntrackedFolder(
+            switch try await refreshUntrackedFolder(
                 folderId: changes.folderId, observation: observation, account: account, provider: provider,
-                deadline: request.context.deadline) {
-                outcome.hadChanges = true
+                deadline: deadline) {
+            case .listed: outcome.hadChanges = true
+            case .unproven: outcome.unprovenListing = true
+            case .notListed: break
             }
         }
         outcome.outOfTime = outOfTime
@@ -446,7 +451,9 @@ extension SyncEngine {
                 var state = FolderChangeState(raw: folder.changeState)
                 // A folder still owed its self-heal pass after an unproven move
                 // stays untracked: the next full sync lists it and heals it again.
-                guard !state.tracking, !state.selfHealDue else { continue }
+                // So does one whose count check is still owed (`listingDue`): a
+                // tracked folder gets no listing, so the check could never finish.
+                guard !state.tracking, !state.selfHealDue, !state.listingDue else { continue }
                 state.tracking = true
                 if let left, let bookmark = left {
                     try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ? AND changeCursor = ?", arguments: [state.encoded, folderId, bookmark])

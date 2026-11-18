@@ -2,18 +2,34 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import Foundation
 import SwiftMail
 
 extension ExtendedSearchResult {
     /// The matched identifiers, from whichever field lists them: `.all` when
     /// ESEARCH is supported, `.ordered` when `extendedSearch` falls back to plain
     /// SEARCH. Throws `ExtendedSearchUnlisted` for an answer that reports matches
-    /// without listing them (`listedMatches` is nil): such an answer proves no
-    /// identifier present or absent, so no caller may read it as a set. This is
-    /// the only way to read an answer as a set.
+    /// without listing them: such an answer proves no identifier present or
+    /// absent, so no caller may read it as a set. This is the only way to read
+    /// an answer as a set.
     func listed() throws -> MessageIdentifierSet<T> {
         guard let listed = listedMatches else { throw ExtendedSearchUnlisted() }
         return listed
+    }
+
+    /// `listed()` for a SEARCH restricted to `requested`: an answer naming any
+    /// identifier outside the request cannot be attributed to it and proves
+    /// nothing, so it throws `ExtendedSearchUnlisted` rather than being trimmed
+    /// to the request (a trimmed answer could read a present identifier as
+    /// absent). Compared range by range, never expanded.
+    func listed(within requested: MessageIdentifierSet<T>) throws -> MessageIdentifierSet<T> {
+        let answer = try listed()
+        var allowed = IndexSet()
+        for range in requested.ranges { allowed.insert(integersIn: range) }
+        for range in answer.ranges where !allowed.contains(integersIn: range) {
+            throw ExtendedSearchUnlisted()
+        }
+        return answer
     }
 
     /// The matched identifiers when the answer lists every one of them, or `nil`
@@ -24,7 +40,7 @@ extension ExtendedSearchResult {
     ///
     /// A list that contradicts the answer's own COUNT, MIN or MAX is not a
     /// complete list either: it is read as unlisted.
-    var listedMatches: MessageIdentifierSet<T>? {
+    private var listedMatches: MessageIdentifierSet<T>? {
         if let all {
             guard Self.agrees(all, count: count, min: min, max: max) else { return nil }
             return all

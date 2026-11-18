@@ -59,14 +59,14 @@ extension SyncEngine {
 
     /// One untracked folder: the turnover trigger, the epoch bootstrap, and for a
     /// changed folder the window listing (which writes the folder's counters)
-    /// and the deletion check on that listing's count. Returns whether the
-    /// folder was listed.
+    /// and the deletion check on that listing's count. Returns what the refresh
+    /// did (`UntrackedRefresh`).
     func refreshUntrackedFolder(
         folderId: String, observation: UntrackedObservation, account: Account, provider: any EmailProvider,
         deadline: Date? = nil
-    ) async throws -> Bool {
+    ) async throws -> UntrackedRefresh {
         guard let folder = try await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
-              !folder.path.isEmpty, folder.uidValidityResetPendingAt == nil else { return false }
+              !folder.path.isEmpty, folder.uidValidityResetPendingAt == nil else { return .notListed }
 
         // The free turnover trigger: both epochs KNOWN and different. A trigger,
         // not a guard: the reaction re-reads everything fresh.
@@ -75,7 +75,7 @@ extension SyncEngine {
            observed != stored {
             AccountManager.shared.fireUidValidityChangeHandler(
                 accountId: account.id, folderPath: folder.path, storedValue: stored, observedValue: observed)
-            return false
+            return .notListed
         }
 
         guard Self.untrackedFolderChanged(
@@ -89,7 +89,7 @@ extension SyncEngine {
             if Self.uidValidityBootstrapWrite(observed: observation.uidValidity, stored: folder.lastKnownUidValidity) != nil {
                 try await bootstrapFolderUidValidity(folderId: folder.id, observed: observation.uidValidity)
             }
-            return false
+            return .notListed
         }
 
         BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) changed (uidNext: \(folder.lastKnownUidNext ?? 0)→\(observation.uidNext), count: \(folder.totalCount)→\(observation.messageCount))")
@@ -97,19 +97,24 @@ extension SyncEngine {
         if newCount > 0 { publishDownloading(newCount, forAccount: account.id) }
         // The listing writes the folder's counters from its own selection, with
         // its rows (`runSyncMessages`); this observation only decided to list.
-        let listed: ListingCounters?
+        let result: SyncMessagesResult
         do {
-            listed = try await syncMessages(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit)
+            result = try await syncMessages(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit)
         } catch {
-            if Self.isSelectFailedError(error) {
+            if error is ProviderFolderNotListable {
                 BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): SELECT failed — skipping")
-                return false
+                return .notListed
+            }
+            // Any other SELECT-shaped failure after the listing started: unproven.
+            if Self.isSelectFailedError(error) {
+                BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): listing failed — skipping")
+                return .unproven
             }
             // A listing whose empty count the server did not confirm: this folder
             // only. No counters are written, so the next pass lists it again.
             if error is ProviderListingUnconfirmed {
                 BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): listing count unconfirmed — skipping: \(error)")
-                return false
+                return .unproven
             }
             throw error
         }
@@ -118,10 +123,24 @@ extension SyncEngine {
         // listing that just ran, never the observation's. A listing that
         // proved nothing has no count: no phase 2 this pass, and the folder
         // was not listed (the next pass lists it again).
-        guard let serverCount = listed?.messageCount else { return false }
+        guard result.proven, let serverCount = result.listedCounters?.messageCount else {
+            return result.notListable ? .notListed : .unproven
+        }
         // Bounded by the pass's deadline: this runs inside the account's turn.
         await reconcileDeletionsAfterListing(
             folder: folder, provider: provider, serverCount: serverCount, logPrefix: "[Sync] Untracked", deadline: deadline)
-        return true
+        return .listed
     }
+}
+
+/// What one untracked refresh did, by this pass's server answer (#755).
+enum UntrackedRefresh: Sendable, Equatable {
+    /// The folder was listed and the listing proved its window.
+    case listed
+    /// Not listed: unchanged, a turnover, or the server made it not listable
+    /// (SELECT refused, no usable EXISTS).
+    case notListed
+    /// A listing started and failed to prove its window (a short FETCH, an
+    /// EXISTS 0 not confirmed): the pass's full-sync stamp is withheld.
+    case unproven
 }

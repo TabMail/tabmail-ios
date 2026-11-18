@@ -337,15 +337,14 @@ struct SyncFullSyncFolderEpochTests {
                 here would make the deletion-reconcile walk's stored-vs-live comparison equal \
                 and delete every local header as a ghost (ADR-IOS-051)
                 """)
-        #expect(after?.lastKnownHighestModSeq == 12,
+        #expect(after?.lastKnownHighestModSeq == 9000,
                 """
-                the cursor still refreshes — a stale-epoch modseq self-corrects on the \
-                following cycle, whereas nulling it on a permanently-behind stored epoch \
-                would destroy the CONDSTORE signal for this folder forever
+                the folder list's STATUS never writes the cursor: only a listing that proved \
+                its window writes the folder's counters, and this one returned no counters
                 """)
     }
 
-    @Test("A stable epoch keeps refreshing the CONDSTORE cursor (no over-reset)")
+    @Test("Within a stable epoch the folder list's STATUS does not write the CONDSTORE cursor; only a proving listing does")
     func sameEpochKeepsRefreshingTheModseqCursor() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
@@ -367,8 +366,8 @@ struct SyncFullSyncFolderEpochTests {
 
         let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
         #expect(after?.lastKnownUidValidity == 111)
-        #expect(after?.lastKnownHighestModSeq == 9500,
-                "within one epoch the cursor must still advance")
+        #expect(after?.lastKnownHighestModSeq == 9000,
+                "STATUS's MODSEQ is not the listing's: the cursor stays until a listing that proved its window writes it")
     }
 
     /// **KNOWN OPEN DEFECT — the merge pass is a SECOND, unguarded deleter.**
@@ -557,7 +556,7 @@ struct SyncFullSyncFolderEpochTests {
         let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try FolderEpochTestFixture.insertFolder(
             accountId: accountId, path: "Archive", role: .archive, pool: pool, totalCount: 3,
-            lastKnownUidValidity: 111, lastKnownHighestModSeq: 9000)
+            lastKnownUidNext: 4, lastKnownUidValidity: 111, lastKnownHighestModSeq: 9000)
 
         let mock = MockEmailProvider()
         await mock.setFetchFoldersResult([

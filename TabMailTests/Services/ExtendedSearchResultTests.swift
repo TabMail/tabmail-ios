@@ -45,8 +45,22 @@ struct ExtendedSearchResultAsSetTests {
               ExtendedSearchResult<UID>(count: 2, min: UID(4), max: UID(9)),
           ])
     func unlistedAnswerIsRefused(_ result: ExtendedSearchResult<UID>) {
-        #expect(result.listedMatches == nil)
         #expect(throws: ExtendedSearchUnlisted.self) { try result.listed() }
+    }
+
+    @Test("An answer to a restricted SEARCH that names an identifier outside the request is refused, never trimmed to the request; one inside it is read as listed")
+    func answerOutsideTheRequestIsRefused() throws {
+        var requested = MessageIdentifierSet<UID>()
+        requested.insert(range: 10...20)
+        requested.insert(UID(30))
+        let outside = ExtendedSearchResult<UID>(all: MessageIdentifierSet<UID>([UID(500)]))
+        #expect(throws: ExtendedSearchUnlisted.self) { try outside.listed(within: requested) }
+        let straddling = ExtendedSearchResult<UID>(all: MessageIdentifierSet<UID>([UID(20), UID(21)]))
+        #expect(throws: ExtendedSearchUnlisted.self) { try straddling.listed(within: requested) }
+        let inside = ExtendedSearchResult<UID>(all: MessageIdentifierSet<UID>([UID(12), UID(30)]))
+        #expect(try inside.listed(within: requested).toArray() == [UID(12), UID(30)])
+        let empty = ExtendedSearchResult<UID>(all: MessageIdentifierSet<UID>())
+        #expect(try empty.listed(within: requested).isEmpty)
     }
 
     @Test("An ALL list that contradicts the same answer's COUNT, MIN or MAX is refused",
@@ -56,7 +70,6 @@ struct ExtendedSearchResultAsSetTests {
               ExtendedSearchResult<UID>(max: UID(12), all: MessageIdentifierSet<UID>([UID(4), UID(9)])),
           ])
     func contradictoryAllIsRefused(_ result: ExtendedSearchResult<UID>) {
-        #expect(result.listedMatches == nil)
         #expect(throws: ExtendedSearchUnlisted.self) { try result.listed() }
     }
 
