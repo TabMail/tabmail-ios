@@ -271,6 +271,8 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// Every ENABLE a connection sent after a SELECT (refused, RFC 5161 §3.1).
         var enableInSelectedStateCount = 0
         var condStoreSelectCount = 0
+        /// Every `UID FETCH … (CHANGEDSINCE n)` answered.
+        var changedSinceFetchCount = 0
 
         /// STATUS attributes a mailbox's answer leaves out (a server may omit one).
         var statusOmittedAttributesByMailbox: [String: Set<String>] = [:]
@@ -2855,6 +2857,7 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// Every command each connection sent, in order, by connection (its fd).
     var commandLogByConnection: [Int32: [String]] { withState { $0.commandLogByConnection } }
     var condStoreSelectCount: Int { withState { $0.condStoreSelectCount } }
+    var changedSinceFetchCount: Int { withState { $0.changedSinceFetchCount } }
 
     /// The oracle reads: ENABLE QRESYNC per connection, QRESYNC SELECTs per
     /// connection, and QRESYNC SELECTs refused for want of ENABLE.
@@ -3618,7 +3621,19 @@ final class FakeIMAPServer: @unchecked Sendable {
     private func handleFetch(tag: String, args rawArgs: String, uidMode: Bool, mailbox: String, condStoreEnabled: inout Bool) -> String {
         let seqStr: String
         let itemsStr: String
-        let args = rawArgs
+        // A trailing `(CHANGEDSINCE n)` modifier (RFC 7162 §3.1.4.1): only
+        // messages whose modseq is above n, and it switches CONDSTORE on.
+        var args = rawArgs
+        var changedSince: Int?
+        if let range = rawArgs.range(of: #"\s*\(CHANGEDSINCE (\d+)\)\s*$"#, options: [.regularExpression, .caseInsensitive]) {
+            let digits = rawArgs[range].filter(\.isNumber)
+            guard capabilities.contains("CONDSTORE"), let value = Int(digits) else {
+                return "\(tag) BAD CHANGEDSINCE not supported\r\n"
+            }
+            changedSince = value
+            args = String(rawArgs[..<range.lowerBound])
+            condStoreEnabled = true
+        }
         let reportsModSeq = condStoreEnabled && modelsModSeqs
 
         if let parenOpen = args.firstIndex(of: "("),
@@ -3634,7 +3649,8 @@ final class FakeIMAPServer: @unchecked Sendable {
 
         let modSeqs: [Int: Int] = reportsModSeq
             ? withState { state -> [Int: Int] in
-                Self.observeQResync(mailbox, state: &state).modSeqByUID
+                if changedSince != nil { state.changedSinceFetchCount += 1 }
+                return Self.observeQResync(mailbox, state: &state).modSeqByUID
             }
             : [:]
         let snapshot = withState { state in
@@ -3677,6 +3693,7 @@ final class FakeIMAPServer: @unchecked Sendable {
             // in the mailbox (so SELECT still counts it in EXISTS) but no record
             // for it reaches the client.
             if snapshot.recordSuppressed.contains(msg.uid) { continue }
+            if let changedSince, (modSeqs[msg.uid] ?? 0) <= changedSince { continue }
             let seqnum = (snapshot.messages.firstIndex(where: { $0.uid == msg.uid }) ?? 0) + 1
             var fetchItems: [String] = []
 
