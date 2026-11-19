@@ -179,16 +179,16 @@ actor BackfillBodyQueue {
     /// can drive its passes off the REAL queue contents rather than a model of them.
     var queuedItemsForTesting: [Item] { storage.queue }
 
-    /// Test-only seam: pre-set the per-folder batch cap so the disposition tests can
-    /// pin that the defer decision keys on THIS batch's `items.count` and NOT on the
-    /// shared cap.
-    /// Test-only seam: an idle queue (no item queued, none in flight), so a
-    /// test of a reader of `isIdle` starts from what an earlier test left.
+    /// Test-only seam: cancel in-flight work and drop every queued item, so a test of
+    /// an `isIdle` reader starts from an idle queue regardless of earlier tests.
     func emptyForTesting() {
         cancelAllInFlight()
         storage = QueueStorage<Item>()
     }
 
+    /// Test-only seam: pre-set the per-folder batch cap so the disposition tests can
+    /// pin that the defer decision keys on THIS batch's `items.count` and NOT on the
+    /// shared cap.
     func setFolderMaxBatchForTesting(_ n: Int, folderPath: String) {
         folderMaxBatch[folderPath] = n
     }
