@@ -216,6 +216,9 @@ struct ChatSuggestionBubble: View {
         .accessibilityLabel("\(ChatSuggestionConfig.label): \(text)")
         .accessibilityHint("Opens the email, ready to review and send")
         .accessibilityAddTraits(.isButton)
+        // The combined element ignores the Button inside it, so its activation is its own:
+        // without this, VoiceOver's double tap opened nothing.
+        .accessibilityAction { onTap() }
         .accessibilityIdentifier(Self.bubbleId)
         .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
             width * ChatViewLayout.bubbleMaxWidthFraction
