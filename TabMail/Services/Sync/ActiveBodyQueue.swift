@@ -225,6 +225,13 @@ actor ActiveBodyQueue {
     /// pin that the defer decision keys on THIS batch's `items.count` and NOT on the
     /// shared cap — a concurrent fast-failing batch lowering the cap to 1 must not
     /// cause a genuine multi-item batch of ordinary messages to defer.
+    /// Test-only seam: an idle queue (no item queued, none in flight), so a
+    /// test of a reader of `isIdle` starts from what an earlier test left.
+    func emptyForTesting() {
+        cancelAllInFlight()
+        storage = QueueStorage<Item>()
+    }
+
     func setFolderMaxBatchForTesting(_ n: Int, folderPath: String) {
         folderMaxBatch[folderPath] = n
     }

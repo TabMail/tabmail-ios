@@ -2023,8 +2023,10 @@ struct FastSyncKeepAwakeTests {
 
     @Test("The keep-awake lock is HELD while any account's header walk is unfinished, including an account with no progress entry yet")
     func heldWhileAnyHeaderWalkUnfinished() {
-        // `FastSyncView.holdAwake` maps a MISSING progress entry to `false`
-        // (`…?.headersDone == true`), so a not-yet-reporting account holds the lock.
+        // `FastSyncView.holdAwake(accounts:…)` maps an account whose folder walk
+        // is not known complete (not polled yet, or its folder rows unfinished)
+        // to `false`, so it holds the lock. Driven end to end through the poll in
+        // `FastSyncWakeLockTests`.
         #expect(FastSyncView.keepScreenAwakeWhileWorking(
             accountHeadersDone: [true, false],
             activeBodyIdle: true,

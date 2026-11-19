@@ -97,10 +97,20 @@ struct FastSyncView: View {
     }
 
     /// Live keep-awake value — maps the current SwiftUI state into the pure
-    /// predicate. An account not polled yet counts as not done (hold awake).
+    /// predicate (`holdAwake(accounts:…)`).
     private var holdAwake: Bool {
-        Self.keepScreenAwakeWhileWorking(
-            accountHeadersDone: navigationStore.accounts.map { walkDoneByAccount[$0.id] == true },
+        Self.holdAwake(accounts: navigationStore.accounts, walkDoneByAccount: walkDoneByAccount,
+                       activeBodyIdle: activeBodyIdle, backfillBodyIdle: backfillBodyIdle)
+    }
+
+    /// The keep-awake decision from one poll: an account's header walk is done
+    /// only when its folder rows say so (`walkDoneByAccount`, from
+    /// `SyncEngine.isFolderWalkComplete`), never from a published progress
+    /// entry. An account not polled yet counts as not done (hold awake).
+    static func holdAwake(accounts: [Account], walkDoneByAccount: [String: Bool],
+                          activeBodyIdle: Bool, backfillBodyIdle: Bool) -> Bool {
+        keepScreenAwakeWhileWorking(
+            accountHeadersDone: accounts.map { walkDoneByAccount[$0.id] == true },
             activeBodyIdle: activeBodyIdle,
             backfillBodyIdle: backfillBodyIdle
         )
@@ -112,13 +122,23 @@ struct FastSyncView: View {
     /// lock releases once the header walk is done and the queues drain (the
     /// quarantined oversized rows having been removed from the queue).
     private func refreshBodyQueueIdleState() async {
-        activeBodyIdle = await ActiveBodyQueue.shared.isIdle
-        backfillBodyIdle = await BackfillBodyQueue.shared.isIdle
+        let poll = await Self.pollKeepAwakeInputs(accounts: navigationStore.accounts, engine: manager.syncEngine)
+        activeBodyIdle = poll.activeBodyIdle
+        backfillBodyIdle = poll.backfillBodyIdle
+        walkDoneByAccount = poll.walkDoneByAccount
+    }
+
+    /// One poll of the keep-awake inputs: both body queues' idle state and each
+    /// account's header walk read from its folder rows.
+    static func pollKeepAwakeInputs(accounts: [Account], engine: SyncEngine) async
+        -> (activeBodyIdle: Bool, backfillBodyIdle: Bool, walkDoneByAccount: [String: Bool]) {
+        let activeIdle = await ActiveBodyQueue.shared.isIdle
+        let backfillIdle = await BackfillBodyQueue.shared.isIdle
         var walkDone: [String: Bool] = [:]
-        for account in navigationStore.accounts {
-            walkDone[account.id] = await manager.syncEngine.isFolderWalkComplete(account: account)
+        for account in accounts {
+            walkDone[account.id] = await engine.isFolderWalkComplete(account: account)
         }
-        walkDoneByAccount = walkDone
+        return (activeIdle, backfillIdle, walkDone)
     }
 
     private func formatETA(_ seconds: Double) -> String {
