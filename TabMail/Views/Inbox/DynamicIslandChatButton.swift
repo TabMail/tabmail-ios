@@ -872,6 +872,7 @@ struct DynamicIslandChat: View {
             .textFieldStyle(.plain)
             .lineLimit(1...6)
             .focused($isTextFieldFocused)
+            .modifier(ReplyFieldFocusMarker(focused: isTextFieldFocused))
             .frame(minHeight: dictation.isActive ? DictationConfig.meterMaxBarHeight : nil)
             .opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)
             .allowsHitTesting(!dictation.isActive)
@@ -2943,4 +2944,42 @@ private struct ExpandablePillPressStyle: ButtonStyle {
             .scaleEffect(configuration.isPressed ? 0.92 : 1.0)
             .animation(.spring(response: 0.25, dampingFraction: 0.6), value: configuration.isPressed)
     }
+}
+
+/// The reply field's focus as an accessibility-only marker, for the chat swipe UI tests: XCUITest
+/// reads a text field's own focus as lost once a swipe re-renders the chat, while editing goes on.
+/// Active only in debug builds launched with the swipe UI test's argument; it draws nothing (clear
+/// text in the background, so no layout change) and is set only when the field's focus changes.
+private struct ReplyFieldFocusMarker: ViewModifier {
+    let focused: Bool
+
+    func body(content: Content) -> some View {
+        #if DEBUG
+        if Marker.isActive {
+            content.modifier(Marker(focused: focused))
+        } else {
+            content
+        }
+        #else
+        content
+        #endif
+    }
+
+    #if DEBUG
+    private struct Marker: ViewModifier {
+        static let isActive = ProcessInfo.processInfo.arguments.contains("--chat-swipe-ui-test")
+        let focused: Bool
+        @State private var shown = false
+
+        func body(content: Content) -> some View {
+            content
+                .background(
+                    Text(shown ? "focused" : "unfocused")
+                        .foregroundStyle(.clear)
+                        .allowsHitTesting(false)
+                        .accessibilityIdentifier("chatReplyFieldFocus"))
+                .onChange(of: focused) { _, now in shown = now }
+        }
+    }
+    #endif
 }

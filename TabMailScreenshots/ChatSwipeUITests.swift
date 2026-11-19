@@ -264,13 +264,14 @@ final class ChatSwipeUITests: XCTestCase {
         let field = replyField(in: app)
         field.tap()
         XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        XCTAssertTrue(markerReads(focused: true, in: app), "control: the focus marker reads the field's focus")
         openBubble(2, in: app)
-        XCTAssertTrue(waitForFocus(field, true, timeout: 1), "control: opening the actions left the keyboard up")
+        XCTAssertTrue(markerReads(focused: true, in: app), "control: opening the actions left the keyboard up")
         let other = bubble(1, in: app)
         XCTAssertLessThan(other.frame.maxY, field.frame.minY, "control: the bubble shows above the field and its keyboard")
         tap(atY: other.frame.midY, dx: 0.5, in: app)
         XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "the actions closed")
-        XCTAssertTrue(waitForFocus(field, false, timeout: 3), "and the same tap dropped the keyboard")
+        XCTAssertTrue(markerReads(focused: false, in: app), "and the same tap dropped the keyboard")
         XCTAssertFalse(app.buttons["Sheet Grabber"].waitForExistence(timeout: 2), "the tap opened no card")
     }
 
@@ -431,6 +432,24 @@ final class ChatSwipeUITests: XCTestCase {
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "hasKeyboardFocus == %@", NSNumber(value: focused)), object: element)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    /// How long a focus read through the app's marker may take to settle.
+    private static let focusMarkerPollLimit: TimeInterval = 3
+    private static let focusMarkerPollStep: TimeInterval = 0.1
+
+    /// Whether the reply field's focus, read from the app's accessibility marker beside it (the
+    /// field element's own focus reads lost once a swipe re-renders the chat), is `focused` within
+    /// `focusMarkerPollLimit`.
+    private func markerReads(focused: Bool, in app: XCUIApplication) -> Bool {
+        let marker = app.descendants(matching: .any)["chatReplyFieldFocus"].firstMatch
+        let want = focused ? "focused" : "unfocused"
+        let deadline = Date().addingTimeInterval(Self.focusMarkerPollLimit)
+        repeat {
+            if marker.exists && marker.label == want { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.focusMarkerPollStep))
+        } while Date() < deadline
+        return false
     }
 
     private func replyField(in app: XCUIApplication) -> XCUIElement {
