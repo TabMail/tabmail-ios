@@ -195,8 +195,11 @@ struct ChatFieldWordsTests {
             await poll { $0.writes >= count }
         }
 
+        /// How long a test waits for a held read or write before it fails.
+        static let waitLimit: Duration = .seconds(10)
+
         private func poll(_ done: (State) -> Bool) async -> Bool {
-            let deadline = ContinuousClock.now + .seconds(10)
+            let deadline = ContinuousClock.now + Self.waitLimit
             while ContinuousClock.now < deadline {
                 if state.withLock({ done($0) }) { return true }
                 try? await Task.sleep(for: .milliseconds(10))
@@ -658,6 +661,9 @@ struct ChatFieldWordsTests {
 
     // MARK: - 8. A removed account's and an ended demo's words never come back
 
+    /// Set once a task it is handed to finishes.
+    @MainActor private final class Finished { var value = false }
+
     /// A demo chat's key in the demo account.
     private static func demoKey(_ thread: String) -> String {
         "demo:" + ChatThreadKey.key(accountId: DemoSeed.demoAccountId, threadId: thread)
@@ -816,6 +822,12 @@ struct ChatFieldWordsTests {
             let account = Self.account
             if failedFirst { store.rollBackRemoval(failed) }
             try await pool.write { try AccountManager.removeAccountRowsTxn($0, accountId: account, wasPrimary: false) }
+            if failedFirst {
+                // The delete has committed and the committed removal has not finished yet: its own
+                // hold still fences the delayed batch, which the failed one's end did not release.
+                storage.releaseWrites()
+                await store.written()
+            }
             store.commitRemoval(committed)
             if !failedFirst { store.rollBackRemoval(failed) }
             storage.releaseWrites()
@@ -933,9 +945,18 @@ struct ChatFieldWordsTests {
                 // The next demo's read of the same key runs and lands first.
                 let waiting = storage.heldResultCount(of: demo)
                 storage.stopHolding(resultsOf: demo)
-                await run.load(demo)
+                let finished = Finished()
+                let newLoad = Task { await run.load(demo); finished.value = true }
+                // The next demo's read is its own: it never waits for the ended demo's (bounded by the suite's wait limit, so
+                // a read that joins the old one fails here rather than hanging the run).
+                let deadline = ContinuousClock.now + ControlledStorage.waitLimit
+                while !finished.value, ContinuousClock.now < deadline {
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                #expect(finished.value, "the next demo's read waited for the ended demo's")
                 #expect(waiting == 1, "control: only the old read is held")
                 storage.release(resultsOf: demo)
+                await newLoad.value
                 await oldLoad.value
             }
             #expect(run.fill(for: demo).words == "", "the next demo's field never shows the ended demo's words")
