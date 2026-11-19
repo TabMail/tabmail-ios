@@ -30,6 +30,8 @@ import Testing
 ///     (launch, push wake) follow, and however often a shown chat checks its rows again after the
 ///     queue is rebuilt; AI re-enable asks once more; never one every backoff.
 ///  5. (Removed 2026-11-15, with the list of chat members waiting for their body.)
+///  6. A chat summary queued behind a full LLM semaphore waits for a slot and runs as soon as a
+///     background call frees one; it is never starved.
 @Suite("Chat summary execution", .serialized, .processGlobalState)
 struct ChatSummaryExecutionTests {
 
@@ -459,6 +461,97 @@ struct ChatSummaryExecutionTests {
             await syncStartAndDrain()  // a push wake
             #expect(http.recordedCalls().count == 1,
                     "a push wake in the same process asks no more: \(http.recordedCalls().count) summary calls")
+        }
+    }
+
+    // MARK: - 6. A chat summary behind a full LLM semaphore
+
+    /// A completions reply whose final event carries `assistant`.
+    private static func finalEvent(_ assistant: String) -> FakeHTTP.CannedResponse {
+        let final = String(decoding: try! JSONSerialization.data(withJSONObject: ["assistant": assistant]), as: UTF8.self)
+        return .bytes(Data("event: final\ndata: \(final)\n\n".utf8), contentType: "text/event-stream")
+    }
+
+    private static func eventually(within seconds: Double = 10, _ condition: () async -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return await condition()
+    }
+
+    @Test("A chat summary queued behind a full LLM semaphore runs once a background call frees a slot")
+    func chatSummaryBehindAFullSemaphoreRuns() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        _ = try FolderEpochTestFixture.makeAccount(id: "busy", provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "busy", path: "INBOX", role: .inbox, pool: pool)
+        let row = Self.header("busy-chat", accountId: "busy", folder: "INBOX")
+        try await pool.write { db in try row.insert(db) }
+        try await Self.index(row, body: "Let us meet on Tuesday.")
+        let key = ContentKey(rawValue: row.id)
+        do {
+            try await runsBehindAFullSemaphore(row, pool: pool)
+        } catch {
+            try? await SearchIndex.shared.removeMessages(contentKeys: [key])
+            throw error
+        }
+        try? await SearchIndex.shared.removeMessages(contentKeys: [key])
+    }
+
+    private func runsBehindAFullSemaphore(_ row: MessageHeader, pool: DatabasePool) async throws {
+        // Every slot is held by a background call the backend answers only when the gate opens.
+        let background = "busy-background-call"
+        let gate = DispatchSemaphore(value: 0)
+        let slots = SyncConfig.maxConcurrentLLMCalls
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let summary = try JSONSerialization.data(withJSONObject: [
+            "summary": "A plan.", "todos": [], "reminder": NSNull(), "text_message": "See you Tuesday.",
+        ])
+        http.register(path: "/completions/chat", method: "POST") { request in
+            guard String(decoding: request.body ?? Data(), as: UTF8.self).contains(background) else {
+                return Self.finalEvent(String(decoding: summary, as: UTF8.self))
+            }
+            return .parked { gate.wait(); return Self.finalEvent("Done.") }
+        }
+        let backend = BackendClient(llmSession: http.session)
+        let held = (0..<slots).map { _ in
+            Task {
+                _ = try? await backend.sendCompletions(CompletionsRequest(
+                    messages: [CompletionsMessage(role: "system", content: background, vars: [:])],
+                    client_timezone: nil, disable_tools: true))
+            }
+        }
+        #expect(await Self.eventually { http.recordedCalls().count == slots }, "every slot is held")
+        func textMessage() async -> String? {
+            try? await pool.read { try MessageHeader.fetchOne($0, key: row.id) }?.summaryTextMessage
+        }
+
+        try await Self.withAIOn {
+            let service = AIService(backendClient: backend, peerProbe: { _ in nil })
+            let queue = ActiveAIQueue()
+            await queue.setDispatchSuppressedForTesting(true)
+            let job = ActiveAIQueue.AIJob(
+                headerId: row.id, accountId: row.accountId, jobType: .summary, windowExempt: true, forChat: true)
+            let chat = Task { await queue.executeWholeJobForTesting(job, aiService: service) }
+
+            // Behind the full semaphore, the chat summary has not reached the backend.
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(http.recordedCalls().count == slots, "the chat summary waits for a slot")
+            #expect(await textMessage() == nil)
+
+            // One background call is answered: its slot goes to the waiting chat summary.
+            gate.signal()
+            let ran = await Self.eventually { await textMessage() == "See you Tuesday." }
+            #expect(ran, "the chat summary runs once a slot frees")
+            #expect(http.recordedCalls().count == slots + 1)
+
+            for _ in 1..<slots { gate.signal() }
+            for task in held { await task.value }
+            // A starved chat summary never returns; only a run that finished is awaited.
+            if ran { await chat.value }
         }
     }
 }

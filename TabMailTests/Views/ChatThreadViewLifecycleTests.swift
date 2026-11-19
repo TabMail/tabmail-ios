@@ -19,7 +19,8 @@ import UIKit
 ///  2. Every email of the thread is marked read in the database once the chat shows it.
 ///  3. The open asks for the newest `ChatViewConfig.summaryWindow` emails, newest first, wherever
 ///     it lands. Any other email is asked for only once it has been on screen: scrolling up asks
-///     for the rows it shows, and a row never shown asks nothing.
+///     for the rows it shows, an older row already on screen as the chat lands asks too, and a row
+///     never shown asks nothing.
 ///  4. A context load that a newer member change cancelled never shows: the chat keeps the newer
 ///     load's accounts and attachment chips when the older read finally returns.
 ///  5. An email that joins the open chat is its newest and asks for its summary, first. A draft
@@ -146,16 +147,18 @@ struct ChatThreadViewLifecycleTests {
     /// `then` runs after that, and the queue is read again once it settles.
     private func open(
         unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool = false, tall: Int? = nil,
+        height: CGFloat = 852,
         then action: (@MainActor (UIScrollView) async throws -> Void)? = nil
     ) async throws -> Opened {
         try await HostedAccessibility.withAutomation {
             try await openWithAutomation(unreadFrom: unreadFrom, openedIndex: openedIndex,
-                                         highlights: highlights, landsAway: landsAway, tall: tall, then: action)
+                                         highlights: highlights, landsAway: landsAway, tall: tall,
+                                         height: height, then: action)
         }
     }
 
     private func openWithAutomation(
-        unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool, tall: Int?,
+        unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool, tall: Int?, height: CGFloat,
         then action: (@MainActor (UIScrollView) async throws -> Void)?
     ) async throws -> Opened {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -172,7 +175,7 @@ struct ChatThreadViewLifecycleTests {
 
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
-        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: height)
         let controller = UIHostingController(rootView: NavigationStack {
             ChatThreadView(messageId: headers[openedIndex].id, highlightsOpenedMessage: highlights)
         })
@@ -234,6 +237,143 @@ struct ChatThreadViewLifecycleTests {
         #expect(opened.older.isEmpty,
                 "at the bottom every email on screen is among the newest asked for, so no older one asks: \(opened.older) vs \(opened.partlyShown.sorted())")
         #expect(!opened.queued.contains(0), "the oldest email waits for a scroll")
+    }
+
+    /// SwiftUI reports a bubble's visibility only when it changes, so an older email already on
+    /// screen as the chat lands asks then, or never while it stays there.
+    @Test("A tall screen: every email on screen as the chat lands asks for its summary, older ones too")
+    func tallScreenAsksForEveryEmailShownAtTheOpen() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false, height: 2400)
+        #expect(abs(opened.belowScreen) < 2, "at the bottom, got \(opened.belowScreen) below the screen")
+        Self.expectOpenRequest(opened)
+        let olderShown = opened.fullyShown.subtracting(Self.newest)
+        #expect(!olderShown.isEmpty,
+                "precondition: the screen shows emails older than the newest asked for: \(opened.fullyShown.sorted())")
+        #expect(olderShown.isSubset(of: Set(opened.queued)),
+                "every older email on screen is asked for: \(olderShown.sorted()) vs \(opened.queued)")
+    }
+
+    /// Holds every read of the chat's context (its attachment lists and calendar files) on its
+    /// reader thread until opened (bounded), so the chat cannot land while it is held.
+    final class ContextReadGate: Sendable {
+        struct State { var armed = false; var open = false; var held = 0; var timedOut = false }
+        let state = Mutex(State())
+        /// Holds nothing until armed, so the migrations and the fixture's writes run free.
+        func arm() { state.withLock { $0.armed = true } }
+        func openGate() { state.withLock { $0.open = true } }
+        func statement(_ sql: String) {
+            guard sql.contains("attachmentsJSON"), sql.contains("icsText") else { return }
+            let holds = state.withLock { value -> Bool in
+                guard value.armed, !value.open else { return false }
+                value.held += 1
+                return true
+            }
+            guard holds else { return }
+            let deadline = Date().addingTimeInterval(30)
+            while !state.withLock({ $0.open }) {
+                if Date() > deadline {
+                    state.withLock { $0.timedOut = true }
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+    }
+
+    /// The bug the landing fix closed, made certain: the bubbles are on screen before the chat
+    /// lands (its context read is held), so each reports its visibility then and never again, as
+    /// the landing scroll leaves the screen where it was. Those emails must still be asked for.
+    @Test("An email on screen before the chat lands, whose only visibility report comes then, is asked for its summary")
+    func anEmailShownBeforeTheLandingAsks() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation { try await shownBeforeTheLanding() }
+    }
+
+    private func shownBeforeTheLanding() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let gate = ContextReadGate()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        // Held context reads each keep a reader; the chat's other reads must still run.
+        config.maximumReaderCount = 16
+        config.prepareDatabase { db in db.trace { gate.statement("\($0)") } }
+        let pool = try DatabasePool(path: directory.appendingPathComponent("t.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        let queue = ActiveAIQueue.shared
+        await queue.setDispatchSuppressedForTesting(true)
+        await queue.clearForTesting()
+        defer {
+            gate.openGate()
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        let headers = try Self.insertThread(unreadFrom: nil, pool: pool)
+        let index = Dictionary(uniqueKeysWithValues: headers.enumerated().map { ($1.id, $0) })
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 2400)
+        gate.arm()
+        let controller = UIHostingController(rootView: NavigationStack {
+            ChatThreadView(messageId: headers[Self.length - 1].id)
+        })
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+
+        /// The emails whose whole bubble is in the chat's visible area, and the scroll offset.
+        func screen() -> (shown: Set<Int>, offset: CGFloat)? {
+            guard let scroll = Self.scrollViews(controller.view).max(by: { $0.contentSize.height < $1.contentSize.height }) else { return nil }
+            let visible = scroll.convert(scroll.bounds, to: nil).inset(by: scroll.adjustedContentInset)
+            let shown = Set(Self.bubbleFrames(in: controller.view).filter { visible.contains($0.frame) }.map(\.index))
+            return (shown, scroll.contentOffset.y)
+        }
+        func chatJobs() async -> [Int] {
+            await queue.queuedJobsForTesting.filter(\.forChat).compactMap { index[$0.headerId] }
+        }
+
+        // Before the landing: every email of the thread is in, the bubbles are laid out and still.
+        var before: (shown: Set<Int>, offset: CGFloat)?
+        var stableFor = 0
+        for _ in 0..<80 where stableFor < 6 {
+            try await Task.sleep(for: .milliseconds(150))
+            let now = screen()
+            let complete = now.map { $0.shown.contains(Self.length - 1) && $0.shown.count > ChatViewConfig.summaryWindow } ?? false
+            stableFor = complete && now?.shown == before?.shown && now?.offset == before?.offset ? stableFor + 1 : 0
+            before = now
+        }
+        let held = try #require(before, "the chat's scroll view")
+        #expect(stableFor >= 6, "control: the chat is laid out and still before it lands: \(held.shown.sorted())")
+        #expect(gate.state.withLock { $0.held > 0 }, "control: the chat's context read is held, so it has not landed")
+        let askedBefore = await chatJobs()
+        #expect(!askedBefore.contains(Self.length - 1), "control: the open's request is not made yet: \(askedBefore)")
+
+        // The chat lands.
+        gate.openGate()
+        let jobs = try await Self.settledQueue(queue)
+        try await Task.sleep(for: .milliseconds(600))
+        let after = try #require(screen(), "the chat's scroll view")
+        #expect(!gate.state.withLock { $0.timedOut }, "control: the held reads were released, not timed out")
+        #expect(abs(after.offset - held.offset) < 2,
+                "control: the landing left the screen where it was, so no bubble reports again: \(held.offset) to \(after.offset)")
+        let queued = jobs.compactMap { index[$0] }
+        #expect(queued.filter { Self.newest.contains($0) } == Self.newest, "control: the open asks for the newest, newest first: \(queued)")
+        let olderShown = after.shown.intersection(held.shown).subtracting(Self.newest)
+        #expect(!olderShown.isEmpty, "precondition: emails older than the newest asked for were on screen before the landing: \(held.shown.sorted())")
+        #expect(olderShown.isSubset(of: Set(queued)),
+                "every older email on screen before and after the landing is asked for: \(olderShown.sorted()) vs \(queued)")
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
     }
 
     @Test("Some unread: the chat opens at the Unread line and marks every email read; the open still asks for the newest")

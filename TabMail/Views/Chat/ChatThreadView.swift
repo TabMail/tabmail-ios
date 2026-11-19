@@ -5,76 +5,19 @@
 import GRDB
 import SwiftUI
 
-/// Opens a message from any open path (a folder, search, a notification, a reminder, an email
-/// reference): a draft in the draft editor, as from Drafts (the chat leaves drafts out);
-/// anything else as a chat when the chat view is on, else in today's detail. The chat view
-/// setting is snapshotted once per open, so a Settings change applies to the next open.
-struct MessageOpenView: View {
-    let messageId: String
-    var expectedRfc822MessageId: String?
-    var opensWithSkeletonDwell = false
-    /// Opened from search or a notification: the chat scrolls to this email and its bubble
-    /// glows briefly.
-    var highlightsMessage = false
-    @State private var opensInChat = ChatViewConfig.opensInChat
-
-    /// Where an open goes.
-    enum Route: Equatable {
-        /// A message in a Drafts folder: the draft editor (`DraftComposePresenter`).
-        case draftEditor(MessageHeader)
-        case chat
-        case detail
-    }
-
-    /// The open's route: a Drafts-folder message goes to the draft editor whatever the chat view
-    /// setting; anything else, a message not found included, to the chat or today's detail. One
-    /// read transaction, so the header and its folder agree. A search result carries the
-    /// Message-ID it found (`expectedRfc822MessageId`): a header that no longer has it is not the
-    /// draft searched for, so it goes to the chat or the detail, which refuse a replaced message.
-    nonisolated static func route(
-        messageId: String, expectedRfc822MessageId: String? = nil, opensInChat: Bool, pool: PrioritizedDatabase
-    ) -> Route {
-        let expected = ExpectedMessageIdentity(capturedRfc822MessageId: expectedRfc822MessageId)
-        let draft: MessageHeader? = try? pool.read { db in
-            guard let header = try MessageHeader.fetchOne(db, key: messageId),
-                  expected?.matches(header) ?? true,
-                  try Folder.fetchOne(db, key: header.folderId)?.role == .drafts else { return nil }
-            return header
-        }
-        if let draft { return .draftEditor(draft) }
-        return opensInChat ? .chat : .detail
-    }
-
-    var body: some View {
-        switch Self.route(messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
-                          opensInChat: opensInChat, pool: AppDatabase.dbPool) {
-        case .draftEditor(let header):
-            DraftComposePresenter(source: .header(header))
-        case .chat:
-            ChatThreadView(
-                messageId: messageId,
-                expectedRfc822MessageId: expectedRfc822MessageId,
-                highlightsOpenedMessage: highlightsMessage)
-        case .detail:
-            MessageDetailView(
-                messageId: messageId,
-                opensWithSkeletonDwell: opensWithSkeletonDwell,
-                expectedRfc822MessageId: expectedRfc822MessageId)
-        }
-    }
-}
-
 extension ChatViewConfig {
-    /// Whether an open goes to the chat now. Demo mode with AI declined counts as AI off, and the
-    /// tutorial keeps today's view until it moves into the chat view.
+    /// Whether an open goes to the chat now. Demo mode with AI declined counts as AI off. A
+    /// tutorial run follows what it teaches, decided when it started (`teachesChat`).
     @MainActor static var opensInChat: Bool {
-        opensInChat(active: isActive,
-                    demoHidesAI: DemoModeStore.shared.hidesAIContent,
-                    tutorialRunning: TutorialCoordinator.shared.isRunning)
+        let tutorial = TutorialCoordinator.shared
+        return opensInChat(active: isActive,
+                           demoHidesAI: DemoModeStore.shared.hidesAIContent,
+                           tutorialRunning: tutorial.isRunning,
+                           tutorialTeachesChat: tutorial.teachesChat)
     }
 
-    static func opensInChat(active: Bool, demoHidesAI: Bool, tutorialRunning: Bool) -> Bool {
-        active && !demoHidesAI && !tutorialRunning
+    static func opensInChat(active: Bool, demoHidesAI: Bool, tutorialRunning: Bool, tutorialTeachesChat: Bool) -> Bool {
+        tutorialRunning ? tutorialTeachesChat : active && !demoHidesAI
     }
 }
 
@@ -242,8 +185,12 @@ struct ChatThreadView: View {
         .onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                // Forward the newest email, in today's forward compose.
-                Button { forwardMessage = thread.newest } label: {
+                // Forward the newest email, in today's forward compose. The tutorial's mail
+                // actions are off (owner 2026-10-21).
+                Button {
+                    guard TutorialCoordinator.shared.admits(.other) else { return }
+                    forwardMessage = thread.newest
+                } label: {
                     Image(systemName: "arrowshape.turn.up.right")
                 }
                 .disabled(thread.newest == nil)
@@ -251,6 +198,11 @@ struct ChatThreadView: View {
             }
         }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
+        // Part 3 of the tutorial: the email reference opened this chat at Jordan's email.
+        .task(id: viewModel.message?.id) {
+            guard let opened = viewModel.message else { return }
+            TutorialCoordinator.shared.messageOpened(accountId: opened.accountId, messageId: opened.messageId)
+        }
         .onAppear {
             viewModel.isViewVisible = true
             isOnScreen = true
@@ -377,8 +329,12 @@ struct ChatThreadView: View {
                 }
             }
             .safeAreaInset(edge: .top, spacing: 0) {
-                ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) {
-                    showsReplyTo = true
+                VStack(spacing: 0) {
+                    ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) {
+                        guard TutorialCoordinator.shared.admits(.other) else { return }
+                        showsReplyTo = true
+                    }
+                    tutorialCard(thread)
                 }
             }
             .overlay {
@@ -566,16 +522,40 @@ struct ChatThreadView: View {
     }
 
     /// An email older than the newest `ChatViewConfig.summaryWindow` asks for its own summary when
-    /// it comes on screen, so scrolling up summarizes as it goes. Only once the open has asked for
-    /// the newest (before that, which emails are the newest is not known yet).
+    /// it comes on screen, so scrolling up summarizes as it goes. That includes an email on screen
+    /// as the chat lands: SwiftUI reports a view's visibility only when it changes.
     private func askAsShown(_ item: ChatThread.Item, in thread: ChatThread) {
-        guard didInitialScroll else { return }
         let items = thread.items
         guard let index = items.firstIndex(where: { $0.id == item.id }),
               index < items.count - ChatViewConfig.summaryWindow,
               ChatViewConfig.isActive else { return }
         let header = item.header
         Task { await ActiveAIQueue.shared.enqueueChatSummaries([header]) }
+    }
+
+    // MARK: - Tutorial (parts 2 and 3)
+
+    /// Whether this chat holds Priya's practice email (part 2) or Jordan's source email (part 3).
+    private func holdsTutorialEmail(_ thread: ChatThread) -> (practice: Bool, source: Bool) {
+        let ids = Set(thread.items.filter { $0.header.accountId == DemoSeed.demoAccountId }.map(\.header.messageId))
+        return (ids.contains(DemoSeed.TutorialFixture.priyaOffsite), ids.contains(DemoSeed.TutorialFixture.jordanFlights))
+    }
+
+    /// The step's coach card under the header, in the chat the step is about.
+    @ViewBuilder
+    private func tutorialCard(_ thread: ChatThread) -> some View {
+        let tutorial = TutorialCoordinator.shared
+        let holds = holdsTutorialEmail(thread)
+        if tutorial.isRunning,
+           TutorialCoordinator.chatShowsCard(
+            step: tutorial.step, teachesChat: tutorial.teachesChat,
+            holdsPracticeEmail: holds.practice, holdsSourceEmail: holds.source) {
+            TutorialCoachView(host: .chat, onAction: { action in
+                // Next goes on in the inbox: part 3 starts there, and so does what else to ask.
+                if action == .nextLesson || action == .showMoreToAsk { dismiss() }
+            })
+            .padding(.vertical, 8)
+        }
     }
 
     // MARK: - Swipes
@@ -598,11 +578,15 @@ struct ChatThreadView: View {
             ChatSwipeButton(title: action.title, systemImage: action.systemImage, tint: Theme.accent) {
                 setRead(action, at: item, thread: thread)
             },
-            ChatSwipeButton(title: "Move", systemImage: "folder", tint: Palette.untagged) { showsMove = true },
+            ChatSwipeButton(title: "Move", systemImage: "folder", tint: Palette.untagged) {
+                guard TutorialCoordinator.shared.admits(.other) else { return }
+                showsMove = true
+            },
         ]
     }
 
     private func setRead(_ action: ChatSwipe.ReadAction, at item: ChatThread.Item, thread: ChatThread) {
+        guard TutorialCoordinator.shared.admits(.other) else { return }
         let targets = ChatSwipe.readTargets(action, at: item.id, in: thread.items)
         viewModel.setRead(targets, isRead: action.isRead)
         // The Unread line moves to where unread now starts.
@@ -610,11 +594,13 @@ struct ChatThreadView: View {
     }
 
     private func archiveChat() {
+        guard TutorialCoordinator.shared.admits(.other) else { return }
         let moved = viewModel.archiveChat(viewModel.chatRows)
         if !moved.isEmpty { dismissChat(moved: moved, destinationFolderId: nil) }
     }
 
     private func deleteChat() {
+        guard TutorialCoordinator.shared.admits(.other) else { return }
         let moved = viewModel.deleteChat(viewModel.chatRows)
         if !moved.isEmpty { dismissChat(moved: moved, destinationFolderId: nil) }
     }
@@ -670,7 +656,8 @@ struct ChatThreadView: View {
                     readyText: ChatReplyField.readyText(newest: newest, isOwn: usersTurn),
                     isNoReply: isNoReply,
                     clearCount: fieldClearCount,
-                    onlyTo: replyTarget.only),
+                    onlyTo: replyTarget.only,
+                    tutorialMove: TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)),
                 onSendReadyReply: {
                     readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
                         replyTo: newest, target: replyTarget, accounts: context.accounts))
@@ -754,61 +741,6 @@ struct ChatThreadView: View {
                 replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, onAgentOutcome: onOutcome)
         }
-    }
-}
-
-/// The chat's header: who the reply goes to, the subject, the thread's labels.
-struct ChatHeaderView: View {
-    let thread: ChatThread
-    let subject: String
-    let labels: [UserLabel]
-    /// Tapping the names changes who gets the reply.
-    var onTapNames: (() -> Void)? = nil
-
-    var body: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: -8) {
-                ForEach(Array(thread.replyPeople.prefix(ChatViewLayout.headerNameCount + 1).enumerated()), id: \.offset) { _, person in
-                    ChatAvatar(person: person, size: ChatViewLayout.headerAvatarSize)
-                        .overlay(Circle().stroke(Palette.previewPaneBg, lineWidth: 2))
-                }
-            }
-            if !thread.replyPeople.isEmpty {
-                Button { onTapNames?() } label: {
-                    HStack(spacing: 2) {
-                        Text(ChatThread.headerTitle(thread.replyPeople))
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(Theme.textPrimary)
-                            .lineLimit(1)
-                        Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(Theme.textSecondary)
-                    }
-                }
-                .buttonStyle(.plain)
-                .disabled(onTapNames == nil)
-                .accessibilityHint("Changes who gets your reply")
-            }
-            Text(subject)
-                .font(.caption)
-                .foregroundStyle(Theme.textSecondary)
-                .lineLimit(1)
-            if !labels.isEmpty {
-                HStack(spacing: 4) {
-                    ForEach(UserLabelDisplaySegment.expand(labels)) { segment in
-                        UserLabelChip(name: segment.displayName)
-                    }
-                }
-                .frame(maxWidth: .infinity)
-                .clipped()
-            }
-        }
-        .padding(.horizontal)
-        .padding(.bottom, 8)
-        .frame(maxWidth: .infinity)
-        .background(.bar)
-        .accessibilityElement(children: .contain)
     }
 }
 

@@ -11,7 +11,7 @@ import Testing
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. Every email of the thread shows once, oldest first; drafts never show.
 ///  2. One email in two folders shows once: the opened copy, else one with a text message. Headers
-///     without a Message-ID are copies only when a provider id names the message in one account.
+///     without a Message-ID are never copies, whatever their provider ids.
 ///  3. An email is the user's own when it is from one of their addresses or sits in a Sent folder.
 ///  4. The next reply goes to the newest email's Reply All people, never the user; more than one
 ///     other person makes a group.
@@ -102,7 +102,7 @@ struct ChatThreadTests {
         #expect(Self.thread([bare, other]).items.map(\.id) == [bare.id])
     }
 
-    @Test("Without a Message-ID, the same UID in two folders or two accounts is two emails; a provider id names one email in its account")
+    @Test("Without a Message-ID, two headers are two emails, whatever their ids")
     func noMessageIdIsNotACopy() {
         func bare(_ uid: String, minutesAgo: Double, folder: String = "INBOX", account: String = "acc1") -> MessageHeader {
             MessageHeader(
@@ -124,13 +124,11 @@ struct ChatThreadTests {
         emptyB.rfc822MessageId = ""
         #expect(Self.thread([emptyA, emptyB]).items.count == 2)
 
-        // A provider id names the message itself: two folders of one account hold one email,
-        // the same id in another account is another email.
-        let gmailInbox = bare("18c2f0a1b2", minutesAgo: 10)
-        let gmailLabel = bare("18c2f0a1b2", minutesAgo: 10, folder: "Work")
-        let otherAccount = bare("18c2f0a1b2", minutesAgo: 10, account: "acc2")
-        #expect(Self.thread([gmailInbox, gmailLabel], preferred: gmailLabel.id).items.map(\.id) == [gmailLabel.id])
-        #expect(Self.thread([gmailInbox, otherAccount]).items.count == 2)
+        // Nor does any other id, whatever it looks like: the key never reads the provider id.
+        let inbox = bare("18c2f0a1b2", minutesAgo: 10)
+        let label = bare("18c2f0a1b2", minutesAgo: 10, folder: "Work")
+        #expect(Self.thread([inbox, label], preferred: label.id).items.count == 2)
+        #expect(ChatThread.copyKey(inbox) != ChatThread.copyKey(label))
         // A Message-ID still makes copies, whatever the UIDs.
         let rfcA = Self.header("7", minutesAgo: 3, rfc822: "<one@example.com>")
         let rfcB = Self.header("8", minutesAgo: 3, folder: "Archive", rfc822: "<one@example.com>")

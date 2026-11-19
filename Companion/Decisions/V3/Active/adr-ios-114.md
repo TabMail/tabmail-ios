@@ -33,7 +33,7 @@ same AI result, kept as long as the email itself is shown.
    peer summary or reply clears the text message. A user edit of the reply in compose
    (`ComposeView.writeCachedReplyToDB`) clears `replyTextMessage`: it described the AI's body. The
    "no content" local summary has none. A result computed before 2.0 has none. Requesting the missing
-   ones is the chat view's job (next PR), not this one's.
+   ones is the chat view's job (decision 8).
 5. **Lifetime (decided 2026-11-05).** An AI result lives as long as its email is on the device, with no size or age
    limit. The time-based purge and its inbox-only touch (`refreshAICacheTTLAndPurge`,
    `SyncConfig.aiCacheTTLDays`, the unused `replyTTLSeconds`) are deleted.
@@ -44,7 +44,7 @@ same AI result, kept as long as the email itself is shown.
    job, restoring AI to a header that leaves and comes back (stale detection, a UIDVALIDITY reset).
    Decided 2026-11-05: the 7-day orphan grace. The extension's cache upserts now record the
    Message-ID, so the purge can match them to their email.
-6. **Decoding as sent, and older entries' identity (review round 1, 2026-11-05).** The summary JSON is
+6. **Decoding as sent, and older entries' identity (2026-11-05).** The summary JSON is
    decoded exactly as received: rewriting characters first (`normalizeUnicode`, kept from the labelled
    text) turned curly or fullwidth quotes inside a JSON string into bare ASCII quotes and broke the
    object. A reply body is any non-blank string, "None" included: only the text message's "NONE"
@@ -58,7 +58,7 @@ same AI result, kept as long as the email itself is shown.
    `v106_repairAICacheMessageIds` (`AppDatabase.repairAICacheMessageIds`) stays: it fills the Message-ID from the header in the folder the key names. The purge no
    longer depends on it.
    **Amended by the rebuild (2026-11-09):** the purge no longer reads a missing
-   Message-ID from the key. v97 has run on simulators, so it stays frozen and is the only repair: an
+   Message-ID from the key. `v106_repairAICacheMessageIds` stays as written and is the only repair: an
    entry it could not fill (its email had moved before the upgrade) is purged after the grace and
    its results are made again when needed (bounded, self-healing). Writers now fill a missing
    Message-ID (NULL or empty) from the one they write with, and never replace a stored one:
@@ -67,9 +67,9 @@ same AI result, kept as long as the email itself is shown.
    its email is on the device (`AICacheMessageIdFillTests`). And an entry is kept only while
    a header OF ITS OWN ACCOUNT (the key's first part) carries its Message-ID, so another account's
    copy of the email keeps nothing and a removed account's entries go after the grace; this
-   replaces the writer-side account checks that PR 3b had added to `writeThrough` and the
-   extension merge, which are not built. Review round 2 (2026-11-05) also removed a second purge trigger at the end of
-   the AI queue's drain. Review round 4 (2026-11-05): the purge reads the clock once (its `now`
+   replaces writer-side account checks in `writeThrough` and the extension merge, which are
+   not built. A second purge trigger at the end of the AI queue's drain was removed (2026-11-05).
+   The purge reads the clock once (2026-11-05; its `now`
    argument), the base of its cutoff and the re-stamp of a kept entry, so a kept entry always leaves
    the selection and the pass ends, even if the clock is set back while it runs. Later the same
    day: the extension merge stamps a cache entry's `updatedAt` as a date
@@ -77,7 +77,7 @@ same AI result, kept as long as the email itself is shown.
    date, so such an entry missed the grace. The two "no content" summary writers
    (`AccountManager.processMessage`'s shortcut and `BodyFetchProcessor`'s confirmed-empty write)
    clear the text message with the summary they replace.
-7. **Compose's recompute writes through the identity guard (review round 3, 2026-11-05).**
+7. **Compose's recompute writes through the identity guard (2026-11-05).**
    `ComposeView.recomputedReply` stores its reply and text message with
    `AccountManager.aiGuardedHeaderWrite`, using an `AIWriteTarget` captured from the email compose is
    replying to. A UIDVALIDITY reset can put a different email at the same address while the model
@@ -85,7 +85,7 @@ same AI result, kept as long as the email itself is shown.
    pre-dispatch Device Sync check (`ActiveAIQueue.executeJob`) asks through `AIService.peerProbe`, the
    seam the opened-email path already uses, so a whole queue job can be run against a fake peer
    (`ActiveAIQueue.executeWholeJobForTesting`).
-8. **Chat summaries (amendment, decided 2026-11-05, the second chat-view PR).** The chat view
+8. **Chat summaries (amendment, decided 2026-11-05).** The chat view
    needs a summary with a text message for every email of a thread, from any folder, the user's own
    included. Two requests ask for them, both behind `ChatViewConfig.isActive` (the user's toggle and AI
    on, decision 9), read once at the start of the operation:
@@ -101,6 +101,23 @@ same AI result, kept as long as the email itself is shown.
      release and the writer's call are deleted.
    - **The background walk** (`chatWalkCandidates`, run at the end of `repopulateFromDatabase`):
      the threads of the newest `SyncConfig.maxRecentEmails` Inbox rows, every member with its body.
+     *Amended 2026-11-15:* drafts are left out before each thread's window is
+     taken, so no chat job is asked for a draft (its unsent text would leave the device for
+     nothing shown) and the window holds real emails. Each thread is looked up once: an Inbox row
+     that an earlier lookup reached through the thread's reference links, started from a row with
+     the same `threadId`, is skipped (`ThreadDetection.related`, `linkedIds`). The links are
+     direction-agnostic, so such a row's lookup would return the same thread; a row reached only
+     through a native thread id, or under another one, is looked up itself, so no email is lost.
+     Before, every Inbox row of a thread repeated the whole lookup (k rows of an N-email thread
+     cost about k x N reads), on every `syncStartup`, push wake and background refresh.
+     *Amended 2026-11-15:* unsent draft text never reaches the backend, with no exception. The
+     queue decides it from the email's OWN folder role, read with the row
+     (`ActiveAIQueue.chatSummaryAllowed`), never from what a screen loaded: `enqueueChatSummaries`
+     (the open, a joining email, a row on screen) gives a Drafts-folder email no job and no body
+     request, and the scope check before every model call (`inScope`, in `executeJob` and
+     `readJobOutcome`) refuses a chat summary of one however it was queued (the walk, a landed
+     body, a twin's hand-back, any later caller). An email whose folder row is missing is refused
+     too (fail closed; the next sync writes the folder and a later ask asks again).
    **A thread is the whole thread (amendment 2026-11-06):** `findRelatedMessages`
    returns every email connected to the opened one, with no length or depth limit, because the chat
    shows the whole thread, all the way back (decided 2026-11-06: "Typical email threads are not that long").
@@ -109,7 +126,7 @@ same AI result, kept as long as the email itself is shown.
    only emails not seen yet. The bound is on the AI work instead (decided 2026-11-06: "add a safety
    bound that you load up to something like 10 emails from the current visible oldest message"):
    the open chat asks only for the emails on screen and those near them (decision 9,
-   `ChatSummaryWindow`); until the chat screen exists the requests stay off in release builds.
+   `ChatSummaryWindow`).
    **Amended 2026-11-09 (supersedes the 2026-11-06 window):** the chat asks, on open, for the
    thread's newest `ChatViewConfig.summaryWindow` emails, newest first, and later for each older
    email as it comes on screen; the walk takes each thread's newest `summaryWindow`. See decision 9, "What
@@ -171,14 +188,21 @@ same AI result, kept as long as the email itself is shown.
    and an in-flight twin keeps the offer (`ActiveAIQueue.chatOffersOnInFlightTwin`) until
    `jobCompleted` admits it.
 
-9. **The chat screen (amendment 2026-11-05, the third chat-view PR, 3a).** With the chat view on
+9. **The chat screen (amendment 2026-11-05).** With the chat view on
    (`ChatViewConfig.isActive` = the user's Settings toggle `chatViewEnabled` (default on, kept while
    AI is off) AND AI on (not opted out, a plan or trial active)), every thread open goes through
    `MessageOpenView`, which decides chat or today's email view ONCE per open (`opensInChat`, also off
    in the demo's AI-off mode and during the tutorial): the inbox, push and notification opens
    (`MessageDetailResolvedContent`), search results and the Reminders link.
-   `ChatThreadView` reuses `MessageDetailViewModel` (body, thread load, mark-read; in 3a also
-   archive, delete and move from today's pill menus, which 3b drops, decision 10); `ChatThread` is the pure model: drafts left out, one copy per `stableId` (the opened copy,
+   *Amended 2026-11-15:* `MessageOpenView.route` also sends a Drafts-folder
+   message to the draft editor (`DraftComposePresenter`), from every one of those paths, so a draft
+   found by search opens for editing, not as an empty chat. The check had sat only in
+   `MessageDetailResolvedContent`, so search and the Reminders link skipped it; that copy is
+   deleted. A search result whose header no longer carries the Message-ID it found goes to the chat
+   or the detail, which refuse a replaced message. The chat screen and the Reply to sheet dismiss
+   the keyboard on a tap outside it (`dismissKeyboardOnTap`, the keyboard dismiss rule).
+   `ChatThreadView` reuses `MessageDetailViewModel` (body, thread load, mark-read; at first also
+   archive, delete and move from today's pill menus, which the reply field drops, decision 10); `ChatThread` is the pure model: drafts left out, one copy per `stableId` (the opened copy,
    else one with a text message), oldest first by (date, id), own = from one of the account addresses
    or in a Sent folder, reply people = the newest email's `buildReplyAllRecipients` minus the user,
    a group when more than one other person; time stamps after `ChatViewLayout.timeStampGap`; the
@@ -300,7 +324,7 @@ same AI result, kept as long as the email itself is shown.
    settled screen showed the target. Decided 2026-11-06 on its calls: one number, 10,
    everywhere (`ChatViewConfig.summaryWindow`). It was replaced on 2026-11-09 with the simpler
    rule above; the mechanism had needed four layers to land reliably on iOS 27.
-   **Decided 2026-11-05:** in 3a today's pill stays and acts on the NEWEST email;
+   **Decided 2026-11-05:** until the reply field (decision 10), today's pill stays and acts on the NEWEST email;
    "Sent" under every own bubble; the 15-minute gap; tutorial and demo-AI-off keep today's view; a
    reminder open highlights its email; triage rows keep the snippet, with no text message; the
    agent's toast is not shown in the chat. The User Interface Settings section, which holds the
@@ -308,11 +332,11 @@ same AI result, kept as long as the email itself is shown.
    **The hidden release switch is deleted (decided 2026-11-05).** Until then release builds kept the
    chat view off (`isAvailableInBuild = false`; a debug-menu override turned it on while debug was
    unlocked; `isReachable` showed the toggle and moved User Interface to the top), so `main` stayed
-   releasable between the chat-view PRs. It was decided that the whole train is tested, merged and
-   released at once, so that reason is gone and the switch, the override and the two Settings
-   positions went with it.
+   releasable while the chat view was built in parts. It was decided that the whole chat view is
+   tested, merged and released at once, so that reason is gone and the switch, the override and the
+   two Settings positions went with it.
 
-10. **The reply field (amendment 2026-11-05, the fourth chat-view PR, 3b).** In the chat, today's
+10. **The reply field (amendment 2026-11-05).** In the chat, today's
    pill on the newest email is shown as a reply field, [mic] [field] [Send]: `DynamicIslandChat`
    with a `ChatReplyField`, so it is the same agent session (`msg:{accountId}:{stableId}`) and the
    same sheet. The field holds the ready AI Reply's text message (`ChatReplyField.readyText`: someone
@@ -354,9 +378,8 @@ same AI result, kept as long as the email itself is shown.
    while debug logging is on, for every caller (typed chat text included), and the flag and
    `loggedText` are deleted. Tests: `ChatReplyFieldRuntimeTests.chatRequestFailureLog` (every
    request failure branch, debug off and on) and `BackgroundSyncLoggerTests.chatErrorRoundTrip`.
-   Decided 2026-11-08: typed chat text no longer reaches the production
-   chat error log either (debug logging keeps it), following the rule that diagnostic logging is
-   debug-gated.
+   Decided 2026-11-06: typed chat text no longer reaches the production chat error
+   log either (debug logging keeps it), following the rule that diagnostic logging is debug-gated.
    **The Sending bubble is read from the outbox (rebuild, 2026-11-09):** every outbox row whose
    In-Reply-To is the Message-ID of an email in the chat, from any account, and whose own email is
    not one of the chat's emails yet, shows as
@@ -382,7 +405,9 @@ same AI result, kept as long as the email itself is shown.
    `ComposeOutcome.sent(outboxId:)` are deleted; a sent compose card only empties the field
    (`composeEnded`). A reply sent outside the chat to one of its emails shows the same way. An
    email that joins the open chat (a Sent copy the provider filed under a Message-ID of its own has
-   no summary from Send) asks for its summary like the open's newest (`noteMembers`).
+   no summary from Send) asks for its summary like the open's newest (`noteMembers`); a draft that
+   joins, from any account, never gets one: the queue refuses it (`chatSummaryAllowed`, decision 8,
+   2026-11-15).
    *Amended 2026-11-15:* `noteMembers` no longer asks. A joining email changes the chat's member
    ids, which restarts the summary observation (decision 9), and its first value asks for the
    newest emails, the joining one first. The summary at Send (`SentEmailSummary`) and the
@@ -397,7 +422,7 @@ same AI result, kept as long as the email itself is shown.
    took it (`sentAt`). Undo or a discard deletes the unsent row and the bubble with it; a filed row
    (sent, then appended to Sent) keeps the bubble, "Sent", until the email itself, by its own
    Message-ID, is in the chat (`isInChat`, `settle`), or until no email of its account carries that
-   Message-ID any more, or after `sentReplyLifetime`. Review round 11 (2026-11-07): Outlook files
+   Message-ID any more, or after `sentReplyLifetime`. Found 2026-11-07: Outlook files
    its own copy under a Message-ID of its own and the Sent sync then drops our optimistic copy, so
    with no chat on screen at that moment the bubble stayed under its own email for up to a day and
    held the user's turn; `ChatSentReplies` now follows a filed row's Message-ID and ends the bubble
@@ -429,17 +454,17 @@ same AI result, kept as long as the email itself is shown.
    the bottom until an own email answering that Message-ID, dated no earlier than the send minus
    `ChatViewLayout.sentReplyDateSlack`, is in the chat (`settle`), or after `sentReplyLifetime`.
    The words never go on an email: an email shows only its own text message, "Summarizing" until
-   then. Review round 10 (2026-11-07): the date match had put a chat reply's words on a different
+   then. Found 2026-11-07: the date match had put a chat reply's words on a different
    reply sent elsewhere to the same email; nothing proves which email is which send, so the match
-   now only ends the pending bubble. Decided 2026-11-08: the arrived email reads
-   "Summarizing" for the few seconds until its summary, instead of the user's words. Nothing is
-   persisted (ADR-004).
-   **Product choices made in 3b, decided 2026-11-08:** the chat-view pill drops today's Reply
-   and Archive menus (swipes come with PR 5, Forward and recipients with PR 4); the field-to-sheet
+   now only ends the pending bubble. Decided 2026-11-07, with the summary-at-Send
+   decision: the arrived email reads "Summarizing" for the few seconds until its summary, instead of
+   the user's words. Nothing is persisted (ADR-004).
+   **Product choices of the reply field, decided 2026-11-08:** the chat-view pill drops today's Reply
+   and Archive menus (swipes are decision 12, Forward and recipients decision 11); the field-to-sheet
    change has no morph animation yet; the sheet is not sized to its content; a request that only
    acts (archive, label) opens the sheet with the agent's answer.
 
-11. **Who gets the reply, and Forward (amendment 2026-11-05, the fifth chat-view PR, PR 4).** The
+11. **Who gets the reply, and Forward (amendment 2026-11-05).** The
    reply is a Reply All to the newest email's people by default (`ChatReplyTarget.replyAll`).
    Tapping the header's names opens "Reply to" (`ChatReplyToSheet`): the newest email's people, all
    ticked; untick someone or add someone (today's contact search, or a typed address; never the
@@ -456,7 +481,7 @@ same AI result, kept as long as the email itself is shown.
    "(replied only to you, David Kim +1)" after the sender's name, or "You (replied only to …)" above
    the user's own bubble; tap for the full list (`ChatPeopleList`). The user is one person whichever
    address an email used. VoiceOver reads it (`ChatBubbleView.accessibilityText`).
-   **Product choices made in PR 4, decided 2026-11-08:** an email that only adds someone new is
+   **Product choices of who gets the reply, decided 2026-11-08:** an email that only adds someone new is
    not "only" (the new person joins the chat's people), and an email is never "only" for someone who
    joined after it; a new newest email resets the choice to Reply All; with recipients chosen the
    agent's own recipient changes are replaced by the chosen people on the compose card.
@@ -607,6 +632,36 @@ same AI result, kept as long as the email itself is shown.
    own id, as the open reads them (decision 9). A copy the thread did not load keeps its state
    (ADR-IOS-068 D4). Test: `ChatCopiesTests.readSwipesChangeEveryCopy`.
 
+13. **The tutorial in the chat view (amendment 2026-11-05).** A
+   tutorial run teaches the view it starts in: with Chat View on and AI not opted out
+   (`TutorialCoordinator.chatViewOnForTutorial`), `start` snapshots `teachesChat = true` and the run
+   keeps it whatever the setting does meanwhile; with Chat View off or AI opted out the run is today's,
+   unchanged. `ChatViewConfig.opensInChat` follows the run (`tutorialRunning ? tutorialTeachesChat :
+   …`), so a chat-view run's emails open as chats and today's run keeps today's view. Part 2 opens
+   Priya's email as a chat with everyone on the thread (the demo seeds Sam Lee's earlier email in the
+   same thread, and Jordan's trip thread with the user's own Sent reply; every seeded email has its
+   text message, every seeded AI Reply its reply text message). The reply field holds the AI Reply,
+   prefilled and read-only (`TutorialChatInputBar` with the "AI Reply" label, `FieldMove.sendReadyReply`);
+   Send opens today's compose, whose draft-chat edit is "Make it shorter", so the Sent bubble stays a
+   yes (`TutorialChatScript.shorterReply`). After it is sent, the same field asks "Save my reply as a
+   template." (`FieldMove.ask(.saveReplyAsTemplate)`, "Saving template" for a moment), which shows the
+   real Create card for "Event RSVP: yes"; the inbox chat offers no template prompt in this run. Part 3
+   asks the flights question in the inbox chat as today; the email reference opens Jordan's chat at his
+   email, where the step's card says so (`chatShowsCard`). A last step (`Step.chatViewSwitch`, after
+   the recap's Finish) shows TabMail Settings' Chat View switch, ringed, in a sheet
+   (`TutorialChatViewSwitchSheet`, `ChatViewToggleRow`, shared with Settings); flipping it switches for
+   real, and only the card's Finish closes it. The welcome and recap screens name the chat view's reply
+   and the switch. Inside the chat, Forward, Reply to, Move, the read swipes, Archive and Trash ask the
+   tutorial first (`admits(.other)`), as every mail action does in the tutorial. Outside the tutorial:
+   the inbox's Reply tag opens the email's chat when the chat view is on (`executeTaggedAction`
+   `.reply`), and an email opened from a chat's email reference highlights its referenced text as a
+   message opened from the agent does (`PushedMessageDestination`, `highlightsMessage: true`).
+   **Product choices of the tutorial (decided 2026-11-05):** today's
+   tutorial still runs with Chat View off or AI opted out; the switch step is a sheet holding only the
+   switch; the edit is "Make it shorter"; the template is "Event RSVP: yes"; compose keeps its Use
+   Suggestion step; no attachment chip is seeded for the agenda; the Reply tag opens the chat in
+   general, not only in the tutorial.
+
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
 parser does not read.
@@ -614,7 +669,7 @@ parser does not read.
 **Tests:** `AISummaryParsingTests`, `AISummaryResponseTests`, `AIReplyParseTests`, `AIReplyTests`
 (parsers and `ReplyResult`); `AICachePurgeTests` (the orphan purge, driven for real, including
 `legacyEntryWithoutMessageIdPurged`, `entryKeptOnlyByItsOwnAccount`, `maintenanceRunsThePurge` and `clockOffWallClockEnds`, the clock behind and ahead of the wall clock);
-`ComposeSuggestionPersistTests.editClearsReplyTextMessage`; migration and merge tests in this PR;
+`ComposeSuggestionPersistTests.editClearsReplyTextMessage`; the migration and merge tests;
 `AITextMessageCallerTests` (the queue's summary and reply jobs, a failed reply asked again and the next
 one stored (`queueReplyFailureRecovers`), the "no content" summary clearing the text message
 (`noContentClearsTextMessage`, `confirmedEmptyClearsTextMessage`), the opened-email direct path in full and
@@ -624,7 +679,7 @@ device's summary and reply text messages (`queuePeerActionKeepsLocalPairs`), com
 (`composeRecomputeReplacedEmail`), a filtered recompute and one from the snippet
 (`composeRecomputeFiltered`, `composeRecomputeFromSnippet`), and the extension's request, each through its real producer and a
 fake backend or peer); `AITextMessageStorageTests.upgradeKeepsResults` (a v94 database with results,
-upgraded) and `legacyEntriesSurviveUpgradeAndPurge` (the purge keeps only the entries v97 filled; including v97 filling the Message-ID that a peer's
+upgraded) and `legacyEntriesSurviveUpgradeAndPurge` (the purge keeps only the entries v106 filled; including v106 filling the Message-ID that a peer's
 probe then finds); `RFC822IdentityMergeGuardTests.preSyncInboxReclaimCarriesTextMessages`;
 `NSESummaryTextMessageCarryTests` (the staging writes, `NSEStagingDB.open(path:)` upgrading an older
 file, the extension bundle's protocol version, a later push whose only change is the text message,
@@ -632,14 +687,14 @@ including to none (`sameSummaryNewTextMessage`), the merge's second stage creati
 stage could not and caching its result with the text message (`secondStageCachesTextMessage`), a merged
 cache entry kept through the orphan grace (`mergedCacheEntryGetsTheGrace`), and a push through `NotificationService.didReceive`
 staging the text message, via `NotificationService.stagingPathOverride`).
-Decision 8: `ChatSummaryQueueTests` (including a chat offer made while its ordinary twin is in flight, just after it ended, or when it runs again, and the foreground pass's walk, two-sided on the chat view); `ChatSummaryExecutionTests` (the own-email field, two-sided; the executor refusing an ordinary summary outside the Inbox, with an Inbox control). Decision 9: `ChatThreadTests`,
-`ChatThreadContextTests`, `ChatThreadViewLifecycleTests`, `ChatCardIdentityTests`, `ChatSummaryQueueTests.chatViewSwitch`/`activeMatrix`, `ThreadGroupTests.displayInfoUnionLabels`.
+Decision 8: `ChatSummaryQueueTests` (including a chat offer made while its ordinary twin is in flight, just after it ended, or when it runs again, and the foreground pass's walk, two-sided on the chat view; the walk leaving drafts out of its window (`walkLeavesDraftsOut`), looking a thread up once (`walkLooksEachThreadUpOnce`, statements counted) and losing no email to that (`walkLosesNoEmailOfAThread`); the draft gate for every caller (`draftGateRefusesEveryCaller`)); `ChatSummaryExecutionTests` (the own-email field, two-sided; the executor refusing an ordinary summary outside the Inbox, with an Inbox control, and a chat summary of a draft, with a Sent control (`chatSummaryRefusesADraft`)). Decision 9: `ChatThreadTests`,
+`ChatThreadContextTests` (including `draftOpensInTheDraftEditor`, `everyOpenPathRoutesDrafts` and `chatDismissesTheKeyboardOnTap`), `ChatThreadViewLifecycleTests`, `ChatCardIdentityTests`, `ChatSummaryQueueTests.chatViewSwitch`/`activeMatrix`, `ThreadGroupTests.displayInfoUnionLabels`.
 Decision 10: `ChatReplyFieldTests` (the ready text, Send's route, the agent's message, the status
 line, and the field and chat wiring read from the source),
 `ChatReplyFieldRuntimeTests` (the ready AI Reply in the mounted field, the send's email lookup,
 a failed request's log with and without its text, and the send wiring),
 `ChatSendingBubbleTests` (`whichRowsShow`, the hosted hand-over and Retry/Delete, the summary at
-Send and its gate), `ChatThreadViewLifecycleTests.aJoiningEmailAsks`,
+Send and its gate), `ChatThreadViewLifecycleTests.aJoiningEmailAsks`, `aJoiningDraftDoesNotAsk`, `aJoiningDraftFromAnotherAccountDoesNotAsk`,
 `newestBubbleClearsATallField` and `sentReplyTakesTheTurn`.
 Decision 11: `ChatThreadTests.repliedOnlyTo`,
 `someoneNewIsNotOnly`, `userIsOnePerson`; `ChatReplyFieldTests` (`changedRecipientsRoute`,
@@ -653,3 +708,22 @@ one queued move, one undo restoring every email, one undo command per source fol
 (the shared by-account grouping and its one undo entry); the single-email detail
 actions stay pinned by `MessageDetailViewModelMoveTests`, `MessageDetailMarkReadOnArchiveDeleteTests`,
 `SameFolderNoOpTests` and `MessageDetailStagedFallbackTests`, green before and after the refactor.
+Decision 13: `TutorialChatViewContentTests` (each step's card where it happens, compose's order, the
+progress lines and titles, Send only on screens that have it, the field's moves, the inbox chat's
+prompts and working status, where a chat shows the card, the edit staying a yes);
+`TutorialChatViewSeedTests` (the request shows the Create card without reaching the model, the seeded
+chats and inbox groups, every seeded email's text message); `TutorialChatViewRunTests` (a chat-view run
+from Part 2 to the switch with the setting flipped mid-run, and today's run with Chat View off or AI
+opted out); `ChatThreadContextTests.opensInChat`; the tutorial locks in the chat read from the source
+by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`.
+
+## The longer index line (routed 2026-11-09)
+
+The DECISIONS.md row grew with each decision of the chat view; it moved here when the index went
+back under its size budget. The index keeps one short line. The migration names were corrected to
+the renumbered `v105`/`v106` on 2026-11-15, and the build-stage labels were replaced by decision
+numbers.
+
+```text
+- **[ADR-IOS-114](Companion/Decisions/V3/Active/adr-ios-114.md)** — Active. Protocol 2.0.0: summary + precomputed reply arrive as JSON with a text message (`summaryTextMessage`, `replyTextMessage`, `v105_addAITextMessages`, `parseReplyResponse`, NSE `X-Client-Version`); AI results live as long as their email (`runPurgeOrphanedAICache`, `aiCacheOrphanGraceDays`; TTL purge deleted); decode JSON as sent (no `normalizeUnicode`), reply body "None" is data, legacy cache entries filled by `v106_repairAICacheMessageIds`, the purge keeps an entry only while a header of its OWN account has its Message-ID (`aiCacheEntryHasEmail`; key branch and writer account guards dropped, 2026-11-09), purge only in storage maintenance (`runWALMaintenance`), one clock read per pass (`now`), extension cache entries stamped as a date (`upsertAICacheFromStaging`, shared with #395), "no content" summaries clear the text message; compose recompute (`recomputedReply`) writes through `aiGuardedHeaderWrite`; queue peer check via `AIService.peerProbe`; the backend's protocol 2.0.0 JSON shape; TB-parity exception. Decision 8: chat summaries for every thread member, any folder (`AIJob.forChat`, `enqueueChatSummaries`, `chatWalkCandidates`, `summaryDone`, `ChatViewConfig`, `noContentSummary`, textless answers in `textlessChatJobs` until `aiReenabled`). Decision 9: the chat screen (`MessageOpenView`, `opensInChat`, `ChatThreadView`, `ChatThread`, `ChatThreadContext`, `ChatInvite`, `chatViewEnabled` toggle, `isActive` = toggle + AI on (hidden release switch deleted, the chat view ships whole), `MessageSnapshot.preview`, `UserLabel.union`); what it asks for and where it opens (decided 2026-11-09, supersedes the 2026-11-06 window): newest `summaryWindow` on open, newest first (`askForNewest`), older rows as they come on screen (`askAsShown`, `onScrollVisibilityChange`), chat work always at the front (`moveToFront`, `chatAwaitingBody`, no request numbering), plain `VStack` + `defaultScrollAnchor(.bottom)` + one `scrollTo` re-issued on size change until the first scroll (the Unread line, a searched email); `ChatSummaryWindow`, `ChatLanding`, `summaryAskSettle` deleted. Decision 10: the reply field (`ChatReplyField`, `readyText`, `route`, `agentMessage`, `statusLine`, `DynamicIslandChat` `replyField`), the Sending bubble read from the outbox (`ChatUnsentReply`, `ChatUnsentReplyBubble`, row by In-Reply-To until its Sent copy is in the chat, `filed` + `reloadThread` hand-over, no in-memory state; rebuild 2026-11-09), summary at Send `SentEmailSummary`, a joining member's summary (`noteMembers`). Decision 11: who gets the reply (`ChatReplyTarget`, `ChatReplyToSheet`, `ChatReplyToChoice`, "Replying only to", `route(recipientsChanged:)`, `agentMessage(onlyTo:)`), Forward button, "replied only to" labels (`repliedOnlyTo`, `OnlyTo`, `ChatPeopleList`, VoiceOver `accessibilityText`). Decision 12: chat swipes (`ChatSwipe`, `ChatSwipeReveal`, `ChatHorizontalPan`, Unread from here / Read up to here, `readTargets`, `unreadIds`), whole-chat Archive/Trash/Move as one undo + one move (`archiveMessages`, `deleteMessages`, `moveMessages`, `recordMove`, shared `UndoableAction.byAccount`/`move`, `chatMembers`), `setRead`, inbox Read on a collapsed chat reads it all (`inboxReadIds`). Decision 13: the tutorial in the chat view (`teachesChat` snapshot at `start`, `chatViewOnForTutorial`, `opensInChat` follows the run, `FieldMove` `.sendReadyReply`/`.ask(.saveReplyAsTemplate)`, `chatShowsCard`, `Step.chatViewSwitch`, `TutorialChatViewSwitchSheet`, `ChatViewToggleRow`, "Make it shorter" `shorterReply`, "Event RSVP: yes", seeded threads `computedThreadId`/`inReplyTo`/`textMessage`, chat mail actions `admits(.other)`), Reply tag opens the chat, reference highlight.
+```

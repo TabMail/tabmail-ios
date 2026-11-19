@@ -169,13 +169,11 @@ struct ChatThread: Equatable {
     }
 
 
-    /// What makes two headers copies of one email (`copyKey`): its RFC Message-ID; without one, a
-    /// provider id that names the message itself (Gmail, Exchange), in its account; else the row.
-    /// An IMAP UID only numbers a message inside one folder, so two headers with the same UID and no
-    /// Message-ID are two emails, never copies (`MessageHeader.stableId` falls back to the bare UID).
+    /// What makes two headers copies of one email (`copyKey`): its RFC Message-ID; without one, the
+    /// row, so two headers with no Message-ID are always two emails. The key reads nothing of the
+    /// provider id, whose meaning differs by provider.
     static func copyKey(_ header: MessageHeader) -> String {
         if let rfc822 = header.rfc822MessageId, !rfc822.isEmpty { return "rfc:\(rfc822)" }
-        if UInt32(header.messageId) == nil { return "id:\(header.accountId):\(header.messageId)" }
         return "row:\(header.id)"
     }
 
