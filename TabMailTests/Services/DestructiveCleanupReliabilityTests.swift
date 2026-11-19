@@ -191,6 +191,86 @@ struct DestructiveCleanupReliabilityTests {
         #expect(CalendarPutBackFiles.holdsBytes(op.id), "the saved file went with an aborted removal")
     }
 
+    /// INVARIANT (#979, ADR-IOS-117): the real account removal owns its chats' unsent words. A
+    /// refused removal keeps them (shown, stored, and new words still written); a committed one
+    /// forgets them and writes none again.
+    @Test("account removal keeps the chat words when refused and forgets them, never writing again, when it commits")
+    func accountRemovalOwnsTheChatWords() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: directory.appendingPathComponent("cleanup.sqlite").path, configuration: config)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previousDatabase = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let previous = current
+            current = appDatabase
+            return previous
+        }
+        let suiteName = "DestructiveCleanupReliabilityTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let nseDefaults = UserDefaults(suiteName: "group.ai.tabmail")!
+        let previousNSEAccountMap = nseDefaults.string(forKey: "nse.accountMap")
+        let previousNSEIMAPAccounts = nseDefaults.string(forKey: "nse.imapAccounts")
+        await PushNotificationService.shared._setRemovedAccountCleanupDependenciesForTesting(
+            client: nil, defaults: SendableRemovedAccountCleanupDefaults(value: defaults))
+        await MainActor.run { ChatFieldWords.shared = ChatFieldWords(database: { PrioritizedDatabase(pool: pool) }) }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            if let previousNSEAccountMap { nseDefaults.set(previousNSEAccountMap, forKey: "nse.accountMap") } else { nseDefaults.removeObject(forKey: "nse.accountMap") }
+            if let previousNSEIMAPAccounts { nseDefaults.set(previousNSEIMAPAccounts, forKey: "nse.imapAccounts") } else { nseDefaults.removeObject(forKey: "nse.imapAccounts") }
+            AppDatabase.shared.withLock { $0 = previousDatabase }
+            TestDatabaseTeardown.retire(pool: pool, directory: directory)
+        }
+
+        var account = Account(emailAddress: "words-\(UUID().uuidString)@example.com", displayName: "Words", provider: .outlook)
+        account.id = "words-account-\(UUID().uuidString)"
+        let bytes = Data("own notes".utf8)
+        let file = PutBackFile(occurrence: "occ-1", name: "notes.txt", contentType: "text/plain", isInline: false, contentId: nil,
+                               sha256: SavedFileName.of(bytes))
+        let recordData = try JSONSerialization.data(
+            withJSONObject: [SeriesEditRecord.argumentKey: SeriesEditRecord(seriesId: "ser-1", capture: "{}", files: [file], write: .sent, seriesEtag: "W/\"ser-1-0\"").jsonObject])
+        let op = PendingCalendarOperation(
+            operationType: .edit, accountId: account.id, eventId: "ser-1", calendarId: "primary",
+            arguments: try JSONDecoder().decode([String: JSONValue].self, from: recordData), eventTitle: "Planning")
+        let snapshot = account
+        try await pool.write { conn in
+            try snapshot.insert(conn)
+            try op.insert(conn)
+        }
+        _ = try CalendarPutBackFiles.save(bytes, opId: op.id)
+        let typed = ChatThreadKey.key(accountId: account.id, threadId: "typed-before")
+        let after = ChatThreadKey.key(accountId: account.id, threadId: "typed-after")
+        let words: @Sendable () async throws -> [String: String] = {
+            try await pool.read { db in
+                Dictionary(uniqueKeysWithValues: try ChatFieldWordsRecord.fetchAll(db).map { ($0.sessionId, $0.words) })
+            }
+        }
+        await MainActor.run { ChatFieldWords.shared.apply(.put("Typed before"), to: typed) }
+        await ChatFieldWords.shared.written()
+        #expect(try await words() == [typed: "Typed before"], "control: the words are kept")
+
+        // Refused (more saved files than warned of): the words stay, and the account's chats write again.
+        await #expect(throws: AccountRemovalSavedFilesGrew(savedFiles: 1)) {
+            try await AccountManager.shared.removeAccount(account, warnedSavedFiles: 0)
+        }
+        #expect(await MainActor.run { ChatFieldWords.shared.fill(for: typed).words } == "Typed before")
+        await MainActor.run { ChatFieldWords.shared.apply(.put("Typed after the refusal"), to: after) }
+        await ChatFieldWords.shared.written()
+        #expect(try await words() == [typed: "Typed before", after: "Typed after the refusal"],
+                "the refused removal released its hold")
+
+        // Committed: the words go from disk and the store, and new ones are never written.
+        try await AccountManager.shared.removeAccount(account, warnedSavedFiles: 1)
+        #expect(try await pool.read { try Account.fetchCount($0) } == 0, "control: the removal committed")
+        #expect(await MainActor.run { ChatFieldWords.shared.fill(for: typed).words } == "", "forgotten by the store")
+        await MainActor.run { ChatFieldWords.shared.apply(.put("Typed after the removal"), to: after) }
+        await ChatFieldWords.shared.written()
+        #expect(await MainActor.run { ChatFieldWords.shared.fill(for: after).words } == "")
+        #expect(try await words().isEmpty, "nothing of the removed account is written")
+        await MainActor.run { ChatFieldWords.shared = ChatFieldWords() }
+    }
+
     @Test("a stale Account value cannot resurrect runtime state after committed removal")
     func staleAccountCannotReconnect() async {
         var account = Account(
