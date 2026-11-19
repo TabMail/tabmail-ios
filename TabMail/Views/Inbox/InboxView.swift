@@ -1122,10 +1122,17 @@ struct InboxView: View {
     private func handleAgentToastTap(_ payload: AgentToastPayload) {
         let sessionKey = payload.sessionKey ?? "inbox"
         switch AgentToastPayload.destination(forSessionKey: sessionKey) {
-        case .message(let accountId, let stableId):
-            // Message-detail session — navigate to the message with chat open.
+        case .thread(let threadKey):
+            // An email's chat — open the thread's newest email with the chat open.
             Task {
-                guard let messageId = try? await lookupMessageId(accountId: accountId, stableId: stableId) else { return }
+                let messageId: String?
+                do {
+                    messageId = try await AppDatabase.dbPool.read { db in try ChatThreadKey.newestMessageId(of: threadKey, db: db) }
+                } catch {
+                    BackgroundSyncLogger.logDebug("[InboxView] Agent toast thread lookup failed: \(error)")
+                    return
+                }
+                guard let messageId else { return }
                 // If already viewing this message, just reload + open chat.
                 // If different, navigate first (view creation triggers .task { loadBody() }).
                 if selectedMessageId != messageId {
@@ -1157,40 +1164,6 @@ struct InboxView: View {
                 chatExpanded = true
             }
         }
-    }
-
-    /// Look up a message's current GRDB PK by accountId + stableId.
-    private func lookupMessageId(accountId: String, stableId: String) async throws -> String? {
-        try await AppDatabase.dbPool.read { db in
-            try Self.resolveMessageIdByStableId(accountId: accountId, stableId: stableId, db: db)
-        }
-    }
-
-    /// The RFC arm of the agent-toast lookup, named so plan coverage executes
-    /// production SQL. The provider-messageId fallback remains separately expressed.
-    nonisolated static let stableIdRfcLookupSQL = """
-        SELECT * FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
-        WHERE accountId = ? AND rfc822MessageId = ?
-        ORDER BY id ASC
-        LIMIT 1
-        """
-
-    nonisolated static func resolveMessageIdByStableId(
-        accountId: String, stableId: String, db: Database
-    ) throws -> String? {
-        // Try rfc822MessageId first (IMAP stableId)
-        let normalized = EmailFilter.normalizeMessageId(stableId)
-        if let header = try MessageHeader.fetchOne(
-            db, sql: Self.stableIdRfcLookupSQL, arguments: [accountId, normalized]) {
-            return header.id
-        }
-        // Try messageId (Gmail/Exchange)
-        if let header = try MessageHeader
-            .filter(Column("accountId") == accountId && Column("messageId") == stableId)
-            .fetchOne(db) {
-            return header.id
-        }
-        return nil
     }
 
     private func dismissAgentToast() {
@@ -1382,7 +1355,9 @@ struct InboxView: View {
                 }
                 .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 12, trailing: 16))
                 .modifier(MessageRowBackgroundModifier(
-                    members: group.members.map { ($0.accountId, $0.stableId) },
+                    threadKeys: group.members.map {
+                        ChatThreadKey.key(accountId: $0.accountId, id: $0.id, computedThreadId: $0.computedThreadId)
+                    },
                     isThreadExpanded: isExpanded
                 ))
                 .listRowSeparator(isExpanded ? .hidden : .automatic, edges: .bottom)
@@ -1541,9 +1516,9 @@ struct InboxView: View {
                                   onRetag: { tag in viewModel.applyManualTag(snapshot.id, tag: tag) })
                 }
                 .compositingGroup()
-                .agentWorkingGlow(active: ActiveAgentTracker.shared.isMessageWorking(
-                    accountId: snapshot.accountId, stableId: snapshot.stableId
-                ))
+                .agentWorkingGlow(active: ActiveAgentTracker.shared.isThreadWorking(ChatThreadKey.key(
+                    accountId: snapshot.accountId, id: snapshot.id, computedThreadId: snapshot.computedThreadId
+                )))
                 .opacity(swipeFadingMessages.contains(snapshot.id) ? 0 : 1)
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(
@@ -2356,7 +2331,8 @@ struct AgentToastPayload {
 
 /// Where a tapped agent completion toast sends the user.
 enum AgentToastDestination: Equatable {
-    case message(accountId: String, stableId: String)
+    /// An email's chat: the thread's key (`ChatThreadKey`).
+    case thread(key: String)
     case composeDraft(draftId: String)
     /// Inbox session, or a key no live decoder recognises.
     case chatPill
@@ -2379,12 +2355,10 @@ extension AgentToastPayload {
     /// the pre-existing safe landing spot for unknown keys: an undecodable key names
     /// no draft, and opening a presenter that instantly dismisses is worse than
     /// expanding the chat pill.
-    /// `@MainActor` only because `ActiveAgentTracker.messageStableId` inherits the
-    /// tracker's actor isolation; the decision itself touches no mutable state.
     @MainActor
     static func destination(forSessionKey sessionKey: String) -> AgentToastDestination {
-        if let parsed = ActiveAgentTracker.messageStableId(from: sessionKey) {
-            return .message(accountId: parsed.accountId, stableId: parsed.stableId)
+        if ChatThreadKey.parse(sessionKey) != nil {
+            return .thread(key: sessionKey)
         }
         if let parsed = ActiveAgentTracker.parseComposeSession(sessionKey) {
             return .composeDraft(draftId: parsed.draftId)
@@ -2396,12 +2370,13 @@ extension AgentToastPayload {
 /// Combined row background: agent glow (accent tint pulse) + thread expanded fill.
 /// Uses `.listRowBackground()` so the glow fills the entire row area including insets.
 private struct MessageRowBackgroundModifier: ViewModifier {
-    let members: [(accountId: String, stableId: String)]
+    /// The chat keys of the row's emails (ADR-IOS-114).
+    let threadKeys: [String]
     let isThreadExpanded: Bool
 
     func body(content: Content) -> some View {
         let sessions = ActiveAgentTracker.shared.workingSessions
-        let isAgentActive = members.contains { sessions.contains("msg:\($0.accountId):\($0.stableId)") }
+        let isAgentActive = threadKeys.contains { sessions.contains($0) }
 
         if isAgentActive {
             content.listRowBackground(AgentWorkingRowBackground(active: true))

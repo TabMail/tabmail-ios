@@ -663,10 +663,9 @@ struct MessageDetailView: View {
 
     // MARK: - Agent Toast
 
-    /// Session key for the current message's chat session.
+    /// Session key of the chat the pill shows: the thread's, about the open email (ADR-IOS-114).
     private var messageSessionKey: String? {
-        guard let msg = chatContextMessage ?? viewModel.message else { return nil }
-        return "msg:\(msg.accountId):\(msg.stableId)"
+        (chatContextMessage ?? viewModel.message).map(ChatThreadKey.key(for:))
     }
 
     private func showAgentToast(_ text: String) {

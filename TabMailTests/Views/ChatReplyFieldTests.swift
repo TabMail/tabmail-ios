@@ -422,7 +422,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldSentText = nil // Words written after the send this completes are newer, and stay (`ChatFieldFill`). fieldFill.apply(.completed)", in: text) == 1)
         // A confirmation card raises the sheet and ends the field's pulse over the earlier send
         // (the sheet rising is also run for real: `ChatReplyFieldRuntimeTests.confirmationCardOpensTheSheet`).
-        #expect(Self.count(".onChange(of: chatMessages.last?.actionConfirmation != nil) { _, hasCard in guard hasCard, replyField != nil, !isExpanded else { return } fieldFill.apply(.confirmationCard) fieldSentText = nil withAnimation(expandSpring) { isExpanded = true } }", in: text) == 1)
+        // It watches the thread's whole chat, so a card raised for an earlier email of the thread counts.
+        #expect(Self.count(".onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in guard hasCard, replyField != nil, !isExpanded else { return } fieldFill.apply(.confirmationCard) fieldSentText = nil withAnimation(expandSpring) { isExpanded = true } }", in: text) == 1)
         #expect(Self.count("dictation.inputSent(inputText) // From the open sheet the input empties as it goes; a newer draft is what is typed next. fieldFill.apply(.sentFromSheet)", in: text) == 1)
         #expect(Self.count("isTextFieldFocused = false fieldFill.apply(.sentFromField) if ChatReplyField.route", in: text) == 1)
         #expect(Self.count("fieldFill.apply(.put(text)) isTextFieldFocused = true", in: text) == 1)

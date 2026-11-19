@@ -369,7 +369,7 @@ struct DatabaseIndexTests {
                 "the un-hinted form must still exhibit the regression, or the assertions above prove nothing: \(pre)")
     }
 
-    /// IOS-PERF-012 — all seven production statements must seek the stable RFC id
+    /// IOS-PERF-012 — all six production statements must seek the stable RFC id
     /// even in the statistics-poor state left by the production migration chain.
     /// A wall-clock threshold would be device-dependent; the account-or-folder
     /// walks are the invariant behind this stale-statistics class.
@@ -394,8 +394,6 @@ struct DatabaseIndexTests {
             ("reply parent lookup", ReplyParentResolver.parentLookupSQL(count: 3),
              "messageHeader_accountId_messageId"),
             ("reply target lookup", Draft.replyTargetLookupSQL,
-             "messageHeader_accountId_messageId"),
-            ("agent-toast stable-id lookup", InboxView.stableIdRfcLookupSQL,
              "messageHeader_accountId_messageId"),
             ("optimistic sent existence probe", AccountManager.optimisticSentDedupSQL,
              "messageHeader_folderId_providerDate"),

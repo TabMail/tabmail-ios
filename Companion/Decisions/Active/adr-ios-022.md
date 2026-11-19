@@ -22,4 +22,10 @@
 - `chat_converse` alias in `gen-registries.mjs` maps `chat_converse_user_message` filename → `chat_converse` registry key (critical for iOS code that sends `content: "chat_converse"`)
 - Budget enforcement is device-local — chat history is NOT synced via Device Sync (per design: stays per-device)
 
+**Note (2026-11-16, ADR-IOS-114 decision 14):** an email's chat turns are stored per thread, under
+`thread:<accountId>:<threadId>` (`ChatThreadKey`); `v107_rekeyChatSessionsByThread` moved the per-email
+`msg:` turns. The history a request about an email sends is the whole thread's chat, merged by time
+from every key among the thread's emails, within the same 50-exchange budget (`ThreadChatReader`).
+Inbox chats are unchanged.
+
 ---

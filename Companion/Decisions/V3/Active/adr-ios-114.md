@@ -338,7 +338,8 @@ same AI result, kept as long as the email itself is shown.
 
 10. **The reply field (amendment 2026-11-05).** In the chat, today's
    pill on the newest email is shown as a reply field, [mic] [field] [Send]: `DynamicIslandChat`
-   with a `ChatReplyField`, so it is the same agent session (`msg:{accountId}:{stableId}`) and the
+   with a `ChatReplyField`, so it is the same agent session (`msg:{accountId}:{stableId}`; the
+   thread's `thread:{accountId}:{threadId}` since decision 14, 2026-11-16) and the
    same sheet. The field holds the ready AI Reply's text message (`ChatReplyField.readyText`: someone
    else's email, a full `cachedReply` and a `replyTextMessage`, not a no-reply sender), with an
    "AI Reply" caption while unchanged. Send with it unchanged (`ChatReplyField.route`, trimmed
@@ -661,6 +662,89 @@ same AI result, kept as long as the email itself is shown.
    switch; the edit is "Make it shorter"; the template is "Event RSVP: yes"; compose keeps its Use
    Suggestion step; no attachment chip is seeded for the agenda; the Reply tag opens the chat in
    general, not only in the tutorial.
+
+14. **One TabMail chat per thread (amendment 2026-11-16).** An email's TabMail chat belongs to its
+   thread, with the chat view on or off. Decided 2026-11-16: "per-mail chat sessions now should be
+   per-thread chat sessions, which is fine even when chat view is off", with "a simple migration +
+   going forward identity using threads not individual messages".
+   - **Identity.** The session key is `thread:<accountId>:<threadId>` (`ChatThreadKey`), the thread id
+     being the one the inbox groups by: `computedThreadId`, or the header id when it is empty. A demo
+     keeps its `demo:` scope (`DemoModeStore.scopedSessionId`). The in-process session
+     (`ChatPillState.session(for:)`) is keyed by the bare thread key; the agent dot on an inbox row
+     (`MessageRowBackgroundModifier`), the row glow and the agent toast (`AgentToastDestination.thread`,
+     which opens the thread's newest email, `ChatThreadKey.newestMessageId`) read the same key. The
+     per-email key `msg:<accountId>:<stableId>`, `ActiveAgentTracker.messageStableId`,
+     `isMessageWorking`, `ChatStore.isMessageInInbox` and `InboxView.resolveMessageIdByStableId` are
+     deleted.
+   - **The newest email is the context, everywhere.** Decided 2026-11-16: "for the chat in the chat
+     view, it is ALWAYS regarding the most recent email in context", and for the email screen's Chat
+     pill: "the context email that gets sent in the request still should be the most latest email ...
+     in the thread ... since that's most useful. And even if that changes due to timing issues, that's
+     fine and not a problem. Since it will just be as if we were interrupted mid-discussion and the
+     next message will be properly contexted. The message on top should thus be the most recent
+     message." So every request, from the chat view or from the email screen's pill while an older
+     email is on screen, names the thread's newest email (`MessageDetailViewModel.chatNewest`: the
+     chat view's `ChatThread.newest` rule, drafts left out, latest by date then id), and its turns are
+     written under that email's current thread key. The pill's top card shows the newest email. A
+     request already running when a newer email lands finishes with the context it was sent with;
+     nothing else is done about it. The email screen keeps the email the user picked
+     (`chatContextMessage`) for its own bottom-bar actions. The chat view's panel card is unchanged.
+     *Amended 2026-11-16:* the newest email is the context in the chat view only. The email
+     screen's Chat pill is about the email that is open, as before the thread chat: its requests
+     name that email (`chatContextMessage`, else the screen's email), its top card shows it, and its
+     turns are written under that email's current thread key, so the thread's chat is still one
+     chat, read whole by `ThreadChatReader`. `MessageDetailViewModel.chatNewest` is deleted. Tests:
+     `ThreadChatTests.emailScreenUsesTheOpenEmail`, `chatViewUsesTheNewestEmail`.
+   - **One reader** (`ThreadChatReader`), for what the pill shows and for the history a request sends,
+     on both surfaces. Its keys are the own key of the email the chat is about (the chat view's
+     newest, the email screen's open one, 2026-11-16) and those of every other email of the
+     thread on the device (`ThreadDetection.related`, every account, copies included), so a copy in
+     another account or two threads a newer email joins read as one chat with no re-keying. It merges
+     their turns by time (a stable k-way merge, so a session's own order is kept), shows each key's
+     live confirmation card in place (the card stays in the session that raised it, where its request
+     is waiting), and sends the newest turns within `ChatStore.maxExchanges` exchanges and
+     `maxExchanges * charsPerExchange` characters. An inbox chat still sends its own session's turns.
+     The re-send and rewind menu acts on the shown session's own turns only.
+   - **Email pills stay resolvable.** The `ChatIdTranslator` mapping is global and a move remaps it
+     (`ChatIdTranslator.remapRealId`, called by the move's effects in `AccountManagerOperationEffects`), so every `[Email](N)` in a merged chat, whichever email's chat it
+     was written in, still resolves. The per-email remap on open is deleted: the translator already
+     follows moves, and a merged chat has no single email to remap to.
+   - **Clearing old chats** (`ChatStore.evictMessageDetailSessions`) counts threads: a thread chat is
+     kept, uncounted, while any email of its account and thread is in the Inbox
+     (`ChatStore.isThreadInInbox`, `ChatThreadKey.memberSQL`, one index search). A leftover `msg:`
+     chat (one the migration found no email for) has no Inbox email and is counted and cleared as it
+     was before. Inbox chats
+     (`inboxSessionScopeSQL`, which keeps `thread:` and leftover `msg:` keys out) and compose chats are
+     unchanged.
+   - **Migration `v107_rekeyChatSessionsByThread`.** One set-based statement per turn table
+     (`chatTurn`, `chatHistory`, `AppDatabase.rekeyChatSessionsByThreadSQL`) moves every `msg:` and
+     `demo:msg:` session to its email's thread key, finding the email as the app found it
+     (`MessageHeader.stableId`: a UID `messageId` with a Message-ID by the Message-ID, otherwise by
+     `messageId`; account-scoped; Inbox copy first, then lowest id). Two emails of one thread end
+     under one key in time order. A chat whose email is not on the device keeps its key and stays as
+     it was; no cap is added. Turn ids do not change, so memory index entries (`memory_meta`) still
+     name their turns. Each email lookup is a hinted index search (`messageHeader_rfc822MessageId`,
+     `messageHeader_accountId_messageId`), with or without planner statistics.
+   - **No write changes a thread id under a chat; a fence keeps it so (2026-11-16).** The one write
+     of `computedThreadId` to an existing email is the fragment merge
+     (`ThreadUtils.runFragmentMergeOnce`), and its only caller is `v54`, which runs before `v107`
+     creates thread keys, so it never strands a chat and no chat-moving code exists.
+     `ThreadIdWriteFenceTests` fails any caller of the merge other than a migration registered
+     before v107, and any other write of `computedThreadId` to an existing row (a migration from
+     v107 on included); its message says the new caller must move the thread chats to their new key.
+   - **Tests:** `ThreadChatTests` (a card raised for an earlier email answered after a newer one
+     lands, also across accounts; a newer email's question carries the earlier exchange; the email
+     screen on an older email shows the thread's chat with the open email's card and context
+     (`emailScreenUsesTheOpenEmail`), the chat view the newest email's (`chatViewUsesTheNewestEmail`); two joined
+     threads; the upgrade; eviction keeps a thread with an Inbox email; inbox chats unchanged; through
+     the pill's Send and the production reader, the history of a chat stored under two keys,
+     interleaved and over the budget by turns and by characters, is in time order with equal times
+     the newest email's key first and keeps the newest turns that fit,
+     `historyAcrossKeysIsChronologicalAndBudgeted`; a live card keeps its place, `liveCardKeepsItsPlace`),
+     `ThreadIdWriteFenceTests` (the fragment merge's callers and the write sites of
+     `computedThreadId`, with planted violations),
+     `ThreadChatKeyTests` (key round trip, reader keys, merge, budget, migration key equals the runtime
+     key, migration plan and time, thread-in-Inbox plan, toast).
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this

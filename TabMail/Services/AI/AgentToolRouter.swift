@@ -226,6 +226,9 @@ final class AgentToolRouter {
         composeQueue.first?.outcomeState.resolved
     }
 
+    /// Test-only: the request at the head of the queue, as the compose that takes it will read it.
+    var firstQueuedRequestForTesting: ComposeRequest? { composeQueue.first }
+
     /// Test-only: reset queue + counters between tests. Does NOT touch `pendingCompose`
     /// so existing tests are unaffected.
     func resetComposeQueueForTesting() {

@@ -443,8 +443,10 @@ enum ScreenshotMode {
         inboxSession.lastChatActivity = Date()
 
         // Detail chat: contextual discussion about the Q1 Budget Review email (msg001)
-        // Session key = "msg:\(accountId):\(stableId)" where stableId = messageId for non-UID IDs
-        let detailSession = ChatPillState.shared.session(for: "msg:screenshot-account:msg001")
+        // Session key = its thread's (ADR-IOS-114); the email has no computedThreadId, so its
+        // thread id is its header id.
+        let detailSession = ChatPillState.shared.session(for: ChatThreadKey.key(
+            accountId: "screenshot-account", threadId: "screenshot-account:INBOX:msg001"))
         detailSession.chatMessages = [
             ChatMessage(role: .user, content: "Is the 15% marketing overspend normal for our industry?", timestamp: now.addingTimeInterval(-200)),
             ChatMessage(role: .agent, content: "Based on Sarah's email, marketing spend is 15% over projection due to an expanded social campaign.\n\nI searched for benchmarks — **SaaS companies typically budget 10-20% of revenue on marketing** (industry benchmark surveys). A 15% overshoot within an already allocated budget is within normal range, especially if the campaign ROI justifies it.\n\nSarah mentioned the results look good — you could approve and ask for a post-campaign ROI report.", timestamp: now.addingTimeInterval(-195)),

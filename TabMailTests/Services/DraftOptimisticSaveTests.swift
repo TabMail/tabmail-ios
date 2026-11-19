@@ -659,11 +659,11 @@ struct DraftOptimisticSaveTests {
     /// did before the decision moved out of the view. Without this, a consumer that
     /// returned `.chatPill` for everything would pass the test above.
     @MainActor
-    @Test("Message and inbox toast keys still route to their own destinations")
+    @Test("Thread and inbox toast keys still route to their own destinations")
     func nonComposeToastKeysKeepTheirDestinations() {
         #expect(
-            AgentToastPayload.destination(forSessionKey: "msg:acct1:stable:id:with:colons")
-                == .message(accountId: "acct1", stableId: "stable:id:with:colons")
+            AgentToastPayload.destination(forSessionKey: "thread:acct1:thread:id:with:colons")
+                == .thread(key: "thread:acct1:thread:id:with:colons")
         )
         #expect(AgentToastPayload.destination(forSessionKey: "inbox") == .chatPill)
     }

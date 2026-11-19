@@ -43,13 +43,13 @@ struct ActiveAgentTrackerTests {
         #expect(!tracker.anyWorking)
     }
 
-    @Test("isMessageWorking matches exact session key format")
-    func isMessageWorkingExactMatch() {
+    @Test("isThreadWorking matches the exact thread key")
+    func isThreadWorkingExactMatch() {
         let tracker = ActiveAgentTracker()
-        tracker.setWorking("msg:account123:messageIdABC")
-        #expect(tracker.isMessageWorking(accountId: "account123", stableId: "messageIdABC"))
-        #expect(!tracker.isMessageWorking(accountId: "account123", stableId: "other"))
-        #expect(!tracker.isMessageWorking(accountId: "other", stableId: "messageIdABC"))
+        tracker.setWorking(ChatThreadKey.key(accountId: "account123", threadId: "threadABC"))
+        #expect(tracker.isThreadWorking(ChatThreadKey.key(accountId: "account123", threadId: "threadABC")))
+        #expect(!tracker.isThreadWorking(ChatThreadKey.key(accountId: "account123", threadId: "other")))
+        #expect(!tracker.isThreadWorking(ChatThreadKey.key(accountId: "other", threadId: "threadABC")))
     }
 
     @Test("anyComposeWorking checks prefix")
@@ -195,25 +195,26 @@ struct ActiveAgentTrackerTests {
 
     // MARK: - Session Key Parsing
 
-    @Test("messageStableId parses msg: session keys correctly")
-    func messageStableIdParsing() {
-        let result = ActiveAgentTracker.messageStableId(from: "msg:account123:rfc822@example.com")
+    @Test("ChatThreadKey.parse reads a thread session key")
+    func threadKeyParsing() {
+        let result = ChatThreadKey.parse("thread:account123:rfc822@example.com")
         #expect(result?.accountId == "account123")
-        #expect(result?.stableId == "rfc822@example.com")
+        #expect(result?.threadId == "rfc822@example.com")
     }
 
-    @Test("messageStableId returns nil for non-msg keys")
-    func messageStableIdNonMsg() {
-        #expect(ActiveAgentTracker.messageStableId(from: "inbox") == nil)
-        #expect(ActiveAgentTracker.messageStableId(from: "compose:draft1") == nil)
+    @Test("ChatThreadKey.parse returns nil for other keys")
+    func threadKeyParsingOtherKeys() {
+        #expect(ChatThreadKey.parse("inbox") == nil)
+        #expect(ChatThreadKey.parse("compose:draft1") == nil)
+        #expect(ChatThreadKey.parse("msg:acct:id") == nil)
     }
 
-    @Test("messageStableId handles stableId with colons")
-    func messageStableIdWithColons() {
-        // rfc822 message IDs can contain colons
-        let result = ActiveAgentTracker.messageStableId(from: "msg:acct:some:complex:id")
+    @Test("ChatThreadKey.parse keeps a thread id with colons")
+    func threadKeyParsingWithColons() {
+        // Thread ids (Message-IDs, header ids) can contain colons
+        let result = ChatThreadKey.parse("thread:acct:some:complex:id")
         #expect(result?.accountId == "acct")
-        #expect(result?.stableId == "some:complex:id")
+        #expect(result?.threadId == "some:complex:id")
     }
 
     // MARK: - Notification

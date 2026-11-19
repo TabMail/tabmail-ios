@@ -4459,7 +4459,7 @@ final class AppDatabase: Sendable {
         // text message, and the chat view asks for one when it needs it.
         // Convergence: a fresh install and an upgraded DB both end with the four
         // columns, NULL on every pre-existing row. Numbered after main's newest,
-        // v104_addReplyAllAndMarkSentAt, whose numbers stay; the next migration is v107.
+        // v104_addReplyAllAndMarkSentAt, whose numbers stay; the next migration after v106 is v107.
         migrator.registerTimedMigration(
             "v105_addAITextMessages", foreignKeyChecks: .immediate
         ) { db in
@@ -4490,6 +4490,77 @@ final class AppDatabase: Sendable {
         ) { db in
             try repairAICacheMessageIds(db)
         }
+
+        // An email's TabMail chat belongs to its thread (ADR-IOS-114): its turns move from the
+        // email's key, `msg:<accountId>:<stableId>`, to the thread's, `thread:<accountId>:<threadId>`
+        // (`ChatThreadKey`), the `demo:` scope kept. The email is found the way the app found it
+        // (`ChatStore.findByStableIdSQL`); chats of two emails of one thread end under one key, in
+        // time order as before. A chat whose email is not on the device keeps its key and stays as
+        // it was (`ChatStore.inboxSessionScopeSQL` keeps it out of the inbox list). Turn ids do not
+        // change, so memory index entries still name their turns. Set-based
+        // (`rekeyChatSessionsByThreadSQL`): one probe of messageHeader per session.
+        // Convergence: a fresh install has no `msg:` rows; an upgraded DB ends with every chat
+        // whose email is here under its thread's key, the rest unchanged.
+        migrator.registerTimedMigration(
+            "v107_rekeyChatSessionsByThread", foreignKeyChecks: .immediate
+        ) { db in
+            try rekeyChatSessionsByThread(db)
+        }
+    }
+
+    /// Move per-email chat turns to their thread's key (v107). Shared by the migration and its
+    /// tests.
+    static func rekeyChatSessionsByThread(_ db: Database) throws {
+        for table in ["chatTurn", "chatHistory"] {
+            try db.execute(sql: rekeyChatSessionsByThreadSQL(table: table))
+        }
+    }
+
+    /// v107's statement for one turn table (`chatTurn`, `chatHistory`), shared with its
+    /// query-plan test.
+    ///
+    /// `s` lists each `msg:` session once (the `<table>_sessionId` index serves the GLOBs; GLOB
+    /// is case-sensitive, as the keys are). Each session's email is looked up once, as
+    /// `MessageHeader.stableId` defines the key: a numeric (UID) `messageId` with a Message-ID
+    /// is keyed by the Message-ID, any other by its `messageId`. The two arms are hinted
+    /// (`messageHeader_rfc822MessageId`, `messageHeader_accountId_messageId`) because without
+    /// statistics, the state an upgrade runs in, SQLite walks the account
+    /// (`ChatStore.findByStableIdSQL`). Copies pick the Inbox one, then the lowest id, as the
+    /// app did. A session with no email has a NULL new key and is left alone. The `thread:` prefix
+    /// is written here, not read from `ChatThreadKey.prefix`: a migration must not change with app
+    /// code, and the v107 key test fails if the two ever differ.
+    static func rekeyChatSessionsByThreadSQL(table: String) -> String {
+        let uid = "h.messageId != '' AND h.messageId NOT GLOB '*[^0-9]*' AND CAST(h.messageId AS INTEGER) BETWEEN 0 AND 4294967295"
+        let threadId = "CASE WHEN h.computedThreadId = '' THEN h.id ELSE h.computedThreadId END"
+        return """
+            UPDATE \(table) SET sessionId = m.newId
+            FROM (
+                SELECT s.oldId AS oldId,
+                       s.scope || 'thread:' || s.acct || ':' || COALESCE(
+                           (SELECT \(threadId) FROM messageHeader AS h INDEXED BY messageHeader_rfc822MessageId
+                             WHERE h.rfc822MessageId = s.stable AND h.accountId = s.acct AND \(uid)
+                             ORDER BY h.isInInbox DESC, h.id ASC LIMIT 1),
+                           (SELECT \(threadId) FROM messageHeader AS h INDEXED BY messageHeader_accountId_messageId
+                             WHERE h.accountId = s.acct AND h.messageId = s.stable
+                               AND NOT (\(uid) AND h.rfc822MessageId IS NOT NULL AND h.rfc822MessageId != '')
+                             ORDER BY h.isInInbox DESC, h.id ASC LIMIT 1)
+                       ) AS newId
+                FROM (
+                    SELECT k.oldId, k.scope,
+                           substr(k.rest, 1, instr(k.rest, ':') - 1) AS acct,
+                           substr(k.rest, instr(k.rest, ':') + 1) AS stable
+                    FROM (
+                        SELECT DISTINCT sessionId AS oldId,
+                               CASE WHEN sessionId GLOB 'demo:*' THEN 'demo:' ELSE '' END AS scope,
+                               CASE WHEN sessionId GLOB 'demo:*' THEN substr(sessionId, 10) ELSE substr(sessionId, 5) END AS rest
+                        FROM \(table)
+                        WHERE sessionId GLOB 'msg:*' OR sessionId GLOB 'demo:msg:*'
+                    ) AS k
+                    WHERE instr(k.rest, ':') > 1 AND instr(k.rest, ':') < length(k.rest)
+                ) AS s
+            ) AS m
+            WHERE \(table).sessionId = m.oldId AND m.newId IS NOT NULL
+            """
     }
 
     /// Fill a missing `messageAICache.rfc822MessageId` from the header the entry's key names
