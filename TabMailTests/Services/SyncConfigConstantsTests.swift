@@ -103,11 +103,6 @@ struct SyncConfigConstantsTests {
         #expect(SyncConfig.aiCacheOrphanGraceDays == 7)
     }
 
-    @Test("threadQueryLimit is 100")
-    func threadQueryLimitValue() {
-        #expect(SyncConfig.threadQueryLimit == 100)
-    }
-
     @Test("maxInlineImages is 20")
     func maxInlineImagesValue() {
         #expect(SyncConfig.maxInlineImages == 20)

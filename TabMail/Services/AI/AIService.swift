@@ -137,7 +137,8 @@ actor AIService {
         userName: String,
         kbText: String,
         actionPrompt: String,
-        recipientStatus: String
+        recipientStatus: String,
+        isSentByUser: Bool
     ) async throws -> (summary: SummaryResult, action: ActionTag?, reply: String?)? {
         // Device Sync probe (single roundtrip, results used independently below)
         // rfc822MessageId is already stored normalized (no angle brackets/whitespace)
@@ -202,7 +203,8 @@ actor AIService {
             summary = try await generateSummary(
                 subject: subject, from: from, fromAddress: fromAddress,
                 date: date, bodyText: bodyText, htmlContent: htmlContent,
-                userName: userName, kbText: kbText, recipientStatus: recipientStatus
+                userName: userName, kbText: kbText, recipientStatus: recipientStatus,
+                isSentByUser: isSentByUser
             )
             BackgroundSyncLogger.logDebug("[AIService] Summary generated for \(messageId): blurb=\(summary.blurb?.prefix(50) ?? "nil")")
         } else {

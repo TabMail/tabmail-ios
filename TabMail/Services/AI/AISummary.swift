@@ -43,7 +43,8 @@ extension AIService {
         htmlContent: String?,
         userName: String,
         kbText: String,
-        recipientStatus: String = ""
+        recipientStatus: String = "",
+        isSentByUser: Bool = false
     ) async throws -> SummaryResult {
         guard !disableLLMCalls else {
             return .empty
@@ -66,7 +67,8 @@ extension AIService {
         )
         let account = AccountContext(userName: userName, kbText: kbText, actionPrompt: "")
         let rawVars = PromptVariables.summaryVariables(
-            metadata: metadata, body: body, account: account, recipientStatus: recipientStatus
+            metadata: metadata, body: body, account: account, recipientStatus: recipientStatus,
+            isSentByUser: isSentByUser
         )
         let vars: [String: JSONValue] = rawVars.mapValues { JSONValue.fromAny($0) }
 

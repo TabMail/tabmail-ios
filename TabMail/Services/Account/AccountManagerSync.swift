@@ -304,9 +304,10 @@ extension AccountManager {
     /// Re-queue all inbox messages for AI processing.
     /// Called when AI is re-enabled (privacy toggle off) so messages received while AI was off get processed.
     /// Idempotent: messages that already have summary+action are filtered out by ActiveAIQueue.
+    /// A chat summary the model answered without a text message is asked once more (`aiReenabled`).
     func reprocessInboxMessages(accounts: [Account]) {
         Task {
-            await ActiveAIQueue.shared.repopulateFromDatabase()
+            await ActiveAIQueue.shared.aiReenabled()
         }
     }
 }
