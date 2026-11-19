@@ -1608,18 +1608,15 @@ struct IMAPProviderPoolInvariantTests {
 
     // MARK: Invariant 11: a logged-in session is never abandoned (D-13 / R11-H2)
 
-    /// **The property.** `createFolderConnection` performs LOGIN and then SELECT.
-    /// When the SELECT fails, the connection is already logged in — abandoning it
-    /// leaks a live session nothing will ever track or tear down again, and it
-    /// still counts against the server's per-user connection cap, which makes the
-    /// very limit error the surrounding branch exists to handle WORSE.
-    ///
-    /// **Red-first evidence.** Delete the `if let createdServer { … logout() }`
-    /// block from `IMAPProvider.createFolderConnection`'s catch (the pre-fix
-    /// shape, which threw without ever naming the local). No LOGOUT reaches the
-    /// wire and the bounded wait below expires: "the SELECT-failed session was
-    /// abandoned without a logout attempt".
-    @Test("a folder creation whose LOGIN succeeded but whose SELECT failed logs that session out — it is never abandoned")
+    /// **The property.** A folder connection whose caller's SELECT the server
+    /// refuses is never abandoned while logged in: it stays tracked by the pool,
+    /// and the next acquire of the folder reuses it (no second LOGIN). Since
+    /// #755 the pool opens no mailbox (`createFolderConnection` hands over an
+    /// authenticated session), so the refusal answers the caller's own SELECT
+    /// and the session itself is healthy. The creation catch's logout of a
+    /// logged-in server (D-13 / R11-H2) is kept for any later step that throws
+    /// before the plant.
+    @Test("a folder connection whose caller's SELECT is refused is never abandoned: it stays tracked and the next acquire reuses it without a new LOGIN")
     func folderCreationLogsOutTheSessionWhoseSelectFailed() async throws {
         let server = FakeIMAPServer(
             username: Self.uniqueUsername(),
@@ -1629,14 +1626,6 @@ struct IMAPProviderPoolInvariantTests {
         defer { server.stop() }
         let provider = Self.provider(for: server)
         defer { awaitDisconnect(provider) }
-
-        // Object-layer disposition mark — the wire-level counters cannot make
-        // this claim (see `FakeIMAPServer.liveSessionCount()`'s own note).
-        let logoutAttempts = Mutex<Int>(0)
-        provider.setLogoutAttemptTestHookForTesting { _ in
-            logoutAttempts.withLock { $0 += 1 }
-        }
-        defer { provider.setLogoutAttemptTestHookForTesting(nil) }
 
         server.failNextCommand(containing: "SELECT")
 
@@ -1648,12 +1637,13 @@ struct IMAPProviderPoolInvariantTests {
         }
 
         // THE INVARIANT.
-        #expect(server.consumedInjectedFailureCount() == 1, "non-vacuity: the injected SELECT failure never fired, so nothing about the abandon path was exercised")
-        let attempted = await waitUntil { logoutAttempts.withLock { $0 } >= 1 }
-        #expect(attempted, "the SELECT-failed session was abandoned without a logout attempt — it stays logged in and counted against the server's cap")
-        let sawWireLogout = await waitUntil { server.recordedCommands().contains { $0.hasPrefix("LOGOUT") } }
-        #expect(sawWireLogout, "no LOGOUT reached the wire for the abandoned session")
-        #expect(await provider.hasFolderConnectionForTesting(folder: "INBOX") == false, "a folder whose SELECT failed must not be left tracked")
+        #expect(server.consumedInjectedFailureCount() == 1, "non-vacuity: the injected SELECT failure never fired")
+        #expect(await provider.hasFolderConnectionForTesting(folder: "INBOX"), "the logged-in session stays tracked by the pool, never abandoned")
+        let loginsBefore = server.recordedCommands().filter { $0.uppercased().hasPrefix("LOGIN") || $0.uppercased().hasPrefix("AUTHENTICATE") }.count
+        let again = await joinBounded(Task { _ = try await provider.fetchMessages(folder: "INBOX", limit: 1, offset: 0) })
+        if case .success? = again {} else { Issue.record("the next acquire on the kept session lists the folder: \(String(describing: again))") }
+        let loginsAfter = server.recordedCommands().filter { $0.uppercased().hasPrefix("LOGIN") || $0.uppercased().hasPrefix("AUTHENTICATE") }.count
+        #expect(loginsAfter == loginsBefore, "the kept session is reused: no new LOGIN")
     }
 
     // MARK: Invariant 12: eviction never reports a PHANTOM success (D-18)

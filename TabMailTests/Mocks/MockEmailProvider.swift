@@ -112,6 +112,14 @@ actor MockEmailProvider: EmailProvider {
         mockedBoundFetchEpochBox.withLock { $0[folderPath] = value }
     }
 
+    /// The counters the mock's SELECT reports for a folder (its listing's
+    /// `coverage.counters`, carrying the UIDNEXT bound). Unset: nil, as for a
+    /// provider whose listing has no selection.
+    private nonisolated let mockedListingCountersBox = Mutex<[String: ListingCounters]>([:])
+    nonisolated func setListingCounters(_ counters: ListingCounters, folder: String) {
+        mockedListingCountersBox.withLock { $0[folder] = counters }
+    }
+
     /// Coverage for the mock's own "server". `fetchMessagesResult` IS this
     /// provider's entire mailbox and it is returned verbatim — the mock performs
     /// NO client-side narrowing, no `compactMap`, no parse that can fail — so
@@ -132,7 +140,8 @@ actor MockEmailProvider: EmailProvider {
         let coverage = FetchCoverage(
             serverRecordCount: messages.count,
             spansEntireFolder: messages.count < limit,
-            unmaterialisedIds: [])
+            unmaterialisedIds: [],
+            counters: mockedListingCountersBox.withLock { $0[folder] })
         if let bound = mockedBoundFetchEpochBox.withLock({ $0[folder] }) {
             return (messages, bound, coverage)
         }
@@ -284,6 +293,11 @@ actor MockEmailProvider: EmailProvider {
         callLog.append("disconnect")
         if let error = disconnectThrows { throw error }
     }
+
+    /// What `progressTotal` answers (default: the protocol's `.none`).
+    var progressTotalAnswer: ProgressTotal = .none
+    func setProgressTotalAnswer(_ answer: ProgressTotal) { progressTotalAnswer = answer }
+    func progressTotal(crawling: Bool) async -> ProgressTotal { progressTotalAnswer }
 
     func fetchFolders() async throws -> [FolderInfo] {
         callLog.append("fetchFolders")

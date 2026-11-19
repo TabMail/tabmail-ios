@@ -81,11 +81,16 @@ struct IMAPChangeReaderTests {
     static func withWorld(
         capabilities: [String] = qresyncCapabilities,
         inbox: [Int], archive: [Int] = [],
+        overbroadUIDSearch: Bool = false,
         _ body: (World) async throws -> Void
     ) async throws {
         let server = FakeIMAPServer(capabilities: capabilities, mailboxes: [
             inboxPath: inbox.map(message), archivePath: archive.map(message),
         ])
+        // A conforming server answers `UID SEARCH UID <set>` within the set; the
+        // adversarial fixture (`overbroadUIDSearch`) answers with the whole
+        // mailbox, which the reader must refuse (#755).
+        if !overbroadUIDSearch { server.honorSearchUIDSetCriterion() }
         server.setUidValidity(epoch, for: inboxPath)
         server.setUidValidity(epoch, for: archivePath)
         try server.start()
@@ -353,6 +358,29 @@ struct IMAPChangeReaderTests {
             w.server.setMessages([1, 2, 3, 4].map(Self.message), in: Self.inboxPath)
             let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
             #expect(Set(changes.records.compactMap { $0.header?.messageId }) == ["3", "4"])
+        }
+    }
+
+    @Test("An arrival SEARCH answered beyond its UID range proves nothing: the read fails and keeps the bookmark; a conforming answer (control) advances it and loads the arrival",
+          arguments: [true, false])
+    func overbroadArrivalSearchKeepsTheBookmark(_ overbroad: Bool) async throws {
+        try await Self.withWorld(inbox: [1, 2], overbroadUIDSearch: overbroad) { w in
+            let cursor = try await Self.baseline(w)
+            w.server.setQResyncOmitsArrivals(true, for: Self.inboxPath)
+            w.server.setMessages([1, 2, 3].map(Self.message), in: Self.inboxPath)
+            let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
+            if overbroad {
+                #expect(!Self.isTracked(changes.status), "an answer outside the request is not this request's answer: \(changes.status)")
+                guard case .failed = changes.status else { Issue.record("expected a failed read, got \(changes.status)"); return }
+                // The kept bookmark only gains the time its reads started failing.
+                #expect(try #require(IMAPChangeCursor.decode(changes.cursor)).uidNext
+                        == (try #require(IMAPChangeCursor.decode(cursor))).uidNext, "the old bookmark is kept")
+                #expect(changes.removals.isEmpty && changes.records.isEmpty, "nothing applied from it")
+            } else {
+                #expect(Self.isTracked(changes.status))
+                #expect(Set(changes.records.compactMap { $0.header?.messageId }) == ["3"])
+                #expect(try #require(IMAPChangeCursor.decode(changes.cursor)).uidNext == 4)
+            }
         }
     }
 
@@ -638,21 +666,34 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("Recheck: a compact confirming SEARCH answer spanning millions of UIDs is not expanded; it still decides read-again versus removed")
+    @Test("Recheck: a compact confirming SEARCH answer spanning millions of UIDs beyond the request is refused without being expanded: nothing is removed")
     func recheckCompactConfirmingAnswerIsNotExpanded() async throws {
         try await Self.withWorld(inbox: [1], archive: [10, 11]) { w in
             // The FETCH returns neither 10 (a short FETCH) nor 50000001 (gone);
-            // the confirming SEARCH answers with one compact range holding 10.
+            // the confirming SEARCH, asked about 10 and 50000001 only, answers
+            // with one compact range naming millions of UIDs it was not asked about.
             w.server.suppressFetchRecord(in: Self.archivePath, uids: [10])
             w.server.answerNextUIDSearch(in: Self.archivePath, all: "1:50000000")
             let start = ContinuousClock.now
             let set = try await Self.read(w, recheck: [w.archiveId: ["10", "50000001"]])
             let elapsed = ContinuousClock.now - start
             #expect(w.server.compactUIDSearchAnswersServed() == 1, "setup: the confirming SEARCH got the compact answer")
+            let archive = set.folders.first { $0.folderId == w.archiveId }
+            #expect(archive?.removals.isEmpty ?? true, "an answer outside its request proves no absence: nothing removed")
+            #expect(elapsed < .seconds(5), "bounded work: the answer is never expanded (took \(elapsed))")
+        }
+    }
+
+    @Test("Recheck control: a confirming SEARCH answer inside its request decides read-again versus removed")
+    func recheckInScopeConfirmingAnswerDecides() async throws {
+        try await Self.withWorld(inbox: [1], archive: [10, 11]) { w in
+            w.server.suppressFetchRecord(in: Self.archivePath, uids: [10])
+            w.server.answerNextUIDSearch(in: Self.archivePath, all: "10")
+            let set = try await Self.read(w, recheck: [w.archiveId: ["10", "50000001"]])
+            #expect(w.server.compactUIDSearchAnswersServed() == 1, "setup: the confirming SEARCH got the answer under test")
             let archive = try #require(set.folders.first { $0.folderId == w.archiveId })
             #expect(archive.rereadLater == ["10"], "still on the server: read again, never removed")
             #expect(archive.removals == ["50000001"], "not on the server: removed")
-            #expect(elapsed < .seconds(5), "bounded work: the answer is never expanded (took \(elapsed))")
         }
     }
 

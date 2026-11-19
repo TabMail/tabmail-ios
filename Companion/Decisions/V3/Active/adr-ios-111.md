@@ -866,3 +866,145 @@ COPYUID, exit rule, dropChangeBookmark, move without destination proof, connecti
 evictChangeConnectionIfIdle, createChangeServer, max_userip_connections, eviction order, heldRangeStart,
 olderMailComplete, olderMailCursor, backfillUidCursor, un-deleted, pass-start NOOP, selfHealDue, selfHealOwed, SelfHealFolderOutcome,
 healFoldersAfterAnUnprovenMove, evictIdleConnection, IDLE DONE before LOGOUT, #751.
+
+### Amendment 2026-11-18 (#755): one writer of folder counters, and a listing proves its window
+
+**Context.** Folder counters (`totalCount`, `lastKnownUidNext`, `lastKnownHighestModSeq`) had several
+writers (folder-list STATUS, the change read's observation, the listing), so a counter could claim a state
+no listing had seen, and the ADR-IOS-051 phase 2 could compare the local rows against a count taken at
+another moment. A listing whose FETCH came back short still counted as the folder's listing, and the stale
+sweep had a lower UID bound only, so a listing could remove a message another listing had stored after
+its own SELECT.
+
+**Decision.**
+1. **The listing is the only writer of folder counters.** An IMAP folder's count, UIDNEXT and MODSEQ are
+   written only from the SELECT of the window listing that saw the rows, carried on the provider-neutral
+   listing result (`FetchCoverage.counters`, `ListingCounters`) and written in the listing's own
+   transaction (`SyncEngine.writeListingCounters`). `applyFolderList`, `applyFolderUpdates`, the untracked
+   refresh and the crawl write no counters. The UIDVALIDITY bootstrap (ADR-IOS-061) is unchanged.
+   Resets (Settings resets, the startup migration, the UIDVALIDITY reaction) clear counters only through
+   the same owner (`SyncEngine.invalidateListingCounters`). **By construction:** the database record
+   encoding (`Folder.encode(to: inout PersistenceContainer)`) leaves the three counters
+   (`Folder.listingCounterColumns`) out of the record's persistence container, while `Codable` stays whole
+   (a JSON round trip keeps every field), so a
+   whole-record `insert`/`update`/`save` cannot write them (an insert takes the table defaults); only the
+   writer's column-scoped UPDATE does. Seeds (demo, screenshot, preview, test fixtures) write counts
+   through the same writer. Fence: `FolderRoleTests.wholeRecordSaveNeverWritesTheListingCounters`.
+2. **The listing's MODSEQ.** The listing's connection decides CONDSTORE once per session
+   (`IMAPProvider.negotiateListingCondStore`): with ENABLE, only an acknowledged `ENABLE CONDSTORE`; without
+   ENABLE, CONDSTORE if advertised. The decision belongs to the pooled connection and goes with it. With
+   CONDSTORE on, the listing's SELECT carries `(CONDSTORE)` (through `IMAPChangeCommands`). With it off, or
+   on a NOMODSEQ folder, the listing clears the stored MODSEQ and never fails for it. The decision is keyed
+   by the connection's identity, never the folder path, and set only while that connection is a live pool
+   entry: a renegotiation that resumes after its connection left the pool cannot overwrite the decision of
+   the connection that replaced it. A `(CONDSTORE)` SELECT refused by the server, or by the client because a
+   reopened session no longer advertises CONDSTORE (`IMAPProvider.isCondStoreSelectRefusal`), is selected
+   again plainly and that connection lists without CONDSTORE from then on: no ENABLE after a session has
+   selected (RFC 5161 §3.1); ENABLE is sent only when a connection opens, before its first SELECT. The
+   pool's own open-the-folder SELECT is always plain: a server that refuses the `(CONDSTORE)` parameter
+   still opens the folder, and only the listing's own SELECT (with its plain fallback) carries it. The cost
+   of a server that misbehaves here is only an extra listing without MODSEQ; it is RFC 5161 compliant. A HIGHESTMODSEQ of 0 (NOMODSEQ) is no value (`SyncEngine.knownModSeq`): it never
+   triggers a listing and never proves a folder unchanged.
+3. **Each folder's listing this pass is one of three, by the server's answer** (`SyncEngine.listingProvedItsWindow`):
+   - **Proven:** EXISTS in range, a header record back for every message the window holds, and (on EXISTS
+     0) a confirming SEARCH. It writes the counters, may sweep, counts toward the full-sync stamp.
+   - **Not listable:** the server refused the SELECT (`ProviderFolderNotListable`, mapped from the IMAP
+     SELECT refusal at the provider boundary) or the SELECT sent no usable EXISTS
+     (`FetchCoverage.notListable`). Nothing is written or swept; the folder does not withhold the stamp, so
+     a folder the server always refuses does not keep the full sync due on every pass.
+   - **Unproven:** a short or empty FETCH against a positive EXISTS (an expunge between SELECT and FETCH
+     included), a contradicted EXISTS 0, or any other failure after the listing started. It writes no
+     counters, runs no stale sweep, certifies no change baseline and drives no phase 2, and it withholds
+     the stamp of the pass that ran it (`FullSyncListing.droppedFolder`; the untracked route's listings
+     record in `SyncEngine.unprovenListingPasses` under the foreground pass's own id, which only grows
+     during that pass, so an error in a later folder never loses an earlier folder's). An on-demand listing
+     belongs to no pass and never withholds a scheduled pass's stamp. Every unproven listing (on-demand or
+     untracked) makes its folder due (`FolderChangeState.listingDue`) and owes it a deep pass, so the next
+     pass lists it whatever STATUS or its counters say. Invariant: `lastFullSyncAt` is never stamped after a pass in which a
+     started listing failed to prove its window.
+   The records an unproven listing did return are still merged as positive records (inserts and flag
+   updates of messages the server showed); only absence is never inferred from it. A connection lost
+   mid-listing is retried once; the retry's own answer classifies the folder, and the failed attempt wrote
+   nothing (`runSyncMessages` writes in one transaction after its server reads). The background passes show
+   no error for it; pull-to-refresh keeps the errors it showed before (a lost connection ends the refresh
+   with that error; a refused or server-gone folder and an unconfirmed count are skipped silently), mapped
+   by its caller from the outcome, whose `.unproven` carries the listing's own error. The folder is listed
+   again next pass. **The proof is bound to its session:** after the listing's SELECT its connection never
+   reconnects inside a command (`setReconnectsInsideCommands(false)` for the FETCH or SEARCH that confirms
+   it), so a session lost between the SELECT and its proof makes the listing unproven (a lost connection,
+   retried whole on a fresh SELECT) instead of proving a new session's selection against this one's count,
+   epoch and UIDNEXT. A refused SELECT is typed (`ProviderFolderNotListable`) at the listing's own SELECT.
+4. **An EXISTS 0** empties a folder only when a `UID SEARCH ALL` on the same selection reads as empty;
+   otherwise that folder's listing fails (`ProviderListingUnconfirmed`, content-free description) and is
+   retried; the other folders proceed. A SEARCH that the library reports as an empty result without an
+   untagged answer is treated as unproven once the library preserves that distinction (tracked separately);
+   Tests pin it.
+   **One classifier.** Every route (full sync, untracked refresh, and every on-demand listing: folder
+   open, after a send, after a move, epoch-rebuild step 6, all through `syncFolderMessages` → `listFolder`)
+   lists through `SyncEngine.runListing`, which never throws and returns `ListingOutcome` (`.proven`,
+   `.notListable`, `.unproven`); any failure after the SELECT is `.unproven` there, so no caller can rethrow
+   a listing error past it. The merge (`runSyncMessages`) is private to it; there is no other door
+   (fence: `ListingRouteFenceTests`). An on-demand listing that proves nothing is not an error shown to
+   the user; the folder is listed again next pass. The full sync records it with `SyncEngine.record`; the untracked route consumes it via
+   `listFolder`. An unproven listing (the deep pass's included) owes the folder a deep pass
+   (`oweDeepListing`), so the next full sync never MODSEQ-skips it. The proof, the rows and the sweep
+   bounds read one record set: the requested window's records with a UID, one per UID
+   (`IMAPProvider.inWindow`); an unsolicited FETCH outside the window is no part of the listing. A record
+   set that names one sequence number twice or whose UIDs do not rise with the sequence number
+   (`IMAPProvider.windowRecordsAreConsistent`) proves nothing and lists nothing.
+5. **SEARCH answers (RFC 4731) have one reader,** `ExtendedSearchResult.listed(within:)`; the unbounded
+   `listed()` is private to it, so every caller must name its request's scope and the compiler finds a new
+   one. An answer that does not list its UIDs fails the request, never reads as empty; one naming any UID
+   outside the scope is refused, so a set cannot be trimmed into absence. A search over the whole selected
+   mailbox uses `MessageIdentifierSet.anyUID`: a UID at or above the SELECT's UIDNEXT there is new mail
+   delivered since, kept for app search and the NSE lookup; removal evidence is bounded separately by the
+   listing's own SELECT (item 6). Census: the EXISTS 0 confirmation, `searchOnConnection`, `searchDateRange`,
+   `searchBeforeOnly`, `searchByMessageId`, `currentUIDs`, `appendToSentFolder`, the arrivals range,
+   the QRESYNC `rereadIds` re-read, `searchExistingUIDs`, `readChangeFolder` and the NSE's `searchMessageId`.
+6. **The stale sweep stays inside the listing's own window (#997).** On IMAP it judges only UIDs from the
+   lowest to the highest UID the listing fetched; a whole-folder listing judges only UIDs below its own
+   UIDNEXT (or, with none reported, at most the highest UID it saw; with neither it removes nothing). A
+   windowed listing's ceiling is also below its own SELECT's UIDNEXT: a UID allocated after that SELECT
+   that its FETCH still returned is never evidence for removal. Both sweep branches (small whole-folder and
+   windowed) take the coverage they judge with from one builder (`SyncEngine.sweepCoverage`), which keeps
+   the listing's own SELECT evidence, and the windowed candidate load and the removal decision take their
+   UID window from one helper (`SyncEngine.windowedSweepUIDBounds`); fence:
+   `ListingRouteFenceTests.sweepCoverageHasOneBuilder`. A
+   message another listing stored after this listing's SELECT is never removed by it. Removals come only
+   from this sweep and from the change reader's removal core; phase 2 removes only after its own walk.
+7. **Observations are triggers only.** STATUS and the change read's observation decide whether a folder is
+   listed. The full sync's MODSEQ skip (`shouldSkipFolderFetch`) needs MODSEQ, MESSAGES and UIDNEXT all equal
+   to the stored listing counters and no due listing.
+8. **Phase 2 runs only on the count of a listing in the same pass** (`FullSyncListing.listedCounts`; the
+   untracked refresh uses its own listing's result). A phase 2 that does not finish sets
+   `FolderChangeState.listingDue`, as does a listing whose server count is below the rows held (armed in the
+   listing's transaction, `armListingDueIfHeldExceeds`); a due folder is listed and walked again and is left
+   out of the change baseline; only a finished walk whose counts agree clears it. Phase 2 honours the
+   pass's deadline (`FullSyncPlan.deadline`, the foreground pass's own). The due bit carries a token per
+   mark (`FolderChangeState.markListingDue` / `clearListingDue(ifMarkedBy:)`): a phase 2 clears only its own
+   mark, so an older check that finishes after a newer listing marked the folder never clears that mark.
+   A walk's deletion re-checks, inside the deleting transaction, that the folder's stored UIDVALIDITY is
+   still the one the answer was read under and no turnover is armed
+   (`deleteServerConfirmedDeletions(answerEpoch:)`); an answer about the old mailbox deletes nothing. The
+   always-on deletion log names the folder's role, never its name. The count checks compare the server's
+   count with the rows the server can list (`SyncEngine.heldServerRowCount`): a never-uploaded draft's
+   placeholder is not one, so it never keeps a healthy folder due.
+9. **Backfill progress has its own source,** `EmailProvider.progressTotal(crawling:)`, needed because the
+   STATUS writers that fed it are gone: Gmail its profile total, Exchange the sum of `totalItemCount` over its
+   last complete folder list, set only when the scheduled full sync adopts one
+   (`EmailProvider.adoptFullSyncFolderList`; a change read's folder discovery never sets it), IMAP each folder's UIDNEXT from its last folder
+   list (`SyncEngine.uidWalkProgress`). Before the first folder list nothing is published. The wake lock
+   reads the folders' walk state and fails closed: an account not polled, or with no folder rows, is not
+   done.
+
+**Consequences.** A folder whose listing proves nothing keeps its earlier counters and rows and is listed
+again next pass. The engine stays provider-blind. No column, no migration (`listingDue` lives in
+`changeState`).
+
+Keywords: ListingCounters, writeListingCounters, listedCounts, listingProvedItsWindow, short FETCH,
+unproven listing, stale sweep window, upper bound, negotiateListingCondStore, ProviderListingUnconfirmed,
+ExtendedSearchResult.listed, listed(within:), ProviderFolderNotListable, notListable, UntrackedRefresh,
+invalidateListingCounters, ListingOutcome, runListing, listingCounterColumns,
+inWindow, anyUID, unprovenListingAccounts, unprovenListingPasses, sweepCoverage, windowedSweepUIDBounds,
+windowRecordsAreConsistent, heldServerRowCount, adoptFullSyncFolderList, setReconnectsInsideCommands, ListingRouteFenceTests, syncFolderMessages, knownModSeq, NOMODSEQ, listingDueToken, oweDeepListing, answerEpoch, isCondStoreSelectRefusal, answeredInWindow, armListingDueIfHeldExceeds, folderWalkDone, listingDue, progressTotal, ProgressTotal, uidWalkProgress, folder counters one
+writer, #755, #985, #990, #997.

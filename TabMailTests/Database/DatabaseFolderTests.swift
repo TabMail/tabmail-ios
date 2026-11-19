@@ -32,7 +32,7 @@ struct DatabaseFolderTests {
         folder.backfillUidCursor = 500
         folder.backfillPageToken = "token123"
         folder.lastKnownUidNext = 1000
-        try db.write { try folder.update($0) }
+        try db.write { try folder.updateWithListingCounters($0) }
 
         let fetched = try db.read { try Folder.fetchOne($0, key: folder.id) }
         #expect(fetched?.backfillComplete == true)

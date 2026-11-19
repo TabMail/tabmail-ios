@@ -1593,6 +1593,21 @@ actor GmailProvider: EmailProvider {
         return profile.historyId
     }
 
+    /// `EmailProvider.progressTotal`: the profile's deduplicated total; `.none`
+    /// when the read fails or reports none (progress then counts stored rows).
+    /// The profile's total from its first successful read, for the backfill bar.
+    private var profileMessagesTotal: Int?
+
+    /// The first successful total is kept for the process (one profile request
+    /// per account, as before); a failed or empty read is asked again next time.
+    func progressTotal(crawling: Bool) async -> ProgressTotal {
+        guard crawling else { return .none }
+        if let cached = profileMessagesTotal { return .messages(cached) }
+        guard let total = try? await getMessagesTotal(), total > 0 else { return .none }
+        profileMessagesTotal = total
+        return .messages(total)
+    }
+
     /// Total message count in the mailbox (deduplicated across labels).
     func getMessagesTotal() async throws -> Int {
         let data = try await request(path: "/profile")

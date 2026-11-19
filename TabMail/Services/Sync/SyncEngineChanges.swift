@@ -62,6 +62,33 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// when no retirement was added while the pass ran.
     var selfHealOwed: Int = 0
 
+    /// The full sync's listing is due for this folder whatever its counters say:
+    /// a count check (phase 2) that did not finish (a failed SEARCH, or a ghost
+    /// a shield protects) set it; a phase 2 that finishes clears it (#755).
+    var listingDue: Bool = false
+
+    /// Who set `listingDue` last: a fresh token on every mark. A count check
+    /// clears the bit only while the token is still the one its own mark wrote,
+    /// so an older check landing after a newer listing marked the folder never
+    /// clears the newer mark (#755). Nil when not due.
+    var listingDueToken: String?
+
+    /// Mark the listing due under a fresh token, returned for the clear.
+    @discardableResult
+    mutating func markListingDue() -> String {
+        let token = UUID().uuidString
+        listingDue = true
+        listingDueToken = token
+        return token
+    }
+
+    /// Clear the listing-due bit only when `token` is still the last mark's.
+    mutating func clearListingDue(ifMarkedBy token: String) {
+        guard listingDueToken == token else { return }
+        listingDue = false
+        listingDueToken = nil
+    }
+
     /// The folder is owed a self-heal pass before it is tracked again.
     var selfHealDue: Bool { selfHealOwed > 0 }
 
@@ -70,7 +97,7 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         self.recheck = recheck
     }
 
-    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed }
+    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed, listingDue, listingDueToken }
 
     /// `selfHealOwed` is absent from a state stored before it existed.
     init(from decoder: Decoder) throws {
@@ -79,6 +106,8 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         tracking = try container.decode(Bool.self, forKey: .tracking)
         recheck = try container.decode([String].self, forKey: .recheck)
         selfHealOwed = try container.decodeIfPresent(Int.self, forKey: .selfHealOwed) ?? 0
+        listingDue = try container.decodeIfPresent(Bool.self, forKey: .listingDue) ?? false
+        listingDueToken = try container.decodeIfPresent(String.self, forKey: .listingDueToken)
     }
 
     /// The stored JSON; unreadable or absent = the untracked default.
@@ -94,7 +123,7 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// The JSON to store; nil for the default (untracked, nothing to re-read,
     /// no self-heal due).
     var encoded: String? {
-        guard tracking || !recheck.isEmpty || selfHealDue,
+        guard tracking || !recheck.isEmpty || selfHealDue || listingDue,
               let data = try? JSONEncoder().encode(self) else { return nil }
         return String(data: data, encoding: .utf8)
     }
@@ -111,9 +140,6 @@ struct ChangePassOutcome: Sendable {
     var outOfTime = false
     /// Rows were written.
     var hadChanges = false
-    /// The read carried the folder list and it was applied (the MODSEQ-skippable
-    /// paths), so the full sync skips its own discovery.
-    var appliedFolderList: Set<String>?
     /// A candidate bookmark, stored after the foreground pass's listings.
     var candidate: String?
     /// Folders the read covered (`.tracked` or `.baselineReady`).
@@ -138,7 +164,7 @@ extension SyncEngine {
     /// - Parameter deadline: the caller's own deadline for the whole pass (its
     ///   timeout), or nil when the caller sets none. It is not account sync state.
     func readAndApplyChanges(
-        account: Account, provider: any EmailProvider, scope: ChangeScope, deadline: Date? = nil
+        account: Account, provider: any EmailProvider, scope: ChangeScope, deadline: Date? = nil, pass: UUID? = nil
     ) async throws -> ChangePassOutcome? {
         let accountId = account.id
         let request = try await makeChangeRequest(accountId: accountId, scope: scope, deadline: deadline)
@@ -170,9 +196,14 @@ extension SyncEngine {
         // Folders no bookmark can cover: listed here when they changed.
         for changes in changeSet.folders {
             guard case .untracked(let observation) = changes.status else { continue }
-            if try await refreshUntrackedFolder(
-                folderId: changes.folderId, observation: observation, account: account, provider: provider) {
-                outcome.hadChanges = true
+            switch try await refreshUntrackedFolder(
+                folderId: changes.folderId, observation: observation, account: account, provider: provider,
+                deadline: deadline, pass: pass) {
+            case .listed: outcome.hadChanges = true
+            // Recorded for this pass by `listFolder` (`unprovenListingPasses`),
+            // so an error in a later folder cannot lose it.
+            case .unproven: break
+            case .notListed: break
             }
         }
         outcome.outOfTime = outOfTime
@@ -277,14 +308,12 @@ extension SyncEngine {
 
         switch changeSet.folderList {
         case .complete(let folderList):
-            outcome.appliedFolderList = try await dbPool.write { db in
+            _ = try await dbPool.write { db in
                 try Self.applyFolderList(folderList, account: account, db: db)
             }
         case .updated(let updates):
-            // Folders already stored, matched by path: nothing to add or remove,
-            // so the full sync's own discovery is not needed either.
+            // Folders already stored, matched by path: nothing to add or remove.
             try await dbPool.write { db in try Self.applyFolderUpdates(updates, accountId: accountId, db: db) }
-            outcome.appliedFolderList = []
         case nil:
             break
         }
@@ -386,10 +415,11 @@ extension SyncEngine {
         return outcome
     }
 
-    /// Names and counts of folders already stored, matched by path, column by
-    /// column (`updateChanges`, which bumps no backfill version; ADR-IOS-107). A
-    /// path not stored is ignored: adding and removing folders is the complete
-    /// list's job.
+    /// Names of folders already stored, matched by path, column by column
+    /// (`updateChanges`, which bumps no backfill version; ADR-IOS-107). A path
+    /// not stored is ignored: adding and removing folders is the complete list's
+    /// job. Counts are not written: a folder's counters have one writer, its
+    /// listing.
     nonisolated static func applyFolderUpdates(_ updates: [FolderInfo], accountId: String, db: Database) throws {
         for info in updates {
             guard var folder = try Folder
@@ -397,7 +427,6 @@ extension SyncEngine {
                 .fetchOne(db) else { continue }
             let original = folder
             folder.name = info.name
-            folder.totalCount = info.totalCount
             _ = try folder.updateChanges(db, from: original)
         }
     }
@@ -410,8 +439,11 @@ extension SyncEngine {
     ///   asked to list again (#783). It is stored also when the full sync
     ///   dropped a folder (`FullSyncListing.droppedFolder`: a lost connection
     ///   stops the listing there, so that folder and every later one; a failed
-    ///   retry or SELECT, that folder). Those folders stay untracked and the
-    ///   caller keeps the full sync due, so the next foreground pass lists them;
+    ///   retry, a short FETCH, or an empty count the server did not confirm
+    ///   (`ProviderListingUnconfirmed`), that folder) or found one not listable
+    ///   (`notListableFolderIds`: SELECT refused or no usable EXISTS). Those
+    ///   folders stay untracked; for a dropped one the caller keeps the full
+    ///   sync due, so the next foreground pass lists them;
     ///   their changes after the candidate arrive by the reads from the bookmark
     ///   (an account-wide reader names every folder, and a full record inserts a
     ///   message the folder does not hold yet). A listing that fails any other
@@ -436,7 +468,9 @@ extension SyncEngine {
                 var state = FolderChangeState(raw: folder.changeState)
                 // A folder still owed its self-heal pass after an unproven move
                 // stays untracked: the next full sync lists it and heals it again.
-                guard !state.tracking, !state.selfHealDue else { continue }
+                // So does one whose count check is still owed (`listingDue`): a
+                // tracked folder gets no listing, so the check could never finish.
+                guard !state.tracking, !state.selfHealDue, !state.listingDue else { continue }
                 state.tracking = true
                 if let left, let bookmark = left {
                     try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ? AND changeCursor = ?", arguments: [state.encoded, folderId, bookmark])

@@ -144,11 +144,14 @@ enum ScreenshotMode {
                 for f in folders {
                     try db.execute(
                         sql: """
-                            INSERT INTO folder (id, accountId, name, path, role, unreadCount, totalCount, backfillComplete)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT INTO folder (id, accountId, name, path, role, unreadCount, backfillComplete)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
                             """,
-                        arguments: [f.id, f.accountId, f.name, f.path, f.role, f.unread, f.total, true]
+                        arguments: [f.id, f.accountId, f.name, f.path, f.role, f.unread, true]
                     )
+                    // The synthetic count goes through the counters' one writer.
+                    try SyncEngine.writeListingCounters(
+                        ListingCounters(messageCount: f.total, uidNext: nil, highestModSeq: nil), folderId: f.id, db: db)
                 }
 
                 // --- Messages ---

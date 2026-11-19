@@ -34,8 +34,6 @@ extension SyncEngine {
             UPDATE folder SET
                 backfillComplete = 0,
                 oldestSyncedDate = NULL,
-                lastKnownUidNext = NULL,
-                lastKnownHighestModSeq = NULL,
                 backfillUidCursor = NULL,
                 backfillPageToken = NULL,
                 backfillPageHeldSince = NULL,
@@ -46,9 +44,11 @@ extension SyncEngine {
         let accountReset = "UPDATE account SET lastHistoryId = NULL, lastFullSyncAt = NULL"
         if let accountId {
             try db.execute(sql: folderReset + " WHERE accountId = ?", arguments: [accountId])
+            try invalidateListingCounters(Folder.filter(Column("accountId") == accountId), resettingCount: false, db: db)
             try db.execute(sql: accountReset + " WHERE id = ?", arguments: [accountId])
         } else {
             try db.execute(sql: folderReset)
+            try invalidateListingCounters(Folder.all(), resettingCount: false, db: db)
             try db.execute(sql: accountReset)
         }
     }

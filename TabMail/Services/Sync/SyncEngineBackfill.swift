@@ -368,34 +368,30 @@ extension SyncEngine {
 
     /// Query current backfill state and push to AccountManager for UI.
     /// Derives headersDone from DB (all folders backfillComplete) — no in-memory cache.
+    ///
+    /// The denominator has its own provider-side source (`progressTotal`), never
+    /// the stored folder counters. While the provider's total is not known yet
+    /// (before this launch's first folder list) nothing is published: the bar
+    /// stays hidden rather than show 0 or the stored row count.
     func updateBackfillProgressForAccount(_ account: Account) async {
         let accountId = account.id
+        // Quick DB check: are all folders done?
+        let folders = (try? await dbPool.read { db in
+            try Folder.filter(Column("accountId") == accountId && Column("path") != "").fetchAll(db)
+        })
+        let headersDone = Self.folderWalkDone(folders)
 
-        // Quick DB check: are all folders done? + UID walk progress
-        let (incompleteFolders, uidTotal, uidWalked) = (try? await dbPool.read { db -> (Int, Int, Int) in
-            let folders = try Folder.filter(
-                Column("accountId") == accountId &&
-                Column("path") != ""
-            ).fetchAll(db)
-            let incomplete = folders.filter { !$0.backfillComplete }.count
-            // UID progress: sum of (UIDNEXT-1) for total scope, walked = total - remaining cursors
-            var total = 0
-            var walked = 0
-            for folder in folders {
-                let uidNext = folder.lastKnownUidNext ?? 0
-                guard uidNext > 0 else { continue }
-                let folderTotal = uidNext - 1
-                total += folderTotal
-                if folder.backfillComplete {
-                    walked += folderTotal  // Fully walked
-                } else if let cursor = folder.backfillUidCursor {
-                    walked += max(0, folderTotal - cursor)  // Partially walked
-                }
-                // cursor == nil && !complete → not started, walked = 0
-            }
-            return (incomplete, total, walked)
-        }) ?? (1, 0, 0)
-        let headersDone = incompleteFolders == 0
+        // The provider is the source (#755): Gmail keeps its profile total,
+        // Exchange answers its latest folder list's sum, IMAP its folder lists'
+        // UIDNEXT. A provider not registered yet, or one with no folder list yet
+        // (`.notKnownYet`), publishes nothing: the bar waits for its source.
+        guard let provider = providers[accountId] else { return }
+        let source = await provider.progressTotal(crawling: !headersDone)
+        if source == .notKnownYet { return }
+        let uidNextByPath: [String: Int]
+        if case .uidNext(let map) = source { uidNextByPath = map } else { uidNextByPath = [:] }
+        let walk = Self.uidWalkProgress(folders: folders ?? [], uidNextByPath: uidNextByPath)
+        let (uidTotal, uidWalked) = (walk.total, walk.walked)
 
         // GRDB is sole authority for body status flags
         let (grdbTotal, grdbIndexed, pendingBody) = (try? await dbPool.read { db -> (Int, Int, Int) in
@@ -430,26 +426,9 @@ extension SyncEngine {
         // PROJECT_MEMORY "Fast Sync / backfill completion".
         var totalEmails = grdbTotal
         let ftsIndexed = grdbIndexed
-        if uidTotal == 0 && !headersDone {
-            // Fetch & cache server total on first call
-            if serverMessageTotal[accountId] == nil {
-                if let gp = providers[accountId] as? GmailProvider {
-                    if let t = try? await gp.getMessagesTotal(), t > 0 { serverMessageTotal[accountId] = t }
-                } else if providers[accountId] is ExchangeProvider {
-                    // Exchange folders don't overlap — sum totalCount from DB
-                    let sum = (try? await dbPool.read { db in
-                        try Int.fetchOne(db, sql: """
-                            SELECT COALESCE(SUM(totalCount), 0) FROM folder
-                            WHERE accountId = ? AND path != ''
-                            """, arguments: [accountId])
-                    }) ?? nil
-                    if let s = sum, s > 0 { serverMessageTotal[accountId] = s }
-                }
-            }
-            if let serverTotal = serverMessageTotal[accountId], serverTotal > grdbTotal {
-                totalEmails = serverTotal
-                // ftsIndexed stays as-is (bodies indexed), total becomes server count
-            }
+        if uidTotal == 0 && !headersDone, case .messages(let serverTotal) = source, serverTotal > grdbTotal {
+            totalEmails = serverTotal
+            // ftsIndexed stays as-is (bodies indexed), total becomes server count
         }
 
         await AccountManager.shared.updateBackfillProgress(
@@ -461,18 +440,50 @@ extension SyncEngine {
             )
     }
 
+    /// UID walk progress: per folder, the scope is UIDNEXT-1 (from the provider's
+    /// last folder list) and the walked part is the scope for a completed folder,
+    /// the scope less the crawl's cursor for a started one, 0 otherwise. A folder
+    /// the list gave no UIDNEXT adds nothing.
+    nonisolated static func uidWalkProgress(folders: [Folder], uidNextByPath: [String: Int]) -> (total: Int, walked: Int) {
+        var total = 0
+        var walked = 0
+        for folder in folders {
+            let uidNext = uidNextByPath[folder.path] ?? 0
+            guard uidNext > 0 else { continue }
+            let folderTotal = uidNext - 1
+            total += folderTotal
+            if folder.backfillComplete {
+                walked += folderTotal
+            } else if let cursor = folder.backfillUidCursor {
+                // Clamped to this folder's own denominator: a crawl that started
+                // after UIDNEXT moved past the folder list's value (cursor above
+                // it) counts 0, never a negative share or more than the folder
+                // (#755). Only a folder whose walk is complete counts in full.
+                walked += min(folderTotal, max(0, folderTotal - cursor))
+            }
+        }
+        return (total, walked)
+    }
+
     /// Check if all folders have been walked for an account (header crawl complete).
     /// Does NOT check FTS body completion — body fetch is handled by BackfillBodyQueue.
+    /// A failed read answers "not complete": no caller may release work (the
+    /// wake lock, the crawl) on a count it could not read.
     func isFolderWalkComplete(account: Account) async -> Bool {
         let accountId = account.id
-        let incompleteFolders = (try? await dbPool.read { db in
-            try Folder.filter(
-                Column("accountId") == accountId &&
-                Column("backfillComplete") == false &&
-                Column("path") != ""
-            ).fetchCount(db)
-        }) ?? 0
-        return incompleteFolders == 0
+        let folders = try? await dbPool.read { db in
+            try Folder.filter(Column("accountId") == accountId && Column("path") != "").fetchAll(db)
+        }
+        return Self.folderWalkDone(folders)
+    }
+
+    /// The account's header walk is done: its folders were read (nil = the read
+    /// failed), at least one real folder is known (none = not discovered yet),
+    /// and every one of them finished its walk. Fails closed.
+    nonisolated static func folderWalkDone(_ folders: [Folder]?) -> Bool {
+        guard let folders else { return false }
+        let real = folders.filter { !$0.path.isEmpty }
+        return !real.isEmpty && real.allSatisfy(\.backfillComplete)
     }
 
 }

@@ -583,9 +583,9 @@ struct AppReleaseBoundaryAdmissionTests {
                 isRead: false, isFlagged: false, hasAttachments: false,
                 isReplied: false, isForwarded: false, actionTag: nil)
         ])
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: inbox, provider: mock, limit: 50,
-            dbPool: PrioritizedDatabase(pool: f.pool))
+            dbPool: PrioritizedDatabase(pool: f.pool)).requireResult()
 
         // MEMBERSHIP — the message is back in the folder the server holds it in,
         // and it is query-visible rather than a half-written row.

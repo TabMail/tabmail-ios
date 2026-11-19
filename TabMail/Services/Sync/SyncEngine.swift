@@ -17,6 +17,14 @@ actor SyncEngine {
     let primaryRoles = SyncEngine.syncedPrimaryRoles
     let secondaryRoles = SyncEngine.syncedSecondaryRoles
 
+    /// Per account: a listing in the current foreground pass that proved
+    /// nothing. Only grows during the pass (every unproven `listFolder` and
+    /// full-sync listing adds the account; nothing removes it but the start of
+    /// the next pass), so an error after it, in any later folder or route,
+    /// never loses it; `lastFullSyncAt` is stamped only when the account is not
+    /// in it (#755).
+    var unprovenListingPasses: Set<UUID> = []
+
     var headerBackfillTasks: [String: Task<Void, Never>] = [:]
 
     /// When the account's current catch-up slice window ends (ADR-IOS-107, #766):
@@ -25,9 +33,6 @@ actor SyncEngine {
     /// `SyncConfig.catchUpSliceIntervalSeconds`. In memory only; a relaunch starts afresh.
     var catchUpSliceWindowEnds: [String: Date] = [:]
 
-    /// Cached server-reported total message count for Gmail/Exchange accounts.
-    /// Used as progress denominator instead of FTS row count (which grows with crawl).
-    var serverMessageTotal: [String: Int] = [:]
 
     /// Generation counter per account — prevents stale task defer from clearing
     /// a replacement task's dictionary entry after resetCrawlState.
@@ -544,9 +549,14 @@ actor SyncEngine {
         // makes the full sync due in this pass, and its listings decide which
         // folders become tracked and whether a candidate bookmark is stored.
         var changePass: ChangePassOutcome?
+        // This pass's own unproven listings (#755): its change pass's
+        // untracked refreshes record here; an on-demand listing running at the
+        // same time belongs to no pass and never does.
+        let pass = UUID()
+        defer { unprovenListingPasses.remove(pass) }
         do {
             let deltaResult = try await queue.execute(priority: .headerFetch) {
-                try await self.performChangePass(account: account, provider: provider, deadline: deadline)
+                try await self.performChangePass(account: account, provider: provider, deadline: deadline, pass: pass)
             }
             changePass = deltaResult
             if deltaResult.succeeded {
@@ -570,7 +580,7 @@ actor SyncEngine {
                     // retry reads from the account row as it is now.
                     guard let current = try await accountAtTurnStart(account.id) else { throw error }
                     let retryResult = try await queue.execute(priority: .headerFetch) {
-                        try await self.performChangePass(account: current, provider: provider, deadline: deadline)
+                        try await self.performChangePass(account: current, provider: provider, deadline: deadline, pass: pass)
                     }
                     changePass = retryResult
                     if retryResult.succeeded {
@@ -610,7 +620,7 @@ actor SyncEngine {
         let fullSyncDue = timeSinceFullSync >= fullSyncInterval || listingNeeded
         if fullSyncDue {
             BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"), new bookmark: \(listingNeeded))...")
-            let plan = FullSyncPlan(appliedFolderList: changePass?.appliedFolderList)
+            let plan = FullSyncPlan(deadline: deadline)
             let listing: FullSyncListing
             do {
                 listing = try await queue.execute(priority: .headerFetch) {
@@ -642,17 +652,18 @@ actor SyncEngine {
                 await self.healFoldersAfterAnUnprovenMove(account: account)
             }
 
-            var listingDone = true
             if let changePass, changePass.fromReader {
                 // The reader's bookmark was read BEFORE these listings; store a
                 // candidate and turn tracking on only now that they are done.
                 try await commitChangeBaseline(
                     account: account, outcome: changePass, listedFolderIds: listing.listedFolderIds)
-                listingDone = !listing.droppedFolder
             }
 
+            // Never stamped after a pass in which a started listing failed to
+            // prove its window (#755). A folder the server made not listable
+            // (SELECT refused, no usable EXISTS) does not withhold it.
             let now = Date()
-            let fullSyncDone = listingDone
+            let fullSyncDone = !listing.droppedFolder && !unprovenListingPasses.contains(pass)
             try await dbPool.write { db in
                 _ = try Account.filter(Column("id") == account.id)
                     .updateAll(db, Column("lastSyncedAt").set(to: now))
@@ -982,6 +993,7 @@ actor SyncEngine {
     /// Not a connection error — the connection is fine, just this folder can't be opened.
     /// Callers should skip the folder and continue with the next one.
     nonisolated static func isSelectFailedError(_ error: Error) -> Bool {
+        if error is ProviderFolderNotListable { return true }
         let msg = "\(error)"
         return msg.contains("Select mailbox failed")
     }

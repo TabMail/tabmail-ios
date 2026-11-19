@@ -179,10 +179,10 @@ struct RFC822IdentityMergeGuardTests {
     private func sync(
         _ pool: DatabasePool, folderId: String, provider: MockEmailProvider
     ) async throws -> SyncEngine.SyncMessagesResult {
-        try await SyncEngine.runSyncMessages(
+        try await SyncEngine.runListing(
             for: try folder(pool, id: folderId), provider: provider,
             limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
     }
 
     private func header(_ pool: DatabasePool, id: String) throws -> MessageHeader? {

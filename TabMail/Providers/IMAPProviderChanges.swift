@@ -430,7 +430,7 @@ extension IMAPProvider {
             let listed = Set(toFetch)
             let deletedArrivals = Set(changed.filter { $0.key.value >= cursor.uidNext && $0.value.contains(.deleted) }.map(\.key.value))
             toFetch += Self.arrivals(
-                in: found.asSet, from: cursor.uidNext, excluding: listed.union(deletedArrivals),
+                in: try found.listed(within: range), from: cursor.uidNext, excluding: listed.union(deletedArrivals),
                 room: SyncConfig.imapChangeArrivalsLimit - toFetch.count
             )
         }
@@ -628,7 +628,7 @@ extension IMAPProvider {
             let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
                 try await server.extendedSearch(identifierSet: missingSet, criteria: [.all])
             }
-            let confirmed = Self.confirmMissing(missing, present: found.asSet)
+            let confirmed = Self.confirmMissing(missing, present: try found.listed(within: missingSet))
             unreadable += confirmed.unreadable
             removals += confirmed.removals
         }

@@ -292,7 +292,7 @@ final class AccountOperationExecutor {
                     continue
                 }
                 do {
-                    try await queue.execute(priority: .userAction) {
+                    _ = try await queue.execute(priority: .userAction) {
                         try await manager.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
                     }
                     queueLog("[MoveTrace] post-drain sync — completed for \(folder.name)")

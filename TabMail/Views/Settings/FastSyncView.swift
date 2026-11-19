@@ -33,6 +33,11 @@ struct FastSyncView: View {
     /// owns (re)populating the queues on wake.
     @State private var activeBodyIdle = false
     @State private var backfillBodyIdle = false
+    /// Polled with the queues: each account's header walk done, read from the
+    /// folders' `backfillComplete` (`SyncEngine.isFolderWalkComplete`), never from
+    /// the progress entry, which is not published until the launch's first
+    /// folder list (#755). Missing = not polled yet = not done (holds awake).
+    @State private var walkDoneByAccount: [String: Bool] = [:]
 
     /// True when all accounts have progress AND all are fully complete.
     ///
@@ -49,8 +54,13 @@ struct FastSyncView: View {
     /// it counts the same rows as resolved, so the two agree. The user still learns the
     /// truth about the individual message: opening it reports "unable to load".
     private var isAllComplete: Bool {
-        let values = Array(state.backfillProgressByAccount.values)
-        return !values.isEmpty && values.allSatisfy(\.isFullyComplete)
+        Self.allAccountsComplete(accountIds: navigationStore.accounts.map(\.id), progress: state.backfillProgressByAccount)
+    }
+
+    /// Every current account has published progress and it is complete: an
+    /// account whose progress is not published yet is not complete.
+    nonisolated static func allAccountsComplete(accountIds: [String], progress: [String: BackfillProgress]) -> Bool {
+        !accountIds.isEmpty && accountIds.allSatisfy { progress[$0]?.isFullyComplete == true }
     }
 
     /// Keep-awake predicate. The device stays awake while there is RUNNABLE body
@@ -87,14 +97,20 @@ struct FastSyncView: View {
     }
 
     /// Live keep-awake value — maps the current SwiftUI state into the pure
-    /// predicate. `state.backfillProgressByAccount[$0.id]?.headersDone == true`
-    /// preserves the `?.headersDone != true` semantics (a missing progress entry ⇒
-    /// not-done ⇒ hold awake).
+    /// predicate (`holdAwake(accounts:…)`).
     private var holdAwake: Bool {
-        Self.keepScreenAwakeWhileWorking(
-            accountHeadersDone: navigationStore.accounts.map {
-                state.backfillProgressByAccount[$0.id]?.headersDone == true
-            },
+        Self.holdAwake(accounts: navigationStore.accounts, walkDoneByAccount: walkDoneByAccount,
+                       activeBodyIdle: activeBodyIdle, backfillBodyIdle: backfillBodyIdle)
+    }
+
+    /// The keep-awake decision from one poll: an account's header walk is done
+    /// only when its folder rows say so (`walkDoneByAccount`, from
+    /// `SyncEngine.isFolderWalkComplete`), never from a published progress
+    /// entry. An account not polled yet counts as not done (hold awake).
+    static func holdAwake(accounts: [Account], walkDoneByAccount: [String: Bool],
+                          activeBodyIdle: Bool, backfillBodyIdle: Bool) -> Bool {
+        keepScreenAwakeWhileWorking(
+            accountHeadersDone: accounts.map { walkDoneByAccount[$0.id] == true },
             activeBodyIdle: activeBodyIdle,
             backfillBodyIdle: backfillBodyIdle
         )
@@ -106,8 +122,23 @@ struct FastSyncView: View {
     /// lock releases once the header walk is done and the queues drain (the
     /// quarantined oversized rows having been removed from the queue).
     private func refreshBodyQueueIdleState() async {
-        activeBodyIdle = await ActiveBodyQueue.shared.isIdle
-        backfillBodyIdle = await BackfillBodyQueue.shared.isIdle
+        let poll = await Self.pollKeepAwakeInputs(accounts: navigationStore.accounts, engine: manager.syncEngine)
+        activeBodyIdle = poll.activeBodyIdle
+        backfillBodyIdle = poll.backfillBodyIdle
+        walkDoneByAccount = poll.walkDoneByAccount
+    }
+
+    /// One poll of the keep-awake inputs: both body queues' idle state and each
+    /// account's header walk read from its folder rows.
+    static func pollKeepAwakeInputs(accounts: [Account], engine: SyncEngine) async
+        -> (activeBodyIdle: Bool, backfillBodyIdle: Bool, walkDoneByAccount: [String: Bool]) {
+        let activeIdle = await ActiveBodyQueue.shared.isIdle
+        let backfillIdle = await BackfillBodyQueue.shared.isIdle
+        var walkDone: [String: Bool] = [:]
+        for account in accounts {
+            walkDone[account.id] = await engine.isFolderWalkComplete(account: account)
+        }
+        return (activeIdle, backfillIdle, walkDone)
     }
 
     private func formatETA(_ seconds: Double) -> String {

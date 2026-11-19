@@ -712,8 +712,6 @@ extension AccountManager {
                 // step 5 owns advancing it, and leaving it here is what makes an
                 // abort between the two re-drivable.
                 if var folder = try Folder.fetchOne(db, key: folderId) {
-                    folder.lastKnownUidNext = nil
-                    folder.lastKnownHighestModSeq = nil
                     folder.catchUpState = nil
                     // The change bookmark and re-read list name the dead
                     // generation: a kept bookmark would cost a pass refused on
@@ -726,8 +724,10 @@ extension AccountManager {
                     folder.backfillPageHeldSince = nil
                     folder.oldestSyncedDate = Date()
                     folder.unreadCount = 0
-                    folder.totalCount = 0
                     try folder.update(db)
+                    // The listing's counters, through their one owner.
+                    try SyncEngine.invalidateListingCounters(
+                        Folder.filter(Column("id") == folderId), resettingCount: true, db: db)
                 }
 
                 return UidValidityResetPurgeResult(purgedMessageIds: purgedMessageIds)

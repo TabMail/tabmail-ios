@@ -277,7 +277,7 @@ extension SyncEngine {
     /// `InboxView.onAppear` → `InboxViewModel.startSync()` → `performSync()` →
     /// `AccountManager.syncFolders(_:connecting:)` (in `AccountManagerFetch.swift`, which
     /// filters on `!folder.path.isEmpty` alone — no role predicate, no favourite
-    /// predicate) → `SyncEngine.syncFolderMessages` → `syncMessages` →
+    /// predicate) → `SyncEngine.syncFolderMessages` → `listFolder` → `runListing` →
     /// `runSyncMessages`, carrying T1.2b's SELECT-sourced bootstrap.
     /// `SyncEngineFullSync.swift` says so itself, three lines under the
     /// `syncableFolders` construction: *"Custom non-favorited folders sync
@@ -1550,7 +1550,6 @@ extension SyncEngine {
                                     guard try Self.writeUIDWalkPosition(
                                         db, folderId: folderId, premiseEpoch: writePremise, position: position, [
                                             Column("backfillComplete").set(to: true),
-                                            Column("lastKnownUidNext").set(to: uidNext),
                                         ]
                                     ) else { return false }
                                     _ = try Self.bootstrapCrawledFolderUidValidity(
@@ -1646,7 +1645,6 @@ extension SyncEngine {
                                 guard try Self.writeUIDWalkPosition(
                                     db, folderId: folderId, premiseEpoch: writePremise, position: position, [
                                         Column("backfillUidCursor").set(to: initialCursor),
-                                        Column("lastKnownUidNext").set(to: uidNext),
                                     ]
                                 ) else { return (landed: false, stamped: false) }
                                 let stamped = try Self.bootstrapCrawledFolderUidValidity(
