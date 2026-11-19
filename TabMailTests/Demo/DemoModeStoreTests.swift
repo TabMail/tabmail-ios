@@ -274,6 +274,27 @@ struct DemoModeStoreTests {
         #expect(!store.hidesAIContent)
     }
 
+    @Test("Starting the demo from the debug menu leaves the device's AI setting as it was")
+    func debugMenuStartKeepsTheDeviceSetting() async throws {
+        let store = DemoModeStore.shared
+        let restore = AITestSetting.save()
+        defer { store._resetForTests(); restore() }
+        store._resetForTests()
+        AITestSetting.set(aiOff: true)
+        let suite = AIService.optOutStore
+        let choiceBefore = suite.object(forKey: AIService.aiChoiceMadeKey) as? Bool
+        let optOutBefore = suite.object(forKey: AIService.optOutAllAIKey) as? Bool
+        // An active demo makes the start step a no-op, so only the debug menu's own flags run.
+        store.isActive = true
+
+        try await DemoModeService.shared.startFromDebugMenu()
+
+        #expect(store.hasCompletedConsentGate && store.enteredFromDebugMenu)
+        #expect(AIService.isAIOff)
+        #expect(suite.object(forKey: AIService.aiChoiceMadeKey) as? Bool == choiceBefore)
+        #expect(suite.object(forKey: AIService.optOutAllAIKey) as? Bool == optOutBefore)
+    }
+
 }
 
 @Suite("DemoAuth helpers — JWT format constants")

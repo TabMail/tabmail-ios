@@ -217,6 +217,19 @@ struct OneAISettingForTheDeviceTests {
             }
         }
         #expect(callers == Array(repeating: "TabMailAuthService.swift", count: 3), "\(callers)")
+
+        // Only the sign-in step clears the device's AI answer.
+        let clearers = try ["TabMail", "TabMailNotificationService", "Shared"].flatMap { dir -> [String] in
+            let base = root.appendingPathComponent(dir)
+            let files = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil)?
+                .compactMap { $0 as? URL }.filter { $0.pathExtension == "swift" } ?? []
+            return try files.flatMap { file in
+                try String(contentsOf: file, encoding: .utf8).components(separatedBy: "\n")
+                    .filter { $0.contains("AIConsentPolicy.clearChoice(") && !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+                    .map { _ in file.lastPathComponent }
+            }
+        }
+        #expect(clearers == ["TabMailAuthService+AIChoice.swift"], "\(clearers)")
     }
 
     // MARK: - An answer from an earlier version
