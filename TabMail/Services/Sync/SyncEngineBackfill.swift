@@ -333,7 +333,7 @@ extension SyncEngine {
                             let sleepDelay = walkAllowed
                                 ? Self.backfillInterCycleDelay(cycle: cycle, walkComplete: walkDone, profile: profile)
                                 : (powerHeld ? 60 : 30)
-                            try? await Task.sleep(for: .seconds(sleepDelay))
+                            await Self.backfillSleep(seconds: sleepDelay)
                             continue
                         }
 
@@ -342,7 +342,7 @@ extension SyncEngine {
                     }
 
                     let sleepSeconds = Self.backfillInterCycleDelay(cycle: cycle, walkComplete: walkDone, profile: profile)
-                    try? await Task.sleep(for: .seconds(sleepSeconds))
+                    await Self.backfillSleep(seconds: sleepSeconds)
                 }
 
                 // Only clear dictionary if this task is still the current generation.

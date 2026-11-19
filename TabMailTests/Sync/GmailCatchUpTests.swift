@@ -3131,15 +3131,14 @@ struct GmailCatchUpTests {
             world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
             let account = try await Self.account(world)
 
-            let walkAllowed = await DownloadGateHarness.runOnce(world.engine, account: account, gate: gate, runner: runner)
+            try await DownloadGateHarness.runOnce(world.engine, account: account, gate: gate, runner: runner)
+            let walkHeld = !DownloadGateHarness.walkExpected(gate, runner)
 
-            #expect(walkAllowed != nil, "the \(runner) ran nothing under \(gate): the scan waited for a download gate")
             #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the lapsed folder was listed under \(gate)")
             let rows = try Self.rows(world, inboxPath)
             #expect(rows["g0"]?.isRead == false, "the lapsed change arrives under \(gate)")
             #expect(rows["moved"] != nil, "a listed message no local row held loads with the scan under \(gate)")
-            #expect(walkAllowed == DownloadGateHarness.walkExpected(gate, runner), "the walk decision under \(gate)")
-            if walkAllowed == false {
+            if walkHeld {
                 let pages = world.server.http.recordedCalls().map(\.url).filter { $0.contains("/messages?") && !$0.contains("after") }
                 #expect(pages.isEmpty, "the held walk listed no page: \(pages)")
                 #expect(rows["old"] == nil, "the held walk loaded nothing older than every local row")
@@ -3175,6 +3174,88 @@ struct GmailCatchUpTests {
 
             #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the listing after the lapse ran and completed")
             #expect(try Self.rows(world, inboxPath)["g2"]?.isRead == false, "the change in the passed range arrives")
+        }
+    }
+
+    // MARK: - The worker's wait while the walk is held (#1063)
+
+    /// A lapsed Inbox whose walk is `walkComplete` or not, with `g0` marked unread
+    /// on the server.
+    private static func heldWalkWorld(
+        _ name: String, walkComplete: Bool, _ body: (World, Account) async throws -> Void
+    ) async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.rangesWorld(clock, count: 3)
+        try await Self.withWorld(name, seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let folderId = world.folderId(inboxPath)
+            let lapsed = GmailCatchUpState(
+                lastCompletedAt: Date().addingTimeInterval(-3_600), lapseCount: 1, listedLapseCount: 0).encoded()
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ?, backfillComplete = ? WHERE id = ?",
+                               arguments: [lapsed, walkComplete ? 1 : 0, folderId])
+            }
+            world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
+            try await body(world, try await Self.account(world))
+        }
+    }
+
+    /// The real worker with its walk held, by a power gate or by Wi-Fi-only on
+    /// cellular. The first cycle's scan repairs the lapsed change before any wait,
+    /// and the wait after it is the normal one (the catch-up made progress). The
+    /// next cycle has nothing to do, so the worker waits 60 s (a power gate) or
+    /// 30 s (Wi-Fi-only); no cycle starts inside that wait, and the next one runs
+    /// after it. The walk never sends a request.
+    @Test("With the walk held, the worker scans first, then waits 60 s for a power gate or 30 s for Wi-Fi-only, and retries after the wait",
+          arguments: [DownloadGate.lowPowerMode, .lowBattery, .expensiveNetwork])
+    func heldWalkWaitsThenRetries(gate: DownloadGate) async throws {
+        try await Self.heldWalkWorld("gcu-held-wait-\(gate.rawValue)", walkComplete: false) { world, account in
+            try await DownloadGateHarness.withNetwork(expensive: gate == .expensiveNetwork) { () async throws in
+                try await DownloadGateHarness.withWorker(world.engine, account: account, power: DownloadGateHarness.power(gate)) { sleeps async throws in
+                    #expect(await sleeps.waitFor(count: 1), "the first cycle never ended")
+                    #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the scan ran before the first wait")
+                    #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the lapsed change arrived before the first wait")
+                    let profile = await world.engine.getBackfillProfile()
+                    let productive = SyncEngine.backfillInterCycleDelay(
+                        cycle: .init(walked: false, caughtUp: true), walkComplete: false, profile: profile)
+                    #expect(sleeps.recorded.first == productive, "a productive cycle waits the normal delay: \(sleeps.recorded)")
+
+                    sleeps.release()
+                    #expect(await sleeps.waitFor(count: 2), "the idle cycle never ended")
+                    let held: TimeInterval = gate == .expensiveNetwork ? 30 : 60
+                    #expect(sleeps.recorded.dropFirst().first == held, "the held walk's wait under \(gate): \(sleeps.recorded)")
+
+                    // A lapse makes the next cycle list again; inside the wait, no cycle starts.
+                    try await Self.lapse(world)
+                    try? await Task.sleep(for: .milliseconds(500))
+                    #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "a cycle started inside the wait")
+                    #expect(sleeps.recorded.count == 2)
+
+                    sleeps.release()
+                    let retried = try await Self.eventually(seconds: 30, poll: .milliseconds(20)) {
+                        try Self.state(world, inboxPath)?.listedLapseCount == 2
+                    }
+                    #expect(retried, "the worker never retried after the wait")
+                }
+            }
+            let pages = world.server.http.recordedCalls().map(\.url).filter { $0.contains("/messages?") && !$0.contains("after") }
+            #expect(pages.isEmpty, "the held walk listed a page: \(pages)")
+        }
+    }
+
+    /// The control: with the walk complete, a cycle with nothing to do ends the
+    /// worker; it does not wait for a held walk.
+    @Test("With the walk complete, the worker stops after an idle cycle instead of waiting for a held walk")
+    func completedWalkStopsTheWorker() async throws {
+        try await Self.heldWalkWorld("gcu-held-wait-done", walkComplete: true) { world, account in
+            try await DownloadGateHarness.withNetwork(expensive: false) { () async throws in
+                try await DownloadGateHarness.withWorker(world.engine, account: account, power: DownloadGateHarness.power(.lowPowerMode)) { sleeps async throws in
+                    #expect(await sleeps.waitFor(count: 1), "the first cycle never ended")
+                    #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the scan ran")
+                    sleeps.release()
+                    #expect(await sleeps.waitFor(count: 2, seconds: 2) == false,
+                            "the worker waited again with its walk complete: \(sleeps.recorded)")
+                }
+            }
         }
     }
 

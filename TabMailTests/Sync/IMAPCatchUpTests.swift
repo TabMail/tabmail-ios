@@ -737,15 +737,14 @@ struct IMAPCatchUpTests {
                 listing: nil), world)
             let commandsBefore = world.server.recordedCommands().count
 
-            let walkAllowed = await DownloadGateHarness.runOnce(world.engine, account: account, gate: gate, runner: runner)
+            try await DownloadGateHarness.runOnce(world.engine, account: account, gate: gate, runner: runner)
+            let walkHeld = !DownloadGateHarness.walkExpected(gate, runner)
             await world.engine.remove(accountId: accountId)
 
-            #expect(walkAllowed != nil, "the \(runner) ran nothing under \(gate): the scan waited for a download gate")
             #expect(try Self.rows(world)["2"]?.isRead == true, "the scan applied the server's read under \(gate)")
             let state = try Self.state(world)
             #expect(state?.lastCompletedAt.map { $0 > Date().addingTimeInterval(-60) } == true, "the daily listing completed")
-            #expect(walkAllowed == DownloadGateHarness.walkExpected(gate, runner), "the walk decision under \(gate)")
-            if walkAllowed == false {
+            if walkHeld {
                 let searches = world.server.recordedCommands().dropFirst(commandsBefore)
                     .filter { $0.uppercased().hasPrefix("UID SEARCH") }
                 #expect(searches.isEmpty, "the held walk sent no range SEARCH: \(searches)")

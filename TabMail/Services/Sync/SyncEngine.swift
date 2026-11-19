@@ -132,11 +132,33 @@ actor SyncEngine {
     /// top of each cycle (MainActor hop): fast sync, Low Power Mode, external power
     /// and the battery level (-1 when unknown).
     func backfillPowerState() async -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
-        await MainActor.run {
+        #if DEBUG
+        if let state = Self.backfillPowerStateForTesting.withLock({ $0 }) { return state }
+        #endif
+        return await MainActor.run {
             let battery = UIDevice.current.batteryState
             return (AccountManagerState.shared.fastSyncModeActive, ProcessInfo.processInfo.isLowPowerModeEnabled,
                     battery == .charging || battery == .full, UIDevice.current.batteryLevel)
         }
+    }
+
+    #if DEBUG
+    /// Test seams for the backfill worker, nil (the default) in normal use: the
+    /// power state `backfillPowerState` returns instead of the device's, and the
+    /// wait between cycles, called with its length in seconds instead of
+    /// sleeping. They exist because a simulator cannot enter Low Power Mode and
+    /// no test can wait out the worker's pauses.
+    nonisolated static let backfillPowerStateForTesting =
+        Mutex<(fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float)?>(nil)
+    nonisolated static let backfillSleepForTesting = Mutex<(@Sendable (TimeInterval) async -> Void)?>(nil)
+    #endif
+
+    /// The worker's wait between cycles.
+    nonisolated static func backfillSleep(seconds: TimeInterval) async {
+        #if DEBUG
+        if let sleeper = backfillSleepForTesting.withLock({ $0 }) { await sleeper(seconds); return }
+        #endif
+        try? await Task.sleep(for: .seconds(seconds))
     }
 
     /// The foreground worker's walk decision for one cycle, from one snapshot.

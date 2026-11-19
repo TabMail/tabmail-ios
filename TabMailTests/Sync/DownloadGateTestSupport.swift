@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -40,40 +41,95 @@ enum DownloadGateHarness {
         try await body()
     }
 
-    /// One backfill call by `runner` under `gate`, with the walk decided exactly as
-    /// that runner decides it from the gate's snapshot: the worker one cycle
-    /// (`SyncEngine.backfillWalkAllowed`, then `runBackfillCycle`), the job its
-    /// production entry (`SyncScheduler.backgroundBackfillPlan`, then
-    /// `performBackfill` with the job's deadline). Returns the walk decision, or nil
-    /// when the runner ran nothing at all (the scan waited too).
-    static func runOnce(_ engine: SyncEngine, account: Account, gate: DownloadGate, runner: BackfillRunner) async -> Bool? {
+    /// The worker's power snapshot under `gate`: off power, battery 80% unless the
+    /// gate is a low battery (15%), Low Power Mode only under its gate.
+    static func power(_ gate: DownloadGate) -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
+        (fastSync: false, lowPowerMode: gate == .lowPowerMode, onPower: false, batteryLevel: gate == .lowBattery ? 0.15 : 0.8)
+    }
+
+    /// One backfill by `runner` under `gate`, through the production entry: the
+    /// worker's loop (`SyncEngine.startBackfill`, its first cycle, stopped at its
+    /// first wait) or the job's backfill stage (`SyncScheduler.runBackgroundBackfill`
+    /// with the job's deadline). The engine must have the account's provider
+    /// registered.
+    static func runOnce(_ engine: SyncEngine, account: Account, gate: DownloadGate, runner: BackfillRunner) async throws {
         let expensive = gate == .expensiveNetwork
-        let decision: Bool?
-        switch runner {
-        case .worker:
-            decision = SyncEngine.backfillWalkAllowed(
-                fastSync: false, lowPowerMode: gate == .lowPowerMode, onPower: false,
-                batteryLevel: gate == .lowBattery ? 0.15 : 0.8, wifiOnly: true, expensive: expensive)
-        case .job:
-            decision = SyncScheduler.backgroundBackfillPlan(
-                isLowPowerMode: gate == .lowPowerMode, wifiOnly: true, onWiFi: !expensive)
-        }
-        guard let walkAllowed = decision else { return nil }
-        await withNetwork(expensive: expensive) {
+        try await withNetwork(expensive: expensive) { () async throws in
             switch runner {
             case .worker:
-                _ = await engine.runBackfillCycle(account: account, walkAllowed: walkAllowed)
+                try await withWorker(engine, account: account, power: power(gate)) { sleeps async throws in
+                    #expect(await sleeps.waitFor(count: 1), "the worker's first cycle never ended")
+                }
             case .job:
                 let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
-                _ = await engine.performBackfill(account: account, deadline: deadline, walkAllowed: walkAllowed)
+                await SyncScheduler.runBackgroundBackfill(
+                    accounts: [account], isLowPowerMode: gate == .lowPowerMode, wifiOnly: true, onWiFi: !expensive
+                ) { account, walkAllowed in
+                    _ = await engine.performBackfill(account: account, deadline: deadline, walkAllowed: walkAllowed)
+                }
             }
         }
-        return walkAllowed
+    }
+
+    /// Runs the real backfill worker for `account` with `power` as its power
+    /// snapshot and its waits between cycles handed to a `WorkerSleeps`, then
+    /// stops it (the account is removed from the engine).
+    static func withWorker(
+        _ engine: SyncEngine, account: Account,
+        power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float),
+        _ body: (WorkerSleeps) async throws -> Void
+    ) async throws {
+        let sleeps = WorkerSleeps()
+        SyncEngine.backfillPowerStateForTesting.withLock { $0 = power }
+        SyncEngine.backfillSleepForTesting.withLock { $0 = { await sleeps.sleep($0) } }
+        defer {
+            SyncEngine.backfillPowerStateForTesting.withLock { $0 = nil }
+            SyncEngine.backfillSleepForTesting.withLock { $0 = nil }
+        }
+        await engine.startBackfill(account: account)
+        do {
+            try await body(sleeps)
+        } catch {
+            await engine.remove(accountId: account.id)
+            throw error
+        }
+        await engine.remove(accountId: account.id)
     }
 
     /// Whether `runner` lets the walk run under `gate`: never, except the job under
     /// a low battery, because the job has no battery gate.
     static func walkExpected(_ gate: DownloadGate, _ runner: BackfillRunner) -> Bool {
         runner == .job && gate == .lowBattery
+    }
+}
+
+/// The backfill worker's waits between cycles, under a test's control: each wait
+/// records its length and lasts until the test releases it (or the worker is
+/// cancelled), so no test waits out a real pause and no cycle starts early.
+final class WorkerSleeps: Sendable {
+    private let lengths = Mutex<[TimeInterval]>([])
+    private let released = Mutex(0)
+
+    /// The lengths of the waits so far, in order.
+    var recorded: [TimeInterval] { lengths.withLock { $0 } }
+
+    func sleep(_ seconds: TimeInterval) async {
+        let index = lengths.withLock { $0.append(seconds); return $0.count - 1 }
+        while !Task.isCancelled, released.withLock({ $0 }) <= index {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    /// Ends the waits recorded so far.
+    func release() { released.withLock { $0 = lengths.withLock { $0.count } } }
+
+    /// True once `count` waits have begun, within `seconds`.
+    func waitFor(count: Int, seconds: Double = 30) async -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end {
+            if recorded.count >= count { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return recorded.count >= count
     }
 }

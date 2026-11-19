@@ -543,18 +543,15 @@ final class SyncScheduler {
             let wifiOnly = UserDefaults.standard.object(forKey: Self.wifiOnlyKey) as? Bool ?? true
             var onWiFi = true
             if wifiOnly && !isLowPowerMode { onWiFi = await Self.isOnWiFi() }
-            let walkAllowed = Self.backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: onWiFi)
             if !Task.isCancelled {
                 let accounts = (try? await dbPool.read { db in
                     try Account.filter(Column("isActive") == true).fetchAll(db)
                 }) ?? []
                 let backfillDeadline = Date(timeIntervalSinceNow: SyncConfig.backgroundBackfillDeadlineSeconds)
-                await withTaskGroup(of: Void.self) { group in
-                    for account in accounts {
-                        group.addTask {
-                            _ = await self.manager.runBackfill(account: account, deadline: backfillDeadline, walkAllowed: walkAllowed)
-                        }
-                    }
+                await Self.runBackgroundBackfill(
+                    accounts: accounts, isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: onWiFi
+                ) { account, walkAllowed in
+                    _ = await self.manager.runBackfill(account: account, deadline: backfillDeadline, walkAllowed: walkAllowed)
                 }
             }
 
@@ -1451,6 +1448,20 @@ final class SyncScheduler {
     /// the walk only.
     nonisolated static func backgroundBackfillPlan(isLowPowerMode: Bool, wifiOnly: Bool, onWiFi: Bool) -> Bool {
         !isLowPowerMode && (!wifiOnly || onWiFi)
+    }
+
+    /// The job's backfill stage: every account's backfill runs, so its folder
+    /// scans run, under any gate; the decision passed to `run` holds the walk only.
+    nonisolated static func runBackgroundBackfill(
+        accounts: [Account], isLowPowerMode: Bool, wifiOnly: Bool, onWiFi: Bool,
+        run: @escaping @Sendable (Account, Bool) async -> Void
+    ) async {
+        let walkAllowed = backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: onWiFi)
+        await withTaskGroup(of: Void.self) { group in
+            for account in accounts {
+                group.addTask { await run(account, walkAllowed) }
+            }
+        }
     }
 
     /// Check if the device is currently on WiFi.

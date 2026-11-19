@@ -388,14 +388,13 @@ struct OutlookCatchUpTests {
             #expect(try Self.state(w, w.archive) == nil, "precondition: no listing yet")
             let listingsBefore = w.server.requestCounts().listings
 
-            let walkAllowed = await DownloadGateHarness.runOnce(engine, account: try w.account(), gate: gate, runner: runner)
+            try await DownloadGateHarness.runOnce(engine, account: try w.account(), gate: gate, runner: runner)
+            let walkHeld = !DownloadGateHarness.walkExpected(gate, runner)
 
-            #expect(walkAllowed != nil, "the \(runner) ran nothing under \(gate): the scan waited for a download gate")
             let row = try #require(try w.row("a-1", in: w.archive))
             #expect(row.isRead && row.isFlagged, "the scan healed the stale state under \(gate)")
             #expect(try w.row("a-2", in: w.archive) != nil, "a listed message no local row held loads with the scan under \(gate)")
-            #expect(walkAllowed == DownloadGateHarness.walkExpected(gate, runner), "the walk decision under \(gate)")
-            if walkAllowed == false {
+            if walkHeld {
                 #expect(w.server.requestCounts().listings == listingsBefore, "the held walk listed no page")
                 #expect(try w.row("a-old", in: w.archive) == nil, "the held walk loaded nothing older than every local row")
             }
