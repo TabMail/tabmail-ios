@@ -46,7 +46,9 @@
 choice has been made and Opt Out of AI is off. Both values live in the App Group suite; a missing value never turns
 AI on. The AI choice (`hasSeenAIConsent`) moved from `.standard` to the suite with the opt-out. The one-time move in
 item 1 is replaced by `AIConsentPolicy.migrateLegacyValues`, run as the first statement of `TabMailApp.init` on every
-launch (opt-out first, then a completed choice; a value already in the suite is never overwritten). Until the
+launch (opt-out first, then a completed choice; a value already in the suite is never overwritten). After the copy, both values are removed from `.standard`, so the move happens once: a
+later clear of the suite (the AI choice is asked again at a sign-in with no mail account) is not undone by the next
+launch. A launch that stops between the copy and the removal copies again into the still-empty keys on the next run. Until the
 updated app has run once, the extension finds no choice and sends no AI request (a plain notification); the app
 requeues those messages on launch. The setting is the device's, used by the demo too (ADR-IOS-038 amendment
 2026-11-19).
