@@ -82,11 +82,12 @@ struct FolderResetGenerationTests {
     }
 
     private func makeEnv(
-        accountId: String, shownHasRfc: Bool = true, writeFailure: OneShotWriteFailure? = nil
+        accountId: String, shownHasRfc: Bool = true, writeFailure: OneShotWriteFailure? = nil,
+        archive: [FakeIMAPServer.Message] = []
     ) throws -> Env {
         let server = FakeIMAPServer(mailboxes: [
             "INBOX": [FakeIMAPServer.makeMessage(uid: Self.uid, rfc822Text: Self.rfc822(messageId: Self.replacementRfc))],
-            "Archive": [],
+            "Archive": archive,
             "Trash": [],
         ])
         for path in ["INBOX", "Archive", "Trash"] { server.setUidValidity(Self.newEpoch, for: path) }
@@ -641,18 +642,62 @@ struct FolderResetGenerationTests {
 
     // MARK: - A deferred Undo recorded for the replacement
 
+    /// How the stale request reaches `move`, and what else rides in its batch.
+    enum StaleRoute: String, CaseIterable, CustomStringConvertible {
+        /// The shown header straight into `move`, to Trash (retargets the Undo).
+        case directRetarget
+        /// The shown header straight into `move`, back to Archive (cancels the Undo).
+        case directCancel
+        /// A delete card of an RFC-less shown row: `performCoordinatedRoleMove`
+        /// re-resolves the id to the replacement, whose row sits in Archive.
+        case coordinated
+        /// Batched with a member already in Trash, so nothing is movable.
+        case batchedWithMemberAlreadyThere
+        /// Batched with an unaffected member that is moved for real.
+        case batchedWithMovableMember
+        var description: String { rawValue }
+        var destination: String { self == .directCancel ? "Archive" : "Trash" }
+    }
+
+    private static let otherArchiveUid = 7
+    private static let otherArchiveRfc = "other-archive-7@example.com"
+    private static let otherTrashUid = 9
+
     @Test("""
-    A move stamped before the folder's reset never redirects the Undo the user recorded for the \
-    email re-seated at the same id: the replacement ends where the Undo put it and the stale move is \
-    reported refused; stamped after the reset, the move redirects the Undo as before
-    """, arguments: [true, false])
-    func staleMoveNeverRedirectsADeferredUndoOfTheReplacement(stampedBeforeReset: Bool) async throws {
-        let env = try makeEnv(accountId: "frg-deferred-\(stampedBeforeReset)")
+    A move stamped before the folder's reset never cancels or redirects the Undo the user recorded \
+    for the email re-seated at the same id, by any route and in any batch: the replacement ends \
+    where the Undo put it, the stale member is reported refused and other members act normally; \
+    stamped after the reset, the move cancels or redirects the Undo as before
+    """, arguments: StaleRoute.allCases, [true, false])
+    func staleMoveNeverRedirectsADeferredUndoOfTheReplacement(route: StaleRoute, stampedBeforeReset: Bool) async throws {
+        // RFC-less, so the content witness a card carries cannot tell the rows apart.
+        let env = try makeEnv(
+            accountId: "frg-deferred-\(route)-\(stampedBeforeReset)", shownHasRfc: false,
+            archive: [FakeIMAPServer.makeMessage(
+                uid: Self.otherArchiveUid, rfc822Text: Self.rfc822(messageId: Self.otherArchiveRfc))])
         UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
         clearOverlay()
         await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
 
-        // The view the stale gesture carries: the shown email, read before the reset.
+        // Members of the same batch in folders that never reset.
+        func insertOther(path: String, uid: Int) throws -> MessageHeader {
+            var header = MessageHeader(
+                messageId: String(uid), subject: "other", from: "Sender",
+                fromAddress: "sender@example.com", to: "recipient@example.com",
+                date: Date(), snippet: "other",
+                folderId: "\(env.accountId):\(path)", accountId: env.accountId, folderPath: path,
+                isInInbox: false)
+            header.headerComplete = true
+            header.observedUidValidity = Self.newEpoch
+            if path == "Archive" { header.rfc822MessageId = "<\(Self.otherArchiveRfc)>" }
+            let toInsert = header
+            try env.pool.write { db in try toInsert.insert(db) }
+            return header
+        }
+        let otherInArchive = try insertOther(path: "Archive", uid: Self.otherArchiveUid)
+        let otherInTrash = try insertOther(path: "Trash", uid: Self.otherTrashUid)
+
+        // The view the stale request carries: the shown email, read before the reset.
         let shown = try #require(try await row(env))
         let preResetStamp = FolderResetGeneration.current()
         try await runReset(env)
@@ -685,11 +730,23 @@ struct FolderResetGenerationTests {
         }
         defer { NotificationCenter.default.removeObserver(observer) }
 
-        // The stale gesture: a move to Trash of the SHOWN email's id.
+        // The stale request, naming the SHOWN email's id.
         let stamp = stampedBeforeReset ? preResetStamp : FolderResetGeneration.current()
-        await FolderResetGeneration.$gestureStamp.withValue(stamp) {
-            await AccountManager.shared.move([shown], to: "Trash")
+        let outcome: RoleMoveAdmission = await FolderResetGeneration.$gestureStamp.withValue(stamp) {
+            switch route {
+            case .directRetarget, .directCancel:
+                return await AccountManager.shared.move([shown], to: route.destination)
+            case .coordinated:
+                return await AccountManager.shared.performCoordinatedRoleMove(
+                    ids: [shown.id], role: .trash,
+                    expectedIdentities: [shown.id: ExpectedMessageIdentity(header: shown)!])
+            case .batchedWithMemberAlreadyThere:
+                return await AccountManager.shared.move([shown, otherInTrash], to: "Trash")
+            case .batchedWithMovableMember:
+                return await AccountManager.shared.move([shown, otherInArchive], to: "Trash")
+            }
         }
+        await AccountManager.shared.awaitWriteQueueDrain()
         for _ in 0..<200 where stampedBeforeReset && !refused.withLock({ $0.contains(env.headerId) }) {
             await Task.yield()
         }
@@ -704,21 +761,65 @@ struct FolderResetGenerationTests {
         await AccountManager.shared.awaitWriteQueueDrain()
         try await drainToWire(env)
 
-        let inbox = env.server.messageIDs(in: "INBOX")
-        let trash = env.server.messageIDs(in: "Trash")
+        let replacementOnWire = "<\(Self.replacementRfc)>"
+        let placement = "INBOX=\(env.server.messageIDs(in: "INBOX")) Archive=\(env.server.messageIDs(in: "Archive")) Trash=\(env.server.messageIDs(in: "Trash"))"
         if stampedBeforeReset {
-            #expect(inbox == ["<\(Self.replacementRfc)>"] && trash.isEmpty, """
-                a move stamped before the reset redirected the Undo of the replacement: \
-                INBOX=\(inbox) Archive=\(env.server.messageIDs(in: "Archive")) Trash=\(trash)
-                """)
+            #expect(env.server.messageIDs(in: "INBOX") == [replacementOnWire],
+                    "\(route): a request stamped before the reset changed the Undo of the replacement: \(placement)")
+            #expect(outcome.failedIds.contains(env.headerId),
+                    "\(route): the stale member was not refused as terminal: \(outcome.diagnosticSummary)")
             #expect(refused.withLock { $0.contains(env.headerId) },
-                    "the refused move was not reported, so its hidden row never returns")
+                    "\(route): the refused member was not reported, so its hidden row never returns")
         } else {
-            #expect(trash == ["<\(Self.replacementRfc)>"],
-                    "control: a move stamped after the reset did not redirect the Undo: INBOX=\(inbox) Trash=\(trash)")
+            let undoTarget = route == .directCancel ? "Archive" : "Trash"
+            #expect(env.server.messageIDs(in: undoTarget).contains(replacementOnWire),
+                    "\(route) control: a request stamped after the reset did not change the Undo: \(placement)")
         }
-        #expect(env.server.wrongMessageViolations().isEmpty)
+        if route == .batchedWithMovableMember {
+            #expect(env.server.messageIDs(in: "Trash").contains("<\(Self.otherArchiveRfc)>"),
+                    "the unaffected member of the batch did not move: \(placement)")
+        }
         await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+        await finish(env)
+    }
+
+    @Test("""
+    A reply-draft id (extra colons after the folder) is refused by a stale stamp only when its own \
+    folder was reset; in a folder that was not reset it is never refused as stale
+    """, arguments: [true, false])
+    func replyDraftShapedIdIsJudgedByItsOwnFolder(folderWasReset: Bool) async throws {
+        let env = try makeEnv(accountId: "frg-draft-id-\(folderWasReset)")
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+        try FolderEpochTestFixture.insertFolder(
+            accountId: env.accountId, path: "Drafts", role: .drafts, pool: env.pool,
+            lastKnownUidValidity: Self.newEpoch)
+        let path = folderWasReset ? "INBOX" : "Drafts"
+        let messageId = "draft-reply:\(env.accountId):reply-source@example.com"
+        var header = MessageHeader(
+            messageId: messageId, subject: "draft", from: "Sender",
+            fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "draft",
+            folderId: "\(env.accountId):\(path)", accountId: env.accountId, folderPath: path,
+            isInInbox: false)
+        header.headerComplete = true
+        let toInsert = header
+        try await env.pool.write { db in try toInsert.insert(db) }
+        #expect(header.id.split(separator: ":").count > 3, "fixture: the id is not reply-draft shaped")
+
+        let stale = FolderResetGeneration.current()
+        FolderResetGeneration.recordReset(folderId: env.inboxFolderId)
+        let outcome = await FolderResetGeneration.$gestureStamp.withValue(stale) {
+            await AccountManager.shared.move([header], to: "Trash")
+        }
+        await AccountManager.shared.awaitWriteQueueDrain()
+        if folderWasReset {
+            #expect(outcome.failedIds.contains(header.id),
+                    "a stale request on a reset folder was not refused: \(outcome.diagnosticSummary)")
+        } else {
+            #expect(!outcome.failedIds.contains(header.id),
+                    "a folder that was not reset refused the request as stale: \(outcome.diagnosticSummary)")
+        }
         await finish(env)
     }
 
