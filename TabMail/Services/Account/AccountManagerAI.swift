@@ -483,7 +483,7 @@ extension AccountManager {
         let needsReply = current.cachedReply == nil
         guard needsSummary || needsAction || needsReply else { return } // already fully processed
 
-        let aiDisabled = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
+        let aiDisabled = AIService.isAIOff
         let deviceSyncEnabled = UserDefaults.standard.object(forKey: "device_sync_auto_enabled") as? Bool ?? true
         let hasSession = TabMailAuthService.hasSession()
         guard hasSession && (!aiDisabled || deviceSyncEnabled) else { return }

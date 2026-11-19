@@ -162,7 +162,7 @@ struct DebugMenuView: View {
 
             Section("Consent") {
                 Button {
-                    UserDefaults.standard.set(false, forKey: "hasSeenAIConsent")
+                    AIService.optOutStore.set(false, forKey: AIService.aiChoiceMadeKey)
                 } label: {
                     Label("Reset AI Consent", systemImage: "brain")
                 }

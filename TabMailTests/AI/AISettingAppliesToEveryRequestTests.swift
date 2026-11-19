@@ -79,19 +79,10 @@ struct AISettingAppliesToEveryRequestTests {
 
     private static let request = CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil)
 
-    /// Runs `body` with the real setting (the App Group flag) set as given, then restores it.
+    /// Runs `body` with the real setting (the App Group values, the AI choice made) set as given,
+    /// then restores it.
     private func withRealSetting<T>(aiOff: Bool, _ body: () async throws -> T) async rethrows -> T {
-        let store = AIService.optOutStore
-        let previous = store.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous {
-                store.set(previous, forKey: AIService.optOutAllAIKey)
-            } else {
-                store.removeObject(forKey: AIService.optOutAllAIKey)
-            }
-        }
-        AIService.writeOptOutFlag(aiOff)
-        return try await body()
+        try await AITestSetting.with(aiOff: aiOff, body)
     }
 
     private func makeService(_ http: FakeHTTP.Scenario, _ setting: AISettingSwitch) -> AIService {
@@ -576,7 +567,7 @@ struct AISettingAppliesToEveryRequestTests {
 
     // MARK: - Wiring
 
-    @Test("by default both clients read the Opt Out of AI setting itself")
+    @Test("by default both clients read the AI setting itself: Opt Out of AI and the AI choice")
     func theDefaultsReadTheSetting() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -597,6 +588,15 @@ struct AISettingAppliesToEveryRequestTests {
             #expect(nse == Self.answerText)
             #expect(http.recordedCalls().count == 2)
         }
+        // Not opted out, but the AI choice not made yet: both refuse.
+        let restore = AITestSetting.save()
+        defer { restore() }
+        AITestSetting.clear()
+        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+        await #expect(throws: AIOffError.self) { try await client.sendCompletionsDirect(Self.request) }
+        let nse = await BackendNSEClient.$transport.withValue(transport) { await nseSummary() }
+        #expect(nse == nil)
+        #expect(http.recordedCalls().count == 2)
     }
 
     // MARK: - Source fences
@@ -654,5 +654,56 @@ struct AISettingAppliesToEveryRequestTests {
         }
         #expect(completions == ["TabMail/Services/BackendClient.swift", "TabMailNotificationService/BackendNSEClient.swift"])
         #expect(transcription == ["TabMail/Services/BackendClient.swift"])
+    }
+
+    /// Files allowed to name the AI setting's keys: the policy and AIService that declare them,
+    /// the writers (the AI choice, screenshot seeding, the debug reset), the Settings switch, and
+    /// views that only hide AI content (reachable after the choice). Every other reader decides
+    /// through `AIService.isAIOff` / `NSEState.isAIDisabled`.
+    private static let keyNamingFiles: Set<String> = [
+        "Shared/AI/AIConsentPolicy.swift",
+        "TabMail/Services/AI/AIService.swift",
+        "TabMail/Views/RootView.swift",
+        "TabMail/App/ScreenshotMode.swift",
+        "TabMail/Views/Settings/DebugLogView.swift",
+        "TabMail/Views/Settings/TabMailSettingsView.swift",
+        "TabMail/Views/Message/MessageCardView.swift",
+        "TabMail/Views/Message/MessageDetailView.swift",
+        "TabMail/Views/Message/SummaryBubbleView.swift",
+        "TabMail/Views/Inbox/TriageCardView.swift",
+        "TabMail/Views/Inbox/DynamicIslandChatButton.swift",
+        "TabMail/Views/Inbox/MessageRowView.swift",
+    ]
+
+    @Test("only the AI setting's own files name its keys; everything else reads the one predicate")
+    func onlyThePolicyNamesTheKeys() throws {
+        let root = DiagnosticPrintGateTests.repositoryRoot()
+        var literals: Set<String> = []
+        var keyNames: Set<String> = []
+        for folder in ["TabMail", "Shared", "TabMailNotificationService"] {
+            let enumerator = try #require(FileManager.default.enumerator(at: root.appendingPathComponent(folder), includingPropertiesForKeys: nil))
+            for case let url as URL in enumerator where url.pathExtension == "swift" {
+                let relative = String(url.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count + 1))
+                let lines = Self.codeLines(try String(contentsOf: url, encoding: .utf8))
+                if lines.contains(where: { $0.contains(#""privacy_opt_out_all_ai""#) || $0.contains(#""hasSeenAIConsent""#) }) {
+                    literals.insert(relative)
+                }
+                let keyPattern = #"\b(optOutAllAIKey|aiChoiceMadeKey|completedChoiceKey|optOutKey)\b"#
+                if lines.contains(where: { $0.range(of: keyPattern, options: .regularExpression) != nil }) {
+                    keyNames.insert(relative)
+                }
+            }
+        }
+        #expect(literals == ["Shared/AI/AIConsentPolicy.swift"])
+        #expect(keyNames.isSubset(of: Self.keyNamingFiles), "read the setting through AIService.isAIOff: \(keyNames.subtracting(Self.keyNamingFiles).sorted())")
+        // The request and queue paths that read it decide only through the predicate.
+        for path in [
+            "TabMail/Services/AI/ActiveAIQueue.swift", "TabMail/Services/Account/AccountManagerAI.swift",
+            "TabMail/Services/AI/KBRefinementService.swift", "TabMail/Services/Dictation/DictationController.swift",
+            "TabMail/Views/MailNavigationView.swift",
+        ] {
+            #expect(!keyNames.contains(path), "\(path) names the setting's keys")
+            #expect(Self.codeLines(try Self.source(path)).contains { $0.contains("AIService.isAIOff") }, "\(path) does not read AIService.isAIOff")
+        }
     }
 }

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -21,18 +22,18 @@ struct AIChoiceComesBeforeAnyRequestTests {
     private static let choiceKey = "hasSeenAIConsent"
     private static let answer = "event: final\ndata: {\"assistant\":\"Two-line summary: A short summary.\"}\n\n"
 
-    /// Runs `body` with both flags absent, as after a reinstall, then restores them.
+    /// Runs `body` with both flags absent, as after a reinstall (in the app's own defaults and in
+    /// the App Group suite), then restores them.
     private func withChoiceNotMade<T>(_ body: () async throws -> T) async rethrows -> T {
         let standard = UserDefaults.standard
-        let group = AIService.optOutStore
         let savedChoice = standard.object(forKey: Self.choiceKey)
-        let savedOptOut = group.object(forKey: AIService.optOutAllAIKey)
+        let restoreShared = AITestSetting.save()
         defer {
             if let savedChoice { standard.set(savedChoice, forKey: Self.choiceKey) } else { standard.removeObject(forKey: Self.choiceKey) }
-            if let savedOptOut { group.set(savedOptOut, forKey: AIService.optOutAllAIKey) } else { group.removeObject(forKey: AIService.optOutAllAIKey) }
+            restoreShared()
         }
         standard.removeObject(forKey: Self.choiceKey)
-        group.removeObject(forKey: AIService.optOutAllAIKey)
+        AITestSetting.clear()
         return try await body()
     }
 
@@ -65,4 +66,247 @@ struct AIChoiceComesBeforeAnyRequestTests {
             #expect(nseRequests == 0, "the notification extension sent \(nseRequests) AI request(s) before the AI choice (answer: \(nse?.assistant ?? "nil"))")
         }
     }
+
+    // MARK: - Fixtures
+
+    /// A fresh, empty defaults suite for one test; removed when `body` ends.
+    private static func withScratchDefaults<T>(_ count: Int, _ body: ([UserDefaults]) async throws -> T) async rethrows -> T {
+        let names = (0..<count).map { _ in "test.ai-setting.\(UUID().uuidString)" }
+        defer { for name in names { UserDefaults.standard.removePersistentDomain(forName: name) } }
+        return try await body(names.map { UserDefaults(suiteName: $0)! })
+    }
+
+    private func summarize(_ service: AIService) async throws -> SummaryResult {
+        try await service.generateSummary(
+            subject: "Quarterly planning", from: "Sender", fromAddress: "sender@company.com", date: Date(),
+            bodyText: "Notes from the planning call.", htmlContent: nil, userName: "Recipient", kbText: "")
+    }
+
+    private func nseSummary(_ transport: @escaping BackendNSEClient.Transport) async -> String? {
+        await BackendNSEClient.$transport.withValue(transport) {
+            await BackendNSEClient.sendCompletions(
+                promptAlias: "system_prompt_summary", variables: BackendNSEClient.Vars([:]), authToken: "test-token")?.assistant
+        }
+    }
+
+    private func answering() -> FakeHTTP.Scenario {
+        let http = FakeHTTP.Scenario()
+        http.register(path: "/completions/chat", method: "POST", response: .bytes(Data(Self.answer.utf8), contentType: "text/event-stream"))
+        return http
+    }
+
+    // MARK: - The predicate
+
+    @Test("AI is on only when the choice is made and AI is not opted out; a missing value never turns it on",
+          arguments: [nil, false, true] as [Bool?], [nil, false, true] as [Bool?])
+    func thePredicate(choice: Bool?, optedOut: Bool?) async {
+        await Self.withScratchDefaults(1) { suites in
+            let defaults = suites[0]
+            if let choice { defaults.set(choice, forKey: AIConsentPolicy.completedChoiceKey) }
+            if let optedOut { defaults.set(optedOut, forKey: AIConsentPolicy.optOutKey) }
+            let aiOn = choice == true && optedOut != true
+            #expect(AIConsentPolicy.isDisabled(in: defaults) == !aiOn)
+        }
+    }
+
+    // MARK: - Moving the setting into the shared suite
+
+    @Test("an earlier completed choice moves to the shared suite; no choice moves as none")
+    func theChoiceMoves() async {
+        for legacyChoice in [nil, false, true] as [Bool?] {
+            await Self.withScratchDefaults(2) { suites in
+                let (legacy, shared) = (suites[0], suites[1])
+                if let legacyChoice { legacy.set(legacyChoice, forKey: AIConsentPolicy.completedChoiceKey) }
+                AIConsentPolicy.migrateLegacyValues(from: legacy, to: shared)
+                if legacyChoice == true {
+                    #expect(shared.object(forKey: AIConsentPolicy.completedChoiceKey) as? Bool == true)
+                    #expect(!AIConsentPolicy.isDisabled(in: shared))
+                } else {
+                    #expect(shared.object(forKey: AIConsentPolicy.completedChoiceKey) == nil)
+                    #expect(AIConsentPolicy.isDisabled(in: shared))
+                }
+            }
+        }
+    }
+
+    @Test("a value already in the shared suite is never overwritten, and a second run changes nothing")
+    func sharedValuesStay() async {
+        for sharedValue in [false, true] {
+            await Self.withScratchDefaults(2) { suites in
+                let (legacy, shared) = (suites[0], suites[1])
+                legacy.set(!sharedValue, forKey: AIConsentPolicy.completedChoiceKey)
+                legacy.set(!sharedValue, forKey: AIConsentPolicy.optOutKey)
+                shared.set(sharedValue, forKey: AIConsentPolicy.completedChoiceKey)
+                shared.set(sharedValue, forKey: AIConsentPolicy.optOutKey)
+                #expect(AIConsentPolicy.migrateLegacyValues(from: legacy, to: shared).isEmpty)
+                #expect(shared.object(forKey: AIConsentPolicy.completedChoiceKey) as? Bool == sharedValue)
+                #expect(shared.object(forKey: AIConsentPolicy.optOutKey) as? Bool == sharedValue)
+            }
+        }
+        await Self.withScratchDefaults(2) { suites in
+            let (legacy, shared) = (suites[0], suites[1])
+            legacy.set(true, forKey: AIConsentPolicy.completedChoiceKey)
+            legacy.set(false, forKey: AIConsentPolicy.optOutKey)
+            #expect(Set(AIConsentPolicy.migrateLegacyValues(from: legacy, to: shared)) == [AIConsentPolicy.completedChoiceKey, AIConsentPolicy.optOutKey])
+            #expect(AIConsentPolicy.migrateLegacyValues(from: legacy, to: shared).isEmpty)
+            #expect(!AIConsentPolicy.isDisabled(in: shared))
+        }
+    }
+
+    @Test("an earlier opt-out moves in the same step as the choice, so the moved setting never reads AI on")
+    func anEarlierOptOutMovesWithTheChoice() async {
+        await Self.withScratchDefaults(2) { suites in
+            let (legacy, shared) = (suites[0], suites[1])
+            legacy.set(true, forKey: AIConsentPolicy.completedChoiceKey)
+            legacy.set(true, forKey: AIConsentPolicy.optOutKey)
+            AIConsentPolicy.migrateLegacyValues(from: legacy, to: shared)
+            #expect(shared.object(forKey: AIConsentPolicy.optOutKey) as? Bool == true)
+            #expect(AIConsentPolicy.isDisabled(in: shared))
+        }
+    }
+
+    @Test("the setting moves first on every launch, before anything else the app runs")
+    func theMoveRunsFirst() throws {
+        let root = DiagnosticPrintGateTests.repositoryRoot()
+        let app = try String(contentsOf: root.appendingPathComponent("TabMail/App/TabMailApp.swift"), encoding: .utf8)
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("//") }
+        let start = try #require(app.firstIndex(of: "init() {"))
+        #expect(app[start + 1].contains("AIConsentPolicy.migrateLegacyValues(from: .standard, to: AIService.optOutStore)"),
+                "first statement of TabMailApp.init: \(app[start + 1])")
+        let delegate = try String(contentsOf: root.appendingPathComponent("TabMail/App/AppDelegate.swift"), encoding: .utf8)
+        #expect(!delegate.contains("optOut"), "the delegate runs no second, later move")
+
+        // No other production code moves the setting.
+        let callers = try ["TabMail", "TabMailNotificationService", "Shared"].flatMap { dir -> [String] in
+            let base = root.appendingPathComponent(dir)
+            let files = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil)?
+                .compactMap { $0 as? URL }.filter { $0.pathExtension == "swift" } ?? []
+            return try files.filter { file in
+                try String(contentsOf: file, encoding: .utf8).components(separatedBy: "\n")
+                    .contains { $0.contains("migrateLegacyValues(") && !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            }.map(\.lastPathComponent)
+        }
+        #expect(callers.sorted() == ["AIConsentPolicy.swift", "TabMailApp.swift"], "\(callers)")
+    }
+
+    // MARK: - The notification extension before the app's first launch
+
+    @Test("the extension sends nothing until the app has moved the choice; then it sends")
+    func theExtensionWaitsForTheMove() async throws {
+        let http = answering()
+        defer { http.close() }
+        let transport: BackendNSEClient.Transport = { try await http.session.data(for: $0) }
+        try await withChoiceNotMade {
+            try await Self.withScratchDefaults(1) { suites in
+                // An earlier version answered the choice: the answer is only in the app's defaults.
+                let legacy = suites[0]
+                legacy.set(true, forKey: AIConsentPolicy.completedChoiceKey)
+                legacy.set(false, forKey: AIConsentPolicy.optOutKey)
+                #expect(await nseSummary(transport) == nil)
+                #expect(http.recordedCalls().isEmpty)
+
+                AIConsentPolicy.migrateLegacyValues(from: legacy, to: AIService.optOutStore)
+                let answer = try #require(await nseSummary(transport))
+                #expect(!answer.isEmpty)
+                #expect(http.recordedCalls().count == 1)
+            }
+        }
+    }
+
+    // MARK: - The queue holds until the choice
+
+    @Test("queued jobs run only with AI on, or with Device Sync for its cache alone",
+          arguments: [false, true], [false, true])
+    func theQueueGate(aiOff: Bool, deviceSync: Bool) {
+        #expect(ActiveAIQueue.canProcessAI(
+            hasSession: true, hasCompletedConsent: true, aiOff: aiOff,
+            deviceSyncConnected: deviceSync, subscriptionActive: true) == (!aiOff || deviceSync))
+        for missing in 0..<3 {
+            #expect(!ActiveAIQueue.canProcessAI(
+                hasSession: missing != 0, hasCompletedConsent: missing != 1, aiOff: false,
+                deviceSyncConnected: deviceSync, subscriptionActive: missing != 2))
+        }
+    }
+
+    @Test("before the choice the queue reads AI as off; once AI is enabled there it reads it on")
+    func theQueueReadsTheChoice() async {
+        await withChoiceNotMade {
+            #expect(AIService.isAIOff)
+            #expect(!ActiveAIQueue.canProcessAI(
+                hasSession: true, hasCompletedConsent: true, aiOff: AIService.isAIOff,
+                deviceSyncConnected: false, subscriptionActive: true))
+            AIConsentPolicy.recordChoice(aiEnabled: true, in: AIService.optOutStore)
+            #expect(ActiveAIQueue.canProcessAI(
+                hasSession: true, hasCompletedConsent: true, aiOff: AIService.isAIOff,
+                deviceSyncConnected: false, subscriptionActive: true))
+        }
+    }
+
+    // MARK: - Answering the choice
+
+    @Test("answering writes the opt-out before the choice; enabling AI resumes the held mail, declining resumes nothing",
+          arguments: [false, true])
+    func answeringTheChoice(aiEnabled: Bool) async throws {
+        let store = try #require(WriteRecordingDefaults(suiteName: "test.ai-setting.\(UUID().uuidString)"))
+        defer { UserDefaults.standard.removePersistentDomain(forName: store.name) }
+        let resumed = ResumeCount()
+
+        AIService.recordAIChoice(aiEnabled: aiEnabled, in: store) { resumed.add() }
+        #expect(store.writes == [AIConsentPolicy.optOutKey, AIConsentPolicy.completedChoiceKey])
+        #expect(store.object(forKey: AIConsentPolicy.optOutKey) as? Bool == !aiEnabled)
+        #expect(AIConsentPolicy.isDisabled(in: store) == !aiEnabled)
+
+        // The resume runs in its own task: give it time to run, or to show it never does.
+        for _ in 0..<50 where resumed.count == 0 { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(resumed.count == (aiEnabled ? 1 : 0))
+    }
+
+    @Test("after declining, nothing is sent; after enabling, the next summary is sent")
+    func theAnswerDecidesWhatIsSent() async throws {
+        for aiEnabled in [false, true] {
+            let http = answering()
+            defer { http.close() }
+            let service = AIService(backendClient: BackendClient(llmSession: http.session))
+            try await withChoiceNotMade {
+                AIService.recordAIChoice(aiEnabled: aiEnabled) {}
+                _ = try await summarize(service)
+                #expect(http.recordedCalls().count == (aiEnabled ? 1 : 0))
+            }
+        }
+    }
+}
+
+/// Records the order of the keys written to it, once per write (a Bool write that Foundation
+/// passes on to the object setter is not counted twice).
+private final class WriteRecordingDefaults: UserDefaults {
+    private(set) var writes: [String] = []
+    private var inBoolWrite = false
+    let name: String
+
+    override init?(suiteName: String?) {
+        guard let suiteName else { return nil }
+        name = suiteName
+        super.init(suiteName: suiteName)
+    }
+
+    override func set(_ value: Any?, forKey defaultName: String) {
+        if !inBoolWrite { writes.append(defaultName) }
+        super.set(value, forKey: defaultName)
+    }
+
+    override func set(_ value: Bool, forKey defaultName: String) {
+        writes.append(defaultName)
+        inBoolWrite = true
+        defer { inBoolWrite = false }
+        super.set(value, forKey: defaultName)
+    }
+}
+
+/// Counts resume calls from another task.
+private final class ResumeCount: Sendable {
+    private let value = Mutex(0)
+    var count: Int { value.withLock { $0 } }
+    func add() { value.withLock { $0 += 1 } }
 }

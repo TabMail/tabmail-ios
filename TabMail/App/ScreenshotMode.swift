@@ -94,7 +94,7 @@ enum ScreenshotMode {
         // Bypass all onboarding gates
         UserDefaults.standard.set(true, forKey: "hasLaunchedBefore")
         UserDefaults.standard.set(true, forKey: AgeAndTermsConsent.completedKey)
-        UserDefaults.standard.set(true, forKey: "hasSeenAIConsent")
+        AIService.optOutStore.set(true, forKey: AIService.aiChoiceMadeKey)
         UserDefaults.standard.set(true, forKey: "hasSeenPushConsent")
         UserDefaults.standard.set(true, forKey: "didMigrateHeaderIds_v2")
         UserDefaults.standard.set(true, forKey: "didClearBodiesForAttachmentEncoding_v1")

@@ -17,8 +17,11 @@ actor AIService {
 
     /// UserDefaults key for the privacy opt-out toggle (Settings → AI Settings → Privacy).
     /// When true, blocks ALL AI backend calls. Device Sync cache hits still work.
-    /// Same literal as `SharedNSEData.aiOptOutAllKey` — see that declaration.
-    static let optOutAllAIKey = "privacy_opt_out_all_ai"
+    /// Declared once in `AIConsentPolicy`, shared with the notification extension.
+    static let optOutAllAIKey = AIConsentPolicy.optOutKey
+
+    /// UserDefaults key (in `optOutStore`) set once the AI choice has been answered.
+    static let aiChoiceMadeKey = AIConsentPolicy.completedChoiceKey
 
     /// App Group suite used for the AI opt-out flag. The NSE runs in a
     /// separate process and has its own `UserDefaults.standard` namespace, so
@@ -29,23 +32,29 @@ actor AIService {
         UserDefaults(suiteName: "group.ai.tabmail") ?? .standard
     }
 
-    /// Write the opt-out flag. Views/settings call this instead of touching
-    /// UserDefaults directly so the App Group suite is always updated.
-    static func writeOptOutFlag(_ value: Bool) {
-        optOutStore.set(value, forKey: optOutAllAIKey)
-    }
-
     /// UserDefaults key for the web search toggle (Settings → AI Settings → Privacy).
     /// When true, allows the `search_web` server-side tool. Default: false (matching TB).
     static let webSearchEnabledKey = "privacy_web_search_enabled"
 
-    /// Whether AI is turned off (Settings → Opt Out of AI). Read live: `BackendClient`
-    /// checks it right before every AI request it sends.
+    /// Whether AI is turned off: the AI choice is not made yet, or Settings → Opt Out of AI is on.
+    /// Read live: `BackendClient` checks it right before every AI request it sends.
     static var isAIOff: Bool {
-        optOutStore.bool(forKey: optOutAllAIKey)
+        AIConsentPolicy.isDisabled(in: optOutStore)
     }
 
-    /// Whether AI backend calls are disabled (privacy opt-out).
+    /// Records the answer to the AI choice. With AI enabled, the inbox mail that came in while
+    /// the choice was open is queued for AI (`resume`); with AI off, nothing is queued or sent.
+    static func recordAIChoice(
+        aiEnabled: Bool,
+        in store: UserDefaults = optOutStore,
+        resume: @escaping @Sendable () async -> Void = { await ActiveAIQueue.shared.repopulateFromDatabase() }
+    ) {
+        AIConsentPolicy.recordChoice(aiEnabled: aiEnabled, in: store)
+        guard aiEnabled else { return }
+        Task { await resume() }
+    }
+
+    /// Whether AI backend calls are disabled (`isAIOff`).
     var disableLLMCalls: Bool {
         Self.isAIOff
     }

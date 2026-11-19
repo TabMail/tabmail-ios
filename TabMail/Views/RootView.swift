@@ -17,7 +17,9 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var hasTabMailSession = ScreenshotMode.isActive || TabMailAuthService.hasSession()
     @AppStorage(AgeAndTermsConsent.completedKey) private var hasCompletedConsentGate = false
-    @AppStorage("hasSeenAIConsent") private var hasSeenAIConsent = false
+    /// The AI choice, in the App Group suite with the opt-out (`AIConsentPolicy`): the
+    /// notification extension reads both.
+    @AppStorage(AIService.aiChoiceMadeKey, store: AIService.optOutStore) private var hasSeenAIConsent = false
     @AppStorage("hasSeenPushConsent") private var hasSeenPushConsent = false
     // Demo Mode gate persistence.
     // Production gates above stay untouched while demo runs.
@@ -75,7 +77,7 @@ struct RootView: View {
         // Debug: reset gate flags on every launch so all gate screens show
         if DEBUG_ALWAYS_SHOW_GATES {
             UserDefaults.standard.set(false, forKey: AgeAndTermsConsent.completedKey)
-            UserDefaults.standard.set(false, forKey: "hasSeenAIConsent")
+            AIService.optOutStore.set(false, forKey: AIService.aiChoiceMadeKey)
             UserDefaults.standard.set(false, forKey: "hasSeenPushConsent")
         }
 
@@ -83,7 +85,7 @@ struct RootView: View {
         // The GRDB data is already on disk — show the inbox immediately with cached data.
         // Fresh installs (no DB, no consent) will go through the normal gated flow.
         let onboardingDone = UserDefaults.standard.bool(forKey: AgeAndTermsConsent.completedKey)
-            && UserDefaults.standard.bool(forKey: "hasSeenAIConsent")
+            && AIService.optOutStore.bool(forKey: AIService.aiChoiceMadeKey)
             && UserDefaults.standard.bool(forKey: "hasSeenPushConsent")
             && !DEBUG_ALWAYS_SHOW_GATES
         let isReturningUser = UserDefaults.standard.bool(forKey: "hasLaunchedBefore")
@@ -229,11 +231,11 @@ struct RootView: View {
                 AddAccountGeneralView()
             } else if !hasSeenAIConsent {
                 AIConsentView { aiEnabled in
-                    // Persist the user's AI opt-out decision. Pre-refactor
-                    // the view called `AIService.writeOptOutFlag` internally;
-                    // we moved it here so demo mode can write to its own flag
-                    // instead.
-                    AIService.writeOptOutFlag(!aiEnabled)
+                    // Persist the user's AI choice (the opt-out, then the
+                    // choice itself) and, with AI enabled, queue the inbox
+                    // mail that arrived while this screen was open. Demo mode
+                    // writes its own flag instead (above).
+                    AIService.recordAIChoice(aiEnabled: aiEnabled)
                     // Arm or disarm the plan-picker latch. Every arm writes
                     // an explicit value — the pre-fix code fell through both
                     // arms for an active subscriber with AI enabled, leaving

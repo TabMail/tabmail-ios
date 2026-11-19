@@ -33,8 +33,8 @@ actor KBRefinementService {
     /// Matches TB's `kbUpdate(conversationHistory)`.
     /// Fire-and-forget safe — logs errors internally.
     func refineKB(sessionTurns: [ChatTurn]) async {
-        // Respect privacy opt-out (matches AIService.disableLLMCalls check)
-        guard !AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) else {
+        // Respect the AI setting (matches AIService.disableLLMCalls check)
+        guard !AIService.isAIOff else {
             BackgroundSyncLogger.logDebug("[KBRefine] Skipped — AI calls disabled (privacy opt-out)")
             return
         }

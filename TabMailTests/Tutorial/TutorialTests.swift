@@ -357,7 +357,7 @@ struct TutorialPracticeTests {
         store.isActive = true
         store.isTutorialPractice = true
         await #expect {
-            _ = try await BackendClient(llmSession: server.session)
+            _ = try await BackendClient(llmSession: server.session, isAIOff: { false })
                 .transcribeDictation(flac: Data([0]), language: nil, vocabulary: [])
         } throws: { error in
             if case BackendError.unauthorized = error { return true }
@@ -379,7 +379,7 @@ struct TutorialPracticeTests {
             path: "/completions/chat", method: "POST",
             response: .bytes(Data("event: final\ndata: {\"assistant\":\"ok\"}\n\n".utf8),
                              contentType: "text/event-stream"))
-        let client = BackendClient(llmSession: server.session)
+        let client = BackendClient(llmSession: server.session, isAIOff: { false })
         let request = CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil)
 
         store._resetForTests()
@@ -418,7 +418,7 @@ struct TutorialPracticeTests {
         let server = FakeHTTP.Scenario()
         defer { server.close() }
         server.register(path: DictationConfig.warmUpPath, response: .status(200))
-        let client = BackendClient(llmSession: server.session)
+        let client = BackendClient(llmSession: server.session, isAIOff: { false })
 
         store._resetForTests()
         store.isActive = true
