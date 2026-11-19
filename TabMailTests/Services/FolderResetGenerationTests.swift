@@ -832,6 +832,14 @@ struct FolderResetGenerationTests {
         FolderResetGeneration.$gestureStamp.withValue(before) {
             #expect(FolderResetGeneration.refuses(folderId: "frg-scope:INBOX"))
             #expect(!FolderResetGeneration.refuses(folderId: "frg-scope:Archive"), "a reset refused another folder")
+            #expect(FolderResetGeneration.refuses(headerId: "frg-scope:INBOX:101", accountId: "frg-scope"))
+            #expect(!FolderResetGeneration.refuses(headerId: "frg-scope:Archive:101", accountId: "frg-scope"),
+                    "an id in a folder that was not reset was refused")
+            #expect(!FolderResetGeneration.refuses(headerId: "frg-scope:INBOX:101", accountId: "frg-scope-other"),
+                    "a reset refused an id judged for another account")
+            #expect(!FolderResetGeneration.refuses(
+                headerId: "frg-scope:Drafts:draft-reply:frg-scope:a@example.com", accountId: "frg-scope"),
+                    "a reply-draft id in a folder that was not reset was refused")
         }
         FolderResetGeneration.$gestureStamp.withValue(after) {
             #expect(!FolderResetGeneration.refuses(folderId: "frg-scope:INBOX"), "a post-reset gesture was refused")

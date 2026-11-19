@@ -1504,9 +1504,12 @@ extension AccountManager {
         // names the email re-seated at that id. Refuse it before coalescing,
         // so it can never cancel or retarget a deferred Undo recorded for the
         // replacement (ADR-IOS-115). Unstamped callers get no verdict.
+        // The id is checked too: a caller that re-resolves by id (the AI cards)
+        // passes an optimistically moved row whose folderPath is not the shown one.
         let staleIds = Set(messages.filter {
             FolderResetGeneration.refuses(folderId: MessageIdentity.folderId(
                 accountId: $0.accountId, folderPath: $0.folderPath))
+                || FolderResetGeneration.refuses(headerId: $0.id, accountId: $0.accountId)
         }.map(\.id))
         outcome.set(.terminalStale, ids: Array(staleIds))
         let coalesced = coalesceDeferredMoves(
