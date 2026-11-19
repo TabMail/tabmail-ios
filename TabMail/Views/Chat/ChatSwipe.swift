@@ -602,10 +602,19 @@ struct ChatSwipeCloser: UIViewRepresentable {
         /// tap only closes: the bubbles' taps and swipes, the reply field, the bar's buttons and both
         /// back swipes. Two exceptions run alongside it instead (`shouldRecognizeSimultaneouslyWith`):
         /// a scroll view's pan, so a vertical drag also scrolls, and the window's own recognizers.
+        /// A reveal's pan never waits for the closer's tap: a tap tolerates a short move, so waiting
+        /// would let a short sideways drag on the open reveal end as a closing tap. The pan takes only
+        /// its open reveal's drags (`ChatSwipe.takesDrag`); the closer's pan still decides the rest.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
             guard other !== pan, other !== tap, Self.isTheScreens(other) else { return false }
+            if recognizer === tap && Self.isRevealPan(other) { return false }
             return !(recognizer === pan && Self.isScroll(other))
+        }
+
+        /// Whether `other` is a reveal's swipe pan (`ChatHorizontalPan`).
+        static func isRevealPan(_ other: UIGestureRecognizer) -> Bool {
+            other.delegate is ChatHorizontalPan.Coordinator
         }
 
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,

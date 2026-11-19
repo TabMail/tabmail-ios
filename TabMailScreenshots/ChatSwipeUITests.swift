@@ -369,7 +369,7 @@ final class ChatSwipeUITests: XCTestCase {
         // where the card sat is the chat's.
         let moveOn = app.buttons["Move the tutorial on"]
         XCTAssertTrue(moveOn.isHittable, "control: the move-on button shows under the chat")
-        XCTAssertGreaterThan(moveOn.frame.minY, replyField(in: app).frame.maxY, "control: it sits below the chat's region")
+        XCTAssertGreaterThan(moveOn.frame.minY, app.descendants(matching: .any)["chatReplyPill"].firstMatch.frame.maxY, "control: it sits below the chat's region")
         moveOn.tap()
         XCTAssertTrue(card.waitForNonExistence(timeout: 5), "the card goes once the run moves on")
         XCTAssertTrue(isInChat(app), "the chat stays")

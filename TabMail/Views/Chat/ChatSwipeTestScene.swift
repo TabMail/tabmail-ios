@@ -62,15 +62,17 @@ struct ChatSwipeTestScene: View {
                         Text("No message")
                     }
                 } else if tutorialCard {
-                    NavigationStack { list }
-                        .safeAreaInset(edge: .bottom, spacing: 0) {
-                            Button("Move the tutorial on") {
-                                // Part 3 starts in the inbox: Priya's chat holds no card for it,
-                                // and the demo stays.
-                                TutorialCoordinator.shared.nextLesson()
-                            }
-                            .padding()
+                    // The strip sits below the whole navigation stack, not in its safe area, so
+                    // the chat's reply bar (which extends into the bottom safe area) ends above it.
+                    VStack(spacing: 0) {
+                        NavigationStack { list }
+                        Button("Move the tutorial on") {
+                            // Part 3 starts in the inbox: Priya's chat holds no card for it,
+                            // and the demo stays.
+                            TutorialCoordinator.shared.nextLesson()
                         }
+                        .padding()
+                    }
                 } else {
                     NavigationStack { list }
                 }
