@@ -537,13 +537,14 @@ final class SyncScheduler {
             // Ensure sync completed
             _ = await syncTask.value
 
-            // Backfill: Low Power Mode skips it; Wi-Fi-only holds back the walk only.
+            // Backfill always runs, so the folder scans always run; Low Power Mode
+            // and Wi-Fi-only off Wi-Fi hold back the walk only (#1063).
             let isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
             let wifiOnly = UserDefaults.standard.object(forKey: Self.wifiOnlyKey) as? Bool ?? true
             var onWiFi = true
             if wifiOnly && !isLowPowerMode { onWiFi = await Self.isOnWiFi() }
-            let backfill = Self.backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: onWiFi)
-            if let walkAllowed = backfill, !Task.isCancelled {
+            let walkAllowed = Self.backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: onWiFi)
+            if !Task.isCancelled {
                 let accounts = (try? await dbPool.read { db in
                     try Account.filter(Column("isActive") == true).fetchAll(db)
                 }) ?? []
@@ -1445,12 +1446,11 @@ final class SyncScheduler {
         return !bodyIdle || !aiIdle || staleShards
     }
 
-    /// The background job's backfill decision. Nil: Low Power Mode skips the whole
-    /// backfill (it lifts on its own). Otherwise whether the walk may run: Wi-Fi-only
-    /// off Wi-Fi holds back the walk only.
-    nonisolated static func backgroundBackfillPlan(isLowPowerMode: Bool, wifiOnly: Bool, onWiFi: Bool) -> Bool? {
-        if isLowPowerMode { return nil }
-        return !wifiOnly || onWiFi
+    /// The background job's walk decision. The backfill always runs, so the folder
+    /// scans always run (#1063); Low Power Mode, and Wi-Fi-only off Wi-Fi, hold back
+    /// the walk only.
+    nonisolated static func backgroundBackfillPlan(isLowPowerMode: Bool, wifiOnly: Bool, onWiFi: Bool) -> Bool {
+        !isLowPowerMode && (!wifiOnly || onWiFi)
     }
 
     /// Check if the device is currently on WiFi.

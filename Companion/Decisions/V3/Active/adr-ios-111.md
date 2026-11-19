@@ -162,7 +162,7 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
    - `ChangeRequest.localRows`: the existing `CatchUpLocalRowReader` (ids and two flags, never content;
      ADR-004), so a reader whose records lack the header fields fetches headers only for messages a folder
      does not hold.
-   - `ChangeContext`: the caller's read deadline, an injectable clock and `isExpensiveNetwork`, a value
+   - `ChangeContext`: the caller's read deadline, an injectable clock and `isExpensiveNetwork`, a value *Superseded 2026-11-19 (#1063): every state baseline runs on any network; see ADR-IOS-107, amendment of that date.*
      snapshot taken when the pass's turn starts.
    - `FolderChangeStatus.baselining` (a folder's first round in progress); `ChangeRefusal.rejected(status)`
      and `.failingTooLong`; `AccountCursorUpdate.unchanged` (the read succeeded and the stored account
@@ -187,7 +187,7 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
      `Account.lastHistoryId`) is the mail-folder delta link only; an older build's Inbox delta link reads
      as no bookmark. Each folder's `OutlookFolderCursor` holds the link to read next, its phase (baseline
      or tracking), its `$select` kind, the round's page count, the first counted failure and when its
-     baseline was first needed.
+     baseline was first needed. *Superseded 2026-11-19 (#1063): every state baseline runs on any network; see ADR-IOS-107, amendment of that date.*
    - **Two `$select`s, chosen by role when a chain starts and stored in the cursor.** The Inbox uses the
      header fields (`ExchangeGraphMessageRequest.readChanges`, `GraphAPI.headerOnlySelection`), so new
      Inbox mail arrives in the delta page itself. Every other folder uses the state set
@@ -220,7 +220,7 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
    - **Network.** A non-Inbox baseline on an expensive network (cellular, a hotspot) waits at most
      `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds`, counted from when the folder first needed it
      (stored in its cursor), then runs on any network, as the catch-up does (ADR-IOS-107). The Wi-Fi-only
-     setting is not consulted. The Inbox baseline runs on any network.
+     setting is not consulted. The Inbox baseline runs on any network. *Superseded 2026-11-19 (#1063): every state baseline runs on any network; see ADR-IOS-107, amendment of that date.*
    - **Failures.** A refused bookmark (`graphRefusedDeltaToken`: a 4xx other than 401, 403, 408 and 429) is
      `.refused(.rejected(status))`; a refused saved baseline continuation restarts the baseline from page 1
      once per pass first. A 5xx, a page that cannot be decoded, a repeating next link or a round longer
@@ -510,7 +510,7 @@ holds), and the bookmark would otherwise move past a cut arrival. A folder with 
    in one pass; an unfinished baseline resumes page by page on later passes.
 2. **Networks.** The Inbox re-baseline runs on cellular, as the Inbox baseline already does by design;
    other folders' state baselines wait on an expensive network as before
-   (`catchUpExpensiveNetworkMaxWaitSeconds`).
+   (`catchUpExpensiveNetworkMaxWaitSeconds`). *Superseded 2026-11-19 (#1063): every state baseline runs on any network; see ADR-IOS-107, amendment of that date.*
 3. **Cost on Outlook.** For a folder of N messages: about N/100 delta pages
    (`graphChangeReadPageSize` = 100), plus header fetches only for messages a non-Inbox folder is
    missing within the held range, plus the by-id reads of the folder's re-read list (at most

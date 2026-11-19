@@ -95,18 +95,14 @@ struct ChangeContext: Sendable {
     let deadline: Date
     /// The clock the budget is measured on; injectable for tests.
     let clock: @Sendable () -> Date
-    /// `NetworkMonitor.checkExpensive()` (cellular or a hotspot) as it stood when
-    /// the turn started.
-    let isExpensiveNetwork: Bool
     /// The reader calls this with the number of messages it is about to fetch,
     /// so the engine can show "downloading N".
     let onProgress: @Sendable (Int) -> Void
 
     init(deadline: Date = .distantFuture, clock: @escaping @Sendable () -> Date = { Date() },
-         isExpensiveNetwork: Bool = false, onProgress: @escaping @Sendable (Int) -> Void) {
+         onProgress: @escaping @Sendable (Int) -> Void) {
         self.deadline = deadline
         self.clock = clock
-        self.isExpensiveNetwork = isExpensiveNetwork
         self.onProgress = onProgress
     }
 

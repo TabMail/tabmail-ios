@@ -19,9 +19,6 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
     var lastCompletedAt: Date?
     /// The listing in progress, if any.
     var listing: Listing?
-    /// When the catch-up first saw the folder under this epoch. Until a listing
-    /// completes, the expensive-network wait is counted from here.
-    var createdAt: Date?
     /// When the catch-up last tried a listing for the folder, whether or not it
     /// succeeded. Drives the order: a folder that keeps failing goes to the back,
     /// so it cannot hold the others' catch-up past its bound.
@@ -76,21 +73,14 @@ extension IMAPProvider {
     ///   stored (`Folder.lastKnownHighestModSeq`, written only by
     ///   `SyncEngine.writeListingCounters`; STATUS is a trigger and never writes
     ///   it), nil on a server or session without CONDSTORE.
-    /// - On an expensive network only a MODSEQ change may list: that is evidence of
-    ///   a change, whereas the full check (and continuing one) waits for a
-    ///   non-expensive network — but for no longer than
-    ///   `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` since the folder's last
-    ///   completed listing (or, before the first, since `createdAt`). After that
-    ///   the network no longer holds the folder back, so a device that is always
-    ///   on an expensive network still gets a full catch-up.
-    /// - A folder with no state on an expensive network gets `.none`; the caller
-    ///   writes a state carrying `createdAt` so the wait has a start.
+    /// - The decision is the same on every network, battery level and power mode:
+    ///   a scan is cheap and always runs; only downloads wait (#1063).
     /// - `isTracked`: the folder's change bookmark covers it (ADR-IOS-111). Its
     ///   changes arrive through the change read, so neither the MODSEQ check nor
     ///   the daily full check lists it; its first listing, a listing in progress
     ///   and a lapse of its bookmark still do (the Gmail rule, ADR-IOS-107).
     nonisolated static func catchUpPlan(
-        state: IMAPCatchUpState?, freshModSeq: Int?, isExpensiveNetwork: Bool, now: Date, isTracked: Bool = false
+        state: IMAPCatchUpState?, freshModSeq: Int?, now: Date, isTracked: Bool = false
     ) -> CatchUpPlan {
         let modSeqChanged: Bool = {
             guard !isTracked, let stamp = state?.completionStamp, let freshModSeq else { return false }
@@ -101,9 +91,6 @@ extension IMAPProvider {
             : CatchUpSchedule.fullCheckDue(
                 lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.catchUpFullCheckIntervalSeconds)
                 || state?.lapsedSinceLastListing == true
-        let waitedTooLong = CatchUpSchedule.waitedTooLong(
-            hasState: state != nil, lastCompletedAt: state?.lastCompletedAt, createdAt: state?.createdAt, now: now)
-        if isExpensiveNetwork && !modSeqChanged && !waitedTooLong { return .none }
         if let listing = state?.listing { return .list(listing) }
         if modSeqChanged || fullCheckDue {
             return .list(IMAPCatchUpState.Listing(
@@ -154,16 +141,9 @@ extension IMAPProvider {
         let state = IMAPCatchUpState.decode(folder.catchUpState).flatMap { $0.epoch == epoch ? $0 : nil }
         let plan = Self.catchUpPlan(
             state: state, freshModSeq: folder.lastKnownHighestModSeq,
-            isExpensiveNetwork: context.isExpensiveNetwork, now: context.clock(),
+            now: context.clock(),
             isTracked: IMAPChangeCursor.decode(folder.changeCursor) != nil)
-        guard case .list(var listing) = plan else {
-            guard state == nil else { return nil }
-            // First sight of the folder, held back by the network: record when the
-            // wait began. No request is made.
-            var waiting = CatchUpFolderResult(folderId: folder.id, epoch: epoch)
-            waiting.newState = IMAPCatchUpState(epoch: epoch, createdAt: context.clock()).encoded()
-            return waiting
-        }
+        guard case .list(var listing) = plan else { return nil }
 
         var result = CatchUpFolderResult(folderId: folder.id, epoch: epoch)
         let span = SyncConfig.catchUpListingRangeSpan
@@ -247,7 +227,7 @@ extension IMAPProvider {
             listing.nextUid = hi + 1
         }
 
-        var newState = state ?? IMAPCatchUpState(epoch: epoch, createdAt: context.clock())
+        var newState = state ?? IMAPCatchUpState(epoch: epoch)
         newState.lastAttemptAt = context.clock()
         if completed {
             newState.completionStamp = listing.firstStamp

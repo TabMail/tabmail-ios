@@ -139,17 +139,17 @@ actor SyncEngine {
         }
     }
 
-    /// The foreground worker's gate decision for one cycle, from one snapshot.
-    /// Nil: no cycle at all (Low Power Mode off power, or battery below 20% off
-    /// power; fast sync bypasses both). Otherwise whether the walk may run: the
-    /// Wi-Fi-only setting on an expensive network holds it back.
+    /// The foreground worker's walk decision for one cycle, from one snapshot.
+    /// The cycle always runs, so the folder scans (the catch-up) always run; the
+    /// gates hold only the walk, which downloads mail (#1063). Low Power Mode off
+    /// power, or battery below 20% off power, holds it (fast sync lifts both), and
+    /// so does the Wi-Fi-only setting on an expensive network.
     nonisolated static func backfillWalkAllowed(
         fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float, wifiOnly: Bool, expensive: Bool
-    ) -> Bool? {
+    ) -> Bool {
         // batteryLevel is -1 when monitoring is off (it is set in TabMailApp.init).
         let powerHeld = !fastSync && !onPower && (lowPowerMode || (batteryLevel >= 0 && batteryLevel < 0.20))
-        if powerHeld { return nil }
-        return !(wifiOnly && expensive)
+        return !powerHeld && !(wifiOnly && expensive)
     }
 
     func register(accountId: String, provider: any EmailProvider, workQueue: ProviderWorkQueue) {

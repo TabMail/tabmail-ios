@@ -248,7 +248,7 @@ extension SyncEngine {
             if !asked.isEmpty { recheck[folder.id] = asked }
         }
         let context = ChangeContext(
-            deadline: readEnd, clock: clock, isExpensiveNetwork: NetworkMonitor.checkExpensive(),
+            deadline: readEnd, clock: clock,
             onProgress: { count in
                 guard count > 0 else { return }
                 Task { @MainActor in

@@ -22,7 +22,7 @@ import Testing
 /// on a message the phone holds and when that read completes, and chaos for the
 /// read itself: page and batch latency, failed pages (a server error, a
 /// throttle, a dropped connection), failed batches, one message whose header
-/// fetch answers an error, a read budget cut anywhere, and an expensive network.
+/// fetch answers an error, and a read budget cut anywhere.
 ///
 /// Invariants checked after every read, never expected values for a schedule:
 /// 1. **Intention ledger**: every queued read the schedule did not complete is
@@ -225,7 +225,8 @@ struct OutlookChangeFuzzTests {
                 }
                 let requests: Int? = Int(localRng.next() % 100) < FuzzConfig.budgetCutPercent
                     ? 1 + Int(localRng.next() % UInt64(FuzzConfig.budgetCutMaxRequests)) : nil
-                let expensive = localRng.next() % 5 == 0
+                // The retired network draw, kept so every seed replays the same schedule.
+                _ = localRng.next()
 
                 let driver = Int(localRng.next() % 100)
                 if driver < FuzzConfig.foregroundPassPercent {
@@ -236,8 +237,8 @@ struct OutlookChangeFuzzTests {
                 } else if driver < FuzzConfig.foregroundPassPercent + FuzzConfig.enginePassPercent {
                     do { try await w.delta(); did.append("change pass") } catch { did.append("change pass failed: \(error)") }
                 } else {
-                    try await w.read(now: now, requests: requests, expensive: expensive)
-                    did.append("read requests=\(requests.map(String.init) ?? "all") expensive=\(expensive)")
+                    try await w.read(now: now, requests: requests)
+                    did.append("read requests=\(requests.map(String.init) ?? "all")")
                 }
                 let differs = try Self.differences(w).joined(separator: ", ")
                 trace.append("round \(round): \(did.joined(separator: "; ")); differs: \(differs)")
