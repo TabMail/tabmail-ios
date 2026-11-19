@@ -422,20 +422,14 @@ extension SyncEngine {
             for folder in syncableFolders where !folder.path.isEmpty && !skippablePaths.contains(folder.path)
                 && !trackedFolderIds.contains(folder.id) {
                 // T4.S6 re-drive. A folder left quarantined by an interrupted
-                // reaction (crash, transient step failure) BRANCHES INTO the
-                // reaction instead of a normal sync — never a plain skip. The flag
-                // means "re-drive me", and only incidentally "skip normal sync
-                // until then": an ordinary pass here would insert NEW-epoch headers
-                // under the OLD stamp, which is precisely the state a bare-UID
-                // durable op mutates the wrong message from. Launch/foreground full
-                // sync is therefore the re-drive OWNER; `runUidValidityResetReaction`
-                // re-enters at the barrier (idempotent) when the flag is already set.
-                if folder.uidValidityResetPendingAt != nil {
-                    await AccountManager.shared.runUidValidityResetReaction(
-                        accountId: account.id, folderPath: folder.path
-                    )
-                    continue
-                }
+                // reaction (crash, transient step failure) is never listed here:
+                // an ordinary pass would insert NEW-epoch headers under the OLD
+                // stamp, which is precisely the state a bare-UID durable op
+                // mutates the wrong message from. It BRANCHES INTO the reaction
+                // after this block, in the pass's own task (`quarantinedFolders`
+                // below): the reaction's resync lists inside the account's sync
+                // turn, which this detached task does not hold (#755).
+                if folder.uidValidityResetPendingAt != nil { continue }
                 // The `recentlyCompleted` protection set is NOT read here. It is
                 // read INSIDE `runSyncMessages`'s write transaction — see the note
                 // there and on `AccountManager.liveRecentlyCompleted`.
@@ -494,6 +488,21 @@ extension SyncEngine {
             return (allMigratedIds, listing)
         }.value
 
+        // T4.S6 re-drive, in the pass's own task (the turn's holder), after the
+        // listing so no reaction delays it. The flag means "re-drive me", and
+        // only incidentally "skip normal sync until then". Launch/foreground full
+        // sync is therefore the re-drive OWNER; `runUidValidityResetReaction`
+        // re-enters at the barrier (idempotent) when the flag is already set.
+        // The same folders the listing loop skipped for it.
+        let quarantinedFolders = syncableFolders.filter {
+            !$0.path.isEmpty && !skippablePaths.contains($0.path) && !trackedFolderIds.contains($0.id)
+                && $0.uidValidityResetPendingAt != nil
+        }
+        for folder in quarantinedFolders {
+            try Task.checkCancellation()
+            await AccountManager.shared.runUidValidityResetReaction(accountId: account.id, folderPath: folder.path)
+        }
+
         // Clear undo protection for migrated UIDs
         // UID migration tracking — logged for diagnostics but no longer clears undoProtectedIds
         // (pending-op check in sync transaction handles undo protection now)
@@ -533,7 +542,8 @@ extension SyncEngine {
                     folderId: folder.id, folderPath: folder.path, accountId: account.id,
                     provider: provider, dbPool: pool)
                 // A tracked folder's removals arrive exactly through the change
-                // read (QRESYNC VANISHED against held rows): no count walk for
+                // read (QRESYNC VANISHED, or the CONDSTORE removal check, against
+                // held rows): no count walk for
                 // it (ADR-IOS-111). An untracked folder's removals come from its
                 // listing's own sweep and from the walk below.
                 if trackedFolderIds.contains(folder.id) { continue }
@@ -592,8 +602,9 @@ extension SyncEngine {
     @discardableResult
     func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws -> ListingOutcome? {
         // T4.S6 re-drive — the THIRD owner, and the ONLY one that reaches a custom
-        // non-favourite folder. `fullSync`'s per-folder loop and `imapDeltaSync`
-        // both branch into the reaction for a quarantined folder, but both iterate
+        // non-favourite folder. `fullSync` (after its listing, in the pass's own
+        // task) and `imapDeltaSync` both branch into the reaction for a quarantined
+        // folder, but both iterate
         // `syncableFolders` (primary ∪ secondary ∪ favourite), so a quarantined
         // custom folder previously had NO re-drive at all: `runSyncMessages`'s
         // in-transaction quarantine term correctly SKIPS the merge pass and
@@ -620,7 +631,11 @@ extension SyncEngine {
             return nil
         }
         Task { @MainActor in AccountManagerState.shared.setSyncPhase(.checking, forAccount: folder.accountId) }
-        let outcome = await listFolder(folder, provider: provider, limit: SyncConfig.syncMessageLimit)
+        // Inside the account's sync turn: no listing commits between a change
+        // read and its apply (#755).
+        let outcome = await oneSyncAtATime(accountId: folder.accountId) {
+            await listFolder(folder, provider: provider, limit: SyncConfig.syncMessageLimit)
+        }
         try Task.checkCancellation()
         // Unread recount is handled when the listing's result is published.
 

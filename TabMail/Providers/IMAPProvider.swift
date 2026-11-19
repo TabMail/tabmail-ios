@@ -858,8 +858,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `dropChangeServer`, `evictChangeConnectionIfIdle`, `disconnect()` and
     /// `markDirty()`.
     var changeServer: IMAPServer?
-    /// `ENABLE QRESYNC` was acknowledged on `changeServer`'s session.
-    var changeServerQResync = false
+    /// How `changeServer`'s session reads changes, decided once when it opened
+    /// (`IMAPChangeMode.decide`); nil = it cannot, every folder is untracked.
+    var changeMode: IMAPChangeMode?
+    #if DEBUG
+    /// Test seam: `SyncConfig.imapChangeRemovalCheckWindow` for this provider.
+    var removalCheckWindowForTesting: Int?
+    #endif
     var changeServerLastUsed: Date?
     /// The LOGOUT of the change session dropped last (`dropChangeServer`): true
     /// once the session has ended. A pass opens a new session after a dropped one
@@ -2744,7 +2749,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let capturedActionServer = actionServer
         let capturedChangeServer = changeServer
         changeServer = nil
-        changeServerQResync = false
+        changeMode = nil
         changeSelectedPath = nil
         let capturedFolderWaiters = folderWaiters
         let capturedFolderCapacityWaiters = folderCapacityWaiters
@@ -2911,7 +2916,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if let server = changeServer {
             detachedTeardownLogout(server)
             changeServer = nil
-            changeServerQResync = false
+            changeMode = nil
             changeSelectedPath = nil
         }
 
@@ -3711,7 +3716,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         guard let server = changeServer, !changeLaneBusy else { return false }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAPChanges] Evicting the idle change connection to free a server slot") }
         changeServer = nil
-        changeServerQResync = false
+        changeMode = nil
         changeSelectedPath = nil
         logouts.append(detachedTeardownLogout(server))
         return true

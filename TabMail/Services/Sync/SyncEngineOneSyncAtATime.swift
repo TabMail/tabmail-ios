@@ -18,12 +18,29 @@ extension SyncEngine {
     /// The provider's `ProviderWorkQueue` does not do this: it has several
     /// slots, so without this two passes of one account ran side by side, each
     /// writing the account's delta cursor.
+    ///
+    /// Re-entrant for the task holding the turn (`heldSyncTurn`): a listing
+    /// started inside a pass of the same account runs in that pass's turn.
+    /// Only that task: a task spawned inside the turn inherits the task-local
+    /// but is a different task, so it waits for the turn like any other.
     func oneSyncAtATime<T>(accountId: String, _ pass: () async throws -> T) async rethrows -> T {
+        let task = Self.currentTaskIdentity()
+        if let task, Self.heldSyncTurn[accountId] == task { return try await pass() }
         if !syncPassRunning.insert(accountId).inserted {
             await withCheckedContinuation { syncPassWaiters[accountId, default: []].append($0) }
         }
         defer { handOverSyncPass(accountId: accountId) }
-        return try await pass()
+        var held = Self.heldSyncTurn
+        held[accountId] = task
+        return try await Self.$heldSyncTurn.withValue(held) { try await pass() }
+    }
+
+    /// The accounts whose sync turn is held, each with the task holding it.
+    @TaskLocal static var heldSyncTurn: [String: Int] = [:]
+
+    /// The running task's identity, nil outside a task.
+    nonisolated static func currentTaskIdentity() -> Int? {
+        withUnsafeCurrentTask { $0?.hashValue }
     }
 
     /// Runs `body` holding the sync turn (`oneSyncAtATime`) of every account in

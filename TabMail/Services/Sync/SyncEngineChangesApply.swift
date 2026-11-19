@@ -101,6 +101,15 @@ extension SyncEngine {
             return result
         }
 
+        // The rows the read checked, counted again before any removal: a row
+        // that came or went meanwhile was not checked, so the bookmark stays.
+        let heldRowsHold = try changes.heldRowsProof.map { proof in
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM messageHeader
+                WHERE folderId = ? AND CAST(messageId AS INTEGER) BETWEEN ? AND ?
+                """, arguments: [folder.id, proof.lowerId, proof.upperId]) == proof.count
+        } ?? true
+
         // Shields, read INSIDE this transaction.
         let snapshot = try PendingOperationSnapshot.load(accountId: accountId, db: db)
         let recentlyCompleted = AccountManager.shared.liveRecentlyCompleted()
@@ -192,7 +201,7 @@ extension SyncEngine {
         // checked (issued with one, none stored now): a reader's own later page
         // of the same folder moves the bookmark forward, never to none.
         let bookmarkMoved = changes.readFrom.map { $0.cursor != nil && folder.changeCursor == nil } ?? false
-        var cursor = bookmarkMoved ? folder.changeCursor : (changes.cursor ?? folder.changeCursor)
+        var cursor = bookmarkMoved || !heldRowsHold ? folder.changeCursor : (changes.cursor ?? folder.changeCursor)
         switch changes.status {
         case .refused(let reason):
             // This folder only: its bookmark is gone, so it is not covered, its

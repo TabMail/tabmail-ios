@@ -187,6 +187,9 @@ struct UntrackedObservation: Sendable, Equatable {
     let highestModSeq: Int?
     /// Nil when the server did not report one.
     let uidValidity: Int?
+    /// List this folder this pass whatever the counters say: the reader stopped
+    /// a check it owes for want of budget (#755).
+    var mustList = false
 }
 
 enum FolderChangeStatus: Sendable {
@@ -316,6 +319,12 @@ struct FolderChanges: Sendable {
     /// the bookmark, so a pass with no listing, a failed listing or a crash
     /// before tracking starts never leaves the bookmark without its check.
     var armCatchUpWithBookmark = false
+    /// The folder's rows with numeric ids in `lowerId...upperId` the read
+    /// checked, `count` of them. The apply counts them again in its
+    /// transaction; on a difference it keeps the stored bookmark (a row came or
+    /// went meanwhile, so the check did not see it). Nil = nothing to recount.
+    var heldRowsProof: HeldRowsProof?
+    struct HeldRowsProof: Sendable, Equatable { let lowerId: Int; let upperId: Int; let count: Int }
     /// Set by the engine, never by a reader: the folder bookmark the read was
     /// issued with. A bookmark dropped between the read and the apply
     /// (`SyncEngine.dropChangeBookmark`) is never written back. Nil = not

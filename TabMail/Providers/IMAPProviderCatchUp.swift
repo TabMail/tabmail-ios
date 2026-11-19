@@ -241,9 +241,13 @@ extension IMAPProvider {
 
         // A state from another epoch describes UIDs that no longer exist: drop it.
         let state = IMAPCatchUpState.decode(folder.catchUpState).flatMap { $0.epoch == epoch ? $0 : nil }
+        // With a bookmark of this epoch, its MODSEQ alone is the folder's
+        // freshness (S-5); without one, the listing's.
         let bookmark = IMAPChangeCursor.decode(folder.changeCursor)
+        let freshModSeq = bookmark.map { $0.uidValidity == epoch ? Int(exactly: $0.highestModSeq) : folder.lastKnownHighestModSeq }
+            ?? folder.lastKnownHighestModSeq
         let plan = Self.catchUpPlan(
-            state: state, freshModSeq: folder.lastKnownHighestModSeq,
+            state: state, freshModSeq: freshModSeq,
             now: context.clock(),
             // Tracked: a bookmark held AND not owed a check. An owed folder can
             // regain a bookmark from a change pass, and a tracked folder gets no

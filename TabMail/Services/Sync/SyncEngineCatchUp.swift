@@ -83,6 +83,16 @@ struct SyncEngineCatchUpRowReader: CatchUpLocalRowReader {
         }
     }
 
+    func rows(folderId: String, numericIdsBelow upper: Int, limit: Int) async throws -> [CatchUpLocalRow] {
+        try await pool.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT \(Self.columns) FROM messageHeader
+                WHERE folderId = ? AND CAST(messageId AS INTEGER) < ?
+                ORDER BY CAST(messageId AS INTEGER) DESC LIMIT ?
+                """, arguments: [folderId, upper, limit]).map(Self.localRow)
+        }
+    }
+
     func firstNumericId(folderId: String, atLeast lower: Int) async throws -> Int? {
         try await pool.read { db in
             try Int.fetchOne(db, sql: """

@@ -14,8 +14,16 @@ import SwiftMail
 // so nothing else in the provider depends on the fork's names. Below the
 // provider boundary (ADR-IOS-060): the engine never sees this type.
 
-/// The fork's CONDSTORE request, in the provider's terms.
+/// The fork's CONDSTORE requests, in the provider's terms (the only caller of
+/// `selectMailbox(_:enablingCondStore:)` and `fetchFlagsChangedSince`).
 struct IMAPChangeCommands: Sendable {
+    /// `UID FETCH <uids> (UID FLAGS MODSEQ) (CHANGEDSINCE m)`: the messages in
+    /// `uids` changed since `modSeq`, each with its whole flag set.
+    func flagsChangedSince(_ uids: UIDSet, modSeq: UInt64, on server: IMAPServer) async throws -> [IMAPChangedFlags] {
+        try await server.fetchFlagsChangedSince(uids, modificationSequence: modSeq)
+            .map { IMAPChangedFlags(uid: $0.uid.value, flags: $0.flags) }
+    }
+
     /// `SELECT <name> (CONDSTORE)`. `highestModificationSequenceValue` is nil for
     /// NOMODSEQ.
     func selectCondStore(_ name: String, on server: IMAPServer) async throws -> Mailbox.Selection {
