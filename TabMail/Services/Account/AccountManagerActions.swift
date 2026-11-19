@@ -1500,11 +1500,23 @@ extension AccountManager {
         // the net cancel-out. Fold it before re-resolving the deliberately
         // optimistic row (whose durable folder still reflects the predecessor).
         let requestedIds = Set(messages.map(\.id))
+        // A member whose view was read before its folder's UIDVALIDITY reset
+        // names the email re-seated at that id. Refuse it before coalescing,
+        // so it can never cancel or retarget a deferred Undo recorded for the
+        // replacement (ADR-IOS-115). Unstamped callers get no verdict.
+        let staleIds = Set(messages.filter {
+            FolderResetGeneration.refuses(folderId: MessageIdentity.folderId(
+                accountId: $0.accountId, folderPath: $0.folderPath))
+        }.map(\.id))
+        outcome.set(.terminalStale, ids: Array(staleIds))
         let coalesced = coalesceDeferredMoves(
-            headerIds: requestedIds, destinationPath: destinationPath)
+            headerIds: requestedIds.subtracting(staleIds), destinationPath: destinationPath)
         outcome.merge(coalesced.admission)
-        let remainingMessages = messages.filter { !coalesced.ids.contains($0.id) }
+        let remainingMessages = messages.filter {
+            !coalesced.ids.contains($0.id) && !staleIds.contains($0.id)
+        }
         guard !remainingMessages.isEmpty else {
+            await Self.announceMovesRefused(staleIds)
             BackgroundSyncLogger.logInbox(
                 "[RoleActionTrace] manager.move phase=coalescedAll "
                     + "destination=\(destinationPath) outcome=\(outcome.diagnosticSummary)")
@@ -1559,7 +1571,7 @@ extension AccountManager {
             BackgroundSyncLogger.logInbox(
                 "[RoleActionTrace] manager.move phase=noMovable destination=\(destinationPath) "
                     + "outcome=\(outcome.diagnosticSummary)")
-            await Self.announceMovesRefused(Set(unresolvedIds))
+            await Self.announceMovesRefused(Set(unresolvedIds).union(staleIds))
             return outcome
         }
         await ensureDurable(movable)
