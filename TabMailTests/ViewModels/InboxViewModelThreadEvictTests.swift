@@ -451,6 +451,10 @@ struct InboxViewModelThreadEvictTests {
             ("m2", "Thread", baseDate.addingTimeInterval(60), "thread-1", "bob@test.com"),
             ("m3", "Thread", baseDate.addingTimeInterval(120), "thread-1", "carol@test.com"),
         ], folderId: folder.id)
+        // A thread moves only into a folder its account has.
+        try await pool.writeWithoutTransaction { db in
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1").insert(db)
+        }
 
         let vm = InboxViewModel(folders: [folder])
         vm.start()
