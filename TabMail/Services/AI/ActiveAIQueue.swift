@@ -601,6 +601,16 @@ actor ActiveAIQueue {
         }
     }
 
+    /// Whether queued jobs may run. With AI off (`AIService.isAIOff`) they still run while
+    /// Device Sync is connected: a job then only asks the user's other devices for a cached
+    /// result and sends no AI request (the AI calls refuse on their own).
+    nonisolated static func canProcessAI(
+        hasSession: Bool, hasCompletedConsent: Bool, aiOff: Bool,
+        deviceSyncConnected: Bool, subscriptionActive: Bool
+    ) -> Bool {
+        hasSession && hasCompletedConsent && (!aiOff || deviceSyncConnected) && subscriptionActive
+    }
+
     /// Dispatch jobs from queue as independent fire-and-forget tasks.
     /// Phase 1: snapshot MainActor config (single hop, cached for subsequent dispatches).
     /// Phase 2: collect ALL pending candidates (no concurrency limit — semaphore gates LLM calls).
@@ -617,8 +627,10 @@ actor ActiveAIQueue {
         connectivityWatchTask?.cancel()
         connectivityWatchTask = nil
 
-        // Snapshot state — nonisolated reads where possible, minimal MainActor hop
-        let aiDisabled = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
+        // Snapshot state — nonisolated reads where possible, minimal MainActor hop.
+        // `isAIOff` is also true while the AI choice is not made yet: jobs are held
+        // (cleared below) until the choice, and requeued when AI is enabled there.
+        let aiDisabled = AIService.isAIOff
         let hasCompletedConsent = UserDefaults.standard.bool(forKey: AgeAndTermsConsent.completedKey)
         let deviceSyncConnected = DeviceSyncService.checkConnected()
         let kbText = PromptStore.kbTextSnapshot()
@@ -629,7 +641,9 @@ actor ActiveAIQueue {
              PromptStore.shared.compositionMarkdown())
         }
         let subscriptionActive = AISubscriptionGate.shared.isActive
-        let canProcessAI = hasSession && hasCompletedConsent && (!aiDisabled || deviceSyncConnected) && subscriptionActive
+        let canProcessAI = Self.canProcessAI(
+            hasSession: hasSession, hasCompletedConsent: hasCompletedConsent, aiOff: aiDisabled,
+            deviceSyncConnected: deviceSyncConnected, subscriptionActive: subscriptionActive)
         guard canProcessAI else {
             if !storage.isEmpty {
                 activeAILog("[ActiveAI] Skipping dispatch — canProcessAI=false (session=\(hasSession), consent=\(hasCompletedConsent), aiDisabled=\(aiDisabled), deviceSync=\(deviceSyncConnected), subscription=\(subscriptionActive))")

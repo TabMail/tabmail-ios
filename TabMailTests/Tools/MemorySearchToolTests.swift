@@ -748,16 +748,9 @@ struct MemorySearchToolTests {
     /// Begins the next turn through the chat entry point, with AI turned off so
     /// it goes no further than its start.
     private func beginTurn(_ start: TurnStart) async throws {
-        let store = AIService.optOutStore
-        let previous = store.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous {
-                store.set(previous, forKey: AIService.optOutAllAIKey)
-            } else {
-                store.removeObject(forKey: AIService.optOutAllAIKey)
-            }
-        }
-        AIService.writeOptOutFlag(true)
+        let restore = AITestSetting.save()
+        defer { restore() }
+        AITestSetting.set(aiOff: true)
         switch start {
         case .send:
             #expect(try await AIService.shared.sendChatMessage(userText: "next", history: []) == nil)

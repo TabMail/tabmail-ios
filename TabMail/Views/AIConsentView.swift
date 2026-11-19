@@ -69,10 +69,8 @@ struct AIConsentView: View {
                     .frame(height: 16)
 
                 Button {
-                    // Caller decides where to persist the choice. Production
-                    // RootView writes `AIService.optOutAllAIKey = false` in
-                    // its onComplete; demo RootView writes `demo.aiEnabled = true`
-                    // and leaves the production opt-out flag untouched.
+                    // The caller records the choice, always as the device's AI
+                    // setting (`AIService.recordAIChoice`), in the demo too.
                     onComplete(true)
                 } label: {
                     Text("Enable AI Features")

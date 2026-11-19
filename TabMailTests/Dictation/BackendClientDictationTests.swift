@@ -191,7 +191,7 @@ struct BackendClientDictationAuthTests {
                 ? .json(raw: #"{"text":"ask jordan"}"#)
                 : .json(raw: #"{"error":"invalid_token"}"#, statusCode: 401)
         }
-        let client = BackendClient(llmSession: http.session)
+        let client = BackendClient(llmSession: http.session, isAIOff: { false })
 
         let outcome: Result<Void, any Error>
         do {
@@ -225,7 +225,7 @@ struct BackendClientDictationAuthTests {
             seen.withLock { $0.append(request) }
             return .json(raw: #"{"error":"invalid_token"}"#, statusCode: 401)
         }
-        let warmUp = DictationController.backendWarmUp(BackendClient(llmSession: http.session))
+        let warmUp = DictationController.backendWarmUp(BackendClient(llmSession: http.session, isAIOff: { false }))
 
         let outcome: Result<Void, any Error>
         do {

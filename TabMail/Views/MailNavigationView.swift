@@ -255,7 +255,7 @@ struct MailNavigationView: View {
     /// the navigation side effects.
     private func consumePendingPlanNavigation() {
         let gate = AISubscriptionGate.shared
-        let aiOptedOut = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
+        let aiOptedOut = AIService.isAIOff
         switch PendingPlanNavigationLatch.consume(
             gateHasAuthoritativeState: gate.lastAuthoritativeApplyAt != nil,
             gateIsActive: gate.isActive,

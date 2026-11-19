@@ -46,17 +46,7 @@ struct ComposeEditRecipientRolesRequestTests {
     }
 
     private func withAIEnabled<T>(_ body: () async throws -> T) async rethrows -> T {
-        let store = AIService.optOutStore
-        let previous = store.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous {
-                store.set(previous, forKey: AIService.optOutAllAIKey)
-            } else {
-                store.removeObject(forKey: AIService.optOutAllAIKey)
-            }
-        }
-        AIService.writeOptOutFlag(false)
-        return try await body()
+        try await AITestSetting.with(aiOff: false, body)
     }
 
     @Test("performInlineEdit sends To Sam, Cc Pat, Bcc Lee to the backend in their own roles")

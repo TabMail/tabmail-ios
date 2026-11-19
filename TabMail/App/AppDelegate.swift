@@ -1011,28 +1011,8 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // state mirror live inside `ensureDatabaseReady` (they touch AppDatabase),
         // so they still run on every launch as they did before the splash work.
         Task { _ = await AppStartup.shared.ensureDatabaseReady() }
-        migrateOptOutFlagToSharedSuite()
         BootProfiler.mark("AppDelegate.didFinishLaunching exit (DB build kicked async)")
         return true
-    }
-
-    /// One-time migration: copy the AI privacy opt-out flag from the main
-    /// app's `UserDefaults.standard` (where it used to live) into the shared
-    /// App Group suite (where it now lives so the NSE can read it). Idempotent:
-    /// if the shared suite already has the key, we assume it's authoritative
-    /// and leave it alone. Without this, an existing opt-out user whose flag
-    /// lived only in `.standard` would silently re-enable AI on first launch
-    /// of this version.
-    private func migrateOptOutFlagToSharedSuite() {
-        let key = AIService.optOutAllAIKey
-        let shared = AIService.optOutStore
-        guard shared.object(forKey: key) == nil else { return }
-        if let legacy = UserDefaults.standard.object(forKey: key) as? Bool {
-            shared.set(legacy, forKey: key)
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[AppDelegate] Migrated opt-out flag to shared suite: \(legacy)")
-            }
-        }
     }
 
     private func registerNotificationCategories() {

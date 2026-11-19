@@ -48,6 +48,21 @@ Added after the line beginning "memory_read never cross modes (NULL sessionId = 
   no admission is refused; any other turn is real history and always admitted.
 >
 > **2026-11-09, tabmail-ios #495:** the `CalendarBackend` enum named under CalendarProviderDispatch below is deleted; `resolve()` returns the provider and account directly. The demo boundary itself is unchanged.
+>
+> **2026-11-19, one AI setting for the device (amendment at the end of this file).** Where the pinned body below says
+> otherwise, this wins:
+> - *Consent gates:* only the age and terms screen keeps a demo key (`demo.hasCompletedConsentGate`). The demo's
+>   `AIConsentView` records the device's AI setting and is shown only while the device has no AI choice;
+>   `demo.hasSeenAIConsent` and `demo.aiEnabled` are retired. "Production gates run from scratch when the user later
+>   signs up" now holds for the AI choice through the clear at a sign-in with no mail account.
+> - *AI-disabled demo:* the views gate on the device's AI setting (`DemoModeStore.hidesAIContent` reads
+>   `AIService.isAIOff`), not `DemoModeStore.aiEnabled`; the demo Settings page's "Enable AI" and "Turn off AI" record
+>   the device's setting.
+> - *Persists across exit:* "demo gate flags" means the age and terms flag only.
+> - *Debug-menu entry:* `startFromDebugMenu` pre-sets only the age and terms flag and uses the device's AI setting.
+> - *Tutorial, scripted, no AI:* the seeded tags and summaries show whatever the device's AI setting; outside the
+>   tutorial `completeSetup` opens the subscription gate when the device's AI setting is on.
+> - *Consent once (dropped):* the demo-prefixed age and terms gate stands; the AI choice is the device's.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 
@@ -537,3 +552,24 @@ the old mode with the new counter or the reverse. (3) *Absolute deadline.* Each 
 cannot turn a waiter that ran out of time into a holder; and `hold` refuses a grant whose lease expired before its body starts (`PromptRefusal.changed`), so a body never runs under an already-expired lease. (4) The template toggle no longer returns early when the
 template already has the requested state: the call goes through the same guarded write as every other tool, so a
 switch refuses it too.
+
+---
+
+**Amendment 2026-11-19: one AI setting for the device.** The demo no longer keeps an AI choice of its own. The AI
+setting is the device's: the AI choice and Opt Out of AI, kept in the App Group suite and read by the app for every
+AI request, demo or not, and by the notification extension (`AIConsentPolicy`, ADR-IOS-037 amendment). In the demo,
+the AI screen is shown only when the device has no AI choice yet, and its answer is the device's
+(`AIService.recordAIChoice`, which requeues nothing there); the demo Settings page's AI buttons change the same
+setting. `demo.hasSeenAIConsent` and `demo.aiEnabled` are no longer read (values left on devices are unused). The age
+and terms screen keeps its demo key, `demo.hasCompletedConsentGate`.
+
+So that an answer given while trying the demo is not applied to the person's own mail without asking again, signing
+in to TabMail on a device with no mail account clears the AI choice and Opt Out of AI, the choice first
+(`TabMailAuthService.clearAIChoiceIfNoMailAccount`, on the line before each of the three session writes). Mail
+accounts are counted with the sidebar's definition (`Account.sidebarRequest(demoActive: false)`: active, not
+calendar-only, not the demo's account, so a demo row left by an unfinished cleanup does not count); a count that
+cannot be read clears too. The AI screen is then shown after the first account is added, and AI stays off until it is
+answered. A real account cannot be added on a device with no mail account before sign-in, so the clear always comes
+first. Signing in with mail accounts on the device, updating the app, and refreshing a session keep the answer.
+Demo setup opens the subscription gate when the device's AI is on, or in the tutorial. The debug-menu demo and a
+tutorial replay write no session and use the device's setting as it is.

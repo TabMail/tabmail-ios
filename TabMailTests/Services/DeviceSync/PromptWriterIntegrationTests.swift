@@ -35,12 +35,9 @@ struct PromptWriterIntegrationTests {
     }
 
     private func withAIEnabled<T>(_ body: () async throws -> T) async rethrows -> T {
-        let optOut = AIService.optOutStore
-        let previous = optOut.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous { optOut.set(previous, forKey: AIService.optOutAllAIKey) } else { optOut.removeObject(forKey: AIService.optOutAllAIKey) }
-        }
-        AIService.writeOptOutFlag(false)
+        let restore = AITestSetting.save()
+        defer { restore() }
+        AITestSetting.set(aiOff: false)
         return try await body()
     }
 

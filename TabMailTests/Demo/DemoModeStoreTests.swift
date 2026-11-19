@@ -245,26 +245,54 @@ struct DemoModeStoreTests {
 
     // MARK: - Persistence
 
-    @Test("Demo gate flags persist independent of production flags")
+    @Test("The demo's age and terms flag is its own; production's stays untouched")
     func gateFlagsPersistSeparately() {
         DemoModeStore.shared._resetForTests()
         // Leave the demo gates closed: with them passed, the test host's root
         // view finishes a demo setup whenever a later test turns demo on.
         defer { DemoModeStore.shared._resetForTests() }
         UserDefaults.standard.set(false, forKey: "hasCompletedConsentGate")
-        UserDefaults.standard.set(false, forKey: "hasSeenAIConsent")
 
         DemoModeStore.shared.hasCompletedConsentGate = true
-        DemoModeStore.shared.hasSeenAIConsent = true
-        DemoModeStore.shared.aiEnabled = true
 
-        // Production flags untouched
         #expect(UserDefaults.standard.bool(forKey: "hasCompletedConsentGate") == false)
-        #expect(UserDefaults.standard.bool(forKey: "hasSeenAIConsent") == false)
-        // Demo flags set
         #expect(UserDefaults.standard.bool(forKey: "demo.hasCompletedConsentGate") == true)
-        #expect(UserDefaults.standard.bool(forKey: "demo.hasSeenAIConsent") == true)
-        #expect(UserDefaults.standard.bool(forKey: "demo.aiEnabled") == true)
+    }
+
+    @Test("The demo shows AI content by the device's AI setting")
+    func demoFollowsTheDeviceSetting() {
+        let store = DemoModeStore.shared
+        let restore = AITestSetting.save()
+        defer { store._resetForTests(); restore() }
+        store._resetForTests()
+        store.isActive = true
+        AITestSetting.clear()
+        #expect(store.hidesAIContent)
+        AITestSetting.set(aiOff: true)
+        #expect(store.hidesAIContent)
+        AITestSetting.set(aiOff: false)
+        #expect(!store.hidesAIContent)
+    }
+
+    @Test("Starting the demo from the debug menu leaves the device's AI setting as it was")
+    func debugMenuStartKeepsTheDeviceSetting() async throws {
+        let store = DemoModeStore.shared
+        let restore = AITestSetting.save()
+        defer { store._resetForTests(); restore() }
+        store._resetForTests()
+        AITestSetting.set(aiOff: true)
+        let suite = AIService.optOutStore
+        let choiceBefore = suite.object(forKey: AIService.aiChoiceMadeKey) as? Bool
+        let optOutBefore = suite.object(forKey: AIService.optOutAllAIKey) as? Bool
+        // An active demo makes the start step a no-op, so only the debug menu's own flags run.
+        store.isActive = true
+
+        try await DemoModeService.shared.startFromDebugMenu()
+
+        #expect(store.hasCompletedConsentGate && store.enteredFromDebugMenu)
+        #expect(AIService.isAIOff)
+        #expect(suite.object(forKey: AIService.aiChoiceMadeKey) as? Bool == choiceBefore)
+        #expect(suite.object(forKey: AIService.optOutAllAIKey) as? Bool == optOutBefore)
     }
 
 }
