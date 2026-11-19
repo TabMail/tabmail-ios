@@ -146,7 +146,8 @@ struct ChatThreadView: View {
         .dismissKeyboardOnTap()
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarVisibility(chatExpanded && chatInputFocused ? .hidden : .automatic, for: .navigationBar)
+        // The bar stays while the opened pill has focus, unlike the inbox and the email screen: it
+        // holds who the chat is with, and Messages never hides it.
         .task {
             noteMembers()
             await viewModel.loadBody()
@@ -184,6 +185,16 @@ struct ChatThreadView: View {
         // A new newest email has its own people: the next reply is a Reply All to them.
         .onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }
         .toolbar {
+            // Who the reply goes to, in the navigation bar as in Messages: the avatars level with
+            // Back, the names under them.
+            ToolbarItem(placement: .principal) {
+                if viewModel.message != nil {
+                    ChatHeaderView(thread: thread) {
+                        guard TutorialCoordinator.shared.admits(.other) else { return }
+                        showsReplyTo = true
+                    }
+                }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 // Forward the newest email, in today's forward compose. The tutorial's mail
                 // actions are off (owner 2026-10-21).
@@ -330,10 +341,7 @@ struct ChatThreadView: View {
             }
             .safeAreaInset(edge: .top, spacing: 0) {
                 VStack(spacing: 0) {
-                    ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) {
-                        guard TutorialCoordinator.shared.admits(.other) else { return }
-                        showsReplyTo = true
-                    }
+                    ChatSubjectLine(subject: subject(thread), labels: context.labels)
                     tutorialCard(thread)
                 }
             }
@@ -629,6 +637,9 @@ struct ChatThreadView: View {
 
     // MARK: - Reply field
 
+    /// The reply field's container, as tests find it.
+    static let replyPillId = "chatReplyPill"
+
     private func pill(on newest: MessageHeader) -> some View {
         let isOwn = thread.items.last?.isOwn ?? false
         // The user's turn: their email is the newest, or a reply of theirs is still in the outbox
@@ -663,9 +674,12 @@ struct ChatThreadView: View {
                         replyTo: newest, target: replyTarget, accounts: context.accounts))
                 },
                 onFieldSend: { _ in fieldComposeOpened = false })
+            // One container, so its frame is the field's own (ChatThreadLayoutTests).
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier(Self.replyPillId)
         }
-        .padding(.horizontal, chatExpanded ? 0 : 12)
-        .padding(.bottom, chatExpanded ? 8 : 34)
+        .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)
+        .padding(.bottom, ChatViewLayout.fieldBottomGap)
         .animation(Self.pillSpring, value: chatExpanded)
     }
 

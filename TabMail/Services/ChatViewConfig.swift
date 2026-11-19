@@ -70,6 +70,13 @@ enum ChatViewLayout {
     static let pillStartHeight: CGFloat = 98
     /// Room between the last bubble and the pill's top, beyond the bubble spacing.
     static let pillGap: CGFloat = 6
+    /// The reply field's bottom edge sits this far above the bottom safe-area line, collapsed or
+    /// opened: the safe area already clears the home indicator, so nothing else is added.
+    static let fieldBottomGap: CGFloat = 8
+    /// The reply field's distance from each side of the screen, as in Messages.
+    static let fieldSideInset: CGFloat = 16
+    /// Room between the header's names and the subject line under the navigation bar.
+    static let subjectLineSpacing: CGFloat = 2
     /// The jump-to-bottom button shows once the bottom is this far below the screen.
     static let jumpButtonThreshold: CGFloat = 240
     static let jumpButtonSize: CGFloat = 40

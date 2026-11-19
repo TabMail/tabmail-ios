@@ -801,6 +801,20 @@ from Part 2 to the switch with the setting flipped mid-run, and today's run with
 opted out); `ChatThreadContextTests.opensInChat`; the tutorial locks in the chat read from the source
 by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`.
 
+15. **Where the field and the header sit (amendment 2026-11-17).** The chat is laid out as Messages
+   is. The reply field's bottom edge sits `ChatViewLayout.fieldBottomGap` (8 pt) above the bottom
+   safe-area line, collapsed or opened, with `ChatViewLayout.fieldSideInset` (16 pt, measured in
+   Messages) on each side. The safe area already clears the home indicator, so nothing else is
+   added; the 34 pt the pill used to add counted it twice. The inbox and email-screen pills keep
+   theirs. The header (`ChatHeaderView`, the avatars and the names that open "Reply to") is the
+   navigation bar's principal item, level with Back; the subject and labels are one thin line under
+   the bar (`ChatSubjectLine`), with no band of their own. The chat screen never hides its
+   navigation bar, even while the opened pill has focus, since the bar holds who the chat is with;
+   the inbox and the email screen keep hiding theirs then. Tests: `ChatThreadLayoutTests` (the
+   hosted chat's measured field position, the opened pill between the bar and the safe area at the
+   largest text size, the header inside the bar and the subject under it) and
+   `ChatReplyFieldTests.messagesLayout`.
+
 ## The longer index line (routed 2026-11-09)
 
 The DECISIONS.md row grew with each decision of the chat view; it moved here when the index went
