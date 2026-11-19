@@ -20,12 +20,12 @@ struct RootView: View {
     /// The AI choice, in the App Group suite with the opt-out (`AIConsentPolicy`): the
     /// notification extension reads both.
     @AppStorage(AIService.aiChoiceMadeKey, store: AIService.optOutStore) private var hasSeenAIConsent = false
+    /// Opt Out of AI, observed so views that show the device's AI setting redraw.
+    @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var aiOptedOut = false
     @AppStorage("hasSeenPushConsent") private var hasSeenPushConsent = false
-    // Demo Mode gate persistence.
-    // Production gates above stay untouched while demo runs.
+    // The demo's own age and terms flag. The AI choice is the device's
+    // (`hasSeenAIConsent` above), in the demo too.
     @AppStorage("demo.hasCompletedConsentGate") private var demoHasCompletedConsentGate = false
-    @AppStorage("demo.hasSeenAIConsent") private var demoHasSeenAIConsent = false
-    @AppStorage("demo.aiEnabled") private var demoAiEnabled = false
     private var tutorial: TutorialCoordinator { TutorialCoordinator.shared }
     /// The first-launch tutorial welcome (`TutorialProgress.markWelcomePending`).
     @State private var showsTutorialWelcome = TutorialProgress().isWelcomePending
@@ -108,9 +108,10 @@ struct RootView: View {
                 await checkAppStoreAge()
             }
         } else if demoStore.isActive {
-            // Demo mode wins over all other routing. Runs the SAME consent + AI
-            // gates as production but writes to demo-prefixed AppStorage so
-            // production flags survive demo entry/exit untouched. The guided
+            // Demo mode wins over all other routing. Runs the same age and terms
+            // screen as production with its own demo flag, and the AI screen
+            // only while the device has no AI choice; that answer is the
+            // device's AI setting, used by the demo and the app. The guided
             // tutorial skips both: it is scripted and sends nothing anywhere
             // (ADR-IOS-038 amendment 2026-10-21).
             if !demoHasCompletedConsentGate && !tutorial.isRunning {
@@ -119,12 +120,13 @@ struct RootView: View {
                 }, onIneligible: {
                     await DemoModeService.shared.exit()
                 })
-            } else if !demoHasSeenAIConsent && !tutorial.isRunning {
+            } else if !hasSeenAIConsent && !tutorial.isRunning {
                 AIConsentView { aiEnabled in
-                    demoAiEnabled = aiEnabled
-                    // Critical: NEVER write to AIService.optOutAllAIKey here.
-                    // Demo's AI choice lives entirely in demo.aiEnabled.
-                    withAnimation { demoHasSeenAIConsent = true }
+                    // Records the device's AI choice. Nothing is requeued: the
+                    // demo has no real inbox mail held for the choice. Signing
+                    // in on a device with no mail account clears this answer
+                    // (`TabMailAuthService`), so the real AI screen asks again.
+                    withAnimation { AIService.recordAIChoice(aiEnabled: aiEnabled, resume: {}) }
                 }
             } else if !demoSeedingComplete {
                 DemoSeedingSplash()
@@ -233,8 +235,7 @@ struct RootView: View {
                 AIConsentView { aiEnabled in
                     // Persist the user's AI choice (the opt-out, then the
                     // choice itself) and, with AI enabled, queue the inbox
-                    // mail that arrived while this screen was open. Demo mode
-                    // writes its own flag instead (above).
+                    // mail that arrived while this screen was open.
                     AIService.recordAIChoice(aiEnabled: aiEnabled)
                     // Arm or disarm the plan-picker latch. Every arm writes
                     // an explicit value — the pre-fix code fell through both
@@ -380,7 +381,7 @@ struct RootView: View {
             // The tutorial's coach cards carry their own Skip, and it makes
             // no AI calls, so it has no allowance to show.
             if demoStore.isActive && demoSeedingComplete && !demoStore.enteredFromDebugMenu && !tutorial.isRunning {
-                DemoBanner(aiEnabled: demoAiEnabled)
+                DemoBanner(aiEnabled: hasSeenAIConsent && !aiOptedOut)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .ignoresSafeArea(.container, edges: .bottom)
             }
@@ -728,7 +729,8 @@ struct RootView: View {
             withAnimation {
                 hasTabMailSession = false
                 hasCompletedConsentGate = false
-                // AI consent (hasSeenAIConsent) is device-level — not cleared on sign-out.
+                // AI consent (hasSeenAIConsent) is device-level — not cleared on sign-out
+                // (a sign-in on a device with no mail account clears it).
                 // Apple 5.1.2(i) disclosure is about app behavior, not account identity.
                 pendingDeletionDate = nil
                 pendingDeletionRequestId = nil

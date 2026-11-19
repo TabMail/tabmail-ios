@@ -333,13 +333,14 @@ struct TutorialPracticeTests {
         #expect(answer.contains("[Email]("))
     }
 
-    @Test("Tutorial practice shows the seeded AI content even with demo AI off")
+    @Test("Tutorial practice shows the seeded AI content even with the AI setting off")
     func practiceShowsSeededContent() {
         let store = DemoModeStore.shared
-        defer { store._resetForTests() }
+        let restore = AITestSetting.save()
+        defer { store._resetForTests(); restore() }
         store._resetForTests()
+        AITestSetting.set(aiOff: true)
         store.isActive = true
-        store.aiEnabled = false
         #expect(store.hidesAIContent)
         store.isTutorialPractice = true
         #expect(!store.hidesAIContent)

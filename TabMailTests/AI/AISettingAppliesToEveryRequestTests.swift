@@ -673,6 +673,9 @@ struct AISettingAppliesToEveryRequestTests {
         "TabMail/Views/Inbox/TriageCardView.swift",
         "TabMail/Views/Inbox/DynamicIslandChatButton.swift",
         "TabMail/Views/Inbox/MessageRowView.swift",
+        // Display only: observes both values so the demo's AI section redraws; it records
+        // through AIService.recordAIChoice.
+        "TabMail/Views/Account/DemoAccountDashboardView.swift",
     ]
 
     @Test("only the AI setting's own files name its keys; everything else reads the one predicate")
