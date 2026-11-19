@@ -639,6 +639,89 @@ struct FolderResetGenerationTests {
         #expect(seen == 424_242)
     }
 
+    // MARK: - A deferred Undo recorded for the replacement
+
+    @Test("""
+    A move stamped before the folder's reset never redirects the Undo the user recorded for the \
+    email re-seated at the same id: the replacement ends where the Undo put it and the stale move is \
+    reported refused; stamped after the reset, the move redirects the Undo as before
+    """, arguments: [true, false])
+    func staleMoveNeverRedirectsADeferredUndoOfTheReplacement(stampedBeforeReset: Bool) async throws {
+        let env = try makeEnv(accountId: "frg-deferred-\(stampedBeforeReset)")
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+
+        // The view the stale gesture carries: the shown email, read before the reset.
+        let shown = try #require(try await row(env))
+        let preResetStamp = FolderResetGeneration.current()
+        try await runReset(env)
+        try await expectReseated(env)
+        let replacement = try #require(try await row(env))
+
+        // The user acts on the replacement: archive it, and press Undo while the
+        // archive is in flight, so the Undo waits as a deferred successor.
+        // No provider is registered, so the archive's own drain does nothing.
+        await AccountManager.shared.move([replacement], to: "Archive")
+        let forward = try #require(try await ops(env).first { $0.type == .move },
+                                   "fixture: the archive of the replacement was not queued")
+        try await env.pool.write { db in
+            var op = forward
+            op.status = PendingStatus.inFlight.rawValue
+            try op.update(db)
+        }
+        let restored = await AccountManager.shared.undoMove(
+            accountId: env.accountId, forwardDestinationPath: "Archive",
+            members: [UndoMember(header: replacement)])
+        #expect(restored == [replacement.id], "fixture: Undo of the replacement was refused")
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1,
+                "fixture: the Undo was not deferred behind the in-flight archive")
+
+        let refused = Mutex<[String]>([])
+        let observer = NotificationCenter.default.addObserver(
+            forName: .messageMovesRefused, object: nil, queue: nil
+        ) { note in
+            refused.withLock { $0.append(contentsOf: note.object as? [String] ?? []) }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        // The stale gesture: a move to Trash of the SHOWN email's id.
+        let stamp = stampedBeforeReset ? preResetStamp : FolderResetGeneration.current()
+        await FolderResetGeneration.$gestureStamp.withValue(stamp) {
+            await AccountManager.shared.move([shown], to: "Trash")
+        }
+        for _ in 0..<200 where stampedBeforeReset && !refused.withLock({ $0.contains(env.headerId) }) {
+            await Task.yield()
+        }
+
+        // Release the archive and drain everything to the wire.
+        try await env.pool.write { db in
+            var op = try #require(try PendingOperation.fetchOne(db, key: forward.id))
+            op.status = PendingStatus.queued.rawValue
+            try op.update(db)
+        }
+        try await drainToWire(env)
+        await AccountManager.shared.awaitWriteQueueDrain()
+        try await drainToWire(env)
+
+        let inbox = env.server.messageIDs(in: "INBOX")
+        let trash = env.server.messageIDs(in: "Trash")
+        if stampedBeforeReset {
+            #expect(inbox == ["<\(Self.replacementRfc)>"] && trash.isEmpty, """
+                a move stamped before the reset redirected the Undo of the replacement: \
+                INBOX=\(inbox) Archive=\(env.server.messageIDs(in: "Archive")) Trash=\(trash)
+                """)
+            #expect(refused.withLock { $0.contains(env.headerId) },
+                    "the refused move was not reported, so its hidden row never returns")
+        } else {
+            #expect(trash == ["<\(Self.replacementRfc)>"],
+                    "control: a move stamped after the reset did not redirect the Undo: INBOX=\(inbox) Trash=\(trash)")
+        }
+        #expect(env.server.wrongMessageViolations().isEmpty)
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+        await finish(env)
+    }
+
     @Test("A reset refuses only earlier stamps, only for its own folder, never unstamped work; the real reaction bumps once and a re-drive does not bump again")
     func generationScopeAndReDrive() async throws {
         let before = FolderResetGeneration.current()
