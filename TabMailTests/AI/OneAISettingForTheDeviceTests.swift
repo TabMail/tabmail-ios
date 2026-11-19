@@ -108,4 +108,36 @@ struct OneAISettingForTheDeviceTests {
             try await expectAskedAgain(pool)
         }
     }
+
+    @Test("a demo account row left by an unfinished cleanup does not count as the person's account")
+    func aLeftoverDemoRowIsNotAnAccount() async throws {
+        try await withDeviceState { pool in
+            answerTheDemosAIScreen(aiEnabled: true)
+            // The demo ended but its cleanup did not finish: its account row is still there.
+            _ = try FolderEpochTestFixture.makeAccount(id: DemoSeed.demoAccountId, provider: .imap, pool: pool)
+
+            await signIn(pool)
+
+            try await expectAskedAgain(pool)
+        }
+    }
+
+    @Test("an AI answer given in a demo the app was closed in is asked again after sign-in")
+    func aDemoClosedMidwayIsAskedAgain() async throws {
+        try await withDeviceState { pool in
+            await MainActor.run {
+                DemoModeStore.shared._resetForTests()
+                DemoModeStore.shared.isActive = true
+            }
+            answerTheDemosAIScreen(aiEnabled: true)
+            _ = try FolderEpochTestFixture.makeAccount(id: DemoSeed.demoAccountId, provider: .imap, pool: pool)
+            // The app is closed in the demo, with no exit: the next launch starts with the demo
+            // off in memory, and its rows still on disk.
+            await MainActor.run { DemoModeStore.shared._resetForTests() }
+
+            await signIn(pool)
+
+            try await expectAskedAgain(pool)
+        }
+    }
 }
