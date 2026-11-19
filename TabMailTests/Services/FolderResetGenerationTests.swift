@@ -763,6 +763,20 @@ struct FolderResetGenerationTests {
 
         let replacementOnWire = "<\(Self.replacementRfc)>"
         let placement = "INBOX=\(env.server.messageIDs(in: "INBOX")) Archive=\(env.server.messageIDs(in: "Archive")) Trash=\(env.server.messageIDs(in: "Trash"))"
+        // Non-vacuity: the archive really ran and the Undo really materialized,
+        // so the replacement in INBOX is the Undo's work, not an archive that
+        // never left.
+        let leftover = try await ops(env)
+        #expect(!leftover.contains { $0.id == forward.id },
+                "\(route): the forward archive never finished: \(placement)")
+        #expect(leftover.isEmpty, "\(route): the queue did not converge: \(leftover.map(\.type.rawValue))")
+        #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0,
+                "\(route): the Undo never materialized: \(placement)")
+        if stampedBeforeReset {
+            // A message back in INBOX by a real archive and Undo carries a new UID.
+            #expect(!inboxUids(env).contains(Self.uid),
+                    "\(route): the replacement never left INBOX on the server: UIDs \(inboxUids(env))")
+        }
         if stampedBeforeReset {
             #expect(env.server.messageIDs(in: "INBOX") == [replacementOnWire],
                     "\(route): a request stamped before the reset changed the Undo of the replacement: \(placement)")
