@@ -2566,11 +2566,6 @@ extension SyncEngine {
         )
     }
 
-    /// A listing that did not count as the folder's listing, classified by this
-    /// pass's server answer alone (#755): a selection with no usable count is
-    /// not listable and does not withhold the full-sync stamp; any other
-    /// (a short or empty FETCH under a counted selection, a refused merge) is a
-    /// started listing that failed to prove its window and withholds it.
     /// A folder listing's outcome, classified in one place (`runListing`) by
     /// this pass's server answer (ADR-IOS-111):
     /// - `proven`: the listing proved its window; its counters, sweep and count

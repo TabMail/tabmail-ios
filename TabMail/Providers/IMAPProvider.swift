@@ -3913,24 +3913,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         try await fetchMessagesWithObservedEpoch(folder: folder, limit: limit, offset: offset).messages
     }
 
-    /// Coverage for one windowed `fetchMessages` pass, from the SELECT that served
-    /// it and the raw FETCH records it returned — computed here because this is the
-    /// only place both facts exist. See `FetchCoverage`.
-    ///
-    /// `spansEntireFolder` needs BOTH halves and neither alone is sound:
-    ///  - `messageCount <= limit` — the requested `selection.latest(limit)` range is
-    ///    then the whole mailbox, so nothing on the server sits outside it. Without
-    ///    this a 900-message folder that returned a full window would read as
-    ///    complete the moment one record failed to map.
-    ///  - `rawRecordCount == messageCount` — the server returned a record for every
-    ///    message in that range. A SHORT FETCH (already visible in production as the
-    ///    `[IMAP-FETCH-GAP]` diagnostic) otherwise manufactures the same false
-    ///    completeness from the other direction, and the messages whose records
-    ///    never came back would be stale-deleted.
-    ///
-    /// Records the client could not map are NOT excluded from either half — they
-    /// were covered. They are reported as `unmaterialisedIds` instead, so presence
-    /// stays true for them while coverage stays honest.
     /// How a pooled connection's listings get HIGHESTMODSEQ (RFC 7162 §3.1.2.1:
     /// only once a CONDSTORE enabling command was sent), decided once per
     /// session when it opens, in the authenticated state before its first SELECT
@@ -3986,6 +3968,24 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             highestModSeq: condStore == .off ? nil : selection.highestModificationSequenceValue.flatMap { Int(exactly: $0) })
     }
 
+    /// Coverage for one windowed `fetchMessages` pass, from the SELECT that served
+    /// it and the raw FETCH records it returned — computed here because this is the
+    /// only place both facts exist. See `FetchCoverage`.
+    ///
+    /// `spansEntireFolder` needs BOTH halves and neither alone is sound:
+    ///  - `messageCount <= limit` — the requested `selection.latest(limit)` range is
+    ///    then the whole mailbox, so nothing on the server sits outside it. Without
+    ///    this a 900-message folder that returned a full window would read as
+    ///    complete the moment one record failed to map.
+    ///  - `rawRecordCount == messageCount` — the server returned a record for every
+    ///    message in that range. A SHORT FETCH (already visible in production as the
+    ///    `[IMAP-FETCH-GAP]` diagnostic) otherwise manufactures the same false
+    ///    completeness from the other direction, and the messages whose records
+    ///    never came back would be stale-deleted.
+    ///
+    /// Records the client could not map are NOT excluded from either half — they
+    /// were covered. They are reported as `unmaterialisedIds` instead, so presence
+    /// stays true for them while coverage stays honest.
     nonisolated static func coverage(
         rawRecordCount: Int, serverMessageCount: Int, limit: Int, unmaterialisedIds: Set<String>
     ) -> FetchCoverage {
