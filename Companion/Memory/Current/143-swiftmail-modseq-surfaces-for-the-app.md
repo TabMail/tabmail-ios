@@ -41,3 +41,9 @@ now answers only within every `UID <set>` key in the request, resolved against i
 with a `HEADER Message-ID` probe and the opt-in SINCE/BEFORE keys (RFC 3501 sections 6.4.4, 6.4.8). The one
 seam is the opt-out `FakeIMAPServer.ignoreSearchUIDSetCriterion()`, used only by the `IMAPChangeReaderTests`
 over-broad fixture that tests the client refusing a superset answer.
+
+**2026-11-19 (#755): `CHANGEDSINCE` is now used.** On a CONDSTORE session without QRESYNC the change
+reader sends `UID FETCH lo:N1-1 (UID FLAGS) (CHANGEDSINCE m)` through
+`IMAPChangeCommands.flagsChangedSince` (the fork's `fetchFlagsChangedSince`), and `SELECT … (CONDSTORE)`
+through `selectCondStore` when the server has no ENABLE. The fake answers CHANGEDSINCE by per-message
+mod-sequence and counts it (`changedSinceFetchCount`). Design: ADR-IOS-111 amendment "CONDSTORE without QRESYNC".
