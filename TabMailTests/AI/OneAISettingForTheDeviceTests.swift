@@ -218,6 +218,90 @@ struct OneAISettingForTheDeviceTests {
         }
         #expect(callers == Array(repeating: "TabMailAuthService.swift", count: 3), "\(callers)")
     }
+
+    // MARK: - An answer from an earlier version
+
+    @Test("an answer moved from an earlier version and cleared at sign-in does not come back on the next launch",
+          arguments: [true, false])
+    func aClearedMovedAnswerStaysCleared(earlierAnswer aiEnabled: Bool) async throws {
+        try await withDeviceState { pool in
+            let legacyName = "test.ai-setting.legacy.\(UUID().uuidString)"
+            defer { UserDefaults.standard.removePersistentDomain(forName: legacyName) }
+            let legacy = try #require(UserDefaults(suiteName: legacyName))
+            // An earlier version: the choice in the app's own defaults, the opt-out already in the shared suite.
+            legacy.set(true, forKey: AIConsentPolicy.completedChoiceKey)
+            AIService.optOutStore.set(!aiEnabled, forKey: AIService.optOutAllAIKey)
+
+            AIConsentPolicy.migrateLegacyValues(from: legacy, to: AIService.optOutStore)
+            #expect(AIService.isAIOff == !aiEnabled, "the first launch keeps the earlier answer")
+
+            await signIn(pool)
+            try addMailAccount("account-one", pool: pool)
+            // The app is closed before the AI screen is answered; the next launch moves values again.
+            AIConsentPolicy.migrateLegacyValues(from: legacy, to: AIService.optOutStore)
+
+            #expect(AIService.optOutStore.object(forKey: AIService.aiChoiceMadeKey) == nil)
+            let http = answering()
+            defer { http.close() }
+            let held = try await requestsForOneMessage(http)
+            #expect(held.app == 0 && held.nse == 0, "sent before a new answer: \(held)")
+
+            AIService.recordAIChoice(aiEnabled: true, resume: {})
+            let answered = try await requestsForOneMessage(http)
+            #expect(answered.app == 1 && answered.nse == 1, "after the new answer: \(answered)")
+        }
+    }
+
+    // MARK: - The sign-in step itself
+
+    @Test("at sign-in, accounts that cannot be counted clear the answer; a counted account keeps it")
+    func theSignInStepClearsWhenTheCountFails() async throws {
+        try await withDeviceState { _ in
+            AIService.recordAIChoice(aiEnabled: true, resume: {})
+            await TabMailAuthService.clearAIChoiceIfNoMailAccount(countMailAccounts: { 1 })
+            #expect(!AIService.isAIOff, "a counted account keeps the answer")
+
+            struct Unreadable: Error {}
+            await TabMailAuthService.clearAIChoiceIfNoMailAccount(countMailAccounts: { throw Unreadable() })
+            #expect(AIService.optOutStore.object(forKey: AIService.aiChoiceMadeKey) == nil)
+            #expect(AIService.optOutStore.object(forKey: AIService.optOutAllAIKey) == nil)
+            let http = answering()
+            defer { http.close() }
+            let sent = try await requestsForOneMessage(http)
+            #expect(sent.app == 0 && sent.nse == 0, "\(sent)")
+        }
+    }
+
+    // MARK: - The demo's screens
+
+    @Test("the demo's AI screen and its Settings buttons record the device's AI setting")
+    func theDemoScreensRecordTheDeviceSetting() throws {
+        let root = DiagnosticPrintGateTests.repositoryRoot()
+        func code(_ path: String) throws -> [String] {
+            try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+                .components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && !$0.hasPrefix("//") }
+        }
+        // RootView's demo branch: the AI screen is shown while the device has no choice, and records it.
+        let root_ = try code("TabMail/Views/RootView.swift")
+        let demoStart = try #require(root_.firstIndex(of: "} else if demoStore.isActive {"))
+        let demoEnd = try #require(root_[demoStart...].firstIndex(of: "} else if hasEmailAccounts && !hasTabMailSession {"))
+        let demo = Array(root_[demoStart..<demoEnd])
+        let screen = try #require(demo.firstIndex(of: "} else if !hasSeenAIConsent && !tutorial.isRunning {"))
+        #expect(demo[screen + 1] == "AIConsentView { aiEnabled in")
+        let closeOfScreen = try #require(demo[screen...].firstIndex(of: "} else if !demoSeedingComplete {"))
+        #expect(demo[screen..<closeOfScreen].contains("withAnimation { AIService.recordAIChoice(aiEnabled: aiEnabled, resume: {}) }"))
+        #expect(!demo.contains { $0.contains("demo.") && $0.contains("AI") }, "no demo AI key in the demo branch")
+
+        // The demo Settings page: "Turn off AI" and the "Enable AI" sheet.
+        let dashboard = try code("TabMail/Views/Account/DemoAccountDashboardView.swift")
+        #expect(dashboard.filter { $0 == "AIService.recordAIChoice(aiEnabled: false, resume: {})" }.count == 1)
+        let sheet = try #require(dashboard.firstIndex(of: "AIConsentView { aiEnabled in"))
+        #expect(dashboard[sheet + 1] == "AIService.recordAIChoice(aiEnabled: aiEnabled, resume: {})")
+        #expect(dashboard.contains("if aiChoiceMade && !aiOptedOut {"))
+        #expect(!dashboard.contains { $0.contains("store.aiEnabled") })
+    }
 }
 
 /// Records the order of the keys removed from it, and whether AI read as off after each removal.

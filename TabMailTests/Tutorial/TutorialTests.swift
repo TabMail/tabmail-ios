@@ -1492,4 +1492,29 @@ struct TutorialLifecycleTests {
         #expect(!store.isActive)
         #expect(!store.isTutorialPractice, "a signed-in user's AI calls would stay refused until relaunch")
     }
+
+    @Test("a plain demo's setup opens the subscription gate when the device's AI setting is on, not when it is off",
+          arguments: [false, true])
+    func plainDemoSetupFollowsTheDeviceSetting(aiOff: Bool) async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        let gate = AISubscriptionGate.shared
+        let gateWasActive = gate.isActive
+        let restoreSetting = AITestSetting.save()
+        defer {
+            if gateWasActive { gate.openGate() } else { gate.closeGate() }
+            restoreSetting()
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        gate.closeGate()
+        AITestSetting.set(aiOff: aiOff)
+
+        try await DemoModeService.shared.start(mintToken: false)
+        try #require(store.isActive && !store.isTutorialPractice)
+        try await DemoModeService.shared.completeSetup()
+        #expect(gate.isActive == !aiOff)
+        await DemoModeService.shared.exit()
+    }
 }

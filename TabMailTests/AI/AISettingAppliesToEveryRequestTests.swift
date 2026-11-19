@@ -381,6 +381,29 @@ struct AISettingAppliesToEveryRequestTests {
         }
     }
 
+    @Test("in the demo, chat, inline edit and the dictation warm-up follow the device's AI setting by default",
+          arguments: [true, false])
+    func theDemoReadsTheDeviceSetting(aiOff: Bool) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/completions/chat", method: "POST", response: Self.answer)
+        http.register(path: DictationConfig.warmUpPath, response: .status(200))
+        // The default reading of the setting: no injected switch.
+        let client = BackendClient(llmSession: http.session)
+        let service = AIService(backendClient: client)
+
+        try await withTestDatabase { _ in
+            try await withRealSetting(aiOff: aiOff) {
+                try await inDemo {
+                    _ = try await service.sendChatMessage(userText: "What is on my calendar tomorrow?", history: [])
+                    _ = try await inlineEdit(service)
+                    await client.warmUpDictation()
+                    #expect(http.recordedCalls().count == (aiOff ? 0 : 3), "\(http.recordedCalls().map(\.url))")
+                }
+            }
+        }
+    }
+
     @Test("a demo call refused after its check uses none of the demo budget; one sent uses exactly one", arguments: DemoCall.allCases)
     func aRefusedDemoCallUsesNoBudget(call: DemoCall) async throws {
         let http = FakeHTTP.Scenario()

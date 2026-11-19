@@ -51,7 +51,7 @@ struct AIChoiceComesBeforeAnyRequestTests {
 
             // The app: a summary job for a newly synced inbox message.
             let summary = try await service.generateSummary(
-                subject: "Quarterly planning", from: "Sender", fromAddress: "sender@company.com", date: Date(),
+                subject: "Quarterly planning", from: "Sender", fromAddress: "sender@example.com", date: Date(),
                 bodyText: "Notes from the planning call.", htmlContent: nil, userName: "Recipient", kbText: "")
             let appRequests = http.recordedCalls().count
 
@@ -78,7 +78,7 @@ struct AIChoiceComesBeforeAnyRequestTests {
 
     private func summarize(_ service: AIService) async throws -> SummaryResult {
         try await service.generateSummary(
-            subject: "Quarterly planning", from: "Sender", fromAddress: "sender@company.com", date: Date(),
+            subject: "Quarterly planning", from: "Sender", fromAddress: "sender@example.com", date: Date(),
             bodyText: "Notes from the planning call.", htmlContent: nil, userName: "Recipient", kbText: "")
     }
 
@@ -275,6 +275,50 @@ struct AIChoiceComesBeforeAnyRequestTests {
                 #expect(http.recordedCalls().count == (aiEnabled ? 1 : 0))
             }
         }
+    }
+
+    @Test("enabling AI on the choice offers the inbox mail held while it was open to the queue again; declining offers nothing")
+    func enablingOffersTheHeldMail() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "acc-ai-choice"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        var header = MessageHeader(
+            messageId: "1", subject: "Quarterly planning", from: "Sender",
+            fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "Notes from the planning call.",
+            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX"),
+            accountId: accountId, folderPath: "INBOX", isInInbox: true)
+        header.rfc822MessageId = "<held-1@example.com>"
+        header.headerComplete = true
+        header.bodyComplete = true
+        let held = header
+        try await pool.write { db in try held.insert(db) }
+
+        // The queue the production default resume offers to; dispatch is held so the offer is observable.
+        let queue = ActiveAIQueue.shared
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(true)
+        func offered() async -> Bool { await queue.queuedJobsForTesting.contains { $0.headerId == held.id } }
+
+        await Self.withScratchDefaults(1) { suites in
+            AIService.recordAIChoice(aiEnabled: false, in: suites[0])
+            try? await Task.sleep(for: .milliseconds(300))
+            let offeredAfterDeclining = await offered()
+            #expect(!offeredAfterDeclining, "declining offers nothing")
+
+            // The default resume, as RootView records the choice. A recent cancel delays it up to 2s.
+            AIService.recordAIChoice(aiEnabled: true, in: suites[0])
+            var waited = 0
+            while !(await offered()), waited < 100 {
+                try? await Task.sleep(for: .milliseconds(50))
+                waited += 1
+            }
+            #expect(await offered(), "the held message is offered to the queue again")
+        }
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
     }
 }
 
