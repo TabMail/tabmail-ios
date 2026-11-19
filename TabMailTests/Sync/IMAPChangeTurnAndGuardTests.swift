@@ -24,6 +24,7 @@ struct IMAPChangeTurnAndGuardTests {
     static let quietWatchSeconds: TimeInterval = 1
 
     final class Done: Sendable { let flag = Mutex(false) }
+    final class Finished: Sendable { let count = Mutex(0) }
 
     static func waitUntil(_ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(raceBoundSeconds)
@@ -67,7 +68,9 @@ struct IMAPChangeTurnAndGuardTests {
             _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
             w.server.setFlags(["\\Seen"], in: E.path, uid: 1)
             w.server.holdNextCommand(containing: "(QRESYNC (")
-            let pass = Task { try await w.engine.performDeltaSync(account: w.account, provider: w.provider) }
+            // The production entry point, which takes the account's sync turn
+            // (`performDeltaSync` is the pass body, called inside it).
+            let pass = Task { try await w.engine.backgroundDeltaSync(account: w.account) }
             try await Self.waitUntil { w.server.isHoldingCommand(containing: "(QRESYNC (") }
             let start = w.server.recordedCommands().count
             let folder = try w.folder()
@@ -96,6 +99,129 @@ struct IMAPChangeTurnAndGuardTests {
             }
             try await Self.waitUntil { done.flag.withLock { $0 } }
             #expect(try w.uids().contains("3"), "the nested listing ran and loaded the new message")
+        }
+    }
+
+    @Test("A task spawned inside a held turn is not the turn's holder: its own turn waits until the pass ends")
+    func spawnedTaskWaitsForTheTurn() async throws {
+        try await E.withWorld("cs-turn-spawn", capabilities: C.condstore, serverUIDs: [1], localUIDs: [1]) { w in
+            let ran = Done()
+            let spawned: Task<Void, Never> = await w.engine.oneSyncAtATime(accountId: w.account.id) {
+                let child = Task {
+                    await w.engine.oneSyncAtATime(accountId: w.account.id) { ran.flag.withLock { $0 = true } }
+                }
+                try? await Task.sleep(nanoseconds: UInt64(Self.quietWatchSeconds * 1_000_000_000))
+                #expect(!ran.flag.withLock { $0 }, "the spawned task ran inside the pass's turn")
+                return child
+            }
+            await spawned.value
+            #expect(ran.flag.withLock { $0 }, "it runs once the pass ends")
+        }
+    }
+
+    /// Asserts only the catch-up's requests (its `(UID FLAGS)` fetches). The worker's walk runs
+    /// outside the turn on main by design; its writes are covered by the from-server insert guard.
+    @Test("The backfill worker started from inside a sync pass takes the turn: no catch-up request goes out while the pass holds it")
+    func backfillWorkerStartedInAPassWaitsForTheTurn() async throws {
+        try await E.withWorld("cs-turn-backfill", capabilities: E.condstoreOnly, serverUIDs: Array(1...6), localUIDs: [4, 5, 6]) { w in
+            defer { Task { await w.engine.resetBackfill(accountId: w.account.id) } }
+            let (start, during): (Int, Int) = await w.engine.oneSyncAtATime(accountId: w.account.id) {
+                let start = w.server.recordedCommands().count
+                await w.engine.startBackfill(account: w.account)
+                try? await Task.sleep(nanoseconds: UInt64(Self.quietWatchSeconds * 1_000_000_000))
+                return (start, w.server.recordedCommands().count)
+            }
+            let sent = w.server.recordedCommands()[start..<during].filter { $0.uppercased().contains("(UID FLAGS)") }
+            #expect(sent.isEmpty, "the catch-up's requests interleaved with the pass holding the turn: \(Array(sent))")
+            try await Self.waitUntil { w.server.recordedCommands().count > during }
+        }
+    }
+
+    /// How long a full sync over one quarantined folder may take before it
+    /// counts as stuck (a bound, never a sleep).
+    static let quarantinedFullSyncBoundSeconds: TimeInterval = 20
+
+    @Test("A full sync over a quarantined folder finishes within its bound and its turnover reaction ran (the reaction's resync lists inside the pass's turn)")
+    func fullSyncReDrivesAQuarantinedFolderWithoutDeadlock() async throws {
+        let oldEpoch = 755_001
+        let newEpoch = 755_002
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [IMAPChangeReaderTests.message(1)]])
+        server.setUidValidity(newEpoch, for: "INBOX")
+        try server.start()
+        defer { server.stop() }
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "cs-quarantine-fullsync"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "INBOX", role: .inbox, pool: pool, totalCount: 1, lastKnownUidValidity: oldEpoch)
+        try FolderEpochTestFixture.insertHeaders(accountId: accountId, path: "INBOX", uids: [301], pool: pool)
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE folder SET uidValidityResetPendingAt = ? WHERE id = ?", arguments: [Date(), "\(accountId):INBOX"])
+        }
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port, username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+        let engine = await AccountManager.shared.syncEngine
+        let done = Done()
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
+            // Never awaited: a deadlock must fail the test by its bound, not hang the suite.
+            Task {
+                _ = try? await engine.oneSyncAtATime(accountId: accountId) {
+                    try await engine.fullSync(account: account, provider: provider)
+                }
+                done.flag.withLock { $0 = true }
+            }
+            let deadline = Date().addingTimeInterval(Self.quarantinedFullSyncBoundSeconds)
+            while !done.flag.withLock({ $0 }), Date() < deadline { try? await Task.sleep(nanoseconds: 10_000_000) }
+        }
+        #expect(done.flag.withLock { $0 }, "the full sync did not finish within its bound: deadlocked on the turn")
+        let folder = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
+        #expect(folder?.uidValidityResetPendingAt == nil && folder?.lastKnownUidValidity == newEpoch, "the reaction ran and completed")
+    }
+
+    enum TurnFuzz {
+        static let iterations = 4
+        static let seed: UInt64 = 0x0755_7017_0000_0001
+        static let tasksPerIteration = 6
+        static let latencyMaxMilliseconds = 5
+    }
+
+    @Test("T17 fuzz: seeded mixes of nested listings, standalone listings and change passes, with seeded latency, all complete and converge to the server's folder")
+    func turnFuzzNeverDeadlocksAndConverges() async throws {
+        for iteration in 0..<TurnFuzz.iterations {
+            var rng = SplitMix64(seed: TurnFuzz.seed &+ UInt64(iteration))
+            let label = "seed=0x\(String(TurnFuzz.seed, radix: 16)) iteration=\(iteration)"
+            try await E.withWorld("cs-t17f-\(iteration)", capabilities: C.condstore, serverUIDs: Array(1...6), localUIDs: [4, 5, 6]) { w in
+                w.server.honorSearchUIDSetCriterion()
+                w.server.setSeededLatencyInjection(seed: TurnFuzz.seed &+ UInt64(iteration) &* 31, maxMilliseconds: TurnFuzz.latencyMaxMilliseconds)
+                let folder = try w.folder()
+                let kinds = (0..<TurnFuzz.tasksPerIteration).map { _ in Int.random(in: 0..<3, using: &rng) }
+                let finished = Finished()
+                for kind in kinds {
+                    // Never awaited: a deadlock must fail the test, not hang the suite.
+                    Task {
+                        switch kind {
+                        case 0:
+                            _ = try? await w.engine.oneSyncAtATime(accountId: w.account.id) {
+                                try await w.engine.syncFolderMessages(folder: folder, provider: w.provider)
+                            }
+                        case 1: _ = try? await w.engine.syncFolderMessages(folder: folder, provider: w.provider)
+                        default: _ = try? await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+                        }
+                        finished.count.withLock { $0 += 1 }
+                    }
+                }
+                try await Self.waitUntil { finished.count.withLock { $0 } == kinds.count }
+                #expect(finished.count.withLock { $0 } == kinds.count, "\(label): every task completed (\(kinds))")
+                _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+                _ = try await w.engine.syncFolderMessages(folder: try w.folder(), provider: w.provider)
+                let rows = try w.uids()
+                #expect(Set(["4", "5", "6"]).isSubset(of: rows), "\(label): no live message lost: \(rows.sorted())")
+                #expect(rows.isSubset(of: Set((1...6).map(String.init))), "\(label): no row the server does not hold: \(rows.sorted())")
+            }
         }
     }
 }

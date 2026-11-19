@@ -347,6 +347,31 @@ struct NSEStaleStagedRowInvalidationTests {
         #expect(stagedRows.contains { $0.headerId == headerId("msg-new") })
     }
 
+    @Test("A staged message below the UIDNEXT of a bookmark a change read wrote, which the folder no longer holds, is not re-created; one above it merges (#755)")
+    func stagedMessageProvenGoneByTheBookmarkIsNotRecreated() async throws {
+        let (dir, pool, inbox, _, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: ownedQueues, directory: dir)
+        }
+        resetGlobals()
+        let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
+        let bookmark = IMAPChangeCursor(uidValidity: 1, highestModSeq: 5, uidNext: 10, messageCount: 3, provenFrom: 1).encoded
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [bookmark, inbox.id])
+        }
+        // UID 5 was proven gone by the read that wrote the bookmark; UID 12 is new.
+        try stageHeaderRow(q, messageId: "5")
+        try stageHeaderRow(q, messageId: "12")
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: headerId("5")) } == nil, "a proven-gone message is not re-created")
+        #expect(try stagingRowExists(q, messageId: "5") == false, "its staged copy is dropped")
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: headerId("12")) } != nil, "a message above the bookmark merges")
+    }
+
     /// G3 audit (the unified inbox read (ADR-IOS-055)): an UNRELATED durable message
     /// already living in Archive that happens to share the staged row's raw
     /// UID (a legitimate per-folder IMAP UID collision, not a move) must NOT
