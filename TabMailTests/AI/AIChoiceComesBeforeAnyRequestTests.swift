@@ -155,6 +155,52 @@ struct AIChoiceComesBeforeAnyRequestTests {
         }
     }
 
+    @Test("a launch stopped after any write of the move never reads AI on for an earlier no, and the next launch finishes the move once without overwriting a newer answer",
+          arguments: [true, false], [1, 2])
+    func aStoppedMoveKeepsAnEarlierNo(earlierAnswer aiEnabled: Bool, stopAfterWrite k: Int) throws {
+        for newerAnswerBeforeRelaunch in [false, true] {
+            let legacyName = "test.ai-setting.legacy.\(UUID().uuidString)"
+            let sharedName = "test.ai-setting.shared.\(UUID().uuidString)"
+            defer {
+                UserDefaults.standard.removePersistentDomain(forName: legacyName)
+                UserDefaults.standard.removePersistentDomain(forName: sharedName)
+            }
+            let process = StoppingProcess(stopAfterSharedWrite: k)
+            let legacy = try #require(StoppableDefaults(suiteName: legacyName, process: process, countsWrites: false))
+            let shared = try #require(StoppableDefaults(suiteName: sharedName, process: process, countsWrites: true))
+            legacy.set(true, forKey: AIConsentPolicy.completedChoiceKey)
+            legacy.set(!aiEnabled, forKey: AIConsentPolicy.optOutKey)
+
+            // The first launch stops right after shared write k; nothing after it is written.
+            process.start()
+            AIConsentPolicy.migrateLegacyValues(from: legacy, to: shared)
+            try #require(process.stopped, "the move has at least \(k) shared writes")
+            let readsOffWhenStopped = AIConsentPolicy.isDisabled(in: UserDefaults(suiteName: sharedName)!)
+            if !aiEnabled {
+                #expect(readsOffWhenStopped, "an earlier no read AI on after write \(k) of the move")
+            }
+
+            // Between the stop and the relaunch the person may answer again in the new version.
+            let fresh = UserDefaults(suiteName: sharedName)!
+            if newerAnswerBeforeRelaunch {
+                fresh.set(true, forKey: AIConsentPolicy.optOutKey)
+                fresh.set(true, forKey: AIConsentPolicy.completedChoiceKey)
+            }
+
+            // The relaunch runs the move again to the end.
+            let relaunchLegacy = UserDefaults(suiteName: legacyName)!
+            AIConsentPolicy.migrateLegacyValues(from: relaunchLegacy, to: fresh)
+
+            #expect(relaunchLegacy.object(forKey: AIConsentPolicy.completedChoiceKey) == nil, "the earlier choice is retired")
+            #expect(relaunchLegacy.object(forKey: AIConsentPolicy.optOutKey) == nil, "the earlier opt-out is retired")
+            #expect(AIConsentPolicy.migrateLegacyValues(from: relaunchLegacy, to: fresh).isEmpty, "the move happens once")
+            #expect(fresh.object(forKey: AIConsentPolicy.completedChoiceKey) as? Bool == true)
+            let expectedOptOut = newerAnswerBeforeRelaunch ? true : !aiEnabled
+            #expect(fresh.object(forKey: AIConsentPolicy.optOutKey) as? Bool == expectedOptOut, "newer answer kept: \(newerAnswerBeforeRelaunch)")
+            #expect(AIConsentPolicy.isDisabled(in: fresh) == expectedOptOut, "an earlier yes reads AI on unless a newer no replaced it")
+        }
+    }
+
     @Test("an earlier opt-out moves in the same step as the choice, so the moved setting never reads AI on")
     func anEarlierOptOutMovesWithTheChoice() async {
         await Self.withScratchDefaults(2) { suites in
@@ -355,4 +401,52 @@ private final class ResumeCount: Sendable {
     private let value = Mutex(0)
     var count: Int { value.withLock { $0 } }
     func add() { value.withLock { $0 += 1 } }
+}
+
+/// One launch of the app that stops right after its k-th write to the shared suite: from then
+/// on no write or removal reaches either suite, as when the process ends at that point.
+private final class StoppingProcess {
+    let stopAfterSharedWrite: Int
+    private(set) var sharedWrites = 0
+    private(set) var running = false
+    private(set) var stopped = false
+
+    init(stopAfterSharedWrite: Int) { self.stopAfterSharedWrite = stopAfterSharedWrite }
+
+    func start() { running = true }
+
+    /// Whether a change may still be written.
+    var writes: Bool { !(running && stopped) }
+
+    func didWriteShared() {
+        guard running else { return }
+        sharedWrites += 1
+        if sharedWrites == stopAfterSharedWrite { stopped = true }
+    }
+}
+
+private final class StoppableDefaults: UserDefaults {
+    private let process: StoppingProcess
+    private let countsWrites: Bool
+
+    init?(suiteName: String, process: StoppingProcess, countsWrites: Bool) {
+        self.process = process
+        self.countsWrites = countsWrites
+        super.init(suiteName: suiteName)
+    }
+
+    override func set(_ value: Any?, forKey defaultName: String) {
+        guard process.writes else { return }
+        super.set(value, forKey: defaultName)
+        if countsWrites { process.didWriteShared() }
+    }
+
+    override func set(_ value: Bool, forKey defaultName: String) {
+        set(NSNumber(value: value) as Any?, forKey: defaultName)
+    }
+
+    override func removeObject(forKey defaultName: String) {
+        guard process.writes else { return }
+        super.removeObject(forKey: defaultName)
+    }
 }
