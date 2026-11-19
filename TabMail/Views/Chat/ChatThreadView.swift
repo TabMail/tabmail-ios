@@ -9,6 +9,8 @@ import SwiftUI
 extension Notification.Name {
     /// Test seam only: a scroll phase delivered to the open chat as if its scroll view reported it.
     static let chatScrollPhaseForTesting = Notification.Name("chatScrollPhaseForTesting")
+    /// Test fixture only: the jump button was tapped (its animated scroll starts now).
+    static let chatJumpTappedForTesting = Notification.Name("chatJumpTappedForTesting")
 }
 #endif
 
@@ -373,6 +375,10 @@ struct ChatThreadView: View {
                             // scroll, and a held target would pull the chat back on the next height.
                             scrollTarget = nil
                             withAnimation { proxy.scrollTo(Self.bottomId, anchor: .bottom) }
+                            #if DEBUG
+                            NSLog("[cv9diag] jump tapped")
+                            NotificationCenter.default.post(name: .chatJumpTappedForTesting, object: nil)
+                            #endif
                         }
                     }
                 }

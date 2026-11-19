@@ -345,6 +345,21 @@ final class ChatSwipeUITests: XCTestCase {
                       "the newest bubble ends in view above the grown field: \(newest.frame), field \(typed.frame)")
     }
 
+    /// The AI Suggestion lands the moment the jump is tapped, while its scroll animates: the jump
+    /// still ends with the newest bubble in view.
+    func testJumpReachesTheNewestBubbleWhenTheSuggestionLandsMidScroll() {
+        let app = launchIntoChat(tall: true, unread: true, suggestionOnJump: true)
+        let jump = app.buttons["Jump to the newest email"]
+        XCTAssertTrue(jump.waitForExistence(timeout: 5), "control: the chat lands at the Unread line, away from the bottom")
+        let fieldTop = replyField(in: app).frame.minY
+        jump.tap()
+        let ghost = app.descendants(matching: .any)["chat.aiSuggestion"].firstMatch
+        XCTAssertTrue(ghost.waitForExistence(timeout: 5), "control: the AI Suggestion landed with the jump")
+        let newest = bubble(3, in: app)
+        XCTAssertTrue(newestInView(newest, above: fieldTop, in: app, timeout: 5),
+                      "the jump ends with the newest bubble in view: \(newest.frame), field at \(fieldTop)")
+    }
+
     /// Whether the newest bubble's bottom is on screen, above `fieldTop`, within `timeout`.
     private func newestInView(_ newest: XCUIElement, above fieldTop: CGFloat, in app: XCUIApplication, timeout: TimeInterval) -> Bool {
         let shown = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
@@ -495,7 +510,8 @@ final class ChatSwipeUITests: XCTestCase {
     private enum Host { case stack, sheet, split, tutorialCard }
 
     private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false,
-                                lateSuggestion: Bool = false, unread: Bool = false) -> XCUIApplication {
+                                lateSuggestion: Bool = false, unread: Bool = false,
+                                suggestionOnJump: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
@@ -503,6 +519,7 @@ final class ChatSwipeUITests: XCTestCase {
             + (host == .split ? ["--chat-swipe-in-split"] : [])
             + (tall ? ["--chat-swipe-tall"] : [])
             + (unread ? ["--chat-swipe-unread"] : [])
+            + (suggestionOnJump ? ["--chat-swipe-suggestion-on-jump"] : [])
             + (host == .tutorialCard ? ["--chat-swipe-tutorial-card"] : [])
         app.launch()
         switch host {

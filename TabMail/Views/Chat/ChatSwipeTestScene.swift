@@ -35,6 +35,9 @@ struct ChatSwipeTestScene: View {
     /// `--chat-swipe-unread`: every email is unread, so the chat lands at the Unread line above the
     /// oldest email; with `--chat-swipe-tall` that is far from the bottom.
     nonisolated private static let unread = ProcessInfo.processInfo.arguments.contains("--chat-swipe-unread")
+    /// `--chat-swipe-suggestion-on-jump`: the newest email's AI Suggestion lands the moment the
+    /// jump button is tapped, while its scroll animates.
+    nonisolated private static let suggestionOnJump = ProcessInfo.processInfo.arguments.contains("--chat-swipe-suggestion-on-jump")
     private let tutorialCard = ProcessInfo.processInfo.arguments.contains("--chat-swipe-tutorial-card")
     nonisolated private static let accountID = "chat-swipe-fixture"
     nonisolated private static let count = 4
@@ -90,6 +93,10 @@ struct ChatSwipeTestScene: View {
             }
         }
         .task { await seed() }
+        .onReceive(NotificationCenter.default.publisher(for: .chatJumpTappedForTesting)) { _ in
+            guard Self.suggestionOnJump else { return }
+            Task { await Self.writeSuggestion() }
+        }
     }
 
     private var list: some View {
@@ -131,15 +138,20 @@ struct ChatSwipeTestScene: View {
         suggestionArmed = true
         Task {
             try? await Task.sleep(for: Self.suggestionDelay)
-            let id = Self.headerId(Self.count - 1)
-            _ = try? await AppDatabase.dbPool.write { db in
-                guard var header = try MessageHeader.fetchOne(db, key: id) else { return }
-                header.cachedReply = "Hello,\n\n\(Self.lateSuggestion)\n\nThanks."
-                header.replyTextMessage = Self.lateSuggestion
-                try header.save(db)
-            }
-            NotificationCenter.default.post(name: .messageDataDidChange, object: id)
+            await Self.writeSuggestion()
         }
+    }
+
+    private static func writeSuggestion() async {
+        let id = headerId(count - 1)
+        _ = try? await AppDatabase.dbPool.write { db in
+            guard var header = try MessageHeader.fetchOne(db, key: id) else { return }
+            header.cachedReply = "Hello,\n\n\(lateSuggestion)\n\nThanks."
+            header.replyTextMessage = lateSuggestion
+            try header.save(db)
+        }
+        NSLog("[cv9diag] late suggestion written")
+        NotificationCenter.default.post(name: .messageDataDidChange, object: id)
     }
 
     /// The tutorial variant: a real chat-view run of Part 2 on the real demo seed, as
