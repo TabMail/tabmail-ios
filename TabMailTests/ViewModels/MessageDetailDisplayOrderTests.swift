@@ -50,35 +50,49 @@ struct MessageDetailDisplayOrderTests {
     @MainActor
     final class Flag { var on = false }
 
-    /// Every value a screen field took, in order (repeats folded). Shows a
-    /// backslide even when a later refresh puts the newer value back.
+    /// Every value a screen field took, in order: the view model calls it on
+    /// every assignment of the field, with the new value in place, so no
+    /// publication is missed between two samples. A backslide is caught at the
+    /// publication that makes it, before any later reader can repair it.
     @MainActor
     final class Recorder<Value: Equatable> {
         private(set) var values: [Value]
         private let read: @MainActor () -> Value
+        private let vm: MessageDetailViewModel
+        private let field: MessageDetailViewModel.DisplayField
+        private let startCount: Int
+        private var recorded = 0
 
-        init(_ read: @escaping @MainActor () -> Value) {
+        init(
+            _ vm: MessageDetailViewModel, _ field: MessageDetailViewModel.DisplayField,
+            _ read: @escaping @MainActor () -> Value
+        ) {
+            self.vm = vm
+            self.field = field
             self.read = read
             values = [read()]
-            track()
-        }
-
-        private func track() {
-            withObservationTracking { _ = read() } onChange: { [weak self] in
-                Task { @MainActor in self?.record() }
+            startCount = vm.publicationCountForTesting[field] ?? 0
+            let previous = vm._publicationHook
+            vm._publicationHook = { [weak self] published in
+                previous?(published)
+                guard let self, published == self.field else { return }
+                self.recorded += 1
+                self.values.append(self.read())
             }
         }
 
-        private func record() {
-            let value = read()
-            if value != values.last { values.append(value) }
-            track()
-        }
+        /// True when every publication of the field since init was recorded.
+        var isComplete: Bool { recorded == (vm.publicationCountForTesting[field] ?? 0) - startCount }
 
         /// True when `older` was shown again after `newer` had been shown.
         func wentBack(from newer: Value, to older: Value) -> Bool {
             guard let first = values.firstIndex(of: newer) else { return false }
             return values[(first + 1)...].contains(older)
+        }
+
+        /// The recorder saw every publication, saw `newer`, and never `older` after it.
+        func neverWentBack(from newer: Value, to older: Value) -> Bool {
+            isComplete && values.contains(newer) && !wentBack(from: newer, to: older)
         }
     }
 
@@ -124,6 +138,8 @@ struct MessageDetailDisplayOrderTests {
             var acc = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
             acc.id = "acc1"
             try acc.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1").insert(db)
         }
         return (pool, dir, previous)
     }
@@ -378,7 +394,7 @@ struct MessageDetailDisplayOrderTests {
         #expect(vm.message == nil)
         // The mark-read's own write posts a later refresh that would put the new
         // summary back, so every shown value is recorded, not just the last.
-        let shown = Recorder { vm.message?.summaryBlurb }
+        let shown = Recorder(vm, .message) { vm.message?.summaryBlurb }
         let gate = Gate()
         vm._displayReadHook = { point in
             if point == .markReadResolve, !gate.reached { await gate.hold() }
@@ -396,7 +412,7 @@ struct MessageDetailDisplayOrderTests {
         try await waitUntil { vm.message?.summaryBlurb == "new summary" }
         #expect(vm.message?.summaryBlurb == "new summary")
         #expect(vm.message?.isRead == true)
-        #expect(!shown.wentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
+        #expect(shown.neverWentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
     }
 
     // MARK: - Opening and pull-to-refresh, one case per display turn
@@ -413,7 +429,7 @@ struct MessageDetailDisplayOrderTests {
             messageId: opened.id, dbPool: pool,
             fetchBodyOverride: { msg in try await script.fetch(msg) },
             observeNotifications: true)
-        let shown = Recorder { vm.message?.summaryBlurb }
+        let shown = Recorder(vm, .message) { vm.message?.summaryBlurb }
         let gate = Gate()
         vm._displayReadHook = { point in
             if point == .openResolve, !gate.reached { await gate.hold() }
@@ -431,7 +447,7 @@ struct MessageDetailDisplayOrderTests {
         #expect(vm.message?.id == opened.id)
         #expect(vm.message?.summaryBlurb == "new summary")
         #expect(vm.messageBody?.htmlContent == "<p>fetched</p>")
-        #expect(!shown.wentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
+        #expect(shown.neverWentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
     }
 
     @MainActor
@@ -446,7 +462,7 @@ struct MessageDetailDisplayOrderTests {
             messageId: opened.id, dbPool: pool,
             fetchBodyOverride: { msg in try await script.fetch(msg) },
             observeNotifications: true)
-        let shown = Recorder { vm.message?.summaryBlurb }
+        let shown = Recorder(vm, .message) { vm.message?.summaryBlurb }
         let gate = Gate()
         let landed = Flag()
         vm._displayReadHook = { point in
@@ -470,7 +486,7 @@ struct MessageDetailDisplayOrderTests {
         #expect(vm.message?.id == opened.id)
         #expect(vm.message?.summaryBlurb == "new summary")
         #expect(vm.messageBody?.htmlContent == "<p>fetched</p>")
-        #expect(!shown.wentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
+        #expect(shown.neverWentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
     }
 
     @MainActor
@@ -485,7 +501,7 @@ struct MessageDetailDisplayOrderTests {
             messageId: opened.id, dbPool: pool,
             fetchBodyOverride: { msg in try await script.fetch(msg) },
             observeNotifications: true)
-        let shown = Recorder { vm.message?.summaryBlurb }
+        let shown = Recorder(vm, .message) { vm.message?.summaryBlurb }
         let gate = Gate()
         vm._displayReadHook = { point in
             if point == .openReread, !gate.reached { await gate.hold() }
@@ -504,7 +520,7 @@ struct MessageDetailDisplayOrderTests {
         #expect(vm.message?.id == opened.id)
         #expect(vm.message?.summaryBlurb == "new summary")
         #expect(vm.messageBody?.htmlContent == "<p>fetched</p>")
-        #expect(!shown.wentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
+        #expect(shown.neverWentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
     }
 
     @MainActor
@@ -520,7 +536,7 @@ struct MessageDetailDisplayOrderTests {
             fetchBodyOverride: { msg in try await script.fetch(msg) },
             observeNotifications: true)
         vm._testSeedMessage(opened)
-        let shown = Recorder { vm.message?.summaryBlurb }
+        let shown = Recorder(vm, .message) { vm.message?.summaryBlurb }
         let gate = Gate()
         vm._displayReadHook = { point in
             if point == .refetchResolve, !gate.reached { await gate.hold() }
@@ -538,7 +554,7 @@ struct MessageDetailDisplayOrderTests {
         #expect(vm.message?.id == opened.id)
         #expect(vm.message?.summaryBlurb == "new summary")
         #expect(vm.messageBody?.htmlContent == "<p>refetched</p>")
-        #expect(!shown.wentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
+        #expect(shown.neverWentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
     }
 
     @MainActor
@@ -556,7 +572,7 @@ struct MessageDetailDisplayOrderTests {
             messageId: opened.id, dbPool: pool,
             fetchBodyOverride: { msg in try await script.fetch(msg) },
             observeNotifications: true)
-        let shown = Recorder { vm.messageBody?.htmlContent }
+        let shown = Recorder(vm, .messageBody) { vm.messageBody?.htmlContent }
         let gate = Gate()
         vm._displayReadHook = { point in
             if point == .refetchReread, !gate.reached { await gate.hold() }
@@ -580,7 +596,7 @@ struct MessageDetailDisplayOrderTests {
 
         #expect(vm.message?.id == opened.id)
         #expect(vm.messageBody?.htmlContent == "<p>newer</p>")
-        #expect(!shown.wentBack(from: "<p>newer</p>", to: "<p>older</p>"), "shown: \(shown.values)")
+        #expect(shown.neverWentBack(from: "<p>newer</p>", to: "<p>older</p>"), "shown: \(shown.values)")
     }
 
     // MARK: - Turn hand-off
@@ -705,5 +721,238 @@ struct MessageDetailDisplayOrderTests {
         #expect(vm.messageBody?.htmlContent == "<p>cached</p>")
         #expect(vm.isLoading == false)
         #expect(!fetched)
+    }
+
+    // MARK: - The oracle
+
+    @MainActor
+    @Test("the recorder sees every publication, even newer, older and newer again in one main-actor turn")
+    func recorderSeesEveryPublication() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let older = header("opened", summary: "old summary")
+        var newer = older
+        newer.summaryBlurb = "new summary"
+        let vm = MessageDetailViewModel(
+            messageId: older.id, dbPool: pool, fetchBodyOverride: { _ in },
+            observeNotifications: false)
+        let shown = Recorder(vm, .message) { vm.message?.summaryBlurb }
+        // No suspension between the three: a sampler that reads in a later task
+        // sees only the last.
+        vm._testSeedMessage(newer)
+        vm._testSeedMessage(older)
+        vm._testSeedMessage(newer)
+        #expect(shown.isComplete)
+        #expect(shown.values == [nil, "new summary", "old summary", "new summary"])
+        #expect(shown.wentBack(from: "new summary", to: "old summary"))
+        #expect(!shown.neverWentBack(from: "new summary", to: "old summary"))
+    }
+
+    // MARK: - Local actions against a held thread scan
+
+    /// A chat with one other email, loaded; then a thread scan reads it and is
+    /// held before it publishes. Returns the view model, the member and the gate.
+    @MainActor
+    private func holdScan(
+        _ pool: DatabasePool, member name: String
+    ) async throws -> (vm: MessageDetailViewModel, member: MessageHeader, gate: Gate) {
+        let member = header(name, summary: "member")
+        let opened = header("opened", summary: "opened", references: [member.rfc822MessageId!])
+        try insert(member, into: pool)
+        try insert(opened, into: pool)
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: pool, fetchBodyOverride: { _ in },
+            observeNotifications: true)
+        vm._testSeedMessage(opened)
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        try await waitUntil { vm.threadMessages.first?.id == member.id }
+        #expect(vm.threadMessages.map(\.id) == [member.id])
+        let gate = Gate()
+        vm._displayReadHook = { point in
+            if point == .threadScan, !gate.reached { await gate.hold() }
+        }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        try await waitUntil { gate.reached }
+        #expect(gate.reached)
+        return (vm, member, gate)
+    }
+
+    /// Waits until the action's local write has landed and its overlay retired.
+    @MainActor
+    private func waitLocalCompletion(
+        _ pool: DatabasePool, _ id: String, _ landed: @escaping (MessageHeader?) -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let row = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+            if landed(row), AccountManager.shared.snapshotOverlay()[id] == nil { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let row = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(landed(row))
+        #expect(AccountManager.shared.snapshotOverlay()[id] == nil)
+    }
+
+    @MainActor
+    @Test("an archive that completes while an older thread scan is held never shows the email back in its old folder")
+    func archiveCompletingUnderHeldScanNeverGoesBack() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        defer { UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey) }
+        let (vm, member, gate) = try await holdScan(pool, member: "archived")
+        defer { AccountManager.shared.removeOverlayEntries(ids: [member.id]) }
+        let memberId = member.id
+        let shown = Recorder(vm, .threadMessages) {
+            vm.threadMessages.first(where: { $0.id == memberId })?.folderPath
+        }
+
+        let current = try #require(vm.threadMessages.first)
+        #expect(vm.archiveMessage(current))
+        #expect(vm.threadMessages.first?.folderPath == "Archive")
+        try await waitLocalCompletion(pool, memberId) { $0?.folderPath == "Archive" }
+
+        gate.open()
+        try await waitUntil { gate.passed }
+        try await waitIdle(vm)
+        #expect(shown.isComplete)
+        #expect(!shown.wentBack(from: "Archive", to: "INBOX"), "shown: \(shown.values)")
+    }
+
+    @MainActor
+    @Test("a read that completes while an older thread scan is held never shows the email unread again")
+    func readCompletingUnderHeldScanNeverGoesBack() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let (vm, member, gate) = try await holdScan(pool, member: "read")
+        defer { AccountManager.shared.removeOverlayEntries(ids: [member.id]) }
+        let memberId = member.id
+        let shown = Recorder(vm, .threadMessages) {
+            vm.threadMessages.first(where: { $0.id == memberId })?.isRead
+        }
+
+        vm.toggleReadForThread(try #require(vm.threadMessages.first))
+        #expect(vm.threadMessages.first?.isRead == true)
+        try await waitLocalCompletion(pool, memberId) { $0?.isRead == true }
+
+        gate.open()
+        try await waitUntil { gate.passed }
+        try await waitIdle(vm)
+        #expect(vm.threadMessages.first?.isRead == true)
+        #expect(shown.neverWentBack(from: true, to: false), "shown: \(shown.values)")
+    }
+
+    @MainActor
+    @Test("a tag that completes while an older thread scan is held never shows the old tag again")
+    func tagCompletingUnderHeldScanNeverGoesBack() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let (vm, member, gate) = try await holdScan(pool, member: "tagged")
+        defer { AccountManager.shared.removeOverlayEntries(ids: [member.id]) }
+        let memberId = member.id
+        let shown = Recorder(vm, .threadMessages) {
+            vm.threadMessages.first(where: { $0.id == memberId })?.actionTag
+        }
+
+        vm.applyManualTag(try #require(vm.threadMessages.first), tag: .reply)
+        #expect(vm.threadMessages.first?.actionTag == .reply)
+        try await waitLocalCompletion(pool, memberId) { $0?.actionTag == .reply }
+
+        gate.open()
+        try await waitUntil { gate.passed }
+        try await waitIdle(vm)
+        #expect(vm.threadMessages.first?.actionTag == .reply)
+        #expect(shown.neverWentBack(from: .reply, to: nil), "shown: \(shown.values)")
+    }
+
+    @MainActor
+    @Test("an overlay change on another email costs a held scan one more read and changes nothing it shows")
+    func overlayChangeElsewhereCostsOneRead() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let (vm, member, gate) = try await holdScan(pool, member: "untouched")
+        let elsewhere = "elsewhere-\(UUID().uuidString)"
+        defer { AccountManager.shared.removeOverlayEntries(ids: [elsewhere]) }
+        let before = vm.displayRereadCountForTesting
+        let shownBefore = vm.threadMessages
+        let shown = Recorder(vm, .threadMessages) { vm.threadMessages }
+
+        AccountManager.shared.registerMutation(id: elsewhere, mutation: .init(isRead: true))
+        gate.open()
+        try await waitUntil { gate.passed }
+        try await waitIdle(vm)
+
+        #expect(vm.displayRereadCountForTesting - before == 1)
+        #expect(shown.isComplete)
+        #expect(shown.values.allSatisfy { $0 == shownBefore }, "shown: \(shown.values.map { $0.map(\.id) })")
+        #expect(vm.threadMessages.map(\.id) == [member.id])
+    }
+
+    // MARK: - Bodies that only fill an empty slot
+
+    @MainActor
+    @Test("loadBody's cache-hit body never replaces a body another reader already showed")
+    func lateCacheHitNeverReplacesShownBody() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let opened = header("opened", summary: "summary")
+        try insert(opened, into: pool)
+        let openedId = opened.id
+        let vm = MessageDetailViewModel(
+            messageId: openedId, dbPool: pool, fetchBodyOverride: { _ in },
+            observeNotifications: false)
+        let shown = Recorder(vm, .messageBody) { vm.messageBody?.htmlContent }
+        // While the open resolves its header, another reader shows the stored
+        // body; the stored row then changes before the open's cache read.
+        vm._displayReadHook = { point in
+            guard point == .openResolve, vm.messageBody == nil else { return }
+            try? await pool.write { db in
+                try MessageBody(contentKey: ContentKey(rawValue: openedId), htmlContent: "<p>shown</p>")
+                    .insert(db, onConflict: .replace)
+            }
+            _ = await vm.adoptReadyBody(source: "test")
+            try? await pool.write { db in
+                try MessageBody(contentKey: ContentKey(rawValue: openedId), htmlContent: "<p>late</p>")
+                    .insert(db, onConflict: .replace)
+            }
+        }
+        await vm.loadBody()
+
+        #expect(vm.messageBody?.htmlContent == "<p>shown</p>")
+        #expect(shown.isComplete)
+        #expect(shown.values == [nil, "<p>shown</p>"], "shown: \(shown.values)")
+    }
+
+    @MainActor
+    @Test("loadBody's staged body never replaces a body another reader already showed")
+    func lateStagedBodyNeverReplacesShownBody() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let opened = header("opened", summary: "summary")
+        try insert(opened, into: pool)
+        let openedId = opened.id
+        defer { NSEDataBridge.latestStagedBodies.withLock { $0[openedId] = nil } }
+        let vm = MessageDetailViewModel(
+            messageId: openedId, dbPool: pool, fetchBodyOverride: { _ in },
+            observeNotifications: false)
+        defer { vm.cancelBodyPollForTesting() }
+        let shown = Recorder(vm, .messageBody) { vm.messageBody?.htmlContent }
+        // While the open resolves its header, another reader shows a staged body;
+        // the staged snapshot then changes before the open's staged read.
+        vm._displayReadHook = { point in
+            guard point == .openResolve, vm.messageBody == nil else { return }
+            NSEDataBridge.latestStagedBodies.withLock {
+                $0[openedId] = .init(htmlContent: "<p>shown</p>", attachmentsJSON: nil, icsText: nil)
+            }
+            _ = await vm.adoptReadyBody(source: "test")
+            NSEDataBridge.latestStagedBodies.withLock {
+                $0[openedId] = .init(htmlContent: "<p>late</p>", attachmentsJSON: nil, icsText: nil)
+            }
+        }
+        await vm.loadBody()
+
+        #expect(vm.messageBody?.htmlContent == "<p>shown</p>")
+        #expect(shown.isComplete)
+        #expect(!shown.values.contains("<p>late</p>"), "shown: \(shown.values)")
     }
 }

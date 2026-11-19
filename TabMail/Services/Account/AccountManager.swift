@@ -786,6 +786,13 @@ actor AccountManager {
 
     let optimisticOverlay = Mutex<[String: PendingMutation]>([:])
 
+    /// Raised on every overlay change (register and remove), under the overlay's
+    /// lock, so a display reader that took it before its database read can tell
+    /// an overlay entry appeared or retired (its write landed) while it read,
+    /// and read again instead of publishing a snapshot older than the screen (#992).
+    private let overlayGenerationCounter = Mutex<Int>(0)
+    nonisolated var overlayGeneration: Int { overlayGenerationCounter.withLock { $0 } }
+
     /// Register an optimistic mutation. Callable synchronously from any isolation domain.
     nonisolated func registerMutation(id: String, mutation: PendingMutation) {
         let locationTrace = optimisticOverlay.withLock { overlay -> String? in
@@ -798,6 +805,7 @@ actor AccountManager {
             if let v = mutation.isFlagged { existing.isFlagged = v }
             if let v = mutation.actionTag { existing.actionTag = v }
             overlay[id] = existing
+            overlayGenerationCounter.withLock { $0 += 1 }
 
             guard mutation.folderId != nil || mutation.folderPath != nil
                     || mutation.isInInbox != nil
@@ -817,6 +825,7 @@ actor AccountManager {
     nonisolated func removeOverlayEntries(ids: [String]) {
         optimisticOverlay.withLock { overlay in
             for id in ids { overlay.removeValue(forKey: id) }
+            overlayGenerationCounter.withLock { $0 += 1 }
         }
     }
 
