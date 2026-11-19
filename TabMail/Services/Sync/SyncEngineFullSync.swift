@@ -631,9 +631,12 @@ extension SyncEngine {
 
     /// One folder listing through the one classifier (`runListing`), with its
     /// merge result published (unread recount, FTS, body queue).
-    /// An unproven listing makes the folder due (`FolderChangeState.listingDue`)
-    /// and owes it a deep pass, so the next pass lists it whatever its counters
-    /// or STATUS say (#755). It counts against a pass's full-sync stamp only for
+    /// An unproven listing owes the folder a deep pass. A folder holding the UID
+    /// counters an earlier listing returned is also made due
+    /// (`FolderChangeState.listingDue`), so the next pass lists it whatever those
+    /// counters or STATUS say, until its count check clears it (#755). A folder
+    /// whose listings return no counters (a date-window provider's) has no such
+    /// counters to skip on and no count check to clear the debt, so it owes none. It counts against a pass's full-sync stamp only for
     /// the pass that ran it (`pass`); an on-demand listing (nil) belongs to no
     /// pass and never withholds a scheduled pass's stamp.
     func listFolder(_ folder: Folder, provider: any EmailProvider, limit: Int, pass: UUID? = nil) async -> ListingOutcome {
@@ -642,7 +645,11 @@ extension SyncEngine {
             if let pass { unprovenListingPasses.insert(pass) }
             Self.oweDeepListing(folderId: folder.id)
             do {
-                try await dbPool.write { db in try Self.markListingDue(folderId: folder.id, db: db) }
+                try await dbPool.write { db in
+                    let holdsListedCounters = try Int.fetchOne(
+                        db, sql: "SELECT lastKnownUidNext FROM folder WHERE id = ?", arguments: [folder.id]) != nil
+                    if holdsListedCounters { try Self.markListingDue(folderId: folder.id, db: db) }
+                }
             } catch {
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Listing] \(folder.name): could not mark the folder due: \(error)") }
             }
