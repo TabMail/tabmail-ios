@@ -49,6 +49,10 @@ enum BackgroundSyncLogger {
 
     /// Log a chat/AI error with context. Captures tool failures, empty responses, connection errors.
     ///
+    /// The error line is always kept; the user's words (`userMessage`) only while debug logging is
+    /// on. They can be the email itself: the chat view's reply field holds the AI Reply, written
+    /// from the email, and a resend or rewind replays it. Gating here covers every caller.
+    ///
     /// **BOTH spans this writes are outside our control, and both are bounded and
     /// escaped here — in the façade — rather than at each call site:**
     ///
@@ -109,7 +113,7 @@ enum BackgroundSyncLogger {
         // stays three orders of magnitude below `AppLogStore.keepBytes`.
         var entry = DebugModeManager.escapedForLogLine(
             String(String.UnicodeScalarView(message.unicodeScalars.prefix(4000))))
-        if let userMessage {
+        if let userMessage, DebugModeManager.isLoggingEnabled() {
             // ORDER: cap FIRST, escape SECOND. `prefix(100)` carries the INTENT —
             // roughly a hundred characters of the user's own text is what the log
             // needs — and escaping afterwards can only expand what survived (one

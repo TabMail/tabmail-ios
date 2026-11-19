@@ -3593,7 +3593,9 @@ enum NSEDataBridge {
     /// REPLACE = delete+insert, NULLs columns it doesn't list (e.g. a peer's
     /// precomputed `cachedReply`). DO UPDATE touches only the AI columns, and only
     /// when the content actually differs. The Message-ID lets the orphan purge match the
-    /// entry to its email.
+    /// entry to its email: an existing entry without one (NULL or empty, an older build's)
+    /// takes the incoming one, even when the AI fields are unchanged, and a stored one is
+    /// never replaced, by NULL or otherwise.
     ///
     /// `updatedAt` is bound as a `Date` (GRDB text), like every other writer of this
     /// column. The staged `processedAt` is a number, and SQLite orders every number
@@ -3610,6 +3612,7 @@ enum NSEDataBridge {
                 (key, rfc822MessageId, summaryBlurb, summaryTodos, summaryTextMessage, actionTag, updatedAt)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
+                rfc822MessageId = COALESCE(NULLIF(messageAICache.rfc822MessageId, ''), excluded.rfc822MessageId),
                 summaryBlurb = excluded.summaryBlurb,
                 summaryTodos = excluded.summaryTodos,
                 summaryTextMessage = excluded.summaryTextMessage,
@@ -3619,6 +3622,8 @@ enum NSEDataBridge {
                OR summaryTodos IS NOT excluded.summaryTodos
                OR summaryTextMessage IS NOT excluded.summaryTextMessage
                OR actionTag IS NOT excluded.actionTag
+               OR (NULLIF(messageAICache.rfc822MessageId, '') IS NULL
+                   AND NULLIF(excluded.rfc822MessageId, '') IS NOT NULL)
             """, arguments: [
                 cacheKey, rfc822MessageId, msg.summaryBlurb, msg.summaryTodos, msg.summaryTextMessage,
                 msg.actionTag, Date(timeIntervalSince1970: msg.processedAt)

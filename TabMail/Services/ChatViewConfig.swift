@@ -65,9 +65,15 @@ enum ChatViewLayout {
     static let bubbleCornerRadius: CGFloat = 18
     static let bubbleMaxWidthFraction: CGFloat = 0.78
     static let bubbleSpacing: CGFloat = 6
-    /// Room under the last bubble so it sits above the pill, never under it.
-    static let pillClearance: CGFloat = 104
+    /// The one-line pill's height, used until the pill is measured: the thread keeps the measured
+    /// collapsed height under its last bubble, so it sits above the pill, never under it.
+    static let pillStartHeight: CGFloat = 98
+    /// Room between the last bubble and the pill's top, beyond the bubble spacing.
+    static let pillGap: CGFloat = 6
     /// The jump-to-bottom button shows once the bottom is this far below the screen.
     static let jumpButtonThreshold: CGFloat = 240
     static let jumpButtonSize: CGFloat = 40
+    /// The reply field's words pulse to this opacity while TabMail writes, as compose does.
+    static let fieldPulseOpacity: Double = 0.35
+    static let fieldPulseDuration: Double = 0.8
 }

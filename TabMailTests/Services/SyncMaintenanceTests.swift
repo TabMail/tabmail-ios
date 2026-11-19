@@ -481,7 +481,8 @@ struct BodyCacheEvictionTests {
 // MARK: - AI Cache Purge Tests
 
 /// `SyncEngine.runPurgeOrphanedAICache`, driven for real: an AI result lives as long as its email
-/// is on the device (a header with its Message-ID in ANY folder), with no age limit; an entry whose
+/// is on the device (a header of its own account with its Message-ID in ANY folder), with no age
+/// limit; an entry whose
 /// email is gone is purged once it has been untouched for `SyncConfig.aiCacheOrphanGraceDays`.
 @Suite("AI Cache Orphan Purge")
 struct AICachePurgeTests {
@@ -627,17 +628,26 @@ struct AICachePurgeTests {
         #expect(try cache(f, "acc1:INBOX:empty") == nil)
     }
 
-    @Test("An old entry without a Message-ID is kept while its key's email is in any folder of that account")
-    func legacyEntryKeptByItsKey() throws {
+    @Test("An old entry without a Message-ID is purged, even while its key's email is on the device")
+    func legacyEntryWithoutMessageIdPurged() throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
-        // Written by an older build without the Message-ID; the email moved to Archive since.
+        // Written by an older extension build without the Message-ID; the email moved to Archive.
         try insertHeader(f, uid: "7", folderPath: "Archive", rfc: "legacy@example.com")
         try insertCache(f, key: "acc1:INBOX:legacy@example.com", rfc: nil, daysAgo: pastGrace)
-        // A folder path holding the delimiter still ends the key with the Message-ID.
-        try insertHeader(f, uid: "8", folderPath: "Archive", rfc: "nested@example.com")
-        try insertCache(f, key: "acc1:Work:Projects:nested@example.com", rfc: nil, daysAgo: pastGrace)
-        // The same Message-ID in another account does not keep this account's entry.
+        // Control: the same email's entry with its Message-ID is kept.
+        try insertCache(f, key: "acc1:Archive:legacy@example.com", rfc: "legacy@example.com", daysAgo: pastGrace)
+
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+
+        #expect(try cache(f, "acc1:INBOX:legacy@example.com") == nil)
+        #expect(try cache(f, "acc1:Archive:legacy@example.com") != nil)
+    }
+
+    @Test("An entry is kept only by an email of its own account: another account's copy keeps nothing")
+    func entryKeptOnlyByItsOwnAccount() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         try f.pool.write { db in
             var other = Account(emailAddress: "other@example.com", displayName: "Other", provider: .gmail)
             other.id = "acc2"
@@ -648,16 +658,20 @@ struct AICachePurgeTests {
                 to: "other@example.com", date: Date(), snippet: "", folderId: "acc2:INBOX",
                 accountId: "acc2", folderPath: "INBOX", isInInbox: true
             )
-            header.rfc822MessageId = "elsewhere@example.com"
+            header.rfc822MessageId = "shared@example.com"
             try header.insert(db)
         }
-        try insertCache(f, key: "acc1:INBOX:elsewhere@example.com", rfc: nil, daysAgo: pastGrace)
+        // The account the entry was written for no longer has the email (or is gone).
+        try insertCache(f, key: "acc1:INBOX:shared@example.com", rfc: "shared@example.com", daysAgo: pastGrace)
+        // Control: the account that has it keeps its own entry, also under a folder path with a colon.
+        try insertCache(f, key: "acc2:INBOX:shared@example.com", rfc: "shared@example.com", daysAgo: pastGrace)
+        try insertCache(f, key: "acc2:Work:Projects:shared@example.com", rfc: "shared@example.com", daysAgo: pastGrace)
 
         SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
 
-        #expect(try cache(f, "acc1:INBOX:legacy@example.com")?.summaryTextMessage == "Text for acc1:INBOX:legacy@example.com")
-        #expect(try cache(f, "acc1:Work:Projects:nested@example.com") != nil)
-        #expect(try cache(f, "acc1:INBOX:elsewhere@example.com") == nil)
+        #expect(try cache(f, "acc1:INBOX:shared@example.com") == nil)
+        #expect(try cache(f, "acc2:INBOX:shared@example.com") != nil)
+        #expect(try cache(f, "acc2:Work:Projects:shared@example.com") != nil)
     }
 
     @Test("Storage maintenance runs the purge: an aged orphan goes, an entry whose email is here stays")

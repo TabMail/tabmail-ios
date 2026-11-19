@@ -219,7 +219,7 @@ struct AITextMessageStorageTests {
         #expect(entry?.replyTextMessage == nil)
     }
 
-    @Test("An older build's entries without a Message-ID survive the upgrade and the purge while their email is here")
+    @Test("An older build's entries without a Message-ID: the upgrade fills the ones whose email is where the key says, and the purge keeps only those")
     func legacyEntriesSurviveUpgradeAndPurge() throws {
         let (pool, dir) = try Self.migrated(upTo: "v105_addAITextMessages")
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
@@ -263,7 +263,8 @@ struct AITextMessageStorageTests {
         SyncEngine.runPurgeOrphanedAICache(dbPool: PrioritizedDatabase(pool: pool, priority: .background))
 
         let keys = try pool.read { db in Set(try MessageAICache.fetchAll(db).map(\.key)) }
-        #expect(keys == ["acc1:INBOX:stayed@example.com", "acc1:INBOX:moved@example.com"])
+        // The moved email's entry has no Message-ID: an orphan, made again if ever needed.
+        #expect(keys == ["acc1:INBOX:stayed@example.com"])
         let applied = try pool.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations") }
         #expect(applied.contains("v106_repairAICacheMessageIds"))
     }

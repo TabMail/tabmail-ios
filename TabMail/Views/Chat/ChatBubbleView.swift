@@ -151,6 +151,81 @@ struct ChatBubbleView: View {
     }
 }
 
+/// A reply in the outbox that has not gone out yet (`ChatUnsentReply`): a blue bubble with the
+/// email's summary once it is made ("Summarizing" until then), and under it "Sending", as under
+/// every email of the user's. A send that failed for good reads "Not sent", with the red mark beside
+/// the bubble as in Messages; touch and hold offers Retry and Delete, which are the Outbox's own
+/// Retry and Discard for the same row (owner 2026-11-07).
+struct ChatUnsentReplyBubble: View {
+    let reply: ChatUnsentReply
+    let retry: () -> Void
+    let delete: () -> Void
+
+    private var notSent: Bool { reply.failed }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 6) {
+            bubble
+            if notSent {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(Theme.destructive)
+                    .accessibilityLabel("Not sent")
+                    .accessibilityIdentifier(Self.notSentMarkId)
+                    .accessibilityAction(named: "Retry", retry)
+                    .accessibilityAction(named: "Delete", delete)
+            }
+        }
+        .contextMenu { if notSent { failedSendMenu } }
+        .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
+            width * ChatViewLayout.bubbleMaxWidthFraction
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.horizontal)
+    }
+
+    static let notSentMarkId = "chat.unsentReply.notSent"
+
+    @ViewBuilder
+    private var failedSendMenu: some View {
+        Button(action: retry) { Label("Retry", systemImage: "arrow.clockwise") }
+        Button(role: .destructive, action: delete) { Label("Delete", systemImage: "trash") }
+    }
+
+    private var bubble: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            Group {
+                // Each branch says what it shows, so VoiceOver reads what is on screen.
+                if let text = reply.textMessage {
+                    Text(text)
+                        .font(.body)
+                        .foregroundStyle(Color.white)
+                        .multilineTextAlignment(.leading)
+                        .accessibilityLabel("You said: \(text)")
+                } else {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.mini).tint(Color.white)
+                        Text("Summarizing")
+                            .font(.caption)
+                            .foregroundStyle(Color.white.opacity(0.8))
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("You said: summarizing")
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                    .fill(Theme.accent)
+            )
+            Text(reply.caption)
+                .font(.caption2)
+                .foregroundStyle(Theme.textSecondary)
+        }
+    }
+}
+
 /// Initials in a circle of the person's color.
 struct ChatAvatar: View {
     let person: ChatThread.Person

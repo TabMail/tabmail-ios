@@ -591,6 +591,17 @@ final class MessageDetailViewModel {
         aiUpdateObserver = obs
     }
 
+    /// Re-reads the thread's emails, as a merge commit does. The chat calls it when a sent reply's
+    /// Sent copy is in the database, so the copy joins the chat (`ChatUnsentReply`); the chat does
+    /// not observe the database. Same preview-freeze buffering as the merge listener.
+    func reloadThread() {
+        if PreviewFreezeGate.shared.isFrozen {
+            pendingThreadRefreshOnRelease = true
+            return
+        }
+        loadThreadMessagesAsync()
+    }
+
     /// Listen for the NSE merge committing staged rows to GRDB. A quick-rendered
     /// open (ADR-IOS-049: header/body synthesized from the in-memory staged
     /// snapshot) ran thread detection BEFORE the merge wrote the header +

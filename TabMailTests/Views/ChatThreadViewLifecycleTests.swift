@@ -22,6 +22,15 @@ import UIKit
 ///     for the rows it shows, and a row never shown asks nothing.
 ///  4. A context load that a newer member change cancelled never shows: the chat keeps the newer
 ///     load's accounts and attachment chips when the older read finally returns.
+///  5. An email that joins the open chat is its newest and asks for its summary, first. A draft
+///     that joins is not the chat's and never asks, from any account, whatever folders the
+///     chat had read.
+///  6. At the bottom, the newest bubble stays above the reply field however tall the field grows,
+///     a six-line ready AI Reply included.
+///  7. No AI Reply is offered on the user's turn (owner 2026-11-07): while a reply of theirs is in
+///     the outbox (offline it may stay there for long) and once it is sent, until an email from
+///     someone else arrives; that email's own AI Reply then shows. (The Sending bubble itself:
+///     `ChatSendingBubbleTests`.)
 ///
 /// What was asked is read back from the summary queue; which rows are on screen is read from the
 /// bubbles' accessibility frames (each email has its own subject).
@@ -39,12 +48,13 @@ struct ChatThreadViewLifecycleTests {
 
     /// A 40-email chain, e0 (oldest) to e39 (newest), all in the Inbox with their bodies and no
     /// summaries, ten minutes apart (no time stamps between them). `unreadFrom`: emails from this
-    /// index on are unread.
+    /// index on are unread. `newestReady`: the newest email's ready AI Reply.
     /// `tall`: this email's bubble holds `tallText`, many times the screen's height, with no summary
     /// stored yet, so it still asks for one.
-    private static func insertThread(unreadFrom: Int?, tall: Int? = nil, pool: DatabasePool) throws -> [MessageHeader] {
+    private static func insertThread(unreadFrom: Int?, newestReady: String? = nil, tall: Int? = nil, pool: DatabasePool) throws -> [MessageHeader] {
         _ = try FolderEpochTestFixture.makeAccount(id: account, provider: .gmail, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: account, path: "INBOX", role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: account, path: "Drafts", role: .drafts, pool: pool)
         let now = Date()
         var headers: [MessageHeader] = []
         for index in 0..<length {
@@ -60,6 +70,10 @@ struct ChatThreadViewLifecycleTests {
             header.bodyComplete = true
             header.isRead = unreadFrom.map { index < $0 } ?? true
             if index == tall { header.summaryTextMessage = tallText(index) }
+            if index == length - 1, let newestReady {
+                header.cachedReply = "Hello,\n\n\(newestReady)\n\nThanks."
+                header.replyTextMessage = newestReady
+            }
             let row = header
             try pool.write { db in
                 try row.insert(db)
@@ -78,6 +92,8 @@ struct ChatThreadViewLifecycleTests {
     private struct Opened {
         /// The summary queue's chat jobs, front first, as email indices.
         let queued: [Int]
+        /// The same jobs as header ids, including emails that joined after the open.
+        let queuedIds: [String]
         /// Emails any part of whose bubble is inside the chat's scroll view at the end.
         let partlyShown: Set<Int>
         /// Emails any part of whose bubble is inside the scroll view's visible area (below the
@@ -192,7 +208,7 @@ struct ChatThreadViewLifecycleTests {
             try headers.map { try MessageHeader.fetchOne(db, key: $0.id)?.isRead ?? false }
         }
         let opened = Opened(
-            queued: jobs.compactMap { index[$0] },
+            queued: jobs.compactMap { index[$0] }, queuedIds: jobs,
             partlyShown: Set(frames.filter { $0.frame.intersects(scrollFrame) }.map(\.index)),
             partlyVisible: Set(frames.filter { $0.frame.intersects(visible) }.map(\.index)),
             fullyShown: Set(frames.filter { visible.contains($0.frame) }.map(\.index)),
@@ -337,6 +353,188 @@ struct ChatThreadViewLifecycleTests {
         Self.expectOpenRequest(opened)
     }
 
+    // MARK: - 5. An email that joins
+
+    @Test("An email that joins the open chat asks for its summary, first")
+    func aJoiningEmailAsks() async throws {
+        let joinedIndex = Self.length
+        var joined = MessageHeader(
+            messageId: "life\(joinedIndex)", subject: "Plans \(joinedIndex)", from: "Sender 1",
+            fromAddress: "sender1@example.com", to: "me@example.com", date: Date(), snippet: "Note \(joinedIndex)",
+            folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: "INBOX"),
+            accountId: Self.account, folderPath: "INBOX", isInInbox: true)
+        joined.rfc822MessageId = Self.rfc(joinedIndex)
+        joined.inReplyTo = Self.rfc(joinedIndex - 1)
+        joined.headerComplete = true
+        joined.bodyComplete = true
+        joined.isRead = true
+        let row = joined
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { _ in
+            let askedBefore = await ActiveAIQueue.shared.queuedJobsForTesting.contains { $0.headerId == row.id }
+            #expect(!askedBefore, "control: not asked before it joins")
+            try await AppDatabase.dbPool.write { db in
+                try row.insert(db)
+                try MessageBody(contentKey: ContentKey(rawValue: row.id), htmlContent: "<p>Note</p>").insert(db)
+            }
+            // Announced as a mail merge announces new mail.
+            NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+        }
+        #expect(opened.queuedIds.first == row.id, "the joining email is asked for, at the front: \(opened.queuedIds.prefix(3))")
+        Self.expectOpenRequest(opened)
+    }
+
+    /// An email answering the thread's newest, joining the open chat.
+    private static func joining(_ uid: String, folderPath: String, accountId: String = account) -> MessageHeader {
+        var header = MessageHeader(
+            messageId: uid, subject: "Plans \(uid)", from: "Me",
+            fromAddress: "me@example.com", to: "sender1@example.com", date: Date(), snippet: "Reply \(uid)",
+            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath),
+            accountId: accountId, folderPath: folderPath, isInInbox: folderPath == "INBOX")
+        header.rfc822MessageId = "<life-\(uid)@example.com>"
+        header.inReplyTo = rfc(length - 1)
+        header.headerComplete = true
+        header.bodyComplete = true
+        header.isRead = true
+        return header
+    }
+
+    @Test("A draft that joins the open chat never asks for a summary; an email joining with it does")
+    func aJoiningDraftDoesNotAsk() async throws {
+        // The user's reply draft, saved while the chat is open, with its body on the device.
+        let draft = Self.joining("draft", folderPath: "Drafts")
+        // Control: an email that joins at the same time.
+        let email = Self.joining("joined", folderPath: "INBOX")
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { _ in
+            try await AppDatabase.dbPool.write { db in
+                for row in [draft, email] {
+                    try row.insert(db)
+                    try MessageBody(contentKey: ContentKey(rawValue: row.id), htmlContent: "<p>Reply</p>").insert(db)
+                }
+            }
+            NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+        }
+        #expect(opened.queuedIds.contains(email.id), "control: the joining email is asked for: \(opened.queuedIds.prefix(3))")
+        #expect(!opened.queuedIds.contains(draft.id),
+                "no chat summary is asked for a draft: its text would leave the device for nothing shown")
+        Self.expectOpenRequest(opened)
+    }
+
+    @Test("A draft from an account that holds no other email of the thread never asks for a summary when it joins")
+    func aJoiningDraftFromAnotherAccountDoesNotAsk() async throws {
+        // The reply draft sits in another account, which has no other email of the thread, so the
+        // chat had no reason to read that account's folders before it joined.
+        let other = "acc-chat-life-other"
+        let draft = Self.joining("other-draft", folderPath: "Drafts", accountId: other)
+        // Control: an email that joins at the same time.
+        let email = Self.joining("other-joined", folderPath: "INBOX")
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { _ in
+            try await AppDatabase.dbPool.write { db in
+                var account = Account(emailAddress: "\(other)@example.com", displayName: "Other", provider: .gmail)
+                account.id = other
+                try account.insert(db)
+                try Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: other).insert(db)
+                for row in [draft, email] {
+                    try row.insert(db)
+                    try MessageBody(contentKey: ContentKey(rawValue: row.id), htmlContent: "<p>Reply</p>").insert(db)
+                }
+            }
+            NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+        }
+        #expect(opened.queuedIds.contains(email.id), "control: the joining email is asked for: \(opened.queuedIds.prefix(3))")
+        #expect(!opened.queuedIds.contains(draft.id),
+                "unsent draft text never leaves the device, whatever folders the chat had read")
+        Self.expectOpenRequest(opened)
+    }
+
+    // MARK: - 6. The field never covers the newest bubble
+
+    private struct Bottom: Equatable {
+        /// The chat's scrollable height: the bubbles, then the room kept under the last one.
+        let contentHeight: CGFloat
+        /// The top of the reply field's text, on screen.
+        let fieldTop: CGFloat
+        /// The bottom of the newest email's bubble, on screen.
+        let newestBottom: CGFloat
+        let belowScreen: CGFloat
+    }
+
+    private static func textViews(_ view: UIView) -> [UITextView] {
+        ((view as? UITextView).map { [$0] } ?? []) + view.subviews.flatMap { textViews($0) }
+    }
+
+    /// Opens the all-read thread, signed in, with `ready` as the newest email's AI Reply, and reads
+    /// the bottom once the scroll and the field have not moved for a while.
+    private func bottom(ready: String) async throws -> Bottom {
+        try await HostedAccessibility.withAutomation { try await bottomWithAutomation(ready: ready) }
+    }
+
+    private func bottomWithAutomation(ready: String) async throws -> Bottom {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let queue = ActiveAIQueue.shared
+        await queue.setDispatchSuppressedForTesting(true)
+        await queue.clearForTesting()
+        defer {
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        ChatPillState.shared.removeAllSessions()
+        let headers = try Self.insertThread(unreadFrom: nil, newestReady: ready, pool: pool)
+        let newest = try #require(headers.last)
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: NavigationStack {
+            ChatThreadView(messageId: newest.id)
+        }.environment(\.hasTabMailSession, true))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            ChatPillState.shared.removeAllSessions()
+        }
+
+        var last: Bottom?
+        var stableFor = 0
+        for _ in 0..<120 where stableFor < 6 {
+            try await Task.sleep(for: .milliseconds(100))
+            guard let scroll = Self.scrollViews(controller.view).max(by: { $0.contentSize.height < $1.contentSize.height }),
+                  let field = Self.textViews(controller.view).first(where: { $0.text == ready }),
+                  let newestBubble = Self.bubbleFrames(in: controller.view).first(where: { $0.index == Self.length - 1 }) else {
+                stableFor = 0
+                continue
+            }
+            let now = Bottom(contentHeight: scroll.contentSize.height,
+                             fieldTop: field.convert(field.bounds, to: nil).minY,
+                             newestBottom: newestBubble.frame.maxY,
+                             belowScreen: Self.below(scroll))
+            stableFor = now == last ? stableFor + 1 : 0
+            last = now
+        }
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
+        try #require(stableFor >= 6, "the chat and its field settle, got \(String(describing: last))")
+        return try #require(last)
+    }
+
+    @Test("At the bottom, the newest bubble stays above the reply field, a six-line ready AI Reply included")
+    func newestBubbleClearsATallField() async throws {
+        let short = try await bottom(ready: "Sounds good.")
+        let long = try await bottom(ready: "Thanks for sending the detailed schedule, I can attend the planning session on Tuesday afternoon and will bring the updated budget numbers, the contractor estimates and the notes from our last discussion. I will also check the two open questions with the team beforehand and send the revised agenda by Monday so everyone has time to review it.")
+        #expect(abs(short.belowScreen) < 2 && abs(long.belowScreen) < 2,
+                "both open at the bottom: \(short.belowScreen), \(long.belowScreen)")
+        // What the user sees: the newest bubble ends above the field's text in both chats. The text
+        // rises a little more than the field around it (one line sits centred in the field's
+        // starting height), so the bubble is compared with the text, not with the field's growth.
+        let fieldRise = short.fieldTop - long.fieldTop
+        #expect(fieldRise > 40, "control: the long reply grows the field, by \(fieldRise)")
+        #expect(short.newestBottom <= short.fieldTop && long.newestBottom <= long.fieldTop,
+                "the newest bubble stays above the field: \(short.newestBottom) over \(short.fieldTop), \(long.newestBottom) over \(long.fieldTop)")
+    }
+
     /// Holds the first context read that reaches the body table, on its reader thread, until
     /// released (bounded): the read of the chat's attachment lists and calendar files.
     final class ContextReadHold: Sendable {
@@ -442,6 +640,125 @@ struct ChatThreadViewLifecycleTests {
         try await Task.sleep(for: .seconds(1))
         #expect(!hold.state.withLock { $0.timedOut }, "control: the held read was released, not timed out")
         #expect(showsChip(), "the cancelled older load did not replace the newer one")
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
+    }
+
+    // MARK: - 7. The user's turn
+
+    @Test("While a reply is in the outbox and once it is sent, no AI Reply shows, until someone else's email arrives")
+    func sentReplyTakesTheTurn() async throws {
+        try await HostedAccessibility.withAutomation { try await sentReplyTakesTheTurnBody() }
+    }
+
+    private func sentReplyTakesTheTurnBody() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let queue = ActiveAIQueue.shared
+        await queue.setDispatchSuppressedForTesting(true)
+        await queue.clearForTesting()
+        ChatPillState.shared.removeAllSessions()
+        defer {
+            ChatPillState.shared.removeAllSessions()
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        let account = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
+        let now = Date()
+        func header(_ id: String, from: String, secondsAgo: Double, inReplyTo: String?, ready: String?) -> MessageHeader {
+            var header = MessageHeader(
+                messageId: id, subject: "Lunch plans", from: from, fromAddress: from, to: "someone@example.com",
+                date: now.addingTimeInterval(-secondsAgo), snippet: "Note \(id)",
+                folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: "INBOX"),
+                accountId: Self.account, folderPath: "INBOX", isInInbox: true)
+            header.rfc822MessageId = "<\(id)@example.com>"
+            header.inReplyTo = inReplyTo
+            header.headerComplete = true
+            header.bodyComplete = true
+            header.isRead = true
+            if let ready {
+                header.cachedReply = "Hello,\n\n\(ready)\n\nThanks."
+                header.replyTextMessage = ready
+            }
+            return header
+        }
+        let ready = "Yes, Tuesday works for me."
+        let parent = header("turn-parent", from: "sender@example.com", secondsAgo: 600, inReplyTo: nil, ready: ready)
+        let accountId = Self.account
+        try await pool.write { db in
+            try parent.insert(db)
+            var draft = Draft(
+                id: "turn-draft", accountId: accountId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Re: Lunch plans", body: ready, replyToId: nil, isForward: false, editHistoryJSON: nil,
+                createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: NavigationStack {
+            ChatThreadView(messageId: parent.id)
+        }.environment(\.hasTabMailSession, true))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func fieldTexts() -> [String] { Self.textViews(controller.view).map(\.text) }
+        func waitFor(_ done: () -> Bool) async throws {
+            for _ in 0..<60 where !done() { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        try await waitFor { fieldTexts().contains(ready) }
+        #expect(fieldTexts().contains(ready), "control: the field offers the AI Reply on the sender's turn: \(fieldTexts())")
+
+        // A reply to it is queued, as the compose card queues it.
+        let queued = try await AccountManager.persistQueuedSend(
+            draft: DraftMessage(to: ["sender@example.com"], subject: "Re: Lunch plans", body: ready,
+                                inReplyTo: parent.rfc822MessageId),
+            accountId: Self.account, replyToHeaderId: parent.id, isForward: false, serverDraftId: nil,
+            draftId: "turn-draft", instanceEpoch: "E1")
+        let sentId = try #require(try await pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId)?.sentMessageId })
+        try await waitFor { !fieldTexts().contains(ready) }
+        // Offline, the email stays in the outbox: the field stays without a suggestion.
+        try await Task.sleep(for: .milliseconds(1500))
+        #expect(!fieldTexts().isEmpty, "control: the field is on screen")
+        #expect(!fieldTexts().contains(ready), "no suggestion while the reply is in the outbox: \(fieldTexts())")
+
+        // Online, the provider takes it: the send stamps `sentAt`, then writes the Sent copy, in two
+        // writes, and nothing tells the chat (no merge signal is posted here).
+        func said() -> Int { HostedAccessibility.labels(in: controller.view).filter { $0.hasPrefix("You said") }.count }
+        func sending() -> Int { HostedAccessibility.labels(in: controller.view).filter { $0.contains("Sending") }.count }
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?", arguments: [Date(), queued.outboxId])
+        }
+        try await Task.sleep(for: .milliseconds(1000))
+        #expect(said() == 1, "sent, its copy not written yet: the reply's bubble stays until the copy is in the chat")
+        var own = header("turn-own", from: account.emailAddress, secondsAgo: 0, inReplyTo: "<turn-parent@example.com>", ready: nil)
+        own.rfc822MessageId = EmailFilter.normalizeMessageId(sentId)
+        let ownCopy = own
+        try await pool.write { db in try ownCopy.insert(db) }
+        var neither = 0
+        for _ in 0..<60 where !(said() == 1 && sending() == 0) {
+            if said() == 0 { neither += 1 }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(said() == 1 && sending() == 0, "the sent email is in the chat and its outbox bubble is gone")
+        #expect(neither == 0, "never neither the bubble nor the email on screen")
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(!fieldTexts().contains(ready), "no suggestion once the sent email is in the chat: \(fieldTexts())")
+
+        // Someone else answers: their email's own AI Reply shows.
+        let later = "Friday is better for me."
+        let other = header("turn-other", from: "friend@example.com", secondsAgo: -5, inReplyTo: own.rfc822MessageId, ready: later)
+        try await pool.write { db in try other.insert(db) }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+        try await waitFor { fieldTexts().contains(later) }
+        #expect(fieldTexts().contains(later), "a new email from someone else is their turn: \(fieldTexts())")
         await queue.clearForTesting()
         await queue.setDispatchSuppressedForTesting(false)
     }

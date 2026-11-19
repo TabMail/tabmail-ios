@@ -14,7 +14,9 @@ import Synchronization
 ///  1. A chat summary is done only with its text message, except the local no-content summary,
 ///     which never gets one; an ordinary summary is done with the summary alone. One predicate
 ///     (`summaryDone`) decides it for every site, so no chat job can retry forever.
-///  2. A chat summary passes the folder scope in any folder; every other job keeps the Inbox scope.
+///  2. A chat summary passes the folder scope in any folder but Drafts; every other job keeps the
+///     Inbox scope. A chat summary is never asked for a draft, whichever caller asks, decided from
+///     the email's own folder role; an email whose folder is unknown is refused too.
 ///  3. `forChat` is context, not identity: a chat offer and an ordinary offer for the same message
 ///     are one job, and the flags only widen. A chat offer is never lost to its ordinary twin,
 ///     pending, in flight or just completed: once the twin is gone, a chat summary is asked for.
@@ -28,8 +30,8 @@ import Synchronization
 ///     takes no place in a thread's window. Each thread is looked up once however many of its
 ///     emails are in the Inbox, and no email of a thread is lost to that. A foreground pass runs it
 ///     only when the chat view was on as the pass began.
-///  6. Release builds keep all of it off; the debug override counts only while debug is unlocked;
-///     on also needs the user's toggle and AI on, and AI going off never rewrites the toggle.
+///  6. The chat view is on by default; it needs the user's toggle and AI on, and AI going off
+///     never rewrites the toggle.
 ///
 /// Which emails an open chat asks for is `ChatThreadViewLifecycleTests`.
 ///
@@ -113,18 +115,64 @@ struct ChatSummaryQueueTests {
 
     // MARK: - 2. Scope
 
-    @Test("A chat summary is in scope in any folder; every other job only in the Inbox")
+    @Test("A chat summary is in scope in any folder but Drafts; every other job only in the Inbox")
     func scopeMatrix() {
         let archived = header(blurb: nil, textMessage: nil, isInInbox: false)
         let inbox = header(blurb: nil, textMessage: nil, isInInbox: true)
         let chat = ActiveAIQueue.AIJob(headerId: "h", accountId: "a", jobType: .summary, windowExempt: true, forChat: true)
         let ordinary = ActiveAIQueue.AIJob(headerId: "h", accountId: "a", jobType: .summary)
         let exempt = ActiveAIQueue.AIJob(headerId: "h", accountId: "a", jobType: .summary, windowExempt: true)
-        #expect(ActiveAIQueue.inScope(archived, for: chat), "a thread holds Sent and archived mail")
-        #expect(!ActiveAIQueue.inScope(archived, for: ordinary))
-        #expect(!ActiveAIQueue.inScope(archived, for: exempt), "window exemption never removes the Inbox scope")
-        #expect(ActiveAIQueue.inScope(inbox, for: chat))
-        #expect(ActiveAIQueue.inScope(inbox, for: ordinary))
+        #expect(ActiveAIQueue.inScope(archived, chatAllowed: true, for: chat), "a thread holds Sent and archived mail")
+        #expect(!ActiveAIQueue.inScope(archived, chatAllowed: false, for: chat), "never a draft")
+        #expect(!ActiveAIQueue.inScope(archived, chatAllowed: true, for: ordinary))
+        #expect(!ActiveAIQueue.inScope(archived, chatAllowed: true, for: exempt), "window exemption never removes the Inbox scope")
+        #expect(ActiveAIQueue.inScope(inbox, chatAllowed: true, for: chat))
+        #expect(ActiveAIQueue.inScope(inbox, chatAllowed: true, for: ordinary))
+    }
+
+    @Test("A chat summary is refused for a Drafts-role email whichever caller asks, from its own folder role, any account")
+    func draftGateRefusesEveryCaller() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let acc = "acc-cs-gate"
+        try makeAccount(acc, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: acc, path: "Drafts", role: .drafts, pool: pool)
+        // Another account that holds nothing but the draft.
+        let other = "acc-cs-gate-other"
+        _ = try FolderEpochTestFixture.makeAccount(id: other, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: other, path: "Drafts", role: .drafts, pool: pool)
+        let draft = try insertHeader(accountId: acc, uid: "draft", folderPath: "Drafts", pool: pool)
+        let otherDraft = try insertHeader(accountId: other, uid: "other-draft", folderPath: "Drafts", bodyComplete: false, pool: pool)
+        // A folder no row describes: its role is unknown, so it is refused (fail closed).
+        let unknown = try insertHeader(accountId: acc, uid: "unknown", folderPath: "Gone", pool: pool)
+        // Controls: Sent, Archive and a folder of the user's own, with no role, are summarized for
+        // the chat.
+        try FolderEpochTestFixture.insertFolder(accountId: acc, path: "Projects", role: .custom, pool: pool)
+        let sent = try insertHeader(accountId: acc, uid: "sent", folderPath: "Sent", pool: pool)
+        let archived = try insertHeader(accountId: acc, uid: "archived", folderPath: "Archive", bodyComplete: false, pool: pool)
+        let filed = try insertHeader(accountId: acc, uid: "filed", folderPath: "Projects", pool: pool)
+
+        let allowed = try await pool.read { db in
+            try [draft, otherDraft, unknown, sent, archived, filed].map { try ActiveAIQueue.chatSummaryAllowed($0, db: db) }
+        }
+        #expect(allowed == [false, false, false, true, true, true], "allowed: \(allowed)")
+        let chatJob = { (h: MessageHeader) in
+            ActiveAIQueue.AIJob(headerId: h.id, accountId: h.accountId, jobType: .summary, windowExempt: true, forChat: true)
+        }
+        #expect(!ActiveAIQueue.inScope(draft, chatAllowed: allowed[0], for: chatJob(draft)), "the executor's scope refuses it")
+
+        // The shown chat (its open, its database observation and re-checks, a joining email) and a
+        // row on screen all ask through `enqueueChatSummaries`.
+        let queue = ActiveAIQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        let requests = BodyRequests()
+        await queue.enqueueChatSummaries([draft, otherDraft, unknown, sent, archived, filed],
+                                         requestBodies: { await requests.add($0) })
+        #expect(Set(await queue.queuedJobsForTesting.map(\.headerId)) == [sent.id, filed.id],
+                "no job for a draft of either account, nor for an unknown folder; controls: Sent and a folder with no role")
+        #expect(await requests.ids == [archived.id], "no body is fetched to summarize a draft; control: Archive")
+        // The walk never offers it either (`walkLeavesDraftsOut`); a job that reaches the executor
+        // by any other way is refused there (`ChatSummaryExecutionTests.chatSummaryRefusesADraft`).
     }
 
     @Test("The action chained after a chat summary keeps the Inbox scope")

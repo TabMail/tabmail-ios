@@ -119,7 +119,9 @@ struct PillDictationModeTests {
         #expect(usesOfAuto.isEmpty, "startDictation may only pass `auto` to the recognizer: \(usesOfAuto)")
         #expect(codeLines.contains { $0.contains("speech.start(locale: speechLocale, auto: auto)") })
         // The newest gesture wins: the mic button cancels a pending delayed auto-start before it acts.
-        #expect(view.contains("autoStartTask?.cancel()\n                autoStartTask = nil\n                if speech.isRecording || speech.isStarting {"))
+        // Matched with whitespace collapsed, so moving the mic button does not change what is checked.
+        let flatView = view.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        #expect(flatView.contains("autoStartTask?.cancel() autoStartTask = nil if speech.isRecording || speech.isStarting {"))
         #expect(view.components(separatedBy: "startDictation(auto: true)").count == 4)
         // Going to the background releases the recognizer; a recording keeps the screen awake and blocks send.
         #expect(view.contains("if phase == .background { speech.stop() }"))
