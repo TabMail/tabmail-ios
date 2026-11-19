@@ -104,6 +104,10 @@ actor ExchangeProvider: EmailProvider {
         lastFolderListMessageTotal = folders.reduce(0) { $0 + $1.totalCount }
     }
 
+    /// The total is the sum over a complete tree, and a change read's `.updated`
+    /// carries only the folders that changed: every scheduled full sync lists.
+    nonisolated var progressTotalComesFromFolderList: Bool { true }
+
     func fetchFolders() async throws -> [FolderInfo] {
         // v1.0 mailFolder resource does NOT include wellKnownName property.
         // Resolve well-known folder IDs by addressing them by name (e.g., GET /mailFolders/inbox).

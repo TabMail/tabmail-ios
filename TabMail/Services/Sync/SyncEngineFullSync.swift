@@ -308,8 +308,11 @@ extension SyncEngine {
         // A provider whose progress total is not known yet (no complete folder
         // list since launch: a change read may have carried only the folders
         // that changed) gets a complete folder list here, so the scheduled full
-        // sync is what discovers it, never the change read (#755).
-        let providerNeedsFolderList = await provider.progressTotal(crawling: false) == .notKnownYet
+        // sync is what discovers it, never the change read (#755). A provider
+        // whose total is that list's (Exchange) lists on every scheduled full
+        // sync, so its total follows the server's.
+        let totalNotKnownYet = await provider.progressTotal(crawling: false) == .notKnownYet
+        let providerNeedsFolderList = provider.progressTotalComesFromFolderList || totalNotKnownYet
         if let applied = plan.appliedFolderList, !providerNeedsFolderList {
             // This pass's change read carried the folder list and it is applied.
             skippablePaths = applied
