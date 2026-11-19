@@ -4,6 +4,16 @@
 
 import Foundation
 
+/// A precomputed reply: the email body and its short text-message version
+/// (`MessageHeader.cachedReply` / `replyTextMessage`).
+struct ReplyResult: Sendable, Equatable {
+    let body: String
+    let textMessage: String?
+
+    /// The quality filters' sentinel: no reply wanted (an empty body), distinct from nil (error, retried).
+    static let filtered = ReplyResult(body: "", textMessage: nil)
+}
+
 extension AIService {
 
     // MARK: - Reply Generation
@@ -26,7 +36,7 @@ extension AIService {
         relatedFrom: String,
         relatedTo: String,
         relatedCc: String
-    ) async throws -> String? {
+    ) async throws -> ReplyResult? {
         guard !disableLLMCalls else {
             BackgroundSyncLogger.logDebug("[AIService] generateReply: SKIP — LLM calls disabled")
             return nil
@@ -115,20 +125,25 @@ extension AIService {
         BackgroundSyncLogger.logDebug("[AIService] generateReply: === END RAW RESPONSE ===")
         #endif
 
-        // Parse compose response (Subject: / Body: format), matching TB's processEditResponse
-        let parsed = Self.parseComposeResponse(text)
+        // The reply JSON (body + text message); not that object = no reply this time (retried).
+        guard let parsed = AIResponseParser.parseReplyResponse(text) else {
+            BackgroundSyncLogger.logDebug("[AIService] Reply: response is not the reply JSON (\(text.count) chars)")
+            return nil
+        }
         #if DEBUG
         BackgroundSyncLogger.logDebug("[AIService] generateReply: === PARSED BODY ===")
-        BackgroundSyncLogger.logDebug("[AIService]   \(parsed)")
+        BackgroundSyncLogger.logDebug("[AIService]   \(parsed.body)")
+        BackgroundSyncLogger.logDebug("[AIService]   text message: \(parsed.textMessage ?? "nil")")
         BackgroundSyncLogger.logDebug("[AIService] generateReply: === END PARSED BODY ===")
         #endif
-        return parsed
+        return ReplyResult(body: parsed.body, textMessage: parsed.textMessage)
     }
 
     // MARK: - Reply Processing (standalone step, called after summary+action)
 
     /// Generate or retrieve a cached reply for a message.
-    /// Returns nil if quality filters exclude it (no-reply, self-sent).
+    /// Returns `ReplyResult.filtered` (an empty body) if quality filters exclude it (no-reply,
+    /// self-sent), nil on an error (retried).
     /// Per-message dedup is handled by queue dedup (QueueStorage) and GRDB field checks.
     /// Runs in parallel with SA — does NOT depend on summary/action output.
     func processReply(
@@ -145,7 +160,7 @@ extension AIService {
         userName: String,
         kbText: String,
         compositionPrompt: String
-    ) async throws -> String? {
+    ) async throws -> ReplyResult? {
         BackgroundSyncLogger.logDebug("[AIService] processReply START for \(messageId)")
         BackgroundSyncLogger.logDebug("[AIService]   subject=\(subject.prefix(60))")
         BackgroundSyncLogger.logDebug("[AIService]   from=\(from) fromAddress=\(fromAddress)")
@@ -161,7 +176,7 @@ extension AIService {
         let isSelfSent = EmailFilter.isSelfSent(fromAddress)
         if isNoReply || isSelfSent {
             BackgroundSyncLogger.logDebug("[AIService] Reply: skipping \(messageId) — noReply=\(isNoReply) self=\(isSelfSent)")
-            return "" // empty sentinel: filtered, no reply needed (distinct from nil = error/retry)
+            return .filtered // empty sentinel: filtered, no reply needed (distinct from nil = error/retry)
         }
 
         // Format date for prompt — match TB's formatTimestampForAgent
@@ -183,11 +198,12 @@ extension AIService {
 
         // Device Sync probe: ask peer for cached reply before running LLM
         if let probeKey = rfc822MessageId {
-            if let probeResults = await DeviceSyncService.shared.probeAICache(keys: [probeKey]),
+            if let probeResults = await peerProbe([probeKey]),
                let cached = probeResults[probeKey],
                let peerReply = cached.reply, !peerReply.isEmpty {
                 BackgroundSyncLogger.logDebug("[AIService] Reply Device Sync HIT for \(messageId)")
-                return peerReply
+                // A peer (Thunderbird) has no text message for its reply.
+                return ReplyResult(body: peerReply, textMessage: nil)
             }
         }
 
@@ -209,31 +225,12 @@ extension AIService {
             relatedCc: ""  // iOS MessageHeader doesn't store CC; empty for now (matches TB when ccList is empty)
         )
 
-        if let reply, !reply.isEmpty {
-            BackgroundSyncLogger.logDebug("[AIService] Reply generated for \(messageId): \(reply.prefix(80))...")
+        if let reply, !reply.body.isEmpty {
+            BackgroundSyncLogger.logDebug("[AIService] Reply generated for \(messageId): \(reply.body.prefix(80))...")
         } else {
             BackgroundSyncLogger.logDebug("[AIService] Reply: no content generated for \(messageId)")
         }
 
         return reply
-    }
-
-    /// Parse compose/edit response from LLM, matching TB's `processEditResponse()` in llm.js.
-    /// Looks for "Body:" section marker; returns everything after it, or raw text as fallback.
-    static func parseComposeResponse(_ rawText: String) -> String {
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Match "Body:" at the start of a line (case-insensitive), capture everything after it
-        if let range = text.range(of: #"(?mi)^Body:\s*([\s\S]*)$"#, options: .regularExpression) {
-            let match = String(text[range])
-            // Strip the "Body:" prefix
-            if let colonRange = match.range(of: "Body:", options: .caseInsensitive) {
-                let body = match[colonRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-                if !body.isEmpty { return body }
-            }
-        }
-
-        // Fallback: return raw text (same as TB's `parsed.message || assistantResp`)
-        return text
     }
 }

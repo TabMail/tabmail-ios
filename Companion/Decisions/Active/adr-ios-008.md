@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note (ADR-IOS-114, 2026-11-05):** decision 7 below, "Caching with TTL", is superseded on iOS: there is no TTL; an AI result lives as long as its email is on the device, a documented deviation from TB.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-008: AI Processing Must Replicate TB Addon Architecture
 

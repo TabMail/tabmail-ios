@@ -12,16 +12,22 @@ struct SummaryResult: Sendable {
     let reminderDate: String?
     let reminderTime: String?
     let reminderContent: String?
+    /// The email as a short text message (`MessageHeader.summaryTextMessage`).
+    let textMessage: String?
 
-    init(blurb: String?, todos: String?, reminderDate: String?, reminderTime: String?, reminderContent: String?) {
+    init(blurb: String?, todos: String?, reminderDate: String?, reminderTime: String?, reminderContent: String?, textMessage: String?) {
         self.blurb = blurb; self.todos = todos
         self.reminderDate = reminderDate; self.reminderTime = reminderTime; self.reminderContent = reminderContent
+        self.textMessage = textMessage
     }
 
     init(from shared: AIResponseParser.SummaryResult) {
         self.blurb = shared.blurb; self.todos = shared.todos
         self.reminderDate = shared.reminderDate; self.reminderTime = shared.reminderTime; self.reminderContent = shared.reminderContent
+        self.textMessage = shared.textMessage
     }
+
+    static let empty = SummaryResult(blurb: nil, todos: nil, reminderDate: nil, reminderTime: nil, reminderContent: nil, textMessage: nil)
 }
 
 extension AIService {
@@ -40,7 +46,7 @@ extension AIService {
         recipientStatus: String = ""
     ) async throws -> SummaryResult {
         guard !disableLLMCalls else {
-            return SummaryResult(blurb: nil, todos: nil, reminderDate: nil, reminderTime: nil, reminderContent: nil)
+            return .empty
         }
 
         // Shared prompt variable assembly (single source of truth — also used by NSE).
@@ -89,12 +95,13 @@ extension AIService {
 
         guard let rawText = response.assistant else {
             BackgroundSyncLogger.logDebug("[AIService] Summary: no assistant text in response")
-            return SummaryResult(blurb: nil, todos: nil, reminderDate: nil, reminderTime: nil, reminderContent: nil)
+            return .empty
         }
 
-        // Match TB: normalizeUnicode(json.assistant.trim()) before parsing
-        let text = Self.normalizeUnicode(rawText.trimmingCharacters(in: .whitespacesAndNewlines))
-        return parseSummaryResponse(text)
+        // Decoded as sent: the reply is JSON (protocol 2.0.0), so rewriting characters first, as
+        // the labelled text once was, can break it (curly quotes become bare ASCII quotes inside
+        // a JSON string). The NSE parses the same text the same way.
+        return parseSummaryResponse(rawText)
     }
 
     // MARK: - Response Parsing

@@ -164,9 +164,18 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     var reminderDate: String?
     var reminderTime: String?
     var reminderContent: String?
+    /// The email as a short text message in its sender's voice (the user's own for an email the
+    /// user sent), from the same summary result as `summaryBlurb`; the chat view's bubble. Written
+    /// and restored with the other summary fields, never alone. Nil when the summary came from a
+    /// source without one (a Thunderbird peer over Device Sync, a pre-2.0 result).
+    var summaryTextMessage: String?
 
     // AI-generated reply cache (matches TB's reply: IDB prefix)
     var cachedReply: String?
+    /// `cachedReply` as a short text message from the user to the most recent sender, from the
+    /// same reply result; the chat view's AI Reply. Nil when `cachedReply` came without one (a
+    /// peer, the filtered sentinel) or was edited by the user since.
+    var replyTextMessage: String?
 
     /// Whether this header's FTS indexing is complete (GRDB + FTS two-phase write).
     /// Set after indexHeadersForFTS succeeds. Body queue requires headerComplete=1

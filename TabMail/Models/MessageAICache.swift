@@ -23,6 +23,8 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     var reminderDate: String?
     var reminderTime: String?
     var reminderContent: String?
+    /// The summary's text message (`MessageHeader.summaryTextMessage`).
+    var summaryTextMessage: String?
 
     // Action field (matches TB's action cache — plain ActionTag enum)
     var actionTag: ActionTag?
@@ -30,6 +32,8 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     // Reply cache (matches TB's reply: IDB prefix in replyGenerator.js)
     var cachedReply: String?
     var replyGeneratedAt: Date?
+    /// The reply's text message (`MessageHeader.replyTextMessage`).
+    var replyTextMessage: String?
 
     var updatedAt: Date
 
@@ -79,6 +83,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
             header.reminderDate = cached.reminderDate
             header.reminderTime = cached.reminderTime
             header.reminderContent = cached.reminderContent
+            header.summaryTextMessage = cached.summaryTextMessage
         }
 
         // Restore action ONLY if header doesn't already have one from server
@@ -97,9 +102,9 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         // Restore cached reply if header doesn't have one
         if header.cachedReply == nil, let reply = cached.cachedReply, !reply.isEmpty {
             header.cachedReply = reply
+            header.replyTextMessage = cached.replyTextMessage
         }
 
-        // Touch updatedAt so TTL stays fresh for inbox messages being re-created
         cached.updatedAt = Date()
         try cached.save(db)
 
@@ -107,7 +112,10 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     }
 
     /// Write AI state to the persistent cache (upsert).
-    /// Only overwrites non-nil parameters — preserves existing cached fields.
+    /// Only overwrites non-nil parameters — preserves existing cached fields — except the two
+    /// text messages, which belong to their result: a new summary (`summaryBlurb` given) sets
+    /// `summaryTextMessage` to the one passed, nil included, and a new reply (`cachedReply` given)
+    /// sets `replyTextMessage` likewise, so a result without one never keeps an older result's.
     /// No-op if rfc822MessageId is nil (skip cache for messages without Message-ID).
     static func writeThrough(
         accountId: String,
@@ -118,9 +126,11 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         reminderDate: String? = nil,
         reminderTime: String? = nil,
         reminderContent: String? = nil,
+        summaryTextMessage: String? = nil,
         actionTag: ActionTag? = nil,
         cachedReply: String? = nil,
         replyGeneratedAt: Date? = nil,
+        replyTextMessage: String? = nil,
         db: Database
     ) throws {
         guard let key = cacheKey(
@@ -133,14 +143,21 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
             .filter(Column("key") == key)
             .fetchOne(db) ?? MessageAICache(key: key, rfc822MessageId: rfc822MessageId)
 
+
         // Only overwrite non-nil values (preserves existing fields on partial updates)
-        if let summaryBlurb { cache.summaryBlurb = summaryBlurb }
+        if let summaryBlurb {
+            cache.summaryBlurb = summaryBlurb
+            cache.summaryTextMessage = summaryTextMessage
+        }
         if let summaryTodos { cache.summaryTodos = summaryTodos }
         if let reminderDate { cache.reminderDate = reminderDate }
         if let reminderTime { cache.reminderTime = reminderTime }
         if let reminderContent { cache.reminderContent = reminderContent }
         if let actionTag { cache.actionTag = actionTag }
-        if let cachedReply { cache.cachedReply = cachedReply }
+        if let cachedReply {
+            cache.cachedReply = cachedReply
+            cache.replyTextMessage = replyTextMessage
+        }
         if let replyGeneratedAt { cache.replyGeneratedAt = replyGeneratedAt }
         cache.updatedAt = Date()
         try cache.save(db)

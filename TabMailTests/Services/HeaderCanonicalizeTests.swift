@@ -151,8 +151,8 @@ struct HeaderCanonicalizeTests {
         let remnant = try insertRemnant(db, messageId: "g2", actionTag: .reply, isRead: true)
         try db.write { dbConn in
             try dbConn.execute(
-                sql: "UPDATE messageHeader SET summaryBlurb = ?, cachedReply = ? WHERE id = ?",
-                arguments: ["the blurb", "the reply", remnant.id]
+                sql: "UPDATE messageHeader SET summaryBlurb = ?, cachedReply = ?, summaryTextMessage = ?, replyTextMessage = ? WHERE id = ?",
+                arguments: ["the blurb", "the reply", "summary text", "reply text", remnant.id]
             )
         }
         try TestDatabase.insertMessageBody(db, headerId: remnant.id, htmlContent: "<p>rich</p>")
@@ -172,6 +172,9 @@ struct HeaderCanonicalizeTests {
         #expect(rows[0].actionTag == .reply)
         #expect(rows[0].summaryBlurb == "the blurb")
         #expect(rows[0].cachedReply == "the reply")
+        // Each text message travels with the result it belongs to.
+        #expect(rows[0].summaryTextMessage == "summary text")
+        #expect(rows[0].replyTextMessage == "reply text")
         #expect(rows[0].isRead == true) // OR-merge: remnant was read
         // The remnant's body reattached under the canonical id.
         let body = try db.read { try MessageBody.fetchOne($0, key: "acc1:TRASH:g2") }
@@ -180,6 +183,36 @@ struct HeaderCanonicalizeTests {
         // row's FTS entry never had a body indexed); no OR-merge faking it.
         // The body pipeline picks it up naturally.
         #expect(rows[0].bodyComplete == false)
+    }
+
+    @Test("A survivor with its own results keeps its own text messages, not a duplicate's")
+    func survivorKeepsItsOwnTextMessages() throws {
+        let db = try makeDB()
+        let remnant = try insertRemnant(db, messageId: "g7")
+        try db.write { dbConn in
+            try dbConn.execute(
+                sql: "UPDATE messageHeader SET summaryBlurb = ?, cachedReply = ?, summaryTextMessage = ?, replyTextMessage = ? WHERE id = ?",
+                arguments: ["old blurb", "old reply", "old summary text", "old reply text", remnant.id]
+            )
+        }
+        let canonical = try insertCanonical(db, messageId: "g7")
+        try db.write { dbConn in
+            try dbConn.execute(
+                sql: "UPDATE messageHeader SET summaryBlurb = ?, cachedReply = ? WHERE id = ?",
+                arguments: ["own blurb", "own reply", canonical.id]
+            )
+        }
+
+        _ = try canonicalize(db, messageId: "g7")
+
+        let rows = try db.read { try MessageHeader.filter(Column("messageId") == "g7").fetchAll($0) }
+        #expect(rows.count == 1)
+        guard rows.count == 1 else { return }
+        #expect(rows[0].summaryBlurb == "own blurb")
+        #expect(rows[0].cachedReply == "own reply")
+        // The survivor's results had no text message; the duplicate's must not be grafted on.
+        #expect(rows[0].summaryTextMessage == nil)
+        #expect(rows[0].replyTextMessage == nil)
     }
 
     @Test("Clean canonical row is untouched")

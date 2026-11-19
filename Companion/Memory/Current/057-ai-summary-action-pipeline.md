@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note (ADR-IOS-114):** since protocol 2.0.0 the summary and the precache reply arrive as JSON, each with a `text_message`, parsed by `AIResponseParser` (shared with the extension); the section-based summary parser described below is gone. `MessageHeader` also carries `summaryTextMessage` (and `replyTextMessage` with `cachedReply`).
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### AI Summary & Action Pipeline
 

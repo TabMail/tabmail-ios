@@ -18,6 +18,8 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>TabMailProtocolVersion</key>
+	<string>$(TABMAIL_PROTOCOL_VERSION)</string>
 	<key>IMAP_CRED_ENCRYPTION_KEY_DEV</key>
 	<string>$(IMAP_CRED_ENCRYPTION_KEY_DEV)</string>
 	<key>IMAP_CRED_ENCRYPTION_KEY_PROD</key>
