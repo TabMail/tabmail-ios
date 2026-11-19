@@ -449,7 +449,8 @@ struct ChatReplyFieldRuntimeTests {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         let start = try #require(text.range(of: "private func sendAgentChat("))
         let send = String(text[start.upperBound...])
-        #expect(send.contains("var contextNumericId = await Self.contextNumber(sendingAbout: message, known: contextEmailNumericId)"))
+        // A field send, or its retry, names the email the field's send started on.
+        #expect(send.contains("var contextNumericId = await Self.contextNumber(sendingAbout: field?.message ?? message, known: contextEmailNumericId)"))
     }
 
     /// The text from `start` to the next `private func`.
@@ -466,7 +467,8 @@ struct ChatReplyFieldRuntimeTests {
         #expect(text.components(separatedBy: "fieldClearCount += 1").count == 3, "only the two completions")
         let answered = try Self.function("private func agentAnswered() {", in: text)
         #expect(answered.contains("guard !fieldComposeOpened else { return } fieldClearCount += 1"))
-        let ended = try Self.function("private func composeEnded(_ outcome: ComposeOutcome) {", in: text)
-        #expect(ended.contains("if case .sent = outcome { fieldClearCount += 1 }"), "the field empties only after a send")
+        let ended = try Self.function("private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
+        #expect(ended.contains("guard case .sent = outcome else { return }"))
+        #expect(ended.components(separatedBy: "fieldClearCount += 1").count == 2, "the field empties only after a send")
     }
 }

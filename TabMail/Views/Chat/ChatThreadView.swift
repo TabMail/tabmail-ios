@@ -110,9 +110,9 @@ struct ChatThreadView: View {
     @State private var pillHeight = ChatViewLayout.pillStartHeight
     @State private var chatInputFocused = false
     @State private var chatWorking = false
-    /// The ready AI Reply's compose card: the email it answers.
-    @State private var readyReplyMessage: MessageHeader?
-    @State private var agentCompose: AgentToolRouter.ComposeRequest?
+    /// The ready AI Reply's compose card: the email it answers, and how it opens.
+    @State private var readyReply: ChatReadyReply?
+    @State private var agentCompose: ChatAgentCard?
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet.
     @State private var fieldComposeOpened = false
@@ -120,6 +120,11 @@ struct ChatThreadView: View {
     @State private var fieldClearCount = 0
     /// The chat's replies still in the outbox (`ChatUnsentReply`), read from the database.
     @State private var unsentReplies: [ChatUnsentReply] = []
+    /// Who the next reply goes to; Reply All until changed in Reply to.
+    @State private var replyTarget = ChatReplyTarget.replyAll
+    @State private var showsReplyTo = false
+    @State private var showsOnlyList = false
+    @State private var forwardMessage: MessageHeader?
 
     private static let bottomId = "chat-bottom"
     private static let unreadLineId = "chat-unread-line"
@@ -164,7 +169,8 @@ struct ChatThreadView: View {
     }
 
     private var isAnyPresentation: Bool {
-        cardMessage != nil || readyReplyMessage != nil || agentCompose != nil
+        cardMessage != nil || readyReply != nil || agentCompose != nil
+            || forwardMessage != nil || showsReplyTo
     }
 
     // MARK: - Body
@@ -227,6 +233,18 @@ struct ChatThreadView: View {
                 BackgroundSyncLogger.logDebug("[Chat] unsent reply observation ended: \(error)")
             }
         }
+        // A new newest email has its own people: the next reply is a Reply All to them.
+        .onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                // Forward the newest email, in today's forward compose.
+                Button { forwardMessage = thread.newest } label: {
+                    Image(systemName: "arrowshape.turn.up.right")
+                }
+                .disabled(thread.newest == nil)
+                .accessibilityLabel("Forward")
+            }
+        }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
         .onAppear {
             viewModel.isViewVisible = true
@@ -254,10 +272,11 @@ struct ChatThreadView: View {
             askForSummaries()
         }
         .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
-            guard newId != nil else { return }
-            // Asked from the field (not the open sheet): the agent's closing words open nothing.
-            fieldComposeOpened = !chatExpanded
-            agentCompose = AgentToolRouter.shared.pendingCompose
+            guard newId != nil, let req = AgentToolRouter.shared.pendingCompose else { return }
+            // Asked for in a reply field: the agent's closing words open nothing. Who the card goes
+            // to travels with the request (`fieldReply`); this chat's own state decides nothing.
+            fieldComposeOpened = req.fieldReply != nil
+            agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))
             AgentToolRouter.shared.pendingCompose = nil
         }
         .sheet(item: $cardMessage) { msg in
@@ -267,16 +286,19 @@ struct ChatThreadView: View {
             }
             .presentationDragIndicator(.visible)
         }
-        .fullScreenCover(item: $readyReplyMessage) { msg in
-            // Today's reply compose, Reply All, with the AI Reply in its suggestion box.
-            let recipients = buildReplyAllRecipients(for: msg, allAccounts: context.accounts)
-            ComposeView(
-                replyTo: msg,
-                prefillTo: recipients.to.isEmpty ? nil : recipients.to,
-                prefillCc: recipients.cc.isEmpty ? nil : recipients.cc,
-                onAgentOutcome: { outcome in composeEnded(outcome) })
+        .fullScreenCover(item: $readyReply) { ready in
+            // Today's reply compose, with the AI Reply in its suggestion box: Reply All, or a reply
+            // to only the people chosen in Reply to.
+            ready.compose.composeView(
+                replyTo: ready.message, onAgentOutcome: { outcome in composeEnded(outcome, replyTo: ready.message) })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
+        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
+        .sheet(isPresented: $showsReplyTo) {
+            ChatReplyToSheet(
+                replyPeople: thread.replyPeople, target: replyTarget,
+                ownAddresses: context.ownAddresses) { replyTarget = $0 }
+        }
     }
 
     @ViewBuilder
@@ -330,7 +352,11 @@ struct ChatThreadView: View {
                     }
                 }
             }
-            .safeAreaInset(edge: .top, spacing: 0) { ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) {
+                    showsReplyTo = true
+                }
+            }
             .overlay {
                 if chatExpanded {
                     Color.black.opacity(0.3)
@@ -531,6 +557,9 @@ struct ChatThreadView: View {
         let usersTurn = isOwn || !unsentReplies.isEmpty
         let isNoReply = !isOwn && EmailFilter.isNoReply(newest.fromAddress)
         return VStack(spacing: 8) {
+            if let only = replyTarget.only, !chatExpanded {
+                replyingOnlyTo(only)
+            }
             if isNoReply && !chatExpanded {
                 // The field stays usable (the agent declines to write a reply).
                 Text("This is a no-reply email. Replies won't be read.")
@@ -547,13 +576,51 @@ struct ChatThreadView: View {
                 replyField: ChatReplyField(
                     readyText: ChatReplyField.readyText(newest: newest, isOwn: usersTurn),
                     isNoReply: isNoReply,
-                    clearCount: fieldClearCount),
-                onSendReadyReply: { readyReplyMessage = newest },
+                    clearCount: fieldClearCount,
+                    onlyTo: replyTarget.only),
+                onSendReadyReply: {
+                    readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
+                        replyTo: newest, target: replyTarget, accounts: context.accounts))
+                },
                 onFieldSend: { _ in fieldComposeOpened = false })
         }
         .padding(.horizontal, chatExpanded ? 0 : 12)
         .padding(.bottom, chatExpanded ? 8 : 34)
         .animation(Self.pillSpring, value: chatExpanded)
+    }
+
+    /// The gray line above the field when the reply is not a Reply All; tap for everyone.
+    private func replyingOnlyTo(_ people: [ChatThread.Person]) -> some View {
+        let chips = ChatReplyTarget.chips(people)
+        return Button { showsOnlyList = true } label: {
+            HStack(spacing: 6) {
+                Text("Replying only to")
+                    .font(.caption)
+                    .foregroundStyle(Theme.textSecondary)
+                    .fixedSize()
+                ForEach(Array(chips.names.enumerated()), id: \.offset) { _, name in
+                    chip(name)
+                }
+                if chips.more > 0 { chip("+\(chips.more)") }
+            }
+            .lineLimit(1)
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Replying only to \(people.map(\.name).joined(separator: ", "))")
+        .popover(isPresented: $showsOnlyList) {
+            ChatPeopleList(title: "Replying only to", names: people.map(\.name))
+        }
+    }
+
+    private func chip(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(Theme.textPrimary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Palette.boxBg))
+            .overlay(Capsule().stroke(Palette.separator, lineWidth: 0.5))
     }
 
     /// The agent finished a request from the field with something to say: the sheet rises with
@@ -567,15 +634,19 @@ struct ChatThreadView: View {
 
     /// A compose card from the chat closed. Sent: the field empties; a reply shows as its queued
     /// email's bubble, read from the outbox.
-    private func composeEnded(_ outcome: ComposeOutcome) {
-        if case .sent = outcome { fieldClearCount += 1 }
+    private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {
+        guard case .sent = outcome else { return }
+        // A reply sent clears "Replying only to"; the next one is a Reply All again.
+        if replyTo != nil { replyTarget = .replyAll }
+        fieldClearCount += 1
     }
 
     @ViewBuilder
-    private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
+    private func composeView(for card: ChatAgentCard) -> some View {
+        let req = card.request
         let onOutcome: @MainActor (ComposeOutcome) -> Void = { outcome in
             req.onOutcome(outcome)
-            composeEnded(outcome)
+            composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)
         }
         switch req.mode {
         case .compose:
@@ -584,10 +655,7 @@ struct ChatThreadView: View {
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
                 onAgentOutcome: onOutcome)
         case .reply:
-            ComposeView(
-                replyTo: req.replyTo, suggestedBody: req.body,
-                prefillTo: req.to.isEmpty ? nil : req.to, prefillCc: req.cc.isEmpty ? nil : req.cc,
-                prefillBcc: req.bcc.isEmpty ? nil : req.bcc, onAgentOutcome: onOutcome)
+            card.reply.composeView(replyTo: req.replyTo, suggestedBody: req.body, onAgentOutcome: onOutcome)
         case .forward:
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
@@ -601,6 +669,8 @@ struct ChatHeaderView: View {
     let thread: ChatThread
     let subject: String
     let labels: [UserLabel]
+    /// Tapping the names changes who gets the reply.
+    var onTapNames: (() -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 4) {
@@ -611,11 +681,21 @@ struct ChatHeaderView: View {
                 }
             }
             if !thread.replyPeople.isEmpty {
-                Text(ChatThread.headerTitle(thread.replyPeople))
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(Theme.textPrimary)
-                    .lineLimit(1)
+                Button { onTapNames?() } label: {
+                    HStack(spacing: 2) {
+                        Text(ChatThread.headerTitle(thread.replyPeople))
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(onTapNames == nil)
+                .accessibilityHint("Changes who gets your reply")
             }
             Text(subject)
                 .font(.caption)
@@ -635,7 +715,7 @@ struct ChatHeaderView: View {
         .padding(.bottom, 8)
         .frame(maxWidth: .infinity)
         .background(.bar)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }
 

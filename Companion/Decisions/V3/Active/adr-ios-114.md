@@ -439,6 +439,80 @@ same AI result, kept as long as the email itself is shown.
    change has no morph animation yet; the sheet is not sized to its content; a request that only
    acts (archive, label) opens the sheet with the agent's answer.
 
+11. **Who gets the reply, and Forward (amendment 2026-11-05, the fifth chat-view PR, PR 4).** The
+   reply is a Reply All to the newest email's people by default (`ChatReplyTarget.replyAll`).
+   Tapping the header's names opens "Reply to" (`ChatReplyToSheet`): the newest email's people, all
+   ticked; untick someone or add someone (today's contact search, or a typed address; never the
+   user). Done with everyone ticked and nobody added stays Reply All (`ChatReplyTarget.chosen`);
+   anything else replies only to the ticked people, shown as a gray "Replying only to" line of chips
+   above the field (two names, then "+N"; tap for everyone). Nothing forks: the header stays the
+   whole group. The chosen people become the compose card's To (Cc empty) for a reply asked for in
+   the field. With recipients changed, Send on the unchanged AI Reply goes to the agent, so the
+   email is written again for the people chosen (`route(recipientsChanged:)`), and the agent's
+   message names them (`agentMessage(onlyTo:)`). A sent reply, or a new newest email, returns to
+   Reply All. Forward is the chat's top-right button: today's forward compose for the newest email.
+   **Replied only to:** an email that left out someone already in the chat (on an earlier
+   email) carries who it went to (`ChatThread.Item.repliedOnlyTo`, `OnlyTo`): a gray
+   "(replied only to you, David Kim +1)" after the sender's name, or "You (replied only to …)" above
+   the user's own bubble; tap for the full list (`ChatPeopleList`). The user is one person whichever
+   address an email used. VoiceOver reads it (`ChatBubbleView.accessibilityText`).
+   **Product choices made in PR 4, decided 2026-11-08:** an email that only adds someone new is
+   not "only" (the new person joins the chat's people), and an email is never "only" for someone who
+   joined after it; a new newest email resets the choice to Reply All; with recipients chosen the
+   agent's own recipient changes are replaced by the chosen people on the compose card.
+   **Reply All is recorded as the reply goes (2026-11-15):** the ready AI Reply and a reply asked
+   for in the field open compose as Reply All (`ComposeView.isReplyAll`, which the send records on
+   the original) exactly when nobody is chosen in Reply to; with people chosen they open as a plain
+   reply to only them, with no Cc or Bcc. A reply the agent writes in the open sheet keeps the
+   agent's recipients and opens as Reply All only when the agent opened it as one and those
+   recipients are the whole Reply All audience. One helper decides the kind and the recipients
+   together (`ChatReplyCompose.make`), once, as the card opens, so a newer email resetting the
+   choice does not change an open card. Before this, the ready AI Reply always went to everyone and
+   neither card opened as Reply All. Tests: `ChatReplyFieldTests` (`readyReplyToEveryoneIsReplyAll`,
+   `readyReplyToChosenIsPlainReply`, `agentReplyFromTheFieldFollowsTheTarget`,
+   `agentReplyFromTheSheetKeepsItsRecipients`).
+   **Reply All only to the whole audience (2026-11-16):** a chat reply records Reply All only when
+   its recipients (To, Cc and Bcc, compared case-insensitively) equal the full Reply All audience.
+   This now holds for a reply the agent writes from the field with nobody chosen too: it keeps the
+   agent's recipients, and when the agent left someone out or added someone it opens as a plain
+   reply. Before this, such a reply opened as Reply All whatever the agent's recipients were.
+   `ChatReplyCompose.make` checks the audience once for every agent reply. Test:
+   `ChatReplyFieldTests.agentReplyFromTheFieldIsReplyAllOnlyToTheWholeAudience`. (History: the
+   containment rule of 2026-11-16 below replaces this equal-audience rule.)
+   **Reply All when the recipients contain the whole audience (2026-11-16, current):** a chat reply
+   records Reply All when its recipients (To, Cc and Bcc, compared case-insensitively) contain
+   everyone in the full Reply All audience, whether or not the agent added people. This matches what
+   Outlook's own apps record; the kind drives the Outlook last-verb marker on the original. A reply
+   that drops anyone in the audience stays a plain reply; from the open sheet the agent must also have
+   opened it as a Reply All, as before. Before this, a reply the agent widened was a plain reply.
+   `ChatReplyCompose.make` checks containment once for every agent reply. Tests:
+   `ChatReplyFieldTests.agentReplyThatAddsPeopleIsStillReplyAll`,
+   `agentReplyFromTheFieldFollowsTheTarget`, `agentReplyFromTheSheetKeepsItsRecipients`.
+   **Who a field reply is for travels with its request (2026-11-16, current):** whether a reply was
+   asked for in the field, and who was chosen in Reply to, are read once, as the field's send
+   starts, and travel with the request (`ChatFieldReply`: `ToolInvocation.fieldReply`, stamped on
+   the `ComposeRequest` by the reply tool only for a reply to the email the field replies to). The
+   agent's compose card is read from its request alone (`ChatReplyCompose.make(agent:)`): with
+   people chosen when it was sent, a plain reply to only them; otherwise the agent's recipients,
+   under the containment rule above. The chat that shows the card decides nothing from its own state
+   at that moment. Before this, the chat replaced any agent reply's recipients with its current
+   choice whenever its sheet was closed as the card arrived, so a reply asked for in the open sheet
+   whose sheet closed while the card waited, or a reply about another chat's email delivered to this
+   chat, went only to this chat's chosen people. Tests: `ChatReplyComposeOriginTests` (a held real
+   reply, the chat opened and its Reply to chosen through the sheet: `panelClosedBeforeDelivery`,
+   `requestFromAnotherChat`, `fieldRequestAboutAnotherEmail`, `fieldRequestUsesItsCapturedChoice`,
+   `fieldRequestToEveryoneKeepsItsRecipients`).
+   *Amended 2026-11-16:* a recovered send keeps its origin and choice. The field's send is read once
+   as it starts (`ChatFieldSend`: the email, the people chosen, whether the email takes replies).
+   A turn cut off in transit keeps its `ChatFieldReply` beside its checkpoint
+   (`ChatPillState.Session.pendingResume`, in memory only), and the resumed turn's tools get it.
+   Retry after a failed send re-sends the send as it was (`Session.lastFailedSend`): from the
+   field, with the same email and choice, or from the sheet; it never reads the field again. Before
+   this, a resumed turn lost the field's request, so its compose card took the agent's recipients
+   instead of the people chosen, and Retry re-read the field (its current choice, or a sheet send when the sheet was open). Tests:
+   `ChatReplyRecoveryTests` (connection lost then resumed, and a server failure then Retry, the
+   choice changed in between).
+
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
 parser does not read.
@@ -473,3 +547,7 @@ a failed request's log with and without its text, and the send wiring),
 `ChatSendingBubbleTests` (`whichRowsShow`, the hosted hand-over and Retry/Delete, the summary at
 Send and its gate), `ChatThreadViewLifecycleTests.aJoiningEmailAsks`,
 `newestBubbleClearsATallField` and `sentReplyTakesTheTurn`.
+Decision 11: `ChatThreadTests.repliedOnlyTo`,
+`someoneNewIsNotOnly`, `userIsOnePerson`; `ChatReplyFieldTests` (`changedRecipientsRoute`,
+`agentMessageOnlyTo`, `replyTarget`, `replyToChoice`, `accessibilityOnlyTo`, `recipientsWiring`);
+`ChatReplyComposeOriginTests` (who gets the agent's reply, by where its request came from).

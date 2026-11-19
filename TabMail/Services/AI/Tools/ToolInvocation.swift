@@ -20,10 +20,16 @@ struct ToolInvocation: Sendable {
     let uiSink: (any AgentUISink)?
     /// Invoking session key, for logging/correlation only.
     let sessionKey: String?
+    /// Set when the request was sent from the chat's reply field: the email the field replies to
+    /// and who the user chose in Reply to, as they were when it was sent (ADR-IOS-114 decision 11).
+    /// The agent's reply to that email carries it (`ComposeRequest.fieldReply`); nil for every
+    /// other request.
+    let fieldReply: ChatFieldReply?
 
-    init(uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil) {
+    init(uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil, fieldReply: ChatFieldReply? = nil) {
         self.uiSink = uiSink
         self.sessionKey = sessionKey
+        self.fieldReply = fieldReply
     }
 
     /// The no-UI invocation used by every non-interactive completion caller and

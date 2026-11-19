@@ -18,6 +18,13 @@ struct EmailReplyTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        try await execute(arguments: arguments, invocation: .noninteractive)
+    }
+
+    /// `invocation.fieldReply`: the request was sent from the chat's reply field. A reply to the
+    /// email that field replies to carries it, so its compose goes to the people chosen then; a
+    /// reply to any other email keeps its own recipients (ADR-IOS-114 decision 11).
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         // Parse unique_id (numeric ID from ChatIdTranslator)
         let numericId: Int
         if let n = arguments["unique_id"]?.wholeNumber {
@@ -151,6 +158,7 @@ struct EmailReplyTool: AgentTool, Sendable {
                 // Recipients start from the reply-all set, so the send
                 // records reply-all on the original (#915).
                 isReplyAll: true,
+                fieldReply: invocation.fieldReply.flatMap { $0.emailKey == ChatThread.copyKey(header) ? $0 : nil },
                 onOutcome: onOutcome,
                 outcomeState: state
             )

@@ -17,6 +17,8 @@ struct ChatReplyField: Equatable {
     /// Changes when the field must empty: the reply went out, or the agent answered in the
     /// sheet.
     let clearCount: Int
+    /// The reply goes only to these people; nil for Reply All.
+    var onlyTo: [ChatThread.Person]? = nil
 
     var placeholder: String { isNoReply ? "Ask anything" : "Reply or ask anything" }
 
@@ -28,8 +30,10 @@ struct ChatReplyField: Equatable {
         case agent
     }
 
-    static func route(text: String, readyText: String?) -> Route {
-        guard let readyText else { return .agent }
+    /// With recipients changed the ready AI Reply was written for everyone, so Send has the agent
+    /// write it again for the people chosen.
+    static func route(text: String, readyText: String?, recipientsChanged: Bool = false) -> Route {
+        guard let readyText, !recipientsChanged else { return .agent }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
             == readyText.trimmingCharacters(in: .whitespacesAndNewlines) ? .readyReply : .agent
     }
@@ -47,10 +51,17 @@ struct ChatReplyField: Equatable {
     /// newest email (`Regarding [Email](N): …`), with a nudge that the words came from this
     /// email's reply field, so an unclear request is a reply to it. For a no-reply
     /// sender the nudge says it takes no replies.
-    static func agentMessage(emailNumericId: Int, text: String, isNoReply: Bool) -> String {
-        let nudge = isNoReply
+    /// With recipients chosen in Reply to the nudge names them: a reply goes only to them.
+    static func agentMessage(
+        emailNumericId: Int, text: String, isNoReply: Bool, onlyTo: [ChatThread.Person]? = nil
+    ) -> String {
+        var nudge = isNoReply
             ? "typed in its reply field; the sender is a no-reply address, so do not write a reply to it"
             : "typed in its reply field; if what I want is unclear, I am replying to it"
+        if let onlyTo, !onlyTo.isEmpty {
+            let people = onlyTo.map { "\($0.name) <\($0.address)>" }.joined(separator: ", ")
+            nudge += "; a reply goes only to \(people)"
+        }
         return "Regarding [Email](\(emailNumericId)) (\(nudge)): \(text)"
     }
 
@@ -169,6 +180,114 @@ struct ChatFieldFill {
         guard let atSend else { return true }
         return words == atSend || words.isEmpty
     }
+}
+
+/// Who the chat's next reply goes to: Reply All, or only the people chosen in Reply to.
+struct ChatReplyTarget: Equatable {
+    /// Nil: Reply All, the newest email's people.
+    let only: [ChatThread.Person]?
+
+    static let replyAll = ChatReplyTarget(only: nil)
+
+    /// Done in Reply to: everyone on the newest email ticked and nobody added is Reply All.
+    static func chosen(_ ticked: [ChatThread.Person], replyPeople: [ChatThread.Person]) -> ChatReplyTarget {
+        Set(ticked.map(\.address)) == Set(replyPeople.map(\.address)) ? .replyAll : ChatReplyTarget(only: ticked)
+    }
+
+    /// The "Replying only to" chips: up to `nameCount` names, then how many more.
+    static func chips(_ people: [ChatThread.Person], nameCount: Int = ChatViewLayout.headerNameCount) -> (names: [String], more: Int) {
+        (people.prefix(nameCount).map(\.name), max(0, people.count - nameCount))
+    }
+}
+
+/// A request sent from the chat's reply field, as it was when sent (ADR-IOS-114 decision 11): the
+/// email the field replies to and who the user chose in Reply to. It travels with the request
+/// (`ToolInvocation.fieldReply`, then `ComposeRequest.fieldReply` on a reply to that email), so the
+/// chat that shows the compose card never decides who it goes to from its own state at that moment.
+struct ChatFieldReply: Sendable, Equatable {
+    /// The email the field replies to (`ChatThread.copyKey`: copies of one email are one).
+    let emailKey: String
+    /// The addresses chosen in Reply to; nil: Reply All.
+    let onlyTo: [String]?
+}
+
+/// A send from the chat's reply field, read once as it starts: the email it is about, who the user
+/// chose in Reply to, and whether that email takes replies. The send's words and its request are
+/// built from it, and a resume or a retry of that send carries it, so neither reads the field again.
+struct ChatFieldSend {
+    let message: MessageHeader
+    let onlyTo: [ChatThread.Person]?
+    let isNoReply: Bool
+
+    var fieldReply: ChatFieldReply {
+        ChatFieldReply(emailKey: ChatThread.copyKey(message), onlyTo: onlyTo?.map(\.address))
+    }
+}
+
+/// How a reply from the chat opens compose: Reply All or a plain reply, and to whom, read together
+/// from who the chat's reply goes to (`ChatReplyTarget`), so the kind the send records on the
+/// original (`ComposeView.isReplyAll`, #915) is the kind the "Replying only to" line shows. Read once,
+/// as the card opens: a newer email resetting the target must not change an open card's kind.
+struct ChatReplyCompose: Equatable {
+    let isReplyAll: Bool
+    let to: [String]
+    let cc: [String]
+    let bcc: [String]
+
+    /// The ready AI Reply to `message`: a Reply All to the newest email's people exactly when nobody
+    /// is chosen in Reply to (`target.only == nil`); with people chosen, a plain reply to only them,
+    /// with no Cc or Bcc.
+    static func make(replyTo message: MessageHeader?, target: ChatReplyTarget, accounts: [Account]) -> ChatReplyCompose {
+        if let only = target.only {
+            return ChatReplyCompose(isReplyAll: false, to: only.map(\.address), cc: [], bcc: [])
+        }
+        let audience = message.map { buildReplyAllRecipients(for: $0, allAccounts: accounts) }
+        return ChatReplyCompose(isReplyAll: audience != nil, to: audience?.to ?? [], cc: audience?.cc ?? [], bcc: [])
+    }
+
+    /// The agent's reply, read from its request alone, never from the chat showing the card: whether
+    /// its sheet is open, or who that chat would reply to now, decides nothing.
+    /// - Asked for in the reply field with people chosen (`fieldReply.onlyTo`, as they were when it
+    ///   was sent): a plain reply to only them, with no Cc or Bcc.
+    /// - Otherwise the agent's recipients, a Reply All only when they (To, Cc and Bcc) contain the
+    ///   whole Reply All audience, people the agent added included; asked for anywhere but the
+    ///   field, also only when the agent opened it as one.
+    static func make(agent req: AgentToolRouter.ComposeRequest, accounts: [Account]) -> ChatReplyCompose {
+        if let only = req.fieldReply?.onlyTo {
+            return ChatReplyCompose(isReplyAll: false, to: only, cc: [], bcc: [])
+        }
+        let audience = req.replyTo.map { buildReplyAllRecipients(for: $0, allAccounts: accounts) }
+        let addresses = { (list: [String]) in Set(list.map { $0.lowercased() }) }
+        let toWholeAudience = audience.map { addresses(req.to + req.cc + req.bcc).isSuperset(of: addresses($0.to + $0.cc)) } == true
+        let isReplyAll = toWholeAudience && (req.fieldReply != nil || req.isReplyAll)
+        return ChatReplyCompose(isReplyAll: isReplyAll, to: req.to, cc: req.cc, bcc: req.bcc)
+    }
+
+    /// The compose card, opened in this kind, as main's Reply All entries open it.
+    @MainActor
+    func composeView(
+        replyTo message: MessageHeader?, suggestedBody: String? = nil,
+        onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
+    ) -> ComposeView {
+        ComposeView(
+            replyTo: message, suggestedBody: suggestedBody, isReplyAll: isReplyAll,
+            prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,
+            prefillBcc: bcc.isEmpty ? nil : bcc, onAgentOutcome: onAgentOutcome)
+    }
+}
+
+/// The ready AI Reply's compose card: the email it answers and how it opens.
+struct ChatReadyReply: Identifiable {
+    let message: MessageHeader
+    let compose: ChatReplyCompose
+    var id: MessageHeader.ID { message.id }
+}
+
+/// A compose card the agent opens in the chat, with how a reply opens, read as it opened.
+struct ChatAgentCard: Identifiable {
+    let request: AgentToolRouter.ComposeRequest
+    let reply: ChatReplyCompose
+    var id: UUID { request.id }
 }
 
 /// A reply in the outbox the chat does not show as an email yet, shown as the user's bubble at the
