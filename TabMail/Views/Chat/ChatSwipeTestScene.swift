@@ -22,6 +22,7 @@ struct ChatSwipeTestScene: View {
     @State private var ready = false
     @State private var status = "Preparing fixture"
     @State private var armed = false
+    @State private var suggestionArmed = false
     @State private var showsSheet = false
     @State private var mailbox: String?
     @State private var pushedId: String?
@@ -39,6 +40,11 @@ struct ChatSwipeTestScene: View {
     /// How long after "Remove a bubble" the email leaves: long enough for a test to open the chat
     /// and that bubble's actions first.
     private static let removalDelay: Duration = .seconds(8)
+    /// How long after "Arm a late suggestion" the newest email's AI Suggestion lands: long enough
+    /// for a test to open the chat and scroll away first.
+    private static let suggestionDelay: Duration = .seconds(10)
+    /// The late AI Suggestion's text message.
+    static let lateSuggestion = "Sounds good, see you Tuesday."
 
     var body: some View {
         Group {
@@ -95,6 +101,7 @@ struct ChatSwipeTestScene: View {
             }
             if !tutorialCard {
                 Button(armed ? "Removal armed" : "Remove a bubble") { arm() }
+                Button(suggestionArmed ? "Late suggestion armed" : "Arm a late suggestion") { armSuggestion() }
             }
         }
         .navigationTitle("Fixture list")
@@ -112,6 +119,23 @@ struct ChatSwipeTestScene: View {
             _ = try? await AppDatabase.dbPool.write { db in try MessageHeader.deleteOne(db, key: id) }
             // As a sync's merge announces it: the open chat re-reads its emails.
             NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+        }
+    }
+
+    /// Writes the newest email's AI Suggestion after `suggestionDelay`, as the AI's reply write does,
+    /// so the open chat gets a late row height.
+    private func armSuggestion() {
+        suggestionArmed = true
+        Task {
+            try? await Task.sleep(for: Self.suggestionDelay)
+            let id = Self.headerId(Self.count - 1)
+            _ = try? await AppDatabase.dbPool.write { db in
+                guard var header = try MessageHeader.fetchOne(db, key: id) else { return }
+                header.cachedReply = "Hello,\n\n\(Self.lateSuggestion)\n\nThanks."
+                header.replyTextMessage = Self.lateSuggestion
+                try header.save(db)
+            }
+            NotificationCenter.default.post(name: .messageDataDidChange, object: id)
         }
     }
 

@@ -875,6 +875,8 @@ struct ChatThreadViewLifecycleTests {
             #expect(try await Self.until { (chat.fieldTop ?? fieldTop) < fieldTop - 40 }, "control: the field grows")
             chat.screenShrinks(by: 120)
             #expect(try await Self.until { (chat.scroll?.bounds.height ?? 0) < 852 - 100 }, "control: the screen shrinks")
+            // The jump's animated scroll runs on past the line: read once it has stopped.
+            #expect(try await Self.scrollStopped(chat), "control: the jump's scroll comes to rest")
             #expect(!chat.shows(firstUnread), "the Unread line never comes back after the jump")
             // That the jump's animated scroll reaches the newest bubble is ChatSwipeUITests'
             // testJumpButtonScrollsToTheNewestBubble: an animated scroll does not run to its end in
@@ -882,27 +884,22 @@ struct ChatThreadViewLifecycleTests {
         }
     }
 
-    @Test("After the user's own scroll, late heights below never bring the landing back")
-    func usersScrollEndsTheLanding() async throws {
-        try await withPinned(unreadFrom: nil) { chat in
-            #expect(try await Self.until { chat.field != nil && chat.landed && chat.belowScreen < 2 }, "control: the open lands at the bottom")
-            let scroll = try #require(chat.scroll)
-            // A hand drag up: the scroll view reports tracking, then interacting, and moves.
-            NSLog("[cv9diag] test: posting tracking, interacting")
-            chat.phases(.tracking, .interacting)
-            Self.scroll(scroll, by: -1500)
-            NSLog("[cv9diag] test: scrolled, below=%f", chat.belowScreen)
-            chat.phases(.idle)
-            let away = chat.belowScreen
-            #expect(away > 1000, "control: the drag moved the chat up: \(away)")
-            NSLog("[cv9diag] test: ghost arrives")
-            try await chat.ghostArrives("Sounds good, see you Tuesday.")
-            let fieldTop = try #require(chat.fieldTop)
-            NSLog("[cv9diag] test: field grows, below=%f", chat.belowScreen)
-            try chat.fieldGrows()
-            #expect(try await Self.until { chat.ghostShows && (chat.fieldTop ?? fieldTop) < fieldTop - 40 },
-                    "control: the AI Suggestion arrives and the field grows")
-            #expect(chat.belowScreen > 1000, "the reading position stays the user's: \(chat.belowScreen)")
+    // The user's own scroll and a late height after it: ChatSwipeUITests'
+    // testUsersScrollKeepsItsPlaceWhenTheSuggestionArrivesLate, with a real drag. A hosted test
+    // can only move the offset under SwiftUI, which puts its own position back on the next update.
+
+    /// Frames the offset must hold still to count as at rest.
+    private static let restFrames = 10
+
+    /// Waits, frame by frame, until the chat's scroll offset has not moved for `restFrames` frames.
+    private static func scrollStopped(_ chat: Pinned) async throws -> Bool {
+        var last = chat.scroll?.contentOffset.y
+        var still = 0
+        return try await until {
+            let now = chat.scroll?.contentOffset.y
+            still = now == last ? still + 1 : 0
+            last = now
+            return still >= restFrames
         }
     }
 

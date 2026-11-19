@@ -286,6 +286,29 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(jump.waitForNonExistence(timeout: 3), "at the bottom the jump button goes")
     }
 
+    /// After the user scrolls away from the landing, a late AI Suggestion (a new row height below)
+    /// never pulls the chat back to the bottom: the reading position stays the user's.
+    func testUsersScrollKeepsItsPlaceWhenTheSuggestionArrivesLate() {
+        let app = launchIntoChat(tall: true, lateSuggestion: true)
+        let jump = app.buttons["Jump to the newest email"]
+        let middle = app.frame.height / 2
+        for _ in 0..<Self.jumpScrollDrags where !jump.exists {
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: (middle - Self.verticalDrag / 2) / app.frame.height))
+                .press(forDuration: 0.05,
+                       thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: (middle + Self.verticalDrag / 2) / app.frame.height)),
+                       withVelocity: .fast, thenHoldForDuration: 0.1)
+        }
+        XCTAssertTrue(jump.waitForExistence(timeout: 3), "control: the user scrolled away from the bottom")
+        let oldest = bubble(0, in: app)
+        let place = oldest.frame.minY
+        let ghost = app.descendants(matching: .any)["chat.aiSuggestion"].firstMatch
+        XCTAssertTrue(ghost.waitForExistence(timeout: 20), "control: the AI Suggestion lands late")
+        // Let any layout the new row causes run.
+        XCTAssertFalse(app.buttons["Jump to the newest email"].waitForNonExistence(timeout: 2),
+                       "the chat stays away from the bottom: the jump button is still there")
+        XCTAssertEqual(oldest.frame.minY, place, accuracy: 2, "the reading position is the user's")
+    }
+
     func testOpenActionsTapOnAnotherBubbleClosesAndDropsTheKeyboard() {
         let app = launchIntoChat()
         let field = replyField(in: app)
@@ -427,7 +450,8 @@ final class ChatSwipeUITests: XCTestCase {
     /// the coach card.
     private enum Host { case stack, sheet, split, tutorialCard }
 
-    private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false) -> XCUIApplication {
+    private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false,
+                                lateSuggestion: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
@@ -449,6 +473,7 @@ final class ChatSwipeUITests: XCTestCase {
         }
         XCTAssertTrue(app.staticTexts["Chat swipe fixture"].waitForExistence(timeout: 20))
         if armRemoval { app.buttons["Remove a bubble"].tap() }
+        if lateSuggestion { app.buttons["Arm a late suggestion"].tap() }
         app.buttons["Open chat"].tap()
         XCTAssertTrue(subject(in: app).waitForExistence(timeout: 10))
         XCTAssertTrue(bubble(host == .tutorialCard ? nil : 3, in: app).waitForExistence(timeout: 10))

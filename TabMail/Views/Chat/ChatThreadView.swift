@@ -227,6 +227,9 @@ struct ChatThreadView: View {
             TutorialCoordinator.shared.messageOpened(accountId: opened.accountId, messageId: opened.messageId)
         }
         .onAppear {
+            #if DEBUG
+            NSLog("[cv9diag] onAppear didInitialScroll=%d", didInitialScroll ? 1 : 0)
+            #endif
             viewModel.isViewVisible = true
             isOnScreen = true
             Task { await viewModel.loadBody() }
@@ -323,11 +326,17 @@ struct ChatThreadView: View {
                 // Only the user's hand ends the landing. A programmatic scroll that animates (a
                 // late height arriving inside an animated transaction) or its settling is not the
                 // user: the chat stays pinned while the ghost and the field's height arrive.
-                .onScrollPhaseChange { _, phase in endLanding(on: phase) }
+                .onScrollPhaseChange { old, phase in
+                    #if DEBUG
+                    NSLog("[cv9diag] real phase %@ -> %@", String(describing: old), String(describing: phase))
+                    #endif
+                    endLanding(on: phase)
+                }
                 #if DEBUG
                 // Test seam: tests cannot make a hand scroll or a programmatic animation phase on
                 // demand, so they post one here. Production never posts it.
                 .onReceive(NotificationCenter.default.publisher(for: .chatScrollPhaseForTesting)) { note in
+                    NSLog("[cv9diag] seam received object=%@", String(describing: note.object))
                     if let phase = note.object as? ScrollPhase { endLanding(on: phase) }
                 }
                 #endif
@@ -339,6 +348,9 @@ struct ChatThreadView: View {
                     withAnimation(.easeInOut(duration: 0.2)) { showsJumpButton = isAbove }
                 }
                 .onChange(of: scrollTarget) { _, target in
+                    #if DEBUG
+                    NSLog("[cv9diag] scrollTarget -> %@", String(describing: target?.id))
+                    #endif
                     guard let target else { return }
                     proxy.scrollTo(target.id, anchor: target.anchor)
                 }
@@ -347,7 +359,10 @@ struct ChatThreadView: View {
                 // is issued again on every size change until a scroll begins.
                 .onScrollGeometryChange(for: [CGFloat].self) { geo in
                     [geo.containerSize.height, geo.contentSize.height]
-                } action: { _, _ in
+                } action: { old, new in
+                    #if DEBUG
+                    NSLog("[cv9diag] size %@ -> %@ target=%@", String(describing: old), String(describing: new), String(describing: scrollTarget?.id))
+                    #endif
                     guard let target = scrollTarget else { return }
                     proxy.scrollTo(target.id, anchor: target.anchor)
                 }
@@ -485,6 +500,9 @@ struct ChatThreadView: View {
 
     /// A scroll phase began: the user's own scroll ends the landing.
     private func endLanding(on phase: ScrollPhase) {
+        #if DEBUG
+        NSLog("[cv9diag] endLanding phase=%@ target=%@ ends=%d", String(describing: phase), String(describing: scrollTarget?.id), Self.userTookOver(phase) ? 1 : 0)
+        #endif
         if Self.userTookOver(phase) { scrollTarget = nil }
     }
 
@@ -529,6 +547,9 @@ struct ChatThreadView: View {
         // be missing and the chat opens at the bottom.
         noteMembers()
         didInitialScroll = true
+        #if DEBUG
+        NSLog("[cv9diag] scrollOnceLoaded landing")
+        #endif
         let thread = thread
         if highlightsOpenedMessage, let opened = viewModel.message,
            let item = thread.items.first(where: { ChatThread.copyKey($0.header) == ChatThread.copyKey(opened) }) {
