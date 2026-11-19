@@ -34,29 +34,78 @@ final class ChatFieldWords {
         let words: String
         /// The demo run the words were typed in (`DemoModeStore.chatAdmission`); nil outside one.
         let admission: DemoModeStore.Admission?
-        /// The store's record of removed accounts.
+        /// The store's record of accounts being removed and removed.
         let lifetimes: Lifetimes
 
-        /// Whether the words may still be written: a removed account's never, an ended demo's never.
+        /// Whether the words may be written now: not while their account's removal runs, never once
+        /// it is removed, never once their demo ended.
         func admits(_ key: String) -> Bool { lifetimes.admits(key, admission: admission) }
+
+        /// Whether the words are still the user's: their account is not removed and their demo run
+        /// has not ended. A removal still running holds them; it does not end them.
+        func isKept(_ key: String) -> Bool { !lifetimes.isGone(key, admission: admission) }
     }
 
-    /// The accounts removed in this run: their chats' words are never written again
-    /// (`retireAccount`). Checked inside the write's own transaction, so a write either lands
-    /// before the account's row-delete transaction (and is deleted by it) or is refused.
+    /// One account removal's hold on its account's words (`beginRemoval`). Only its own removal
+    /// releases it (`commitRemoval`, `rollBackRemoval`), so overlapping removals of one account never release each
+    /// other's, as the push cleanup's per-attempt generations do.
+    struct Removal: Sendable, Equatable {
+        let accountId: String
+        fileprivate let attempt: UInt64
+    }
+
+    /// Which accounts' words may be written: none of an account whose removal runs (each attempt's
+    /// own hold), none of an account removed in this run. Checked inside the write's own
+    /// transaction, so a write lands before the account's row-delete transaction (and is deleted by
+    /// it) or is refused.
     final class Lifetimes: Sendable {
-        private let removed = Mutex<Set<String>>([])
+        private struct State {
+            var holds: [String: Set<UInt64>] = [:]
+            var removed: Set<String> = []
+            var lastAttempt: UInt64 = 0
+        }
+        private let state = Mutex(State())
 
-        func retire(_ accountId: String) { removed.withLock { _ = $0.insert(accountId) } }
-        func reactivate(_ accountId: String) { removed.withLock { _ = $0.remove(accountId) } }
-
-        /// Whether the chat `key`'s words may be written or shown: its account is not removed,
-        /// and a demo chat's run (`admission`) is the current one and still open.
-        func admits(_ key: String, admission: DemoModeStore.Admission?) -> Bool {
-            if let accountId = ChatThreadKey.parse(key)?.accountId, removed.withLock({ $0.contains(accountId) }) {
-                return false
+        func hold(_ accountId: String) -> Removal {
+            state.withLock { state in
+                state.lastAttempt += 1
+                state.holds[accountId, default: []].insert(state.lastAttempt)
+                return Removal(accountId: accountId, attempt: state.lastAttempt)
             }
-            return DemoModeStore.admits(sessionId: key, admission: admission)
+        }
+
+        /// Ends `removal`'s hold; `committed` records its account as removed.
+        func release(_ removal: Removal, committed: Bool) {
+            state.withLock { state in
+                state.holds[removal.accountId]?.remove(removal.attempt)
+                if state.holds[removal.accountId]?.isEmpty == true { state.holds[removal.accountId] = nil }
+                if committed { state.removed.insert(removal.accountId) }
+            }
+        }
+
+        /// The account `accountId` exists again (the demo's fixed account, seeded anew).
+        func reopen(_ accountId: String) {
+            state.withLock { _ = $0.removed.remove(accountId) }
+        }
+
+        /// Whether a removal of the chat `key`'s account is running.
+        func isHeld(_ key: String) -> Bool {
+            guard let accountId = ChatThreadKey.parse(key)?.accountId else { return false }
+            return state.withLock { $0.holds[accountId] != nil }
+        }
+
+        /// Whether the chat `key`'s words are no longer anyone's: its account was removed, or its
+        /// demo run (`admission`) is not the current one or ended.
+        func isGone(_ key: String, admission: DemoModeStore.Admission?) -> Bool {
+            if let accountId = ChatThreadKey.parse(key)?.accountId, state.withLock({ $0.removed.contains(accountId) }) {
+                return true
+            }
+            return !DemoModeStore.admits(sessionId: key, admission: admission)
+        }
+
+        /// Whether the chat `key`'s words may be written now.
+        func admits(_ key: String, admission: DemoModeStore.Admission?) -> Bool {
+            !isHeld(key) && !isGone(key, admission: admission)
         }
     }
 
@@ -64,8 +113,8 @@ final class ChatFieldWords {
     struct Storage: Sendable {
         /// The words stored for a key; nil when none.
         let read: @Sendable (String) async throws -> String?
-        /// Writes each key's words; "" deletes the key's row. Words a removed account or an ended
-        /// demo typed are refused (`Write.admits`).
+        /// Writes each key's words; "" deletes the key's row. Words of an account being removed or
+        /// removed, or of an ended demo, are refused (`Write.admits`).
         let write: @Sendable ([String: Write]) async throws -> Void
 
         /// The app's database (tests install their own).
@@ -106,7 +155,7 @@ final class ChatFieldWords {
     @ObservationIgnored private var reading: [String: (id: UUID, task: Task<String?, Error>)] = [:]
     /// Chats whose words changed since they were last written, with the words to write.
     @ObservationIgnored private var unwritten: [String: Write] = [:]
-    /// The accounts removed in this run (`retireAccount`).
+    /// The accounts being removed and removed in this run (`beginRemoval`).
     private let lifetimes = Lifetimes()
     /// The write in progress, if any; it writes until `unwritten` is empty.
     @ObservationIgnored private var writer: Task<Void, Never>?
@@ -133,9 +182,10 @@ final class ChatFieldWords {
     /// The only way a chat's words change (`ChatFieldFill.apply`), from any pill on it. What is
     /// not sent (`ChatFieldFill.unsent`) is kept whenever it changes; "" keeps nothing.
     func apply(_ change: ChatFieldFill.Change, to key: String) {
-        // A removed account's chat, or an ended demo's, keeps nothing.
+        // A removed account's chat, or an ended demo's, keeps nothing. One whose removal runs keeps
+        // its words in memory until the removal commits or fails.
         let admission = DemoModeStore.shared.chatAdmission
-        guard lifetimes.admits(key, admission: admission) else { return }
+        guard !lifetimes.isGone(key, admission: admission) else { return }
         let before = fill(for: key)
         var after = before
         after.apply(change)
@@ -196,18 +246,34 @@ final class ChatFieldWords {
         forget(where: isDemo)
     }
 
-    /// Forget the words of the account `accountId`'s chats, real and demo, and never write them
-    /// again in this run, a write in progress or a failed write's retry included. Account removal
-    /// calls it before its row-delete transaction (`AccountManager.removeAccount`), as it does
-    /// `AccountFieldPersistenceStore.discardAccount`; `reactivateAccount` if that transaction fails.
-    func retireAccount(_ accountId: String) {
-        lifetimes.retire(accountId)
-        forget { ChatThreadKey.parse($0)?.accountId == accountId }
+    /// An account removal begins: no word of the account's chats, real or demo, is written until it
+    /// ends (`commitRemoval`, `rollBackRemoval`); they stay in memory meanwhile. Account removal calls it before its
+    /// row-delete transaction (`AccountManager.removeAccount`), as it does
+    /// `AccountFieldPersistenceStore.discardAccount`.
+    func beginRemoval(_ accountId: String) -> Removal {
+        lifetimes.hold(accountId)
     }
 
-    /// The account `accountId` was not removed after all: its chats' words are kept again.
-    func reactivateAccount(_ accountId: String) {
-        lifetimes.reactivate(accountId)
+    /// The removal `removal` committed: the account's words are forgotten and never written again
+    /// in this run, a write in progress or a failed write's retry included.
+    func commitRemoval(_ removal: Removal) {
+        lifetimes.release(removal, committed: true)
+        forget { ChatThreadKey.parse($0)?.accountId == removal.accountId }
+    }
+
+    /// The removal `removal` failed: the words it held are kept, and written unless another
+    /// removal of the account still runs.
+    func rollBackRemoval(_ removal: Removal) {
+        lifetimes.release(removal, committed: false)
+        guard writer == nil, !unwritten.isEmpty else { return }
+        writer = Task { await writeUnwritten() }
+    }
+
+    /// The account `accountId` exists again: the demo's fixed account, seeded anew once its seed
+    /// committed (`DemoModeService.completeSetup`). An ended demo run's words stay refused by their
+    /// run's admission.
+    func reopenAccount(_ accountId: String) {
+        lifetimes.reopen(accountId)
     }
 
     /// Forget every chat `matches` names: its fill, its reads (a read in progress lands nowhere),
@@ -223,15 +289,21 @@ final class ChatFieldWords {
     private nonisolated static let demoPrefix = "demo:"
 
     private func writeUnwritten() async {
-        while !unwritten.isEmpty {
-            let batch = unwritten
-            unwritten = [:]
+        while true {
+            // Words an account removal holds wait in memory (`rollBackRemoval`).
+            let batch = unwritten.filter { !lifetimes.isHeld($0.key) }
+            guard !batch.isEmpty else { break }
+            for key in batch.keys { unwritten[key] = nil }
             do {
                 try await storage.write(batch)
+                // A removal that began while this wrote refused its words: they wait for its end.
+                for (key, write) in batch where unwritten[key] == nil && lifetimes.isHeld(key) && write.isKept(key) {
+                    unwritten[key] = write
+                }
             } catch {
                 // Kept in memory for this run; the next change writes them again. A removed
                 // account's, or an ended demo's, are not: they were forgotten while this wrote.
-                for (key, write) in batch where unwritten[key] == nil && write.admits(key) { unwritten[key] = write }
+                for (key, write) in batch where unwritten[key] == nil && write.isKept(key) { unwritten[key] = write }
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[ChatFieldWords] write failed: \(type(of: error))")
                 }

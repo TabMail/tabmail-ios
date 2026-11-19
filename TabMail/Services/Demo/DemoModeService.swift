@@ -167,6 +167,8 @@ final class DemoModeService {
         do {
             try DemoSeed.seed()
             AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
+            // A removal of the last demo's account left its id removed; the new row is this run's.
+            ChatFieldWords.shared.reopenAccount(DemoSeed.demoAccountId)
         } catch {
             // DemoSeed is transactional: failure restores the prior row, if any.
             AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
