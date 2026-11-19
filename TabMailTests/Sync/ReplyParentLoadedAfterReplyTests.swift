@@ -162,9 +162,9 @@ struct ReplyParentLoadedAfterReplyTests {
         let mock = MockEmailProvider(staleWindowMode: .uid)
         await mock.setFetchMessagesResult([Self.parentInfo(uid: "7", rfc822: parentRfc822)])
 
-        // `runSyncMessages` hands the ids to announce to its caller, which posts them.
-        let result = try await SyncEngine.runSyncMessages(
-            for: inbox, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+        // The listing (`runListing`) hands the ids to announce to its caller, which posts them.
+        let result = try await SyncEngine.runListing(
+            for: inbox, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool,
                               announced: { result.replyDetectIds.contains($0) })
