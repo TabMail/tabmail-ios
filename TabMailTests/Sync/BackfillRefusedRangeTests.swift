@@ -10,9 +10,8 @@ import Synchronization
 @testable import TabMail
 
 /// One-shot fault for `storedUIDReadFailureLeavesTheRangePending`: while
-/// `armed`, the first read of `messageHeader.messageId` prepared on a READER
-/// connection is denied (the statement fails to prepare), then the fault
-/// disarms. Writers never get the authorizer, so inserts are unaffected.
+/// `armed`, every read of `messageHeader.messageId` prepared on a READER
+/// connection is denied (the statement fails to prepare). Writers never get the authorizer, so inserts are unaffected.
 private let storedUIDReadFault = Mutex((armed: false, refused: 0))
 
 /// The IMAP UID walk and a range it cannot load:
@@ -565,8 +564,10 @@ struct BackfillRefusedRangeTests {
     // MARK: - The stored-UID read fails
 
     /// The read of which SEARCHed UIDs the folder stores (before the FETCH)
-    /// fails once: that range is not FETCHed and not confirmed, the walk's
-    /// position claims no missing mail, and the next call loads it.
+    /// fails for the whole call: nothing is FETCHed or confirmed, the folder
+    /// does not complete, the walk's position claims no missing mail, and the
+    /// next call loads everything. (Denying only the first read let another
+    /// worker reload the failed range in the same call.)
     @Test("A failed stored-UID read leaves its range unfetched and pending; the next call loads it")
     func storedUIDReadFailureLeavesTheRangePending() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -581,7 +582,6 @@ struct BackfillRefusedRangeTests {
                 else { return SQLITE_OK }
                 return storedUIDReadFault.withLock { state in
                     guard state.armed else { return SQLITE_OK }
-                    state.armed = false
                     state.refused += 1
                     return SQLITE_DENY
                 }
@@ -599,11 +599,10 @@ struct BackfillRefusedRangeTests {
         storedUIDReadFault.withLock { $0 = (true, 0) }
 
         #expect(await Self.callEnds(world))
-        #expect(storedUIDReadFault.withLock { $0.refused } == 1, "precondition: the stored-UID read failed once")
-        let missing = Set(world.uids).subtracting(try world.local())
-        #expect(!missing.isEmpty, "the failed read lost no range: the fixture is vacuous")
+        storedUIDReadFault.withLock { $0.armed = false }
+        #expect(storedUIDReadFault.withLock { $0.refused } >= 1, "precondition: the stored-UID read failed")
         let fetched = Self.fetches(world.server.recordedCommands()[...]).reduce(Set<Int>()) { $0.union($1) }
-        #expect(fetched.isDisjoint(with: missing), "the range whose stored-UID read failed was FETCHed: \(fetched.intersection(missing).sorted())")
+        #expect(fetched.isEmpty, "a range whose stored-UID read failed was FETCHed: \(fetched.sorted())")
         let row = try world.row()
         #expect(!row.backfillComplete, "the folder completed over a range that never loaded")
         let claim = F.uidPositionClaimsMissingMail(row, local: try world.local(), server: world.uids)

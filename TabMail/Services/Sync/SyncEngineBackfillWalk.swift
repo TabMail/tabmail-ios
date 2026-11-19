@@ -1740,7 +1740,7 @@ extension SyncEngine {
                                 func confirmRangeWithNothingToLoad(_ range: (from: Int, to: Int)) async {
                                     await cursor.confirmRange(from: range.from, to: range.to)
                                     if await lastProgressUpdate.shouldUpdate() {
-                                        let snapshotCursor = await cursor.currentCursor
+                                        let snapshotCursor = await cursor.confirmedCursorSnapshot()
                                         try? await AppDatabase.backgroundPool.write { db in
                                             // NB2/NB4: guarded like every other
                                             // bookkeeping write this walk makes,
@@ -1844,7 +1844,8 @@ extension SyncEngine {
                                     // insert's own existence predicate.
                                     let uidsToFetch: [UInt32]
                                     do {
-                                        let stored = try await AppDatabase.backgroundPool.read { db in
+                                        // An empty SEARCH answer needs no read.
+                                        let stored: Set<String> = existingUIDs.isEmpty ? [] : try await AppDatabase.backgroundPool.read { db in
                                             try MessageHeader.existingMessageIds(
                                                 db, folderId: folderCaptured.id, among: existingUIDs.map(String.init))
                                         }

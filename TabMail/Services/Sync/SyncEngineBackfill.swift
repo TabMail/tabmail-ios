@@ -132,6 +132,11 @@ actor UIDWalkCursor {
     /// are fully confirmed, not just claimed.
     var currentCursor: Int { confirmedCursor }
 
+    /// The confirmed cursor, read inside the actor. A local function reading
+    /// `currentCursor` across the actor boundary draws a spurious
+    /// "no 'async' operations" warning; a method call does not.
+    func confirmedCursorSnapshot() -> Int { confirmedCursor }
+
     /// Current chunk size (for logging).
     var currentChunkSize: Int { chunkSize }
 

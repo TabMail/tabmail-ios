@@ -63,7 +63,7 @@ struct ReplyParentLoadedAfterReplyTests {
     }
 
     private static func expectMarked(
-        accountId: String, parentRfc822: String, pool: DatabasePool, announced: Announced
+        accountId: String, parentRfc822: String, pool: DatabasePool, announced: (String) -> Bool
     ) throws {
         let (parent, ops) = try pool.read { db in
             (try MessageHeader.filter(Column("accountId") == accountId && Column("rfc822MessageId") == parentRfc822).fetchOne(db),
@@ -75,7 +75,7 @@ struct ReplyParentLoadedAfterReplyTests {
         #expect(ops.contains { $0.type == .setTag && $0.tagValue == ActionTag.none.rawValue
                     && $0.folderPath == row.folderPath && $0.messageIds == [row.stableId] },
                 "the cleared tag was not queued for the server: \(ops.map { ($0.type, $0.folderPath, $0.messageIds) })")
-        #expect(announced.contains(row.id), "the parent's change was not announced")
+        #expect(announced(row.id), "the parent's change was not announced")
     }
 
     @Test("IMAP UID walk: a parent loaded after its stored reply is marked replied")
@@ -124,7 +124,7 @@ struct ReplyParentLoadedAfterReplyTests {
         let announced = Announced()
         _ = await engine.runBackfillWalk(account: account, deadline: F.deadline())
 
-        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced)
+        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced.contains)
     }
 
     @Test("Gmail page walk: a parent loaded after its stored reply is marked replied")
@@ -145,7 +145,7 @@ struct ReplyParentLoadedAfterReplyTests {
         let announced = Announced()
         _ = await engine.runBackfill(account: account, deadline: F.deadline())
 
-        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced)
+        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced.contains)
     }
 
     @Test("Full sync: a parent loaded after its stored reply is marked replied")
@@ -162,11 +162,12 @@ struct ReplyParentLoadedAfterReplyTests {
         let mock = MockEmailProvider(staleWindowMode: .uid)
         await mock.setFetchMessagesResult([Self.parentInfo(uid: "7", rfc822: parentRfc822)])
 
-        let announced = Announced()
-        _ = try await SyncEngine.runSyncMessages(
+        // `runSyncMessages` hands the ids to announce to its caller, which posts them.
+        let result = try await SyncEngine.runSyncMessages(
             for: inbox, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
 
-        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced)
+        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool,
+                              announced: { result.replyDetectIds.contains($0) })
     }
 
     @Test("Scroll to older mail: a parent loaded after its stored reply is marked replied")
@@ -194,7 +195,7 @@ struct ReplyParentLoadedAfterReplyTests {
         let announced = Announced()
         _ = try await engine.fetchOlderMessages(folders: [inbox])
 
-        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced)
+        try Self.expectMarked(accountId: accountId, parentRfc822: parentRfc822, pool: pool, announced: announced.contains)
     }
 
     private static func parentInfo(uid: String, rfc822: String) -> MessageHeaderInfo {
