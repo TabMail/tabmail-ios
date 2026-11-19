@@ -20,6 +20,7 @@ enum AISummariesNotice {
     static let reportSeparator = "\n\n"
 
     /// The once-per-install flag: the notice has opened by itself. Local, never synced.
+    // A plain flag, not a TipKit tip: TipKit's store cannot be reset in-process (ADR-IOS-085).
     static let shownKey = "chatView.aiSummariesNotice.shownOnFirstOpen"
 
     /// Whether tips may show now: never on sample mail or in the tutorial, as every one-time tip
