@@ -5,7 +5,7 @@
 import Foundation
 
 /// The device's AI setting, shared by the app and the notification extension: the AI choice
-/// (the AI screen shown after the first account is added) and Settings → Opt Out of AI. Both
+/// (the AI screen) and Settings → Opt Out of AI. Both
 /// live in the App Group suite so both processes read the same values. AI is on only when the
 /// choice has been made and AI is not opted out; a missing value never turns AI on.
 ///
@@ -28,6 +28,13 @@ enum AIConsentPolicy {
     static func recordChoice(aiEnabled: Bool, in defaults: UserDefaults) {
         defaults.set(!aiEnabled, forKey: optOutKey)
         defaults.set(true, forKey: completedChoiceKey)
+    }
+
+    /// Removes the answer: the choice first, so AI reads as off from the first removal on, then
+    /// the opt-out. Used at a sign-in on a device with no mail account.
+    static func clearChoice(in defaults: UserDefaults) {
+        defaults.removeObject(forKey: completedChoiceKey)
+        defaults.removeObject(forKey: optOutKey)
     }
 
     /// Copies both values from where earlier versions kept them (`legacy`, the app's

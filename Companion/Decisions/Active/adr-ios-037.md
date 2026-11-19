@@ -40,3 +40,13 @@
 - `mainAppPollMaxMs = 28000` (NSE's 30 s budget minus a safety margin)
 
 **Related:** ADR-IOS-008 (AI processing architecture), ADR-IOS-010 (Device Sync).
+
+**Amendment 2026-11-19: the gate reads the whole AI setting.** `NSEState.isAIDisabled()` and the app's
+`AIService.isAIOff` now read one predicate, `AIConsentPolicy.isDisabled(in:)` (Shared/AI): AI is off unless the AI
+choice has been made and Opt Out of AI is off. Both values live in the App Group suite; a missing value never turns
+AI on. The AI choice (`hasSeenAIConsent`) moved from `.standard` to the suite with the opt-out. The one-time move in
+item 1 is replaced by `AIConsentPolicy.migrateLegacyValues`, run as the first statement of `TabMailApp.init` on every
+launch (opt-out first, then a completed choice; a value already in the suite is never overwritten). Until the
+updated app has run once, the extension finds no choice and sends no AI request (a plain notification); the app
+requeues those messages on launch. The setting is the device's, used by the demo too (ADR-IOS-038 amendment
+2026-11-19).

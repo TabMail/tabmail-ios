@@ -371,6 +371,7 @@ final class TabMailAuthService: NSObject {
         // un-bumped epoch and vouch for the new account).
         let previousUserId = Self.getSession()?.userId
         let encoded = try JSONEncoder().encode(session)
+        await Self.clearAIChoiceIfNoMailAccount()
         _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
         // Session identity changed — re-evaluate the debug-logging gate.
@@ -474,6 +475,7 @@ final class TabMailAuthService: NSObject {
         // Epoch advances at the identity change — see `signInWithIdToken`.
         let previousUserId = Self.getSession()?.userId
         let encoded = try JSONEncoder().encode(session)
+        await Self.clearAIChoiceIfNoMailAccount()
         _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
         // Session identity changed — re-evaluate the debug-logging gate.
@@ -572,6 +574,7 @@ final class TabMailAuthService: NSObject {
         // Epoch advances at the identity change — see `signInWithIdToken`.
         let previousUserId = Self.getSession()?.userId
         let encoded = try JSONEncoder().encode(session)
+        await Self.clearAIChoiceIfNoMailAccount()
         _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
         // Session identity changed — re-evaluate the debug-logging gate.
