@@ -130,6 +130,12 @@ struct ComposeEditRecipientRolesRequestTests {
             #expect(messages.count == 1)
             guard messages.count == 1 else { return }
             let vars = messages[0]
+            let recipientsJSON = try #require(vars["recipients_json"] as? String)
+            let recipients = try #require(
+                try JSONSerialization.jsonObject(with: Data(recipientsJSON.utf8)) as? [[String: Any]]
+            )
+            #expect(recipients.compactMap { $0["email"] as? String } == [Self.primary])
+            #expect(recipients.count == 1)
             #expect(vars["original_to"] as? String == "Sam Lee <\(Self.primary)>")
             #expect(vars["original_cc"] as? String == "Pat Kim <\(Self.copied)>")
         }

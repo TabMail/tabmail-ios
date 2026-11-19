@@ -37,6 +37,20 @@ struct EmailComposeToolParseTests {
         #expect(result.last == "a@b.com")
     }
 
+    /// A blank name is no name, so the chip shows the address; a padded name is trimmed.
+    @Test("A tool recipient's blank name gives no display name and a padded one is trimmed",
+          arguments: [("   ", nil), (" Sam Lee ", "Sam Lee")] as [(String, String?)])
+    func blankAndPaddedNames(_ name: String, _ expected: String?) throws {
+        let value: JSONValue = .array([
+            .dictionary(["name": .string(name), "email": .string("sam@example.com")]),
+        ])
+        let result = try #require(EmailComposeTool.parseStringArray(value))
+        let field = ComposeDraftGuards.fieldState(RecipientEntry(result))
+        #expect(field.tokens == ["sam@example.com"])
+        #expect(field.rejected.isEmpty)
+        #expect(field.displayNames["sam@example.com"] == expected)
+    }
+
     /// Each name the model may send round-trips through the tool's mailbox text: the same
     /// name, exactly one recipient at the given address, nothing rejected or invented.
     @Test("A tool recipient's name round-trips, whatever characters it holds",

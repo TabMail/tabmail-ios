@@ -145,6 +145,7 @@ struct ComposeEditRecipientRolesTests {
         #expect(contexts.count == 1)
         guard contexts.count == 1 else { return }
         #expect(contexts[0].toRecipients == [Self.primary])
+        #expect(contexts[0].recipients == [Self.primary])
         #expect(contexts[0].ccRecipients == [Self.copied])
         #expect(contexts[0].toDisplayNames == [Self.primary: "Sam Lee"])
         #expect(contexts[0].ccDisplayNames == [Self.copied: "Pat Kim"])
@@ -335,5 +336,31 @@ struct ComposeEditRecipientRolesTests {
         #expect(Self.cardNames(captured.to)[Self.newlyCopied] == "Kim Cho")
         #expect(Self.cardNames(captured.cc) == [Self.copied: "Pat Kim"])
         #expect(Self.cardNames(captured.bcc) == [Self.blind: "Lee Park"])
+    }
+
+    @Test("email_reply: adding the original sender by name keeps one To recipient")
+    func replyAddingSenderByNameKeepsOneTo() async throws {
+        let (ctx, db, translator, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "rep3", subject: "Offsite",
+            from: Self.primary, fromAddress: Self.primary,
+            to: "test@example.com"
+        )
+        await translator.seed(header.id, as: 15)
+
+        let tool = EmailReplyTool(context: ctx)
+        let captured = try await captureEditAndRequest(router: router) {
+            try await tool.execute(arguments: [
+                "unique_id": .int(15),
+                "add_recipients": .array([Self.namedObject(Self.primary)]),
+                "request": .string("Say Friday works"),
+            ])
+        }
+        #expect(captured.contexts.count == 1)
+        guard captured.contexts.count == 1 else { return }
+        #expect(captured.contexts[0].toRecipients == [Self.primary])
+        #expect(ComposeDraftGuards.fieldState(RecipientEntry(captured.to)).tokens == [Self.primary])
     }
 }
