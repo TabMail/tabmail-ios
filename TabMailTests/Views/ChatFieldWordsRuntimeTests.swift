@@ -64,6 +64,7 @@ struct ChatFieldWordsRuntimeTests {
     }
 
     /// A mounted pill: its view, and `close` for Back.
+    @MainActor
     final class Mounted {
         private var window: UIWindow?
         let view: UIView
@@ -298,7 +299,7 @@ struct ChatFieldWordsRuntimeTests {
 
                     #expect(Self.type("", in: card.view))
                     try await Self.settle()
-                    #expect(Self.fieldTexts(field.view).allSatisfy(\.isEmpty), "emptied on the card, empty in the field: \(Self.fieldTexts(field.view))")
+                    #expect(Self.fieldTexts(field.view).allSatisfy { $0.isEmpty }, "emptied on the card, empty in the field: \(Self.fieldTexts(field.view))")
 
                     // A send from the card: its words went, from both pills and from storage.
                     #expect(Self.type("Ask about the date", in: card.view))
@@ -407,10 +408,10 @@ struct ChatFieldWordsRuntimeTests {
                 try await Self.settle()
                 await gate.release()
                 try await Self.settle()
-                #expect(Self.fieldTexts(view).allSatisfy(\.isEmpty), "the user's emptying stays: \(Self.fieldTexts(view))")
+                #expect(Self.fieldTexts(view).allSatisfy { $0.isEmpty }, "the user's emptying stays: \(Self.fieldTexts(view))")
             }
             try await Self.open(email) { view in
-                #expect(Self.fieldTexts(view).allSatisfy(\.isEmpty), "and is what is kept: \(Self.fieldTexts(view))")
+                #expect(Self.fieldTexts(view).allSatisfy { $0.isEmpty }, "and is what is kept: \(Self.fieldTexts(view))")
             }
             await ChatFieldWords.shared.written()
             let stored4 = try Self.stored(pool)
@@ -466,28 +467,31 @@ struct ChatFieldWordsRuntimeTests {
     @Test("The email screen's pill keeps its chat's words over Back; the inbox's chat keeps none")
     func emailScreenPillKeepsWords() async throws {
         try await Self.withDatabase { pool in
-            let email = Self.header("screen-1", thread: "screen-thread")
-            let screen = try await Self.mount(PillView(host: Host(email, expanded: true), replyField: false))
-            #expect(Self.type("From the email screen", in: screen.view), "the open pill has a native editable field")
-            try await Self.settle()
-            screen.close()
-            try await Self.settle()
-            let again = try await Self.mount(PillView(host: Host(email, expanded: true), replyField: false))
-            #expect(Self.fieldTexts(again.view).contains("From the email screen"), "\(Self.fieldTexts(again.view))")
-            again.close()
+            // The pill shows its field with the chat view on, as in `twoPillsShareOneDraft`.
+            try await ThreadChatTests.withBackend(ThreadChatTests.Backend(), chatView: true) {
+                let email = Self.header("screen-1", thread: "screen-thread")
+                let screen = try await Self.mount(PillView(host: Host(email, expanded: true), replyField: false))
+                #expect(Self.type("From the email screen", in: screen.view), "the open pill has a native editable field")
+                try await Self.settle()
+                screen.close()
+                try await Self.settle()
+                let again = try await Self.mount(PillView(host: Host(email, expanded: true), replyField: false))
+                #expect(Self.fieldTexts(again.view).contains("From the email screen"), "\(Self.fieldTexts(again.view))")
+                again.close()
 
-            // Control: the inbox's chat has no thread, and keeps nothing.
-            let inbox = try await Self.mount(PillView(host: Host(nil, expanded: true), replyField: false))
-            #expect(Self.type("An inbox question", in: inbox.view), "control: the inbox's chat has a field")
-            try await Self.settle()
-            inbox.close()
-            try await Self.settle()
-            let inboxAgain = try await Self.mount(PillView(host: Host(nil, expanded: true), replyField: false))
-            #expect(Self.fieldTexts(inboxAgain.view).allSatisfy { !$0.contains("An inbox question") }, "\(Self.fieldTexts(inboxAgain.view))")
-            inboxAgain.close()
-            await ChatFieldWords.shared.written()
-            let stored6 = try Self.stored(pool)
-            #expect(stored6 == [ChatFieldWords.key(for: email): "From the email screen"])
+                // Control: the inbox's chat has no thread, and keeps nothing.
+                let inbox = try await Self.mount(PillView(host: Host(nil, expanded: true), replyField: false))
+                #expect(Self.type("An inbox question", in: inbox.view), "control: the inbox's chat has a field")
+                try await Self.settle()
+                inbox.close()
+                try await Self.settle()
+                let inboxAgain = try await Self.mount(PillView(host: Host(nil, expanded: true), replyField: false))
+                #expect(Self.fieldTexts(inboxAgain.view).allSatisfy { !$0.contains("An inbox question") }, "\(Self.fieldTexts(inboxAgain.view))")
+                inboxAgain.close()
+                await ChatFieldWords.shared.written()
+                let stored6 = try Self.stored(pool)
+                #expect(stored6 == [ChatFieldWords.key(for: email): "From the email screen"])
+            }
         }
     }
 

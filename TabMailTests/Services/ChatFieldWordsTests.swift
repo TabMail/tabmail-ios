@@ -694,7 +694,8 @@ struct ChatFieldWordsTests {
             store.apply(.put("Removed account's words"), to: removed)
             store.apply(.put("Live account's words"), to: live)
             await store.written()
-            #expect(try Self.rows(pool).isEmpty, "control: the write failed, both are waiting for a retry")
+            let onDisk696 = try Self.rows(pool)
+            #expect(onDisk696.isEmpty, "control: the write failed, both are waiting for a retry")
 
             try await Self.remove(Self.account, store: store, pool: pool)
             storage.failWrites(false)
@@ -749,7 +750,8 @@ struct ChatFieldWordsTests {
             store.apply(.put("Typed earlier"), to: earlier)
             await store.written()
             storage.failWrites(false)
-            #expect(try Self.rows(pool).isEmpty, "control: not on disk")
+            let onDisk751 = try Self.rows(pool)
+            #expect(onDisk751.isEmpty, "control: not on disk")
 
             // A write running as the removal begins: its transaction finds the fence.
             storage.holdWrites()
@@ -760,13 +762,15 @@ struct ChatFieldWordsTests {
             await store.written()
             store.apply(.put("Typed during"), to: during)
             await store.written()
-            #expect(try Self.rows(pool).isEmpty, "control: nothing of the account is written while its removal runs")
+            let onDisk762 = try Self.rows(pool)
+            #expect(onDisk762.isEmpty, "control: nothing of the account is written while its removal runs")
             #expect(store.fill(for: earlier).words == "Typed earlier", "the field keeps its words meanwhile")
 
             // The delete fails (as `AccountRemovalSavedFilesGrew` refuses it): rolled back.
             store.rollBackRemoval(removal)
             await store.written()
-            #expect(try Self.storedWords(pool) == [earlier: "Typed earlier", inFlight: "Written as it began", during: "Typed during"])
+            let onDisk768 = try Self.storedWords(pool)
+            #expect(onDisk768 == [earlier: "Typed earlier", inFlight: "Written as it began", during: "Typed during"])
             #expect(store.fill(for: earlier).words == "Typed earlier")
             #expect(await Self.nextRun(storage, earlier) == "Typed earlier")
         }
@@ -785,7 +789,8 @@ struct ChatFieldWordsTests {
             storage.holdWriteReturns()
             storage.releaseWrites()
             #expect(await storage.waitForHeldWriteReturn(), "control: the transaction ran")
-            #expect(try Self.rows(pool).isEmpty, "control: the fence refused the words")
+            let onDisk787 = try Self.rows(pool)
+            #expect(onDisk787.isEmpty, "control: the fence refused the words")
             // The removal fails, and ends, before the write returns.
             store.rollBackRemoval(removal)
             storage.releaseWriteReturns()
@@ -818,7 +823,8 @@ struct ChatFieldWordsTests {
             store.apply(.put("Live words"), to: live)
             await store.written()
 
-            #expect(try Self.storedWords(pool) == [live: "Live words"], "the removed account's words stay gone")
+            let onDisk820 = try Self.storedWords(pool)
+            #expect(onDisk820 == [live: "Live words"], "the removed account's words stay gone")
             let accountLeft = try await pool.read { try Account.fetchOne($0, key: account) }
             #expect(accountLeft == nil, "control: the account is removed")
             #expect(store.fill(for: key).words == "")
@@ -847,7 +853,8 @@ struct ChatFieldWordsTests {
             store.apply(.put("New run's words"), to: demo)
             #expect(store.fill(for: demo).words == "New run's words", "the next demo's field takes the edit")
             await store.written()
-            #expect(try Self.storedWords(pool) == [demo: "New run's words"], "and keeps it; the old run's write stays refused")
+            let onDisk849 = try Self.storedWords(pool)
+            #expect(onDisk849 == [demo: "New run's words"], "and keeps it; the old run's write stays refused")
         }
     }
 
@@ -915,7 +922,8 @@ struct ChatFieldWordsTests {
             let oldLoad = Task { await run.load(demo) }
             #expect(await storage.waitForHeldResult(of: demo), "the old read has the old words")
             try await Self.endDemoAndStartTheNext(run, pool: pool)
-            #expect(try Self.rows(pool).isEmpty, "control: the wipe took the old words off disk")
+            let onDisk917 = try Self.rows(pool)
+            #expect(onDisk917.isEmpty, "control: the wipe took the old words off disk")
 
             if oldFirst {
                 storage.release(resultsOf: demo)
@@ -933,7 +941,8 @@ struct ChatFieldWordsTests {
             #expect(run.fill(for: demo).words == "", "the next demo's field never shows the ended demo's words")
             run.apply(.put("x"), to: Self.demoKey("other"))
             await run.written()
-            #expect(try Self.rows(pool).map(\.sessionId) == [Self.demoKey("other")], "nor does its disk")
+            let onDisk935 = try Self.rows(pool)
+            #expect(onDisk935.map(\.sessionId) == [Self.demoKey("other")], "nor does its disk")
         }
     }
 }
