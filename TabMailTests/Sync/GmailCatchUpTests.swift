@@ -3166,6 +3166,79 @@ struct GmailCatchUpTests {
         }
     }
 
+    // MARK: - Scans never wait for a download gate (#1063)
+
+    /// A lapsed Inbox whose walk is unfinished: `g0` was marked unread on the
+    /// server, `moved` sits inside the local range with no local row (the scan's
+    /// direct load), and `old` is older than every local row (the walk's). Under
+    /// every download gate, in the worker's cycle and in the background job, the
+    /// listing runs in that one call, the change and the missing message arrive,
+    /// and the walk stays held (except the job under a low battery, which has no
+    /// battery gate).
+    @Test("A due Gmail scan runs under every download gate, in the worker and the job; a missing message loads; the walk stays held",
+          arguments: DownloadGate.allCases, BackfillRunner.allCases)
+    func scanRunsUnderEveryDownloadGate(gate: DownloadGate, runner: BackfillRunner) async throws {
+        let clock = Clock()
+        var (seeds, local) = Self.rangesWorld(clock, count: 3)
+        seeds.append(Self.seed("moved", clock.daysAgo(135), [inboxPath]))
+        seeds.append(Self.seed("old", clock.daysAgo(300), [inboxPath]))
+        try await Self.withWorld("gcu-gate-\(gate.rawValue)-\(runner.rawValue)", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let folderId = world.folderId(inboxPath)
+            let lapsed = GmailCatchUpState(
+                lastCompletedAt: Date().addingTimeInterval(-3_600), lapseCount: 1, listedLapseCount: 0).encoded()
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ?, backfillComplete = 0 WHERE id = ?", arguments: [lapsed, folderId])
+            }
+            world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
+            let account = try await Self.account(world)
+
+            let walkAllowed = await DownloadGateHarness.runOnce(world.engine, account: account, gate: gate, runner: runner)
+
+            #expect(walkAllowed != nil, "the \(runner) ran nothing under \(gate): the scan waited for a download gate")
+            #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the lapsed folder was listed under \(gate)")
+            let rows = try Self.rows(world, inboxPath)
+            #expect(rows["g0"]?.isRead == false, "the lapsed change arrives under \(gate)")
+            #expect(rows["moved"] != nil, "a listed message no local row held loads with the scan under \(gate)")
+            #expect(walkAllowed == DownloadGateHarness.walkExpected(gate, runner), "the walk decision under \(gate)")
+            if walkAllowed == false {
+                let pages = world.server.http.recordedCalls().map(\.url).filter { $0.contains("/messages?") && !$0.contains("after") }
+                #expect(pages.isEmpty, "the held walk listed no page: \(pages)")
+                #expect(rows["old"] == nil, "the held walk loaded nothing older than every local row")
+            }
+        }
+    }
+
+    /// A lapse that came while a listing ran: the completing pass starts the new
+    /// listing at once on an expensive network too, so a change in a range the
+    /// first listing had already passed arrives in the same run.
+    @Test("On cellular, a listing that completes after a lapse starts the next listing at once")
+    func lapseDuringListingRelistsAtOnceOnCellular() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.rangesWorld(clock, count: 3)
+        try await Self.withWorld("gcu-lapse-cellular", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let folderId = world.folderId(inboxPath)
+            // Ranges go newest first: g2's range is already listed.
+            let passedNewest = Int(clock.daysAgo(130).timeIntervalSince1970)
+            let running = GmailCatchUpState(
+                lastCompletedAt: Date().addingTimeInterval(-3_600),
+                listing: .init(nextBeforeSecond: passedNewest, lapseCountAtStart: 0),
+                lapseCount: 1, listedLapseCount: 0).encoded()
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [running, folderId])
+            }
+            world.server.applyLabelChange(providerMessageId: "g2", add: ["UNREAD"])
+            let account = try await Self.account(world)
+
+            try await DownloadGateHarness.withNetwork(expensive: true) { () async throws in
+                let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
+                _ = await world.engine.performBackfill(account: account, deadline: deadline, walkAllowed: false)
+            }
+
+            #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the listing after the lapse ran and completed")
+            #expect(try Self.rows(world, inboxPath)["g2"]?.isRead == false, "the change in the passed range arrives")
+        }
+    }
+
     // MARK: - In the backfill worker, in slices (#766)
 
     private static let inboxOnly: [(path: String, role: FolderRole)] = [(inboxPath, .inbox)]
@@ -3476,105 +3549,6 @@ struct GmailCatchUpTests {
             #expect(try Self.state(world, inboxPath)?.listing != nil, "precondition: the listing needs more slices")
             #expect(Date() <= deadline.addingTimeInterval(window / 4),
                     "the job never waits for a slice window past its deadline")
-        }
-    }
-
-    // MARK: - The Wi-Fi-only setting holds back the walk, not the catch-up (#766)
-
-    /// Runs `body` on a simulated expensive (cellular) network with the Wi-Fi-only
-    /// setting on, then restores both.
-    static func withCellularAndWiFiOnly(_ body: () async throws -> Void) async throws {
-        let key = "backgroundSyncWiFiOnly"
-        let savedSetting = UserDefaults.standard.object(forKey: key)
-        let savedExpensive = NetworkMonitor.checkExpensive()
-        UserDefaults.standard.set(true, forKey: key)
-        NetworkMonitor.setExpensiveForTesting(true)
-        defer {
-            UserDefaults.standard.set(savedSetting, forKey: key)
-            NetworkMonitor.setExpensiveForTesting(savedExpensive)
-        }
-        try await body()
-    }
-
-    /// A folder whose last listing completed longer ago than the expensive-network
-    /// wait, with a lapse since: a listing is due, and on an expensive network it
-    /// no longer waits for a non-expensive one.
-    private static func lapsedPastTheWait(_ world: World, _ path: String) throws {
-        let state = GmailCatchUpState(
-            lastCompletedAt: Date().addingTimeInterval(-SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds - 60),
-            lapseCount: 1, listedLapseCount: 0)
-        let raw = state.encoded()
-        let folderId = world.folderId(path)
-        try world.pool.write { db in
-            try db.execute(sql: "UPDATE folder SET catchUpState = ?, backfillComplete = 0 WHERE id = ?", arguments: [raw, folderId])
-        }
-    }
-
-    /// The walk's own requests: its page lists (no `after:` bound) and its
-    /// `format=full` loads.
-    private static func walkRequests(_ server: StatefulGmailActionServer) -> [String] {
-        server.http.recordedCalls().map(\.url).filter {
-            ($0.contains("/messages?") && !$0.contains("after")) || $0.contains("format=full")
-        }
-    }
-
-    /// The foreground backfill worker on a cellular network with Wi-Fi-only on:
-    /// the walk stays paused, as before; the catch-up runs under its own network
-    /// rule, so a lapsed folder whose expensive-network wait has passed is listed
-    /// and its changes arrive (ADR-IOS-107 decision 2, 2026-11-12).
-    @Test("With Wi-Fi-only on and only cellular, the worker's catch-up lists a lapsed folder past its wait; the walk stays paused")
-    func wifiOnlyHoldsTheWorkerWalkNotTheCatchUp() async throws {
-        let clock = Clock()
-        let (seeds, local) = Self.rangesWorld(clock, count: 3)
-        try await Self.withWorld("gcu-wifi-only-worker", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
-            try await Self.withCellularAndWiFiOnly {
-                try Self.lapsedPastTheWait(world, inboxPath)
-                world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
-                let account = try await Self.account(world)
-
-                await world.engine.startBackfill(account: account)
-                let listed = try await Self.eventually(seconds: 30, poll: .milliseconds(100)) {
-                    try Self.state(world, inboxPath)?.listedLapseCount == 1
-                }
-                await world.engine.remove(accountId: world.accountId)
-
-                #expect(listed, "the catch-up listed the lapsed folder on cellular with Wi-Fi-only on")
-                #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the lapsed change arrives")
-                #expect(Self.walkRequests(world.server).isEmpty,
-                        "the walk stays paused on cellular with Wi-Fi-only on: \(Self.walkRequests(world.server))")
-            }
-        }
-    }
-
-    /// The background processing job on a cellular network with Wi-Fi-only on:
-    /// its decision (`SyncScheduler.backgroundBackfillPlan`) holds back the walk
-    /// only, and the backfill it runs lists the lapsed folder. Low Power Mode
-    /// still skips the whole backfill.
-    @Test("With Wi-Fi-only on and off Wi-Fi, the background job runs the catch-up, not the walk; Low Power Mode skips both")
-    func wifiOnlyHoldsTheJobWalkNotTheCatchUp() async throws {
-        typealias S = SyncScheduler
-        #expect(S.backgroundBackfillPlan(isLowPowerMode: true, wifiOnly: true, onWiFi: false) == .skip)
-        #expect(S.backgroundBackfillPlan(isLowPowerMode: true, wifiOnly: false, onWiFi: true) == .skip)
-        #expect(S.backgroundBackfillPlan(isLowPowerMode: false, wifiOnly: true, onWiFi: true) == .run(walkAllowed: true))
-        #expect(S.backgroundBackfillPlan(isLowPowerMode: false, wifiOnly: false, onWiFi: false) == .run(walkAllowed: true))
-        let offWiFi = S.backgroundBackfillPlan(isLowPowerMode: false, wifiOnly: true, onWiFi: false)
-        #expect(offWiFi == .run(walkAllowed: false), "Wi-Fi-only off Wi-Fi still runs the backfill, without the walk")
-        guard case .run(let walkAllowed) = offWiFi else { return }
-
-        let clock = Clock()
-        let (seeds, local) = Self.rangesWorld(clock, count: 3)
-        try await Self.withWorld("gcu-wifi-only-job", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
-            try await Self.withCellularAndWiFiOnly {
-                try Self.lapsedPastTheWait(world, inboxPath)
-                world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
-                let account = try await Self.account(world)
-
-                let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
-                #expect(await world.engine.performBackfill(account: account, deadline: deadline, walkAllowed: walkAllowed))
-                #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the job listed the lapsed folder")
-                #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the lapsed change arrives")
-                #expect(Self.walkRequests(world.server).isEmpty, "the job's walk stays held back off Wi-Fi")
-            }
         }
     }
 

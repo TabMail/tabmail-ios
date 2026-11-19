@@ -132,7 +132,7 @@ final class SyncScheduler {
     /// Key for WiFi-only background backfill setting (default: true).
     /// Only gates the backward crawl (history backfill). Sync, body fetch,
     /// AI processing, and embeddings always run regardless of network type.
-    static let wifiOnlyKey = "backgroundSyncWiFiOnly"
+    nonisolated static let wifiOnlyKey = "backgroundSyncWiFiOnly"
 
     private var timer: Timer?
     private let foregroundInterval: TimeInterval = SyncConfig.foregroundPollIntervalSeconds
@@ -543,7 +543,7 @@ final class SyncScheduler {
             var onWiFi = true
             if wifiOnly && !isLowPowerMode { onWiFi = await Self.isOnWiFi() }
             let backfill = Self.backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: onWiFi)
-            if case .run(let walkAllowed) = backfill, !Task.isCancelled {
+            if let walkAllowed = backfill, !Task.isCancelled {
                 let accounts = (try? await dbPool.read { db in
                     try Account.filter(Column("isActive") == true).fetchAll(db)
                 }) ?? []
@@ -1445,23 +1445,12 @@ final class SyncScheduler {
         return !bodyIdle || !aiIdle || staleShards
     }
 
-    /// What the background processing job's backfill does.
-    enum BackgroundBackfillPlan: Equatable, Sendable {
-        /// Low Power Mode: no backfill this run.
-        case skip
-        /// Run the backfill; `walkAllowed` false holds back the walk only.
-        case run(walkAllowed: Bool)
-    }
-
-    /// The background job's backfill decision. Low Power Mode skips the whole
-    /// backfill (it lifts on its own). Wi-Fi-only off Wi-Fi holds back the walk
-    /// only: the catch-up ignores the setting and keeps its own network rules
-    /// (ADR-IOS-107 decision 2, 2026-11-12), because it lists ids and labels and its
-    /// repairs must not wait for a Wi-Fi network that may never come.
-    /// *Superseded (#766):* Wi-Fi-only off Wi-Fi skipped the whole backfill.
-    nonisolated static func backgroundBackfillPlan(isLowPowerMode: Bool, wifiOnly: Bool, onWiFi: Bool) -> BackgroundBackfillPlan {
-        if isLowPowerMode { return .skip }
-        return .run(walkAllowed: !wifiOnly || onWiFi)
+    /// The background job's backfill decision. Nil: Low Power Mode skips the whole
+    /// backfill (it lifts on its own). Otherwise whether the walk may run: Wi-Fi-only
+    /// off Wi-Fi holds back the walk only.
+    nonisolated static func backgroundBackfillPlan(isLowPowerMode: Bool, wifiOnly: Bool, onWiFi: Bool) -> Bool? {
+        if isLowPowerMode { return nil }
+        return !wifiOnly || onWiFi
     }
 
     /// Check if the device is currently on WiFi.

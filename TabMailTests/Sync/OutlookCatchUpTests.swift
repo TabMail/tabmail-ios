@@ -360,6 +360,48 @@ struct OutlookCatchUpTests {
         }
     }
 
+    // MARK: - Scans never wait for a download gate (#1063)
+
+    /// A tracking Archive with no completed listing and an unfinished walk: `a-1`
+    /// was read and flagged on the server while the phone holds a stale state,
+    /// `a-2` sits inside the local range with no local row (the scan's direct
+    /// load), and `a-old` is older than every local row (the walk's). Under every
+    /// download gate, in the worker's cycle and in the background job, the first
+    /// listing runs in that one call, the state is healed and the missing message
+    /// arrives; the walk stays held (except the job under a low battery, which
+    /// has no battery gate).
+    @Test("A due Outlook scan runs under every download gate, in the worker and the job; a missing message loads; the walk stays held",
+          arguments: DownloadGate.allCases, BackfillRunner.allCases)
+    func scanRunsUnderEveryDownloadGate(gate: DownloadGate, runner: BackfillRunner) async throws {
+        let c = Clock()
+        try await Self.withWorld(seeds: [
+            Self.seed("a-1", in: Self.archive, at: c.daysAgo(5), isRead: true, isFlagged: true),
+            Self.seed("a-2", in: Self.archive, at: c.daysAgo(4)),
+            Self.seed("a-3", in: Self.archive, at: c.daysAgo(3)),
+            Self.seed("a-old", in: Self.archive, at: c.daysAgo(60)),
+        ], heldSince: nil, walkComplete: false) { w, engine in
+            try w.insertRow("a-1", in: w.archive, date: c.daysAgo(5), isRead: true, isFlagged: true)
+            try w.insertRow("a-3", in: w.archive, date: c.daysAgo(3))
+            try await w.baselineAll()
+            // A change the delta never delivered: the phone holds a stale state.
+            try Self.setLocal(w, "a-1", in: w.archive, isRead: false, isFlagged: false)
+            #expect(try Self.state(w, w.archive) == nil, "precondition: no listing yet")
+            let listingsBefore = w.server.requestCounts().listings
+
+            let walkAllowed = await DownloadGateHarness.runOnce(engine, account: try w.account(), gate: gate, runner: runner)
+
+            #expect(walkAllowed != nil, "the \(runner) ran nothing under \(gate): the scan waited for a download gate")
+            let row = try #require(try w.row("a-1", in: w.archive))
+            #expect(row.isRead && row.isFlagged, "the scan healed the stale state under \(gate)")
+            #expect(try w.row("a-2", in: w.archive) != nil, "a listed message no local row held loads with the scan under \(gate)")
+            #expect(walkAllowed == DownloadGateHarness.walkExpected(gate, runner), "the walk decision under \(gate)")
+            if walkAllowed == false {
+                #expect(w.server.requestCounts().listings == listingsBefore, "the held walk listed no page")
+                #expect(try w.row("a-old", in: w.archive) == nil, "the held walk loaded nothing older than every local row")
+            }
+        }
+    }
+
     // MARK: - Lapses
 
     /// A Graph refusal (410) lapses the folder. A message deleted during the

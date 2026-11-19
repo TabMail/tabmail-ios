@@ -39,6 +39,30 @@ struct ChangeSeamFenceTests {
         }
     }
 
+    /// Scans (the catch-up of every provider, the change readers, their seams and
+    /// the engine's catch-up and change files) never read a download gate: no
+    /// network type, no battery, no Low Power Mode (#1063). Only the walk does.
+    @Test("scans never read the network type, the battery or Low Power Mode (#1063)")
+    func scansNeverReadAGate() throws {
+        let files = try Self.sources().filter { file in
+            let name = (file.relativePath as NSString).lastPathComponent
+            return (file.relativePath.hasPrefix("TabMail/Providers/")
+                    && (name.hasSuffix("ProviderCatchUp.swift") || name.contains("ProviderChanges")))
+                || (file.relativePath.hasPrefix("TabMail/Services/Sync/")
+                    && (name == "SyncEngineCatchUp.swift" || name.hasPrefix("SyncEngineChanges")))
+        }
+        #expect(files.count >= 11, "precondition: the catch-up and change files were read (\(files.count))")
+        let forbidden = [
+            "checkExpensive", "isExpensiveNetwork", "catchUpExpensiveNetworkMaxWaitSeconds",
+            "batteryLevel", "batteryState", "isLowPowerModeEnabled",
+        ]
+        for file in files {
+            for term in forbidden {
+                #expect(!file.source.contains(term), "\(file.relativePath) reads \(term)")
+            }
+        }
+    }
+
     @Test("the release boundary's re-read of retired actions names no concrete provider and tests no account provider (#876)")
     func retiredActionRecheckIsProviderBlind() throws {
         let source = try Self.file(try Self.sources(), "TabMail/Services/Sync/SyncEngineRetiredActionRecheck.swift")

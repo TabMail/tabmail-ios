@@ -110,7 +110,7 @@ actor SyncEngine {
     ///   .aggressive — plugged in. Full throughput, UI stays responsive (priority lock).
     ///   .normal     — on battery. Moderate progress, reasonable drain.
     ///   .low        — thermal throttling. Minimal resource usage.
-    /// Note: Low Power Mode and battery < 20% pause backfill entirely (getShouldPauseBackfill).
+    /// Note: Low Power Mode and battery < 20% pause backfill entirely (backfillWalkAllowed).
     /// Reads UIDevice state via MainActor hop — always returns latest power state.
     func getBackfillProfile() async -> BackfillProfile {
         await MainActor.run {
@@ -128,20 +128,28 @@ actor SyncEngine {
         }
     }
 
-    /// Whether backfill should be paused entirely.
-    /// Pauses when: battery < 20% (not charging), or Low Power Mode enabled.
-    /// Fast sync mode bypasses this gate entirely.
-    /// Reads UIDevice state via MainActor hop.
-    func getShouldPauseBackfill() async -> Bool {
+    /// The device's power state for the backfill worker's gates, read once at the
+    /// top of each cycle (MainActor hop): fast sync, Low Power Mode, external power
+    /// and the battery level (-1 when unknown).
+    func backfillPowerState() async -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
         await MainActor.run {
-            let isFastSync = AccountManagerState.shared.fastSyncModeActive
-            if isFastSync { return false }
-            let isOnPower = UIDevice.current.batteryState == .charging || UIDevice.current.batteryState == .full
-            if ProcessInfo.processInfo.isLowPowerModeEnabled && !isOnPower { return true }
-            let level = UIDevice.current.batteryLevel
-            // batteryLevel returns -1 if monitoring not enabled (shouldn't happen — set in TabMailApp.init)
-            return !isOnPower && level >= 0 && level < 0.20
+            let battery = UIDevice.current.batteryState
+            return (AccountManagerState.shared.fastSyncModeActive, ProcessInfo.processInfo.isLowPowerModeEnabled,
+                    battery == .charging || battery == .full, UIDevice.current.batteryLevel)
         }
+    }
+
+    /// The foreground worker's gate decision for one cycle, from one snapshot.
+    /// Nil: no cycle at all (Low Power Mode off power, or battery below 20% off
+    /// power; fast sync bypasses both). Otherwise whether the walk may run: the
+    /// Wi-Fi-only setting on an expensive network holds it back.
+    nonisolated static func backfillWalkAllowed(
+        fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float, wifiOnly: Bool, expensive: Bool
+    ) -> Bool? {
+        // batteryLevel is -1 when monitoring is off (it is set in TabMailApp.init).
+        let powerHeld = !fastSync && !onPower && (lowPowerMode || (batteryLevel >= 0 && batteryLevel < 0.20))
+        if powerHeld { return nil }
+        return !(wifiOnly && expensive)
     }
 
     func register(accountId: String, provider: any EmailProvider, workQueue: ProviderWorkQueue) {

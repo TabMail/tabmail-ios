@@ -503,6 +503,19 @@ struct OutlookChangeReadingTests {
         }
     }
 
+    /// A non-Inbox state baseline is a scan: on cellular it runs on the first pass
+    /// (#1063).
+    @Test("On cellular, a non-Inbox state baseline runs on the first pass")
+    func stateBaselineRunsOnCellular() async throws {
+        try await Self.withWorld(seeds: [Self.seed("a-1", in: Self.archive)]) { w in
+            try await DownloadGateHarness.withNetwork(expensive: true) { () async throws in
+                try await w.delta()
+            }
+            #expect(w.deltaPageRequests(Self.archive) > 0, "the Archive baseline waited on cellular")
+            #expect(try w.row("a-1", in: w.archive) != nil)
+        }
+    }
+
     @Test("The Wi-Fi-only setting does not hold back a change read")
     func wifiOnlyIsIgnored() async throws {
         let defaults = UserDefaults.standard

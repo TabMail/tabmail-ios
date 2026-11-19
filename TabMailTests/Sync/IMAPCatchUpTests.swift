@@ -725,7 +725,7 @@ struct IMAPCatchUpTests {
                 listing: nil)
             try Self.setState(overdue, world)
 
-            try await GmailCatchUpTests.withCellularAndWiFiOnly { () async throws in
+            try await DownloadGateHarness.withNetwork(expensive: true) { () async throws in
                 _ = await world.engine.runBackfill(account: account, walkAllowed: false)
                 #expect(Self.fetchCount(world.server) == 0, "no daily listing on cellular")
                 #expect(try Self.rows(world)["2"]?.isRead == false)
@@ -736,6 +736,71 @@ struct IMAPCatchUpTests {
                 #expect(try Self.rows(world)["2"]?.isRead == true, "the daily listing runs on a non-expensive network")
             }
             await world.engine.remove(accountId: world.accountId)
+        }
+    }
+
+    // MARK: - Scans never wait for a download gate (#1063)
+
+    /// The daily check is due and the server marked UID 2 read; UID 1 is on the
+    /// server below every local row, so only the walk would load it. Under every
+    /// download gate, in the worker's cycle and in the background job, the daily
+    /// listing runs in that one call and the read reaches the device; the walk
+    /// stays held (except the job under a low battery, which has no battery gate).
+    @Test("A due IMAP scan runs under every download gate, in the worker and the job; the walk stays held",
+          arguments: DownloadGate.allCases, BackfillRunner.allCases)
+    func scanRunsUnderEveryDownloadGate(gate: DownloadGate, runner: BackfillRunner) async throws {
+        try await Self.withWorld("cu-gate-\(gate.rawValue)-\(runner.rawValue)", serverUIDs: [1, 2, 3], localUIDs: [2, 3]) { world in
+            let accountId = world.accountId
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+            await world.engine.register(
+                accountId: accountId, provider: world.provider,
+                workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
+            let modseq = try #require(try Self.storedModSeq(world))
+            // Daily check overdue, nothing else signals a change.
+            try Self.setState(IMAPCatchUpState(
+                epoch: Self.epoch, completionStamp: modseq,
+                lastCompletedAt: Date().addingTimeInterval(-2 * SyncConfig.catchUpFullCheckIntervalSeconds),
+                listing: nil), world)
+            let commandsBefore = world.server.recordedCommands().count
+
+            let walkAllowed = await DownloadGateHarness.runOnce(world.engine, account: account, gate: gate, runner: runner)
+            await world.engine.remove(accountId: accountId)
+
+            #expect(walkAllowed != nil, "the \(runner) ran nothing under \(gate): the scan waited for a download gate")
+            #expect(try Self.rows(world)["2"]?.isRead == true, "the scan applied the server's read under \(gate)")
+            let state = try Self.state(world)
+            #expect(state?.lastCompletedAt.map { $0 > Date().addingTimeInterval(-60) } == true, "the daily listing completed")
+            #expect(walkAllowed == DownloadGateHarness.walkExpected(gate, runner), "the walk decision under \(gate)")
+            if walkAllowed == false {
+                let searches = world.server.recordedCommands().dropFirst(commandsBefore)
+                    .filter { $0.uppercased().hasPrefix("UID SEARCH") }
+                #expect(searches.isEmpty, "the held walk sent no range SEARCH: \(searches)")
+                #expect(try Self.rows(world)["1"] == nil, "the held walk loaded nothing below the local rows")
+            }
+        }
+    }
+
+    /// A folder the catch-up has never seen lists at once on an expensive network:
+    /// its first listing is a scan, not a download.
+    @Test("A folder never listed lists at once on an expensive network")
+    func firstListingRunsAtOnceOnAnExpensiveNetwork() async throws {
+        try await Self.withWorld("cu-first-on-cellular", serverUIDs: [1, 2], localUIDs: [1, 2]) { world in
+            let accountId = world.accountId
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+            await world.engine.register(
+                accountId: accountId, provider: world.provider,
+                workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
+            #expect(try Self.state(world) == nil, "precondition: no state")
+
+            try await DownloadGateHarness.withNetwork(expensive: true) { () async throws in
+                _ = await world.engine.runBackfillCycle(account: account, walkAllowed: false)
+            }
+            await world.engine.remove(accountId: accountId)
+
+            #expect(try Self.rows(world)["2"]?.isRead == true, "the first listing ran on the expensive network")
+            #expect(try Self.state(world)?.lastCompletedAt != nil)
         }
     }
 
