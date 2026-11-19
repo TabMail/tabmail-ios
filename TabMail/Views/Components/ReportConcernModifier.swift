@@ -28,10 +28,6 @@ struct ReportConcernModifier: ViewModifier {
 
     @State private var showPopover = false
     @State private var showSheet = false
-    @State private var showSubmitted = false
-    @State private var selectedCategory: ReportCategory = .offensive
-    @State private var reason = ""
-    @State private var isSubmitting = false
 
     func body(content view: Content) -> some View {
         view
@@ -66,14 +62,7 @@ struct ReportConcernModifier: ViewModifier {
                 .frame(minWidth: 220)
                 .presentationCompactAdaptation(.popover)
             }
-            .sheet(isPresented: $showSheet) {
-                reportSheet
-            }
-            .alert("Report Submitted", isPresented: $showSubmitted) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text("Thank you. We'll review this content.")
-            }
+            .reportConcernSheet(isPresented: $showSheet, contentType: contentType, content: { content })
     }
 
     // MARK: - Popover rows
@@ -102,6 +91,43 @@ struct ReportConcernModifier: ViewModifier {
         .padding(.vertical, Self.popoverRowVerticalPadding)
         .contentShape(Rectangle())
     }
+}
+
+/// The lines under the report form: an optional line saying what the report sends, then consent.
+enum ReportConcernSheetText {
+    static let storedForReview = "The reported content will be stored on TabMail's servers for review by our team. By submitting, you consent to this."
+
+    static func consentLines(contentNotice: String?) -> [String] {
+        (contentNotice.map { [$0] } ?? []) + [storedForReview]
+    }
+}
+
+/// The report sheet, presented by `isPresented`: category, optional reason, Report. Shared by the
+/// long-press flow and any other entry point that reports AI content.
+struct ReportConcernSheetModifier: ViewModifier {
+    @Binding var isPresented: Bool
+    let contentType: ReportContentType
+    /// Read when the report is sent.
+    let content: () -> String
+    /// An extra line saying what the report sends, when that is more than the pressed content.
+    let contentNotice: String?
+
+    @State private var showSubmitted = false
+    @State private var selectedCategory: ReportCategory = .offensive
+    @State private var reason = ""
+    @State private var isSubmitting = false
+
+    func body(content view: Content) -> some View {
+        view
+            .sheet(isPresented: $isPresented) {
+                reportSheet
+            }
+            .alert("Report Submitted", isPresented: $showSubmitted) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Thank you. We'll review this content.")
+            }
+    }
 
     private var reportSheet: some View {
         NavigationStack {
@@ -121,9 +147,11 @@ struct ReportConcernModifier: ViewModifier {
                 }
 
                 Section {
-                    Text("The reported content will be stored on TabMail's servers for review by our team. By submitting, you consent to this.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    ForEach(ReportConcernSheetText.consentLines(contentNotice: contentNotice), id: \.self) { line in
+                        Text(line)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             .navigationTitle("Report Content")
@@ -131,7 +159,7 @@ struct ReportConcernModifier: ViewModifier {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
-                        showSheet = false
+                        isPresented = false
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
@@ -154,12 +182,12 @@ struct ReportConcernModifier: ViewModifier {
         Task {
             let success = await ReportConcernService.report(
                 contentType: contentType,
-                content: content,
+                content: content(),
                 category: selectedCategory,
                 reason: reason.isEmpty ? nil : reason
             )
             isSubmitting = false
-            showSheet = false
+            isPresented = false
             if success {
                 showSubmitted = true
             }
@@ -176,5 +204,15 @@ extension View {
         extraAction: ReportConcernExtraAction? = nil
     ) -> some View {
         modifier(ReportConcernModifier(contentType: contentType, content: content, extraAction: extraAction))
+    }
+
+    func reportConcernSheet(
+        isPresented: Binding<Bool>,
+        contentType: ReportContentType,
+        content: @escaping () -> String,
+        contentNotice: String? = nil
+    ) -> some View {
+        modifier(ReportConcernSheetModifier(isPresented: isPresented, contentType: contentType,
+                                            content: content, contentNotice: contentNotice))
     }
 }
