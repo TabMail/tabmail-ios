@@ -42,6 +42,8 @@ struct ChatFieldWordsTests {
             var waitingResults: [String: [CheckedContinuation<Void, Never>]] = [:]
             var waitingReads: [String: [CheckedContinuation<Void, Never>]] = [:]
             var holdsWrites = false
+            var holdsWriteReturns = false
+            var waitingWriteReturns: [CheckedContinuation<Void, Never>] = []
             var waitingWrites: [CheckedContinuation<Void, Never>] = []
             var failsReads = false
             var failsWrites = false
@@ -94,7 +96,17 @@ struct ChatFieldWordsTests {
                         if !held { continuation.resume() }
                     }
                     if state.withLock({ $0.failsWrites }) { throw Refused() }
-                    try await base.write(batch)
+                    let refused = try await base.write(batch)
+                    // A held return: the transaction is done and its answer waits.
+                    await withCheckedContinuation { continuation in
+                        let held = state.withLock { state in
+                            guard state.holdsWriteReturns else { return false }
+                            state.waitingWriteReturns.append(continuation)
+                            return true
+                        }
+                        if !held { continuation.resume() }
+                    }
+                    return refused
                 })
         }
 
@@ -136,6 +148,25 @@ struct ChatFieldWordsTests {
         /// Stops holding `key`'s next reads, leaving the reads already held waiting.
         func stopHolding(resultsOf key: String) {
             state.withLock { _ = $0.heldResults.remove(key) }
+        }
+
+        /// Holds each write after its transaction, before it returns.
+        func holdWriteReturns() {
+            state.withLock { $0.holdsWriteReturns = true }
+        }
+
+        func releaseWriteReturns() {
+            let waiting = state.withLock { state in
+                state.holdsWriteReturns = false
+                defer { state.waitingWriteReturns = [] }
+                return state.waitingWriteReturns
+            }
+            waiting.forEach { $0.resume() }
+        }
+
+        /// Waits until a write's transaction is done and its return is held.
+        func waitForHeldWriteReturn() async -> Bool {
+            await poll { !$0.waitingWriteReturns.isEmpty }
         }
 
         func holdWrites() {
@@ -738,6 +769,28 @@ struct ChatFieldWordsTests {
             #expect(try Self.storedWords(pool) == [earlier: "Typed earlier", inFlight: "Written as it began", during: "Typed during"])
             #expect(store.fill(for: earlier).words == "Typed earlier")
             #expect(await Self.nextRun(storage, earlier) == "Typed earlier")
+        }
+    }
+
+    @Test("Words a removal's fence refused are written once it fails, even when it ended before the write returned")
+    func refusedWordsSurviveARollbackBeforeTheWriteReturns() async throws {
+        try await Self.withStore { pool, storage, store in
+            let key = ChatFieldWords.key(for: Self.header("rr-1", thread: "refused-then-rolled-back"))
+            // The writer has the words and waits before its transaction.
+            storage.holdWrites()
+            store.apply(.put("Refused by the fence"), to: key)
+            #expect(await storage.waitForWrites(1), "control: the write is running")
+            // A removal begins; the transaction runs under its fence and refuses the words.
+            let removal = store.beginRemoval(Self.account)
+            storage.holdWriteReturns()
+            storage.releaseWrites()
+            #expect(await storage.waitForHeldWriteReturn(), "control: the transaction ran")
+            #expect(try Self.rows(pool).isEmpty, "control: the fence refused the words")
+            // The removal fails, and ends, before the write returns.
+            store.rollBackRemoval(removal)
+            storage.releaseWriteReturns()
+            await store.written()
+            #expect(await Self.nextRun(storage, key) == "Refused by the fence", "a new run loads them with no further edit")
         }
     }
 

@@ -115,7 +115,8 @@ final class ChatFieldWords {
         let read: @Sendable (String) async throws -> String?
         /// Writes each key's words; "" deletes the key's row. Words of an account being removed or
         /// removed, or of an ended demo, are refused (`Write.admits`).
-        let write: @Sendable ([String: Write]) async throws -> Void
+        /// Returns the keys it refused.
+        let write: @Sendable ([String: Write]) async throws -> Set<String>
 
         /// The app's database (tests install their own).
         static func database(_ database: @escaping @Sendable () -> PrioritizedDatabase) -> Storage {
@@ -131,14 +132,18 @@ final class ChatFieldWords {
                 },
                 write: { batch in
                     let now = Date()
-                    try await database().write { db in
+                    return try await database().write { db -> Set<String> in
+                        var refused: Set<String> = []
                         for (key, write) in batch {
                             if write.words.isEmpty {
                                 try ChatFieldWordsRecord.filter(key: key).deleteAll(db)
                             } else if write.admits(key) {
                                 try ChatFieldWordsRecord(sessionId: key, words: write.words, updatedAt: now).save(db)
+                            } else {
+                                refused.insert(key)
                             }
                         }
+                        return refused
                     }
                 })
         }
@@ -295,9 +300,12 @@ final class ChatFieldWords {
             guard !batch.isEmpty else { break }
             for key in batch.keys { unwritten[key] = nil }
             do {
-                try await storage.write(batch)
-                // A removal that began while this wrote refused its words: they wait for its end.
-                for (key, write) in batch where unwritten[key] == nil && lifetimes.isHeld(key) && write.isKept(key) {
+                let refused = try await storage.write(batch)
+                // Words the transaction refused are kept unless their account was removed or their
+                // demo ended, whether or not the removal that held them has ended since: one still
+                // held waits for its end (`rollBackRemoval`), one released is written next.
+                for key in refused {
+                    guard let write = batch[key], unwritten[key] == nil, write.isKept(key) else { continue }
                     unwritten[key] = write
                 }
             } catch {
