@@ -18,6 +18,30 @@ import Testing
 ///   a refusal covers the whole app.
 /// Every date is computed from today. The age rule is called without a
 /// calendar, as the screen calls it; `calendar` here only builds the inputs.
+/// How long a test waits for a held step (a notice or age check parked on a
+/// continuation) to be reached. A broken path then fails in this time instead
+/// of spinning until the run's watchdog kills it.
+private enum HeldStepWait {
+    static let seconds: Double = 5
+}
+
+/// Waits until `condition` holds, for at most `HeldStepWait.seconds`. Records
+/// an issue and returns false when the step is never reached.
+@MainActor
+private func reachHeldStep(
+    _ condition: @MainActor () -> Bool, sourceLocation: SourceLocation = #_sourceLocation
+) async -> Bool {
+    let end = Date().addingTimeInterval(HeldStepWait.seconds)
+    while !condition() {
+        if Date() >= end {
+            Issue.record("the held step was never reached", sourceLocation: sourceLocation)
+            return false
+        }
+        await Task.yield()
+    }
+    return true
+}
+
 @Suite("Age and terms screen: age rule, device block, saved agreement, App Store answer")
 struct AgeAndTermsConsentTests {
     private let calendar = Calendar(identifier: .gregorian)
@@ -378,7 +402,7 @@ struct AppStoreAgeCheckRunnerGuardTests {
                 acknowledge: { calls.notices += 1 }
             )
         }
-        while calls.heldCheck == nil { await Task.yield() }
+        guard await reachHeldStep({ calls.heldCheck != nil }) else { return }
         #expect(runner.isCheckingAge)
 
         var secondTouched: [String] = []
@@ -470,7 +494,7 @@ struct AppStoreAgeCheckRunnerTapTests {
         let runner = AppStoreAgeCheck.Runner()
         let calls = Calls()
         let first = Task { @MainActor in await runner.acknowledgeOnly { await heldNotice(calls) } }
-        while calls.held == nil { await Task.yield() }
+        guard await reachHeldStep({ calls.held != nil }) else { return }
         #expect(calls.notices == 1, "an idle tap opens the notice once")
         #expect(runner.isAcknowledging)
 
@@ -494,7 +518,7 @@ struct AppStoreAgeCheckRunnerTapTests {
         let first = Task { @MainActor in
             await runner.pass(check: { .allowed }, apply: { _ in }, acknowledge: { await heldNotice(calls) })
         }
-        while calls.held == nil { await Task.yield() }
+        guard await reachHeldStep({ calls.held != nil }) else { return }
 
         await runner.acknowledgeOnly { calls.notices += 1 }
         #expect(calls.notices == 1, "the tap starts no second notice")
@@ -693,7 +717,7 @@ struct SignificantUpdateStuckNoticeTests {
                 await withCheckedContinuation { store.stuck = $0 }
             }
         }
-        while store.stuck == nil { await Task.yield() }
+        _ = await reachHeldStep { store.stuck != nil }
         return task
     }
 
@@ -803,7 +827,7 @@ struct AppStoreAgeCheckRunnerTests {
                 }
             )
         }
-        while calls.stuck == nil { await Task.yield() }
+        guard await reachHeldStep({ calls.stuck != nil }) else { return }
 
         await runner.pass(
             check: { calls.checks += 1; return .minor },
@@ -835,7 +859,7 @@ struct AppStoreAgeCheckRunnerTests {
                 }
             )
         }
-        while calls.stuck == nil { await Task.yield() }
+        guard await reachHeldStep({ calls.stuck != nil }) else { return }
         await runner.pass(check: { calls.checks += 1; return .allowed }, apply: { calls.applied.append($0) }, acknowledge: { calls.notices += 1 })
         #expect(calls.checks == 2)
         #expect(calls.notices == 1)
