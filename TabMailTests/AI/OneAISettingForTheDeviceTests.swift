@@ -140,4 +140,102 @@ struct OneAISettingForTheDeviceTests {
             try await expectAskedAgain(pool)
         }
     }
+
+    // MARK: - An existing answer
+
+    @Test("signing in with a mail account on the device keeps the answer already given",
+          arguments: [true, false])
+    func anExistingAnswerIsKept(aiEnabled: Bool) async throws {
+        try await withDeviceState { pool in
+            try addMailAccount("account-one", pool: pool)
+            AIService.recordAIChoice(aiEnabled: aiEnabled, resume: {})
+
+            // The same person signing in again, or another person, on a device with mail accounts.
+            await signIn(pool)
+
+            #expect(AIService.optOutStore.object(forKey: AIService.aiChoiceMadeKey) as? Bool == true)
+            #expect(AIService.optOutStore.object(forKey: AIService.optOutAllAIKey) as? Bool == !aiEnabled)
+            let http = answering()
+            defer { http.close() }
+            let sent = try await requestsForOneMessage(http)
+            #expect(sent.app == (aiEnabled ? 1 : 0) && sent.nse == (aiEnabled ? 1 : 0), "\(sent)")
+        }
+    }
+
+    @Test("the AI choice is removed before Opt Out of AI, so AI never reads as on in between; the answer stays when there is a mail account")
+    func theChoiceGoesFirst() throws {
+        for (count, cleared) in [(0, true), (1, false)] {
+            let store = try #require(RemovalRecordingDefaults(suiteName: "test.ai-setting.\(UUID().uuidString)"))
+            defer { UserDefaults.standard.removePersistentDomain(forName: store.name) }
+            AIConsentPolicy.recordChoice(aiEnabled: true, in: store)
+
+            TabMailAuthService.clearAIChoice(mailAccountCount: count, in: store)
+
+            #expect(store.removals == (cleared ? [AIConsentPolicy.completedChoiceKey, AIConsentPolicy.optOutKey] : []))
+            #expect(store.disabledAfterEachRemoval.allSatisfy { $0 })
+            #expect(AIConsentPolicy.isDisabled(in: store) == cleared)
+        }
+    }
+
+    @Test("when the accounts cannot be counted, the answer is cleared")
+    func anUnreadableCountClears() throws {
+        let store = try #require(RemovalRecordingDefaults(suiteName: "test.ai-setting.\(UUID().uuidString)"))
+        defer { UserDefaults.standard.removePersistentDomain(forName: store.name) }
+        AIConsentPolicy.recordChoice(aiEnabled: true, in: store)
+
+        TabMailAuthService.clearAIChoice(mailAccountCount: nil, in: store)
+
+        #expect(store.object(forKey: AIConsentPolicy.completedChoiceKey) == nil)
+        #expect(store.object(forKey: AIConsentPolicy.optOutKey) == nil)
+    }
+
+    // MARK: - Where it runs
+
+    @Test("each sign-in clears before it writes the session, and nothing else clears")
+    func everySessionWriteClearsFirst() throws {
+        let root = DiagnosticPrintGateTests.repositoryRoot()
+        let auth = try String(contentsOf: root.appendingPathComponent("TabMail/Services/TabMailAuthService.swift"), encoding: .utf8)
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("//") }
+        let writes = auth.indices.filter { auth[$0].contains("installNewSession(") }
+        #expect(writes.count == 3, "session writes: \(writes.map { auth[$0] })")
+        for index in writes {
+            #expect(index > 0 && auth[index - 1] == "await Self.clearAIChoiceIfNoMailAccount()",
+                    "before \(auth[index]): \(index > 0 ? auth[index - 1] : "")")
+        }
+
+        let callers = try ["TabMail", "TabMailNotificationService", "Shared"].flatMap { dir -> [String] in
+            let base = root.appendingPathComponent(dir)
+            let files = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil)?
+                .compactMap { $0 as? URL }.filter { $0.pathExtension == "swift" } ?? []
+            return try files.flatMap { file in
+                try String(contentsOf: file, encoding: .utf8).components(separatedBy: "\n")
+                    .filter { $0.contains("clearAIChoiceIfNoMailAccount(") && !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//")
+                        && !$0.contains("static func") }
+                    .map { _ in file.lastPathComponent }
+            }
+        }
+        #expect(callers == Array(repeating: "TabMailAuthService.swift", count: 3), "\(callers)")
+    }
+}
+
+/// Records the order of the keys removed from it, and whether AI read as off after each removal.
+/// Used synchronously on the test's own task.
+private final class RemovalRecordingDefaults: UserDefaults {
+    private(set) var removals: [String] = []
+    private(set) var disabledAfterEachRemoval: [Bool] = []
+    let name: String
+
+    override init?(suiteName: String?) {
+        guard let suiteName else { return nil }
+        name = suiteName
+        super.init(suiteName: suiteName)
+    }
+
+    override func removeObject(forKey defaultName: String) {
+        removals.append(defaultName)
+        super.removeObject(forKey: defaultName)
+        disabledAfterEachRemoval.append(AIConsentPolicy.isDisabled(in: self))
+    }
 }
