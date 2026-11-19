@@ -859,67 +859,11 @@ struct ChatThreadViewLifecycleTests {
         }
     }
 
-    @Test("A tap on the jump button ends the Unread landing: a later height never brings the line back")
-    func jumpButtonEndsTheLanding() async throws {
-        let firstUnread = 20
-        try await withPinned(unreadFrom: firstUnread) { chat in
-            #expect(try await Self.until { chat.field != nil && chat.shows(firstUnread) && chat.belowScreen > 2 },
-                    "control: the open lands at the Unread line")
-            let landedAt = try #require(chat.scroll?.contentOffset.y)
-            let jump = try #require(try await Self.jumpButton(in: chat), "the jump button shows away from the bottom")
-            #expect(jump.accessibilityActivate(), "control: the jump button takes the tap")
-            // Its animated scroll reports as SwiftUI reports it: a programmatic phase.
-            chat.phases(.animating)
-            chat.phases(.idle)
-            // In a hosted window the jump's animated scroll comes to rest wherever it stops, so the
-            // test reads where it rested and requires the late heights to leave it there: the old
-            // landing would pull the chat back to the Unread line.
-            #expect(try await Self.scrollStopped(chat), "control: the jump's scroll comes to rest")
-            let rested = try #require(chat.scroll?.contentOffset.y)
-            #expect(rested > landedAt + 50, "control: the jump moved the chat down from the line: \(landedAt) to \(rested)")
-            let fieldTop = try #require(chat.fieldTop)
-            try chat.fieldGrows()
-            #expect(try await Self.until { (chat.fieldTop ?? fieldTop) < fieldTop - 40 }, "control: the field grows")
-            chat.screenShrinks(by: 120)
-            #expect(try await Self.until { (chat.scroll?.bounds.height ?? 0) < 852 - 100 }, "control: the screen shrinks")
-            #expect(try await Self.scrollStopped(chat), "control: the layout comes to rest")
-            let after = try #require(chat.scroll?.contentOffset.y)
-            // The screen shrank by 120 with the bottom anchor: allow that, never a jump back up to
-            // the line thousands of points above.
-            #expect(after >= rested - 2, "never pulled back toward the Unread line: rested at \(rested), now \(after)")
-            // That the jump's animated scroll reaches the newest bubble is ChatSwipeUITests'
-            // testJumpButtonScrollsToTheNewestBubble: an animated scroll does not run to its end in
-            // a hosted window. Here: the old landing never comes back.
-        }
-    }
+    // The jump ending the landing: ChatSwipeUITests' testJumpEndsTheUnreadLandingWhenTheSuggestionArrivesLate.
 
     // The user's own scroll and a late height after it: ChatSwipeUITests'
     // testUsersScrollKeepsItsPlaceWhenTheSuggestionArrivesLate, with a real drag. A hosted test
     // can only move the offset under SwiftUI, which puts its own position back on the next update.
-
-    /// Frames the offset must hold still to count as at rest.
-    private static let restFrames = 10
-
-    /// Waits, frame by frame, until the chat's scroll offset has not moved for `restFrames` frames.
-    private static func scrollStopped(_ chat: Pinned) async throws -> Bool {
-        var last = chat.scroll?.contentOffset.y
-        var still = 0
-        return try await until {
-            let now = chat.scroll?.contentOffset.y
-            still = now == last ? still + 1 : 0
-            last = now
-            return still >= restFrames
-        }
-    }
-
-    /// The jump button, once it shows.
-    private static func jumpButton(in chat: Pinned) async throws -> NSObject? {
-        func find() -> NSObject? {
-            HostedAccessibility.elements(under: chat.controller.view).first { $0.accessibilityLabel == "Jump to the newest email" }
-        }
-        _ = try await until { find() != nil }
-        return find()
-    }
 
     @Test("At the bottom, the newest bubble and the AI Suggestion stay above the field however tall a typed draft grows it")
     func newestBubbleClearsATallField() async throws {

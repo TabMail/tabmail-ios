@@ -309,6 +309,50 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertEqual(oldest.frame.minY, place, accuracy: 2, "the reading position is the user's")
     }
 
+    /// Opened at the Unread line, a tap on the jump button ends that landing for good: the AI
+    /// Suggestion landing late afterwards (a new row height) leaves the newest bubble in view and
+    /// never pulls the chat back to the line.
+    func testJumpEndsTheUnreadLandingWhenTheSuggestionArrivesLate() {
+        let app = launchIntoChat(tall: true, lateSuggestion: true, unread: true)
+        let jump = app.buttons["Jump to the newest email"]
+        XCTAssertTrue(jump.waitForExistence(timeout: 5), "control: the chat lands at the Unread line, away from the bottom")
+        let newest = bubble(3, in: app)
+        let fieldTop = replyField(in: app).frame.minY
+        jump.tap()
+        XCTAssertTrue(newestInView(newest, above: fieldTop, in: app, timeout: 5), "control: the jump reaches the newest bubble")
+        let ghost = app.descendants(matching: .any)["chat.aiSuggestion"].firstMatch
+        XCTAssertTrue(ghost.waitForExistence(timeout: 20), "control: the AI Suggestion lands late")
+        XCTAssertTrue(newestInView(newest, above: replyField(in: app).frame.minY, in: app, timeout: 3),
+                      "after the late row the newest bubble is still in view: \(newest.frame)")
+        XCTAssertFalse(jump.waitForExistence(timeout: 2), "and the chat was never pulled back up to the Unread line")
+    }
+
+    /// Heights that change right after the jump tap, while its scroll runs (the reply field takes
+    /// focus and grows), still leave the newest bubble in view once it ends.
+    func testJumpReachesTheNewestBubbleThroughHeightsChangingRightAfterTheTap() {
+        let app = launchIntoChat(tall: true, unread: true)
+        let jump = app.buttons["Jump to the newest email"]
+        XCTAssertTrue(jump.waitForExistence(timeout: 5), "control: the chat lands away from the bottom")
+        let field = replyField(in: app)
+        jump.tap()
+        field.tap()
+        field.typeText("One\nTwo\nThree\nFour")
+        let newest = bubble(3, in: app)
+        // With words in it the field has no placeholder: find it by its text.
+        let typed = app.descendants(matching: .any).matching(NSPredicate(format: "value CONTAINS %@", "Four")).firstMatch
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the typed words are in the field")
+        XCTAssertTrue(newestInView(newest, above: typed.frame.minY, in: app, timeout: 5),
+                      "the newest bubble ends in view above the grown field: \(newest.frame), field \(typed.frame)")
+    }
+
+    /// Whether the newest bubble's bottom is on screen, above `fieldTop`, within `timeout`.
+    private func newestInView(_ newest: XCUIElement, above fieldTop: CGFloat, in app: XCUIApplication, timeout: TimeInterval) -> Bool {
+        let shown = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            newest.exists && newest.frame.maxY <= fieldTop + 1 && newest.frame.maxY > fieldTop - app.frame.height / 2
+        }, object: nil)
+        return XCTWaiter.wait(for: [shown], timeout: timeout) == .completed
+    }
+
     func testOpenActionsTapOnAnotherBubbleClosesAndDropsTheKeyboard() {
         let app = launchIntoChat()
         let field = replyField(in: app)
@@ -451,13 +495,14 @@ final class ChatSwipeUITests: XCTestCase {
     private enum Host { case stack, sheet, split, tutorialCard }
 
     private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false,
-                                lateSuggestion: Bool = false) -> XCUIApplication {
+                                lateSuggestion: Bool = false, unread: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
             + (host == .sheet ? ["--chat-swipe-in-sheet"] : [])
             + (host == .split ? ["--chat-swipe-in-split"] : [])
             + (tall ? ["--chat-swipe-tall"] : [])
+            + (unread ? ["--chat-swipe-unread"] : [])
             + (host == .tutorialCard ? ["--chat-swipe-tutorial-card"] : [])
         app.launch()
         switch host {

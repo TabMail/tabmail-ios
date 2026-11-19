@@ -32,6 +32,9 @@ struct ChatSwipeTestScene: View {
     private let inSplit = ProcessInfo.processInfo.arguments.contains("--chat-swipe-in-split")
     /// `--chat-swipe-tall`: the oldest email's text message runs past the screen, so the chat scrolls.
     nonisolated private static let tall = ProcessInfo.processInfo.arguments.contains("--chat-swipe-tall")
+    /// `--chat-swipe-unread`: every email is unread, so the chat lands at the Unread line above the
+    /// oldest email; with `--chat-swipe-tall` that is far from the bottom.
+    nonisolated private static let unread = ProcessInfo.processInfo.arguments.contains("--chat-swipe-unread")
     private let tutorialCard = ProcessInfo.processInfo.arguments.contains("--chat-swipe-tutorial-card")
     nonisolated private static let accountID = "chat-swipe-fixture"
     nonisolated private static let count = 4
@@ -196,7 +199,7 @@ struct ChatSwipeTestScene: View {
                     header.inReplyTo = index == 0 ? nil : "<swipe-\(index - 1)@example.com>"
                     header.headerComplete = true
                     header.bodyComplete = true
-                    header.isRead = true
+                    header.isRead = !Self.unread
                     header.summaryBlurb = "Note \(index)"
                     header.summaryTextMessage = index == 0 && Self.tall
                         ? "Note 0: " + String(repeating: "A long line that fills the screen. ", count: 80)
