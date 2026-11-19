@@ -164,6 +164,17 @@ final class PendingSendService {
         var undoDeadline: Date {
             OutboxCancellationPolicy.undoDeadline(for: holdUntil)
         }
+        /// Whether the toast shows for this send. False for a reply sent with the chat view on:
+        /// its Undo is on the chat's "Sending" bubble (`ChatUndoSendStatus`). Decided at Send.
+        var showsToast = true
+    }
+
+    /// Whether the send gets a chat bubble with its own Undo, so its toast is not shown. Every send
+    /// keeps exactly one visible Undo. Today a bubble exists when the chat view is on (read once at
+    /// Send) and the send is a reply, which the chat shows (`ChatUnsentReply`); a new email keeps the
+    /// toast. A later change that gives new emails a bubble changes this one rule.
+    nonisolated static func sendHasBubbleUndo(chatViewActive: Bool, inReplyTo: String?) -> Bool {
+        chatViewActive && inReplyTo != nil
     }
 
     struct RetainedDraftAuthority: Sendable, Equatable {
@@ -189,6 +200,10 @@ final class PendingSendService {
     }
 
     private(set) var current: Pending?
+
+    /// The compose to reopen after a confirmed Undo, from the toast or a chat bubble alike.
+    /// RootView presents it with `UndoReopenCompose` (ADR-IOS-065 owns its close semantics).
+    var reopenSnapshot: ReopenSnapshot?
 
     /// Non-nil ⇒ the last Undo tap could not be decided, so nothing was cancelled
     /// and the toast was deliberately left up. The view renders this and clears it.
@@ -219,7 +234,8 @@ final class PendingSendService {
         draftId: String,
         instanceEpoch: String,
         toSummary: String,
-        holdUntil: Date?
+        holdUntil: Date?,
+        showsToast: Bool = true
     ) {
         dismissTask?.cancel()
         undoFailureMessage = nil
@@ -230,7 +246,8 @@ final class PendingSendService {
             instanceEpoch: instanceEpoch,
             toSummary: toSummary,
             presentedAt: now,
-            holdUntil: holdUntil)
+            holdUntil: holdUntil,
+            showsToast: showsToast)
 
         // One auto-dismiss Task whose remaining visible window is anchored on the
         // DURABLE hold rather than on this instant:
@@ -269,6 +286,19 @@ final class PendingSendService {
     /// `RetainedAuthorityOutcome` for why collapsing them was the defect.
     func undo() -> ReopenSnapshot? {
         guard let p = current else { return nil }
+        return undo(p)
+    }
+
+    /// Undo, then reopen the compose: the one path for the toast's Undo and a chat bubble's.
+    /// `pending` is the send to cancel; nil means the toast's `current`.
+    func undoAndReopen(_ pending: Pending? = nil) {
+        guard let p = pending ?? current, let snapshot = undo(p) else { return }
+        reopenSnapshot = snapshot
+    }
+
+    /// `undo()` for any send still in its window, not only the toast's (a chat bubble's send).
+    /// Clears the toast only when it is this send's.
+    private func undo(_ p: Pending) -> ReopenSnapshot? {
         switch retainedAuthorityOutcome(for: p) {
         case .readFailed:
             // We could not determine anything, so we decide nothing: the Outbox row
@@ -295,8 +325,7 @@ final class PendingSendService {
                 undoFailureMessage = Self.undoNotConfirmedMessage
                 return nil
             }
-            dismissTask?.cancel()
-            current = nil
+            clearToast(ifShowing: p.id)
             return nil
         case .verified(let authority):
             // The cancellation and the kept draft's return to Drafts commit in one
@@ -310,8 +339,7 @@ final class PendingSendService {
                 undoFailureMessage = Self.undoNotConfirmedMessage
                 return nil
             }
-            dismissTask?.cancel()
-            current = nil
+            clearToast(ifShowing: p.id)
             return ReopenSnapshot(
                 id: p.id, authority: authority, returnedToDrafts: outcome.returnedToDrafts)
         }
@@ -365,9 +393,9 @@ final class PendingSendService {
     /// them contain a `guard discardOutboxMessageConfirmed(…) else { return nil }`,
     /// and BOTH of those inner returns left no snapshot, no cleared toast and no
     /// `undoFailureMessage`. Predicate to re-derive the exit count rather than trust
-    /// it: count `return` statements inside `undo()` — **six**. One per enum case
-    /// (3), plus the two discard-refusal guards, plus the `guard let p = current`
-    /// early return, which is the one exit with nothing to observe because there was
+    /// it: count `return` statements inside `undo(_:)` and `undo()` — **six**. One per
+    /// enum case (3) and the two discard-refusal guards in `undo(_:)`, plus `undo()`'s
+    /// `guard let p = current` early return, which is the one exit with nothing to observe because there was
     /// no toast to begin with. The enum is a roster of ANSWERS, never of exits, which
     /// is precisely how a documented invariant went on reading as evidence that the
     /// work was done (`MIS-018`'s tell).
@@ -401,6 +429,13 @@ final class PendingSendService {
         } catch {
             return .readFailed
         }
+    }
+
+    /// Ends the toast after a confirmed Undo, only when it is showing the undone send.
+    private func clearToast(ifShowing outboxId: String) {
+        guard current?.id == outboxId else { return }
+        dismissTask?.cancel()
+        current = nil
     }
 
     /// The user acknowledged the "couldn't undo" alert.

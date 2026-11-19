@@ -303,7 +303,14 @@ struct ChatAgentCard: Identifiable {
 /// nor the copy on screen). Undo, a discard or the send's own cleanup deletes the row, and the bubble goes.
 struct ChatUnsentReply: Identifiable, Equatable, Sendable {
     let outboxId: String
-    let failed: Bool
+    /// The row's state, as the Outbox's own Cancel Send reads it (`OutboxCancellationPolicy`).
+    let status: OutboxStatus
+    let sentAt: Date?
+    let holdUntil: Date?
+    /// The send's draft generation, for Undo's reopen (`ChatUndoSendStatus`).
+    let draftId: String?
+    let instanceEpoch: String?
+    var failed: Bool { status == .failed }
     /// The provider took the email and its Sent copy is in the database, not yet in the chat.
     let filed: Bool
     /// The email's summary as a text message, once made.
@@ -333,7 +340,8 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
                     .filter(Column("accountId") == row.accountId && Column("rfc822MessageId") == sentId)
                     .fetchCount(db) > 0
             }
-            return ChatUnsentReply(outboxId: row.id, failed: row.outboxStatus == .failed, filed: filed,
+            return ChatUnsentReply(outboxId: row.id, status: row.outboxStatus, sentAt: row.sentAt, holdUntil: row.holdUntil,
+                                   draftId: row.draftId, instanceEpoch: row.instanceEpoch, filed: filed,
                                    textMessage: try summary(of: row, db: db))
         }
     }

@@ -60,12 +60,17 @@ struct RootView: View {
     @State private var suppressNextSignedOutAlert = false
 
     // MARK: - Undo-send toast state
-    /// Exact authority for the retained Draft generation behind a confirmed
-    /// cancellation. PendingSendService.undo() discards only the Outbox row;
-    /// RootView hands this authority to UndoReopenCompose so it can bind to that
-    /// retained Draft without accepting a replacement owner or generation.
-    @State private var reopenSnapshot: PendingSendService.ReopenSnapshot?
+    // Exact authority for the retained Draft generation behind a confirmed
+    // cancellation lives in `PendingSendService.reopenSnapshot`, set by the one
+    // undo-and-reopen path the toast and a chat bubble share. RootView hands it to
+    // UndoReopenCompose so it binds to that retained Draft without accepting a
+    // replacement owner or generation.
     private var pendingSendService: PendingSendService { PendingSendService.shared }
+    /// The compose to reopen after a confirmed Undo (`PendingSendService.reopenSnapshot`).
+    private var reopenSnapshot: Binding<PendingSendService.ReopenSnapshot?> {
+        Binding(get: { pendingSendService.reopenSnapshot },
+                set: { pendingSendService.reopenSnapshot = $0 })
+    }
 
     /// Sync status values — observed once here and published to descendants via
     /// Environment. Centralising here keeps the observer alive across sidebar
@@ -372,14 +377,10 @@ struct RootView: View {
         // undo chip (InboxView.swift:283-284): ignore the bottom safe area
         // and use negative padding to sit where other app toasts sit.
         .overlay(alignment: .bottom) {
-            if let pending = pendingSendService.current {
+            if let pending = pendingSendService.current, pending.showsToast {
                 PendingSendToast(
                     pending: pending,
-                    onUndo: {
-                        if let snapshot = pendingSendService.undo() {
-                            reopenSnapshot = snapshot
-                        }
-                    },
+                    onUndo: { pendingSendService.undoAndReopen() },
                     onDismiss: { pendingSendService.dismiss() }
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -451,7 +452,7 @@ struct RootView: View {
         // `PendingSendService.undo()` already returned that row to Drafts in the
         // cancellation's own write, or reports that it did not (the compose then
         // opens as unsaved).
-        .fullScreenCover(item: $reopenSnapshot) { snapshot in
+        .fullScreenCover(item: reopenSnapshot) { snapshot in
             UndoReopenCompose(snapshot: snapshot)
         }
         // loadInitialData() is called eagerly in TabMailApp.init() (after DB creation)

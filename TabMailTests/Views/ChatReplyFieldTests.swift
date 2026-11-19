@@ -562,7 +562,7 @@ struct ChatReplyFieldTests {
         // A reply filed or gone reloads the chat's emails, so a sent reply's copy takes its place.
         #expect(Self.count("unsentReplies = found if left || found.contains(where: \\.filed) { viewModel.reloadThread() }", in: text) == 1)
         #expect(Self.count("unsentReplies = ", in: text) == 1, "nothing else writes them")
-        #expect(Self.count("ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })", in: text) == 1,
+        #expect(Self.count("ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo() })", in: text) == 1,
                 "a failed send's Retry and Delete act on its own row")
     }
 

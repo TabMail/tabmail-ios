@@ -442,7 +442,7 @@ struct OutboxReconcileInFlightSendTests {
         ) {
             PendingSendService.shared.present(
                 outboxId: outboxId, draftId: draftId, instanceEpoch: epoch,
-                toSummary: "To: recipient@example.com", holdUntil: seededHold)
+                toSummary: "To: recipient@example.com", holdUntil: seededHold, showsToast: true)
 
             // A live drain that is gated out by holdUntil; give it a pass so the
             // race is real, not merely absent.
@@ -509,7 +509,7 @@ struct OutboxReconcileInFlightSendTests {
         ) {
             PendingSendService.shared.present(
                 outboxId: outboxId, draftId: draftId, instanceEpoch: epoch,
-                toSummary: "To: recipient@example.com", holdUntil: seededHold)
+                toSummary: "To: recipient@example.com", holdUntil: seededHold, showsToast: true)
 
             // Two taps back to back in ONE synchronous @MainActor run — no await
             // between them, exactly as a double-tap on the synchronous Undo button.

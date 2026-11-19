@@ -297,6 +297,8 @@ struct ChatUnsentReplyBubble: View {
     let reply: ChatUnsentReply
     let retry: () -> Void
     let delete: () -> Void
+    /// Undo send while the row's undo window lasts (`ChatUndoSendStatus`).
+    let undo: () -> Void
 
     private var notSent: Bool { reply.failed }
 
@@ -356,9 +358,7 @@ struct ChatUnsentReplyBubble: View {
                 RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
                     .fill(Theme.accent)
             )
-            Text(reply.caption)
-                .font(.caption2)
-                .foregroundStyle(Theme.textSecondary)
+            ChatUndoSendStatus(reply: reply, undo: undo)
         }
     }
 }

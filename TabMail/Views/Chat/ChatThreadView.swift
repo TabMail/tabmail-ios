@@ -345,7 +345,7 @@ struct ChatThreadView: View {
                         }
                         // Replies still in the outbox.
                         ForEach(unsentReplies) { reply in
-                            ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })
+                            ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo() })
                         }
                         // The AI Suggestion, where the reply lands once sent: the working bubble
                         // while it is written, then the ghost.

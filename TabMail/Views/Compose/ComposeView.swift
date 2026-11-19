@@ -1107,6 +1107,9 @@ struct ComposeView: View {
         let isReplyAll: Bool
         /// The guided tutorial's practice reply: sent with no undo hold.
         let isTutorialPracticeReply: Bool
+        /// Undo shows on the chat's "Sending" bubble, not the toast
+        /// (`PendingSendService.sendHasBubbleUndo`), read once here.
+        let sendHasBubbleUndo: Bool
         let outbound: DraftMessage
     }
     @State private var recipients = ComposeDraftGuards.Recipients()
@@ -3698,6 +3701,8 @@ struct ComposeView: View {
             isForward: isForward,
             isReplyAll: isReplyAll,
             isTutorialPracticeReply: isPracticeReply,
+            sendHasBubbleUndo: PendingSendService.sendHasBubbleUndo(
+                chatViewActive: ChatViewConfig.isActive, inReplyTo: outbound.inReplyTo),
             outbound: outbound)
 
         // Capture existing draft (server-side metadata preserved through save-before-send).
@@ -3897,7 +3902,8 @@ struct ComposeView: View {
             draftId: snapshot.draftId,
             instanceEpoch: snapshot.instanceEpoch,
             toSummary: toSummary,
-            holdUntil: queued.holdUntil
+            holdUntil: queued.holdUntil,
+            showsToast: !snapshot.sendHasBubbleUndo
         )
         sendWasAdmitted = true
 
