@@ -84,7 +84,7 @@ struct ProgressTotalSourceTests {
 
     // MARK: - The full sync lists folders for a cold provider
 
-    @Test("A full sync with this pass's folder list applied still lists folders when the provider has no total yet (cold), and does not when it has one (warm)",
+    @Test("A full sync runs the provider's own discovery whether the provider has a total yet (warm) or not (cold)",
           arguments: [true, false])
     func coldProviderForcesTheFolderList(_ cold: Bool) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -99,9 +99,9 @@ struct ProgressTotalSourceTests {
         ])
         await mock.setFetchMessagesResult([])
         _ = try await SyncEngine().fullSync(
-            account: account, provider: mock, plan: SyncEngine.FullSyncPlan(appliedFolderList: ["INBOX"]))
+            account: account, provider: mock, plan: SyncEngine.FullSyncPlan())
         let listed = await mock.callLogSnapshot().contains("fetchFolders")
-        #expect(listed == cold, cold ? "a cold provider gets a complete folder list" : "a warm provider uses the applied list")
+        #expect(listed, "the full sync's discovery is the provider's, every time")
     }
 
     // MARK: - Fast Sync completion across accounts

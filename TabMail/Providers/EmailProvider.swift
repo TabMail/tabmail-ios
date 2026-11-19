@@ -386,17 +386,10 @@ protocol EmailProvider: Sendable {
     /// that must make a request for it answers `.none`).
     func progressTotal(crawling: Bool) async -> ProgressTotal
 
-    /// The full sync took this complete folder list (`fetchFolders`) as the
-    /// account's tree: a provider whose progress total comes from the folder
-    /// list takes it from here, and only from here, so a change read's folder
-    /// discovery never sets it (#755).
-    func adoptFullSyncFolderList(_ folders: [FolderInfo]) async
-
-    /// Whether the progress total is taken from the full sync's complete folder
-    /// list: such a provider's scheduled full sync lists the tree every time,
-    /// even when its change read carried the folder list, so the total stays
-    /// current (#755). The change read itself never lists the tree for it.
-    var progressTotalComesFromFolderList: Bool { get }
+    /// The full sync's folder discovery: the complete folder list. A provider
+    /// whose progress total comes from that list takes it here, inside its own
+    /// operation, so a change read's discovery never sets it (#755).
+    func fetchFullSyncFolders() async throws -> [FolderInfo]
 
     /// Which of these ids (numeric, in a provider whose ids are `.uid`-windowed)
     /// the folder still holds, with the generation of the id space the answer
@@ -793,11 +786,8 @@ extension EmailProvider {
     /// No server total by default: progress counts stored rows.
     func progressTotal(crawling: Bool) async -> ProgressTotal { .none }
 
-    /// No folder-list total by default.
-    func adoptFullSyncFolderList(_ folders: [FolderInfo]) async {}
-
-    /// No folder-list total by default: a change read's folder list is reused.
-    var progressTotalComesFromFolderList: Bool { false }
+    /// The folder list, with no progress total of its own by default.
+    func fetchFullSyncFolders() async throws -> [FolderInfo] { try await fetchFolders() }
 
     /// No numeric ids: no presence answer.
     func presentIds(folder: String, uids: [UInt32]) async throws -> UIDExistenceResult? { nil }

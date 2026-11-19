@@ -98,15 +98,11 @@ extension SyncEngine {
     /// What one full sync is told by the change read that ran before it in the
     /// same pass (ADR-IOS-111).
     struct FullSyncPlan: Sendable {
-        /// Non-nil = the change read carried the folder list and it was applied;
-        /// the value is `applyFolderList`'s MODSEQ-skippable set.
-        var appliedFolderList: Set<String>?
         /// The pass's own deadline: the count check (phase 2) after each listing
         /// stops there and leaves the folder's listing due.
         var deadline: Date?
 
-        init(appliedFolderList: Set<String>? = nil, deadline: Date? = nil) {
-            self.appliedFolderList = appliedFolderList
+        init(deadline: Date? = nil) {
             self.deadline = deadline
         }
     }
@@ -292,8 +288,7 @@ extension SyncEngine {
 
 
     /// - Parameter plan: what this pass's change read already did
-    ///   (ADR-IOS-111). `appliedFolderList` = the read carried the folder list and
-    ///   the engine applied it, so the discovery request is skipped. A folder whose
+    ///   (ADR-IOS-111). Discovery always runs (`fetchFullSyncFolders`). A folder whose
     ///   change bookmark covers it (`FolderChangeState.tracking`) gets no window
     ///   listing: its changes arrive through the reader.
     /// - Returns: the folders whose window listing finished in this pass, and
@@ -304,28 +299,13 @@ extension SyncEngine {
         let acctTag = "\(account.provider):\(account.id.prefix(6))"
         BootProfiler.mark("fullSync[\(acctTag)] START (network — fetch folders + inbox headers → populates inbox)")
         let pool = dbPool
-        let skippablePaths: Set<String>
-        // A provider whose progress total is not known yet (no complete folder
-        // list since launch: a change read may have carried only the folders
-        // that changed) gets a complete folder list here, so the scheduled full
-        // sync is what discovers it, never the change read (#755). A provider
-        // whose total is that list's (Exchange) lists on every scheduled full
-        // sync, so its total follows the server's.
-        let totalNotKnownYet = await provider.progressTotal(crawling: false) == .notKnownYet
-        let providerNeedsFolderList = provider.progressTotalComesFromFolderList || totalNotKnownYet
-        if let applied = plan.appliedFolderList, !providerNeedsFolderList {
-            // This pass's change read carried the folder list and it is applied.
-            skippablePaths = applied
-            BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) folder list from this pass's change read")
-        } else {
-            // Sync folder list
-            let remoteFolders = try await provider.fetchFolders()
-            await provider.adoptFullSyncFolderList(remoteFolders)
-            BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) fetchFolders: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
-            BootProfiler.mark("fullSync[\(acctTag)]: fetchFolders done in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
-            skippablePaths = try await pool.write { db in
-                try Self.applyFolderList(remoteFolders, account: account, db: db)
-            }
+        // The provider's own discovery, every full sync: a provider whose
+        // progress total comes from the folder list stores it inside (#755).
+        let remoteFolders = try await provider.fetchFullSyncFolders()
+        BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) fetchFolders: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
+        BootProfiler.mark("fullSync[\(acctTag)]: fetchFolders done in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
+        let skippablePaths = try await pool.write { db in
+            try Self.applyFolderList(remoteFolders, account: account, db: db)
         }
 
         if !skippablePaths.isEmpty {

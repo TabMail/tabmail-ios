@@ -140,9 +140,6 @@ struct ChangePassOutcome: Sendable {
     var outOfTime = false
     /// Rows were written.
     var hadChanges = false
-    /// The read carried the folder list and it was applied (the MODSEQ-skippable
-    /// paths), so the full sync skips its own discovery.
-    var appliedFolderList: Set<String>?
     /// A candidate bookmark, stored after the foreground pass's listings.
     var candidate: String?
     /// Folders the read covered (`.tracked` or `.baselineReady`).
@@ -311,14 +308,12 @@ extension SyncEngine {
 
         switch changeSet.folderList {
         case .complete(let folderList):
-            outcome.appliedFolderList = try await dbPool.write { db in
+            _ = try await dbPool.write { db in
                 try Self.applyFolderList(folderList, account: account, db: db)
             }
         case .updated(let updates):
-            // Folders already stored, matched by path: nothing to add or remove,
-            // so the full sync's own discovery is not needed either.
+            // Folders already stored, matched by path: nothing to add or remove.
             try await dbPool.write { db in try Self.applyFolderUpdates(updates, accountId: accountId, db: db) }
-            outcome.appliedFolderList = []
         case nil:
             break
         }

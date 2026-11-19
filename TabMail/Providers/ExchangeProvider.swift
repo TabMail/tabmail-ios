@@ -91,7 +91,7 @@ actor ExchangeProvider: EmailProvider {
     // MARK: - Folders
 
     /// The sum of `totalItemCount` over the last complete folder list the full
-    /// sync adopted (`adoptFullSyncFolderList`), held in memory only (no
+    /// sync listed (`fetchFullSyncFolders`), held in memory only (no
     /// request of its own): the backfill progress denominator
     /// (`progressTotal`). Nil until a full sync adopted one.
     var lastFolderListMessageTotal: Int?
@@ -100,13 +100,13 @@ actor ExchangeProvider: EmailProvider {
         lastFolderListMessageTotal.map(ProgressTotal.messages) ?? .notKnownYet
     }
 
-    func adoptFullSyncFolderList(_ folders: [FolderInfo]) async {
+    /// The complete tree, with its total stored before it is returned. The
+    /// change read lists the tree through `fetchFolders`, which stores nothing.
+    func fetchFullSyncFolders() async throws -> [FolderInfo] {
+        let folders = try await fetchFolders()
         lastFolderListMessageTotal = folders.reduce(0) { $0 + $1.totalCount }
+        return folders
     }
-
-    /// The total is the sum over a complete tree, and a change read's `.updated`
-    /// carries only the folders that changed: every scheduled full sync lists.
-    nonisolated var progressTotalComesFromFolderList: Bool { true }
 
     func fetchFolders() async throws -> [FolderInfo] {
         // v1.0 mailFolder resource does NOT include wellKnownName property.

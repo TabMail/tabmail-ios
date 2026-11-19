@@ -620,7 +620,7 @@ actor SyncEngine {
         let fullSyncDue = timeSinceFullSync >= fullSyncInterval || listingNeeded
         if fullSyncDue {
             BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"), new bookmark: \(listingNeeded))...")
-            let plan = FullSyncPlan(appliedFolderList: changePass?.appliedFolderList, deadline: deadline)
+            let plan = FullSyncPlan(deadline: deadline)
             let listing: FullSyncListing
             do {
                 listing = try await queue.execute(priority: .headerFetch) {

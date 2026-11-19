@@ -722,7 +722,6 @@ struct ChangeApplyTests {
                 return set
             }])
             let outcome = try await w.outcome()
-            #expect(outcome.appliedFolderList != nil)
             let paths = try await w.pool.read { db in
                 Set(try Folder.filter(Column("accountId") == w.accountId).fetchAll(db).map(\.path))
             }

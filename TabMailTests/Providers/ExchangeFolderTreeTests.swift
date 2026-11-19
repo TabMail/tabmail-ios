@@ -208,10 +208,10 @@ struct ExchangeFolderTreeTests {
         )
         #expect(await provider.progressTotal(crawling: true) == .notKnownYet, "no folder list yet: not known")
         #expect(requests.withLock { $0 } == 0, "asking for the total sends no request")
-        let listed = try await provider.fetchFolders()
+        _ = try await provider.fetchFolders()
         #expect(await provider.progressTotal(crawling: true) == .notKnownYet,
                 "a folder list alone (a change read's discovery) never sets the total")
-        await provider.adoptFullSyncFolderList(listed)
+        _ = try await provider.fetchFullSyncFolders()
         let expected = Self.rootChildren.flatMap(\.subtree).filter { !$0.isSearchFolder }
             .reduce(0) { $0 + Self.counts($1.id).total }
         let sent = requests.withLock { $0 }
@@ -243,7 +243,7 @@ struct ExchangeFolderTreeTests {
         // The scheduled full sync on a cold provider (no folder list since
         // launch) lists the folders even when the change read says it applied
         // one, and the provider takes its total from that list.
-        _ = try? await engine.fullSync(account: account, provider: provider, plan: .init(appliedFolderList: []))
+        _ = try? await engine.fullSync(account: account, provider: provider, plan: .init())
         await engine.updateBackfillProgressForAccount(account)
         let expected = Self.rootChildren.flatMap(\.subtree).filter { !$0.isSearchFolder }
             .reduce(0) { $0 + Self.counts($1.id).total }
@@ -415,7 +415,7 @@ struct ExchangeFolderTreeSyncTests {
 
         // Cold: the change read claimed an applied folder list, but the full
         // sync still lists the tree, because the provider has no total yet.
-        _ = try await engine.fullSync(account: account, provider: provider, plan: .init(appliedFolderList: []))
+        _ = try await engine.fullSync(account: account, provider: provider, plan: .init())
         #expect(await provider.progressTotal(crawling: true) == .messages(7), "the full sync's folder list sets the total")
         await engine.updateBackfillProgressForAccount(account)
         let progress = try #require(await AccountManager.shared._backfillBacking[account.id], "progress is published")
