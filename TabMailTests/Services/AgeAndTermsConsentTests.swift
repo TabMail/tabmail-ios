@@ -565,7 +565,7 @@ struct SignificantUpdateMarkerStorageTests {
         )
     }
 
-    @Test func aStoredMarkerForThisVersionOffersTheBannerAndAsksAppleNothing() async throws {
+    @Test func aStoredMarkerOffersTheBannerAfterOnlyTheRulesQuestion() async throws {
         try await withDefaults { defaults in
             defaults.set("1.7", forKey: Update.acknowledgedVersionKey)
             defaults.set("1.8", forKey: Update.inProgressVersionKey)
@@ -573,7 +573,7 @@ struct SignificantUpdateMarkerStorageTests {
             let outcome = await AppStoreAgeCheck.acknowledgeSignificantUpdate(
                 userAsked: false, current: "1.8.3", defaults: defaults, apple: calls(apple, defaults: defaults))
             #expect(outcome == .offerBanner(version: "1.8"))
-            #expect(apple.asked.isEmpty, "no unasked call")
+            #expect(apple.asked == ["region"], "only the rules question, which draws no UI; no notice")
             #expect(defaults.string(forKey: Update.acknowledgedVersionKey) == "1.7")
             #expect(defaults.string(forKey: Update.inProgressVersionKey) == "1.8")
         }
@@ -607,8 +607,10 @@ struct SignificantUpdateMarkerStorageTests {
         }
     }
 
-    /// The production entry point reads `.standard`: a seeded marker for the
-    /// running version there yields the banner. Both keys are restored.
+    /// The production entry point reads `.standard`. In the Simulator the age
+    /// rules do not apply, so a seeded marker there is read and cleared with
+    /// no banner (the marker is only cleared when it was read). Both keys are
+    /// restored.
     @Test(.enabled(if: ProcessInfo.processInfo.isOperatingSystemAtLeast(
         OperatingSystemVersion(majorVersion: 26, minorVersion: 4, patchVersion: 0))))
     func theProductionEntryReadsTheStandardMarker() async throws {
@@ -625,7 +627,8 @@ struct SignificantUpdateMarkerStorageTests {
         standard.set("0.0", forKey: Update.acknowledgedVersionKey)
         standard.set(majorMinor, forKey: Update.inProgressVersionKey)
         let outcome = await AppStoreAgeCheck.acknowledgeSignificantUpdate()
-        #expect(outcome == .offerBanner(version: majorMinor))
+        #expect(outcome == .none, "no banner where the rules do not apply")
+        #expect(standard.object(forKey: Update.inProgressVersionKey) == nil, "the stored marker was read and cleared")
         #expect(standard.string(forKey: Update.acknowledgedVersionKey) == "0.0")
     }
 }
@@ -738,22 +741,35 @@ struct SignificantUpdateStuckNoticeTests {
         #expect(tapped == .none)
         #expect(store.shown == ["1.8", "1.8"])
         #expect(store.acknowledged == "1.8")
-        #expect(store.inProgress == nil, "the marker clears once the notice returns")
+        let after = await launch(store, current: "1.8.1") { store.shown.append($0) }
+        #expect(after == .none, "the banner goes once its version's notice returned")
+        #expect(store.shown == ["1.8", "1.8"])
 
         store.stuck?.resume()
         await first.value
     }
 
-    @Test func aNewVersionAfterAStuckNoticeIsShownUnaskedAgain() async {
+    /// Once a notice has stalled on this device, a later version's notice is
+    /// not shown unasked either: the banner offers the new version, also after
+    /// the stalled version's notice was later opened from the banner.
+    @Test func aStallOnOneVersionSendsTheNextVersionsNoticeThroughTheBanner() async {
         let store = Store()
         store.acknowledged = "1.7"
         let first = await stuckLaunch(store, current: "1.8.0")
 
         let outcome = await launch(store, current: "1.9.0") { store.shown.append($0) }
-        #expect(outcome == .none)
-        #expect(store.shown == ["1.8", "1.9"], "the older version's marker is ignored")
+        #expect(outcome == .offerBanner(version: "1.9"), "the banner offers the new version")
+        #expect(store.shown == ["1.8"], "no unasked notice for the new version")
+        #expect(store.acknowledged == "1.7", "not recorded as handled")
+
+        let tapped = await launch(store, current: "1.9.0", userAsked: true) { store.shown.append($0) }
+        #expect(tapped == .none)
+        #expect(store.shown == ["1.8", "1.9"])
         #expect(store.acknowledged == "1.9")
-        #expect(store.inProgress == nil)
+
+        let later = await launch(store, current: "1.10.0") { store.shown.append($0) }
+        #expect(later == .offerBanner(version: "1.10"), "still through the banner after a tapped notice returned")
+        #expect(store.shown == ["1.8", "1.9"])
 
         store.stuck?.resume()
         await first.value
@@ -782,14 +798,47 @@ struct SignificantUpdateStuckNoticeTests {
         #expect(store.inProgress == nil, "the marker is cleared, so the next launch shows no banner")
     }
 
-    @Test func aFailedNoticeClearsTheMarker() async {
+    /// An unasked notice that throws is asked again unasked next launch. A
+    /// tapped one that throws keeps the banner: the next launch must not call
+    /// Apple unasked, which would restart the stall cycle.
+    @Test func aFailedUnaskedNoticeIsAskedAgainButAFailedTappedNoticeKeepsTheBanner() async {
         struct Failure: Error {}
         let store = Store()
         store.acknowledged = "1.7"
-        let outcome = await launch(store, current: "1.8.0") { _ in throw Failure() }
-        #expect(outcome == .none)
-        #expect(store.inProgress == nil, "a notice that returned with an error is asked again unasked")
+        let unasked = await launch(store, current: "1.8.0") { _ in throw Failure() }
+        #expect(unasked == .none)
+        #expect(store.inProgress == nil, "an unasked notice that returned with an error is asked again unasked")
         #expect(store.acknowledged == "1.7")
+
+        store.inProgress = "1.8"
+        let tapped = await launch(store, current: "1.8.0", userAsked: true) { _ in throw Failure() }
+        #expect(tapped == .none)
+        #expect(store.inProgress == "1.8", "a tapped notice that throws keeps the marker")
+        #expect(store.acknowledged == "1.7", "nothing recorded")
+        let next = await launch(store, current: "1.8.0") { store.shown.append($0) }
+        #expect(next == .offerBanner(version: "1.8"), "the banner stays after a tapped notice fails")
+        #expect(store.shown.isEmpty, "no unasked notice after a tapped one failed")
+    }
+
+    /// At launch with a stuck marker for this version, the plain rules question
+    /// (no UI) comes first: where the rules no longer apply, the banner is not
+    /// offered and the marker clears.
+    @Test func aLaunchWithAStuckMarkerWhereTheRulesNoLongerApplyOffersNoBanner() async {
+        let store = Store()
+        store.acknowledged = "1.7"
+        store.inProgress = "1.8"
+        let outcome = await AppStoreAgeCheck.acknowledge(
+            acknowledged: store.acknowledged, current: "1.8.1",
+            inProgress: store.inProgress,
+            isRegulated: { false }, requiresNotice: { true },
+            show: { store.shown.append($0) },
+            record: { store.acknowledged = $0 },
+            markInProgress: { store.inProgress = $0 }
+        )
+        #expect(outcome == .none, "no banner where the rules no longer apply")
+        #expect(store.inProgress == nil, "the marker is cleared")
+        #expect(store.shown.isEmpty)
+        #expect(store.acknowledged == "1.7", "nothing recorded")
     }
 }
 

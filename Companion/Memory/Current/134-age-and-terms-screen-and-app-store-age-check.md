@@ -84,13 +84,18 @@ ADR-034.
   awaited, so a stuck notice never skips later age checks; the notice has its own flag, so no second
   notice starts while one is up (2026-11-18). Test: `AppStoreAgeCheckRunnerTests`.
 - Stuck notice across launches (owner 2026-11-18, #1010, option chosen with the fallback approved; no
-  timer): `SignificantUpdate.inProgressVersionKey` holds the major.minor handed to Apple, set just
-  before `show` and cleared when it returns or throws. A launch that finds it set for the CURRENT
-  major.minor makes no unasked call and returns `.offerBanner`; RootView shows
+  timer): `SignificantUpdate.inProgressVersionKey` holds the major.minor handed to Apple. An UNASKED
+  notice sets it just before `show` and clears it when it returns or throws. A launch that finds it
+  set, for ANY version, first asks `isRegulated` (no UI); where the rules no longer apply the marker
+  clears and nothing is shown or recorded (#972 rule). Otherwise it makes no unasked call and returns
+  `.offerBanner` for the CURRENT version (also when the rules question throws); RootView shows
   `SignificantUpdateBanner` (SignInAgainBanner shape, above `MailNavigationView` beside
-  `DeletionBanner`), whose tap calls Apple through the same marker path (`userAsked: true`). A marker
-  for another version is ignored. The tap asks `isRegulated` first; where the rules no longer apply
-  the marker clears and nothing is shown or recorded (#972 rule). The banner state is RootView
+  `DeletionBanner`), whose tap calls Apple through the same path (`userAsked: true`). A tapped notice
+  never clears the marker, returned or thrown: a return records the version (banner goes), a throw
+  keeps the banner, and every later version also goes through the banner (2026-11-19 review ruling;
+  the first version of this fix ignored a marker for another version and cleared it after a tapped
+  throw). Apple documents a throw only "if the feature isn't available"; whether a user dismissal
+  returns or throws is undocumented. The banner state is RootView
   `@State` set from the ZStack `.task`, so it appears when onboarding ends without a relaunch. Killing the app mid-notice also yields the banner (accepted). The
   marker is app state, not user data. Tests: `SignificantUpdateStuckNoticeTests`.
 

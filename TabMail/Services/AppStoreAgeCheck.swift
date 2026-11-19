@@ -291,13 +291,16 @@ enum AppStoreAgeCheck {
     /// foreground asks again.
     ///
     /// Apple's notice can stay up and never return (#972, #1010). `inProgress`
-    /// is the stored in-progress marker: `markInProgress(version)` is called
-    /// just before `show` and `markInProgress(nil)` once it returns or throws.
-    /// A marker still set for THIS major.minor means an earlier notice never
-    /// came back, so unless `userAsked` (the banner was tapped) Apple is not
-    /// called and `.offerBanner` is returned. A marker for another version is
-    /// ignored. A tap still asks whether the age rules apply first; where they
-    /// no longer do, the marker is cleared and nothing is shown or recorded.
+    /// is the stored marker: an unasked notice sets it (`markInProgress(version)`)
+    /// just before `show` and clears it once it returns or throws. A marker
+    /// still set, for ANY version, means a notice once stalled on this device:
+    /// from then on no notice is shown unasked and `.offerBanner` is returned
+    /// for the current version. Apple is called only when `userAsked` (the
+    /// banner was tapped), and a tapped notice leaves the marker in place,
+    /// whether it returns or throws; a returned one records the version, so
+    /// its banner goes while later versions still use the banner. Every path
+    /// first asks whether the age rules apply (no UI); where they no longer
+    /// do, the marker is cleared and nothing is shown or recorded.
     /// No time limit is involved.
     @MainActor
     @discardableResult
@@ -320,10 +323,7 @@ enum AppStoreAgeCheck {
             record(version)
             return .none
         case .askApple:
-            if inProgress == version, !userAsked {
-                BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] Notice for \(version) never returned; offering the banner")
-                return .offerBanner(version: version)
-            }
+            let stuckUnasked = inProgress != nil && !userAsked
             do {
                 // Only where Apple says the age rules apply. Elsewhere, such as
                 // on a device with no Apple Account, Apple's acknowledgment can
@@ -337,13 +337,31 @@ enum AppStoreAgeCheck {
                     if inProgress != nil { markInProgress(nil) }
                     return .none
                 }
+                // A notice once stalled on this device: no unasked call for
+                // this or any later version, the banner is offered instead. Asked only after
+                // the plain rules question above, which draws no UI.
+                if stuckUnasked {
+                    BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] A notice (\(inProgress ?? "")) never returned; offering the banner for \(version)")
+                    return .offerBanner(version: version)
+                }
                 if try await requiresNotice() {
-                    markInProgress(version)
-                    defer { markInProgress(nil) }
-                    try await show(version)
+                    if userAsked {
+                        // Tapped from the banner: the marker stays, returned or
+                        // thrown, so later notices also wait for a tap.
+                        try await show(version)
+                    } else {
+                        markInProgress(version)
+                        defer { markInProgress(nil) }
+                        try await show(version)
+                    }
                 }
                 record(version)
             } catch {
+                // The rules question failed: a stuck notice keeps its banner.
+                if stuckUnasked {
+                    BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] A notice never returned and the rules check failed; offering the banner: \(error)")
+                    return .offerBanner(version: version)
+                }
                 BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] Significant update acknowledgment failed, asking again on next foreground: \(error)")
             }
             return .none
