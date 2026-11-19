@@ -112,6 +112,8 @@ struct MailNavigationView: View {
     /// Popping the pushed view (back button / swipe-back) writes `nil` into
     /// this binding automatically — no manual reset needed.
     @State private var pushedMessageId: String?
+    /// The detail a notification tap opened, so its chat can highlight that email.
+    @State private var notificationOpenedId: String?
     /// #309: a saved draft a chat pill opened. Nothing is pushed: its compose
     /// cover opens at once and prepares the draft behind a spinner (#326).
     @State private var pillDraftOpen: DraftOpenRequest?
@@ -597,7 +599,7 @@ struct MailNavigationView: View {
             // MailNavigationView don't cascade into the detail pane.
             // SwiftUI skips MessageDetailContainer.body when selectedMessageId
             // hasn't changed, even if the parent re-renders.
-            MessageDetailContainer(selectedMessageId: selectedMessageId)
+            MessageDetailContainer(selectedMessageId: selectedMessageId, notificationOpenedId: notificationOpenedId)
         }
         .background(Palette.previewPaneBg)
         .onChange(of: selection) { oldValue, newValue in
@@ -617,6 +619,10 @@ struct MailNavigationView: View {
             } else {
                 selectedMessageId = nil
             }
+        }
+        .onChange(of: selectedMessageId) { _, newId in
+            notificationOpenedId = MessageDetailViewModel.notificationHighlight(
+                afterSelecting: newId, opened: notificationOpenedId)
         }
         .modifier(NavigationNotificationHandlers(selection: $selection, pushedShowsAccount: $pushedShowsAccount))
         .fullScreenCover(isPresented: $showsTutorialReplay) {
@@ -927,6 +933,7 @@ struct MailNavigationView: View {
         BootProfiler.mark(isSentinel
             ? "notifTap: pushed instantly (pending resolve → skeleton) \(messageId.prefix(24))"
             : "notifTap: pushed instantly (staged) \(messageId.prefix(24))")
+        notificationOpenedId = openId
         selectedMessageId = openId
         BackgroundSyncLogger.logDebug("[MailNav] Notification deep link: navigating to message \(messageId.prefix(30))")
     }
@@ -1237,21 +1244,25 @@ private struct OutboxSidebarRow: View {
 /// (the only stored input) and skips body re-evaluation when it hasn't changed.
 private struct MessageDetailContainer: View {
     let selectedMessageId: String?
+    /// The id a notification tap opened, while it is the selection.
+    var notificationOpenedId: String?
 
     var body: some View {
         if let messageId = selectedMessageId {
-            MessageDetailResolvedContent(messageId: messageId, opensWithSkeletonDwell: false)
+            MessageDetailResolvedContent(
+                messageId: messageId, opensWithSkeletonDwell: false,
+                highlightsMessage: messageId == notificationOpenedId)
         } else {
             ContentUnavailableView("Select a Message", systemImage: "envelope", description: Text("Choose a message to read"))
         }
     }
 }
 
-/// Resolves a concrete (non-nil) message id to its detail content: drafts
-/// check + branch between `DraftComposePresenter` (server-draft message,
-/// opened as a compose view) and `MessageDetailView` (everything else).
+/// Resolves a concrete (non-nil) message id to its content through
+/// `MessageOpenView`, which opens a Drafts message in the draft editor and
+/// anything else as a chat or in today's detail, for every open path.
 ///
-/// Shared by two call sites so the drafts-check read logic isn't duplicated:
+/// Shared by two call sites:
 /// - `MessageDetailContainer` — the detail column's selection-driven content
 ///   (`selectedMessageId`, i.e. inbox row taps / notification deep links).
 /// - `PushedMessageDestination` — the content column's programmatic push
@@ -1261,22 +1272,15 @@ private struct MessageDetailContainer: View {
 private struct MessageDetailResolvedContent: View {
     let messageId: String
     let opensWithSkeletonDwell: Bool
+    /// Opened from a notification: the chat scrolls to it and highlights it.
+    var highlightsMessage = false
 
     var body: some View {
-        // Check if this message is in a Drafts folder — if so, open ComposeView.
-        // Single read transaction for consistency (message could be deleted between reads).
-        let draftCheck: (header: MessageHeader, isDraft: Bool)? = try? AppDatabase.dbPool.read { db in
-            guard let h = try MessageHeader.fetchOne(db, key: messageId) else { return nil }
-            let f = try Folder.fetchOne(db, key: h.folderId)
-            return (h, f?.role == .drafts)
-        }
-        if let check = draftCheck, check.isDraft {
-            DraftComposePresenter(source: .header(check.header))
-                .id(messageId)
-        } else {
-            MessageDetailView(messageId: messageId, opensWithSkeletonDwell: opensWithSkeletonDwell)
-                .id(messageId)
-        }
+        MessageOpenView(
+            messageId: messageId,
+            opensWithSkeletonDwell: opensWithSkeletonDwell,
+            highlightsMessage: highlightsMessage)
+            .id(messageId)
     }
 }
 

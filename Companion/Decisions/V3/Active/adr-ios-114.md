@@ -75,9 +75,8 @@ same AI result, kept as long as the email itself is shown.
    (`ActiveAIQueue.executeWholeJobForTesting`).
 8. **Chat summaries (amendment, decided 2026-11-05, the second chat-view PR).** The chat view
    needs a summary with a text message for every email of a thread, from any folder, the user's own
-   included. Two requests ask for them, both behind `ChatViewConfig.isActive` (release builds keep it
-   off, `isAvailableInBuild = false`, until the chat view ships; the debug menu turns it on), read once
-   at the start of the operation:
+   included. Two requests ask for them, both behind `ChatViewConfig.isActive` (the user's toggle and AI
+   on, decision 9), read once at the start of the operation:
    - **Opening a thread** (`MessageDetailViewModel.loadThreadMessagesAsync`, once per open):
      `ActiveAIQueue.enqueueChatSummaries` with the opened message and every member
      `ThreadDetection.findRelatedMessages` returns. A member with its body gets a job now; one without
@@ -99,6 +98,10 @@ same AI result, kept as long as the email itself is shown.
    bound that you load up to something like 10 emails from the current visible oldest message"):
    the open chat asks only for the emails on screen and those near them (decision 9,
    `ChatSummaryWindow`); until the chat screen exists the requests stay off in release builds.
+   **Amended 2026-11-09 (supersedes the 2026-11-06 window):** the chat asks, on open, for the
+   thread's newest `ChatViewConfig.summaryWindow` emails, newest first, and later for each older
+   email as it comes on screen; the walk takes each thread's newest `summaryWindow`. See decision 9, "What
+   the chat asks for".
    A chat request is an ordinary summary job (same model, queue, executor and write) with
    `AIJob.forChat`: it is window-exempt, any folder passes its scope checks (`readJobOutcome`,
    `executeJob`), and it is done only when the summary has its text message. `forChat` is context,
@@ -128,7 +131,8 @@ same AI result, kept as long as the email itself is shown.
    for that job in this process. The executor puts the job in its own in-memory set,
    `ActiveAIQueue.textlessChatJobs`, and `jobCompleted` retires it (`.answeredWithoutTextMessage`,
    `abandonWithoutCompletion`). The open, the walk and the drain all skip a job in
-   that set (`enqueueChatSummaryJobs`, `retiredForProcess`). `rearmUnattributableJobs`, which runs
+   that set, and so do the shown chat's database observation and its re-checks (decision 9)
+   (`enqueueChatSummaryJobs`, `retiredForProcess`). `rearmUnattributableJobs`, which runs
    at every sync start (launch, foreground return, every push wake, background refresh) and on
    suspension recovery, does not clear it: a sync cannot change the model's answer. The set starts
    empty in a new process, and AI re-enable (`ActiveAIQueue.aiReenabled`) empties it; nothing else
@@ -144,13 +148,157 @@ same AI result, kept as long as the email itself is shown.
    through the background backfill (not the AI-enabled body queue) is picked up by the next walk or
    open, not at once.
    *Amended 2026-11-15:* no member is held while it awaits its body; every body writer is the
-   same, and the next request reads what is missing from the database.
+   same, and the next request reads what is missing from the database. While a chat is shown, that
+   request comes at once: the chat observes its rows in the database and asks when a body lands, and
+   asks again after every rebuild of the queue (decision 9, "summaries follow the database while a
+   chat is shown"). A relaunch or a cancel is recovered by that re-check or by the next open.
    *Amended 2026-11-09:* a chat offer is never lost to its ordinary twin. That edge was listed
    above, but it was not recoverable while the chat stayed open: a twin finished by a Device Sync
    peer's summary has no text message, so the bubble kept "Summarizing" until a later reopen. Now a
    pending twin is upgraded, a twin within the `recentlyCompleted` TTL no longer blocks the offer,
    and an in-flight twin keeps the offer (`ActiveAIQueue.chatOffersOnInFlightTwin`) until
    `jobCompleted` admits it.
+
+9. **The chat screen (amendment 2026-11-05, the third chat-view PR, 3a).** With the chat view on
+   (`ChatViewConfig.isActive` = the user's Settings toggle `chatViewEnabled` (default on, kept while
+   AI is off) AND AI on (not opted out, a plan or trial active)), every thread open goes through
+   `MessageOpenView`, which decides chat or today's email view ONCE per open (`opensInChat`, also off
+   in the demo's AI-off mode and during the tutorial): the inbox, push and notification opens
+   (`MessageDetailResolvedContent`), search results and the Reminders link.
+   `ChatThreadView` reuses `MessageDetailViewModel` (body, thread load, mark-read, archive, delete,
+   move); `ChatThread` is the pure model: drafts left out, one copy per `stableId` (the opened copy,
+   else one with a text message), oldest first by (date, id), own = from one of the account addresses
+   or in a Sent folder, reply people = the newest email's `buildReplyAllRecipients` minus the user,
+   a group when more than one other person; time stamps after `ChatViewLayout.timeStampGap`; the
+   Unread line above the first email unread at open (recorded before marking read). Each bubble opens
+   the email card (today's `MessageDetailView` in a sheet). `ChatThreadContext` reads the Drafts/Sent
+   folders, the label union (`UserLabel.union`, shared with `ThreadGroup.displayInfo`), top-level
+   attachment names and an addable invite (`ChatInvite`; the card stands for its calendar file).
+   *Amended 2026-11-16:* a bubble shows at most `ChatViewLayout.attachmentChipCount` (2) attachment
+   chips, then one "+N" chip for the rest, as the header shows its names (`ChatThread.headerTitle`).
+   "+N" opens the email's card, which lists every attachment. Tests: `ChatBubbleActionTests`.
+   The inbox row shows the text message when the chat view is on (`MessageSnapshot.preview`).
+   A bubble with no text message yet reads "Summarizing"; an email with nothing to summarize is
+   done without one (`MessageHeader.noContentSummary`, which `summaryDone` counts as done), so its
+   bubble shows that line instead (`ChatThread.Item.textMessage`), never a spinner that cannot end.
+   The chat shows the whole thread, all the way back (decided 2026-11-06): it comes from
+   `ThreadDetection.findRelatedMessages`, shared with today's thread list, which has no length or
+   depth limit (decision 8).
+   *Amended 2026-11-15:* opening the chat reads every row its thread loaded, not only the copy it
+   shows. `ThreadDetection.related` also returns the `copies` that `excludeCopies` leaves out:
+   another folder's or account's copy of a shown email, the opened one's included (a Sent copy and
+   the list's echo in the Inbox, or one email delivered to two accounts). The view model keeps them
+   from the same load (`MessageDetailViewModel.threadCopies`) and `ChatThreadView.noteCopies` marks
+   each read by its own id, as the shown copy is. The dedupe is display only; a Message-ID never
+   selects a row to change (ADR-IOS-068 D4), so a copy the thread did not load (Trash, Spam) is not
+   touched. Tests: `ChatCopiesTests.openReadsEveryCopy`, `ThreadDetectionTests.copiesAreTheRowsLeftOut`.
+   **What the chat asks for, and where it opens (decided 2026-11-09).** In the decision's words: "Just walk back
+   from the recent thing until you walk through the whole thread with some cap. We already have a
+   cap somewhere; it's probably good enough. If we scroll further up, we could see more summarizing
+   as we scroll up." This supersedes the 2026-11-06 window below and the earlier wording
+   of it. The rule:
+   - On open, once the thread is loaded, the chat asks once for its newest
+     `ChatViewConfig.summaryWindow` (10) emails, newest first, wherever it lands
+     (`ChatThreadView.askForNewest`). *Superseded 2026-11-15* by the first value of the observation
+     below; `askForNewest` is deleted.
+   - An older email asks for its own summary when its row comes on screen (`askAsShown`, per-row
+     `onScrollVisibilityChange`). Nothing else asks: no record of what is on screen, no settle wait,
+     no hand-scroll flag. *Amended 2026-11-15:* the observation and the re-check after a queue
+     rebuild ask too, and the chat keeps the ids of the rows that came on screen (`shownIds`) to know
+     which rows to check. There is still no settle wait and no hand-scroll flag.
+     *Amended 2026-11-16:* a row comes on screen by one rule for every height
+     (`ChatRowVisibility`, per-row `onGeometryChange` against the scroll view's bounds): its visible
+     part is at least `ChatViewLayout.shownShareOfRow` (half) of the row, or at least
+     `ChatViewLayout.shownShareOfViewport` (half) of the chat's visible height.
+     `onScrollVisibilityChange` needed half of the row, which a row taller than twice the screen
+     never shows, so such a row never asked. Tests: `ChatThreadViewLifecycleTests.visibilityRule`,
+     `tallRowAsksOnceScrolledInto`, `shortRowAsksAtHalf`.
+   - **Summaries follow the database while a chat is shown (2026-11-15).** From its landing, while
+     it is on screen, the chat observes its emails' body, summary and text message in the database
+     (`ChatSummaryState`: one GRDB `ValueObservation` per shown chat, run by
+     `ChatThreadView.followSummaries` in a `.task` keyed on the member ids, the landing and whether
+     the chat is on screen). The scope is the newest `summaryWindow` emails plus every email that
+     came on screen during this presentation (`shownIds`), newest first.
+     - The first value, at the open and each time the chat is shown again after another screen
+       covered it, asks for every email in scope.
+     - Each later value asks for the emails in scope whose state changed. A body that lands by any
+       writer (either body queue, backfill, the notification merge, a sync) gets its summary asked
+       for at the front.
+     - After every rebuild of the AI queue from the database (the end of `repopulateFromDatabase`
+       with the chat view on: each sync start, AI re-enable, the AI redrives), the queue posts
+       `.aiQueueRebuilt` and the shown chat asks for its whole scope again. It comes after the
+       foreground return's cancel, so the ask it restores is not wiped by that cancel.
+     - The view's sets say only which rows are checked. Whether a row still needs work is read from
+       the database at every ask (`enqueueChatSummaries`, `summaryDone`); nothing is kept for a row
+       that waits. A done row gets nothing, and a textless one stays retired (decision 8).
+     - The fetch reads only those columns of the chat's members, so a read-state or flag write does
+       not wake it, and `removeDuplicates` passes only real changes to the main actor. This is the
+       one observation of `messageHeader` allowed outside small tables (memory 021): it runs only
+       while a chat is shown and reads only that chat's rows.
+     - A chat left on screen when the app goes to the background keeps observing, so a body that
+       lands during background work asks its summary then, as the walk does at every background
+       start.
+     - Before this, the open asked once and a row without its body waited in the queue (below and
+       decision 8); a body written by any other writer, a queue cancel, or a covered chat left the
+       bubble on "Summarizing" until the chat was opened again.
+   - Every request's work goes to the FRONT of both queues in the order asked, each request in front
+     of the earlier ones (`QueueStorage.moveToFront`, `ActiveBodyQueue.enqueueBatch(first:)`). An
+     email without its body waits in `ActiveAIQueue.chatAwaitingBody` (header id to account) and its
+     job goes to the front when the body lands. There is no request numbering. *Amended 2026-11-15:*
+     nothing waits (`chatAwaitingBody` is deleted); the observation asks for it once its body lands,
+     and its job goes to the front.
+   - The background walk takes each walked thread's newest `summaryWindow` emails, which is what
+     an open asks for first.
+   - The thread is the store's whole thread (`findRelatedMessages`, above), not the inbox list's
+     loaded members; checked 2026-11-09.
+
+   Where it opens: the opened email when it came from search or a notification (centered, with
+   a brief glow), else the Unread line (at the top), else the bottom.
+   - The list is a plain `VStack`. A `LazyVStack` starts rows at guessed heights and moves a
+     `scrollTo` target while they measure (memory 036); with real heights, one `scrollTo` lands.
+     Threads are short, and the AI work is bounded by what the chat asks for, not by the rows it
+     builds. In a plain stack `onAppear` fires for every row at once, which is why the per-row ask
+     uses `onScrollVisibilityChange` (`onGeometryChange` with `ChatRowVisibility` since 2026-11-16).
+   - `defaultScrollAnchor(.bottom)` opens at the newest email. The landing `scrollTo` is issued once
+     the thread is loaded, and again on every container or content size change until a scroll of
+     any kind begins (memory 036: a first scroll can be dropped while the screen settles). The first
+     scroll records the members' unread state itself (`noteMembers`) before choosing where to land:
+     SwiftUI runs the thread-loaded and members changes in either order, and the screen tests caught
+     the chat opening at the bottom with the Unread line missing.
+   - Deleted with the old rule: `ChatSummaryWindow`, the visible-set tracking, the 300 ms
+     `summaryAskSettle`, the landing hold (`ChatLanding`, `landingPasses`) and the request numbering
+     (`chatRequestNumber`), with their tests.
+   - Tests: `ChatSummaryQueueTests` (front order, a landed body first, the walk's bound),
+     `QueueStorageTests` (`moveToFront`), and `ChatThreadViewLifecycleTests`. The last opens the real
+     chat in a window and pins: where it lands (bottom, Unread line, searched email); every email
+     marked read; the open's request is the newest 10, newest first; any other ask is an email that
+     was shown; a jump to the top asks for the top and nothing it jumped past; and
+     (`aBodyThatLandsWhileTheChatIsNotLookingShowsItsSummary`, 2026-11-15) an email whose body lands
+     while the chat is on screen, after a background return that cancelled and rebuilt the queue,
+     while another screen covers the chat, or across a relaunch shows its summary once the chat is
+     shown again.
+
+   **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
+   In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible
+   oldest message. scrolling triggers everything "in view" to be prioritized once scrolling stops,
+   and then again 20 in both directions". As built: the open asked for the emails on screen and the
+   10 above the oldest of them; once a hand scroll stopped, the screen and 10 each way
+   (`ChatSummaryWindow`). It asked once the screen had stayed the same for 300 ms with the scroll at
+   rest. A request number kept the latest screen first, and a landing hold re-scrolled until a
+   settled screen showed the target. Decided 2026-11-06 on its calls: one number, 10,
+   everywhere (`ChatViewConfig.summaryWindow`). It was replaced on 2026-11-09 with the simpler
+   rule above; the mechanism had needed four layers to land reliably on iOS 27.
+   **Decided 2026-11-05:** in 3a today's pill stays and acts on the NEWEST email;
+   "Sent" under every own bubble; the 15-minute gap; tutorial and demo-AI-off keep today's view; a
+   reminder open highlights its email; triage rows keep the snippet, with no text message; the
+   agent's toast is not shown in the chat. The User Interface Settings section, which holds the
+   toggle, sits at the top of Settings.
+   **The hidden release switch is deleted (decided 2026-11-05).** Until then release builds kept the
+   chat view off (`isAvailableInBuild = false`; a debug-menu override turned it on while debug was
+   unlocked; `isReachable` showed the toggle and moved User Interface to the top), so `main` stayed
+   releasable between the chat-view PRs. It was decided that the whole train is tested, merged and
+   released at once, so that reason is gone and the switch, the override and the two Settings
+   positions went with it.
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
@@ -177,4 +325,5 @@ including to none (`sameSummaryNewTextMessage`), the merge's second stage creati
 stage could not and caching its result with the text message (`secondStageCachesTextMessage`), a merged
 cache entry kept through the orphan grace (`mergedCacheEntryGetsTheGrace`), and a push through `NotificationService.didReceive`
 staging the text message, via `NotificationService.stagingPathOverride`).
-Decision 8: `ChatSummaryQueueTests` (including a chat offer made while its ordinary twin is in flight, just after it ended, or when it runs again, and the foreground pass's walk, two-sided on the chat view); `ChatSummaryExecutionTests` (the own-email field, two-sided; the executor refusing an ordinary summary outside the Inbox, with an Inbox control).
+Decision 8: `ChatSummaryQueueTests` (including a chat offer made while its ordinary twin is in flight, just after it ended, or when it runs again, and the foreground pass's walk, two-sided on the chat view); `ChatSummaryExecutionTests` (the own-email field, two-sided; the executor refusing an ordinary summary outside the Inbox, with an Inbox control). Decision 9: `ChatThreadTests`,
+`ChatThreadContextTests`, `ChatThreadViewLifecycleTests`, `ChatCardIdentityTests`, `ChatSummaryQueueTests.chatViewSwitch`/`activeMatrix`, `ThreadGroupTests.displayInfoUnionLabels`.

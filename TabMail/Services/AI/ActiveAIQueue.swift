@@ -206,8 +206,8 @@ actor ActiveAIQueue {
 
     /// Chat summaries (`forChat`) whose model call completed and wrote a summary but no
     /// text message (`.answeredWithoutTextMessage`: an image-only email, an invite).
-    /// GRDB still shows the chat job undone, so without this set every chat open, walk
-    /// and drain would ask again, and each ask is a model call. A sync cannot change
+    /// GRDB still shows the chat job undone, so without this set every chat open, re-show,
+    /// queue-rebuild re-check, walk and drain would ask again, and each ask is a model call. A sync cannot change
     /// the model's answer, so `rearmUnattributableJobs()` leaves this set alone: no
     /// launch-time, foreground, push-wake or suspension-recovery pass clears it. It
     /// starts empty in a new process, and AI re-enable (`aiReenabled`) empties it;
@@ -471,19 +471,25 @@ actor ActiveAIQueue {
     /// never completes is not kept past the next recovery.
     private var chatOffersOnInFlightTwin: Set<AIJob> = []
 
-    /// Opening a thread: summaries for every email of it that lacks one with a text message, the
-    /// user's own included. A member with its body gets a chat summary job now; one without goes to
-    /// the body queue (`ActiveBodyQueue`; tests pass `requestBodies`), and nothing is kept for it: it
-    /// gets its job when a later ask reads it from the database with its body (the next open, or
-    /// the walk). The caller checks `ChatViewConfig`.
+    /// Summaries for the emails a shown chat asks for (ADR-IOS-114, owner 2026-11-09): its newest
+    /// `ChatViewConfig.summaryWindow` and the emails shown, newest first, at the open, each re-show
+    /// and each queue rebuild; each that changed in the database; and each older email as it comes
+    /// on screen. Each one that lacks a summary with a text message, the user's own included,
+    /// goes to the FRONT of the queues in the order given: every request goes in front of the
+    /// earlier ones. A member with its body gets a chat summary job now; one without goes to the
+    /// front of the body queue (`ActiveBodyQueue`; tests pass `requestBodies`), and nothing is kept
+    /// for it: the shown chat observes the row and asks again once its body lands, whatever writes
+    /// it. The caller checks `ChatViewConfig`.
     func enqueueChatSummaries(
         _ members: [MessageHeader],
         requestBodies: (@Sendable ([MessageHeader]) async -> Void)? = nil
     ) async {
         let ids = members.map(\.id)
-        guard let fresh = try? await dbPool.read({ db in
+        guard let rows = try? await dbPool.read({ db in
             try MessageHeader.filter(keys: ids).fetchAll(db)
         }) else { return }
+        let position = Dictionary(ids.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        let fresh = rows.sorted { (position[$0.id] ?? 0) < (position[$1.id] ?? 0) }
         var ready: [(headerId: String, accountId: String)] = []
         var needBody: [MessageHeader] = []
         for member in fresh where !Self.summaryDone(member, forChat: true) {
@@ -497,47 +503,74 @@ actor ActiveAIQueue {
             if let requestBodies {
                 await requestBodies(needBody)
             } else {
-                await ActiveBodyQueue.shared.enqueueBatch(needBody)
+                await ActiveBodyQueue.shared.enqueueBatch(needBody, first: true)
             }
         }
-        enqueueChatSummaryJobs(ready, origin: "open")
+        enqueueChatSummaryJobs(ready, origin: "open", first: true)
     }
 
-    /// Admit chat summary jobs (summary only, window-exempt, any folder).
-    private func enqueueChatSummaryJobs(_ items: [(headerId: String, accountId: String)], origin: String) {
+    /// Admit chat summary jobs (summary only, window-exempt, any folder). `first`: they go to the
+    /// front of the queue in the given order, pending ones already queued included.
+    private func enqueueChatSummaryJobs(
+        _ items: [(headerId: String, accountId: String)], origin: String, first: Bool = false
+    ) {
         var admitted = 0
+        var jobs: [AIJob] = []
         for item in items {
             let job = AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .summary,
                             windowExempt: true, forChat: true)
             guard !retiredForProcess(job) else { continue }
+            jobs.append(job)
             if admitOrUpgrade(job) != .rejected { admitted += 1 }
         }
-        guard admitted > 0 else { return }
+        if first { storage.moveToFront(jobs) }
+        guard admitted > 0 || (first && !jobs.isEmpty) else { return }
         BackgroundSyncLogger.logAIProcessing("Enqueued \(admitted) chat summary job(s) (\(origin), total: \(storage.count))")
         scheduleDispatch()
     }
 
-    /// The background walk: every email of the threads of the newest `SyncConfig.maxRecentEmails`
-    /// Inbox rows (those rows included, any folder, the whole thread as `ThreadDetection` returns it),
-    /// that has its body and no summary with a text message. A member whose body is not downloaded yet
-    /// is picked up by a later walk once backfill has fetched it. One thread lookup per Inbox row, so
-    /// it runs from `repopulateFromDatabase` (launch, foreground, AI re-enable), never on drain.
+    /// The background walk: the newest `ChatViewConfig.summaryWindow` emails of each thread of the
+    /// newest `SyncConfig.maxRecentEmails` Inbox rows (any folder), each that has its body and no
+    /// summary with a text message: what a chat asks for when it opens. Drafts are not the chat's
+    /// to ask for, so they are left out before the window is taken: no chat job is ever asked for a
+    /// draft, and the window holds the thread's newest real emails. A member whose body is not
+    /// downloaded yet is picked up by a later walk once backfill has fetched it.
+    ///
+    /// Each thread is looked up once: an Inbox row that an earlier lookup reached through the
+    /// thread's reference links, started from a row with the same `threadId`, has the same thread
+    /// (`ThreadDetection.related`), so it is skipped. A row reached only through a native thread id,
+    /// or started under another one, is looked up itself, so no email of its thread is lost.
+    ///
+    /// It runs at the end of `repopulateFromDatabase` with the chat view on: every `syncStartup`
+    /// (launch, each foreground return and foreground poll, every push wake, BGAppRefresh and
+    /// BGProcessing), AI re-enable and the AI redrives; never on drain.
     nonisolated static func chatWalkCandidates(
         pool: DatabasePool
     ) throws -> [(headerId: String, accountId: String)] {
-        let inbox = try pool.read { db in
-            try MessageHeader.fetchAll(db, sql: """
+        let (inbox, draftFolderIds) = try pool.read { db in
+            let rows = try MessageHeader.fetchAll(db, sql: """
                 SELECT * FROM messageHeader
                 WHERE isInInbox = 1
                 ORDER BY date DESC, id DESC
                 LIMIT ?
             """, arguments: [SyncConfig.maxRecentEmails])
+            let drafts = try String.fetchAll(db, Folder.select(Column("id"))
+                .filter(Column("role") == FolderRole.drafts.rawValue))
+            return (rows, Set(drafts))
         }
         var seen = Set<String>()
         var members: [MessageHeader] = []
+        /// Per `threadId` of the row a lookup started from: the ids its reference search reached.
+        var linkedByThreadId: [String: Set<String>] = [:]
         for row in inbox {
-            for member in [row] + (try ThreadDetection.findRelatedMessages(for: row, in: pool))
-            where seen.insert(member.id).inserted {
+            let threadKey = row.threadId ?? ""
+            if linkedByThreadId[threadKey]?.contains(row.id) == true { continue }
+            let related = try ThreadDetection.related(to: row, in: pool)
+            linkedByThreadId[threadKey, default: []].formUnion(related.linkedIds)
+            let thread = ([row] + related.messages)
+                .filter { !draftFolderIds.contains($0.folderId) }
+                .sorted { ($0.date, $0.id) > ($1.date, $1.id) }
+            for member in thread.prefix(ChatViewConfig.summaryWindow) where seen.insert(member.id).inserted {
                 members.append(member)
             }
         }
@@ -600,6 +633,10 @@ actor ActiveAIQueue {
         } catch {
             activeAILog("[ActiveAI] Chat walk failed: \(error)")
         }
+        // The walk reaches only the threads of the newest Inbox rows. A shown chat, in any folder,
+        // checks its own rows again: what the queue held for it before the rebuild (a cancel
+        // empties it) is asked again from the database.
+        NotificationCenter.default.post(name: .aiQueueRebuilt, object: nil)
     }
 
     /// The durable arbiter behind every direct-path redrive. Internal so the
@@ -702,8 +739,9 @@ actor ActiveAIQueue {
         }
         inFlightTasks.removeAll()
         storage.cancelAllInFlight()
-        // Chat offers waiting on an in-flight twin are forgotten too: the next open or walk asks
-        // again, reading what is still missing from the database.
+        // Chat offers waiting on an in-flight twin are forgotten too: the next walk, and the shown
+        // chat once the queue is rebuilt (`.aiQueueRebuilt`), ask again, reading what is still
+        // missing from the database.
         chatOffersOnInFlightTwin.removeAll()
         backoff.removeAll()
         backoffRetryCount.removeAll()

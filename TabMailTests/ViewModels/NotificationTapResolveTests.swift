@@ -540,6 +540,20 @@ struct NotificationTapResolveTests {
         #expect(!MessageDetailViewModel.shouldPopForUnresolvedTap(postedId: id, selectedId: nil))
         #expect(!MessageDetailViewModel.shouldPopForUnresolvedTap(postedId: nil, selectedId: nil))
     }
+
+    @Test("Highlight: a notification's email stays highlighted only while its open is the selection")
+    @MainActor
+    func notificationHighlightEndsWithItsOpen() {
+        let id = "acc1:INBOX:m1"
+        #expect(MessageDetailViewModel.notificationHighlight(afterSelecting: id, opened: id) == id,
+                "the notification's own open keeps it")
+        #expect(MessageDetailViewModel.notificationHighlight(afterSelecting: nil, opened: id) == nil,
+                "going back ends it")
+        #expect(MessageDetailViewModel.notificationHighlight(afterSelecting: "acc1:INBOX:m2", opened: id) == nil,
+                "opening another email ends it")
+        #expect(MessageDetailViewModel.notificationHighlight(afterSelecting: id, opened: nil) == nil,
+                "a later inbox open of the same email is an ordinary open")
+    }
 }
 
 @Suite("IOS-PERF-012 — agent-toast stable-id resolve")

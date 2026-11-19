@@ -1075,4 +1075,38 @@ struct ThreadDetectionTests {
         // B is trashed (excluded). C is discoverable only via B, so it stays hidden.
         #expect(related.isEmpty)
     }
+
+    @Test("The rows left out as copies come back as copies: every row the search found is shown or a copy, none twice")
+    func copiesAreTheRowsLeftOut() throws {
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
+        try insertAccount(pool)
+        try insertAccount(pool, id: "acc2")
+        try insertFolder(pool)
+        try insertFolder(pool, name: "Sent", path: "Sent", role: .sent)
+        try insertFolder(pool, accountId: "acc2")
+        try insertFolder(pool, name: "Spam", path: "Spam", role: .spam)
+
+        let now = Date()
+        let opened = try insertHeader(pool, messageId: "1", rfc822MessageId: "<root@test.com>",
+                                      date: now.addingTimeInterval(-7200))
+        // The opened email's own copy in the second account.
+        let openedCopy = try insertHeader(pool, messageId: "1", rfc822MessageId: "<root@test.com>",
+                                          date: now.addingTimeInterval(-7200),
+                                          folderId: "acc2:INBOX", accountId: "acc2")
+        // A reply filed twice: Sent, newest first so it is the one shown, and the Inbox.
+        let replySent = try insertHeader(pool, messageId: "2", rfc822MessageId: "<reply@test.com>",
+                                         inReplyTo: "<root@test.com>", date: now.addingTimeInterval(-3600),
+                                         folderId: "acc1:Sent", folderPath: "Sent")
+        let replyInbox = try insertHeader(pool, messageId: "3", rfc822MessageId: "<reply@test.com>",
+                                          inReplyTo: "<root@test.com>", date: now.addingTimeInterval(-3601))
+        // A copy in Spam is no row of the thread's.
+        let _ = try insertHeader(pool, messageId: "4", rfc822MessageId: "<reply@test.com>",
+                                 inReplyTo: "<root@test.com>", date: now.addingTimeInterval(-3600),
+                                 folderId: "acc1:Spam", folderPath: "Spam")
+
+        let related = try ThreadDetection.related(to: opened, in: pool)
+        #expect(related.messages.map(\.id) == [replySent.id])
+        #expect(Set(related.copies.map(\.id)) == [openedCopy.id, replyInbox.id])
+    }
 }

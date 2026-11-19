@@ -528,44 +528,21 @@ struct ActionConfirmationCard: View {
     /// The zone the event row's times are shown in: the one the tool wrote them in
     /// (`timeZoneId`, the zone it queues), or the device's when it names none.
     nonisolated static func eventZone(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail) -> TimeZone {
-        if let tzId = event.timeZoneId,
-           let resolved = CalendarTimeZoneResolver.zone(named: tzId, in: .none) {
-            return resolved
-        }
-        return .current
+        CalendarEventFormat.timeZone(id: event.timeZoneId)
     }
 
     /// The event row's zone label, with its IANA id, or nil when the times are in `deviceZone`
     /// (the device's zone as the card is shown): like Google Calendar, the card names a zone
     /// only when it is not the user's own (#753).
     nonisolated static func eventTimezoneLabel(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail, deviceZone: TimeZone) -> String? {
-        let tz = eventZone(event)
-        if tz.identifier == deviceZone.identifier { return nil }
-        let abbr = tz.abbreviation() ?? tz.identifier
-        // If abbreviation == identifier (rare), don't duplicate.
-        if abbr == tz.identifier { return tz.identifier }
-        return "\(abbr) (\(tz.identifier))"
+        CalendarEventFormat.timeZoneLabel(eventZone(event), deviceZone: deviceZone)
     }
 
     private func formatEventTime(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail) -> String {
         // The dedicated 🌐 row beneath this label carries the timezone — keep
         // the time string itself clean so we don't render the zone twice.
-        let tz = Self.eventZone(event)
-
-        if event.isAllDay {
-            let fmt = DateFormatter()
-            fmt.dateStyle = .medium
-            fmt.timeStyle = .none
-            fmt.timeZone = tz
-            return "\(fmt.string(from: event.startDate)) (all day)"
-        }
-        let fmt = DateFormatter()
-        fmt.dateStyle = .medium
-        fmt.timeStyle = .short
-        fmt.timeZone = tz
-        let endFmt = DateFormatter()
-        endFmt.timeStyle = .short
-        endFmt.timeZone = tz
-        return "\(fmt.string(from: event.startDate)) – \(endFmt.string(from: event.endDate))"
+        CalendarEventFormat.time(
+            start: event.startDate, end: event.endDate, isAllDay: event.isAllDay,
+            timeZone: Self.eventZone(event))
     }
 }

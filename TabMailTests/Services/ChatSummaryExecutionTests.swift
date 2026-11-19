@@ -14,8 +14,9 @@ import Testing
 ///  1. A summary of the user's own email (from one of their addresses, or in a Sent folder) tells
 ///     the backend so (`is_sent_by_user: true`), so its text message is in the user's voice; any
 ///     other email's request has no such field.
-///  2. (Changed 2026-11-15.) The queue keeps no list of chat members waiting for their body: a
-///     member whose body lands later is asked for when a later ask reads it from the database.
+///  2. (Changed 2026-11-15.) The queue keeps no list of chat members waiting for their body: the
+///     shown chat observes its rows and asks again once a body lands, whatever writes it, and after
+///     every queue rebuild (`ChatThreadViewLifecycleTests`).
 ///  3. The executor refuses an ordinary summary outside the Inbox (no model call, nothing written)
 ///     even when its admission was window-exempt; the same setup in the Inbox calls and writes.
 ///  4. A chat summary is finished only with its text message, at every site that decides it
@@ -24,7 +25,8 @@ import Testing
 ///     retries it after a failed call; an ordinary summary job stops at each of those. A call that
 ///     completed and wrote a summary but no text message ends the job for the process: such an
 ///     email costs one model call per process, however often the chat asks and whatever sync starts
-///     (launch, push wake) follow; AI re-enable asks once more; never one every backoff.
+///     (launch, push wake) follow, and however often a shown chat checks its rows again after the
+///     queue is rebuilt; AI re-enable asks once more; never one every backoff.
 ///  5. (Removed 2026-11-15, with the list of chat members waiting for their body.)
 @Suite("Chat summary execution", .serialized, .processGlobalState)
 struct ChatSummaryExecutionTests {
@@ -44,8 +46,9 @@ struct ChatSummaryExecutionTests {
         return header
     }
 
-    /// A backend that answers every summary request with one structured result.
-    private static func summaryBackend(textMessage: String) -> FakeHTTP.Scenario {
+    /// A backend that answers every summary request with one structured result. Also used by the
+    /// hosted chat tests.
+    static func summaryBackend(textMessage: String) -> FakeHTTP.Scenario {
         let http = FakeHTTP.Scenario()
         http.register(path: "/completions/chat", method: "POST") { _ in
             let object: [String: Any] = ["summary": "A plan.", "todos": [], "reminder": NSNull(), "text_message": textMessage]
@@ -63,14 +66,15 @@ struct ChatSummaryExecutionTests {
         return try #require((object["messages"] as? [[String: Any]])?.first)
     }
 
-    private static func withAIOn<T>(_ body: () async throws -> T) async rethrows -> T {
+    static func withAIOn<T>(_ body: () async throws -> T) async rethrows -> T {
         let saved = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
         AIService.writeOptOutFlag(false)
         defer { AIService.optOutStore.set(saved, forKey: AIService.optOutAllAIKey) }
         return try await body()
     }
 
-    private static func index(_ header: MessageHeader, body: String?) async throws {
+    /// Indexes `header` in the search index, with `body` when given; `nil` leaves it without one.
+    static func index(_ header: MessageHeader, body: String?) async throws {
         let key = ContentKey(rawValue: header.id)
         try await SearchIndex.shared.removeMessages(contentKeys: [key])
         _ = try await SearchIndex.shared.indexHeaders([FTSHeaderRecord(
@@ -349,7 +353,7 @@ struct ChatSummaryExecutionTests {
         }
     }
 
-    @Test("A textless chat answer is not asked again by a later sync start: a launch and then a push wake cost one summary model call in all")
+    @Test("A textless chat answer is not asked again by a later sync start or the shown chat's check after it: a launch and then a push wake cost one summary model call in all")
     func textlessChatSummaryIsNotAskedAgainBySyncStarts() async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
@@ -382,9 +386,11 @@ struct ChatSummaryExecutionTests {
             let queue = ActiveAIQueue()
             await queue.setDispatchSuppressedForTesting(true)
             // One sync start (`SyncScheduler.syncStartup`: launch, foreground return, a push wake)
-            // with the chat view on, then the drain runs what it queued and finishes each job.
+            // with the chat view on, the shown chat's check after the rebuild (`.aiQueueRebuilt`),
+            // then the drain runs what they queued and finishes each job.
             func syncStartAndDrain() async {
                 await queue.repopulateFromDatabase(chatViewActive: true)
+                await queue.enqueueChatSummaries([email], requestBodies: { _ in })
                 for _ in 0..<5 {
                     let jobs = await queue.takePendingIntoFlightForTesting()
                     guard !jobs.isEmpty else { return }

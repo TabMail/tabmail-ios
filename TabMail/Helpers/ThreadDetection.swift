@@ -49,6 +49,20 @@ enum ThreadDetection {
     /// deleted replies and junk should not reappear in thread bubbles. Applied as a
     /// post-index row filter so the existing indexes still drive each lookup.
     static func findRelatedMessages(for msg: MessageHeader, in dbPool: DatabasePool) throws -> [MessageHeader] {
+        try related(to: msg, in: dbPool).messages
+    }
+
+    /// `findRelatedMessages`, and the ids its reference search reached: `msg` and every email,
+    /// copies included, linked to it through the five signals above, before the native
+    /// `threadId` members are added. The links are direction-agnostic, so the search reaches this
+    /// same set from any of its ids: a lookup started at one of them, with the same `threadId`,
+    /// returns the same thread. The chat walk uses it to look each thread up once.
+    ///
+    /// `copies` are the rows the search found that `excludeCopies` left out of `messages`: other
+    /// copies of an email already shown (the opened one's included), in another folder or account.
+    /// The chat shows each email once but acts on every row it loaded, each by its own id
+    /// (ADR-IOS-068 D4: a Message-ID is never mutation authority).
+    static func related(to msg: MessageHeader, in dbPool: DatabasePool) throws -> (messages: [MessageHeader], copies: [MessageHeader], linkedIds: Set<String>) {
         // Fetch trash + spam folder IDs once upfront. Typically one row each per
         // account, so this is a trivial read; the resulting set is closed over by
         // each sub-query below.
@@ -148,6 +162,7 @@ enum ThreadDetection {
             }
             newlyFound = nextRound
         }
+        let linkedIds = seenIds
 
         // Native threadId (Gmail/Exchange server-side threading). Synthetic "subj:"
         // ids (our IMAP fallback) are excluded — they would pull in every unrelated
@@ -156,12 +171,14 @@ enum ThreadDetection {
             let _ = add(try findByThreadId(threadId, excluding: msg, in: dbPool, excludedFolderIds: excludedFolderIds))
         }
 
-        if collected.isEmpty { return [] }
+        if collected.isEmpty { return ([], [], linkedIds) }
 
         // Deduplicate cross-folder copies, sort by date. The whole thread, however long: the chat
         // shows every email of it, all the way back (ADR-IOS-114).
         let deduped = excludeCopies(collected, of: msg)
-        return deduped.sorted { $0.date > $1.date }
+        let shownIds = Set(deduped.map(\.id))
+        let copies = collected.filter { !shownIds.contains($0.id) }
+        return (deduped.sorted { $0.date > $1.date }, copies.sorted { $0.date > $1.date }, linkedIds)
     }
 
     /// Filter out copies of the same email that exist in different folders.
