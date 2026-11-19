@@ -37,22 +37,30 @@ enum AIConsentPolicy {
         defaults.removeObject(forKey: optOutKey)
     }
 
-    /// Copies both values from where earlier versions kept them (`legacy`, the app's
+    /// Moves both values from where earlier versions kept them (`legacy`, the app's
     /// `UserDefaults.standard`) into the shared suite. The app runs it as the first step of every
     /// launch. A value already in the shared suite is never overwritten. The opt-out goes first,
     /// so an earlier "no" is in place before the choice reads as made. Only a completed choice is
-    /// copied: without one, AI stays off until the person answers. Returns the keys it copied.
+    /// copied: without one, AI stays off until the person answers. Both earlier values are then
+    /// removed, so the move happens once and a later clear of the shared suite stays cleared.
+    /// Returns the keys it copied.
     @discardableResult
     static func migrateLegacyValues(from legacy: UserDefaults, to shared: UserDefaults) -> [String] {
+        let legacyOptOut = legacy.object(forKey: optOutKey) as? Bool
+        let legacyChoice = legacy.bool(forKey: completedChoiceKey)
         var copied: [String] = []
-        if shared.object(forKey: optOutKey) == nil, let optedOut = legacy.object(forKey: optOutKey) as? Bool {
-            shared.set(optedOut, forKey: optOutKey)
+        if shared.object(forKey: optOutKey) == nil, let legacyOptOut {
+            shared.set(legacyOptOut, forKey: optOutKey)
             copied.append(optOutKey)
         }
-        if shared.object(forKey: completedChoiceKey) == nil, legacy.bool(forKey: completedChoiceKey) {
+        if shared.object(forKey: completedChoiceKey) == nil, legacyChoice {
             shared.set(true, forKey: completedChoiceKey)
             copied.append(completedChoiceKey)
         }
+        // Removed only after the copy: stopped in between, the next launch copies again into
+        // the still-empty keys or skips the ones already filled.
+        legacy.removeObject(forKey: completedChoiceKey)
+        legacy.removeObject(forKey: optOutKey)
         return copied
     }
 }

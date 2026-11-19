@@ -141,6 +141,8 @@ struct AIChoiceComesBeforeAnyRequestTests {
                 #expect(AIConsentPolicy.migrateLegacyValues(from: legacy, to: shared).isEmpty)
                 #expect(shared.object(forKey: AIConsentPolicy.completedChoiceKey) as? Bool == sharedValue)
                 #expect(shared.object(forKey: AIConsentPolicy.optOutKey) as? Bool == sharedValue)
+                #expect(legacy.object(forKey: AIConsentPolicy.completedChoiceKey) == nil)
+                #expect(legacy.object(forKey: AIConsentPolicy.optOutKey) == nil)
             }
         }
         await Self.withScratchDefaults(2) { suites in
