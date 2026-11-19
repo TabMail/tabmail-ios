@@ -808,12 +808,17 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    added; the 34 pt the pill used to add counted it twice. The inbox and email-screen pills keep
    theirs. The header (`ChatHeaderView`, the avatars and the names that open "Reply to") is the
    navigation bar's principal item, level with Back; the subject and labels are one thin line under
-   the bar (`ChatSubjectLine`), with no band of their own. The chat screen never hides its
+   the bar (`ChatSubjectLine`), with no band of their own: they sit in the chat's top
+   `safeAreaBar`, not a plain `safeAreaInset`, so the navigation bar's scroll-edge backdrop reaches
+   under them and the chat scrolls under the whole header instead of drawing through the subject,
+   with `ChatViewLayout.subjectLineBottomGap` under the line. The chat screen never hides its
    navigation bar, even while the opened pill has focus, since the bar holds who the chat is with;
    the inbox and the email screen keep hiding theirs then. Tests: `ChatThreadLayoutTests` (the
    hosted chat's measured field position, the opened pill between the bar and the safe area at the
-   largest text size, the header inside the bar and the subject under it) and
-   `ChatReplyFieldTests.messagesLayout`.
+   largest text size, the header inside the bar and the subject under it, and the scroll area
+   clearing the subject and its gap at sampled scroll positions),
+   `TutorialChatViewRunTests.chatCardHoldsItsRoom` (no bubble under the coach card in the bar, nor under the subject once it goes) and
+   `ChatReplyFieldTests.messagesLayout` (the top bar, never a plain top inset).
 
 ## The longer index line (routed 2026-11-09)
 

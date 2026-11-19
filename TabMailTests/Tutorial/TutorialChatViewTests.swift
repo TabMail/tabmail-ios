@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftUI
+import UIKit
 import GRDB
 import Testing
 @testable import TabMail
@@ -482,6 +484,79 @@ struct TutorialChatViewRunTests {
             await coordinator.end()
             #expect(!coordinator.teachesChat, "an ended run teaches nothing")
             #expect(!coordinator.highlightsChatViewSwitch)
+        }
+    }
+
+    private static func scrollViews(_ view: UIView) -> [UIScrollView] {
+        ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap { scrollViews($0) }
+    }
+
+    // The coach card is part of the chat's top bar: while it shows, no bubble sits under it; once
+    // the run moves on and it goes, no bubble sits under the subject.
+    // The run moves on rather than ending: ending exits the demo, which takes the chat away.
+    @Test("In Priya's chat the coach card sits in the top bar above the bubbles, and goes when the run moves on")
+    func chatCardHoldsItsRoom() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        try await withSettings(chatView: true) {
+            let coordinator = TutorialCoordinator.shared
+            try await start(.reuseReply)
+            #expect(coordinator.step == .replyToPriya)
+            let priya = try #require(try await fixture.0.read { db in
+                try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                    && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+            })
+            // The run ends on every way out, so a failure here leaves no live run for the next test.
+            do { try await HostedAccessibility.withAutomation {
+                let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+                let window = UIWindow(windowScene: scene)
+                let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) })
+                window.rootViewController = controller
+                window.makeKeyAndVisible()
+                defer {
+                    window.isHidden = true
+                    window.rootViewController = nil
+                }
+                @MainActor func coach() -> CGRect? {
+                    HostedAccessibility.elements(under: controller.view)
+                        .first { HostedAccessibility.identifier(of: $0) == "tutorial-coach" }?.accessibilityFrame
+                }
+                // The top of the first bubble: Priya's chat is short, so it sits at the bottom (its
+                // default anchor) and SwiftUI fills the space above it into the safe area. The room
+                // the card takes is therefore not readable from the scroll view here; what is
+                // readable, and what the bar must keep, is that nothing it holds covers a bubble.
+                @MainActor func firstBubbleTop() -> CGFloat? {
+                    HostedAccessibility.elements(under: controller.view)
+                        .filter { $0.accessibilityLabel?.contains(" said: ") == true }
+                        .map(\.accessibilityFrame.minY).min()
+                }
+                @MainActor func subject() -> CGRect? {
+                    HostedAccessibility.elements(under: controller.view)
+                        .first { $0.accessibilityLabel == priya.subject && $0.accessibilityHint == nil }?.accessibilityFrame
+                }
+                for _ in 0..<80 where coach() == nil || firstBubbleTop() == nil { try await Task.sleep(for: .milliseconds(100)) }
+                try await Task.sleep(for: .milliseconds(500))
+                let card = try #require(coach(), "the coach card shows: \(HostedAccessibility.identifiers(in: controller.view))")
+                #expect(card.height > 0)
+                let withCard = try #require(firstBubbleTop(), "Priya's bubbles show")
+                #expect(withCard >= card.maxY - 0.5, "the first bubble \(withCard) sits below the card \(card)")
+
+                // Part 3 starts in the inbox: Priya's chat holds no card for it. The demo, and so the
+                // chat, stays.
+                coordinator.nextLesson()
+                #expect(coordinator.step != .replyToPriya, "control: the run moved on")
+                for _ in 0..<80 where coach() != nil { try await Task.sleep(for: .milliseconds(100)) }
+                try await Task.sleep(for: .milliseconds(500))
+                #expect(coach() == nil, "the card goes once the run moves on")
+                let line = try #require(subject(), "the subject line shows: \(HostedAccessibility.labels(in: controller.view).prefix(20))")
+                let without = try #require(firstBubbleTop())
+                #expect(without >= line.maxY - 0.5, "the first bubble \(without) sits below the subject \(line)")
+            } } catch {
+                await coordinator.end()
+                throw error
+            }
+            await coordinator.end()
         }
     }
 
