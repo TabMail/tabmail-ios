@@ -44,7 +44,7 @@ struct ChatSwipeTestScene: View {
     /// for a test to open the chat and scroll away first.
     private static let suggestionDelay: Duration = .seconds(10)
     /// The late AI Suggestion's text message.
-    static let lateSuggestion = "Sounds good, see you Tuesday."
+    nonisolated static let lateSuggestion = "Sounds good, see you Tuesday."
 
     var body: some View {
         Group {

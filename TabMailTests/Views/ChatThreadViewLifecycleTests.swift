@@ -865,19 +865,28 @@ struct ChatThreadViewLifecycleTests {
         try await withPinned(unreadFrom: firstUnread) { chat in
             #expect(try await Self.until { chat.field != nil && chat.shows(firstUnread) && chat.belowScreen > 2 },
                     "control: the open lands at the Unread line")
+            let landedAt = try #require(chat.scroll?.contentOffset.y)
             let jump = try #require(try await Self.jumpButton(in: chat), "the jump button shows away from the bottom")
             #expect(jump.accessibilityActivate(), "control: the jump button takes the tap")
             // Its animated scroll reports as SwiftUI reports it: a programmatic phase.
             chat.phases(.animating)
             chat.phases(.idle)
+            // In a hosted window the jump's animated scroll comes to rest wherever it stops, so the
+            // test reads where it rested and requires the late heights to leave it there: the old
+            // landing would pull the chat back to the Unread line.
+            #expect(try await Self.scrollStopped(chat), "control: the jump's scroll comes to rest")
+            let rested = try #require(chat.scroll?.contentOffset.y)
+            #expect(rested > landedAt + 50, "control: the jump moved the chat down from the line: \(landedAt) to \(rested)")
             let fieldTop = try #require(chat.fieldTop)
             try chat.fieldGrows()
             #expect(try await Self.until { (chat.fieldTop ?? fieldTop) < fieldTop - 40 }, "control: the field grows")
             chat.screenShrinks(by: 120)
             #expect(try await Self.until { (chat.scroll?.bounds.height ?? 0) < 852 - 100 }, "control: the screen shrinks")
-            // The jump's animated scroll runs on past the line: read once it has stopped.
-            #expect(try await Self.scrollStopped(chat), "control: the jump's scroll comes to rest")
-            #expect(!chat.shows(firstUnread), "the Unread line never comes back after the jump")
+            #expect(try await Self.scrollStopped(chat), "control: the layout comes to rest")
+            let after = try #require(chat.scroll?.contentOffset.y)
+            // The screen shrank by 120 with the bottom anchor: allow that, never a jump back up to
+            // the line thousands of points above.
+            #expect(after >= rested - 2, "never pulled back toward the Unread line: rested at \(rested), now \(after)")
             // That the jump's animated scroll reaches the newest bubble is ChatSwipeUITests'
             // testJumpButtonScrollsToTheNewestBubble: an animated scroll does not run to its end in
             // a hosted window. Here: the old landing never comes back.
