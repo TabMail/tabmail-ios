@@ -96,6 +96,13 @@ struct IMAPChangeCursor: Codable, Equatable, Sendable {
     }
 }
 
+/// One message's whole flag set as a change read reported it (a QRESYNC
+/// SELECT's FETCH responses, or a CHANGEDSINCE FETCH).
+struct IMAPChangedFlags: Sendable {
+    let uid: UInt32
+    let flags: [Flag]
+}
+
 /// A folder's counters as one read observed them; nil = not reported.
 struct FolderObservation: Sendable {
     let messageCount: Int?
@@ -398,60 +405,11 @@ extension IMAPProvider {
         changes.removals += try await heldIds(in: vanished, folderId: folder.id, request: request)
 
         // Changed flags and arrivals.
-        let changed = resync.changedFlags
-        // Held rows are looked up below the bookmark's UIDNEXT and, for a
-        // `\Deleted` message, at or above it too: a moved-in row is re-keyed to
-        // its destination UID there before the folder's next read.
-        let heldCandidates = changed.filter { $0.key.value < cursor.uidNext || $0.value.contains(.deleted) }.map(\.key.value)
-        let held = try await heldIdSet(heldCandidates, folderId: folder.id, request: request)
-        let heldFrom = Self.heldRangeStart(folder)
-        var toFetch: [UInt32] = []
-        for (uid, flags) in changed.sorted(by: { $0.key.value < $1.key.value }) {
-            let value = uid.value
-            if flags.contains(.deleted) {
-                // A message the server holds as `\Deleted` is never shown: the
-                // folder's row for it goes, wherever its UID sits. One it does not
-                // hold is neither fetched nor inserted.
-                if held.contains(value) { changes.removals.append(String(value)) }
-            } else if value >= cursor.uidNext {
-                toFetch.append(value)
-            } else if held.contains(value) {
-                changes.records.append(Self.flagRecord(uid: value, flags: flags))
-            } else if let heldFrom, Int(value) >= heldFrom {
-                // Changed, not held, within the held range: un-deleted, or removed
-                // locally by an earlier read. Only its full record can bring it back.
-                toFetch.append(value)
-            }
-        }
-        // Arrivals by UID as well: RFC 7162 §3.2.5.1 requires the QRESYNC SELECT
-        // to report flag changes and expunges, not new messages, so every UID
-        // from the bookmark's UIDNEXT to the served one is asked for explicitly.
-        if uidNext > cursor.uidNext {
-            guard context.hasBudget() else { return FolderChanges(folderId: folder.id, status: .notRun) }
-            let range = MessageIdentifierSet<UID>(UID(cursor.uidNext)...UID(uidNext - 1))
-            let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
-                try await server.extendedSearch(identifierSet: range, criteria: [.all])
-            }
-            let listed = Set(toFetch)
-            let deletedArrivals = Set(changed.filter { $0.key.value >= cursor.uidNext && $0.value.contains(.deleted) }.map(\.key.value))
-            toFetch += Self.arrivals(
-                in: try found.listed(within: range), from: cursor.uidNext, excluding: listed.union(deletedArrivals),
-                room: SyncConfig.imapChangeArrivalsLimit - toFetch.count
-            )
-        }
-        guard toFetch.count <= SyncConfig.imapChangeArrivalsLimit else {
-            return FolderChanges(folderId: folder.id, status: .refused(.tooFarBehind))
-        }
-        if !toFetch.isEmpty {
-            guard context.hasBudget() else { return FolderChanges(folderId: folder.id, status: .notRun) }
-            context.onProgress(toFetch.count)
-            // A UID the FETCH does not return is read again later (or removed
-            // once UID SEARCH proves it gone): the bookmark moves past it, so the
-            // re-read list is the only place it survives.
-            let fetched = try await rereadIds(toFetch, server: server, context: context)
-            changes.records += fetched.records
-            changes.removals += fetched.removals
-            changes.rereadLater += fetched.unreadable
+        let changed = resync.changedFlags.map { IMAPChangedFlags(uid: $0.key.value, flags: $0.value) }
+        if case .stopped(let result) = try await readChangedAndArrivals(
+            changed, folder: folder, cursorUidNext: cursor.uidNext, servedUidNext: uidNext,
+            server: server, request: request, into: &changes) {
+            return result
         }
 
         // The re-read list, on this same selection.
@@ -466,6 +424,86 @@ extension IMAPProvider {
             BackgroundSyncLogger.logDebug("[IMAPChanges] \(folder.path): modseq \(cursor.highestModSeq)→\(modseq) uidNext \(cursor.uidNext)→\(uidNext) records=\(changes.records.count) removals=\(changes.removals.count)")
         }
         return changes
+    }
+
+    /// How `readChangedAndArrivals` ended.
+    enum SelectionReadOutcome {
+        /// Read; the arrivals were fetched into the folder's changes.
+        case read
+        /// The folder's read stops with this result.
+        case stopped(FolderChanges)
+    }
+
+    /// Changed flags and arrivals on the current selection, one classification
+    /// for every change mode: a held `\Deleted` message is a removal wherever
+    /// its UID sits (IOS-IMAP-001 D3); a changed message at or above the
+    /// bookmark's UIDNEXT is an arrival, fetched in full; a held one gets a
+    /// partial record (its whole flag and keyword set); a changed message the
+    /// folder does not hold, inside the range the older-mail walk has downloaded
+    /// (`heldRangeStart`), is fetched in full. Arrivals are also asked for by
+    /// UID from the bookmark's UIDNEXT to the served one. More than
+    /// `SyncConfig.imapChangeArrivalsLimit` to fetch refuses with `.tooFarBehind`.
+    func readChangedAndArrivals(
+        _ changed: [IMAPChangedFlags], folder: ChangeFolder, cursorUidNext: UInt32, servedUidNext: UInt32,
+        server: IMAPServer, request: ChangeRequest, into changes: inout FolderChanges
+    ) async throws -> SelectionReadOutcome {
+        let context = request.context
+        let sorted = changed.sorted { $0.uid < $1.uid }
+        // Held rows are looked up below the bookmark's UIDNEXT and, for a
+        // `\Deleted` message, at or above it too: a moved-in row is re-keyed to
+        // its destination UID there before the folder's next read.
+        let heldCandidates = sorted.filter { $0.uid < cursorUidNext || $0.flags.contains(.deleted) }.map(\.uid)
+        let held = try await heldIdSet(heldCandidates, folderId: folder.id, request: request)
+        let heldFrom = Self.heldRangeStart(folder)
+        var toFetch: [UInt32] = []
+        for message in sorted {
+            let value = message.uid
+            if message.flags.contains(.deleted) {
+                // A message the server holds as `\Deleted` is never shown: the
+                // folder's row for it goes, wherever its UID sits. One it does not
+                // hold is neither fetched nor inserted.
+                if held.contains(value) { changes.removals.append(String(value)) }
+            } else if value >= cursorUidNext {
+                toFetch.append(value)
+            } else if held.contains(value) {
+                changes.records.append(Self.flagRecord(uid: value, flags: message.flags))
+            } else if let heldFrom, Int(value) >= heldFrom {
+                // Changed, not held, within the held range: un-deleted, or removed
+                // locally by an earlier read. Only its full record can bring it back.
+                toFetch.append(value)
+            }
+        }
+        // Arrivals by UID as well: RFC 7162 §3.2.5.1 requires the QRESYNC SELECT
+        // to report flag changes and expunges, not new messages, so every UID
+        // from the bookmark's UIDNEXT to the served one is asked for explicitly.
+        if servedUidNext > cursorUidNext {
+            guard context.hasBudget() else { return .stopped(FolderChanges(folderId: folder.id, status: .notRun)) }
+            let range = MessageIdentifierSet<UID>(UID(cursorUidNext)...UID(servedUidNext - 1))
+            let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+                try await server.extendedSearch(identifierSet: range, criteria: [.all])
+            }
+            let listed = Set(toFetch)
+            let deletedArrivals = Set(sorted.filter { $0.uid >= cursorUidNext && $0.flags.contains(.deleted) }.map(\.uid))
+            toFetch += Self.arrivals(
+                in: try found.listed(within: range), from: cursorUidNext, excluding: listed.union(deletedArrivals),
+                room: SyncConfig.imapChangeArrivalsLimit - toFetch.count
+            )
+        }
+        guard toFetch.count <= SyncConfig.imapChangeArrivalsLimit else {
+            return .stopped(FolderChanges(folderId: folder.id, status: .refused(.tooFarBehind)))
+        }
+        if !toFetch.isEmpty {
+            guard context.hasBudget() else { return .stopped(FolderChanges(folderId: folder.id, status: .notRun)) }
+            context.onProgress(toFetch.count)
+            // A UID the FETCH does not return is read again later (or removed
+            // once UID SEARCH proves it gone): the bookmark moves past it, so the
+            // re-read list is the only place it survives.
+            let fetched = try await rereadIds(toFetch, server: server, context: context)
+            changes.records += fetched.records
+            changes.removals += fetched.removals
+            changes.rereadLater += fetched.unreadable
+        }
+        return .read
     }
 
     /// No bookmark yet: a plain SELECT on the QRESYNC session.
