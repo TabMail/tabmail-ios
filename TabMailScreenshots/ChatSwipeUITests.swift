@@ -259,6 +259,33 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(isInChat(app))
     }
 
+    /// The jump button, tapped for real, runs its real animated scroll to the end: the newest
+    /// bubble shows above the reply field. (The hosted pin tests read the same button's effect on
+    /// the landing; an animated scroll does not run to its end in a hosted window.)
+    func testJumpButtonScrollsToTheNewestBubble() {
+        let app = launchIntoChat(tall: true)
+        let jump = app.buttons["Jump to the newest email"]
+        let middle = app.frame.height / 2
+        for _ in 0..<Self.jumpScrollDrags where !jump.exists {
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: (middle - Self.verticalDrag / 2) / app.frame.height))
+                .press(forDuration: 0.05,
+                       thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: (middle + Self.verticalDrag / 2) / app.frame.height)),
+                       withVelocity: .fast, thenHoldForDuration: 0.1)
+        }
+        XCTAssertTrue(jump.waitForExistence(timeout: 3), "control: scrolled up, the jump button shows")
+        let newest = bubble(3, in: app)
+        let fieldTop = replyField(in: app).frame.minY
+        XCTAssertFalse(newest.exists && newest.frame.maxY <= fieldTop && newest.frame.maxY > 0,
+                       "control: the newest bubble is off screen before the jump")
+        jump.tap()
+        let shown = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            newest.exists && newest.frame.maxY <= fieldTop + 1 && newest.frame.maxY > fieldTop - app.frame.height / 2
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [shown], timeout: 5), .completed,
+                       "the jump ends with the newest bubble above the reply field: \(newest.frame), field at \(fieldTop)")
+        XCTAssertTrue(jump.waitForNonExistence(timeout: 3), "at the bottom the jump button goes")
+    }
+
     func testOpenActionsTapOnAnotherBubbleClosesAndDropsTheKeyboard() {
         let app = launchIntoChat()
         let field = replyField(in: app)
@@ -391,6 +418,8 @@ final class ChatSwipeUITests: XCTestCase {
     /// How far the vertical drag goes, and how far the chat must have scrolled with it.
     private static let verticalDrag: CGFloat = 250
     private static let scrolledAtLeast: CGFloat = 60
+    /// Drags up the tall chat until the jump button shows.
+    private static let jumpScrollDrags = 8
 
     /// What the fixture's list sits in: a navigation stack, a presented sheet (as search), or a
     /// collapsed split view's content column (as a mailbox).
