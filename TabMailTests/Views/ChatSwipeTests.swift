@@ -491,8 +491,8 @@ struct ChatSwipeTests {
     }
 
     @Test("The closer takes a touch only while something is open; a tap only off the open reveal's buttons, read in its anchor")
-    func closerTakesOnlyTouchesOutsideTheOpenReveal() throws {
-        let (nav, window) = try Self.pushedChat()
+    func closerTakesOnlyTouchesOutsideTheOpenReveal() async throws {
+        let (nav, window) = try await Self.pushedChat()
         defer { window.isHidden = true }
         let open = ChatSwipeOpen()
         let closer = ChatSwipeCloser.Coordinator(open: open)
@@ -532,8 +532,8 @@ struct ChatSwipeTests {
 
     // UIKit arbitrates by asking the delegates; the keyboard UI test covers the real touch.
     @Test("The screen's recognizers wait for the closer; a scroll view's pan scrolls alongside its drag; the window's own recognizers, the keyboard-dismiss tap among them, run alongside it")
-    func closerBeatsOnlyTheScreensRecognizers() throws {
-        let (nav, window) = try Self.pushedChat()
+    func closerBeatsOnlyTheScreensRecognizers() async throws {
+        let (nav, window) = try await Self.pushedChat()
         defer { window.isHidden = true }
         let open = ChatSwipeOpen()
         let closer = ChatSwipeCloser.Coordinator(open: open)
@@ -567,8 +567,8 @@ struct ChatSwipeTests {
     }
 
     @Test("The closer installs on the navigation controller's own view, the bar included; the edge back swipe is off only while something is open")
-    func closerCoversTheWholeScreen() throws {
-        let (nav, window) = try Self.pushedChat()
+    func closerCoversTheWholeScreen() async throws {
+        let (nav, window) = try await Self.pushedChat()
         defer { window.isHidden = true }
         let open = ChatSwipeOpen()
         let closer = ChatSwipeCloser.Coordinator(open: open)
@@ -593,8 +593,11 @@ struct ChatSwipeTests {
     /// A real navigation controller with a pushed screen, on screen, so its back swipes are live.
     /// `presented`: the pushed chat lives in a second navigation controller presented as a sheet
     /// over the first (search opens chats that way).
-    private static func pushedChat(presented: Bool = false) throws -> (nav: UINavigationController, window: UIWindow) {
-        let root = UINavigationController(rootViewController: UIViewController())
+    private static func pushedChat(presented: Bool = false) async throws -> (nav: UINavigationController, window: UIWindow) {
+        // Each stack is whole (list and pushed chat) before it goes on screen, so no push lands
+        // inside an appearance transition.
+        let stack = { let nav = UINavigationController(); nav.setViewControllers([UIViewController(), UIViewController()], animated: false); return nav }
+        let root = presented ? UINavigationController(rootViewController: UIViewController()) : stack()
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.rootViewController = root
@@ -602,10 +605,10 @@ struct ChatSwipeTests {
         root.view.layoutIfNeeded()
         var nav = root
         if presented {
-            nav = UINavigationController(rootViewController: UIViewController())
-            root.present(nav, animated: false)
+            nav = stack()
+            // The presentation is in the window only once UIKit calls its completion.
+            await withCheckedContinuation { done in root.present(nav, animated: false) { done.resume() } }
         }
-        nav.pushViewController(UIViewController(), animated: false)
         nav.view.layoutIfNeeded()
         return (nav, window)
     }
@@ -622,8 +625,8 @@ struct ChatSwipeTests {
     // back-swipe recognizers. A device check covers the gesture itself.
     @Test("Both back swipes wait for a chat drag's decision and never run with it; nothing else changes",
           arguments: [false, true])
-    func backSwipesWaitForTheRule(presented: Bool) throws {
-        let (nav, window) = try Self.pushedChat(presented: presented)
+    func backSwipesWaitForTheRule(presented: Bool) async throws {
+        let (nav, window) = try await Self.pushedChat(presented: presented)
         defer { nav.presentingViewController?.dismiss(animated: false); window.isHidden = true }
         let (pan, coordinator) = Self.pan()
         let contentPop = try #require(nav.interactiveContentPopGestureRecognizer)
