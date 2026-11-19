@@ -2393,6 +2393,9 @@ extension SyncEngine {
                 db: db
             )
             replyDetectIds.append(contentsOf: discoveredParents)
+            // A parent this pass inserted whose reply is already stored in Sent.
+            replyDetectIds.append(contentsOf: try ReplyParentResolver.markInsertedParentsOfStoredReplies(
+                insertedRfc822Ids: newHeaders.compactMap(\.rfc822MessageId), accountId: accountId, db: db))
 
             // AI cache TTL touch removed from sync transaction — it was holding the
             // GRDB writer lock for 300+ row UPDATEs during every folder sync, blocking

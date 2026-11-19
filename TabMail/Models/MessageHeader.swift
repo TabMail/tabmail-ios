@@ -566,3 +566,24 @@ struct MessageReference: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// Foreign key back to messageHeader.
     static let messageHeaderForeignKey = ForeignKey(["messageHeaderId"])
 }
+
+extension MessageHeader {
+    /// The ids among `messageIds` that the folder already stores, whatever
+    /// their epoch stamp. The one existence predicate of the backfill: the
+    /// insert skips these rows, and the IMAP UID walk does not FETCH them.
+    /// Chunked by `SyncConfig.backfillInsertChunkSize` (under SQLite's bound
+    /// variable limit).
+    static func existingMessageIds(_ db: Database, folderId: String, among messageIds: [String]) throws -> Set<String> {
+        var found = Set<String>()
+        let chunkSize = SyncConfig.backfillInsertChunkSize
+        for start in stride(from: 0, to: messageIds.count, by: chunkSize) {
+            let slice = Array(messageIds[start..<min(start + chunkSize, messageIds.count)])
+            found.formUnion(try String.fetchSet(db,
+                MessageHeader
+                    .select(Column("messageId"))
+                    .filter(Column("folderId") == folderId && slice.contains(Column("messageId")))
+            ))
+        }
+        return found
+    }
+}

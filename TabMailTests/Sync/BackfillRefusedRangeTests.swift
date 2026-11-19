@@ -5,7 +5,14 @@
 import Testing
 import Foundation
 import GRDB
+import SQLite3
+import Synchronization
 @testable import TabMail
+
+/// One-shot fault for `storedUIDReadFailureLeavesTheRangePending`: while
+/// `armed`, every read of `messageHeader.messageId` prepared on a READER
+/// connection is denied (the statement fails to prepare). Writers never get the authorizer, so inserts are unaffected.
+private let storedUIDReadFault = Mutex((armed: false, refused: 0))
 
 /// The IMAP UID walk and a range it cannot load:
 /// - a range whose SEARCH is refused is asked at most once per worker in a
@@ -94,8 +101,9 @@ struct BackfillRefusedRangeTests {
     }
 
     /// A stamped, non-favourite folder the walk resumes at `cursor`.
-    private static func insertWalkFolder(_ db: Database, path: String, accountId: String, cursor: Int) throws {
-        var folder = Folder(name: path, path: path, role: .custom, accountId: accountId)
+    private static func insertWalkFolder(_ db: Database, path: String, accountId: String, cursor: Int,
+                                         role: FolderRole = .custom) throws {
+        var folder = Folder(name: path, path: path, role: role, accountId: accountId)
         folder.isFavorite = false
         folder.backfillComplete = false
         folder.backfillUidCursor = cursor
@@ -110,7 +118,8 @@ struct BackfillRefusedRangeTests {
     private static func makeWorld(
         accountId: String, pool: DatabasePool,
         uids custom: [Int]? = nil, startCursor: Int? = nil,
-        otherFolder: (path: String, uids: [Int])? = nil
+        otherFolder: (path: String, uids: [Int])? = nil,
+        role: FolderRole = .custom
     ) async throws -> World {
         let path = "Receipts"
         let engine = SyncEngine()
@@ -125,7 +134,8 @@ struct BackfillRefusedRangeTests {
         try server.start()
         let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try await pool.write { db in
-            try Self.insertWalkFolder(db, path: path, accountId: accountId, cursor: startCursor ?? rangeCount * chunk)
+            try Self.insertWalkFolder(db, path: path, accountId: accountId, cursor: startCursor ?? rangeCount * chunk,
+                                      role: role)
             if let otherFolder {
                 try Self.insertWalkFolder(db, path: otherFolder.path, accountId: accountId,
                                           cursor: otherFolder.uids.max() ?? 0)
@@ -505,4 +515,102 @@ struct BackfillRefusedRangeTests {
         #expect(try world.row().backfillComplete, "the folder did not complete once the message loaded")
         #expect(try world.local().contains(tooLarge))
     }
+
+    // MARK: - Stored headers below a pending range
+
+    /// A range left pending holds the cursor above it, so every later call
+    /// walks again each range below it. Those ranges' messages are stored:
+    /// their headers must not be downloaded again. Inbox and Sent, and with
+    /// the old cc/bcc fill key on and off (the key must not matter).
+    @Test("Stored headers below a pending range are not fetched again; a new message there is the only one fetched",
+          arguments: [FolderRole.inbox, FolderRole.sent], [true, false])
+    func storedHeadersAreNotFetchedAgainBelowAPendingRange(_ role: FolderRole, _ ccBccFlag: Bool) async throws {
+        let ccBccKey = "ccBccBackfillDone"
+        let saved = UserDefaults.standard.object(forKey: ccBccKey)
+        defer { UserDefaults.standard.set(saved, forKey: ccBccKey) }
+        UserDefaults.standard.set(ccBccFlag, forKey: ccBccKey)
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let world = try await Self.makeWorld(accountId: "stored-below-\(role.rawValue)-\(ccBccFlag)", pool: pool, role: role)
+        defer { Self.tearDown(world) }
+        let refused = Self.range(0, chunk: world.chunk)
+        world.server.failEveryCommand(
+            containing: "UID \(refused.lowerBound):\(refused.upperBound)", message: Self.refusalText)
+
+        #expect(await Self.callEnds(world))
+        let below = Set(world.uids.filter { !refused.contains($0) })
+        let loaded = try world.local()
+        #expect(loaded == below, "precondition: the ranges below the refused one loaded (\(loaded.sorted()))")
+        #expect(!(try world.row()).backfillComplete, "precondition: the refused range is pending")
+
+        let mark = world.server.recordedCommands().count
+        #expect(await Self.callEnds(world))
+        #expect(await Self.callEnds(world))
+        let refetched = Self.fetches(world.server.recordedCommands().dropFirst(mark)).reduce(Set<Int>()) { $0.union($1) }
+        #expect(refetched.isEmpty, "stored headers were downloaded again: \(refetched.sorted())")
+        #expect(try world.local() == loaded)
+
+        // A new message inside a lower range is the only one fetched.
+        let lower = Self.range(Self.rangeCount - 2, chunk: world.chunk)
+        let newUID = try #require(lower.first { !world.uids.contains($0) })
+        world.server.setMessages(world.server.messages(in: world.path) + [Self.message(uid: newUID)], in: world.path)
+        let mark2 = world.server.recordedCommands().count
+        #expect(await Self.callEnds(world))
+        let fetchedNow = Self.fetches(world.server.recordedCommands().dropFirst(mark2)).reduce(Set<Int>()) { $0.union($1) }
+        #expect(fetchedNow == [newUID], "fetched \(fetchedNow.sorted()), expected only the new UID \(newUID)")
+        #expect(try world.local() == loaded.union([newUID]))
+    }
+
+    // MARK: - The stored-UID read fails
+
+    /// The read of which SEARCHed UIDs the folder stores (before the FETCH)
+    /// fails for the whole call: nothing is FETCHed or confirmed, the folder
+    /// does not complete, the walk's position claims no missing mail, and the
+    /// next call loads everything. (Denying only the first read let another
+    /// worker reload the failed range in the same call.)
+    @Test("A failed stored-UID read leaves its range unfetched and pending; the next call loads it")
+    func storedUIDReadFailureLeavesTheRangePending() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        config.prepareDatabase { db in
+            guard db.configuration.readonly, let conn = db.sqliteConnection else { return }
+            sqlite3_set_authorizer(conn, { _, action, table, column, _, _ in
+                guard action == SQLITE_READ, let table, let column,
+                      String(cString: table) == "messageHeader", String(cString: column) == "messageId"
+                else { return SQLITE_OK }
+                return storedUIDReadFault.withLock { state in
+                    guard state.armed else { return SQLITE_OK }
+                    state.refused += 1
+                    return SQLITE_DENY
+                }
+            }, nil)
+        }
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        defer { storedUIDReadFault.withLock { $0 = (false, 0) } }
+        let world = try await Self.makeWorld(accountId: "stored-read-fails", pool: pool)
+        defer { Self.tearDown(world) }
+        storedUIDReadFault.withLock { $0 = (true, 0) }
+
+        #expect(await Self.callEnds(world))
+        storedUIDReadFault.withLock { $0.armed = false }
+        #expect(storedUIDReadFault.withLock { $0.refused } >= 1, "precondition: the stored-UID read failed")
+        let fetched = Self.fetches(world.server.recordedCommands()[...]).reduce(Set<Int>()) { $0.union($1) }
+        #expect(fetched.isEmpty, "a range whose stored-UID read failed was FETCHed: \(fetched.sorted())")
+        let row = try world.row()
+        #expect(!row.backfillComplete, "the folder completed over a range that never loaded")
+        let claim = F.uidPositionClaimsMissingMail(row, local: try world.local(), server: world.uids)
+        #expect(claim == nil, "\(claim ?? "")")
+
+        #expect(await Self.callEnds(world))
+        #expect(try world.local() == Set(world.uids), "the next call did not load the range")
+        #expect(try world.row().backfillComplete)
+    }
 }
+

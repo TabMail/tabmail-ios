@@ -45,7 +45,6 @@ extension SyncEngine {
         case landed(
             inserted: Int,
             ftsRecords: [FTSHeaderRecord],
-            ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)],
             allLanded: Bool
         )
         /// At least one chunk's in-transaction CAS refused: the folder no longer
@@ -125,7 +124,6 @@ extension SyncEngine {
         return .landed(
             inserted: result.inserted,
             ftsRecords: result.ftsRecords,
-            ccBccFtsUpdates: result.ccBccFtsUpdates,
             allLanded: !result.failed
         )
     }
@@ -161,13 +159,13 @@ extension SyncEngine {
         isInInbox: Bool,
         observedEpoch: UInt32?,
         catchUpReadStartedAt: Date? = nil
-    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)], failed: Bool) {
+    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], failed: Bool) {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
             folderRole: folderRole, isInInbox: isInInbox, epochPremise: nil,
             observedEpoch: observedEpoch, catchUpReadStartedAt: catchUpReadStartedAt
         )
-        return (result.inserted, result.ftsRecords, result.ccBccFtsUpdates, result.failed)
+        return (result.inserted, result.ftsRecords, result.failed)
     }
 
     private func insertBackfillBatchGuardable(
@@ -180,8 +178,8 @@ extension SyncEngine {
         epochPremise: SyncEngine.CrawlEpochPremise?,
         observedEpoch: UInt32?,
         catchUpReadStartedAt: Date?
-    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)], refused: Bool, failed: Bool) {
-        guard !headers.isEmpty else { return (0, [], [], false, false) }
+    ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], refused: Bool, failed: Bool) {
+        guard !headers.isEmpty else { return (0, [], false, false) }
 
         let sourceBoundEpoch = observedEpoch.flatMap { epoch in
             epoch > 0 ? Int(exactly: epoch) : nil
@@ -190,7 +188,6 @@ extension SyncEngine {
         var count = 0
         var unreadInserted = 0
         var discoveredParents: [String] = []
-        var ccBccFtsUpdates: [(contentKey: ContentKey, cc: String, bcc: String)] = []
         var anyChunkRefused = false
         var anyChunkFailed = false
 
@@ -207,7 +204,7 @@ extension SyncEngine {
             let end = min(start + chunkSize, headers.count)
             let chunk = Array(headers[start..<end])
             do {
-                let result: (inserted: Int, unread: Int, fts: [FTSHeaderRecord], ccBcc: [(contentKey: ContentKey, cc: String, bcc: String)], parents: [String], refused: Bool) =
+                let result: (inserted: Int, unread: Int, fts: [FTSHeaderRecord], parents: [String], refused: Bool) =
                     try await AppDatabase.backgroundPool.write { db in
                         // THE C3 GUARD — re-read the folder row INSIDE this txn and
                         // compare it against the caller's premise. A chunk refused
@@ -221,7 +218,7 @@ extension SyncEngine {
                             if DebugModeManager.isLoggingEnabled() {
                                 print("[Backfill] \(folderId): skipping insert chunk — the folder no longer holds the UIDVALIDITY this pass premised")
                             }
-                            return (inserted: 0, unread: 0, fts: [], ccBcc: [], parents: [], refused: true)
+                            return (inserted: 0, unread: 0, fts: [], parents: [], refused: true)
                         }
                         // Load pending destructive IDs to skip messages with optimistic moves.
                         // Scoped to (accountId, folderPath) to prevent IMAP cross-folder UID collisions.
@@ -242,17 +239,16 @@ extension SyncEngine {
                              overAge: SyncEngine.catchUpReadIsOverAge(readStartedAt: readStartedAt, now: CatchUpWallClock.now()))
                         }
 
-                        // Existence check — one IN query (chunk <= chunkSize < SQLite's
-                        // ~999 bound-variable limit, so no sub-chunking needed).
-                        let incomingIds = chunk.map(\.messageId)
-                        let existingIds = try String.fetchSet(db,
-                            MessageHeader
-                                .select(Column("messageId"))
-                                .filter(Column("folderId") == folderId && incomingIds.contains(Column("messageId")))
-                        )
+                        // Existence check: the same predicate the IMAP UID walk
+                        // uses to drop stored UIDs before its FETCH.
+                        let existingIds = try MessageHeader.existingMessageIds(
+                            db, folderId: folderId, among: chunk.map(\.messageId))
 
                         var fts: [FTSHeaderRecord] = []
-                        var ccBcc: [(contentKey: ContentKey, cc: String, bcc: String)] = []
+                        // The inserted rows' In-Reply-To and Message-ID, for
+                        // reply discovery in both directions after the loop.
+                        var insertedInReplyTos: [String?] = []
+                        var insertedRfc822Ids: [String] = []
                         var inserted = 0
                         var unread = 0
                         // Ids this chunk has inserted. `existingIds` was read
@@ -264,7 +260,6 @@ extension SyncEngine {
                         // a repeated id is the same message: it is skipped.
                         var insertedIds = Set<String>()
 
-                        let needsCcBccBackfill = !UserDefaults.standard.bool(forKey: "ccBccBackfillDone")
                         for info in chunk {
                             // IOS-IMAP-001 / D3 — a message the server reports with
                             // `\Deleted` is NOT PRESENT for display (RFC 3501 §2.3.2:
@@ -288,23 +283,11 @@ extension SyncEngine {
                             // crawl must never delete as a side effect).
                             if info.isDeletedOnServer { continue }
                             if snapshot.destructive.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId) { continue }
-                            if existingIds.contains(info.messageId) {
-                                // v10 cc/bcc backfill: update existing messages with cc/bcc from server
-                                if needsCcBccBackfill && (!info.cc.isEmpty || !info.bcc.isEmpty) {
-                                    let headerId = "\(accountId):\(folderPath):\(info.messageId)"
-                                    try db.execute(
-                                        sql: "UPDATE messageHeader SET cc = ?, bcc = ? WHERE id = ?",
-                                        arguments: [info.cc, info.bcc, headerId]
-                                    )
-                                    // ⚠ STAGE E1: this list feeds `SearchIndex.updateCcBcc`,
-                                    // which addresses FTS rows — content-key space. The
-                                    // `UPDATE messageHeader … WHERE id = ?` two lines up
-                                    // keeps using the plain `headerId` (F2).
-                                    ccBcc.append((contentKey: ContentKey(rawValue: headerId),
-                                                  cc: info.cc, bcc: info.bcc))
-                                }
-                                continue
-                            }
+                            // A stored row is never read from its FETCH: the
+                            // UID walk does not FETCH it at all, and
+                            // `InsertBackfillBatchTests.existingRowsAreInert`
+                            // keeps the two in step.
+                            if existingIds.contains(info.messageId) { continue }
                             if let catchUpShield {
                                 if catchUpShield.overAge { continue }
                                 if SyncEngine.catchUpReadPredatesAction(
@@ -385,6 +368,8 @@ extension SyncEngine {
 
                             inserted += 1
                             if !info.isRead { unread += 1 }
+                            insertedInReplyTos.append(info.inReplyTo)
+                            if let rfc822 = header.rfc822MessageId { insertedRfc822Ids.append(rfc822) }
 
                             fts.append(FTSHeaderRecord(
                                 contentKey: ContentKey(rawValue: header.id),
@@ -400,20 +385,25 @@ extension SyncEngine {
                             ))
                         }
 
-                        // Sent-folder reply discovery — no-op when folderRole != .sent.
-                        let parents = try ReplyParentResolver.markParentsReplied(
-                            inReplyTos: chunk.map(\.inReplyTo),
+                        // Sent-folder reply discovery over the rows this chunk
+                        // inserted (a stored reply marked its parent when it was
+                        // inserted) — no-op when folderRole != .sent.
+                        var parents = try ReplyParentResolver.markParentsReplied(
+                            inReplyTos: insertedInReplyTos,
                             folderRole: folderRole,
                             accountId: accountId,
                             db: db
                         )
-                        return (inserted, unread, fts, ccBcc, parents, false)
+                        // The other direction: a parent inserted after its
+                        // reply was stored in Sent.
+                        parents += try ReplyParentResolver.markInsertedParentsOfStoredReplies(
+                            insertedRfc822Ids: insertedRfc822Ids, accountId: accountId, db: db)
+                        return (inserted, unread, fts, parents, false)
                     }
                 if result.refused { anyChunkRefused = true }
                 count += result.inserted
                 unreadInserted += result.unread
                 ftsRecords.append(contentsOf: result.fts)
-                ccBccFtsUpdates.append(contentsOf: result.ccBcc)
                 discoveredParents.append(contentsOf: result.parents)
             } catch {
                 anyChunkFailed = true
@@ -433,6 +423,6 @@ extension SyncEngine {
             }
         }
         ReplyParentResolver.postParentNotifications(discoveredParents)
-        return (count, ftsRecords, ccBccFtsUpdates, anyChunkRefused, anyChunkFailed)
+        return (count, ftsRecords, anyChunkRefused, anyChunkFailed)
     }
 }

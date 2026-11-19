@@ -132,6 +132,11 @@ actor UIDWalkCursor {
     /// are fully confirmed, not just claimed.
     var currentCursor: Int { confirmedCursor }
 
+    /// The confirmed cursor, read inside the actor. A local function reading
+    /// `currentCursor` across the actor boundary draws a spurious
+    /// "no 'async' operations" warning; a method call does not.
+    func confirmedCursorSnapshot() -> Int { confirmedCursor }
+
     /// Current chunk size (for logging).
     var currentChunkSize: Int { chunkSize }
 
@@ -230,8 +235,6 @@ extension SyncEngine {
                 WHERE bodyEmptyConfirmed = 1 OR bodyMetadataOversized = 1
                 """)
         }
-        // Reset cc/bcc backfill flag so existing messages get cc/bcc populated
-        UserDefaults.standard.set(false, forKey: "ccBccBackfillDone")
         BackgroundSyncLogger.logDebug("[SmartReindex] Crawl state reset — backfill will re-walk from top")
     }
 
@@ -331,12 +334,6 @@ extension SyncEngine {
                                 : 30
                             try? await Task.sleep(for: .seconds(sleepDelay))
                             continue
-                        }
-
-                        // Mark cc/bcc backfill done after first full crawl cycle completes
-                        if !UserDefaults.standard.bool(forKey: "ccBccBackfillDone") {
-                            UserDefaults.standard.set(true, forKey: "ccBccBackfillDone")
-                            BackgroundSyncLogger.logDebug("[Backfill] cc/bcc backfill marked complete for account \(accountId)")
                         }
 
                         // All folders walked — body fetch handled by BackfillBodyQueue

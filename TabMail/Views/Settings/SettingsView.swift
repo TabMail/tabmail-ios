@@ -661,10 +661,7 @@ struct SettingsView: View {
             BackgroundSyncLogger.logDebug("[NukeDB] Memory index reset failed after GRDB commit: \(error)")
             derivedIndexFailures.append("conversation memory")
         }
-        // 3. Reset sync-related UserDefaults
-        UserDefaults.standard.set(false, forKey: "ccBccBackfillDone")
-
-        // 4. Compact GRDB — checkpoint WAL then VACUUM to reclaim disk space
+        // 3. Compact GRDB — checkpoint WAL then VACUUM to reclaim disk space
         do {
             try await AppDatabase.dbPool.writeWithoutTransaction { db in
                 try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
@@ -676,7 +673,7 @@ struct SettingsView: View {
         }
         BackgroundSyncLogger.logDebug("[NukeDB] Deleted all email data from GRDB")
 
-        // 5. Delete FTS database
+        // 4. Delete FTS database
         do {
             try await SearchIndex.shared.resetAll()
             BackgroundSyncLogger.logDebug("[NukeDB] Reset FTS database")
@@ -697,7 +694,7 @@ struct SettingsView: View {
         await BodyAssetMaintenance.pruneOrphans()
         BackgroundSyncLogger.logDebug("[NukeDB] Pruned BodyAssetStore orphans")
 
-        // 6. `defer` restarts sync — fresh backfill from top — on every exit.
+        // 5. `defer` restarts sync — fresh backfill from top — on every exit.
         BackgroundSyncLogger.logDebug("[NukeDB] Sync restarted — backfill will re-walk all folders")
     }
 

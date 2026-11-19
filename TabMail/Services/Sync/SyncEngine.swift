@@ -908,12 +908,16 @@ actor SyncEngine {
                 }
 
                 // Sent-folder reply discovery — no-op when folder.role != .sent.
-                let discovered = try ReplyParentResolver.markParentsReplied(
+                var discovered = try ReplyParentResolver.markParentsReplied(
                     inReplyTos: headers.map(\.inReplyTo),
                     folderRole: folder.role,
                     accountId: folder.accountId,
                     db: db
                 )
+                // The other direction: an inserted parent whose reply is already stored in Sent.
+                discovered += try ReplyParentResolver.markInsertedParentsOfStoredReplies(
+                    insertedRfc822Ids: inserted.compactMap(\.rfc822MessageId),
+                    accountId: folder.accountId, db: db)
 
                 return (inserted, discovered)
             }

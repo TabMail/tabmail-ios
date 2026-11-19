@@ -643,6 +643,9 @@ extension SyncEngine {
         // Sent-folder reply discovery; a no-op for any other folder.
         result.discoveredParents += try ReplyParentResolver.markParentsReplied(
             inReplyTos: [info.inReplyTo], folderRole: folder.role, accountId: accountId, db: db)
+        // The other direction: this row is a parent whose reply is already stored in Sent.
+        result.discoveredParents += try ReplyParentResolver.markInsertedParentsOfStoredReplies(
+            insertedRfc822Ids: header.rfc822MessageId.map { [$0] } ?? [], accountId: accountId, db: db)
         return true
     }
 }

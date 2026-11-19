@@ -978,13 +978,12 @@ extension SyncEngine {
         // hold and nothing a guard could compare. That overload
         // has no refusal channel to discard (round 13 blocker 3),
         // so this call site cannot silently swallow one.
-        let (inserted, ftsRecords, ccBccUpdates, chunkFailed) = await insertBackfillBatch(
+        let (inserted, ftsRecords, chunkFailed) = await insertBackfillBatch(
             headers, folderId: folder.id, accountId: folder.accountId,
             folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
             observedEpoch: nil, catchUpReadStartedAt: catchUpReadStartedAt
         )
         if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }
-        if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }
 
         // Step 2: Write bodies to FTS for inserted messages.
         // Match body data to headerIds using ftsRecords (which have headerId + messageId).
@@ -1734,6 +1733,44 @@ extension SyncEngine {
                                     return imapProvider.lastObservedUidValidity(
                                         folderPath: folderCaptured.path) == expectedEpoch
                                 }
+                                // Confirm a range that holds nothing to load: its
+                                // SEARCH found no UID, or only UIDs the folder
+                                // stores. Advances the cursor like any confirmed
+                                // range.
+                                func confirmRangeWithNothingToLoad(_ range: (from: Int, to: Int)) async {
+                                    await cursor.confirmRange(from: range.from, to: range.to)
+                                    if await lastProgressUpdate.shouldUpdate() {
+                                        let snapshotCursor = await cursor.confirmedCursorSnapshot()
+                                        try? await AppDatabase.backgroundPool.write { db in
+                                            // NB2/NB4: guarded like every other
+                                            // bookkeeping write this walk makes,
+                                            // and re-read INSIDE the txn — the
+                                            // `storedEpoch` snapshot this pass
+                                            // gated on was taken before the
+                                            // walk-start round trip and can be
+                                            // minutes stale by now. Round 12
+                                            // (NB3): the skews are nil → stamped
+                                            // AND stamped → nil (the clearer
+                                            // `resetEmptyFolderCrawlEpoch`), and
+                                            // BOTH fail open under an
+                                            // epoch comparison — hence the CAS.
+                                            // Also compare-and-set on the walk
+                                            // position: a reset or a second walker
+                                            // landing during this range's SEARCH
+                                            // is never overwritten.
+                                            guard try Self.writeUIDWalkPosition(
+                                                db, folderId: folderCaptured.id, premiseEpoch: walkWritePremise,
+                                                position: position, [Column("backfillUidCursor").set(to: snapshotCursor)]
+                                            ) else {
+                                                if DebugModeManager.isLoggingEnabled() {
+                                                    print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder no longer holds the UIDVALIDITY this pass premised or its walk position moved")
+                                                }
+                                                return
+                                            }
+                                        }
+                                        await self.updateBackfillProgressForAccount(accountCaptured)
+                                    }
+                                }
                                 while let range = await cursor.nextRange() {
                                     guard !Task.isCancelled else {
                                         // Cancelled — return range for retry next cycle
@@ -1800,51 +1837,40 @@ extension SyncEngine {
                                         break
                                     }
 
-                                    if existingUIDs.isEmpty {
-                                        // No messages in this range — confirmed empty, safe to advance
-                                        await cursor.confirmRange(from: range.from, to: range.to)
-                                        if await lastProgressUpdate.shouldUpdate() {
-                                            let snapshotCursor = await cursor.currentCursor
-                                            try? await AppDatabase.backgroundPool.write { db in
-                                                // NB2/NB4: guarded like every other
-                                                // bookkeeping write this walk makes,
-                                                // and re-read INSIDE the txn — the
-                                                // `storedEpoch` snapshot this pass
-                                                // gated on was taken before the
-                                                // walk-start round trip and can be
-                                                // minutes stale by now. Round 12
-                                                // (NB3): the skews are nil → stamped
-                                                // AND stamped → nil (the clearer
-                                                // `resetEmptyFolderCrawlEpoch`), and
-                                                // BOTH fail open under an
-                                                // epoch comparison — hence the CAS.
-                                                // Also compare-and-set on the walk
-                                                // position: a reset or a second walker
-                                                // landing during this range's SEARCH
-                                                // is never overwritten.
-                                                guard try Self.writeUIDWalkPosition(
-                                                    db, folderId: folderCaptured.id, premiseEpoch: walkWritePremise,
-                                                    position: position, [Column("backfillUidCursor").set(to: snapshotCursor)]
-                                                ) else {
-                                                    if DebugModeManager.isLoggingEnabled() {
-                                                        print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder no longer holds the UIDVALIDITY this pass premised or its walk position moved")
-                                                    }
-                                                    return
-                                                }
-                                            }
-                                            await self.updateBackfillProgressForAccount(accountCaptured)
+                                    // Drop the UIDs the folder already stores: the
+                                    // insert would skip them, and it never reads a
+                                    // stored row's FETCH (`existingRowsAreInert`).
+                                    // Read after the epoch check above, with the
+                                    // insert's own existence predicate.
+                                    let uidsToFetch: [UInt32]
+                                    do {
+                                        // An empty SEARCH answer needs no read.
+                                        let stored: Set<String> = existingUIDs.isEmpty ? [] : try await AppDatabase.backgroundPool.read { db in
+                                            try MessageHeader.existingMessageIds(
+                                                db, folderId: folderCaptured.id, among: existingUIDs.map(String.init))
                                         }
+                                        uidsToFetch = existingUIDs.filter { !stored.contains(String($0)) }
+                                    } catch {
+                                        await cursor.failRange(from: range.from, to: range.to)
+                                        outcome.stoppedOnFailure = true
+                                        BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) stored-UID read failed: \(error)")
+                                        break
+                                    }
+
+                                    if uidsToFetch.isEmpty {
+                                        // No messages to load in this range — confirmed, safe to advance
+                                        await confirmRangeWithNothingToLoad((from: range.from, to: range.to))
                                         continue
                                     }
 
-                                    BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH found \(existingUIDs.count) UIDs in \(range.from)...\(range.to)")
+                                    BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH found \(existingUIDs.count) UIDs in \(range.from)...\(range.to), \(uidsToFetch.count) not stored")
 
                                     // FETCH only the existing UIDs
                                     let fetched: (messages: [MessageHeaderInfo], observedEpoch: UInt32?)
                                     do {
                                         fetched = try await workQueue.execute(priority: .headerFetch) {
                                             try await imapProvider.fetchMessageHeadersWithObservedEpoch(
-                                                folder: folderCaptured.path, uids: existingUIDs,
+                                                folder: folderCaptured.path, uids: uidsToFetch,
                                                 batchSize: batchSize, interBatchDelay: interBatchDelay
                                             )
                                         }
@@ -1920,7 +1946,7 @@ extension SyncEngine {
                                         // tuple member, so this leg cannot be skipped by
                                         // omission — `break` inside `guard else` targets
                                         // the `while` (a `switch` would have swallowed it).
-                                        guard case .landed(let inserted, let ftsRecords, let ccBccUpdates, let allLanded) =
+                                        guard case .landed(let inserted, let ftsRecords, let allLanded) =
                                             await self.insertBackfillBatch(
                                                 fetchedHeaders, folderId: folderCaptured.id, accountId: folderCaptured.accountId,
                                                 folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox,
@@ -1936,7 +1962,6 @@ extension SyncEngine {
                                             break
                                         }
                                         if !ftsRecords.isEmpty { await self.indexHeadersForFTS(ftsRecords) }
-                                        if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }
                                         if inserted > 0 {
                                             outcome.didWork = true
                                             await BackfillBodyQueue.shared.enqueueItems(
@@ -2264,18 +2289,7 @@ extension SyncEngine {
 
                     // Dedup returned IDs against DB
                     let missingIds: [String] = try await dbPool.read { db in
-                        let sqlChunkSize = SyncConfig.sqlChunkSize
-                        var existingIds = Set<String>()
-                        for start in stride(from: 0, to: pageIds.count, by: sqlChunkSize) {
-                            let end = min(start + sqlChunkSize, pageIds.count)
-                            let chunk = Array(pageIds[start..<end])
-                            let found = try String.fetchSet(db,
-                                MessageHeader
-                                    .select(Column("messageId"))
-                                    .filter(Column("folderId") == folder.id && chunk.contains(Column("messageId")))
-                            )
-                            existingIds.formUnion(found)
-                        }
+                        let existingIds = try MessageHeader.existingMessageIds(db, folderId: folder.id, among: pageIds)
                         return pageIds.filter { !existingIds.contains($0) }
                     }
 

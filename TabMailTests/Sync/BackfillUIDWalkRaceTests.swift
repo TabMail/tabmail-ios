@@ -189,9 +189,6 @@ struct BackfillUIDWalkRaceTests {
         }
     }
 
-    /// Smart Reindex clears this process-wide flag; the tests put it back.
-    private static let ccBccKey = "ccBccBackfillDone"
-
     // MARK: - (1) A user reset lands while a walker is mid-batch
 
     /// The walker resumes mid-walk (cursor 10, UID 12 above it already
@@ -205,8 +202,6 @@ struct BackfillUIDWalkRaceTests {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         defer { F.clearWalkCheckpoints() }
-        let savedCcBcc = UserDefaults.standard.object(forKey: Self.ccBccKey)
-        defer { UserDefaults.standard.set(savedCcBcc, forKey: Self.ccBccKey) }
 
         let walk = try await Self.makeWalk(
             accountId: "uid-race-reset-\(reset)", serverUIDs: [3, 7, 12], cursor: 10, localUIDs: [12], pool: pool)
@@ -248,8 +243,6 @@ struct BackfillUIDWalkRaceTests {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         defer { F.clearWalkCheckpoints() }
-        let savedCcBcc = UserDefaults.standard.object(forKey: Self.ccBccKey)
-        defer { UserDefaults.standard.set(savedCcBcc, forKey: Self.ccBccKey) }
 
         let walk = try await Self.makeWalk(
             accountId: "uid-race-replant-\(reset)", serverUIDs: [150, 2500], cursor: nil, localUIDs: [], pool: pool)
@@ -444,8 +437,6 @@ struct BackfillUIDWalkRaceTests {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         defer { F.clearWalkCheckpoints() }
-        let savedCcBcc = UserDefaults.standard.object(forKey: Self.ccBccKey)
-        defer { UserDefaults.standard.set(savedCcBcc, forKey: Self.ccBccKey) }
 
         let walk = try await Self.makeWalk(
             accountId: "uid-race-empty-range-\(reset)", serverUIDs: [Self.aboveCursor],
@@ -474,8 +465,6 @@ struct BackfillUIDWalkRaceTests {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         defer { F.clearWalkCheckpoints() }
-        let savedCcBcc = UserDefaults.standard.object(forKey: Self.ccBccKey)
-        defer { UserDefaults.standard.set(savedCcBcc, forKey: Self.ccBccKey) }
 
         let walk = try await Self.makeWalk(
             accountId: "uid-race-empty-mailbox-\(reset)", serverUIDs: [], cursor: nil, localUIDs: [], pool: pool)
@@ -509,8 +498,6 @@ struct BackfillUIDWalkRaceTests {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         defer { F.clearWalkCheckpoints() }
-        let savedCcBcc = UserDefaults.standard.object(forKey: Self.ccBccKey)
-        defer { UserDefaults.standard.set(savedCcBcc, forKey: Self.ccBccKey) }
 
         let walk = try await Self.makeWalk(
             accountId: "uid-race-walk-end-\(reset)", serverUIDs: [Self.aboveCursor],
@@ -600,8 +587,6 @@ struct BackfillUIDWalkRaceTests {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         defer { F.clearWalkCheckpoints() }
-        let savedCcBcc = UserDefaults.standard.object(forKey: Self.ccBccKey)
-        defer { UserDefaults.standard.set(savedCcBcc, forKey: Self.ccBccKey) }
 
         let walk = try await Self.makeWalk(
             accountId: "uid-race-rolled-back-\(reset)", serverUIDs: [Self.aboveCursor],
