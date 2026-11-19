@@ -143,7 +143,8 @@ struct UndoableAction {
         originalFolderId: String,
         originalFolderPath: String,
         accountId: String,
-        timestamp: Date
+        timestamp: Date,
+        destinationPaths: [String: String] = [:]
     ) {
         self.id = id
         self.type = type
@@ -154,11 +155,28 @@ struct UndoableAction {
         self.timestamp = timestamp
         switch type {
         case .move(_, let destinationPath):
-            self.commands = [UndoAccountCommand(
-                accountId: accountId,
-                forwardDestinationPath: destinationPath,
-                members: messages.map(UndoMember.init(header:))
-            )]
+            // One command per source folder and epoch: `AccountManager.undoMove` moves a command's
+            // members back to ONE source, so a move from several folders (a whole chat) undoes as
+            // one entry whose commands each restore their own folder. A source folder belongs to
+            // one account, so each command names its members' account and, from
+            // `destinationPaths` (by account; a move across accounts sends each email to its own
+            // account's folder), where they went.
+            var commands: [UndoAccountCommand] = []
+            var commandIndex: [String: Int] = [:]
+            for header in messages {
+                let member = UndoMember(header: header)
+                let key = "\(member.sourceFolderId)|\(member.sourceObservedUidValidity.map(String.init) ?? "-")"
+                if let index = commandIndex[key] {
+                    commands[index].members.append(member)
+                } else {
+                    commandIndex[key] = commands.count
+                    commands.append(UndoAccountCommand(
+                        accountId: header.accountId,
+                        forwardDestinationPath: destinationPaths[header.accountId] ?? destinationPath,
+                        members: [member]))
+                }
+            }
+            self.commands = commands
         }
     }
 
@@ -169,6 +187,44 @@ struct UndoableAction {
         case .move:
             return "Moved \(count) \(noun)"
         }
+    }
+}
+
+/// A move of emails that can span accounts (a chat, a unified-inbox thread): each account's emails
+/// go to that account's folder, and the whole move is ONE undo entry (memory 061). The one place
+/// both view models group a move by account and build its undo entry.
+extension UndoableAction {
+    /// One account's share of a move: its emails and the folder path in that account they go to.
+    struct AccountShare {
+        let messages: [MessageHeader]
+        let toPath: String
+    }
+
+    /// `messages` by account, in the order the accounts first appear, each email once.
+    static func byAccount(_ messages: [MessageHeader]) -> [[MessageHeader]] {
+        var seen = Set<String>()
+        var accounts: [String] = []
+        var members: [String: [MessageHeader]] = [:]
+        for message in messages where seen.insert(message.id).inserted {
+            if members[message.accountId] == nil { accounts.append(message.accountId) }
+            members[message.accountId, default: []].append(message)
+        }
+        return accounts.compactMap { members[$0] }
+    }
+
+    /// The one undo entry for a move of every share: Undo puts each email back from its own
+    /// account's folder to its own source folder. Nil when no share has an email.
+    static func move(_ shares: [AccountShare]) -> UndoableAction? {
+        let messages = shares.flatMap(\.messages)
+        guard let first = messages.first, let firstPath = shares.first(where: { !$0.messages.isEmpty })?.toPath else { return nil }
+        return UndoableAction(
+            type: .move(fromPath: first.folderPath, toPath: firstPath), messages: messages,
+            originalFolderId: first.folderId,
+            originalFolderPath: first.folderPath,
+            accountId: first.accountId, timestamp: Date(),
+            destinationPaths: Dictionary(
+                shares.compactMap { share in share.messages.first.map { ($0.accountId, share.toPath) } },
+                uniquingKeysWith: { kept, _ in kept }))
     }
 }
 

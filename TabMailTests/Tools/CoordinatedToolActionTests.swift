@@ -114,6 +114,44 @@ struct CoordinatedToolActionTests {
 
     // MARK: - (1) Basic archive
 
+    @Test("A coordinated Archive uses the mark-as-read setting as it was when the action started, even if it changes before the queued work runs",
+          arguments: [true, false])
+    func markReadSettingIsTheOneAtTheStart(onAtStart: Bool) async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        let header = makeDurableHeader(folder: inbox, messageId: "m-setting-at-start")
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+        let id = header.id
+
+        // Hold the write queue so the action's queued work runs only after the setting changes.
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        defer { gate.finish() }
+        await AccountManager.shared.enqueueWrite {
+            var iterator = gateStream.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+        let action = Task {
+            await AccountManager.shared.performCoordinatedRoleMove(ids: [id], role: .archive, expectedIdentities: [:])
+        }
+        // The action has started once its overlay entry shows (bounded wait).
+        var started = false
+        for _ in 0..<400 where !started {
+            started = AccountManager.shared.snapshotOverlay()[id] != nil
+            if !started { try? await Task.sleep(for: .milliseconds(5)) }
+        }
+        #expect(started)
+        UserDefaults.standard.set(!onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        gate.finish()
+        _ = await action.value
+        await drainWriteQueue()
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: id) }
+        #expect(final?.folderPath == archive.path)
+        #expect(final?.isRead == onAtStart, "the read state follows the setting as it was when the action started")
+    }
+
     @Test("performCoordinatedRoleMove archives a message: row moves to Archive, ONE .move PendingOperation is queued, and the overlay refcount/entry fully drain")
     func basicArchiveMovesRowAndDrainsOverlay() async throws {
         let (pool, inbox, archive, _, dir, previous) = try makeTestDB()

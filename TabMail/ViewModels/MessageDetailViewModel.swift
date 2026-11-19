@@ -34,6 +34,13 @@ final class MessageDetailViewModel {
     /// opened email's included. Shown nowhere; the chat acts on them with the email it shows.
     private(set) var threadCopies: [MessageHeader] = []
 
+    /// Every row the chat loaded: the opened email, the thread's emails and their copies. A
+    /// whole-chat action acts on exactly these, each by its own id, never on whatever else shares
+    /// a Message-ID (ADR-IOS-068 D4).
+    var chatRows: [MessageHeader] {
+        (message.map { [$0] } ?? []) + threadMessages + threadCopies
+    }
+
     /// Guards against concurrent/duplicate `loadBody()` calls.
     /// `.task` and `.onAppear` both call `loadBody()` — the first caller wins.
     @ObservationIgnored private var loadBodyCalled = false
@@ -1800,40 +1807,36 @@ final class MessageDetailViewModel {
     /// message is already in it) — callers must not dismiss/flash in that case.
     @discardableResult
     func archiveMessage(_ msg: MessageHeader) -> Bool {
+        archiveMessages([msg])
+    }
+
+    /// Archives emails that share one folder (a chat's members, or one email) as ONE action: one
+    /// undo entry and one queued move, as `InboxViewModel.archiveThread` does for a collapsed row.
+    /// Returns false when nothing was recorded — callers must not dismiss/flash in that case.
+    @discardableResult
+    func archiveMessages(_ msgs: [MessageHeader]) -> Bool {
+        guard let first = msgs.first else { return false }
         // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
         // move. Role check first — accounts can carry more than one folder of
         // the same role (e.g. iCloud "Trash" + "Deleted Messages") and the
         // canonical lookup below is fetchOne-arbitrary among them.
-        guard lookupFolderRole(msg.folderId) != .archive,
-              lookupFolderRole(msg.folderId) != .drafts else {
-            BackgroundSyncLogger.logInbox("[NoOpGuard] detail archiveMessage suppressed — already archived: \(msg.id)")
+        guard lookupFolderRole(first.folderId) != .archive,
+              lookupFolderRole(first.folderId) != .drafts else {
+            BackgroundSyncLogger.logInbox("[NoOpGuard] detail archiveMessage suppressed — already archived: \(first.id)")
             return false
         }
-        guard let archiveFolder = lookupFolder(accountId: msg.accountId, role: .archive) else {
-            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Queue] ERROR: no archive folder for account \(msg.accountId)") }
+        guard let archiveFolder = lookupFolder(accountId: first.accountId, role: .archive) else {
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Queue] ERROR: no archive folder for account \(first.accountId)") }
             return false
         }
-        guard msg.folderPath != archiveFolder.path else { return false }
-        UndoService.shared.push(UndoableAction(
-            type: .move(fromPath: msg.folderPath, toPath: archiveFolder.path), messages: [msg],
-            originalFolderId: msg.folderId,
-            originalFolderPath: msg.folderPath,
-            accountId: msg.accountId, timestamp: Date()
-        ))
-        manager.retainOverlayEntry(id: msg.id)
-        // Archive's destination is never the inbox (guarded above), so
-        // `msg.isInInbox` alone determines "leaving the inbox" (F6) — clears
+        guard first.folderPath != archiveFolder.path else { return false }
+        // Archive's destination is never the inbox (guarded above), so each
+        // member's `isInInbox` alone determines "leaving the inbox" (F6) — clears
         // the tag in the overlay so the mid-drain window doesn't flash it.
         // `isRead` rides the same coalesced entry (mark-as-read-on-archive/
-        // delete, default ON) — see `InboxViewModel.archive(_:)`. `nil` when
-        // the setting is off ⇒ the field is skipped entirely.
-        manager.registerMutation(id: msg.id, mutation: .init(
-            isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
-            folderId: archiveFolder.id,
-            actionTag: msg.isInInbox ? .some(nil) : nil))
-        markReadOnArchiveDeleteInMemory(msg)
-        enqueueMove(msg, to: archiveFolder.path, markReadFirst: true)
-        updateThreadMessageFolder(msg, newFolderPath: archiveFolder.path, newFolderId: archiveFolder.id)
+        // delete, default ON) — see `InboxViewModel.archive(_:)`.
+        recordMove([MoveGroup(msgs: msgs, toPath: archiveFolder.path, toFolderId: archiveFolder.id,
+                              destIsInbox: false)], roleMove: true)
         return true
     }
 
@@ -1843,8 +1846,9 @@ final class MessageDetailViewModel {
     /// primary `message` when it is the one being acted on, and the matching
     /// thread card, which `updateThreadMessageFolder` deliberately KEEPS
     /// VISIBLE after an archive/delete (it only relabels its location).
+    /// Called only when the action's own snapshot of the setting is on.
     private func markReadOnArchiveDeleteInMemory(_ msg: MessageHeader) {
-        guard AccountManager.markReadOnArchiveDeleteEnabled, !msg.isRead else { return }
+        guard !msg.isRead else { return }
         if msg.id == message?.id { message?.isRead = true }
         if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
             threadMessages[idx].isRead = true
@@ -1855,61 +1859,98 @@ final class MessageDetailViewModel {
     /// message is already in it) — callers must not dismiss/flash in that case.
     @discardableResult
     func deleteMessage(_ msg: MessageHeader) -> Bool {
+        deleteMessages([msg])
+    }
+
+    /// Deletes emails that share one folder as ONE action — see `archiveMessages(_:)`.
+    @discardableResult
+    func deleteMessages(_ msgs: [MessageHeader]) -> Bool {
+        guard let first = msgs.first else { return false }
         if DebugModeManager.isLoggingEnabled() {
-            var effective = msg
-            applyOverlay(to: &effective)
-            let rawRole = lookupFolderRole(msg.folderId)?.rawValue ?? "<unknown>"
-            let effectiveRole = lookupFolderRole(effective.folderId)?.rawValue
-                ?? "<unknown>"
-            BackgroundSyncLogger.logInbox(
-                "[RoleActionTrace] detail action=delete phase=received id=\(msg.id) "
-                    + "raw={folderId=\(msg.folderId) folderPath=\(msg.folderPath) role=\(rawRole)} "
-                    + "effective={folderId=\(effective.folderId) "
-                    + "folderPath=\(effective.folderPath) role=\(effectiveRole)} "
-                    + manager.roleActionOverlayDiagnostic(id: msg.id))
+            for msg in msgs {
+                var effective = msg
+                applyOverlay(to: &effective)
+                let rawRole = lookupFolderRole(msg.folderId)?.rawValue ?? "<unknown>"
+                let effectiveRole = lookupFolderRole(effective.folderId)?.rawValue
+                    ?? "<unknown>"
+                BackgroundSyncLogger.logInbox(
+                    "[RoleActionTrace] detail action=delete phase=received id=\(msg.id) "
+                        + "raw={folderId=\(msg.folderId) folderPath=\(msg.folderPath) role=\(rawRole)} "
+                        + "effective={folderId=\(effective.folderId) "
+                        + "folderPath=\(effective.folderPath) role=\(effectiveRole)} "
+                        + manager.roleActionOverlayDiagnostic(id: msg.id))
+            }
         }
-        AccountManager.logDeleteTrace(accountId: msg.accountId, messages: [msg], callSite: "MessageDetailViewModel.deleteMessage")
+        AccountManager.logDeleteTrace(accountId: first.accountId, messages: msgs, callSite: "MessageDetailViewModel.deleteMessage")
         // Delete-from-Trash is a no-op: no undo entry, no overlay, no queued
-        // move. Role check first — see archiveMessage for why.
-        guard lookupFolderRole(msg.folderId) != .trash else {
+        // move. Role check first — see archiveMessages for why.
+        guard lookupFolderRole(first.folderId) != .trash else {
             BackgroundSyncLogger.logInbox(
                 "[RoleActionTrace] detail action=delete phase=refused "
-                    + "id=\(msg.id) reason=rawRole "
-                    + manager.roleActionOverlayDiagnostic(id: msg.id))
-            BackgroundSyncLogger.logInbox("[NoOpGuard] detail deleteMessage suppressed — already in trash: \(msg.id)")
+                    + "id=\(first.id) reason=rawRole "
+                    + manager.roleActionOverlayDiagnostic(id: first.id))
+            BackgroundSyncLogger.logInbox("[NoOpGuard] detail deleteMessage suppressed — already in trash: \(first.id)")
             return false
         }
-        guard let trashFolder = lookupFolder(accountId: msg.accountId, role: .trash) else {
-            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Queue] ERROR: no trash folder for account \(msg.accountId)") }
+        guard let trashFolder = lookupFolder(accountId: first.accountId, role: .trash) else {
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Queue] ERROR: no trash folder for account \(first.accountId)") }
             return false
         }
-        guard msg.folderPath != trashFolder.path else { return false }
-        BackgroundSyncLogger.logInbox(
-            "[RoleActionTrace] detail action=delete phase=record "
-                + "id=\(msg.id) source=\(msg.folderPath) "
-                + "destination=\(trashFolder.path)")
-        UndoService.shared.push(UndoableAction(
-            type: .move(fromPath: msg.folderPath, toPath: trashFolder.path), messages: [msg],
-            originalFolderId: msg.folderId,
-            originalFolderPath: msg.folderPath,
-            accountId: msg.accountId, timestamp: Date()
-        ))
-        manager.retainOverlayEntry(id: msg.id)
+        guard first.folderPath != trashFolder.path else { return false }
+        for msg in msgs {
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] detail action=delete phase=record "
+                    + "id=\(msg.id) source=\(msg.folderPath) "
+                    + "destination=\(trashFolder.path)")
+        }
         // Delete's destination is never the inbox (guarded above), so
-        // `msg.isInInbox` alone determines "leaving the inbox" (F6).
-        // `isRead` rides the same coalesced entry — see `archiveMessage(_:)`.
-        manager.registerMutation(id: msg.id, mutation: .init(
-            isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
-            folderId: trashFolder.id,
-            actionTag: msg.isInInbox ? .some(nil) : nil))
-        BackgroundSyncLogger.logInbox(
-            "[RoleActionTrace] detail action=delete phase=overlayRecorded "
-                + "id=\(msg.id) "
-                + manager.roleActionOverlayDiagnostic(id: msg.id))
-        markReadOnArchiveDeleteInMemory(msg)
-        enqueueMove(msg, to: trashFolder.path, markReadFirst: true)
-        updateThreadMessageFolder(msg, newFolderPath: trashFolder.path, newFolderId: trashFolder.id)
+        // `isInInbox` alone determines "leaving the inbox" (F6).
+        // `isRead` rides the same coalesced entry — see `archiveMessages(_:)`.
+        recordMove([MoveGroup(msgs: msgs, toPath: trashFolder.path, toFolderId: trashFolder.id,
+                              destIsInbox: false)], roleMove: true)
+        for msg in msgs {
+            BackgroundSyncLogger.logInbox(
+                "[RoleActionTrace] detail action=delete phase=overlayRecorded "
+                    + "id=\(msg.id) "
+                    + manager.roleActionOverlayDiagnostic(id: msg.id))
+        }
         return true
+    }
+
+    /// One account's share of a move: its emails and the folder in that account they go to.
+    private struct MoveGroup {
+        let msgs: [MessageHeader]
+        let toPath: String
+        let toFolderId: String
+        let destIsInbox: Bool
+    }
+
+    /// The one recording shape shared by archive/delete/move: ONE undo entry for every email
+    /// (memory 061: a thread action is one grouped undo, never a loop of single actions), the
+    /// overlay, one queued move per group, then each card relabelled in place. One group per
+    /// account: a whole chat can span accounts, and each account's emails go to that account's
+    /// folder. `roleMove` selects mark-as-read-on-archive/delete (archive, delete); a move
+    /// to a user-CHOSEN folder is deliberately not in that scope — see
+    /// `AccountManager.markReadOnArchiveDeleteKey`.
+    private func recordMove(_ groups: [MoveGroup], roleMove: Bool) {
+        guard let undo = UndoableAction.move(groups.map { .init(messages: $0.msgs, toPath: $0.toPath) }) else { return }
+        UndoService.shared.push(undo)
+        let marksRead = roleMove && AccountManager.markReadOnArchiveDeleteEnabled
+        for group in groups {
+            for msg in group.msgs {
+                manager.retainOverlayEntry(id: msg.id)
+                manager.registerMutation(id: msg.id, mutation: .init(
+                    isRead: marksRead ? true : nil,
+                    folderId: group.toFolderId,
+                    actionTag: (msg.isInInbox && !group.destIsInbox) ? .some(nil) : nil))
+                if marksRead { markReadOnArchiveDeleteInMemory(msg) }
+            }
+            enqueueMove(group.msgs, to: group.toPath, markReadFirst: marksRead)
+            for msg in group.msgs {
+                updateThreadMessageFolder(msg, newFolderPath: group.toPath, newFolderId: group.toFolderId,
+                                          isInInbox: group.destIsInbox)
+            }
+        }
     }
 
     /// Update a thread message's folder info in-place after a move operation.
@@ -1953,23 +1994,28 @@ final class MessageDetailViewModel {
     /// round-9 defect, which shipped in three hand-kept copies; one helper
     /// keeps the protocol in lockstep).
     /// `markReadFirst` has NO DEFAULT on purpose: it selects the
-    /// mark-as-read-on-archive/delete composition, which is ON for the two
-    /// role-move callers (archive, delete) and OFF for the user-chosen-folder
-    /// move. A default would let a future caller silently pick one without the
+    /// mark-as-read-on-archive/delete composition. It is the action's own
+    /// snapshot, taken in `recordMove` as the action starts: on for archive and
+    /// delete while the setting was on then, always off for a move to a chosen
+    /// folder. A default would let a future caller silently pick one without the
     /// call site saying so — the same seam the `expectedIdentities` parameter
     /// on `performCoordinatedRoleMove` had to give up.
-    private func enqueueMove(_ msg: MessageHeader, to folderPath: String, markReadFirst: Bool) {
+    private func enqueueMove(_ msgs: [MessageHeader], to folderPath: String, markReadFirst: Bool) {
         let manager = manager
+        let ids = msgs.map(\.id)
         manager.enqueueWriteFromSynchronousContext { [weak self, manager] in
             // Read intent BEFORE the move, in this one closure — a move
             // changes the address the read op would have to name. See
             // `AccountManager.markReadBeforeRoleMove`.
-            if markReadFirst { await manager.markReadBeforeRoleMove(ids: [msg.id]) }
-            await manager.move([msg], to: folderPath)
-            manager.releaseOverlayEntry(id: msg.id)
-            await self?.completeLocalMove(msg.id)
+            await manager.markReadBeforeRoleMove(ids: ids, enabled: markReadFirst)
+            await manager.move(msgs, to: folderPath)
+            for id in ids {
+                manager.releaseOverlayEntry(id: id)
+                await self?.completeLocalMove(id)
+            }
         }
     }
+
 
     /// Ends a bubble move's pin window — called INSIDE the archive/delete/move
     /// `enqueueWrite` closures once THIS move op has fully executed (the
@@ -1998,10 +2044,7 @@ final class MessageDetailViewModel {
 
     /// True when the given folder path is the account's Inbox (role-based, not name-based).
     private func isInboxFolder(accountId: String, path: String) -> Bool {
-        let role = try? dbPool.read { db in
-            try Folder.filter(Column("accountId") == accountId && Column("path") == path).fetchOne(db)?.role
-        }
-        return role == .inbox
+        lookupFolder(accountId: accountId, path: path)?.role == .inbox
     }
 
     /// Returns false when nothing was recorded (no focused message) — callers
@@ -2017,28 +2060,100 @@ final class MessageDetailViewModel {
     /// flash then. See `archiveMessage(_:)` for the full contract.
     @discardableResult
     func moveMessage(_ msg: MessageHeader, toFolderPath: String) -> Bool {
-        guard lookupFolderRole(msg.folderId) != .drafts else { return false }
-        let destFolderId = "\(msg.accountId):\(toFolderPath)"
-        // Generic move: destination CAN be the inbox — reuse the same
-        // dest-is-inbox lookup `updateThreadMessageFolder` below already
-        // needs, combined with the source's isInInbox (F6).
-        let destIsInbox = isInboxFolder(accountId: msg.accountId, path: toFolderPath)
-        manager.retainOverlayEntry(id: msg.id)
-        manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId, actionTag: (msg.isInInbox && !destIsInbox) ? .some(nil) : nil))
-        UndoService.shared.push(UndoableAction(
-            type: .move(fromPath: msg.folderPath, toPath: toFolderPath), messages: [msg],
-            originalFolderId: msg.folderId,
-            originalFolderPath: msg.folderPath,
-            accountId: msg.accountId, timestamp: Date()
-        ))
-        // A move to a user-CHOSEN folder is deliberately NOT in the
-        // mark-as-read-on-archive/delete scope — see
-        // `AccountManager.markReadOnArchiveDeleteKey`.
-        enqueueMove(msg, to: toFolderPath, markReadFirst: false)
-        updateThreadMessageFolder(
-            msg, newFolderPath: toFolderPath, newFolderId: destFolderId,
-            isInInbox: destIsInbox
-        )
+        moveMessages([msg], toFolderPath: toFolderPath)
+    }
+
+    /// Which rows of a chat a whole-chat action takes, decided per row from the snapshot's own
+    /// folder (ADR-IOS-114 decision 12). A folder role only decides which rows qualify; each row is
+    /// still moved by its own id, never by a role or a Message-ID (ADR-IOS-068 D4 and clause 6).
+    enum ChatMoveSource: Equatable {
+        /// Rows in a folder with this role, in every account (Archive takes the Inbox copies).
+        case role(FolderRole)
+        /// Rows in this one folder (a Move from a user folder, a Gmail label included).
+        case folder(id: String)
+        /// Every row (Trash).
+        case everyRow
+
+        func takes(role: FolderRole, folderId: String) -> Bool {
+            switch self {
+            case .role(let wanted): return role == wanted
+            case .folder(let id): return folderId == id
+            case .everyRow: return true
+            }
+        }
+    }
+
+    /// Whether any row the chat loaded is in an Inbox: the chat offers Archive only then, since a
+    /// whole-chat Archive takes only the Inbox copies. One read for every row's folder, since the
+    /// chat view asks on each evaluation; a failed read offers no Archive.
+    var chatHasInboxCopy: Bool {
+        lookupFolderRoles(Set(chatRows.map(\.folderId)))?.values.contains(.inbox) ?? false
+    }
+
+    /// A whole-chat Archive, Delete or Move over the rows the chat loaded (`chatRows`), each by its
+    /// own id and never by Message-ID (ADR-IOS-068 D4), in whichever account: the rows `source`
+    /// takes, except sent copies and drafts, which stay where they are, and rows already in their
+    /// destination. A copy filed elsewhere (a Gmail label, an IMAP folder) stays where it is unless
+    /// `source` takes it. Each email goes to `destination` in its own account (owner 2026-11-06);
+    /// an account without one keeps its emails where they are. The move is one action with one
+    /// undo entry; Undo puts each email back in its own folder. Returns the ids it moved: empty
+    /// when nothing moved, so the chat stays open. A row whose folder role cannot be read (no
+    /// Folder row) may be a sent copy or a draft, so it stays; if the roles cannot be read at all,
+    /// nothing moves.
+    private func recordChatMove(
+        _ members: [MessageHeader], source: ChatMoveSource, roleMove: Bool,
+        destination: (_ accountId: String) -> Folder?
+    ) -> Set<String> {
+        guard let roles = lookupFolderRoles(Set(members.map(\.folderId))) else { return [] }
+        let groups: [MoveGroup] = UndoableAction.byAccount(members).compactMap { share in
+            guard let accountId = share.first?.accountId, let folder = destination(accountId) else { return nil }
+            let movable = share.filter { member in
+                guard let role = roles[member.folderId] else { return false }
+                return role != .sent && role != .drafts && source.takes(role: role, folderId: member.folderId)
+                    && member.folderPath != folder.path
+            }
+            guard !movable.isEmpty else { return nil }
+            if roleMove, folder.role == .trash {
+                AccountManager.logDeleteTrace(accountId: accountId, messages: movable, callSite: "MessageDetailViewModel.deleteChat")
+            }
+            return MoveGroup(msgs: movable, toPath: folder.path, toFolderId: folder.id, destIsInbox: folder.role == .inbox)
+        }
+        guard !groups.isEmpty else { return [] }
+        recordMove(groups, roleMove: roleMove)
+        return Set(groups.flatMap { $0.msgs.map(\.id) })
+    }
+
+    /// Takes the chat out of every Inbox: only the Inbox copies move, so a labeled or filed copy
+    /// stays where it is (on Gmail, archiving the Inbox copy removes only the INBOX label).
+    func archiveChat(_ members: [MessageHeader]) -> Set<String> {
+        recordChatMove(members, source: .role(.inbox), roleMove: true) { lookupFolder(accountId: $0, role: .archive) }
+    }
+
+    func deleteChat(_ members: [MessageHeader]) -> Set<String> {
+        recordChatMove(members, source: .everyRow, roleMove: true) { lookupFolder(accountId: $0, role: .trash) }
+    }
+
+    /// Moves the copies in the folder the chat was opened from: a system folder by its role, in
+    /// every account; a user folder (a Gmail label included) by itself. The opened email's account
+    /// offers `path`; another account's emails go to its folder at the same path, if it has one.
+    /// An opened folder whose role cannot be read moves nothing: it is not known to be a user folder.
+    func moveChat(_ members: [MessageHeader], toFolderPath path: String) -> Set<String> {
+        guard let opened = message, let role = lookupFolderRole(opened.folderId) else { return [] }
+        let source: ChatMoveSource = role == .custom ? .folder(id: opened.folderId) : .role(role)
+        return recordChatMove(members, source: source, roleMove: false) { lookupFolder(accountId: $0, path: path) }
+    }
+
+    /// Moves emails that share one folder as ONE action — see `archiveMessages(_:)`.
+    @discardableResult
+    func moveMessages(_ msgs: [MessageHeader], toFolderPath: String) -> Bool {
+        guard let first = msgs.first, lookupFolderRole(first.folderId) != .drafts else { return false }
+        // Generic move: destination CAN be the inbox, which must re-enable
+        // inbox-only UI on the relabelled card, combined with each source's
+        // isInInbox for the tag clear (F6).
+        recordMove([MoveGroup(
+            msgs: msgs, toPath: toFolderPath, toFolderId: "\(first.accountId):\(toFolderPath)",
+            destIsInbox: isInboxFolder(accountId: first.accountId, path: toFolderPath))],
+            roleMove: false)
         return true
     }
 
@@ -2080,8 +2195,22 @@ final class MessageDetailViewModel {
         }
     }
 
+    private func lookupFolder(accountId: String, path: String) -> Folder? {
+        try? dbPool.read { db in
+            try Folder.filter(Column("accountId") == accountId && Column("path") == path).fetchOne(db)
+        }
+    }
+
     private func lookupFolderRole(_ folderId: String) -> FolderRole? {
         try? dbPool.read { db in try Folder.fetchOne(db, key: folderId)?.role }
+    }
+
+    /// The roles of the folders `folderIds` name, in one read: a folder with no Folder row has
+    /// none. Nil when the read fails.
+    private func lookupFolderRoles(_ folderIds: Set<String>) -> [String: FolderRole]? {
+        try? dbPool.read { db in
+            Dictionary(try Folder.fetchAll(db, keys: Array(folderIds)).map { ($0.id, $0.role) }) { first, _ in first }
+        }
     }
 
     /// Whether ordinary Archive/Move controls must be inert for this row.
@@ -2206,6 +2335,29 @@ final class MessageDetailViewModel {
         // Gesture intents on the same id coalesce to the NET target
         // (ADR-IOS-057) — see `InboxViewModel.toggleRead`'s doc comment.
         manager.registerGestureIntent(id: msg.id, .isRead(target: newIsRead, baseline: wasRead))
+    }
+
+    /// Sets each email's read state (the chat's "Unread from here" / "Read up to here"), on
+    /// screen and through the same gesture intent as the single-email toggles (an email already in
+    /// that state records nothing: the intent's target equals its baseline). Each email's copies
+    /// from the same load change with it (`threadCopies`: the rows `excludeCopies` left out under
+    /// its Message-ID), each by its own id, as opening the chat reads them. Nothing outside that
+    /// snapshot is looked up: a Message-ID never selects a row to change (ADR-IOS-068 D4).
+    func setRead(_ msgs: [MessageHeader], isRead: Bool) {
+        let messageIds = Set(msgs.compactMap(\.rfc822MessageId).filter { !$0.isEmpty })
+        let copies = threadCopies.filter { copy in copy.rfc822MessageId.map(messageIds.contains) ?? false }
+        for msg in msgs + copies {
+            if msg.id == message?.id { message?.isRead = isRead }
+            if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
+                threadMessages[idx].isRead = isRead
+            }
+            if let idx = threadCopies.firstIndex(where: { $0.id == msg.id }) {
+                threadCopies[idx].isRead = isRead
+            }
+            // Gesture intents on the same id coalesce to the NET target
+            // (ADR-IOS-057) — see `InboxViewModel.toggleRead`'s doc comment.
+            manager.registerGestureIntent(id: msg.id, .isRead(target: isRead, baseline: msg.isRead))
+        }
     }
 
     /// Fetch body for any message by ID (used by thread card expansion)

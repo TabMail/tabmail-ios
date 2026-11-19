@@ -513,6 +513,100 @@ same AI result, kept as long as the email itself is shown.
    `ChatReplyRecoveryTests` (connection lost then resumed, and a server failure then Retry, the
    choice changed in between).
 
+12. **Swipes in the chat (amendment 2026-11-05).** Swiping left
+   anywhere between the header and the field slides the whole chat to reveal Trash, then Archive at
+   the edge, so a full swipe archives; swiping right on a bubble reveals "Unread from here"
+   (this email and every newer one become unread, never the user's own) or, on an unread bubble,
+   "Read up to here" (this email and every older one become read), and Move for the whole chat
+   as well. The Unread line then marks the emails unread (`ChatSwipe.unreadIds`). One reveal
+   is open at a time (`ChatSwipeReveal`, `openId`); the pan starts only on a horizontal motion
+   toward its buttons (`ChatHorizontalPan`), so vertical scrolling stays the scroll view's.
+   Only a drag the user finished acts: one the system cancels or fails (a call, a system
+   gesture) closes the reveal and runs nothing, however far it went (`ChatHorizontalPan.finished`,
+   `ChatSwipe.settle(finished:)`; review, 2026-11-05).
+   *Amended 2026-11-16 (the user-interaction freeze rule):* from the moment a swipe's pan begins
+   until it has let go and settled (`ChatViewLayout.swipeSettleHold`: the spring, then the rule's
+   200ms cooldown), data that lands waits: the pan drives the app's one freeze, `PreviewFreezeGate`,
+   whose readers keep what lands and apply it on release (`ChatSwipeHold`, through
+   `ChatHorizontalPan.handle`). A cancelled or failed pan releases the same way, and a reveal that
+   goes away mid-drag releases at once. Several swipes hold it together; a preview that froze first
+   keeps it. Tests: `ChatThreadViewLifecycleTests.swipeHoldsTheFreezeUntilSettled`,
+   `summaryWaitsForTheSwipe` (a real summary write under a held pan, with a no-swipe control),
+   `teardownLetsGo`.
+   *Amended 2026-11-16:* the hold keeps state only for swipes that hold the finger or still settle:
+   each settle has its own token, and an id leaves once it settles, is taken again, or lets go at
+   once (every bubble that leaves the screen lets go of its id), so the state stays bounded and a
+   reused id's newer swipe is never released by an earlier settle. Before, a counter per id grew
+   with every bubble ever shown. Test: `swipeHoldKeepsNoStateOnceSettled`.
+   VoiceOver reaches every button as a named action. *Amended 2026-11-16:* a bubble's own buttons
+   and the chat's ("Archive chat", "Trash chat") are actions of the bubble itself
+   (`ChatBubbleView.actions`), not of its whole row: actions on a row of several elements made
+   VoiceOver read the bubble between its own attachment chips. Tests: `chipsStopAtTheCap`,
+   `chatSwipeWiring`.
+   Archive, Trash and Move act on every email the
+   chat shows, wherever it is filed ("always the whole thread", 2026-11-04), except the user's sent
+   copies and drafts, which stay in their folders, and emails already at the destination
+   (`MessageDetailViewModel.archiveChat` / `deleteChat` / `moveChat`), and close the chat as closing
+   the email does today. **Amended in review (2026-11-06):** they first took only
+   the opened email's folder, which left the chat's archived and filed emails behind. One Undo puts
+   each email back in its own folder: `UndoableAction` keeps one command per source folder and epoch,
+   because `AccountManager.undoMove` moves a command back to one source; this also fixes Undo of an
+   inbox thread whose emails sat in different folders. They are ONE action each: the detail view model's
+   `archiveMessages` / `deleteMessages` / `moveMessages` push one undo entry and queue one move for
+   every email (`recordMove`, one `enqueueMove` closure with the read op before the move); the
+   single-email `archiveMessage` / `deleteMessage` / `moveMessage` are now the one-email case of
+   these. Grouping a move by account and building its one undo entry is one shared helper
+   (`UndoableAction.byAccount`, `UndoableAction.move`; rebuild 2026-11-09), used by the
+   chat here and by the inbox's thread actions. `setRead` sets each email's read state through today's gesture intent. In the inbox, Read
+   on a collapsed chat reads every email in it when the chat view is on (`ChatSwipe.inboxReadIds`,
+   as opening it does); Unread stays on the newest email.
+   **Product choices of the swipes:** Unread from here skips the user's own emails. Decided
+   2026-11-15. A bubble has no full swipe: this follows the 2026-11-04 swipe rules.
+   **Decided 2026-11-06:** a whole-chat action leaves the user's sent copies and
+   drafts where they are (a draft must stay in Drafts to stay editable; on Gmail a sent copy is the
+   same email as its other labels).
+   *Amended 2026-11-15:* the button that moves the chat to Trash says "Trash", the inbox
+   row's word, on screen and as its VoiceOver action ("Trash chat"); it first said "Delete", as the
+   mock did.
+   *Amended 2026-11-15:* a whole-chat Archive, Trash or Move acts on every row the chat loaded
+   (`MessageDetailViewModel.chatRows`: the opened email, the thread's emails and their copies in
+   other folders and accounts, decision 9), each by its own id through the same one move and one
+   undo entry, so no copy of a chat email is left in an Inbox. Sent copies and drafts are still
+   left where they are, per copy. The action set is that snapshot, never a lookup by Message-ID at
+   action or drain time (ADR-IOS-068 D4): a copy the thread did not load (Spam), or one that arrived
+   after the chat loaded, is not moved. Test: `ChatCopiesTests.wholeChatActionMovesEveryCopy`.
+   *Amended 2026-11-15:* which rows of that snapshot each action takes is decided per row from its
+   folder (`MessageDetailViewModel.ChatMoveSource`). Archive takes the Inbox copies (role `.inbox`, in
+   every account). Move takes the copies in the folder the chat was opened from: a system folder by
+   its role, in every account; a user folder, a Gmail label included, by its own folder id. Trash
+   takes every row. Sent copies, drafts and rows already at the destination are still left where
+   they are. A copy filed or labeled elsewhere therefore stays where it is: on Gmail, archiving the
+   Inbox copy removes only the INBOX label, so the message keeps its other labels; on IMAP and
+   Outlook a filed copy is a separate message and stays in its folder. This replaces "every row the
+   chat loaded" above for Archive and Move. The role only decides which rows qualify; each row is
+   still moved by its own id (ADR-IOS-068 D4 and clause 6), and nothing above `EmailProvider`
+   checks the provider. A chat with no Inbox copy (opened from a label, Archive or search) offers
+   no Archive: no swipe button, no "Archive chat" VoiceOver action, and no full swipe
+   (`MessageDetailViewModel.chatHasInboxCopy`, `ChatSwipeReveal(allowsFullSwipe:)`), so the gesture
+   that archives elsewhere never trashes there. The actions return the ids they moved, and the
+   list behind is told to hide the opened row only if it moved (`ChatThreadView.dismissChat`):
+   archiving a chat opened on a label leaves that row in the label's list. Tests:
+   `ChatCopiesTests.wholeChatArchiveLeavesFiledCopies`, `chatWithNoInboxCopyOffersNoArchive`,
+   `archiveFromALabelKeepsTheListRow`, `wholeChatActionMovesEveryCopy`;
+   `MessageDetailThreadActionTests.moveChatTakesTheOpenedFolder`, `archiveChatAcrossFolders`.
+   *Amended 2026-11-16:* the roles are read once for the action (`lookupFolderRoles`) and fail
+   closed. A row whose folder role cannot be read (no Folder row) may be a sent copy or a draft, so
+   it stays where it is; if the read fails, nothing moves. A Move opened from a folder whose role
+   cannot be read moves nothing, since that folder is not known to be a user folder. Before, an
+   unknown role passed the sent and draft check, so Trash took such a row, and an unknown opened
+   folder was moved as a user folder. Tests: `MessageDetailThreadActionTests.unknownRoleFailsClosed`,
+   `systemFoldersByRoleAcrossAccounts`, `sameNamedFolderInAnotherAccountStays`.
+   *Amended 2026-11-15:* "Unread from here" and "Read up to here" change, with each email they
+   target, its copies from the same snapshot (`MessageDetailViewModel.setRead`: the
+   `threadCopies` rows that `excludeCopies` left out under that email's Message-ID), each by its
+   own id, as the open reads them (decision 9). A copy the thread did not load keeps its state
+   (ADR-IOS-068 D4). Test: `ChatCopiesTests.readSwipesChangeEveryCopy`.
+
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
 parser does not read.
@@ -551,3 +645,11 @@ Decision 11: `ChatThreadTests.repliedOnlyTo`,
 `someoneNewIsNotOnly`, `userIsOnePerson`; `ChatReplyFieldTests` (`changedRecipientsRoute`,
 `agentMessageOnlyTo`, `replyTarget`, `replyToChoice`, `accessibilityOnlyTo`, `recipientsWiring`);
 `ChatReplyComposeOriginTests` (who gets the agent's reply, by where its request came from).
+Decision 12: `ChatSwipeTests` (the read swipes' targets, the Unread line after them, the whole-chat
+members, the inbox's Read, letting go, an interrupted drag running nothing, and the drag limits, and the swipe wiring read from the
+source); `MessageDetailThreadActionTests` (a chat's Archive, Trash and Move as one undo entry and
+one queued move, one undo restoring every email, one undo command per source folder and epoch
+(`archiveChatUndoSplitsByEpoch`), the no-ops, `setRead`); `UndoableActionAccountMoveTests`
+(the shared by-account grouping and its one undo entry); the single-email detail
+actions stay pinned by `MessageDetailViewModelMoveTests`, `MessageDetailMarkReadOnArchiveDeleteTests`,
+`SameFolderNoOpTests` and `MessageDetailStagedFallbackTests`, green before and after the refactor.
