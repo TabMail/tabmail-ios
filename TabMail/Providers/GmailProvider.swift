@@ -137,9 +137,13 @@ actor GmailProvider: EmailProvider {
 
     /// Whether a message carrying `labelIds` belongs in the local folder `path`:
     /// All Mail holds every message without an excluded label; every other
-    /// folder is the Gmail label of the same id.
+    /// folder is the Gmail label of the same id, unless the message is in
+    /// Trash or Spam: Gmail keeps SENT, DRAFT, STARRED and user labels on such
+    /// a message, but no listing outside Trash and Spam returns it.
     nonisolated static func folder(_ path: String, containsMessageWithLabels labelIds: [String]) -> Bool {
-        path == archivePath ? !labelIds.contains(where: allMailExcludedLabelIds.contains) : labelIds.contains(path)
+        if path == archivePath { return !labelIds.contains(where: allMailExcludedLabelIds.contains) }
+        if !spamTrashFolderIds.contains(path), labelIds.contains(where: spamTrashFolderIds.contains) { return false }
+        return labelIds.contains(path)
     }
     private static let draftResourceLookupPageSize = 500
 

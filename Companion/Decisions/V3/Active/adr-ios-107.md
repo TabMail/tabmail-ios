@@ -369,6 +369,15 @@ The owner's rulings of 2026-11-09:
      are now a change-bookmark refusal (history expired or too long, `applyChangeRefusal`) and a
      re-read list over `changeRecheckLimit`; a message whose GET fails is put on the folder's re-read
      list and read again on later passes, so it opens no gap.
+     *Amended 2026-11-19 (#1066, #726):* the same rule makes Trash and Spam exclusive: a message
+     carrying TRASH or SPAM is a member of the Trash or Spam folder only, never of Sent, Drafts,
+     Starred, a user label or the Inbox, whatever labels Gmail keeps on it (it keeps SENT, DRAFT,
+     STARRED and user labels on trash). `folder(_:containsMessageWithLabels:)` answers false for
+     those folders through `spamTrashFolderIds`, matching every listing outside Trash and Spam,
+     which omits `includeSpamTrash`. So the change reader removes such a row and the catch-up's
+     removal proof succeeds; before, a delete from Sent was put back into Sent by the re-read
+     after the recent-completion hold. A message carrying both TRASH and SPAM (Gmail does not
+     produce it) would show in both folders; accepted.
    - **Schedule** (amended 2026-11-12: no periodic check). `GmailProvider.catchUpPlan` lists a
      folder in exactly three cases: it continues a listing in progress (a lapse never interrupts
      one); it starts the folder's FIRST listing (no listing has completed yet: no state at all, or
