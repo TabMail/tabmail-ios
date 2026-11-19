@@ -75,9 +75,10 @@ struct GmailDeltaFuzzTests {
     /// Where a queued archive completes relative to the pass.
     enum CompletionPoint: CaseIterable { case beforePass, duringFetch, afterPass }
 
-    /// Labels another client toggles. TRASH is left out: Gmail's listing hides
-    /// it, so the convergence oracle could not read Trash back.
-    static let toggledLabels = ["UNREAD", "STARRED", "INBOX", Pins.userLabelId]
+    /// Labels another client toggles. TRASH is in: a trashed message keeps its
+    /// other labels on the server, and the listing oracle (invariant 5) checks
+    /// that it then leaves every tracked folder. Trash itself is not tracked.
+    static let toggledLabels = ["UNREAD", "STARRED", "INBOX", Pins.userLabelId, "TRASH"]
 
     struct Ghost: Sendable {
         let messageId: String
@@ -284,6 +285,15 @@ struct GmailDeltaFuzzTests {
             if localIds != Set(expected.keys) {
                 Issue.record("[\(`where`)] \(folder.path) rows \(localIds.sorted()) != server \(expected.keys.sorted())"); ok = false
             }
+            // Independent oracle: the server's own listing of the folder, never
+            // the app's membership rule.
+            let listed = Set(serverIds(w).filter { id in
+                guard let snap = w.server.snapshot(providerMessageId: id) else { return false }
+                return listingContains(folder.path, labels: snap.labels)
+            })
+            if localIds != listed {
+                Issue.record("[\(`where`)] \(folder.path) rows \(localIds.sorted()) != server listing \(listed.sorted())"); ok = false
+            }
             for row in local {
                 guard let want = expected[row.messageId] else { continue }
                 if row.isRead != want.read || row.isFlagged != want.flagged {
@@ -300,6 +310,18 @@ struct GmailDeltaFuzzTests {
     }
 
     // MARK: - Helpers
+
+    /// What Gmail's list of `path` returns for a message carrying `labels`, as
+    /// the app lists every folder but Trash and Spam (no `includeSpamTrash`):
+    /// Trash and Spam mail is never listed; All Mail is the exclusion query;
+    /// any other folder is its label.
+    private static func listingContains(_ path: String, labels: Set<String>) -> Bool {
+        if !labels.isDisjoint(with: ["TRASH", "SPAM"]) { return false }
+        if path == GmailProvider.archivePath {
+            return StatefulGmailActionServer.satisfiesQueryExclusions(GmailProvider.allMailExclusionQuery, labels: labels)
+        }
+        return labels.contains(path)
+    }
 
     private static func serverIds(_ w: Pins.World) -> [String] {
         (0..<64).map { "fz\($0)" }.filter { w.server.snapshot(providerMessageId: $0) != nil }

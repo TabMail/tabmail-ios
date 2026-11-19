@@ -329,6 +329,37 @@ struct GmailCatchUpTests {
         }
     }
 
+    /// A message in Trash or Spam keeps its user labels on the server, and no
+    /// listing outside Trash and Spam returns it. Each row is a candidate whose
+    /// own GET decides; a message carrying TRASH or SPAM is a member of no other
+    /// folder, so the GET proves it left the label. (Sent is pinned by the
+    /// change-reader and full-app tests.)
+    @Test("An older labelled message in Trash or Spam is removed by the catch-up")
+    func trashOrSpamMailLeavesLabels() async throws {
+        let clock = Clock()
+        let seeds = [
+            Self.seed("label-steady", clock.daysAgo(42), [labelPath]),
+            Self.seed("label-trashed", clock.daysAgo(43), [labelPath, "TRASH"]),
+            Self.seed("label-spam", clock.daysAgo(44), [labelPath, "SPAM"]),
+        ]
+        let local = [
+            Local(id: "label-steady", path: labelPath, date: clock.daysAgo(42)),
+            Local(id: "label-trashed", path: labelPath, date: clock.daysAgo(43)),
+            Local(id: "label-spam", path: labelPath, date: clock.daysAgo(44)),
+        ]
+        let folders: [(path: String, role: FolderRole)] = [(inboxPath, .inbox), (labelPath, .custom)]
+        try await Self.withWorld("gcu-trash-spam-exclusive", seeds: seeds, local: local, folders: folders) { world async throws in
+            await Self.pass(world, [labelPath])
+
+            #expect(Set(world.server.messageGets()).isSuperset(of: ["label-trashed", "label-spam"]),
+                    "precondition: each GET decided")
+            let label = try Self.rows(world, labelPath)
+            #expect(label["label-trashed"] == nil, "a message carrying TRASH is not in a user label")
+            #expect(label["label-spam"] == nil, "a message carrying SPAM is not in a user label")
+            #expect(label["label-steady"] != nil)
+        }
+    }
+
     /// The catch-up removes a candidate only when its labels no longer place it in
     /// the folder, through the one membership rule the delta also uses.
     @Test("The removal rule, per folder kind")
@@ -344,6 +375,9 @@ struct GmailCatchUpTests {
         for excluded in ["INBOX", "SENT", "TRASH", "SPAM", "DRAFT"] {
             #expect(showsRemoval([excluded], allMailPath), "\(excluded)")
         }
+        #expect(showsRemoval(["SENT", "TRASH"], "SENT"))
+        #expect(showsRemoval([labelPath, "SPAM"], labelPath))
+        #expect(!showsRemoval(["SENT", "TRASH"], "TRASH"))
     }
 
     // MARK: - Bounds: the local range, no inserts, no placeholder ids
