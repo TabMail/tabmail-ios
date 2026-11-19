@@ -72,7 +72,10 @@ actor SyncEngine {
     /// The accounts with a sync pass running, and for each the passes waiting
     /// their turn, oldest first (`oneSyncAtATime`).
     var syncPassRunning: Set<String> = []
-    var syncPassWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    var syncPassWaiters: [String: [SyncTurnWaiter]] = [:]
+    var syncTurnWaiterSerial: UInt64 = 0
+    /// Waiters the test harness released after an overrun (`syncTurnWaitWatch`).
+    var overrunSyncTurnWaiters: Set<UInt64> = []
 
     /// Header walks (`runBackfillWalk`) executing now, foreground or job. A walk
     /// admitted before a download gate closed keeps running on its own snapshot,

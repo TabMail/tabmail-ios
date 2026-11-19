@@ -3,6 +3,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
+
+/// One pass waiting for an account's sync turn.
+struct SyncTurnWaiter {
+    let id: UInt64
+    let continuation: CheckedContinuation<Void, Never>
+}
 
 extension SyncEngine {
     /// Runs `pass` as the account's only sync pass, so a delta and a full sync
@@ -23,17 +30,58 @@ extension SyncEngine {
     /// started inside a pass of the same account runs in that pass's turn.
     /// Only that task: a task spawned inside the turn inherits the task-local
     /// but is a different task, so it waits for the turn like any other.
-    func oneSyncAtATime<T>(accountId: String, _ pass: () async throws -> T) async rethrows -> T {
+    func oneSyncAtATime<T>(
+        accountId: String, caller: String = #fileID, line: Int = #line, _ pass: () async throws -> T
+    ) async rethrows -> T {
         let task = Self.currentTaskIdentity()
         if let task, Self.heldSyncTurn[accountId] == task { return try await pass() }
         if !syncPassRunning.insert(accountId).inserted {
-            await withCheckedContinuation { syncPassWaiters[accountId, default: []].append($0) }
+            let ownsTurn = await waitForSyncTurn(accountId: accountId, caller: "\(caller):\(line)")
+            // Only after a test-harness overrun: that test has already failed.
+            if !ownsTurn { return try await pass() }
         }
         defer { handOverSyncPass(accountId: accountId) }
         var held = Self.heldSyncTurn
         held[accountId] = task
         return try await Self.$heldSyncTurn.withValue(held) { try await pass() }
     }
+
+    /// Waits for the account's turn; false only when the test harness released
+    /// a wait that overran `SyncConfig.syncTurnWaitTestBoundSeconds`.
+    private func waitForSyncTurn(accountId: String, caller: String) async -> Bool {
+        syncTurnWaiterSerial += 1
+        let id = syncTurnWaiterSerial
+        #if DEBUG
+        let watcher: Task<Void, Never>? = Self.syncTurnWaitWatch.withLock { $0 }.map { report in
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(SyncConfig.syncTurnWaitTestBoundSeconds))
+                guard !Task.isCancelled, let self else { return }
+                guard await self.releaseOverrunSyncTurnWaiter(accountId: accountId, id: id) else { return }
+                report(accountId, caller)
+            }
+        }
+        defer { watcher?.cancel() }
+        #endif
+        await withCheckedContinuation {
+            syncPassWaiters[accountId, default: []].append(SyncTurnWaiter(id: id, continuation: $0))
+        }
+        return overrunSyncTurnWaiters.remove(id) == nil
+    }
+
+    #if DEBUG
+    /// Test harness only: set by the test target, never by the app. Called with
+    /// the account and the waiting caller when a turn wait overruns its bound.
+    static let syncTurnWaitWatch = Mutex<(@Sendable (_ accountId: String, _ caller: String) -> Void)?>(nil)
+
+    private func releaseOverrunSyncTurnWaiter(accountId: String, id: UInt64) -> Bool {
+        guard let index = syncPassWaiters[accountId]?.firstIndex(where: { $0.id == id }) else { return false }
+        let waiter = syncPassWaiters[accountId]!.remove(at: index)
+        if syncPassWaiters[accountId]?.isEmpty == true { syncPassWaiters[accountId] = nil }
+        overrunSyncTurnWaiters.insert(id)
+        waiter.continuation.resume()
+        return true
+    }
+    #endif
 
     /// The accounts whose sync turn is held, each with the task holding it.
     @TaskLocal static var heldSyncTurn: [String: Int] = [:]
@@ -101,6 +149,6 @@ extension SyncEngine {
         }
         let next = waiting.removeFirst()
         syncPassWaiters[accountId] = waiting.isEmpty ? nil : waiting
-        next.resume()
+        next.continuation.resume()
     }
 }

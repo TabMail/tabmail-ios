@@ -1036,4 +1036,9 @@ enum SyncConfig {
     /// caller's deadline. A folder whose SELECT keeps timing out is started again
     /// after `changeReadFailureLapseSeconds`.
     static let imapChangeSelectTimeoutSeconds: TimeInterval = 15
+    /// Test harness only (#755): a sync-turn wait longer than this is reported
+    /// to `SyncEngine.syncTurnWaitWatch` as a stuck wait (a turn holder awaiting
+    /// a task that needs the same turn). Far above any wait on the fake servers,
+    /// where a pass holds the turn for well under a second. Unused in production.
+    static let syncTurnWaitTestBoundSeconds: TimeInterval = 60
 }
