@@ -123,9 +123,53 @@ struct ChatSuggestionBubbleTests {
         return try #require(chat.controller.presentedViewController?.view, "the compose card opened")
     }
 
-    /// What the card shows: its accessibility labels and the text of its fields.
+    /// What the card shows: its accessibility labels and the text of its fields, after a layout
+    /// pass (the repo's hosted-poll pattern): the suggestion lands after the card opens, and the
+    /// accessibility walk forces no layout of its own.
     private static func cardTexts(_ card: UIView) -> [String] {
-        HostedAccessibility.labels(in: card) + fieldTexts(card)
+        card.window?.layoutIfNeeded()
+        card.layoutIfNeeded()
+        return HostedAccessibility.labels(in: card) + fieldTexts(card)
+    }
+
+    /// What is on screen, for a failure message: the presentation chain from the chat, whether
+    /// the card is in a window, whether Use Suggestion or a body text view is in its tree, and
+    /// every label it holds.
+    private static func cardReport(_ chat: Chat, _ card: UIView) -> String {
+        var chain: [String] = []
+        var next = chat.controller.presentedViewController
+        while let current = next {
+            chain.append(String(describing: type(of: current)))
+            next = current.presentedViewController
+        }
+        let labels = HostedAccessibility.labels(in: card)
+        let hasTextView = HostedAccessibility.elements(under: card).contains { $0 is UITextView }
+        return "presented=\(chain) window=\(card.window != nil) useSuggestion=\(labels.contains("Use Suggestion")) "
+            + "bodyTextView=\(hasTextView) labels=\(labels) fields=\(fieldTexts(card))"
+    }
+
+    /// Presses the card's button labelled `label`, as a VoiceOver double tap does.
+    private static func press(_ label: String, in card: UIView) -> Bool {
+        HostedAccessibility.elements(under: card).first { $0.accessibilityLabel == label }?.accessibilityActivate() ?? false
+    }
+
+    /// The alert titled `title` the card presented, if it is showing.
+    private static func alert(_ title: String, from chat: Chat) -> UIAlertController? {
+        var next = chat.controller.presentedViewController
+        while let current = next {
+            if let alert = current as? UIAlertController, alert.title == title { return alert }
+            next = current.presentedViewController
+        }
+        return nil
+    }
+
+    /// Taps the alert button titled `button`, running its handler.
+    private static func tap(_ button: String, on alert: UIAlertController) throws {
+        typealias Handler = @convention(block) (UIAlertAction) -> Void
+        let action = try #require(alert.actions.first { $0.title == button }, "the alert has \(button)")
+        let block = try #require(action.value(forKey: "handler") as AnyObject?, "\(button) has a handler")
+        let handler = unsafeBitCast(block, to: Handler.self)
+        alert.dismiss(animated: false) { handler(action) }
     }
 
     private static func ghost(in view: UIView) -> NSObject? {
@@ -217,14 +261,30 @@ struct ChatSuggestionBubbleTests {
                 found = Self.cardTexts(card)
                 return found.contains { $0.contains("Yes, Tuesday works for me.") }
             }
-            #expect(found.contains { $0.contains("Yes, Tuesday works for me.") }, "the card holds the suggestion: \(found)")
+            #expect(found.contains { $0.contains("Yes, Tuesday works for me.") },
+                    "the card holds the suggestion: \(Self.cardReport(chat, card))")
+            #expect(found.contains { $0.contains("Hello Sam") }, "the full email is on the card: \(found)")
             #expect(!found.contains { $0.contains("My own words") }, "never the saved draft: \(found)")
-            chat.controller.dismiss(animated: false)
+            // Both sides: the suggestion saved from the card goes to a row of its own, and the
+            // saved reply draft keeps its words.
+            #expect(Self.press("Use Suggestion", in: card), "Use Suggestion takes a tap: \(Self.cardReport(chat, card))")
+            try await Self.waitUntil { !Self.cardTexts(card).contains("Use Suggestion") }
+            #expect(Self.press("Close", in: card), "Close takes a tap: \(Self.cardReport(chat, card))")
+            try await Self.waitUntil { Self.alert("Save Draft?", from: chat) != nil }
+            try Self.tap("Save", on: try #require(Self.alert("Save Draft?", from: chat), "Close asks to save"))
             try await Self.waitUntil { chat.controller.presentedViewController == nil }
             let after = try await chat.pool.read { try Draft.fetchOne($0, key: key) }
             #expect(after?.body == "My own words, not sent yet" && after?.updatedAt == now, "the saved draft is untouched")
-            let drafts = try await chat.pool.read { try Draft.fetchCount($0) }
-            #expect(drafts >= 1)
+            var own: [Draft] = []
+            try await Self.waitUntil {
+                own = try await chat.pool.read {
+                    try Draft.filter(Column("id").like("\(Draft.separateReplyPrefix)%")).fetchAll($0)
+                }
+                return !own.isEmpty
+            }
+            #expect(own.count == 1, "one new row of its own: \(own.map(\.id))")
+            #expect(own.first?.body.contains("Yes, Tuesday works for me.") == true,
+                    "the new row holds the suggestion: \(String(describing: own.first?.body))")
         }
     }
 
