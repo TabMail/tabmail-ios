@@ -162,8 +162,8 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
    - `ChangeRequest.localRows`: the existing `CatchUpLocalRowReader` (ids and two flags, never content;
      ADR-004), so a reader whose records lack the header fields fetches headers only for messages a folder
      does not hold.
-   - `ChangeContext`: the caller's read deadline, an injectable clock and `isExpensiveNetwork`, a value *Superseded 2026-11-19 (#1063): every state baseline runs on any network; see ADR-IOS-107, amendment of that date.*
-     snapshot taken when the pass's turn starts.
+   - `ChangeContext`: the caller's read deadline, an injectable clock and `isExpensiveNetwork`, a value
+     snapshot taken when the pass's turn starts. *Superseded 2026-11-19 (#1063): every state baseline runs on any network; see ADR-IOS-107, amendment of that date.*
    - `FolderChangeStatus.baselining` (a folder's first round in progress); `ChangeRefusal.rejected(status)`
      and `.failingTooLong`; `AccountCursorUpdate.unchanged` (the read succeeded and the stored account
      part stays); `FolderListUpdate.complete` / `.updated`.

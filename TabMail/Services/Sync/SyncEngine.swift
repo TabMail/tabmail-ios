@@ -110,7 +110,8 @@ actor SyncEngine {
     ///   .aggressive — plugged in. Full throughput, UI stays responsive (priority lock).
     ///   .normal     — on battery. Moderate progress, reasonable drain.
     ///   .low        — thermal throttling. Minimal resource usage.
-    /// Note: Low Power Mode and battery < 20% pause backfill entirely (backfillWalkAllowed).
+    /// Note: Low Power Mode and battery < 20% hold only the walk; the folder scans
+    /// still run (backfillWalkAllowed, #1063).
     /// Reads UIDevice state via MainActor hop — always returns latest power state.
     func getBackfillProfile() async -> BackfillProfile {
         await MainActor.run {

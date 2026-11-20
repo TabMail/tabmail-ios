@@ -22,8 +22,8 @@ re-arms a walk or lists below the oldest local row; the writer list and the Spam
 corrected).
 **Amended 2026-11-12: no periodic Gmail check** (decision 8, owner ruling: the weekly Gmail full check
 is dropped. A Gmail folder is listed in exactly three cases: its first listing, a listing in progress,
-and after a lapse. `SyncConfig.gmailCatchUpFullCheckIntervalSeconds` is deleted; the expensive-network *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
-wait stays; IMAP keeps its daily check).
+and after a lapse. `SyncConfig.gmailCatchUpFullCheckIntervalSeconds` is deleted; the expensive-network
+wait stays; IMAP keeps its daily check). *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
 **Amended 2026-11-12: the direct load** (decisions 1, 3, 4 and 8, owner ruling: the Gmail catch-up
 loads a missing id itself, through the backfill page walk's own insert tail, bounded per pass, newest
 first; a membership page's token moves on only once its missing ids have loaded or been classified
@@ -178,19 +178,19 @@ The owner's rulings of 2026-11-09:
          (three accounts on one engine: an account holding a page while its own catch-up progresses,
          and one holding a page while another account's catch-up progresses; neither held page is
          listed again inside the idle delay).
-     - **The worker's gates now gate the catch-up.** The worker pauses while the battery is below 20% *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
+     - **The worker's gates now gate the catch-up.** The worker pauses while the battery is below 20%
        and not charging, and while the Wi-Fi-only setting (`backgroundSyncWiFiOnly`, default on) is
        on and the network is expensive; the background job does not run in Low Power Mode or, with
-       Wi-Fi-only on, on an expensive network. The catch-up waits for the same conditions as the walk
+       Wi-Fi-only on, on an expensive network. *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.* The catch-up waits for the same conditions as the walk
        (see the consequences).
        - *Superseded 2026-11-12 (#766, the Wi-Fi-only ruling below):* the Wi-Fi-only half of the bullet
          above. The battery gate and Low Power Mode still delay the catch-up as stated.
-     - **Wi-Fi-only holds back the walk, not the catch-up (amended 2026-11-12, #766).** The catch-up *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
+     - **Wi-Fi-only holds back the walk, not the catch-up (amended 2026-11-12, #766).** The catch-up
        ignores the Wi-Fi-only setting and keeps its own network rules, unchanged: a Gmail listing on
        an expensive network (cellular or a hotspot) waits at most
        `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` (7 days) since the last completed listing
        and then lists on any network; an IMAP folder on an expensive network lists only on a MODSEQ
-       change, and its daily full check waits for a non-expensive network for at most the same 7 days.
+       change, and its daily full check waits for a non-expensive network for at most the same 7 days. *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
        The walk keeps honouring Wi-Fi-only exactly as before. Reason: the catch-up lists ids and
        labels only (bodies are loaded only for a message that is missing locally): one full listing
        of a ten-year Gmail Inbox (1,825 messages, 1,371 list requests) is about 1.4 MB. Its repairs
@@ -302,8 +302,8 @@ The owner's rulings of 2026-11-09:
      written by the folder upsert) is compared with the stored completion stamp.
    - **Full check.** It runs every `SyncConfig.catchUpFullCheckIntervalSeconds` (one day). It also
      serves as the only check on a server without CONDSTORE.
-   - **Network.** On an expensive network only a MODSEQ change may list, because that is evidence of a *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
-     change. The full check, and continuing one already in progress, waits for a non-expensive
+   - **Network.** On an expensive network only a MODSEQ change may list, because that is evidence of a
+     change. *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.* The full check, and continuing one already in progress, waits for a non-expensive
      network, but for no longer than `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` (7 days,
      owner 2026-11-10) since the folder's last completed listing. Before the first completed listing
      the wait counts from `createdAt` in the state, written on the catch-up's first sight of the
@@ -375,10 +375,10 @@ The owner's rulings of 2026-11-09:
      the state first sight wrote on an expensive network); and it starts a new listing after a lapse
      as soon as the listing in progress (if any) completes (the lapse marker, below). There is no
      periodic re-check: a tracked folder whose listing completed and that no lapse touched is never
-     listed again. Shared with IMAP (`CatchUpSchedule`): on an expensive network at most *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
+     listed again. Shared with IMAP (`CatchUpSchedule`): on an expensive network at most
      `catchUpExpensiveNetworkMaxWaitSeconds` of waiting (`CatchUpSchedule.waitedTooLong`, kept); least
      recently attempted folder first; the pass budget before every request and
-     `catchUpRequestTimeoutSeconds` on each.
+     `catchUpRequestTimeoutSeconds` on each. *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
      - **Why no periodic check (owner 2026-11-12).** While the history cursor is valid the delta
        follows every folder, All Mail included (#731), and every lapse lists every folder again, so
        the weekly check only backed up what neither reveals: a change whose delta GET failed while
@@ -389,10 +389,10 @@ The owner's rulings of 2026-11-09:
      - *Superseded (2026-11-12, the weekly schedule):* "`CatchUpSchedule` (shared with IMAP): a full
      check every `gmailCatchUpFullCheckIntervalSeconds` (WEEKLY, amended 2026-11-11), and a new listing after
      a lapse as soon as the listing in progress (if any) completes (the lapse marker, below); on an
-     expensive network at most `catchUpExpensiveNetworkMaxWaitSeconds` of waiting (first sight writes *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
+     expensive network at most `catchUpExpensiveNetworkMaxWaitSeconds` of waiting (first sight writes
      `createdAt` and makes no request); least recently attempted folder first; the pass budget before
      every request and `catchUpRequestTimeoutSeconds` on each." *Superseded (2026-11-11, before the
-     lapse marker):* "and at once after a lapse, which clears the folder's state".
+     lapse marker):* "and at once after a lapse, which clears the folder's state". *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
      - **Only IMAP has an interval** (amended 2026-11-12). `CatchUpSchedule.fullCheckDue` is called
        by `IMAPProvider.catchUpPlan` alone, with `catchUpFullCheckIntervalSeconds` (one day). Nothing
        above `EmailProvider` names a provider or an interval. *Superseded (2026-11-12):* the bullet
@@ -420,10 +420,10 @@ The owner's rulings of 2026-11-09:
        lapses come. The earlier wording ("a lapse clears the catch-up state, so every folder is
        listed in full at the next full sync anyway") was false for any folder that needs more than
        one full sync to list.
-     - **Consequences of the week.** The expensive-network wait is counted from the last completed *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
+     - **Consequences of the week.** The expensive-network wait is counted from the last completed
        listing and is as long as the week, so a due weekly check has already waited as long as the
        wait allows and runs on any network; only a folder with no completed listing (new, or reset)
-       waits for a non-expensive network. A lapse does not restart that wait and does not skip it:
+       waits for a non-expensive network. *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.* A lapse does not restart that wait and does not skip it:
        the marker keeps `createdAt` and `lastCompletedAt`, so a listing a lapse asks for on an
        expensive network waits until `catchUpExpensiveNetworkMaxWaitSeconds` after the last
        completed listing, like any other. *Superseded (2026-11-11):* "(new, or cleared by a lapse)":
@@ -837,8 +837,8 @@ The owner's rulings of 2026-11-09:
        about it is lost. Each listing records the count when it started (`lapseCountAtStart`), and a
        completed listing stores it (`listedLapseCount`). When a listing completes and a lapse came
        after it started (`GmailCatchUpState.lapsedSinceLastListing`), a new listing starts at once,
-       in the same pass (on an expensive network it waits like any listing), because a change the *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
-       lost history held may sit in a range that listing had already passed. With no listing in
+       in the same pass (on an expensive network it waits like any listing), because a change the
+       lost history held may sit in a range that listing had already passed. *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.* With no listing in
        progress, the plan starts one at the next full sync. *Amended 2026-11-12 (#766):* at the
        backfill worker's next slice, which the next poll's worker (or the background job) runs; no
        full sync is needed. So a change is repaired within at most
@@ -890,12 +890,12 @@ The owner's rulings of 2026-11-09:
     (712 s) when every list request takes 0.2 s. Before, the same listing took about 56 hours of
     app-open time. (`GmailCatchUpTests.measureForegroundListing`, run only when the test runner's
     environment sets `TABMAIL_CATCHUP_MEASURE`.)
-  - *Superseded 2026-11-12 (#766, the Wi-Fi-only ruling): the next bullet.* The catch-up ignores the *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
+  - *Superseded 2026-11-12 (#766, the Wi-Fi-only ruling): the next bullet.* The catch-up ignores the
     Wi-Fi-only setting, so the 7-day expensive-network bound holds whatever the setting; only the
-    battery gate and Low Power Mode delay it, and both lift on their own.
-  - **The 7-day bound below now holds only when the worker may run.** With the Wi-Fi-only setting on *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
+    battery gate and Low Power Mode delay it, and both lift on their own. *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
+  - **The 7-day bound below now holds only when the worker may run.** With the Wi-Fi-only setting on
     (the default), the catch-up, like the walk, does not run on an expensive network, so a device
-    that is always on cellular or a hotspot gets no catch-up. With the setting off, the 7-day
+    that is always on cellular or a hotspot gets no catch-up. *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.* With the setting off, the 7-day
     expensive-network bound holds as before. The battery gate (below 20%, not charging) and Low Power
     Mode (background job) pause it too.
   - **An IMAP folder whose HIGHESTMODSEQ moves is relisted at the next worker cycle**, which every
@@ -962,8 +962,8 @@ Gmail behaviour above is unchanged.
   check. A new listing starts only while the folder's change bookmark is tracking (its first
   change read is complete), the one place this lives being `catchUpTrackingGateOpen`: before that,
   a message deleted between the listing's pass and the first read's start would be reported by
-  neither. The expensive-network wait counts from first sight, which is recorded even while the *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
-  gate holds, so the two waits run side by side.
+  neither. The expensive-network wait counts from first sight, which is recorded even while the
+  gate holds, so the two waits run side by side. *Superseded 2026-11-19 (#1063): scans always run; see the amendment of that date.*
 - *Paging.* Each range is listed with `receivedDateTime ge/lt` filters, newest first, `$top`
   `SyncConfig.catchUpGraphListPageSize` (250), resuming at a date (keyset), never at a saved
   `$skip` or link. A page whose oldest second also holds newer messages is listed again from that
