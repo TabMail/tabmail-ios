@@ -76,9 +76,12 @@ extension SyncEngine {
     /// that want the classification; the INVARIANTS are asserted on the database
     /// end state, never on this value.
     enum EpochVerificationOutcome: Sendable, Equatable {
-        /// Nothing to do: the folder is stamped already, is in quarantine, holds no
-        /// rows (the blind bootstrap path owns that case), or has vanished.
+        /// Nothing to do: the folder is stamped already, is in quarantine, or holds
+        /// no rows (the blind bootstrap path owns that case).
         case notApplicable
+        /// The folder's row is gone (deleted, or its account removed): nothing to
+        /// verify, and the caller must not go on to read the folder.
+        case folderGone
         /// The SELECT that served the sample reported NO UIDVALIDITY, or the sample
         /// could not be taken/fetched at all. **DO NOTHING** — see the anti-brick
         /// rule on `verifyAndBootstrapPrePopulatedFolderEpoch`.
@@ -294,24 +297,27 @@ extension SyncEngine {
         // ── Step 1: cheap early-out + sample, in ONE read.
         let sampled: [EpochVerificationSample]
         do {
-            guard let candidates = try await dbPool.read({ db -> [EpochVerificationSample]? in
-                guard let folder = try Folder.fetchOne(db, key: folderId) else { return nil }
+            // Outer nil: the folder row is gone. Inner nil: nothing to verify.
+            let read = try await dbPool.read({ db -> [EpochVerificationSample]?? in
+                guard let folder = try Folder.fetchOne(db, key: folderId) else { return .none }
                 // `== nil` and not `knownUidValidity(...) == nil`, deliberately: this
                 // must agree EXACTLY with the `lastKnownUidValidity IS NULL` predicate
                 // the stamp in step 5 carries, or a (structurally impossible) stored 0
                 // would send us through a whole verification whose write can never land.
-                guard folder.lastKnownUidValidity == nil else { return nil }
+                guard folder.lastKnownUidValidity == nil else { return .some(nil) }
                 // A quarantined folder is the reaction's, not ours.
-                guard folder.uidValidityResetPendingAt == nil else { return nil }
+                guard folder.uidValidityResetPendingAt == nil else { return .some(nil) }
                 // ZERO headers is a genuine first sync — the blind bootstrap path (A)
                 // stamps it, and issuing a verification FETCH here would be pure waste.
                 guard try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db) > 0
-                else { return nil }
-                return try sampleUidsForEpochVerification(
+                else { return .some(nil) }
+                return .some(try sampleUidsForEpochVerification(
                     db, folderId: folderId,
                     highCount: SyncConfig.uidValidityVerifySampleHighCount,
-                    lowCount: SyncConfig.uidValidityVerifySampleLowCount)
-            }) else { return .notApplicable }
+                    lowCount: SyncConfig.uidValidityVerifySampleLowCount))
+            })
+            guard let present = read else { return .folderGone }
+            guard let candidates = present else { return .notApplicable }
             sampled = candidates
         } catch {
             if DebugModeManager.isLoggingEnabled() {

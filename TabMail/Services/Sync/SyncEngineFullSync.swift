@@ -601,6 +601,13 @@ extension SyncEngine {
     /// account was removed or the folder deleted before the sync turn was
     /// acquired (nothing is listed). Throws only
     /// `CancellationError`.
+    #if DEBUG
+    /// Test harness only: awaited by a standalone listing after its turn-holder
+    /// checks and current-folder lookup, before it reads anything else. Nil in
+    /// every run but the test that sets it.
+    static let standaloneListingAfterLookupTestHook = Mutex<(@Sendable (_ accountId: String) async -> Void)?>(nil)
+    #endif
+
     @discardableResult
     func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws -> ListingOutcome? {
         // T4.S6 re-drive — the THIRD owner, and the ONLY one that reaches a custom
@@ -653,6 +660,12 @@ extension SyncEngine {
                 BackgroundSyncLogger.logDebug("[Sync] \(folder.name): folder gone while waiting for the sync turn; listing skipped")
                 return nil
             }
+            // The checks above cover only up to here: removal or deletion during
+            // the awaits that follow is refused by the provider's retirement
+            // (no session opens) and by the listing's own folder-row read.
+            #if DEBUG
+            if let hook = Self.standaloneListingAfterLookupTestHook.withLock({ $0 }) { await hook(folder.accountId) }
+            #endif
             return await listFolder(current, provider: provider, limit: SyncConfig.syncMessageLimit)
         }
         try Task.checkCancellation()
@@ -1359,9 +1372,13 @@ extension SyncEngine {
         // (guard (a) skips this pass and the reaction owns it). It is a no-op — one
         // small read, no network — for every folder that already has an epoch, holds
         // no rows, or is already quarantined, which is the steady state.
-        await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
+        //
+        // A folder whose row is gone by now (deleted, or its account removed while
+        // this listing waited) is not read from the server at all.
+        let verification = await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
             folderId: folder.id, folderPath: folder.path, accountId: folder.accountId,
             provider: provider, dbPool: dbPool)
+        if verification == .folderGone { throw FolderGoneBeforeListing() }
         let fetched = try await provider.fetchMessagesWithObservedEpoch(
             folder: folder.path, limit: limit, offset: 0)
         let messages = fetched.messages
@@ -2648,8 +2665,14 @@ extension SyncEngine {
     ///   contradicted EXISTS 0, any error after SELECT. Nothing written; the
     ///   stamp is withheld. `connectionLost` lets the caller retry once.
     /// No error escapes the classifier, so no caller can rethrow past it.
+    /// `runSyncMessages` found the folder's row gone before reading the server.
+    struct FolderGoneBeforeListing: Error {}
+
     enum ListingOutcome: Sendable {
         case proven(SyncMessagesResult)
+        /// The folder's row was gone before the listing read the server: nothing
+        /// was read or written, and the folder owes nothing.
+        case folderGone
         case notListable(SyncMessagesResult?)
         /// `error` is the listing's own error, when it ended with one, so a
         /// caller that shows errors (pull-to-refresh) can show the same one.
@@ -2662,6 +2685,7 @@ extension SyncEngine {
             case .proven(let r): r
             case .notListable(let r): r
             case .unproven(let r, _, _): r
+            case .folderGone: nil
             }
         }
     }
@@ -2675,6 +2699,8 @@ extension SyncEngine {
             let result = try await runSyncMessages(for: folder, provider: provider, limit: limit, dbPool: dbPool)
             if result.proven { return .proven(result) }
             return result.notListable ? .notListable(result) : .unproven(result, connectionLost: false, error: nil)
+        } catch is FolderGoneBeforeListing {
+            return .folderGone
         } catch is ProviderFolderNotListable {
             return .notListable(nil)
         } catch {
@@ -2696,6 +2722,8 @@ extension SyncEngine {
         case .unproven:
             listing.droppedFolder = true
             oweDeepListing(folderId: folderId)
+        case .folderGone:
+            break
         }
     }
 

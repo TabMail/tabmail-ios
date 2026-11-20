@@ -113,6 +113,9 @@ extension SyncEngine {
         case .unproven:
             BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): listing unproven — skipping")
             return .unproven
+        case .folderGone:
+            BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): folder gone — skipping")
+            return .notListed
         }
         guard let serverCount = result.listedCounters?.messageCount else { return .unproven }
         // Bounded by the pass's deadline: this runs inside the account's turn.

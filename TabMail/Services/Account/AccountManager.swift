@@ -1786,8 +1786,14 @@ actor AccountManager {
         // Tear down the provider socket before waiting for sync tasks. Their
         // cancellation is cooperative, so a read parked in SwiftMail may not
         // return until disconnect closes the underlying connection.
+        // Removal retires the provider: a caller still holding it (a listing
+        // waiting for the sync turn) opens no new session with its credentials.
         if let provider {
-            try? await provider.disconnect()
+            if caldavConfigIds != nil {
+                await provider.disconnectForAccountRemoval()
+            } else {
+                try? await provider.disconnect()
+            }
         }
         await syncEngine.remove(accountId: account.id)
         // AI processing is now handled by ActiveBodyQueue + ActiveAIQueue actors

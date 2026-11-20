@@ -796,6 +796,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// connections.
     var generation: Int = 0
 
+    /// Set once, by `disconnectForAccountRemoval()`, and never cleared: the
+    /// account is gone, so no later caller may open a server session with its
+    /// credentials. Read by `openingTornDown`, the one opening check.
+    private var retiredForAccountRemoval = false
+
     // MARK: - Action Connection
     // Dedicated connection for user-initiated actions (move, flag, mark read, draft, etc.).
     // SELECTs the needed folder per-operation (~150ms, fine for low-volume user actions).
@@ -1045,6 +1050,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `passGeneration`: the generation of the change pass the session is opened
     /// for; the LOGIN is sent only while it holds.
     private func createServer(diagSite: String, passGeneration: Int? = nil) async throws -> IMAPServer {
+        // A provider retired by account removal opens nothing, for any caller.
+        if openingTornDown(passGeneration) { throw ProviderError.notConnected }
         let server = IMAPServer(
             host: host,
             port: port,
@@ -2691,6 +2698,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         startKeepAlive()
     }
 
+    /// Account removal: retire the provider in this actor turn, before any
+    /// suspension, then tear down as `disconnect()` does. A caller still
+    /// holding this provider (a listing that waited for the sync turn, a send)
+    /// gets `ProviderError.notConnected` from every later opening.
+    func disconnectForAccountRemoval() async {
+        retiredForAccountRemoval = true
+        try? await disconnect()
+    }
+
     func disconnect() async throws {
         stopKeepAlive()
         stopIdle()
@@ -3722,9 +3738,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return true
     }
 
-    /// Whether the change pass of `passGeneration` has been torn down since.
+    /// Whether an opening must stop: the provider was retired by account
+    /// removal (terminal, every caller), or the change pass of
+    /// `passGeneration` has been torn down since.
     private func openingTornDown(_ passGeneration: Int?) -> Bool {
-        passGeneration.map { $0 != generation } ?? false
+        if retiredForAccountRemoval { return true }
+        return passGeneration.map { $0 != generation } ?? false
     }
 
     /// Teardown: close at once, without a LOGOUT, the change session being
@@ -6297,6 +6316,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     func send(draft: DraftMessage) async throws {
+        // The SMTP session logs in with the same credentials: a retired
+        // provider sends nothing.
+        if openingTornDown(nil) { throw ProviderError.notConnected }
         try await withTimeout(seconds: SyncConfig.smtpSendTimeoutSeconds) {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Sending via \(self.smtpHost):\(self.smtpPort) from=\(self.senderEmail) to=\(draft.to) attachments=\(draft.attachments.count)") }
             // Built before connecting: a recipient SwiftMail cannot read fails the

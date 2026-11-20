@@ -303,6 +303,97 @@ struct IMAPChangeTurnAndGuardTests {
         #expect(after.isEmpty, "a removed account was logged in to or listed: \(Array(after))")
     }
 
+    /// What happens to the account or folder while a post-drain listing is held
+    /// after its turn-holder checks and current-folder lookup.
+    enum AfterLookup { case accountRemoved, folderDeleted, nothing }
+
+    /// Holds a post-drain listing of INBOX after its current-folder lookup (the
+    /// last check the listing makes itself), applies `change`, releases it, and
+    /// returns every command the server received after the change.
+    static func commandsAfterHeldListing(_ change: AfterLookup) async throws -> [String] {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "held-after-lookup-" + UUID().uuidString
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [1, 2, 3].map(IMAPChangeReaderTests.message)])
+        try server.start()
+        defer { server.stop() }
+        let imap = IMAPProvider(
+            host: "127.0.0.1", port: server.port, username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        await AccountManager.shared.connectProviderForTesting(account: account, provider: imap)
+        defer { Task { await AccountManager.shared.disconnectProviderForTesting(accountId: accountId) } }
+
+        let reached = Done()
+        let release = Done()
+        SyncEngine.standaloneListingAfterLookupTestHook.withLock {
+            $0 = { id in
+                guard id == accountId else { return }
+                reached.flag.withLock { $0 = true }
+                while !release.flag.withLock({ $0 }) { try? await Task.sleep(nanoseconds: 10_000_000) }
+            }
+        }
+        defer { SyncEngine.standaloneListingAfterLookupTestHook.withLock { $0 = nil } }
+
+        let drainDone = Done()
+        Task {
+            await AccountManager.shared.finishDrainForTesting(foldersToSync: ["\(accountId)|INBOX"])
+            drainDone.flag.withLock { $0 = true }
+        }
+        try await waitUntil { reached.flag.withLock { $0 } }
+        #expect(reached.flag.withLock { $0 }, "setup: the listing passed its lookup and is held")
+
+        switch change {
+        case .accountRemoved:
+            await AccountManager.shared.disconnectAccount(account, deletingCredentials: [])
+            #expect(AccountManager.shared.isRuntimeRemoved(accountId), "setup: the removal committed")
+        case .folderDeleted:
+            try await pool.write { db in _ = try Folder.deleteOne(db, key: "\(accountId):INBOX") }
+        case .nothing:
+            break
+        }
+        let afterChange = server.recordedCommands().count
+        release.flag.withLock { $0 = true }
+        try await waitUntil { drainDone.flag.withLock { $0 } }
+        // A listing would log in and SELECT within this watch.
+        try await Task.sleep(nanoseconds: UInt64(quietWatchSeconds * 1_000_000_000))
+        // Commands the change itself sent (the removal's LOGOUTs) are not the
+        // listing's; everything after it is.
+        return Array(server.recordedCommands().dropFirst(afterChange))
+    }
+
+    static func serverAccess(_ commands: [String]) -> [String] {
+        commands.filter {
+            let u = $0.uppercased()
+            return u.contains("LOGIN") || u.contains("AUTHENTICATE") || u.contains("SELECT")
+                || u.contains("EXAMINE") || u.contains("FETCH") || u.contains("STATUS")
+        }
+    }
+
+    @Test("A post-drain listing held after its folder lookup while the account is removed reaches the server no more: no login, no select, no fetch")
+    func listingHeldAfterLookupStopsAtAccountRemoval() async throws {
+        let access = Self.serverAccess(try await Self.commandsAfterHeldListing(.accountRemoved))
+        #expect(access.isEmpty, "a removed account's server was accessed: \(access)")
+    }
+
+    @Test("A post-drain listing held after its folder lookup while the folder is deleted does not read the folder from the server")
+    func listingHeldAfterLookupStopsAtFolderDeletion() async throws {
+        let access = Self.serverAccess(try await Self.commandsAfterHeldListing(.folderDeleted))
+        #expect(access.isEmpty, "a deleted folder was read from the server: \(access)")
+    }
+
+    @Test("Control: a post-drain listing held after its folder lookup with the account and folder intact lists the folder")
+    func listingHeldAfterLookupListsALiveFolder() async throws {
+        let commands = try await Self.commandsAfterHeldListing(.nothing)
+        let listed = commands.contains {
+            let u = $0.uppercased(); return (u.contains("SELECT") || u.contains("EXAMINE")) && u.contains("INBOX")
+        }
+        #expect(listed, "the live folder was not listed: \(commands)")
+    }
+
     /// How long a full sync over one quarantined folder may take before it
     /// counts as stuck (a bound, never a sleep).
     static let quarantinedFullSyncBoundSeconds: TimeInterval = 20

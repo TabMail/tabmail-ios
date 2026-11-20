@@ -374,6 +374,12 @@ enum ProgressTotal: Sendable, Equatable {
 protocol EmailProvider: Sendable {
     func connect() async throws
     func disconnect() async throws
+    /// Terminal teardown for account removal: after this returns (and from its
+    /// first actor turn) the provider opens no new server session for any
+    /// caller. A provider holding no credentials of its own (OAuth providers,
+    /// refused by the removal fence on their token accessors) needs nothing
+    /// beyond `disconnect()`.
+    func disconnectForAccountRemoval() async
 
     /// Fetch-ordering dimension for stale-detection windowing. Defaults to `.date`
     /// (HTTP providers); IMAP overrides to `.uid`. See `StaleWindowMode`.
@@ -633,6 +639,12 @@ enum DraftReadConfig {
 struct DraftCopyUnsupportedAttachment: Error {}
 
 extension EmailProvider {
+    /// Default for providers that hold no credentials of their own: the
+    /// removal fence already refuses their token accessors.
+    func disconnectForAccountRemoval() async {
+        try? await disconnect()
+    }
+
     /// Default `false`: a provider that talks to a server cannot address a
     /// local placeholder id. `DemoProvider` overrides it.
     static var placeholderIdsAreAddressable: Bool { false }
