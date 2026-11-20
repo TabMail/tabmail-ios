@@ -170,6 +170,15 @@ struct UploadedDraftSingleEntryTests {
         try #require(entries.map(\.0.id) == [serverHeaderId],
                      "precondition: the upload left \(entries.map(\.0.id))")
         #expect(try await row(fixture, draftId).serverDraftId == fixture.kind.serverId)
+        if fixture.kind == .imap {
+            // The epoch the server copy's UID was observed under, as the next
+            // Drafts sync records it on the entry.
+            try await fixture.pool.write { db in
+                try db.execute(
+                    sql: "UPDATE messageHeader SET observedUidValidity = ? WHERE id = ?",
+                    arguments: [Self.imapEpoch, serverHeaderId])
+            }
+        }
         return (draftId, cursor, serverHeaderId)
     }
 

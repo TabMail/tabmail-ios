@@ -6,8 +6,6 @@ import Foundation
 import GRDB
 import Synchronization
 import Testing
-import SwiftUI
-import UIKit
 @testable import TabMail
 
 /// After Undo Send, Close without typing never drops the words (ADR-IOS-065, as
@@ -354,11 +352,7 @@ struct UndoSendReturnsToDraftsTests {
     /// decision: `ComposeView.snapshotInitialState` must pass the compose's own
     /// `prefillTreatAsUnsavedChanges` to `ComposeDraftGuards.baseline`, so a
     /// failed return opens with unsaved changes and Close asks to save.
-    /// `closeWithoutTyping` above exercises the guards it feeds. Hosting the
-    /// loaded compose and pressing Close is not practical in a unit test: the
-    /// view loads the row through an async `.task`, needs the live account,
-    /// keyboard and attachment environment, and its Close button and alert are
-    /// private SwiftUI state with no handle a test can drive or read.
+    /// The decision that baseline feeds is tested below against the real Undo.
     @Test("The compose records its baseline with its own unsaved-changes flag")
     func composeBaselineUsesTheReopenFlag() throws {
         let projectRoot = URL(fileURLWithPath: #filePath)
@@ -383,94 +377,27 @@ struct UndoSendReturnsToDraftsTests {
         let loadedReturn = try #require(afterLoaded.range(of: "return"))
         #expect(afterLoaded[..<loadedReturn.lowerBound].contains("snapshotInitialState()"),
                 "the loaded-row branch must record its baseline with snapshotInitialState()")
-        let prefillBranch = try #require(source.range(of: "// No draft found — normal prepopulate"))
-        let afterPrefill = source[prefillBranch.upperBound...]
+        // The prefill branch calls `prepopulate()`, which records it at its end.
+        let prefill = try #require(source.range(of: "private func prepopulate() {"))
+        let afterPrefill = source[prefill.upperBound...]
         let prefillEnd = try #require(afterPrefill.range(of: "\n    }\n"))
         #expect(afterPrefill[..<prefillEnd.lowerBound].contains("snapshotInitialState()"),
-                "the prefill branch must record its baseline with snapshotInitialState()")
+                "prepopulate() must record its baseline with snapshotInitialState()")
         let assignments = source.split(separator: "\n")
             .filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("initialBaseline = ") }.count
         #expect(assignments == 1, "only snapshotInitialState may set the baseline, found \(assignments)")
     }
 
-    // MARK: - The real compose: load, then Close
+    // MARK: - The decision Close reads, after the real Undo
 
-    private nonisolated static let hostedDeadlineSeconds: TimeInterval = 30
-    private nonisolated static let hostedSettleMilliseconds = 1_000
-
-    private func textViews(_ view: UIView) -> [UITextView] {
-        (view as? UITextView).map { [$0] } ?? view.subviews.flatMap { textViews($0) }
-    }
-
-    /// The accessibility element a VoiceOver user would activate for `label`.
-    private func accessibilityButton(_ label: String, in element: NSObject) -> NSObject? {
-        if element.accessibilityLabel == label, element.accessibilityTraits.contains(.button) { return element }
-        var children: [NSObject] = (element.accessibilityElements as? [NSObject]) ?? []
-        if let view = element as? UIView { children += view.subviews }
-        for child in children {
-            if let found = accessibilityButton(label, in: child) { return found }
-        }
-        return nil
-    }
-
-    private func presentedAlertTitle(_ window: UIWindow) -> String? {
-        var controller = window.rootViewController?.presentedViewController
-        while let current = controller {
-            if let alert = current as? UIAlertController { return alert.title }
-            controller = current.presentedViewController
-        }
-        return nil
-    }
-
-    private func wait(until condition: () -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(Self.hostedDeadlineSeconds)
-        while Date() < deadline && !condition() {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-    }
-
-    /// Hosts the compose the Undo reopens, waits until it shows `words`, presses
-    /// Close, and returns the title of the alert Close raised, if any.
-    private func closeHostedCompose(
-        _ fixture: Fixture, snapshot: PendingSendService.ReopenSnapshot, words: String
-    ) async throws -> String? {
-        let account = try #require(try await fixture.pool.read { try Account.fetchOne($0, key: fixture.accountId) })
-        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let navigationStore = NavigationStore()
-        navigationStore.accounts = [account]
-        let window = UIWindow(windowScene: scene)
-        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
-        window.rootViewController = UIHostingController(
-            rootView: UndoReopenCompose.composeView(for: snapshot).environment(navigationStore))
-        window.isHidden = false
-        window.makeKeyAndVisible()
-        window.layoutIfNeeded()
-        defer {
-            window.rootViewController?.dismiss(animated: false)
-            window.isHidden = true
-            window.rootViewController = nil
-        }
-        try await wait { textViews(window).contains { $0.text.contains(words) } }
-        try #require(textViews(window).contains { $0.text.contains(words) }, "precondition: the compose loaded the row")
-        // Let the load finish recording its baseline before Close reads it.
-        try await Task.sleep(for: .milliseconds(Self.hostedSettleMilliseconds))
-        var close: NSObject?
-        try await wait {
-            close = accessibilityButton("Close", in: window)
-            return close != nil
-        }
-        let button = try #require(close, "the compose shows no Close button")
-        #expect(button.accessibilityActivate())
-        try await wait { presentedAlertTitle(window) != nil }
-        if presentedAlertTitle(window) == nil {
-            try await Task.sleep(for: .milliseconds(Self.hostedSettleMilliseconds))
-        }
-        return presentedAlertTitle(window)
-    }
-
-    @Test("The reopened compose, loaded and closed without typing, asks to save exactly when the return failed",
+    /// Close compares the compose's fields with the baseline it recorded on
+    /// loading (`ComposeDraftGuards.hasChanges`). After the real Undo, with the
+    /// compose the Undo reopens and the row it loads: a failed return (the
+    /// savepoint refused) reports changes, so Close asks to save; a return that
+    /// landed reports none, so Close just closes.
+    @Test("After a failed return the reopened compose reports changes and Close asks to save; after a return that landed it reports none",
           arguments: [true, false])
-    func hostedComposeCloseFollowsTheReturn(returned: Bool) async throws {
+    func closeDecisionFollowsTheReturn(returned: Bool) async throws {
         let fixture = try makeFixture()
         defer { finish(fixture) }
         let draftId = "draft-\(UUID().uuidString)"
@@ -486,13 +413,18 @@ struct UndoSendReturnsToDraftsTests {
             }
         }
         let snapshot = try #require(PendingSendService.shared.undo(), "the Undo was not confirmed")
-        try #require(snapshot.returnedToDrafts == returned, "precondition: the return \(returned ? "landed" : "failed")")
+        try #require(snapshot.returnedToDrafts == returned,
+                     "precondition: the return \(returned ? "landed" : "failed")")
 
-        let alert = try await closeHostedCompose(fixture, snapshot: snapshot, words: words)
-        if returned {
-            #expect(alert == nil, "Close of a draft already in Drafts raised \(alert ?? "")")
-        } else {
-            #expect(alert == "Save Draft?", "Close without typing would drop the words; it raised \(alert ?? "nothing")")
-        }
+        let compose = UndoReopenCompose.composeView(for: snapshot)
+        let loaded = try await row(fixture, draftId)
+        let fields = ComposeDraftGuards.Baseline(
+            subject: loaded.subject, body: loaded.body,
+            to: loaded.toArray, cc: loaded.ccArray, bcc: loaded.bccArray,
+            attachmentsFingerprint: [])
+        let baseline = ComposeDraftGuards.baseline(
+            afterLoading: fields, treatAsUnsavedChanges: compose.prefillTreatAsUnsavedChanges)
+        #expect(ComposeDraftGuards.hasChanges(current: fields, baseline: baseline) == !returned)
+        #expect(closeWithoutTyping(compose, loaded: loaded) == (returned ? .dismiss : .promptSave))
     }
 }
