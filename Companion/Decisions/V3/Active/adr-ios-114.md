@@ -902,7 +902,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      `ChatReplyCompose.make(replyAllTo:)`); Send there sends and the Sent bubble replaces the ghost,
      and the field's words stay (the card is not a send from the field); Close goes back with the
      ghost still there. An edit or a Recompute in the card that is stored on the row posts
-     `.messageDataDidChange`, so the ghost under the card follows it. How a thread reload
+     `.messageDataDidChange`, so the ghost shows the stored change once the card closes (the
+     ghost leaves while its own card is open). How a thread reload
      is ordered against such a refresh (a reload that read its rows before the change and finishes
      after it puts the older row back, #992) is not decided here: it is superseded by "one display
      read at a time", fixed on its own (ADR-IOS-049's #992 amendment, `MessageDetailViewModel.inDisplayTurn`). The card saves to a draft of its own

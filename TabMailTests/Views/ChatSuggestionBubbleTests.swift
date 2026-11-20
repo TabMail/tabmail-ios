@@ -172,8 +172,10 @@ struct ChatSuggestionBubbleTests {
             try await Self.openCard(chat)
             let queued = try await chat.pool.read { try OutboxMessage.fetchCount($0) }
             #expect(queued == 0, "nothing was sent")
+            #expect(Self.ghost(in: chat.view) == nil, "the ghost leaves while its own card is open")
             chat.controller.dismiss(animated: false)
             try await Self.waitUntil { chat.controller.presentedViewController == nil }
+            try await Self.waitUntil { Self.ghost(in: chat.view) != nil }
             #expect(Self.ghost(in: chat.view) != nil, "Close goes back with the ghost still there")
         }
     }
