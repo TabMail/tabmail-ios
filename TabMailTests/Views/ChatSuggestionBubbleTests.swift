@@ -191,6 +191,7 @@ struct ChatSuggestionBubbleTests {
     private static func tap(_ button: String, on alert: UIAlertController) throws {
         typealias Handler = @convention(block) (UIAlertAction) -> Void
         let action = try #require(alert.actions.first { $0.title == button }, "the alert has \(button)")
+        try #require(action.responds(to: NSSelectorFromString("handler")), "UIAlertAction exposes its handler")
         let block = try #require(action.value(forKey: "handler") as AnyObject?, "\(button) has a handler")
         let handler = unsafeBitCast(block, to: Handler.self)
         alert.dismiss(animated: false) { handler(action) }
@@ -312,7 +313,10 @@ struct ChatSuggestionBubbleTests {
         }
     }
 
-    @Test("A suggestion that lands while the card slides in is held, and comes in once the card is on screen")
+    /// A settled-state check: it cannot make the suggestion land mid-presentation, so its samples
+    /// taken while the card is being presented may be none. The hold itself is pinned by
+    /// `bubbleHeldUntilAppearanceEnds`, which drives the appearance calls by hand.
+    @Test("Once the card from the ghost is on screen, its bubble shows and Use Suggestion fills the body")
     func bubbleWaitsForThePresentation() async throws {
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
@@ -322,13 +326,55 @@ struct ChatSuggestionBubbleTests {
             let watched = try await Self.watchBubbleInsertion(chat)
             let card = try #require(chat.controller.presentedViewController?.view, "the compose card opened")
             #expect(watched.shown, "the bubble comes in once the card is on screen: \(Self.cardReport(chat, card))")
-            #expect(chat.controller.presentedViewController?.isBeingPresented == false, "control: the card has settled")
             #expect(Self.press("Use Suggestion", in: card), "the bubble is usable: \(Self.cardReport(chat, card))")
             try await Self.waitUntil { Self.fieldTexts(card).contains { $0.contains("Yes, Tuesday works for me.") } }
             #expect(Self.fieldTexts(card).contains { $0.contains("Yes, Tuesday works for me.") },
                     "Use Suggestion puts it in the body: \(Self.cardReport(chat, card))")
             chat.controller.dismiss(animated: false)
             try await Self.waitUntil { chat.controller.presentedViewController == nil }
+        }
+    }
+
+    /// A container that does not forward appearance calls, so the test decides when the hosted
+    /// card's appearance begins and ends, as a presentation's transition does.
+    private final class ManualAppearanceContainer: UIViewController {
+        override var shouldAutomaticallyForwardAppearanceMethods: Bool { false }
+    }
+
+    @Test("The card's bubble is held while its appearance runs, and comes in when the appearance ends")
+    func bubbleHeldUntilAppearanceEnds() async throws {
+        try await withChat { chat in
+            let navigationStore = NavigationStore()
+            navigationStore.accounts = try await chat.pool.read { try Account.fetchAll($0) }
+            let compose = ChatReplyCompose.make(replyAllTo: chat.email, accounts: navigationStore.accounts).composeView(
+                replyTo: chat.email, suggestedBody: Self.fullReply,
+                draftId: Draft.separateReplyKey(replyTo: "\(chat.email.accountId):\(chat.email.stableId)"),
+                onAgentOutcome: { _ in })
+            let hosted = UIHostingController(rootView: AnyView(
+                compose.environment(navigationStore).environment(\.hasTabMailSession, true)))
+            let container = ManualAppearanceContainer()
+            let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            let window = UIWindow(windowScene: scene)
+            window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+            window.rootViewController = container
+            window.makeKeyAndVisible()
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+            container.addChild(hosted)
+            hosted.view.frame = container.view.bounds
+            container.view.addSubview(hosted.view)
+            hosted.didMove(toParent: container)
+            hosted.beginAppearanceTransition(true, animated: true)
+            let card = hosted.view!
+            try await Self.waitUntil { Self.cardTexts(card).contains("Re: Lunch plans") }
+            #expect(Self.cardTexts(card).contains("Re: Lunch plans"), "control: the card loaded: \(Self.cardTexts(card))")
+            #expect(!Self.cardTexts(card).contains("Use Suggestion"),
+                    "no bubble while the appearance runs: \(Self.cardTexts(card))")
+            hosted.endAppearanceTransition()
+            try await Self.waitUntil { Self.cardTexts(card).contains("Use Suggestion") }
+            #expect(Self.cardTexts(card).contains("Use Suggestion"), "the bubble comes in once it ends: \(Self.cardTexts(card))")
         }
     }
 
