@@ -64,8 +64,8 @@ struct UploadedDraftSingleEntryTests {
         }
     }
 
-    static let draftsPath = "Drafts"
-    static let imapEpoch = 7
+    nonisolated static let draftsPath = "Drafts"
+    nonisolated static let imapEpoch = 7
 
     private struct Fixture {
         let pool: DatabasePool
