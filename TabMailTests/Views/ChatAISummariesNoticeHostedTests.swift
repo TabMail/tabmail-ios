@@ -367,24 +367,32 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
-    /// A send the test holds until it releases the backend's answer.
+    /// Sends the test holds, each until it releases that send's answer.
     @MainActor
     final class HeldSend {
         var started = 0
         var categories: [ReportCategory] = []
-        private var answer: CheckedContinuation<Bool, Never>?
+        var reasons: [String?] = []
+        private var answers: [Int: CheckedContinuation<Bool, Never>] = [:]
 
         var send: ReportConcernSend {
-            { [self] _, _, category, _ in
+            { [self] _, _, category, reason in
                 started += 1
+                let call = started
                 categories.append(category)
-                return await withCheckedContinuation { answer = $0 }
+                reasons.append(reason)
+                return await withCheckedContinuation { answers[call] = $0 }
             }
         }
 
+        /// Answers the oldest send still held.
         func release(_ accepted: Bool) {
-            answer?.resume(returning: accepted)
-            answer = nil
+            if let oldest = answers.keys.min() { release(oldest, accepted) }
+        }
+
+        /// Answers send number `call` (1 for the first).
+        func release(_ call: Int, _ accepted: Bool) {
+            answers.removeValue(forKey: call)?.resume(returning: accepted)
         }
     }
 
@@ -441,6 +449,37 @@ struct ChatAISummariesNoticeHostedTests {
                 Spacer()
             }
         }
+    }
+
+    /// The first view of type `T` under `view`.
+    private static func firstSubview<T: UIView>(_ type: T.Type, in view: UIView) -> T? {
+        if let match = view as? T { return match }
+        for child in view.subviews {
+            if let match = firstSubview(type, in: child) { return match }
+        }
+        return nil
+    }
+
+    /// The sheet on top shows its defaults: the first category and no reason.
+    private static func expectFreshForm(in controller: UIViewController, _ note: String) throws {
+        let sheetView = try #require(topPresented(controller)?.view)
+        let categories = try #require(firstSubview(UISegmentedControl.self, in: sheetView), "control: the category picker")
+        #expect(categories.selectedSegmentIndex == 0, "\(note): the default category")
+        let reason = try #require(firstSubview(UITextView.self, in: sheetView), "control: the reason field")
+        #expect(reason.text.isEmpty, "\(note): an empty reason, got \(String(describing: reason.text))")
+    }
+
+    /// Picks Inaccurate and types a reason into the sheet on top.
+    private static func fillForm(in controller: UIViewController, reason: String) async throws {
+        let sheetView = try #require(topPresented(controller)?.view)
+        let inaccurate = try #require(element(ReportCategory.inaccurate.displayName, in: sheetView))
+        #expect(inaccurate.accessibilityActivate())
+        let field = try #require(firstSubview(UITextView.self, in: sheetView), "control: the reason field")
+        #expect(field.becomeFirstResponder())
+        field.insertText(reason)
+        try await waitUntil { firstSubview(UISegmentedControl.self, in: sheetView)?.selectedSegmentIndex == 1 }
+        #expect(firstSubview(UISegmentedControl.self, in: sheetView)?.selectedSegmentIndex == 1, "control: Inaccurate is picked")
+        #expect(field.text == reason, "control: the reason was typed")
     }
 
     private static func sheetIsUp(_ controller: UIViewController) -> Bool {
@@ -955,6 +994,146 @@ struct ChatAISummariesNoticeHostedTests {
                 #expect(Self.sheetIsUp(controller) && state.open, "the sheet stays")
                 held.release(false)
                 try await Self.waitUntil { controller.presentedViewController == nil }
+            }
+        }
+    }
+
+    // MARK: - Two sends in flight, the notice's own popover, and a fresh form
+
+    @Test("An old answer, taken or not, leaves the next report's sending sheet open and disabled until its own answer")
+    func anOldAnswerLeavesTheNextSendAlone() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        for oldAccepted in [true, false] {
+            let held = HeldSend()
+            let state = SheetState()
+            try await HostedAccessibility.withAutomation {
+                try await Self.hosting(RetainedHost(state: state, send: held.send)) { controller in
+                    try await Self.waitUntil { Self.sheetIsUp(controller) }
+                    try await Self.pressReport(in: controller, held: held)
+                    state.open = false
+                    try await Self.waitUntil { controller.presentedViewController == nil }
+                    state.open = true
+                    try await Self.waitUntil { Self.sheetIsUp(controller) }
+                    try await Self.pressReport(in: controller, held: held, sends: 2)
+                    let sheetView = try #require(Self.topPresented(controller)?.view)
+                    #expect(!Self.isEnabled("Report", in: sheetView) && !Self.isEnabled("Cancel", in: sheetView),
+                            "control: the second send is in flight")
+                    held.release(1, oldAccepted)
+                    try await Task.sleep(for: .seconds(1))
+                    #expect(Self.sheetIsUp(controller) && state.open, "old answer \(oldAccepted): the sheet stays")
+                    #expect(!Self.isEnabled("Report", in: sheetView) && !Self.isEnabled("Cancel", in: sheetView),
+                            "old answer \(oldAccepted): both buttons stay disabled")
+                    held.release(2, false)
+                    try await Self.waitUntil { controller.presentedViewController == nil }
+                    try await Task.sleep(for: .seconds(1))
+                    #expect(controller.presentedViewController == nil, "its own refusal closes it, with no alert")
+                }
+            }
+        }
+    }
+
+    @Test("An old refusal leaves an idle next report open and usable")
+    func anOldRefusalLeavesAnIdleSheetAlone() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let held = HeldSend()
+        let state = SheetState()
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(RetainedHost(state: state, send: held.send)) { controller in
+                try await Self.waitUntil { Self.sheetIsUp(controller) }
+                try await Self.pressReport(in: controller, held: held)
+                state.open = false
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                state.open = true
+                try await Self.waitUntil { Self.sheetIsUp(controller) }
+                held.release(1, false)
+                try await Task.sleep(for: .seconds(1))
+                #expect(Self.sheetIsUp(controller) && state.open, "the old refusal does not close the next sheet")
+                let sheetView = try #require(Self.topPresented(controller)?.view)
+                #expect(Self.isEnabled("Report", in: sheetView) && Self.isEnabled("Cancel", in: sheetView), "and leaves it usable")
+                try await Self.cancelShowsNothing(in: controller)
+            }
+        }
+    }
+
+    @Test("The notice stays mounted: an answer from a closed popover's report never reaches the reopened one")
+    func aClosedPopoversAnswerNeverReachesTheNext() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        for answerBeforeNextReport in [true, false] {
+            let held = HeldSend()
+            try await HostedAccessibility.withAutomation {
+                let button = AISummariesNoticeButton(landed: false, reportContent: { "Summary" }, firstOpen: Self.freshFirstOpen(),
+                                                     tipsAllowed: { true }, send: held.send)
+                try await Self.hosting(button) { controller in
+                    try await Self.openReport(in: controller)
+                    try await Self.pressReport(in: controller, held: held)
+                    // Only the popover and its sheet close; the button stays mounted.
+                    controller.presentedViewController?.dismiss(animated: false)
+                    try await Self.waitUntil { controller.presentedViewController == nil }
+                    #expect(controller.presentedViewController == nil, "control: the popover and its sheet closed")
+                    if answerBeforeNextReport {
+                        held.release(1, true)
+                        try await Task.sleep(for: .seconds(1))
+                        #expect(controller.presentedViewController == nil, "answer first: no stale sheet or alert")
+                    }
+                    let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))
+                    #expect(glyph.accessibilityActivate())
+                    try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                    try await Task.sleep(for: .milliseconds(500))
+                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title)
+                            && !Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
+                            "the reopened notice shows no stale report sheet: \(Self.presentedLabels(controller))")
+                    let popover = try #require(Self.topPresented(controller)?.view)
+                    let report = try #require(Self.element(AISummariesNotice.reportTitle, in: popover))
+                    #expect(report.accessibilityActivate())
+                    try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
+                    try await Self.pressReport(in: controller, held: held, sends: 2)
+                    let sheetView = try #require(Self.topPresented(controller)?.view)
+                    if !answerBeforeNextReport {
+                        held.release(1, true)
+                        try await Task.sleep(for: .seconds(1))
+                    }
+                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
+                            "the new report stays open")
+                    #expect(!Self.isEnabled("Report", in: sheetView) && !Self.isEnabled("Cancel", in: sheetView),
+                            "and its send's controls are unchanged")
+                    held.release(2, false)
+                    try await Self.waitUntil { controller.presentedViewController == nil }
+                    try await Task.sleep(for: .seconds(1))
+                    #expect(controller.presentedViewController == nil, "its own refusal closes it, with no alert")
+                }
+            }
+        }
+    }
+
+    @Test("A new report starts with the default category and no reason, after a cancelled or a sent one")
+    func aNewReportStartsWithAFreshForm() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let reason = "Synthetic reason"
+        for sendFirst in [false, true] {
+            let held = HeldSend()
+            let state = SheetState()
+            try await HostedAccessibility.withAutomation {
+                try await Self.hosting(RetainedHost(state: state, send: held.send)) { controller in
+                    try await Self.waitUntil { Self.sheetIsUp(controller) }
+                    try await Self.fillForm(in: controller, reason: reason)
+                    if sendFirst {
+                        try await Self.pressReport(in: controller, held: held)
+                        #expect(held.categories == [.inaccurate] && held.reasons == [reason], "control: the first report as filled")
+                        held.release(1, false)
+                        try await Self.waitUntil { controller.presentedViewController == nil }
+                    } else {
+                        try await Self.cancelShowsNothing(in: controller)
+                    }
+                    state.open = true
+                    try await Self.waitUntil { Self.sheetIsUp(controller) }
+                    try Self.expectFreshForm(in: controller, sendFirst ? "after a sent report" : "after a cancelled report")
+                    let before = held.started
+                    try await Self.pressReport(in: controller, held: held, sends: before + 1)
+                    #expect(held.categories.last == .offensive, "the next report sends the default category")
+                    #expect(held.reasons.last == .some(nil), "and no reason")
+                    held.release(before + 1, false)
+                    try await Self.waitUntil { controller.presentedViewController == nil }
+                }
             }
         }
     }
