@@ -1,25 +1,4 @@
-
-## ADR-IOS-005: Progressive Background Backfill
-
-> **Current note (2026-11-12, #766).** The backfill worker now also runs the catch-up of older mail
-> (ADR-IOS-107 decision 2): `SyncEngine.runBackfill` is the folders' walk (`runBackfillWalk`) and then
-> the catch-up run (`runCatchUpRun`), one slice per foreground cycle and slices until the deadline in
-> the background processing job (`SyncConfig.backgroundBackfillDeadlineSeconds`, formerly the literal
-> `5 * 60` in `SyncScheduler`). The worker's gates (battery, Wi-Fi-only, Low Power Mode) gate both.
-> *Amended 2026-11-12:* Wi-Fi-only holds back the walk only; the catch-up ignores it and keeps its own
-> network rules (ADR-IOS-107 decision 2). Battery and Low Power Mode still delay both. Catch-up progress
-> picks the worker's active delay only once every walk of the account is complete.
-> *Amended 2026-11-19 (#1063):* Wi-Fi-only, battery and Low Power Mode hold back the walk only; the
-> catch-up always runs (ADR-IOS-107, amendment of that date). "Battery and Low Power Mode still delay
-> both" above is superseded.
-> The notes below say "the full sync's catch-up"; read "the catch-up".
->
-> **Current note (2026-11-12).** The full sync's catch-up never re-arms or otherwise writes the walk:
-> a Gmail check loads mail missing from a folder itself, through the page walk's own insert tail
-> (`SyncEngine.insertFetchedBackfillMessages`), and under a storage limit lists nothing older than the
-> folder's oldest local row (ADR-IOS-107 decision 8, "the direct load"). The 2026-11-11 note below is
-> superseded and kept as written.
->
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
 > **Amendment (2026-11-20, #1064).** The walk's download gates (the Wi-Fi-only setting on an
 > expensive network, a battery below 20% off power, and Low Power Mode off power) now also hold
 > older-mail body downloads (`BackfillBodyQueue`). A refused dispatch keeps its items pending without
@@ -58,7 +37,35 @@
 > the shared deadline and a productive catch-up could spend all of it, leaving the walk none. Tests:
 > `BackfillBodyDownloadGateTests.pathFactsDecideEveryWiFiOnlyDownload`,
 > `GmailCatchUpTests.jobWalkBudgetIsTheSameWhetherTheReadingIsEarlyOrLate`.
+> *Corrected a third time 2026-11-20 (#1064 review):* a backfill worker that is still running when the
+> background processing job starts (it outlives the foreground) decides its walk with the same call as
+> the bodies, `SyncEngine.backfillDownloadDecisionNow`: in the job, the job's rule and its one network
+> measurement (held while unknown), never NetworkMonitor's cached path or the job's synthetic Fast Sync.
+> Its scans still run every cycle. Test: `GmailCatchUpTests.workerDuringJobFollowsTheJobDecision`.
+> This note was moved above the body, which is kept as written.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
+## ADR-IOS-005: Progressive Background Backfill
+
+> **Current note (2026-11-12, #766).** The backfill worker now also runs the catch-up of older mail
+> (ADR-IOS-107 decision 2): `SyncEngine.runBackfill` is the folders' walk (`runBackfillWalk`) and then
+> the catch-up run (`runCatchUpRun`), one slice per foreground cycle and slices until the deadline in
+> the background processing job (`SyncConfig.backgroundBackfillDeadlineSeconds`, formerly the literal
+> `5 * 60` in `SyncScheduler`). The worker's gates (battery, Wi-Fi-only, Low Power Mode) gate both.
+> *Amended 2026-11-12:* Wi-Fi-only holds back the walk only; the catch-up ignores it and keeps its own
+> network rules (ADR-IOS-107 decision 2). Battery and Low Power Mode still delay both. Catch-up progress
+> picks the worker's active delay only once every walk of the account is complete.
+> *Amended 2026-11-19 (#1063):* Wi-Fi-only, battery and Low Power Mode hold back the walk only; the
+> catch-up always runs (ADR-IOS-107, amendment of that date). "Battery and Low Power Mode still delay
+> both" above is superseded.
+> The notes below say "the full sync's catch-up"; read "the catch-up".
+>
+> **Current note (2026-11-12).** The full sync's catch-up never re-arms or otherwise writes the walk:
+> a Gmail check loads mail missing from a folder itself, through the page walk's own insert tail
+> (`SyncEngine.insertFetchedBackfillMessages`), and under a storage limit lists nothing older than the
+> folder's oldest local row (ADR-IOS-107 decision 8, "the direct load"). The 2026-11-11 note below is
+> superseded and kept as written.
+>
 > **Current note (2026-11-11).** A completed walk can be re-armed by the full sync's catch-up when
 > old mail moves into the folder (ADR-IOS-107 decision 8), but never while a storage limit is in
 > force: then the catch-up loads no old mail back, because the limit means old mail is not kept

@@ -129,19 +129,6 @@ actor SyncEngine {
         }
     }
 
-    /// The device's power state for the backfill worker's gates, read once at the
-    /// top of each cycle (MainActor hop): fast sync, Low Power Mode, external power
-    /// and the battery level (-1 when unknown).
-    func backfillPowerState() async -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
-        await Self.currentBackfillPowerState()
-    }
-
-    /// The device's power state for the backfill gates, readable off the engine
-    /// (BackfillBodyQueue reads it too, #1064).
-    nonisolated static func currentBackfillPowerState() async -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
-        await currentBackfillPowerAndJobState().power
-    }
-
     /// The power state together with the background-job flag and the job's Wi-Fi
     /// measurement, all read in ONE MainActor step. The job sets and clears its
     /// synthetic Fast Sync, the job flag and its (still unknown) Wi-Fi measurement
@@ -275,11 +262,31 @@ actor SyncEngine {
     /// foreground walk's rule, where a network NetworkMonitor has not reported yet
     /// holds. ActiveBodyQueue is not gated.
     nonisolated static func backfillDownloadsAllowedNow() async -> Bool {
+        await backfillDownloadDecisionNow().allowed
+    }
+
+    /// `backfillDownloadsAllowedNow` together with the power snapshot it decided
+    /// from. The backfill worker's walk reads this too, so a worker that outlives
+    /// the foreground into the background processing job decides its walk with the
+    /// job's rule and the job's one network measurement, exactly as the bodies do;
+    /// its scans still run every cycle (#1064). `power` is for the worker's log and
+    /// pause length only.
+    nonisolated static func backfillDownloadDecisionNow() async
+        -> (allowed: Bool, power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float))
+    {
         let wifiOnly = backfillWifiOnlySetting()
         let (power, jobActive, jobOnWiFi) = await currentBackfillPowerAndJobState()
         #if DEBUG
         if let hook = backfillAdmissionDecisionHookForTesting.withLock({ $0 }) { await hook() }
         #endif
+        return (backfillDownloadsAllowed(power: power, jobActive: jobActive, jobOnWiFi: jobOnWiFi, wifiOnly: wifiOnly), power)
+    }
+
+    /// The decision of `backfillDownloadDecisionNow` for one read.
+    private nonisolated static func backfillDownloadsAllowed(
+        power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float),
+        jobActive: Bool, jobOnWiFi: Bool?, wifiOnly: Bool
+    ) -> Bool {
         if jobActive {
             // The job's walk decision with the job's walk input: its Wi-Fi state
             // measured once from job start (`measureJobOnWiFi`), never NetworkMonitor, which

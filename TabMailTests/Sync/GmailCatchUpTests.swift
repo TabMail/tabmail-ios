@@ -3364,6 +3364,102 @@ struct GmailCatchUpTests {
         }
     }
 
+    // MARK: - A worker alive during the background job (#1064)
+
+    /// What the background job in `workerDuringJob` exposes to the test.
+    private final class JobWindow: Sendable {
+        let entered = Mutex(false)
+        let done = Mutex(false)
+    }
+
+    /// The worker's inputs during the job: the job's Wi-Fi reading (nil: never
+    /// lands while the worker runs), the device power, and whether the walk may run.
+    struct WorkerJobCase: Sendable, CustomTestStringConvertible {
+        let name: String
+        let reading: Bool?
+        let power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float)
+        let walks: Bool
+        var testDescription: String { name }
+
+        static let all: [WorkerJobCase] = [
+            WorkerJobCase(name: "reading-unknown", reading: nil,
+                          power: (fastSync: false, lowPowerMode: false, onPower: false, batteryLevel: 0.8), walks: false),
+            WorkerJobCase(name: "job-measured-metered", reading: false,
+                          power: (fastSync: false, lowPowerMode: false, onPower: false, batteryLevel: 0.8), walks: false),
+            WorkerJobCase(name: "low-power-mode-on-power", reading: true,
+                          power: (fastSync: false, lowPowerMode: true, onPower: true, batteryLevel: 1), walks: false),
+            WorkerJobCase(name: "job-measured-unmetered", reading: true,
+                          power: (fastSync: false, lowPowerMode: false, onPower: false, batteryLevel: 0.8), walks: true),
+        ]
+    }
+
+    /// A backfill worker that is still alive when the background processing job
+    /// starts decides its walk by the job's rule and the job's one network
+    /// measurement, never by NetworkMonitor's cached path or the job's synthetic
+    /// Fast Sync. NetworkMonitor reports unmetered Wi-Fi throughout, so a worker
+    /// on the foreground rule would walk in every case. The scan runs in every case.
+    @Test("A backfill worker running during the background job walks only when the job's reading and rule allow it; its scan always runs",
+          arguments: WorkerJobCase.all)
+    func workerDuringJobFollowsTheJobDecision(_ input: WorkerJobCase) async throws {
+        try await Self.heldWalkWorld("gcu-worker-job-\(input.name)", walkComplete: false) { world, account in
+            try await DownloadGateHarness.withNetwork(expensive: false) { () async throws in
+                let window = JobWindow()
+                let reading = input.reading
+                SyncScheduler.jobOnWiFiMeasurementHoldForTesting.withLock {
+                    $0 = {
+                        guard let reading else {
+                            while !window.done.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(20)) }
+                            return true
+                        }
+                        return reading
+                    }
+                }
+                defer { SyncScheduler.jobOnWiFiMeasurementHoldForTesting.withLock { $0 = nil } }
+                let (scheduler, context) = await MainActor.run {
+                    let context = BGTaskContext(label: "gcu-worker-job-\(input.name)", completion: { _ in })
+                    let scheduler = SyncScheduler(
+                        backgroundReadiness: { true },
+                        backgroundWork: { _ in
+                            window.entered.withLock { $0 = true }
+                            while !window.done.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(20)) }
+                        },
+                        processingHasWork: { false },
+                        backgroundSchedule: { _ in },
+                        refreshNetworkAvailable: true
+                    )
+                    scheduler.handleBackgroundAIProcessing(context: context) { _ in }
+                    return (scheduler, context)
+                }
+                let entered = try await Self.eventually(seconds: 30, poll: .milliseconds(20)) {
+                    window.entered.withLock { $0 }
+                }
+                #expect(entered, "the job never started")
+                if input.reading != nil {
+                    let known = try await Self.eventually(seconds: 30, poll: .milliseconds(20)) {
+                        SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 } != nil
+                    }
+                    #expect(known, "the job's reading never landed")
+                }
+                do {
+                    try await DownloadGateHarness.withWorker(world.engine, account: account, power: input.power) { sleeps async throws in
+                        #expect(await sleeps.waitFor(count: 1), "the worker's first cycle never ended")
+                    }
+                } catch {
+                    window.done.withLock { $0 = true }
+                    await context.waitForTaskForTesting()
+                    throw error
+                }
+                window.done.withLock { $0 = true }
+                await context.waitForTaskForTesting()
+                withExtendedLifetime(scheduler) {}
+            }
+            #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the worker's scan ran during the job (\(input.name))")
+            #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the lapsed change arrived during the job (\(input.name))")
+            let pages = world.server.http.recordedCalls().map(\.url).filter { $0.contains("/messages?") && !$0.contains("after") }
+            #expect(pages.isEmpty != input.walks, "the worker's walk during the job (\(input.name)): pages \(pages)")
+        }
+    }
+
     // MARK: - In the backfill worker, in slices (#766)
 
     private static let inboxOnly: [(path: String, role: FolderRole)] = [(inboxPath, .inbox)]

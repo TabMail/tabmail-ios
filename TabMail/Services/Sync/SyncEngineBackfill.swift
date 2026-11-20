@@ -289,11 +289,12 @@ extension SyncEngine {
                 while !Task.isCancelled {
                     // One power and network snapshot per cycle decides the gates.
                     // The gates hold only the walk (downloads); the cycle, and so
-                    // the folder scans, always runs (#1063). BackfillBodyQueue
-                    // shares the same rule (#1064).
-                    let wifiOnly = Self.backfillWifiOnlySetting()
-                    guard let power = await self?.backfillPowerState() else { break }
-                    let walkAllowed = Self.backfillDownloadsAllowed(power: power, wifiOnly: wifiOnly)
+                    // the folder scans, always runs (#1063). This is the decision
+                    // BackfillBodyQueue reads, so a worker still alive during the
+                    // background processing job walks only when the job's rule and
+                    // its one network measurement allow it (#1064).
+                    guard self != nil else { break }
+                    let (walkAllowed, power) = await Self.backfillDownloadDecisionNow()
                     let powerHeld = !Self.backfillWalkAllowed(
                         fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
                         batteryLevel: power.batteryLevel, wifiOnly: false, expensive: false)
