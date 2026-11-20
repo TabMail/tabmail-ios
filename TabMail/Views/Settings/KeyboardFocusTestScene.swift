@@ -12,6 +12,8 @@ import SwiftUI
 /// taps it for real and checks the field ends with the keyboard. One control per launch argument:
 /// - none of the below: a reply template's plus button (`TemplateDetailView`);
 /// - `--keyboard-focus-chip`: a rejected recipient chip in a recipient field (`RecipientTokenField`);
+///   also an address chip, whose remove sits inside the field's own box and keeps the keyboard, and
+///   an attachment row below the field, whose remove sits outside every box and closes the keyboard;
 /// - `--keyboard-focus-bullet`: a bullet list's Add (`BulletListEditor`);
 /// - `--keyboard-focus-search`: a button presenting search in a sheet, as the inbox does (`SearchView`);
 /// - `--keyboard-focus-fork`: the inbox chat with one past session, for "Fork and re-send";
@@ -23,6 +25,8 @@ import SwiftUI
 struct KeyboardFocusTestScene: View {
     static let templateId = "keyboard-focus-fixture-template"
     static let rejectedRecipient = "notanaddress"
+    static let tokenRecipient = "person@example.com"
+    static let attachmentName = "fixture-attachment.pdf"
     static let forkSessionId = "keyboard-focus-fixture-session"
     static let forkUserText = "Keyboard focus fixture question"
     /// The multi-line field's height in lines, so it is backed by a text view with room to tap in.
@@ -53,8 +57,9 @@ struct KeyboardFocusTestScene: View {
     @State private var multiLine = ""
     @State private var editorText = ""
     @State private var recipients = ComposeDraftGuards.Recipients()
-        .filling(to: RecipientEntry([KeyboardFocusTestScene.rejectedRecipient]))
+        .filling(to: RecipientEntry([KeyboardFocusTestScene.tokenRecipient, KeyboardFocusTestScene.rejectedRecipient]))
     @State private var showCc = false
+    @State private var hasAttachment = true
     @State private var revealedChipKey: String?
     @State private var showSearch = false
     @State private var chatExpanded = false
@@ -73,6 +78,17 @@ struct KeyboardFocusTestScene: View {
                         RecipientTokenField(
                             role: .to, recipients: $recipients, showCc: $showCc, searchResults: [],
                             onFocus: {}, revealedChipKey: $revealedChipKey)
+                        // Drawn like compose's attachment rows: a remove outside the field's box.
+                        if hasAttachment {
+                            HStack(spacing: 6) {
+                                Button { hasAttachment = false } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Remove attachment")
+                                Text(Self.attachmentName)
+                            }
+                        }
                         Spacer()
                     }
                     .padding()

@@ -61,7 +61,14 @@ extension KeyboardDismissView: UIGestureRecognizerDelegate {
         // Don't dismiss when tapping inside a text input — it handles focus itself. A tap in a field
         // being edited lands on an internal subview (the field editor, the text view inside a
         // multi-line SwiftUI TextField or TextEditor, selection handles), so walk the superviews.
-        return !sequence(first: view, next: \.superview).contains { $0 is UITextField || $0 is UITextView }
+        if sequence(first: view, next: \.superview).contains(where: { $0 is UITextField || $0 is UITextView }) {
+            return false
+        }
+        // A control drawn inside a text field's own box (a clear button, a token's remove) counts as
+        // a tap on the field. SwiftUI draws those controls without a UIView of their own, so the box is
+        // marked (`textInputBox()`) and the touch is matched against the marked boxes' frames.
+        return !TextInputBoxMarkerView.contains(touch, in: window)
+    }
     }
 
     /// The dismiss tap only watches (`cancelsTouchesInView = false`), so it runs alongside every other
@@ -73,7 +80,42 @@ extension KeyboardDismissView: UIGestureRecognizerDelegate {
     }
 }
 
+/// Marks the frame of a text field's own box: drawn behind the box, so it is exactly as large.
+private final class TextInputBoxMarkerView: UIView {
+    private static let marked = NSHashTable<TextInputBoxMarkerView>.weakObjects()
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { Self.marked.remove(self) } else { Self.marked.add(self) }
+    }
+
+    /// Whether the touch lands inside a marked box shown in `window`.
+    static func contains(_ touch: UITouch, in window: UIWindow?) -> Bool {
+        guard let window else { return false }
+        return marked.allObjects.contains { marker in
+            marker.window === window && !marker.isHidden
+                && marker.bounds.contains(touch.location(in: marker))
+        }
+    }
+}
+
+private struct TextInputBoxMarker: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let view = TextInputBoxMarkerView()
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_: UIView, context: Context) {}
+}
+
 extension View {
+    /// Marks this view as a text field's own box: a tap on a control inside it (a clear button, a
+    /// token's remove) counts as a tap on the field and keeps the keyboard (the keyboard dismiss rule).
+    func textInputBox() -> some View {
+        background(TextInputBoxMarker())
+    }
+
     /// Dismiss the keyboard when the user taps outside any text input.
     func dismissKeyboardOnTap() -> some View {
         modifier(KeyboardDismissOnTapModifier())

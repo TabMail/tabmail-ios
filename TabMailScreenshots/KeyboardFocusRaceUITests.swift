@@ -83,6 +83,72 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up")
     }
 
+    /// A token's remove is drawn inside the recipient field's own box, so it counts as a tap on the
+    /// field: the keyboard stays and the chip is gone.
+    func testRecipientChipRemoveInsideTheFieldKeepsTheKeyboard() {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-chip")
+        defer { app.terminate() }
+
+        let input = app.textFields["recipientInput-to"].firstMatch
+        XCTAssertTrue(input.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
+        let remove = app.buttons["Remove person@example.com"].firstMatch
+        XCTAssertTrue(remove.waitForExistence(timeout: waitSeconds), "control: the address chip shows its remove")
+        input.tap()
+        XCTAssertTrue(waitForFocus(input, timeout: focusSeconds), "control: the recipient input has the keyboard")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: focusSeconds), "control: the keyboard is up")
+        remove.tap()
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: remove)
+        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: focusSeconds), .completed, "the chip is gone")
+        RunLoop.current.run(until: Date().addingTimeInterval(holdSeconds))
+        XCTAssertTrue(waitForFocus(input, timeout: focusSeconds), "the input kept the keyboard after the chip's remove")
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up")
+    }
+
+    /// An attachment's remove sits outside every field's box, so its tap closes the keyboard.
+    func testAttachmentRemoveOutsideTheFieldClosesTheKeyboard() {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-chip")
+        defer { app.terminate() }
+
+        let input = app.textFields["recipientInput-to"].firstMatch
+        XCTAssertTrue(input.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
+        let remove = app.buttons["Remove attachment"].firstMatch
+        XCTAssertTrue(remove.waitForExistence(timeout: waitSeconds), "control: the attachment row shows its remove")
+        input.tap()
+        XCTAssertTrue(waitForFocus(input, timeout: focusSeconds), "control: the recipient input has the keyboard")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: focusSeconds), "control: the keyboard is up")
+        remove.tap()
+        let removed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: remove)
+        XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: focusSeconds), .completed, "control: the attachment row is gone")
+        let closed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.keyboards.firstMatch)
+        XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: focusSeconds), .completed, "the tap outside the field closed the keyboard")
+    }
+
+    /// Search's clear button is drawn inside the search box, so it counts as a tap on the field: the
+    /// text is cleared and the keyboard stays.
+    func testSearchClearInsideTheFieldKeepsTheKeyboard() {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-search")
+        defer { app.terminate() }
+
+        XCTAssertTrue(app.buttons["Open search"].firstMatch.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
+        app.buttons["Open search"].firstMatch.tap()
+        let search = app.textFields["Search emails..."].firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: waitSeconds), "control: the search sheet opened")
+        XCTAssertTrue(waitForFocus(search, timeout: focusSeconds), "control: the search field has the keyboard")
+        search.typeText("Clear text")
+        let clear = app.buttons["Clear search"].firstMatch
+        XCTAssertTrue(clear.waitForExistence(timeout: focusSeconds), "control: the clear button shows")
+        clear.tap()
+        let cleared = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: clear)
+        XCTAssertEqual(XCTWaiter.wait(for: [cleared], timeout: focusSeconds), .completed, "control: the clear button went with the text")
+        XCTAssertNotEqual(search.value as? String, "Clear text", "the text is cleared")
+        RunLoop.current.run(until: Date().addingTimeInterval(holdSeconds))
+        XCTAssertTrue(waitForFocus(search, timeout: focusSeconds), "the search field kept the keyboard after clear")
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up")
+    }
+
     func testBulletListAddKeepsTheInputFocused() {
         continueAfterFailure = false
         let app = launch("--keyboard-focus-bullet")

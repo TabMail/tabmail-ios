@@ -4029,6 +4029,8 @@ struct TokenField: View {
                         }
                 }
             }
+            // The chips and the input are the field's own box: a chip's remove keeps the keyboard.
+            .textInputBox()
 
             // Contact search dropdown — scrollable
             if !searchResults.isEmpty && isFocused {
@@ -4093,6 +4095,7 @@ struct TokenField: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            .accessibilityLabel("Remove \(displayText)")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
