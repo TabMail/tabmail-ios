@@ -26,6 +26,26 @@ struct ChatAISummariesNoticeHostedTests {
     @MainActor
     final class Sent {
         var contents: [String] = []
+        var reports: [(ReportContentType, String)] = []
+
+        var send: ReportConcernSend {
+            { [self] type, content, _, _ in reports.append((type, content)); return false }
+        }
+    }
+
+    /// Drives `landed` on one mounted button, as the chat's landing does.
+    @MainActor @Observable
+    final class Landing {
+        var landed = false
+    }
+
+    private struct LandingHost: View {
+        let landing: Landing
+        let firstOpen: AISummariesNotice.FirstOpen
+
+        var body: some View {
+            AISummariesNoticeButton(landed: landing.landed, reportContent: { "" }, firstOpen: firstOpen, tipsAllowed: { true })
+        }
     }
 
     private static func freshFirstOpen() -> AISummariesNotice.FirstOpen {
@@ -69,7 +89,8 @@ struct ChatAISummariesNoticeHostedTests {
     private static func button(landed: Bool, firstOpen: AISummariesNotice.FirstOpen, tipsAllowed: Bool,
                                sent: Sent? = nil, content: String = "") -> AISummariesNoticeButton {
         AISummariesNoticeButton(landed: landed, reportContent: { sent?.contents.append(content); return content },
-                                firstOpen: firstOpen, tipsAllowed: { tipsAllowed })
+                                firstOpen: firstOpen, tipsAllowed: { tipsAllowed },
+                                send: (sent ?? Sent()).send)
     }
 
     // MARK: - 1. Opening by itself
@@ -139,6 +160,10 @@ struct ChatAISummariesNoticeHostedTests {
                 #expect(submit.accessibilityActivate(), "Report takes a press")
                 try await Self.waitUntil { !sent.contents.isEmpty }
                 #expect(sent.contents == [content], "Report sends the chat's content as handed over")
+                try await Self.waitUntil { !sent.reports.isEmpty }
+                #expect(sent.reports.count == 1)
+                #expect(sent.reports.first?.0 == .summary, "a summary report")
+                #expect(sent.reports.first?.1 == content, "with the newest-first content")
             }
         }
     }
@@ -192,6 +217,65 @@ struct ChatAISummariesNoticeHostedTests {
                 let title = try #require(Self.element(Self.subject, in: controller.view))
                 #expect(abs(title.accessibilityFrame.midX - Self.width / 2) <= 1, "the subject stays centred: \(title.accessibilityFrame)")
                 #expect(!title.accessibilityFrame.intersects(target), "the subject clears the glyph")
+            }
+        }
+    }
+
+    // MARK: - The landing, the default gate, and the long-press control
+
+    @Test("The same mounted button opens the notice when its chat lands")
+    func opensWhenTheSameViewLands() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted view")
+        let landing = Landing()
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(LandingHost(landing: landing, firstOpen: Self.freshFirstOpen())) { controller in
+                try await Task.sleep(for: .seconds(1))
+                #expect(controller.presentedViewController == nil, "control: nothing before the landing")
+                landing.landed = true
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "the landing opens it")
+            }
+        }
+    }
+
+    @Test("The default gate holds the notice back until onboarding completes, without using it up")
+    func defaultGateFollowsOnboarding() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted view")
+        let saved = OnboardingTipGate.onboardingComplete
+        defer { OnboardingTipGate.onboardingComplete = saved }
+        let firstOpen = Self.freshFirstOpen()
+        try await HostedAccessibility.withAutomation {
+            OnboardingTipGate.onboardingComplete = false
+            try await Self.hosting(AISummariesNoticeButton(landed: true, reportContent: { "" }, firstOpen: firstOpen)) { controller in
+                try await Task.sleep(for: .seconds(1))
+                #expect(controller.presentedViewController == nil, "held back while onboarding is not complete")
+            }
+            OnboardingTipGate.onboardingComplete = true
+            try await Self.hosting(AISummariesNoticeButton(landed: true, reportContent: { "" }, firstOpen: firstOpen)) { controller in
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "shown once onboarding completes")
+            }
+        }
+    }
+
+    @Test("Control: the long-press sheet sends its own type and pressed content, with no extra line")
+    func longPressSheetSendsItsOwnReport() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let sent = Sent()
+        try await HostedAccessibility.withAutomation {
+            let view = Color.clear.reportConcernSheet(isPresented: .constant(true), contentType: .suggestedReply,
+                                                      content: { "pressed reply" }, send: sent.send)
+            try await Self.hosting(view) { controller in
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(ReportConcernSheetText.storedForReview) }
+                let sheet = Self.presentedLabels(controller)
+                #expect(!sheet.contains(AISummariesNotice.reportNotice), "no summaries line: \(sheet)")
+                let sheetView = try #require(controller.presentedViewController?.view)
+                let submit = try #require(Self.element("Report", in: sheetView), "\(sheet)")
+                #expect(submit.accessibilityActivate())
+                try await Self.waitUntil { !sent.reports.isEmpty }
+                #expect(sent.reports.count == 1)
+                #expect(sent.reports.first?.0 == .suggestedReply)
+                #expect(sent.reports.first?.1 == "pressed reply")
             }
         }
     }

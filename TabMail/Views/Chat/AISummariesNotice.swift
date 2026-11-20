@@ -72,6 +72,8 @@ struct AISummariesNoticeButton: View {
     /// The install's first-open flag and the tip gate, read once when the chat lands.
     var firstOpen = AISummariesNotice.FirstOpen()
     var tipsAllowed: () -> Bool = { AISummariesNotice.tipsAllowed() }
+    /// Sends the report.
+    var send: ReportConcernSend = ReportConcernService.sendReport
 
     @State private var showsNotice = false
     @State private var reportRequested = false
@@ -100,7 +102,7 @@ struct AISummariesNoticeButton: View {
             }
         }
         .reportConcernSheet(isPresented: $showsReport, contentType: .summary,
-                            content: reportContent, contentNotice: AISummariesNotice.reportNotice)
+                            content: reportContent, contentNotice: AISummariesNotice.reportNotice, send: send)
         .task(id: landed) {
             // One decision per open, read once from the flag and the tip gate.
             if firstOpen.claim(landed: landed, tipsAllowed: tipsAllowed()) {

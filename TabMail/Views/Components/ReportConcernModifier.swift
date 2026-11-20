@@ -102,6 +102,9 @@ enum ReportConcernSheetText {
     }
 }
 
+/// Sends one report: its type, content, category and optional reason; true once the backend took it.
+typealias ReportConcernSend = @MainActor (ReportContentType, String, ReportCategory, String?) async -> Bool
+
 /// The report sheet, presented by `isPresented`: category, optional reason, Report. Shared by the
 /// long-press flow and any other entry point that reports AI content.
 struct ReportConcernSheetModifier: ViewModifier {
@@ -111,6 +114,7 @@ struct ReportConcernSheetModifier: ViewModifier {
     let content: () -> String
     /// An extra line saying what the report sends, when that is more than the pressed content.
     let contentNotice: String?
+    let send: ReportConcernSend
 
     @State private var showSubmitted = false
     @State private var selectedCategory: ReportCategory = .offensive
@@ -180,12 +184,7 @@ struct ReportConcernSheetModifier: ViewModifier {
     private func submit() {
         isSubmitting = true
         Task {
-            let success = await ReportConcernService.report(
-                contentType: contentType,
-                content: content(),
-                category: selectedCategory,
-                reason: reason.isEmpty ? nil : reason
-            )
+            let success = await send(contentType, content(), selectedCategory, reason.isEmpty ? nil : reason)
             isSubmitting = false
             isPresented = false
             if success {
@@ -210,9 +209,10 @@ extension View {
         isPresented: Binding<Bool>,
         contentType: ReportContentType,
         content: @escaping () -> String,
-        contentNotice: String? = nil
+        contentNotice: String? = nil,
+        send: @escaping ReportConcernSend = ReportConcernService.sendReport
     ) -> some View {
         modifier(ReportConcernSheetModifier(isPresented: isPresented, contentType: contentType,
-                                            content: content, contentNotice: contentNotice))
+                                            content: content, contentNotice: contentNotice, send: send))
     }
 }
