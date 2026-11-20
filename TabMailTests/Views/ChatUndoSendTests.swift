@@ -77,6 +77,61 @@ struct ChatUndoSendTests {
                 "nothing scheduled after the deadline")
     }
 
+    // MARK: - 1b. The fill-up look follows the deadline
+
+    private static func fill(_ look: ChatUndoSendLook) -> Double? {
+        if case .pending(let fill) = look { return fill }
+        return nil
+    }
+
+    @Test("The bubble is pending while Undo is offered, filled by the part of the window that has passed, then solid at the deadline")
+    func lookFollowsTheDeadline() {
+        let hold = Date().addingTimeInterval(4.5)
+        let row = Self.reply(holdUntil: hold)
+        let deadline = row.undoDeadline
+        let window = SyncConfig.outboxUndoHoldSeconds
+        let start = deadline.addingTimeInterval(-window)
+        for fraction in [0.0, 0.25, 0.5, 0.9] {
+            let at = start.addingTimeInterval(window * fraction)
+            let fill = Self.fill(row.undoLook(at: at, reduceMotion: false))
+            #expect(fill.map { abs($0 - fraction) < 0.001 } == true, "pending, filled by the part of the window passed: \(fraction)")
+        }
+        #expect(Self.fill(row.undoLook(at: start.addingTimeInterval(-1), reduceMotion: false)) == 0,
+                "a bubble shown before its window starts is empty, never negative")
+        #expect(row.undoLook(at: deadline, reduceMotion: false) == .solid, "solid at the deadline")
+        #expect(row.undoLook(at: deadline.addingTimeInterval(1), reduceMotion: false) == .solid, "and after it")
+        // Every instant agrees with the Undo on the status line: pending iff Undo is offered.
+        for offset in stride(from: -6.0, through: 2.0, by: 0.25) {
+            let at = deadline.addingTimeInterval(offset)
+            #expect((Self.fill(row.undoLook(at: at, reduceMotion: false)) != nil) == (row.undoSecondsLeft(at: at) != nil),
+                    "at \(offset)")
+        }
+        let now = Date()
+        #expect(Self.reply(status: .failed, holdUntil: hold).undoLook(at: now, reduceMotion: false) == .solid)
+        #expect(Self.reply(status: .sending, holdUntil: hold).undoLook(at: now, reduceMotion: false) == .solid)
+        #expect(Self.reply(sentAt: now, holdUntil: hold).undoLook(at: now, reduceMotion: false) == .solid)
+    }
+
+    @Test("Under Reduce Motion the fill does not rise: pending and empty until the deadline, redrawn only when the seconds change")
+    func reduceMotionHasNoRisingFill() {
+        let hold = Date().addingTimeInterval(4.5)
+        let row = Self.reply(holdUntil: hold)
+        let deadline = row.undoDeadline
+        for offset in stride(from: -4.0, to: 0.0, by: 0.25) {
+            #expect(row.undoLook(at: deadline.addingTimeInterval(offset), reduceMotion: true) == .pending(fill: 0),
+                    "at \(offset)")
+        }
+        #expect(row.undoLook(at: deadline, reduceMotion: true) == .solid, "solid when the window ends")
+        let start = deadline.addingTimeInterval(-4)
+        let still = ChatUndoSendSchedule(deadline: deadline, animatesFill: false)
+        #expect(still.entries(from: start, mode: .normal) == ChatUndoSendSchedule.ticks(from: start, deadline: deadline),
+                "no frame-by-frame redraw: only the whole seconds")
+        let moving = ChatUndoSendSchedule(deadline: deadline, animatesFill: true)
+        let frames = moving.entries(from: start, mode: .normal)
+        #expect(frames.count > still.entries(from: start, mode: .normal).count && frames.last == deadline
+                && frames.allSatisfy { $0 <= deadline }, "control: the moving fill redraws often and stops at the deadline")
+    }
+
     // MARK: - 2. Per message
 
     @Test("Each bubble counts down from its own row's deadline, read from the database")
@@ -93,10 +148,13 @@ struct ChatUndoSendTests {
         let rows = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
         let byId = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
         let ra = try #require(byId[a.id]), rb = try #require(byId[b.id])
-        #expect(ra.undoSecondsLeft(at: now) == 9 && rb.undoSecondsLeft(at: now) == 29,
+        // Instants half a second off row a's own stored deadline, so the database's millisecond
+        // dates cannot move a whole-second count.
+        let beforeA = ra.undoDeadline.addingTimeInterval(-0.5)
+        #expect(ra.undoSecondsLeft(at: beforeA) == 1 && rb.undoSecondsLeft(at: beforeA) == 21,
                 "each from its own hold less the claim buffer")
-        let afterA = now.addingTimeInterval(15)
-        #expect(ra.undoSecondsLeft(at: afterA) == nil && rb.undoSecondsLeft(at: afterA) == 14,
+        let afterA = ra.undoDeadline.addingTimeInterval(0.5)
+        #expect(ra.undoSecondsLeft(at: afterA) == nil && rb.undoSecondsLeft(at: afterA) == 20,
                 "one bubble's window ending does not end the other's")
     }
 
