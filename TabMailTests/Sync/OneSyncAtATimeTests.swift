@@ -93,9 +93,9 @@ struct OneSyncAtATimeTests {
 
     /// The first `history` request waits for a second one (another pass's delta)
     /// before it answers; every later one waits for a window listing (a full
-    /// sync). Each wait ends at `parkCap`. `listingStatus` answers the full
-    /// sync's Inbox listing.
-    private static func scenario(wire: Wire, listingStatus: Int = 200) -> FakeHTTP.Scenario {
+    /// sync). Each wait ends at `parkCap`. `historyStatus` answers every
+    /// `history` request once its wait ends.
+    private static func scenario(wire: Wire, historyStatus: Int = 200) -> FakeHTTP.Scenario {
         let scenario = FakeHTTP.Scenario()
         scenario.register(path: "/history", method: "GET") { _ in
             let order: Int = wire.state.withLock { state in
@@ -109,6 +109,7 @@ struct OneSyncAtATimeTests {
             return .parked {
                 _ = (order == 1 ? wire.secondHistory : wire.listing).wait(timeout: .now() + parkCap)
                 wire.state.withLock { $0.historyInFlight -= 1 }
+                guard historyStatus == 200 else { return .status(historyStatus) }
                 return .json(raw: #"{ "historyId": "1000" }"#)
             }
         }
@@ -125,7 +126,6 @@ struct OneSyncAtATimeTests {
             return .parked {
                 Thread.sleep(forTimeInterval: 0.1)
                 wire.state.withLock { $0.listingsInFlight -= 1 }
-                guard listingStatus == 200 else { return .status(listingStatus) }
                 return .json(raw: #"{ "resultSizeEstimate": 0 }"#)
             }
         }
@@ -213,14 +213,17 @@ struct OneSyncAtATimeTests {
         }
     }
 
-    /// A pass whose full sync throws must still hand the turn on, or every later
-    /// pass of the account waits for ever.
+    /// A pass that throws must still hand the turn on, or every later pass of
+    /// the account waits for ever. The pass throws because its delta fails
+    /// (`history` answers 400) and no full sync is due, so no server contact
+    /// succeeded. A failed listing no longer fails a pass (#1060): it leaves the
+    /// folder unproven and keeps the full sync due.
     @Test("A pass that throws hands the turn to the next pass")
     func throwingPassHandsTheTurnOn() async throws {
         try await Self.withAppDB { pool in
-            let account = try Self.makeAccount(pool: pool)
+            let account = try Self.makeAccount(pool: pool, lastFullSyncAt: Date())
             let wire = Wire()
-            let scenario = Self.scenario(wire: wire, listingStatus: 400)
+            let scenario = Self.scenario(wire: wire, historyStatus: 400)
             defer { scenario.close() }
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
@@ -230,7 +233,7 @@ struct OneSyncAtATimeTests {
             #expect(try await Self.waitForHistoryRequests(1, wire: wire), "precondition: the first pass's delta started")
             let secondTask = Task { _ = try? await engine.backgroundDeltaSync(account: account) }
 
-            await #expect(throws: (any Error).self, "precondition: the first pass's full sync throws") {
+            await #expect(throws: (any Error).self, "precondition: the first pass throws (its delta failed, no full sync due)") {
                 _ = try await first.value
             }
             #expect(try await Self.waitForHistoryRequests(2, wire: wire),
