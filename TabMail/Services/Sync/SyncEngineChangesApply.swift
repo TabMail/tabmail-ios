@@ -101,13 +101,17 @@ extension SyncEngine {
             return result
         }
 
-        // The rows the read checked, counted again before any removal: a row
-        // that came or went meanwhile was not checked, so the bookmark stays.
+        // The rows the read checked, read again before any removal: every id
+        // the folder holds in the checked range must be one the check examined.
+        // A row that came meanwhile was not checked (also when another one
+        // left, keeping the count), so the bookmark stays; a checked row that
+        // left (moved out, or a proven removal) does not invalidate it.
         let heldRowsHold = try changes.heldRowsProof.map { proof in
-            try Int.fetchOne(db, sql: """
-                SELECT COUNT(*) FROM messageHeader
+            let held = try Int.fetchAll(db, sql: """
+                SELECT CAST(messageId AS INTEGER) FROM messageHeader
                 WHERE folderId = ? AND CAST(messageId AS INTEGER) BETWEEN ? AND ?
-                """, arguments: [folder.id, proof.lowerId, proof.upperId]) == proof.count
+                """, arguments: [folder.id, proof.lowerId, proof.upperId])
+            return held.allSatisfy(proof.checkedIds.contains)
         } ?? true
 
         // Shields, read INSIDE this transaction.

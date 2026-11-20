@@ -209,7 +209,7 @@ extension IMAPProvider {
         let context = request.context
         let step = SyncConfig.changeReadRequestTimeoutSeconds
         let top = Int(progress.nextBelow) - 1
-        var searched = 0
+        var searched = Set<Int>()
         while true {
             if !progress.unproven.isEmpty {
                 guard context.secondsLeft >= 2 * step else { return false }
@@ -239,8 +239,8 @@ extension IMAPProvider {
             progress.unproven = uids.filter { !present.contains(UID($0)) }.sorted()
             progress.nextBelow = lowest
             progress.remaining -= uids.count
-            searched += uids.count
-            changes.heldRowsProof = .init(lowerId: Int(lowest), upperId: top, count: searched)
+            searched.formUnion(uids.map { Int($0) })
+            changes.heldRowsProof = .init(lowerId: Int(lowest), upperId: top, checkedIds: searched)
         }
     }
 

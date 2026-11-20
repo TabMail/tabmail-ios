@@ -250,7 +250,7 @@ struct IMAPChangeCondstoreCheckTests {
         }
     }
 
-    @Test("T13: a held-rows count that changed between the check and the apply commits neither the bookmark nor the progress")
+    @Test("T13: a held row the check never examined, present between the check and the apply commits neither the bookmark nor the progress")
     func heldRowsMismatchKeepsTheBookmark() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
@@ -267,12 +267,12 @@ struct IMAPChangeCondstoreCheckTests {
         var changes = FolderChanges(
             folderId: folderId, status: .tracked, addressEpoch: R.epoch,
             cursor: IMAPChangeCursor(uidValidity: UInt32(R.epoch), highestModSeq: 6, uidNext: 4, messageCount: 3).encoded)
-        // The read checked two rows in 1...3; the folder holds three there now.
-        changes.heldRowsProof = .init(lowerId: 1, upperId: 3, count: 2)
+        // The read checked 1 and 3 in 1...3; the folder holds 2 there now too.
+        changes.heldRowsProof = .init(lowerId: 1, upperId: 3, checkedIds: [1, 3])
         let mismatch = changes
         _ = try await pool.write { db in try SyncEngine.applyFolderChanges(mismatch, db: db) }
         #expect(try await pool.read { db in try String.fetchOne(db, sql: "SELECT changeCursor FROM folder WHERE id = ?", arguments: [folderId]) } == before)
-        changes.heldRowsProof = .init(lowerId: 1, upperId: 3, count: 3)
+        changes.heldRowsProof = .init(lowerId: 1, upperId: 3, checkedIds: [1, 2, 3])
         let agreeing = changes
         _ = try await pool.write { db in try SyncEngine.applyFolderChanges(agreeing, db: db) }
         #expect(try await pool.read { db in try String.fetchOne(db, sql: "SELECT changeCursor FROM folder WHERE id = ?", arguments: [folderId]) } == agreeing.cursor)
@@ -285,34 +285,42 @@ struct IMAPChangeCondstoreCheckTests {
 
     /// The server holds 1...5, the device 1, 3, 4, 5 (UID 2 not loaded yet).
     /// The server expunges `expunged` (always 4, so a check is owed); the
-    /// reader's check enumerates the held rows; then a crawl that read UID 2
-    /// earlier inserts it, inside the checked range, before the apply. Then
+    /// reader's check enumerates the held rows; then, before the apply, the
+    /// user moves `movedOut` out of the folder (the row leaves it) and a crawl
+    /// that read UID 2 earlier inserts it inside the checked range. Then
     /// ordinary passes run (reader rows = the database's) until the bookmark
-    /// moves. Returns the bookmark after the raced pass, the stored baseline,
-    /// the bookmark at the end, and the rows at the end.
-    static func rowInsertedBetweenCheckAndApply(
-        expunged: Set<Int>, accountId: String
-    ) async throws -> (afterRace: String?, baseline: String, final: String?, rows: [String]) {
+    /// moves. The database and the reader share the reader world's identity.
+    struct RaceOutcome {
+        var afterRace: String?
+        var baseline = ""
+        var final: String?
+        var rows: [String] = []
+        var racedApplyRejected = true
+    }
+
+    static func rowInsertedBetweenCheckAndApply(expunged: Set<Int>, movedOut: Set<Int> = []) async throws -> RaceOutcome {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
-        try FolderEpochTestFixture.insertFolder(
-            accountId: accountId, path: R.inboxPath, role: .inbox, pool: pool,
-            totalCount: 5, lastKnownUidNext: 6, lastKnownUidValidity: R.epoch)
-        try FolderEpochTestFixture.insertHeaders(accountId: accountId, path: R.inboxPath, uids: [1, 3, 4, 5], pool: pool)
-        let folderId = "\(accountId):\(R.inboxPath)"
-        func storedCursor() async throws -> String? {
-            try await pool.read { db in try String.fetchOne(db, sql: "SELECT changeCursor FROM folder WHERE id = ?", arguments: [folderId]) }
-        }
-        func storedRows() async throws -> [String] {
-            try await pool.read { db in
-                try String.fetchAll(db, sql: "SELECT messageId FROM messageHeader WHERE folderId = ? ORDER BY CAST(messageId AS INTEGER)", arguments: [folderId])
-            }
-        }
-        var outcome: (afterRace: String?, baseline: String, final: String?, rows: [String]) = (nil, "", nil, [])
+        var outcome = RaceOutcome()
         try await C.withWorld(inbox: [1, 2, 3, 4, 5]) { w in
-            #expect(w.inboxId == folderId, "setup: the reader and the database name one folder")
-            w.local.set(w.inboxId, [1, 3, 4, 5])
+            let accountId = w.accountId
+            _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+            try FolderEpochTestFixture.insertFolder(
+                accountId: accountId, path: R.inboxPath, role: .inbox, pool: pool,
+                totalCount: 5, lastKnownUidNext: 6, lastKnownUidValidity: R.epoch)
+            try FolderEpochTestFixture.insertHeaders(accountId: accountId, path: R.inboxPath, uids: [1, 3, 4, 5], pool: pool)
+            let folderId = w.inboxId
+            let seeded = try await pool.read { db in try Folder.fetchOne(db, key: folderId) }
+            try #require(seeded != nil, "setup: the reader and the database name one folder")
+            func storedCursor() async throws -> String? {
+                try await pool.read { db in try String.fetchOne(db, sql: "SELECT changeCursor FROM folder WHERE id = ?", arguments: [folderId]) }
+            }
+            func storedRows() async throws -> [String] {
+                try await pool.read { db in
+                    try String.fetchAll(db, sql: "SELECT messageId FROM messageHeader WHERE folderId = ? ORDER BY CAST(messageId AS INTEGER)", arguments: [folderId])
+                }
+            }
+            w.local.set(folderId, [1, 3, 4, 5])
             let base = try await R.baseline(w)
             outcome.baseline = base
             try await pool.write { db in
@@ -320,20 +328,27 @@ struct IMAPChangeCondstoreCheckTests {
             }
             C.remove(expunged, from: w.server)
 
-            // The raced pass: the check enumerated 1, 3, 4, 5; UID 2 lands before the apply.
-            let raced = try await R.inbox(w, R.read(w, cursors: [w.inboxId: base]))
-            #expect(R.isTracked(raced.status), "setup: the raced pass finishes its check, got \(raced.status)")
+            // The raced pass: the check enumerated 1, 3, 4, 5; then rows leave and UID 2 lands before the apply.
+            let raced = try await R.inbox(w, R.read(w, cursors: [folderId: base]))
+            try #require(R.isTracked(raced.status), "setup: the raced pass finishes its check, got \(raced.status)")
+            for uid in movedOut {
+                try await pool.write { db in
+                    try db.execute(sql: "DELETE FROM messageHeader WHERE folderId = ? AND messageId = ?", arguments: [folderId, String(uid)])
+                }
+            }
             try FolderEpochTestFixture.insertHeaders(accountId: accountId, path: R.inboxPath, uids: [2], pool: pool)
-            _ = try await pool.write { db in try SyncEngine.applyFolderChanges(raced, db: db) }
+            let racedResult = try await pool.write { db in try SyncEngine.applyFolderChanges(raced, db: db) }
+            outcome.racedApplyRejected = racedResult.rejected
             outcome.afterRace = try await storedCursor()
 
             // Ordinary passes over what the device now holds.
             for _ in 0..<Self.raceSettlePassCap {
                 let held = try await storedRows().compactMap(Int.init)
-                w.local.set(w.inboxId, held)
+                w.local.set(folderId, held)
                 let cursor = try await storedCursor()
-                let pass = try await R.inbox(w, R.read(w, cursors: [w.inboxId: cursor]))
-                _ = try await pool.write { db in try SyncEngine.applyFolderChanges(pass, db: db) }
+                let pass = try await R.inbox(w, R.read(w, cursors: [folderId: cursor]))
+                let applied = try await pool.write { db in try SyncEngine.applyFolderChanges(pass, db: db) }
+                try #require(!applied.rejected, "an ordinary pass's apply was rejected")
                 if try await storedCursor() != base { break }
             }
             outcome.final = try await storedCursor()
@@ -344,7 +359,8 @@ struct IMAPChangeCondstoreCheckTests {
 
     @Test("T13 race: a row a crawl inserts inside the checked range after the reader's check and before the apply keeps the bookmark; the next ordinary pass removes it once the server has expunged it")
     func rowInsertedAfterTheCheckKeepsTheBookmarkAndIsRemovedLater() async throws {
-        let outcome = try await Self.rowInsertedBetweenCheckAndApply(expunged: [2, 4], accountId: "cs-t13-race")
+        let outcome = try await Self.rowInsertedBetweenCheckAndApply(expunged: [2, 4])
+        #expect(!outcome.racedApplyRejected, "the raced apply reached the proof")
         #expect(outcome.afterRace == outcome.baseline, "the bookmark advanced past a row the check never examined")
         #expect(!outcome.rows.contains("2"), "the expunged message the crawl inserted is still shown: \(outcome.rows)")
         #expect(!outcome.rows.contains("4"), "the expunged message is still shown: \(outcome.rows)")
@@ -352,11 +368,52 @@ struct IMAPChangeCondstoreCheckTests {
         #expect(outcome.final != outcome.baseline, "the folder's bookmark never moved on after the race settled")
     }
 
+    @Test("T13 race, same count: a checked row moved out and an unchecked expunged row inserted keep the held count, yet the bookmark stays and the stale row is removed by ordinary passes")
+    func sameCountReplacementKeepsTheBookmarkAndIsRemovedLater() async throws {
+        let outcome = try await Self.rowInsertedBetweenCheckAndApply(expunged: [2, 4], movedOut: [1])
+        #expect(!outcome.racedApplyRejected, "the raced apply reached the proof")
+        #expect(outcome.afterRace == outcome.baseline, "the bookmark advanced past a row the check never examined")
+        #expect(!outcome.rows.contains("2"), "the expunged message the crawl inserted is still shown: \(outcome.rows)")
+        #expect(!outcome.rows.contains("4"), "the expunged message is still shown: \(outcome.rows)")
+        #expect(outcome.rows.contains("3") && outcome.rows.contains("5"), "a live row was removed: \(outcome.rows)")
+        #expect(outcome.final != outcome.baseline, "the folder's bookmark never moved on after the race settled")
+    }
+
     @Test("Control: a live row a crawl inserts after the reader's check stays, and the bookmark moves on after the next ordinary pass")
     func liveRowInsertedAfterTheCheckLoadsNormally() async throws {
-        let outcome = try await Self.rowInsertedBetweenCheckAndApply(expunged: [4], accountId: "cs-t13-live")
+        let outcome = try await Self.rowInsertedBetweenCheckAndApply(expunged: [4])
+        #expect(!outcome.racedApplyRejected, "the raced apply reached the proof")
         #expect(outcome.rows == ["1", "2", "3", "5"], "the live inserted row is kept and only the expunged one goes: \(outcome.rows)")
         #expect(outcome.final != outcome.baseline, "the bookmark moved on")
+    }
+
+    @Test("Control, rows only leave: a checked row moved out before the apply does not hold the bookmark back")
+    func checkedRowMovedOutStillAdvances() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try await C.withWorld(inbox: [1, 2, 3, 4]) { w in
+            _ = try FolderEpochTestFixture.makeAccount(id: w.accountId, provider: .imap, pool: pool)
+            try FolderEpochTestFixture.insertFolder(
+                accountId: w.accountId, path: R.inboxPath, role: .inbox, pool: pool,
+                totalCount: 4, lastKnownUidNext: 5, lastKnownUidValidity: R.epoch)
+            try FolderEpochTestFixture.insertHeaders(accountId: w.accountId, path: R.inboxPath, uids: [1, 2, 3, 4], pool: pool)
+            let folderId = w.inboxId
+            let base = try await R.baseline(w)
+            try await pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [base, folderId])
+            }
+            C.remove([4], from: w.server)
+            let pass = try await R.inbox(w, R.read(w, cursors: [folderId: base]))
+            try #require(R.isTracked(pass.status), "setup: the check finishes, got \(pass.status)")
+            try #require(pass.heldRowsProof != nil, "setup: the check produced a proof")
+            try await pool.write { db in
+                try db.execute(sql: "DELETE FROM messageHeader WHERE folderId = ? AND messageId = '1'", arguments: [folderId])
+            }
+            let applied = try await pool.write { db in try SyncEngine.applyFolderChanges(pass, db: db) }
+            #expect(!applied.rejected)
+            let stored = try await pool.read { db in try String.fetchOne(db, sql: "SELECT changeCursor FROM folder WHERE id = ?", arguments: [folderId]) }
+            #expect(stored == pass.cursor && stored != base, "a row leaving the checked range does not invalidate the proof")
+        }
     }
 
     // MARK: - An established bookmark and a SELECT that says EXISTS 0

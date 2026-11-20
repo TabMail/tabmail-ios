@@ -320,11 +320,13 @@ struct FolderChanges: Sendable {
     /// before tracking starts never leaves the bookmark without its check.
     var armCatchUpWithBookmark = false
     /// The folder's rows with numeric ids in `lowerId...upperId` the read
-    /// checked, `count` of them. The apply counts them again in its
-    /// transaction; on a difference it keeps the stored bookmark (a row came or
-    /// went meanwhile, so the check did not see it). Nil = nothing to recount.
+    /// checked: exactly `checkedIds` (bounded by the check's window). The apply
+    /// reads the folder's held ids in that range again in its transaction; a
+    /// held id the check never examined (a row that came meanwhile, even when
+    /// another one left and the count is unchanged) keeps the stored bookmark.
+    /// A checked row that left does not. Nil = nothing to verify.
     var heldRowsProof: HeldRowsProof?
-    struct HeldRowsProof: Sendable, Equatable { let lowerId: Int; let upperId: Int; let count: Int }
+    struct HeldRowsProof: Sendable, Equatable { let lowerId: Int; let upperId: Int; let checkedIds: Set<Int> }
     /// Set by the engine, never by a reader: the folder bookmark the read was
     /// issued with. A bookmark dropped between the read and the apply
     /// (`SyncEngine.dropChangeBookmark`) is never written back. Nil = not
