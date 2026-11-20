@@ -158,7 +158,8 @@ struct ChatFieldFill: Equatable {
         /// The open send completed (its compose card's reply went out): it empties the words only
         /// if a send is open and they are still the words sent, or none.
         case completed
-        /// The agent answered the field's send: `completed`, unless a compose card opened for it.
+        /// The agent answered the field's send: `completed`, unless a compose card opened for it and
+        /// closed unsent; then the words are the user's again, kept and not emptied.
         case answered
         /// A compose card opened for the field's send (`composing`).
         case composeOpened
@@ -207,12 +208,13 @@ struct ChatFieldFill: Equatable {
             holdsSentWords = false
             composing = false
         case .answered:
-            // A compose card that opened for the send owns its completion: a closed card's
-            // closing answer leaves the words.
-            guard !composing else { return }
-            if clears { words = "" }
+            // A compose card that opened for the send owns its completion. The answer comes once
+            // the card is done; if it is still composing, the card closed unsent: the answer
+            // empties nothing and hands the words back to the user, so they are kept.
+            if !composing, clears { words = "" }
             atSend = nil
             holdsSentWords = false
+            composing = false
         case .composeOpened:
             composing = true
         case .confirmationCard:

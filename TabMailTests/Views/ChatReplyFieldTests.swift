@@ -516,10 +516,14 @@ struct ChatReplyFieldTests {
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer"), .completed, .answered).words == "Newer")
         // An answer to a send still open empties the words sent.
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, .answered).words == "")
-        // A compose card that opened and closed without sending: the closing answer completes
-        // nothing; the sent words wait in the field, still the send's (none kept).
+        // A compose card that opened and closed without sending: the closing answer empties
+        // nothing and hands the words back to the user, so they are kept.
         let closed = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, .answered)
-        #expect(closed.words == "Ask" && closed.atSend == "Ask" && closed.unsent == "")
+        #expect(closed.words == "Ask" && closed.atSend == nil && !closed.composing && closed.unsent == "Ask")
+        // A compose card closed unsent, then a new field send before any answer: that send's
+        // answer empties its sent words (the new send is not the closed card's).
+        let resent = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, Self.typed("Ask again"), .sentFromField, .answered)
+        #expect(resent.words == "" && resent.atSend == nil && !resent.composing, "\(resent)")
 
         // From the open sheet the words go at once; a draft typed next stays through the completion.
         let sheet = Self.fill(Self.typed("Ask"), .sentFromSheet)

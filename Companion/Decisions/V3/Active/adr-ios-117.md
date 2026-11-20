@@ -80,6 +80,11 @@ chat history the same key already keeps, and goes with that thread's AI data and
   its words as it strands its chat; the purge deletes them once the old key has no email.
 - Words typed in a field whose send is still in flight are not kept until the send completes; a send
   that then fails keeps its own retry in the chat.
+- A reply compose card that opened for the field's send and closed unsent (2026-11-20 ruling, review r7
+  N1): the agent's answer, which comes once the card is done, empties nothing and hands the words back
+  to the user (`ChatFieldFill.apply(.answered)` clears `atSend`, `holdsSentWords` and `composing`), so
+  they are kept like typed words and show again after a relaunch. Before, they showed for the run but
+  were never kept.
 - A field send's transitions (confirmation card, the agent's answer, a compose card opening, its reply
   going out) are applied by the request lifecycle to the chat key captured at send
   (`ToolInvocation.fieldWordsKey`, `SessionUISink.fieldWordsKey`,

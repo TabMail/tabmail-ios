@@ -923,15 +923,26 @@ struct ChatFieldWordsRuntimeTests {
         }
     }
 
-    @Test("A field request's compose closed without sending, then its answer: the sent words wait in the field; with no compose the answer empties them",
-          arguments: [true, false])
-    func closedComposeThenAnswerKeepsTheSend(_ composeClosed: Bool) async throws {
+    /// What the field request does before its answer: no compose, or a compose card of the
+    /// producer closed unsent.
+    enum ClosedCompose: String, CaseIterable, CustomTestStringConvertible {
+        case none, reply, compose, forward
+        var testDescription: String { rawValue }
+        var producer: ComposeProducer? { ComposeProducer(rawValue: rawValue) }
+        /// Only the reply tool's card is the field's own (`request.fieldReply`): it owns the
+        /// completion, so its answer hands the words back. Every other answer empties them.
+        var keepsTheWords: Bool { self == .reply }
+    }
+
+    @Test("A field request's reply compose closed without sending, then its answer: the sent words are the user's again, kept after a relaunch; with no compose, or a compose or forward card, the answer empties them",
+          arguments: ClosedCompose.allCases)
+    func closedComposeThenAnswerKeepsTheSend(_ closed: ClosedCompose) async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can drive the hosted field")
         try await HostedAccessibility.withAutomation {
             try await Self.withDatabase { pool in
                 _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
                 try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
-                let email = Self.header("closed-\(composeClosed)", thread: "closed-thread-\(composeClosed)")
+                let email = Self.header("closed-\(closed.rawValue)", thread: "closed-thread-\(closed.rawValue)")
                 try await pool.write { try email.insert($0) }
                 let key = ChatFieldWords.key(for: email)
                 let sent = "Reply that Friday works"
@@ -943,28 +954,36 @@ struct ChatFieldWordsRuntimeTests {
                     try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
                     let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
                     #expect(asked, "control: the request reached the backend")
-                    if composeClosed {
-                        let result = try await Self.sendCompose(.reply, Self.invocation(.fieldUnchanged, email: email),
+                    if let producer = closed.producer {
+                        let result = try await Self.sendCompose(producer, Self.invocation(.fieldUnchanged, email: email),
                                                                 email: email, pool: pool, outcome: .cancelled)
                         #expect(!result.contains("sent successfully"), "control: the compose closed unsent: \(result)")
-                        #expect(ChatFieldWords.shared.fill(for: key).composing, "control: the compose opened for the field")
+                        #expect(ChatFieldWords.shared.fill(for: key).composing == closed.keepsTheWords,
+                                "control: only the reply card opens for the field")
+                        #expect(ChatFieldWords.shared.fill(for: key).words == sent, "control: the sent words wait for the answer")
                     }
                     backend.proceed.signal()
                     try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
                     try await Self.settle()
                     let fill = ChatFieldWords.shared.fill(for: key)
                     let texts = Self.fieldTexts(pill.view)
-                    if composeClosed {
-                        // The compose card owned the completion: the answer completes nothing.
-                        #expect(fill.words == sent && fill.atSend == sent, "the sent words wait: \(fill.words)")
-                        #expect(texts.contains(sent), "the sent words stay in the field: \(texts)")
+                    #expect(fill.atSend == nil && !fill.composing, "the answer completed the send: \(fill)")
+                    if closed.keepsTheWords {
+                        #expect(fill.words == sent && fill.unsent == sent, "the words are the user's again: \(fill.words)")
+                        #expect(texts.contains(sent), "the words stay in the field: \(texts)")
                     } else {
-                        #expect(fill.words == "" && fill.atSend == nil, "the answer emptied the sent words: \(fill.words)")
+                        #expect(fill.words == "", "the answer emptied the sent words: \(fill.words)")
                         #expect(!texts.contains(sent), "the field is empty: \(texts)")
                     }
                 }
                 await ChatFieldWords.shared.written()
-                #expect(try Self.stored(pool) == [:], "sent words are never kept")
+                let expected = closed.keepsTheWords ? sent : ""
+                #expect(try Self.stored(pool) == (expected.isEmpty ? [:] : [key: expected]), "kept only when handed back")
+                // A relaunch: a fresh store on the same database.
+                await Self.newRun { PrioritizedDatabase(pool: pool) }
+                await ChatFieldWords.shared.load(key)
+                #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                        "after a relaunch: \(ChatFieldWords.shared.fill(for: key).words)")
             }
         }
     }
