@@ -116,12 +116,17 @@ struct ChatSuggestionBubbleTests {
     }
 
     /// What the open compose card shows, read fresh from the top of the chat's presentation
-    /// chain on every call: the card's suggestion lands after it opens, so a view kept from the
-    /// first read can miss it. Never the chat behind it, whose ghost holds the same words.
+    /// chain on every call, after a layout pass: the card's suggestion lands after it opens (an
+    /// async draft read), and the accessibility walk forces no layout, so without one a poll can
+    /// keep reading the layout from before the suggestion. Laid out the way the repo's other
+    /// hosted-view polls do (`window.layoutIfNeeded()` per poll). Never the chat behind the
+    /// card, whose ghost holds the same words.
     private static func cardTexts(_ chat: Chat) -> [String] {
         var top = chat.controller.presentedViewController
         while let next = top?.presentedViewController { top = next }
         guard let card = top?.view else { return [] }
+        card.window?.layoutIfNeeded()
+        card.layoutIfNeeded()
         return HostedAccessibility.labels(in: card) + fieldTexts(card)
     }
 
