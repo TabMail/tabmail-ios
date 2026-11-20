@@ -1371,3 +1371,23 @@ alert is up, and the two notice-only cases end the same way: an alert left up fa
 left it, with a diagnostic line, and is then dismissed so the next test starts clean. A further case refuses the Undo for other reasons on a Gmail
 account (the forward move never happened, the row is gone, the account is gone) and expects the same
 notice for each.
+
+## Chat view — the AI summaries notice
+
+`ChatAISummariesNoticeTests` pins the notice's rules without a view: the first-open flag
+(`AISummariesNotice.FirstOpen.claim`) is used once per install, only after the chat has landed and
+while tips may show (not on sample mail or in the tutorial, which never use it up); the report
+content is every summary in the chat, newest first, without bubbles still being summarized or emails
+with no content; the report sheet's extra line appears only for this report; and the exact wording.
+
+`ChatAISummariesNoticeHostedTests` hosts the real `AISummariesNoticeButton` and `ChatSubjectLine` in a
+window and reads them through their accessibility elements (`HostedAccessibility`): the popover is
+presented by itself on the first landed open, also when the same mounted view goes from not landed to
+landed, and not on a later open; the default tip gate holds it back while onboarding is incomplete;
+"Report a concern" hands over to the sheet, whose Report submits a `.summary` report with the chat's
+content, including replies still sending or not sent (captured through the sheet's `send`
+parameter); a cancelled report never reopens the sheet, and an accepted one closes it and shows
+"Report Submitted"; the glyph has its label, hint and a full 44-point target at the trailing edge,
+and the subject stays centred. A control pins that the long-press sheet still sends its own type and
+content with no extra line. TipKit is not used for the flag, because its store cannot be reset inside
+the test process (ADR-IOS-085), so a tip's show-once rule could not be tested.
