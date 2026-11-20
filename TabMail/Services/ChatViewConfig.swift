@@ -65,8 +65,8 @@ enum ChatViewLayout {
     static let bubbleCornerRadius: CGFloat = 18
     static let bubbleMaxWidthFraction: CGFloat = 0.78
     static let bubbleSpacing: CGFloat = 6
-    /// The one-line pill's height, used until the pill is measured: the thread keeps the measured
-    /// collapsed height under its last bubble, so it sits above the pill, never under it.
+    /// The bottom bar's height until the reply field is measured: the bar is a slot of the
+    /// collapsed field's measured height, and its inset keeps the last bubble above the field.
     static let pillStartHeight: CGFloat = 98
     /// Room between the last bubble and the pill's top, beyond the bubble spacing.
     static let pillGap: CGFloat = 6
@@ -132,6 +132,10 @@ enum ChatViewLayout {
     static let fieldDragMinimumDistance: CGFloat = 10
     static let fieldDragMaxSwell: CGFloat = 220
     static let fieldDragOpenDistance: CGFloat = 60
+    /// After a drag on the field lets go, how long the bar keeps its resting height while the swell
+    /// springs back (the pill's spring, response 0.45, damping 0.82, is at rest by then), so the
+    /// chat does not follow the settling field.
+    static let fieldDragSettle: Duration = .milliseconds(900)
     /// A new email's arrival in the open chat (`ChatArrival`): it rises from behind the field over
     /// this long; under Reduce Motion the space opens at once and it fades in over the second.
     static let arrivalRiseDuration: Double = 0.42

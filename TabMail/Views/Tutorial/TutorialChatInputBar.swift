@@ -37,6 +37,11 @@ struct TutorialChatInputBar: View {
         }
     }
 
+    /// The tutorial tooltip's inset from the bar's edges.
+    static let tooltipInset: CGFloat = 8
+    /// The tooltip arrow's centre from the tooltip's leading edge: over the mic glyph's centre.
+    static let tooltipArrowCenterX = ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2 - tooltipInset
+
     /// The same row as the real bar (`ChatFieldBarRow`).
     private var inputRow: some View {
         ChatFieldBarRow {
@@ -81,9 +86,9 @@ struct TutorialChatInputBar: View {
 private struct TutorialInputTooltip: View {
     let close: () -> Void
 
-    /// The arrow's center sits over the microphone: the bar's leading padding
-    /// plus half the microphone's frame, less the bubble's own inset.
-    private let arrowCenterX: CGFloat = 14 + 14 - 8
+    /// The arrow's center sits over the microphone glyph: the row's inset to the glyph plus half
+    /// the glyph, less the bubble's own inset (`TutorialChatInputBar.tooltipArrowCenterX`).
+    private let arrowCenterX = TutorialChatInputBar.tooltipArrowCenterX
     private let arrowSize = CGSize(width: 16, height: 8)
 
     var body: some View {
@@ -105,7 +110,7 @@ private struct TutorialInputTooltip: View {
         }
         .compositingGroup()
         .shadow(color: .black.opacity(0.2), radius: 8, y: 2)
-        .padding(.horizontal, 8)
+        .padding(.horizontal, TutorialChatInputBar.tooltipInset)
         .contentShape(Rectangle())
         .onTapGesture(perform: close)
         .accessibilityIdentifier("tutorial-input-tooltip")

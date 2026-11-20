@@ -916,7 +916,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    field's corner `min(height / 2, 21)`. The collapsed Chat pill keeps its size. The line height
    scales with the text size (`@ScaledMetric`), so at the largest sizes the buttons still centre
    on the last line. The Stop and Retry glyphs keep their size. Tests:
-   `ChatThreadLayoutTests.fieldButtonsOnTheLastLine`, `ChatReplyFieldTests.everyOpenBarSharesTheRow`.
+   `ChatThreadLayoutTests.fieldButtonsOnTheLastLine` and `signedInEmptyField` (the "e.g." line is
+   the last line, as in the option-B drawing), `ChatReplyFieldTests.everyOpenBarSharesTheRow`,
+   `statusLinePadding` and `tutorialArrowOnTheMic`.
 
 18. **The field is the chat's bottom bar (amendment 2026-11-20).** The reply field is the scroll
    view's `.safeAreaBar(edge: .bottom, spacing: 0)`, as the header is its top bar (decision 15), so
@@ -937,18 +939,30 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `ChatViewLayout.fieldDragMaxSwell`); on let-go the panel opens with the pill's spring once the
    swell, or a flick's predicted swell, reaches `fieldDragOpenDistance`, and otherwise the field
    settles back. Only a drag more up than sideways counts, so the chat's sideways swipes are
-   unchanged. The swell is not the field's room: the bar keeps its collapsed height, so the chat
-   does not move. Not in the tutorial, whose steps open the chat themselves. The panel stays dimmed
+   unchanged. The swell is not the field's room: from the drag's start until its swell has
+   settled (`ChatViewLayout.fieldDragSettle`) the bar keeps its resting height, so the chat does not
+   move during the swell or the settle. The drag's state is a `@GestureState`
+   (`ChatFieldDrag.Progress`) reset with the pill's spring, so a cancelled drag (the panel opening on
+   an agent answer mid-drag, a system interruption) springs back too; the let-go only decides
+   whether the panel opens. The drag holds the user-interaction freeze through `ChatSwipeHold` under
+   its own id (`ChatThreadView.fieldDragHoldId`) from its start until `swipeSettleHold` after it
+   ends, finished or cancelled. VoiceOver opens the panel with the field's named action "Show
+   TabMail chat". Not in the tutorial, whose steps open the chat themselves. The panel stays dimmed
    with the rest of the chat as built (the ghost dims with it). Tests: `ChatFieldDragTests`,
-   `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel` and
-   `testShortDragUpOnTheReplyFieldSettlesBack`.
+   `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel`,
+   `testShortDragUpOnTheReplyFieldSettlesBack` and `testDraggedOpenPanelClosesOnCloseAndOnTheDim`,
+   `testShortDragOnTheReplyFieldKeepsTheChat`, `ChatReplyFieldTests.fieldDragWiring`.
 
 20. **The first-time drag tip (amendment 2026-11-20).** Once, above the collapsed reply field, a
    tip in today's TipKit style (`ChatFieldDragTip`, behind the onboarding gate, shown at most once)
-   says "Drag up to see what you asked TabMail about this conversation." It goes away for good on a
-   tap (the field takes focus, or the popover's own dismissal) or on the first drag up
-   (`invalidate(reason: .actionPerformed)`), and is not shown over the open panel or in the
-   tutorial; there is no tutorial step for it. Test: `ChatReplyFieldTests.fieldDragTip`.
+   says "Drag up to see what you asked TabMail about this conversation." It is an inline `TipView`
+   with `arrowEdge: .bottom` in an overlay whose bottom sits on the field's top, not a popover: it
+   pushes no layout and takes no touch from the field, so the user's first tap focuses the field
+   and their first drag opens the panel (a popover tip would swallow that first touch). It goes
+   away for good when a drag starts, the field takes focus, the panel opens, or on its own close
+   button (`invalidate(reason: .actionPerformed)`), and is not shown over the open panel or in the
+   tutorial; there is no tutorial step for it. Tests: `ChatReplyFieldTests.fieldDragTip`,
+   `ChatFieldDragTests.firstDragWithTheTipOpens`.
 
 21. **A new email rises into the open chat (amendment 2026-11-20).** When the newest email changes
    after the chat has landed (`ChatArrival.isArrival`), the new bubble rises from behind the reply
@@ -957,9 +971,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    inside the animation. While the landing still holds the chat at the bottom, the arrival re-pins
    it through the landing's own target in the same animation, so the new email ends fully above the
    field. Under Reduce Motion the space opens at once (no layout animation, the chat jumps up) and
-   the bubble fades in over `arrivalFadeDuration` (0.2 s). The open's own load never animates.
+   the bubble fades in over `arrivalFadeDuration` (0.2 s). The open's own load never animates, and
+   only the arriving row has the transition, so Reduce Motion does not fade in a load's rows. The
+   user's own newest email (their reply, filed from Sent) is not an arrival and does not rise.
    Not decided here and left for later work: the AI Suggestion's working bubble and its growth into
-   the ghost. Tests: `ChatArrivalTests`, `ChatThreadLayoutTests.arrivalEndsAboveTheField`.
+   the ghost. Tests: `ChatArrivalTests`, `ChatThreadLayoutTests.arrivalEndsAboveTheField`,
+   `ChatReplyFieldTests.arrivalWiring`.
 
 ## The longer index line (routed 2026-11-09)
 

@@ -54,6 +54,8 @@ extension DynamicIslandChat {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
+                    // The row pads only itself: the status line keeps the field's padding above it.
+                    .padding(.top, ChatViewLayout.fieldVerticalPadding)
                     .transition(.opacity)
             }
             ChatFieldBarRow {

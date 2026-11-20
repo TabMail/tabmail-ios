@@ -221,8 +221,10 @@ struct ChatPillTip: Tip {
     }
 }
 
-/// Shown once above the chat view's reply field: a drag up opens the TabMail chat about the
-/// conversation (ADR-IOS-114 decision 20). Gone on a tap or on the first drag (`invalidate`).
+/// Shown once above the chat view's reply field, inline (a `TipView` in an overlay, never a popover,
+/// so it takes no touch from the field): a drag up opens the TabMail chat about the conversation
+/// (ADR-IOS-114 decision 20). Gone for good on the first drag, a tap that focuses the field, the
+/// panel opening, or its own close button (`invalidate`).
 struct ChatFieldDragTip: Tip {
     static let text = "Drag up to see what you asked TabMail about this conversation."
 
@@ -237,7 +239,7 @@ struct ChatFieldDragTip: Tip {
         MaxDisplayCount(1)
     }
 
-    /// The user tapped the field or dragged it: the tip has done its job and never comes back.
+    /// The user dragged or focused the field, or the panel opened: the tip never comes back.
     static func close() {
         ChatFieldDragTip().invalidate(reason: .actionPerformed)
     }

@@ -61,6 +61,19 @@ private struct FieldButtonSlot: ViewModifier {
 /// predicted swell, reaches `ChatViewLayout.fieldDragOpenDistance`; otherwise it settles back.
 /// Only a drag that goes more up than sideways swells the field, so a sideways swipe stays a swipe.
 enum ChatFieldDrag {
+    /// A drag in flight on the field, as the view's `@GestureState`: it resets however the drag
+    /// ends, a cancelled drag included. `isDragging` is the whole drag (the interaction freeze and
+    /// the tip key off it, once per drag); `swell` is how far the field follows the finger.
+    struct Progress: Equatable {
+        var isDragging = false
+        var swell: CGFloat = 0
+    }
+
+    /// The drag's progress for a drag of `translation`.
+    static func progress(translation: CGSize) -> Progress {
+        Progress(isDragging: true, swell: swell(translation: translation))
+    }
+
     /// How far the field swells for a drag of `translation`.
     static func swell(translation: CGSize) -> CGFloat {
         let up = -translation.height
