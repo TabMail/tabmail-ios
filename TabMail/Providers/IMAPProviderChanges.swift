@@ -280,8 +280,13 @@ extension IMAPProvider {
     /// `\Deleted` elsewhere moves that row, and once un-deleted it would fall
     /// outside the range for good while the bookmark moves past it.
     nonisolated static func heldRangeStart(_ folder: ChangeFolder) -> Int? {
-        if folder.olderMailComplete { return 1 }
-        return folder.olderMailCursor.map { $0 + 1 }
+        heldRangeStart(olderMailComplete: folder.olderMailComplete, olderMailCursor: folder.olderMailCursor)
+    }
+
+    /// The same rule from the walk's two values (the catch-up's lower bound, #1062).
+    nonisolated static func heldRangeStart(olderMailComplete: Bool, olderMailCursor: Int?) -> Int? {
+        if olderMailComplete { return 1 }
+        return olderMailCursor.map { $0 + 1 }
     }
 
     /// The arrivals in a UID SEARCH answer, in UID order: every UID from `from`

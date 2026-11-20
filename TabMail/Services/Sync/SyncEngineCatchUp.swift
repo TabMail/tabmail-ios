@@ -76,6 +76,14 @@ struct SyncEngineCatchUpRowReader: CatchUpLocalRowReader {
         }
     }
 
+    func lastNumericId(folderId: String) async throws -> Int? {
+        try await pool.read { db in
+            try Int.fetchOne(db, sql: """
+                SELECT MAX(CAST(messageId AS INTEGER)) FROM messageHeader WHERE folderId = ?
+                """, arguments: [folderId])
+        }
+    }
+
     func rows(folderId: String, ids: [String]) async throws -> [CatchUpLocalRow] {
         guard !ids.isEmpty else { return [] }
         return try await pool.read { db in
@@ -154,6 +162,11 @@ extension SyncEngine {
         let intervalSeconds: TimeInterval
         /// Most requests one slice may send (`SyncConfig.catchUpSliceMaxRequests`).
         var sliceMaxRequests = SyncConfig.catchUpSliceMaxRequests
+        /// About how many messages one listing range holds
+        /// (`CatchUpContext.listingRangeMessages`).
+        var listingRangeMessages = SyncConfig.catchUpListingRangeMessages
+        /// Longest one catch-up request may take (`CatchUpContext.requestTimeoutSeconds`).
+        var requestTimeoutSeconds = SyncConfig.catchUpRequestTimeoutSeconds
         /// The clock the slices and the deadline are measured on. Injectable so a
         /// test can spend a slice deterministically; production passes `Date.init`.
         let clock: @Sendable () -> Date
@@ -178,7 +191,8 @@ extension SyncEngine {
             }
             return CatchUpContext(
                 deadline: end, clock: clock,
-                storageLimitInForce: storageLimitInForce, maxRequests: sliceMaxRequests)
+                storageLimitInForce: storageLimitInForce, maxRequests: sliceMaxRequests,
+                listingRangeMessages: listingRangeMessages, requestTimeoutSeconds: requestTimeoutSeconds)
         }
     }
 
@@ -255,12 +269,17 @@ extension SyncEngine {
     }
 
     /// The account's syncable folders as they are now (`syncableFoldersInOrder`,
-    /// the folders the full sync syncs), in the full sync's order.
+    /// the folders the full sync syncs), in the full sync's order, then every
+    /// other folder owed a check after a move retired without proof
+    /// (`FolderChangeState.selfHealDue`, #1062), so its mark always clears.
     private func syncableFolderIds(accountId: String) async throws -> [String] {
         let folders = try await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId).fetchAll(db)
         }
-        return syncableFoldersInOrder(folders).map(\.id)
+        let syncable = syncableFoldersInOrder(folders).map(\.id)
+        let listed = Set(syncable)
+        let owed = folders.filter { !listed.contains($0.id) && FolderChangeState(raw: $0.changeState).selfHealDue }
+        return syncable + owed.map(\.id)
     }
 
     /// One slice of the catch-up. `folderIds` are the syncable folders, re-read
@@ -289,12 +308,20 @@ extension SyncEngine {
         // this, so an action that completed at or after it may be newer than
         // what the result carries (`applyCatchUpTransaction`).
         let readStartedAt = CatchUpWallClock.now()
+        // What each folder was owed when its read began: a mark that lands
+        // during the read (an unproven move retired meanwhile) is newer than
+        // anything the read carries (`applyCatchUpTransaction`).
+        let owedAtRead = Dictionary(
+            folders.map { ($0.id, FolderChangeState(raw: $0.changeState).selfHealOwed) },
+            uniquingKeysWith: { first, _ in first })
         let results = await provider.catchUp(
             folders: folders, localRows: SyncEngineCatchUpRowReader(pool: dbPool), context: context)
         let windowMode = provider.staleWindowMode
         var madeProgress = false
         for result in results {
-            let outcome = await applyCatchUpResult(result, windowMode: windowMode, readStartedAt: readStartedAt)
+            let outcome = await applyCatchUpResult(
+                result, windowMode: windowMode, readStartedAt: readStartedAt,
+                selfHealOwedAtRead: owedAtRead[result.folderId])
             if result.madeProgress, case .applied = outcome { madeProgress = true }
         }
         return madeProgress
@@ -316,7 +343,8 @@ extension SyncEngine {
     /// it in the folder, is missing again at the next listing.
     @discardableResult
     func applyCatchUpResult(
-        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date
+        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date,
+        selfHealOwedAtRead: Int? = nil
     ) async -> CatchUpApplyOutcome {
         let folderId = result.folderId
         if !result.loadFailures.isEmpty && DebugModeManager.isLoggingEnabled() {
@@ -332,7 +360,8 @@ extension SyncEngine {
         do {
             outcome = try await dbPool.write { db in
                 try Self.applyCatchUpTransaction(
-                    result, windowMode: windowMode, readStartedAt: readStartedAt, now: appliedAt, db: db)
+                    result, windowMode: windowMode, readStartedAt: readStartedAt, now: appliedAt,
+                    selfHealOwedAtRead: selfHealOwedAtRead, db: db)
             }
         } catch {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): apply failed: \(error)")
@@ -368,16 +397,36 @@ extension SyncEngine {
     /// nothing either, so the provider lists the same ids again later. True only
     /// when every write chunk landed. `readStartedAt` makes the insert skip what
     /// the user's own newer action stands on (`insertBackfillBatch`).
+    ///
+    /// Ids that carry an epoch (`result.epoch`) are inserted under the premise of
+    /// that epoch, checked against the folder's stamp inside each insert
+    /// transaction, so a turnover between the read and the insert refuses, which
+    /// is not landed (C3, #1062). Under a storage limit the provider loads
+    /// nothing below where kept mail ends, measured in its own sync order (IMAP:
+    /// the lowest held UID, which the UID-ordered prune keeps a clean floor), so
+    /// this insert keeps every load.
+    /// *Superseded (#1062):* "a loaded message dated older than the folder's
+    /// oldest kept row (`date`, the prune's own order) is not inserted and counts
+    /// as done" — on IMAP that date skip downloaded every pruned hole again at
+    /// each listing (ADR-IOS-006 current note).
     private func insertCatchUpLoads(_ result: CatchUpFolderResult, readStartedAt: Date) async -> Bool {
         let folderId = result.folderId
         guard let folder = try? await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
               folder.uidValidityResetPendingAt == nil else { return false }
         let headers = result.loaded.compactMap(\.header)
+        guard !headers.isEmpty else { return true }
         let bodies = Dictionary(
             result.loaded.map { ($0.id, (htmlBody: $0.htmlBody, textBody: $0.textBody)) },
             uniquingKeysWith: { first, _ in first })
+        // The premise is the epoch that produced the result, never the folder's
+        // stamp read here: a reset that finished between the read and this
+        // insert stamped a new epoch, and the insert's own transaction refuses
+        // it (C3). Rebinding to the stamp read here would admit old-epoch rows.
+        let premise = result.epoch.map { observed in
+            (premise: CrawlEpochPremise(observed), observedEpoch: observed)
+        }
         let insert = await insertFetchedBackfillMessages(
-            headers, bodies: bodies, folder: folder, catchUpReadStartedAt: readStartedAt)
+            headers, bodies: bodies, folder: folder, catchUpReadStartedAt: readStartedAt, epochPremise: premise)
         BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): loaded \(headers.count) missing message(s), inserted \(insert.inserted)")
         return insert.allLanded
     }
@@ -442,8 +491,11 @@ extension SyncEngine {
     /// The transaction itself. Everything it decides on is read INSIDE it: the folder
     /// row (quarantine, epoch), the pending operations and the recent completions.
     /// `now` is the wall clock (`CatchUpWallClock`) at the apply.
+    /// `selfHealOwedAtRead`: the folder's `FolderChangeState.selfHealOwed` when
+    /// the read began (nil: not known, nothing is re-marked).
     nonisolated static func applyCatchUpTransaction(
-        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date, now: Date, db: Database
+        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date, now: Date,
+        selfHealOwedAtRead: Int? = nil, db: Database
     ) throws -> CatchUpApplyOutcome {
         guard let folder = try Folder.fetchOne(db, key: result.folderId),
               folder.uidValidityResetPendingAt == nil else { return .skipped }
@@ -503,9 +555,66 @@ extension SyncEngine {
         // a completed walk (`backfillComplete = 0, backfillPageToken = NULL,
         // backfillPageHeldSince = NULL` with the state), declined for an
         // unfinished walk and while a storage limit was in force.
-        try db.execute(
-            sql: "UPDATE folder SET catchUpState = ? WHERE id = ?",
-            arguments: [result.newState, folder.id])
+        // The new state keeps a lapse count marked after the read began
+        // (`markCatchUpLapse`, e.g. an unproven move retired meanwhile): the
+        // result carries the count it read, and writing it back would lose the
+        // newer mark for good. CASE evaluates lazily: the JSON functions only
+        // see valid JSON objects.
+        // The window floor (`CatchUpWindowFloor`) is the window merge's, never the
+        // provider's: read before the write and carried into the new state, so a
+        // catch-up's state write never drops or moves it.
+        let windowFloor = try Int.fetchOne(db, sql: """
+            SELECT CASE WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object'
+                THEN json_extract(catchUpState, '$.' || ?) END FROM folder WHERE id = ?
+            """, arguments: [CatchUpWindowFloor.key, folder.id])
+        try db.execute(sql: """
+            UPDATE folder SET catchUpState = CASE
+                WHEN :new IS NOT NULL AND json_valid(:new) AND json_type(:new) = 'object'
+                    AND json_valid(catchUpState) AND json_type(catchUpState) = 'object'
+                    AND COALESCE(json_extract(catchUpState, '$.' || :key), 0) > COALESCE(json_extract(:new, '$.' || :key), 0)
+                THEN json_set(:new, '$.' || :key, json_extract(catchUpState, '$.' || :key))
+                ELSE :new END
+            WHERE id = :id
+            """, arguments: ["new": result.newState, "key": CatchUpLapse.countKey, "id": folder.id])
+        if let windowFloor {
+            try Self.recordCatchUpWindowFloor(folderId: folder.id, lowest: windowFloor, db: db)
+        }
+
+        // A folder owed a check after a move retired without proof
+        // (`dropChangeBookmark(selfHealDue:)`) is settled by a clean listing that
+        // STARTED after the last mark (#1062): one that began before it may have
+        // passed the message the move left. Its listing is then made due, so the
+        // next full sync lists it, its count check clears the mark, and
+        // `commitChangeBaseline` tracks it again from that pass's own read.
+        var changeState = FolderChangeState(raw: folder.changeState)
+        let markedDuringRead = selfHealOwedAtRead.map { changeState.selfHealOwed > $0 } ?? false
+        let settles = result.completedListing.map {
+            $0.clean && $0.lapseCountAtStart >= (changeState.selfHealLapse ?? 0)
+        } ?? false
+        // An owed listing that completed without settling the mark (not clean: a
+        // missing UID was passed over) consumed the lapse that made it due; with
+        // a bookmark, nothing else lists the folder again. The obligation is
+        // re-armed, so a later listing still repairs the missing UID (#1062).
+        let completedUnsettled = changeState.selfHealDue && result.completedListing != nil && !settles
+        if markedDuringRead || completedUnsettled {
+            // A mark landed while this read ran, or the owed listing completed
+            // unsettled. The listing the result carries may have begun before
+            // the mark, and a NULL state then had no count for the mark to
+            // raise: the lapse is marked again on the state just written, so
+            // only a listing that starts after it settles the mark.
+            try markCatchUpLapse(folderId: folder.id, db: db)
+            changeState.selfHealLapse = try Int.fetchOne(db, sql: """
+                SELECT CASE WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object'
+                    THEN COALESCE(json_extract(catchUpState, '$.' || ?), 0) ELSE 0 END
+                FROM folder WHERE id = ?
+                """, arguments: [CatchUpLapse.countKey, folder.id]) ?? 0
+            try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [changeState.encoded, folder.id])
+        } else if changeState.selfHealDue, settles {
+            changeState.selfHealOwed = 0
+            changeState.selfHealLapse = nil
+            changeState.markListingDue()
+            try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [changeState.encoded, folder.id])
+        }
         return .applied(updatedFlags: updatedFlags, removedIds: removedIds)
     }
 }

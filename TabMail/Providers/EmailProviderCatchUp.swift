@@ -38,6 +38,8 @@ protocol CatchUpLocalRowReader: Sendable {
     func rows(folderId: String, numericIdsFrom lower: Int, through upper: Int) async throws -> [CatchUpLocalRow]
     /// The smallest id, read as an integer, that is `>= lower`, or nil when none is.
     func firstNumericId(folderId: String, atLeast lower: Int) async throws -> Int?
+    /// The largest id, read as an integer, or nil when the folder holds none.
+    func lastNumericId(folderId: String) async throws -> Int?
     /// Rows for exactly these provider ids. Ids with no local row are absent.
     func rows(folderId: String, ids: [String]) async throws -> [CatchUpLocalRow]
     /// Up to `limit` rows in ascending provider-id order, after `afterId`
@@ -72,6 +74,13 @@ struct CatchUpContext: Sendable {
     /// Most requests this call may send (`SyncConfig.catchUpSliceMaxRequests` for a
     /// slice of the backfill worker's catch-up). `Int.max` bounds it by time only.
     var maxRequests = Int.max
+    /// About how many messages one listing range holds where the provider sizes
+    /// its ranges by message count (IMAP, `SyncConfig.catchUpListingRangeMessages`).
+    /// A test narrows it to list a small folder in several ranges.
+    var listingRangeMessages = SyncConfig.catchUpListingRangeMessages
+    /// Longest one catch-up request may take (`SyncConfig.catchUpRequestTimeoutSeconds`).
+    /// A test shortens it to time a request out without waiting seconds.
+    var requestTimeoutSeconds = SyncConfig.catchUpRequestTimeoutSeconds
     /// Requests charged so far, shared by every copy of this context.
     private let charged = OSAllocatedUnfairLock<Int>(initialState: 0)
 
@@ -124,7 +133,7 @@ struct CatchUpFolderResult: Sendable {
     /// The folder's new opaque state, written in the same transaction as the
     /// results. Nil clears it.
     var newState: String?
-    /// Messages the provider fetched, with their bodies, for ids the server lists
+    /// Messages the provider fetched, with their bodies (IMAP: header only), for ids the server lists
     /// in the folder that no local row in the folder holds (mail moved in, or new
     /// mail beyond the sync window after a lapse). Only the ones that loaded (a
     /// header). The apply inserts them through the backfill page walk's own insert
@@ -143,6 +152,19 @@ struct CatchUpFolderResult: Sendable {
     /// so a folder whose requests keep failing is tried again at the worker's next
     /// cycle, never at network rate (#766).
     var madeProgress = false
+    /// Set only in the call in which a listing of the folder completed (#1062):
+    /// the lapse count it started at, and whether it was clean. The apply clears
+    /// a folder's owed check with it. A provider may leave it nil.
+    var completedListing: CatchUpCompletedListing?
+}
+
+/// A completed listing, as `CatchUpFolderResult.completedListing` reports it.
+struct CatchUpCompletedListing: Sendable, Equatable {
+    /// The folder's lapse count (`CatchUpLapse.countKey`) when the listing started.
+    let lapseCountAtStart: Int
+    /// Every missing message in the listed range was loaded or proven gone:
+    /// none was passed over by the hold bound.
+    let clean: Bool
 }
 
 /// The delta-cursor lapse marker every provider's catch-up state may carry
@@ -156,6 +178,28 @@ struct CatchUpFolderResult: Sendable {
 enum CatchUpLapse {
     /// The key of the lapse count in a state's JSON object.
     static let countKey = "lapseCount"
+}
+
+/// The lowest id a window listing of the folder has reached, for a provider that
+/// windows by UID (#1062). The full sync's window merge
+/// (`SyncEngine.recordCatchUpWindowFloor`) keeps it under `key` in the folder's
+/// catch-up state JSON, as the lowest value any window listing in the folder's
+/// current epoch reached; the catch-up apply carries it across its own state
+/// writes, and a turnover clears it with the state. Rows other paths write
+/// (infinite scroll pages by date) never move it. Before the older-mail walk
+/// starts, a catch-up loads missing mail only from here up: new mail beyond the
+/// window is the catch-up's, older mail is the walk's.
+enum CatchUpWindowFloor {
+    /// The key of the floor in a state's JSON object.
+    static let key = "windowFloor"
+
+    /// The floor recorded in `state`, or nil when none is (no window listing
+    /// recorded one yet, or the state is not a JSON object).
+    static func read(_ state: String?) -> Int? {
+        guard let data = state?.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        return (object[key] as? NSNumber)?.intValue
+    }
 }
 
 /// The time rules every provider's catch-up shares: when a folder's full check is

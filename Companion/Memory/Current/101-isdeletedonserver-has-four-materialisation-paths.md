@@ -1,5 +1,7 @@
 ## `MessageHeaderInfo.isDeletedOnServer` has FOUR **materialisation** paths and a FIFTH **presentation** path the census could not see (2026-08-04, corrected same day)
 
+> **Current note (2026-11-20, #1062):** the date-based self-heal (`SyncEngineSelfHeal`, `selfHealRecentMessages`) is deleted. Missing IMAP mail is now found and loaded by UID by the catch-up (ADR-IOS-107, amendment of 2026-11-20), which feeds the same insert funnel; every self-heal mention below is history.
+
 **The census that matters is of the paths that BUILD A `MessageHeader` FROM a `MessageHeaderInfo`,
 not of the sites that read the flag.** `a659c4bc5` closed `IOS-IMAP-001`/D3 by teaching the *merge*
 to stop presenting a message the server reports as `\Deleted`, and enumerated **two** consumers.

@@ -440,6 +440,13 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// messages, the FETCH over a range covering all N returns fewer than N.
         /// Empty for every pre-existing test.
         var fetchRecordSuppressedByMailbox: [String: Set<Int>] = [:]
+        /// `injectUnsolicitedFetch(in:uid:flags:)`: one extra untagged FETCH
+        /// (UID and FLAGS) sent with the next FETCH in the mailbox, whatever it asked.
+        var unsolicitedFetchByMailbox: [String: [Int: [String]]] = [:]
+        /// `slowListingFetch(in:overRecords:seconds:)`: per mailbox.
+        var slowListingByMailbox: [String: (overRecords: Int, seconds: Double)] = [:]
+        /// Flags-only FETCHes answered in each mailbox, with how many records each matched.
+        var listingFetchSizesByMailbox: [String: [Int]] = [:]
         /// Per-mailbox ESEARCH data for the next UID SEARCHes, in order
         /// (`answerNextUIDSearch(in:all:)`, `answerNextUIDSearch(in:esearchData:)`):
         /// each is sent as `* ESEARCH (TAG …) UID <data>` and consumed. Empty for
@@ -1549,6 +1556,27 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// failure it leaves the client with no id for the missing message at all.
     func suppressFetchRecord(in mailbox: String, uids: Set<Int>) {
         withState { $0.fetchRecordSuppressedByMailbox[mailbox] = uids }
+    }
+
+    /// Test seam: with the next FETCH in this mailbox, whatever UIDs it asks for,
+    /// also send `* n FETCH (UID uid FLAGS (flags))` for `uid` (a message the
+    /// mailbox holds): the unsolicited flag update another client's change causes,
+    /// which RFC 9051 §7 lets a server send at any time. Consumed by one FETCH.
+    func injectUnsolicitedFetch(in mailbox: String, uid: Int, flags: [String]) {
+        withState { $0.unsolicitedFetchByMailbox[mailbox, default: [:]][uid] = flags }
+    }
+
+    /// Test seam: a slow link. Every flags-only FETCH (no ENVELOPE) in this
+    /// mailbox that matches more than `overRecords` messages is answered only
+    /// after `seconds`, so a client whose timeout is shorter gives it up. Stays
+    /// until `slowListingFetch(in:overRecords:nil)`.
+    func slowListingFetch(in mailbox: String, overRecords: Int, seconds: Double?) {
+        withState { $0.slowListingByMailbox[mailbox] = seconds.map { (overRecords, $0) } }
+    }
+
+    /// How many records each flags-only FETCH answered in this mailbox matched, in order.
+    func listingFetchSizes(in mailbox: String) -> [Int] {
+        withState { $0.listingFetchSizesByMailbox[mailbox] ?? [] }
     }
 
     /// Test seam: answer the next UID SEARCH in this mailbox, whatever it asks,
@@ -3476,12 +3504,26 @@ final class FakeIMAPServer: @unchecked Sendable {
                 uidSuppressed: state.fetchUidSuppressedByMailbox[mailbox] ?? [],
                 internalDateSuppressed: state.fetchInternalDateSuppressedByMailbox[mailbox] ?? [],
                 recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? [],
-                conflicting: state.conflictingFetchRecordByMailbox[mailbox]
+                conflicting: state.conflictingFetchRecordByMailbox[mailbox],
+                unsolicited: state.unsolicitedFetchByMailbox.removeValue(forKey: mailbox) ?? [:]
             )
         }
         passHeldGate(Self.snapshotGateKey(mailbox))
         let matched = parseSequenceSet(seqStr, uidMode: uidMode, messages: snapshot.messages)
+        if itemsStr.contains("FLAGS"), !itemsStr.contains("ENVELOPE") {
+            let slow = withState { state -> Double? in
+                state.listingFetchSizesByMailbox[mailbox, default: []].append(matched.count)
+                guard let rule = state.slowListingByMailbox[mailbox], matched.count > rule.overRecords else { return nil }
+                return rule.seconds
+            }
+            // This connection's own thread: blocking delays no other connection.
+            if let slow { usleep(UInt32(slow * 1_000_000)) }
+        }
         var response = ""
+        for (uid, flags) in snapshot.unsolicited.sorted(by: { $0.key < $1.key }) {
+            guard let index = snapshot.messages.firstIndex(where: { $0.uid == uid }) else { continue }
+            response += "* \(index + 1) FETCH (UID \(uid) FLAGS (\(flags.joined(separator: " "))))\r\n"
+        }
 
         for msg in matched {
             // `suppressFetchRecord(in:uids:)` — the SHORT FETCH. The message stays

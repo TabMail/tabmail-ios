@@ -1,0 +1,712 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Foundation
+import GRDB
+import Testing
+@testable import TabMail
+
+/// The catch-up's listing ranges on a bunched folder and a slow link, and its
+/// load floor before the older-mail walk starts (#1062). Same world as
+/// `IMAPMissingByUIDTests`.
+extension IMAPMissingByUIDTests {
+
+    /// The production shape, scaled down so a test runs in seconds: a slice
+    /// shorter than one request's timeout (`catchUpSliceSeconds` 2 s against
+    /// `catchUpRequestTimeoutSeconds` 3 s), so a timeout spends the slice; a
+    /// slow answer later than the timeout; and slices spaced further apart
+    /// than the slow answer, so its late reply has freed the connection by the
+    /// next slice, as on a real link between worker slices.
+    static let scaledSliceSeconds: TimeInterval = 0.3
+    static let scaledTimeout: TimeInterval = 0.5
+    static let slowAnswerSeconds: Double = 1
+    static let scaledIntervalSeconds: TimeInterval = 1.2
+    static let slowLinkDeadline: TimeInterval = 180
+
+    /// The `lo...hi` of each listing FETCH (`UID FETCH lo:hi (UID FLAGS)`) among `commands`, in order.
+    static func listingRanges(_ commands: some Collection<String>) -> [ClosedRange<Int>] {
+        commands.compactMap { command -> ClosedRange<Int>? in
+            let upper = command.uppercased()
+            guard upper.contains("FETCH"), upper.contains("FLAGS"), !upper.contains("ENVELOPE") else { return nil }
+            let tokens = upper.split(separator: " ")
+            guard let index = tokens.firstIndex(of: "FETCH"), index + 1 < tokens.count else { return nil }
+            // `lo:hi`, or a one-UID range written as its UID alone (`7`).
+            let bounds = tokens[index + 1].split(separator: ":").compactMap { Int($0) }
+            if bounds.count == 1 { return bounds[0]...bounds[0] }
+            guard bounds.count == 2, bounds[0] <= bounds[1] else { return nil }
+            return bounds[0]...bounds[1]
+        }
+    }
+
+    /// Run the worker on the scaled slow link and check the timeout path: the
+    /// listing completes across calls, and a range that timed out is never
+    /// asked again at its own width.
+    @MainActor
+    static func runOnSlowLink(_ w: World, overRecords: Int) async throws -> (fetches: Int, ranges: [ClosedRange<Int>]) {
+        w.server.slowListingFetch(in: path, overRecords: overRecords, seconds: slowAnswerSeconds)
+        defer { w.server.slowListingFetch(in: path, overRecords: overRecords, seconds: nil) }
+        let sizesBefore = w.server.listingFetchSizes(in: path).count
+        let start = w.server.recordedCommands().count
+        try await w.workerRun(deadlineIn: slowLinkDeadline, requestTimeout: scaledTimeout,
+                              sliceSeconds: scaledSliceSeconds, intervalSeconds: scaledIntervalSeconds)
+        let commands = Array(w.server.recordedCommands().dropFirst(start))
+        let ranges = listingRanges(commands)
+        let sizes = Array(w.server.listingFetchSizes(in: path).dropFirst(sizesBefore))
+        #expect(ranges.count == sizes.count, "setup: every listing FETCH is parsed: \(ranges.count) vs \(sizes.count)")
+        let timedOut = zip(ranges, sizes).filter { $0.1 > overRecords }.map(\.0)
+        #expect(!timedOut.isEmpty, "setup: the link timed a listing range out")
+        for (index, range) in ranges.enumerated() where timedOut.contains(range) {
+            let askedAgain = ranges[(index + 1)...].first {
+                $0.lowerBound == range.lowerBound && $0.count >= range.count
+            }
+            #expect(askedAgain == nil,
+                    "#1062: from where a range timed out, no later range is as wide again: \(range), then \(askedAgain.map { "\($0)" } ?? "")")
+        }
+        return (listingCost(commands).fetches, ranges)
+    }
+
+    // MARK: - Range widths (pure)
+
+    @Test("The first listing range's width: the minimum with no UIDNEXT, no count or a count of 0; scaled by mean density, rounded up; clamped to the configured minimum and maximum")
+    func firstListingRangeSpanEdges() {
+        let minimum = SyncConfig.catchUpListingMinRangeSpan, maximum = SyncConfig.catchUpListingMaxRangeSpan
+        #expect(IMAPProvider.listingRangeSpan(messages: 1000, exists: 500, uidNext: nil) == minimum)
+        #expect(IMAPProvider.listingRangeSpan(messages: 1000, exists: 500, uidNext: 1) == minimum)
+        #expect(IMAPProvider.listingRangeSpan(messages: 1000, exists: nil, uidNext: 5_000_001) == minimum)
+        #expect(IMAPProvider.listingRangeSpan(messages: 1000, exists: 0, uidNext: 5_000_001) == minimum,
+                "a stored count of 0 is unknown, never one range for the whole folder")
+        #expect(IMAPProvider.listingRangeSpan(messages: 1000, exists: 5000, uidNext: 5001) == minimum,
+                "a dense folder: the minimum width")
+        #expect(IMAPProvider.listingRangeSpan(messages: 1000, exists: 3000, uidNext: 10_001) == 3334,
+                "10000 / 3000 * 1000, rounded up")
+        #expect(IMAPProvider.listingRangeSpan(messages: 1000, exists: 3, uidNext: 1_000_000_001) == maximum,
+                "a very sparse folder: the maximum width")
+    }
+
+    @Test("The next listing range's width: the maximum after an empty range; scaled from the previous range's own count, rounded up; clamped")
+    func nextListingRangeSpanEdges() {
+        let minimum = SyncConfig.catchUpListingMinRangeSpan, maximum = SyncConfig.catchUpListingMaxRangeSpan
+        #expect(IMAPProvider.nextListingRangeSpan(messages: 1000, width: 5000, held: 0) == maximum)
+        #expect(IMAPProvider.nextListingRangeSpan(messages: 1000, width: 10_000, held: 3000) == 3334)
+        #expect(IMAPProvider.nextListingRangeSpan(messages: 1000, width: 1000, held: 1000) == minimum)
+        #expect(IMAPProvider.nextListingRangeSpan(messages: 1000, width: 2000, held: 1) == 2_000_000)
+        #expect(IMAPProvider.nextListingRangeSpan(messages: 1000, width: maximum, held: 1) == maximum)
+    }
+
+    @Test("The one splitting rule: halves cover the range exactly; a one-UID range has none; the walk retries its upper half first and sets a one-UID range aside unconfirmed")
+    func splittingRuleIsShared() async {
+        let halves = UIDWalkCursor.halves(from: 101, to: 200)
+        #expect(halves?.lower.from == 101 && halves?.lower.to == 150 && halves?.upper.from == 151 && halves?.upper.to == 200)
+        let odd = UIDWalkCursor.halves(from: 1, to: 2)
+        #expect(odd?.lower.from == 1 && odd?.lower.to == 1 && odd?.upper.from == 2 && odd?.upper.to == 2)
+        #expect(UIDWalkCursor.halves(from: 7, to: 7) == nil)
+
+        let cursor = UIDWalkCursor(startCursor: 200, chunkSize: 100)
+        let first = await cursor.nextRange()
+        #expect(first?.from == 101 && first?.to == 200)
+        await cursor.failRangeSmaller(from: 101, to: 200)
+        let retryA = await cursor.nextRange(), retryB = await cursor.nextRange()
+        #expect(retryA?.from == 151 && retryA?.to == 200, "the walk's upper half first")
+        #expect(retryB?.from == 101 && retryB?.to == 150)
+
+        let single = UIDWalkCursor(startCursor: 1, chunkSize: 1)
+        _ = await single.nextRange()
+        await single.failRangeSmaller(from: 1, to: 1)
+        #expect(await single.hasFailedThisWalk, "a one-UID range is set aside for this walk")
+        #expect(await single.currentCursor >= 1, "and never confirmed")
+        #expect(!(await single.isComplete))
+
+        #expect(UIDWalkCursor.failureCallsForSmallerRange(TimeoutError(duration: 1)))
+        #expect(!UIDWalkCursor.failureCallsForSmallerRange(CancellationError()))
+    }
+
+    // MARK: - Ranges on a bunched folder and a slow link
+
+    /// 200 messages low in the UID space, then 5000 in one dense band near
+    /// UIDNEXT: the folder's mean density says one range holds about 1000, but
+    /// the band packs 5000 into a range of that width.
+    static let bunchedServer = Array(1...200) + Array(1_000_001...1_005_000)
+
+    @Test("A bunched folder on a slow link whose slice is shorter than one request: a range that times out stops the folder for that call with its width halved, the next call goes on from the same place, and the listing completes across calls within a request ceiling")
+    @MainActor
+    func bunchedFolderListsWithinACeiling() async throws {
+        // Debug-gated diagnostics for one run (#1062): `TEST_RUNNER_TABMAIL_TEST_DEBUG_LOG=1`.
+        let debugLog = ProcessInfo.processInfo.environment["TABMAIL_TEST_DEBUG_LOG"] == "1"
+        if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true } }
+        defer { if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } } }
+        let server = Self.bunchedServer
+        let tooMany = 2 * SyncConfig.catchUpListingRangeMessages
+        try await Self.withWorld("bunched", server: server, local: server,
+                                 rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
+            let missing = [50, 1_000_500, 1_004_900]
+            try await w.dropLocal(missing)
+            try await w.markOwed()
+            let cost = try await Self.runOnSlowLink(w, overRecords: tooMany)
+            // Ceiling: the band halves at most log2(UIDNEXT) times on its way
+            // down, plus one range per `tooMany / 2` messages once it answers.
+            let halvings = Int(log2(Double(server.max()! + 1)).rounded(.up))
+            let answering = server.count / (tooMany / 2) + 1
+            let ceiling = 2 * halvings + answering
+            #expect(cost.fetches <= ceiling, "a bounded number of listing requests: \(cost.fetches) > \(ceiling)")
+            // Once the app is at rest, every message the server holds is held.
+            try await w.reachRest("#1062 bunched")
+            try w.expectHeldExactly(server, "#1062 bunched")
+            #expect(!(try w.changeState()).selfHealDue, "#1062: the listing completed and settled")
+        }
+    }
+
+    @Test("A folder whose stored message count is 0 while its UIDNEXT is known: its first listing range has the minimum width, never the whole folder, and no listing request answers more than about one range's messages")
+    @MainActor
+    func unknownCountListsInRangesOfTheMinimumWidth() async throws {
+        // Debug-gated diagnostics for one run (#1062): `TEST_RUNNER_TABMAIL_TEST_DEBUG_LOG=1`.
+        let debugLog = ProcessInfo.processInfo.environment["TABMAIL_TEST_DEBUG_LOG"] == "1"
+        if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true } }
+        defer { if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } } }
+        let server = Array(1...5000)
+        let messages = SyncConfig.catchUpListingRangeMessages
+        try await Self.withWorld("count-zero", server: server, local: server, rangeMessages: messages) { w in
+            let missing = [10, 2500, 4990]
+            try await w.dropLocal(missing)
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET totalCount = 0 WHERE id = ?", arguments: [folderId])
+            }
+            try await w.markOwed()
+            let sizesBefore = w.server.listingFetchSizes(in: Self.path).count
+            let start = w.server.recordedCommands().count
+            try await w.workerRun()
+            let sizes = Array(w.server.listingFetchSizes(in: Self.path).dropFirst(sizesBefore))
+            let cost = Self.listingCost(w.server.recordedCommands().dropFirst(start))
+            #expect(!sizes.isEmpty, "setup: the listing ran")
+            #expect((sizes.max() ?? 0) <= max(messages, SyncConfig.catchUpListingMinRangeSpan),
+                    "#1062: no listing request covers the whole folder: \(sizes)")
+            // One listing FETCH per range, plus one more per slice boundary: a
+            // slice's request cap can end a call inside a range (after its FETCH,
+            // or between its SEARCH and its load), and the next call lists that
+            // range again from where it stands. Slices are counted from the
+            // requests the run sent (`catchUpSliceMaxRequests` each).
+            let requests = w.server.recordedCommands().dropFirst(start).filter {
+                let upper = $0.uppercased()
+                return upper.contains("FETCH") || upper.contains("SEARCH")
+            }.count
+            let slices = (requests + SyncConfig.catchUpSliceMaxRequests - 1) / SyncConfig.catchUpSliceMaxRequests
+            let ranges = (server.count + messages - 1) / messages
+            let ceiling = ranges + max(0, slices - 1)
+            #expect(cost.fetches <= ceiling, "#1062: about one listing request per range: \(cost.fetches) > \(ceiling)")
+            let asked = Self.listingRanges(w.server.recordedCommands().dropFirst(start))
+            #expect(Set(asked.map(\.lowerBound)).count == asked.count,
+                    "#1062: no slice lists a range again that an earlier slice listed: \(asked)")
+            try w.expectHeldExactly(server, "#1062 count zero")
+            #expect(!(try w.changeState()).selfHealDue, "#1062: the listing completed and settled")
+        }
+    }
+
+    @Test("A first listing range that times out, with a slice shorter than one request: the next call asks half its width from the same place, never the full width again, and the listing completes across calls within a request ceiling")
+    @MainActor
+    func firstRangeThatTimesOutCompletesAfterSplits() async throws {
+        // Debug-gated diagnostics for one run (#1062): `TEST_RUNNER_TABMAIL_TEST_DEBUG_LOG=1`.
+        let debugLog = ProcessInfo.processInfo.environment["TABMAIL_TEST_DEBUG_LOG"] == "1"
+        if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true } }
+        defer { if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } } }
+        let server = Array(1...3000)
+        let messages = SyncConfig.catchUpListingRangeMessages
+        let tooMany = messages / 2
+        try await Self.withWorld("first-timeout", server: server, local: server, rangeMessages: messages) { w in
+            let missing = [5, 1500, 2995]
+            try await w.dropLocal(missing)
+            try await w.markOwed()
+            let cost = try await Self.runOnSlowLink(w, overRecords: tooMany)
+            let first = try #require(cost.ranges.first, "setup: the listing ran")
+            #expect(first.count > tooMany, "setup: the first range was too large for the link: \(first)")
+            // Every answering range holds about `tooMany`; each one before it
+            // timed out at most once at twice its width.
+            let ceiling = 2 * (server.count / tooMany + 1)
+            #expect(cost.fetches <= ceiling, "#1062: a bounded number of listing requests: \(cost.fetches) > \(ceiling)")
+            try w.expectHeldExactly(server, "#1062 first range timed out")
+            #expect(!(try w.changeState()).selfHealDue, "#1062: the listing completed and settled")
+        }
+    }
+
+    // MARK: - Carried ranges: every slice keeps what it proved (#1062)
+
+    /// The server and missing UIDs of the carried-range tests: three listing
+    /// ranges of the minimum width, one missing message in each.
+    static let carryServer = Array(1...3000)
+    static let carryMissing = [5, 1500, 2995]
+    /// Requests the repair needs at most: per range its listing FETCH, its
+    /// membership SEARCH and one header batch.
+    static var carryRequestsNeeded: Int {
+        let ranges = (carryServer.count + SyncConfig.catchUpListingMinRangeSpan - 1) / SyncConfig.catchUpListingMinRangeSpan
+        return 3 * ranges
+    }
+
+    @Test("Any slice budget that fits one request repairs the folder in a bounded number of slices, and no slice throws away what it proved: no listing range is listed twice, no membership proof is asked twice",
+          arguments: [1, 2, 3, 4])
+    @MainActor
+    func anySliceBudgetConvergesWithoutRepeats(budget: Int) async throws {
+        let server = Self.carryServer
+        try await Self.withWorld("carry-budget-\(budget)", server: server, local: server,
+                                 rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
+            try await w.dropLocal(Self.carryMissing)
+            try await w.markOwed()
+            let clock = CatchUpTestClock()
+            let start = w.server.recordedCommands().count
+            // Every slice sends at least one request of new work, and one more
+            // slice finds the listing complete.
+            let bound = Self.carryRequestsNeeded + 1
+            var slices = 0
+            while try w.held() != server || w.catchUpState()?.listing != nil, slices < 2 * bound {
+                await w.slice(maxRequests: budget, clock: clock)
+                slices += 1
+            }
+            #expect(slices <= bound, "#1062: budget \(budget): the repair converges within \(bound) slices: \(slices)")
+            try w.expectHeldExactly(server, "#1062 budget \(budget)")
+            let commands = Array(w.server.recordedCommands().dropFirst(start))
+            let asked = Self.listingRanges(commands)
+            #expect(Set(asked.map(\.lowerBound)).count == asked.count,
+                    "#1062: budget \(budget): no range is listed again: \(asked)")
+            let cost = Self.listingCost(commands)
+            #expect(cost.searches <= asked.count,
+                    "#1062: budget \(budget): one membership proof per listed range: \(cost.searches) for \(asked.count)")
+        }
+    }
+
+    /// What happens to a carried missing UID between the call that carried it
+    /// and the call that loads it.
+    enum CarriedUidGoes: String, CaseIterable, Sendable {
+        /// Another path wrote its row first.
+        case alreadyLocal
+        /// The server expunged it.
+        case expunged
+    }
+
+    @Test("A carried missing UID that went stale before its load (another path wrote it, or the server expunged it) loads nothing, is never fetched again or held, and writes no row",
+          arguments: CarriedUidGoes.allCases)
+    @MainActor
+    func staleCarriedUidWritesNothing(_ goes: CarriedUidGoes) async throws {
+        let server = Self.carryServer
+        let stale = Self.carryMissing[0]
+        try await Self.withWorld("carry-stale-\(goes.rawValue)", server: server, local: server,
+                                 rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try db.execute(sql: "CREATE TEMP TABLE keptRow AS SELECT * FROM messageHeader WHERE folderId = ? AND messageId = ?",
+                               arguments: [folderId, "\(stale)"])
+            }
+            try await w.dropLocal(Self.carryMissing)
+            try await w.markOwed()
+            let clock = CatchUpTestClock()
+            // One request: the first range's listing FETCH; its proof and load
+            // are carried.
+            await w.slice(maxRequests: 1, clock: clock)
+            let carried = try #require(try w.catchUpState()?.listing?.carried, "setup: the range is carried")
+            #expect(carried.missing.contains(UInt32(stale)), "setup: the carried range names \(stale)")
+            var expected = server
+            switch goes {
+            case .alreadyLocal:
+                try await w.pool.write { db in
+                    try db.execute(sql: "INSERT INTO messageHeader SELECT * FROM keptRow")
+                }
+            case .expunged:
+                w.server.setMessages(server.filter { $0 != stale }.map(Self.message), in: Self.path)
+                expected = server.filter { $0 != stale }
+            }
+            let start = w.server.recordedCommands().count
+            var heldStale = 0
+            _ = try await Self.slicesUntilRepaired(w, expected: expected, maxRequests: 1, clock: clock,
+                                                   bound: 2 * (Self.carryRequestsNeeded + 1)) {
+                if let listing = try w.catchUpState()?.listing, listing.nextUid == stale, listing.loadHeldSince != nil {
+                    heldStale += 1
+                }
+            }
+            try w.expectHeldExactly(expected, "#1062 stale carried UID (\(goes.rawValue))")
+            #expect(heldStale == 0, "#1062: the stale UID is never held: \(heldStale) slice(s)")
+            let asked = Self.headerFetches(w.server.recordedCommands().dropFirst(start)).filter { Self.uidSet($0).contains(stale) }
+            switch goes {
+            case .alreadyLocal:
+                #expect(asked.isEmpty, "#1062: a carried UID already local is not fetched again: \(asked)")
+            case .expunged:
+                #expect(asked.count <= 1, "#1062: an expunged carried UID is asked at most once: \(asked)")
+            }
+            let rows = try await w.pool.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader WHERE folderId = ? AND messageId = ?",
+                                 arguments: [folderId, "\(stale)"]) ?? 0
+            }
+            #expect(rows == (goes == .alreadyLocal ? 1 : 0), "#1062: no header row is written for the stale UID: \(rows)")
+        }
+    }
+
+    @Test("A carried range names at most the configured number of UIDs: past it the range is cut at the UID that reaches it, keeping its lowest UIDs, so the carry is bounded and the listing still moves")
+    func carriedRangeIsCapped() {
+        let cap = SyncConfig.catchUpCarriedUidCap
+        let missing = (1...UInt32(cap + 10)).map { $0 * 2 }
+        let carry = IMAPProvider.carry(lo: 1, hi: Int(missing.last!) + 5, candidates: [], missing: missing,
+                                       deletedListed: [], proven: true, heldFloor: missing.last, loadsFrom: 1)
+        #expect(carry.missing.count == cap, "#1062: at most \(cap) carried UIDs: \(carry.missing.count)")
+        #expect(carry.missing == Array(missing.prefix(cap)), "#1062: the carry keeps the range's lowest UIDs")
+        #expect(carry.hi == Int(missing[cap - 1]), "#1062: the range is cut at the UID that reaches the cap")
+        #expect(carry.hi >= carry.lo, "#1062: the cut range is not empty, so the listing moves past it")
+        #expect(carry.heldFloor == nil, "#1062: a held UID past the cut is left to the next listing")
+        #expect(carry.loadsFrom == 1, "#1062: the carry keeps the load floor its range was listed under")
+        let small = IMAPProvider.carry(lo: 1, hi: 1000, candidates: [7], missing: [5], deletedListed: [9], proven: false, heldFloor: nil, loadsFrom: nil)
+        #expect(small.hi == 1000 && small.missing == [5] && small.candidates == [7] && small.deletedListed == [9],
+                "#1062: a range under the cap is carried whole")
+    }
+
+    // MARK: - The load floor before the walk starts
+
+    @Test("Wi-Fi-only on cellular, the older-mail walk not started, rows infinite scroll wrote far below the window: a catch-up loads none of the older mail between them and the window")
+    @MainActor
+    func infiniteScrollRowsDoNotPullTheFloorDown() async throws {
+        let server = Array(1...400)
+        let window = Array((server.count - SyncConfig.syncMessageLimit + 1)...server.count)
+        let scrolled = Array(1...5)
+        try await Self.withWorld("floor-scroll", server: server, local: window, walkStarted: false) { w in
+            try await w.makeFullSyncDue()
+            try await w.foregroundSync()
+            let floor = try #require(CatchUpWindowFloor.read(try w.folder().catchUpState), "setup: the window listing recorded its floor")
+            #expect(floor == window[0], "setup: the floor is where the window listing reached")
+            // Infinite scroll writes old rows without moving the walk.
+            try FolderEpochTestFixture.insertHeaders(accountId: w.accountId, path: Self.path, uids: scrolled, pool: w.pool)
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                for uid in scrolled {
+                    try db.execute(sql: "UPDATE messageHeader SET rfc822MessageId = ?, observedUidValidity = ? WHERE folderId = ? AND messageId = ?",
+                                   arguments: ["<missing-by-uid-\(uid)@example.com>", Self.epoch, folderId, "\(uid)"])
+                }
+            }
+            try await w.markOwed()
+            let start = w.server.recordedCommands().count
+            await AccountManager.shared.clearRecentlyCompletedForTesting()
+            _ = await w.engine.runBackfillCycle(account: try w.account(), walkAllowed: false)
+            let headerFetches = w.server.recordedCommands().dropFirst(start).filter {
+                $0.uppercased().contains("FETCH") && $0.uppercased().contains("ENVELOPE")
+            }
+            let holes = Set((scrolled.max()! + 1)..<window[0])
+            let loadedHoles = holes.filter { uid in headerFetches.contains { Self.uidSet($0).contains(uid) } }
+            #expect(loadedHoles.isEmpty, "#1062: no older mail below the window floor is downloaded: \(loadedHoles.sorted().prefix(20))")
+            try w.expectHeldExactly(scrolled + window, "#1062 scroll")
+            let folder = try w.folder()
+            #expect(!folder.backfillComplete && folder.backfillUidCursor == nil, "setup: the walk has still not started")
+        }
+    }
+    // MARK: - The window floor's bookkeeping
+
+    @Test("The window floor: recorded as the lowest any window listing reached, never raised by a later one; a NULL or non-object state becomes an object holding it; a catch-up's own state write carries it")
+    @MainActor
+    func windowFloorIsKeptAndCarried() async throws {
+        let server = Array(1...20)
+        try await Self.withWorld("floor-books", server: server, local: server, walkStarted: false) { w in
+            let folderId = w.folderId
+            func floor() throws -> Int? { CatchUpWindowFloor.read(try w.folder().catchUpState) }
+            try await w.makeFullSyncDue()
+            try await w.foregroundSync()
+            #expect(try floor() == 1, "setup: the window listing recorded its floor")
+
+            // A later listing that reached higher never raises it.
+            try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 9, db: db) }
+            #expect(try floor() == 1, "#1062: the floor is the lowest any window listing reached")
+            try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 0, db: db) }
+            #expect(try floor() == 0, "#1062: a listing that reached lower lowers it")
+
+            // The catch-up rewrites the folder's state; the floor survives it.
+            try await w.markOwed()
+            let before = try w.folder().catchUpState
+            try await w.workerRun()
+            #expect(try w.folder().catchUpState != before, "setup: the catch-up wrote its state")
+            #expect(try floor() == 0, "#1062: the catch-up's state write carries the floor")
+            #expect(IMAPCatchUpState.decode(try w.folder().catchUpState) != nil, "#1062: the provider still reads its own state")
+
+            // NULL and non-object states.
+            for raw in [nil, "not json", "[1, 2]"] as [String?] {
+                try await w.pool.write { db in
+                    try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [raw, folderId])
+                    try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 4, db: db)
+                }
+                #expect(try floor() == 4, "#1062: a state \(raw ?? "NULL") becomes an object holding the floor")
+            }
+        }
+    }
+
+    @Test("Under a storage limit before the walk starts, loads start at the higher of the window floor and the lowest held UID; with no limit, at the window floor",
+          arguments: [true, false])
+    @MainActor
+    func storageLimitTakesTheHigherFloorBeforeTheWalk(limit: Bool) async throws {
+        let server = Array(1...200)
+        let window = Array((server.count - SyncConfig.syncMessageLimit + 1)...server.count)
+        try await Self.withWorld("floor-limit-\(limit)", server: server, local: window, walkStarted: false) { w in
+            try await w.makeFullSyncDue()
+            try await w.foregroundSync()
+            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState) == window[0], "setup: the floor is where the window reached")
+            // The prune took the window's lowest rows: the lowest held UID is now above the floor.
+            let pruned = Array(window.prefix(10))
+            try await w.dropLocal(pruned)
+            try await w.markOwed()
+            let start = w.server.recordedCommands().count
+            var run = SyncEngine.CatchUpRun(
+                storageLimitInForce: limit, deadline: Date().addingTimeInterval(60),
+                sliceSeconds: SyncConfig.catchUpSliceSeconds, intervalSeconds: SyncConfig.catchUpSliceIntervalSeconds,
+                clock: { Date() })
+            run.listingRangeMessages = w.rangeMessages
+            await AccountManager.shared.clearRecentlyCompletedForTesting()
+            _ = await w.engine.runCatchUpRun(account: try w.account(), run: run)
+            let headerFetches = w.server.recordedCommands().dropFirst(start).filter {
+                $0.uppercased().contains("FETCH") && $0.uppercased().contains("ENVELOPE")
+            }
+            let reloaded = pruned.filter { uid in headerFetches.contains { Self.uidSet($0).contains(uid) } }
+            if limit {
+                #expect(reloaded.isEmpty, "#1062: under a limit nothing below the lowest held UID is loaded: \(reloaded)")
+                try w.expectHeldExactly(Array(window.dropFirst(10)), "#1062 limit")
+            } else {
+                #expect(Set(reloaded) == Set(pruned), "#1062 control: with no limit the floor is the window's: \(reloaded)")
+                try w.expectHeldExactly(window, "#1062 no limit")
+            }
+        }
+    }
+    // MARK: - The stored width across calls
+
+    /// Write the folder's catch-up state: a listing in progress at `nextUid`,
+    /// with `rangeWidth` stored (nil: none, as a listing written before the field).
+    @MainActor
+    static func setListing(_ w: World, nextUid: Int, rangeWidth: Int?,
+                           widthCap: Int? = nil, widthCapThrough: Int? = nil) async throws {
+        var listing = IMAPCatchUpState.Listing(nextUid: nextUid, rangeWidth: rangeWidth)
+        listing.widthCap = widthCap
+        listing.widthCapThrough = widthCapThrough
+        let state = IMAPCatchUpState(epoch: UInt32(epoch), listing: listing)
+        let raw = try #require(state.encoded())
+        let folderId = w.folderId
+        try await w.pool.write { db in
+            try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [raw, folderId])
+        }
+    }
+
+    @Test("A call that answers a range at a stored half width and then stops on its budget stores the width re-sized from that range's count; the next call asks at that width")
+    @MainActor
+    func answeredRangeStoresItsResizedWidth() async throws {
+        let server = Array(1...3000)
+        let messages = SyncConfig.catchUpListingRangeMessages
+        try await Self.withWorld("stored-width-resized", server: server, local: server, rangeMessages: messages) { w in
+            let half = messages / 2
+            try await Self.setListing(w, nextUid: 1, rangeWidth: half)
+            let clock = CatchUpTestClock()
+            // Budget for one range: its listing FETCH and its membership SEARCH.
+            await w.slice(maxRequests: 2, clock: clock)
+            let listing = try #require(try w.catchUpState()?.listing, "setup: the listing is in progress")
+            let resized = IMAPProvider.nextListingRangeSpan(messages: messages, width: half, held: half)
+            #expect(resized != half, "setup: the re-sized width differs from the stored half")
+            #expect(listing.nextUid == half + 1, "setup: the call answered one range")
+            #expect(listing.rangeWidth == resized, "#1062: an answered range stores the width re-sized from its own count")
+            let start = w.server.recordedCommands().count
+            await w.slice(maxRequests: 1, clock: clock)
+            let next = Self.listingRanges(w.server.recordedCommands().dropFirst(start)).first
+            #expect(next == (half + 1)...(half + resized), "#1062: the next call asks at the stored width: \(next.map { "\($0)" } ?? "none")")
+        }
+    }
+
+    @Test("A range that times out caps the width from its place: later ranges up to its upper end are never wider than the stored half, even when their counts size them wider and after the state is reloaded as on a restart; past that end the cap lifts")
+    @MainActor
+    func timedOutWidthCapsUntilThePlaceIsPassed() async throws {
+        // 600 messages in UIDs 1...1000, then a dense run from 1401: a range
+        // over 1...1000 re-sizes the next one wider than the half width.
+        let server = Array(1...600) + Array(1401...5000)
+        let messages = SyncConfig.catchUpListingRangeMessages
+        try await Self.withWorld("width-cap", server: server, local: server, rangeMessages: messages) { w in
+            let first = 2 * messages
+            try await Self.setListing(w, nextUid: 1, rangeWidth: first)
+            let clock = CatchUpTestClock()
+
+            // 1...2000 holds 1200 messages: on the slow link it times out.
+            w.server.slowListingFetch(in: Self.path, overRecords: messages, seconds: Self.slowAnswerSeconds)
+            await w.slice(clock: clock, requestTimeout: Self.scaledTimeout)
+            w.server.slowListingFetch(in: Self.path, overRecords: messages, seconds: nil)
+            // Let the late answer free the connection.
+            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
+            let timedOut = try #require(try w.catchUpState()?.listing, "setup: the listing is in progress")
+            let half = first / 2
+            #expect(timedOut.nextUid == 1 && timedOut.rangeWidth == half, "setup: the listing kept its place with the half width")
+            #expect(timedOut.widthCap == half && timedOut.widthCapThrough == first,
+                    "#1062: the cap is the half width, up to the timed-out range's upper end")
+
+            // Reload the stored state as a restart reads it.
+            func reload() async throws {
+                let raw = try #require(try w.catchUpState()?.encoded())
+                let folderId = w.folderId
+                try await w.pool.write { db in
+                    try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [raw, folderId])
+                }
+            }
+            // One range per call: its listing FETCH and its membership SEARCH.
+            func nextRange() async throws -> ClosedRange<Int>? {
+                try await reload()
+                let start = w.server.recordedCommands().count
+                await w.slice(maxRequests: 2, clock: clock)
+                return Self.listingRanges(w.server.recordedCommands().dropFirst(start)).first
+            }
+
+            #expect(try await nextRange() == 1...half, "#1062: the next call asks the half width from the same place")
+            let resized = IMAPProvider.nextListingRangeSpan(messages: messages, width: half, held: 600)
+            #expect(resized > half, "setup: 1...\(half)'s count sizes the next range wider than the half: \(resized)")
+            #expect(try await nextRange() == (half + 1)...first,
+                    "#1062: below the timed-out range's upper end, no range is wider than the half width")
+            let lifted = try await nextRange()
+            #expect(lifted.map { $0.lowerBound == first + 1 && $0.count > half } == true,
+                    "#1062: past the timed-out range's upper end the cap lifts: \(lifted.map { "\($0)" } ?? "none")")
+            let listing = try w.catchUpState()?.listing
+            #expect(listing?.widthCap == nil && listing?.widthCapThrough == nil, "#1062: the lifted cap is not stored")
+        }
+    }
+
+    /// Reload the stored catch-up state through storage, as a restart reads it.
+    @MainActor
+    static func reloadState(_ w: World) async throws {
+        let raw = try #require(try w.folder().catchUpState)
+        let state = try #require(IMAPCatchUpState.decode(raw), "the stored state decodes")
+        let again = try #require(state.encoded())
+        let folderId = w.folderId
+        try await w.pool.write { db in
+            try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [again, folderId])
+        }
+    }
+
+    /// One call that lists one range (its FETCH and its SEARCH) after a reload.
+    @MainActor
+    static func nextRange(_ w: World, _ clock: CatchUpTestClock) async throws -> ClosedRange<Int>? {
+        try await reloadState(w)
+        let start = w.server.recordedCommands().count
+        await w.slice(maxRequests: 2, clock: clock)
+        return listingRanges(w.server.recordedCommands().dropFirst(start)).first
+    }
+
+    @Test("A second timeout from the same place halves the cap again and keeps it up to the first timed-out range's upper end")
+    @MainActor
+    func secondTimeoutKeepsTheFirstUpperEnd() async throws {
+        let server = Array(1...5000)
+        let messages = SyncConfig.catchUpListingRangeMessages
+        try await Self.withWorld("width-cap-twice", server: server, local: server, rangeMessages: messages) { w in
+            let first = 2 * messages
+            let half = first / 2, quarter = half / 2
+            try await Self.setListing(w, nextUid: 1, rangeWidth: first)
+            let clock = CatchUpTestClock()
+            // Ranges of more than `quarter` messages time out: 1...2000, then 1...1000.
+            w.server.slowListingFetch(in: Self.path, overRecords: quarter, seconds: Self.slowAnswerSeconds)
+            for _ in 0..<2 {
+                try await Self.reloadState(w)
+                await w.slice(clock: clock, requestTimeout: Self.scaledTimeout)
+                try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
+            }
+            w.server.slowListingFetch(in: Self.path, overRecords: quarter, seconds: nil)
+            let listing = try #require(try w.catchUpState()?.listing, "setup: the listing is in progress")
+            #expect(listing.nextUid == 1, "setup: the listing kept its place")
+            #expect(listing.widthCap == quarter, "#1062: the second timeout halves the cap again")
+            #expect(listing.widthCapThrough == first, "#1062: the cap holds up to the FIRST timed-out range's upper end")
+
+            // Up to that end, no range is wider than the new cap, though each
+            // range's count (`quarter` held) re-sizes the next to the full width.
+            var lo = 1
+            while lo <= first {
+                let range = try #require(try await Self.nextRange(w, clock), "a range from \(lo) was asked")
+                #expect(range.lowerBound == lo && range.count <= quarter,
+                        "#1062: a range starting at or below \(first) is no wider than \(quarter): \(range)")
+                lo = range.upperBound + 1
+            }
+            let lifted = try await Self.nextRange(w, clock)
+            #expect(lifted.map { $0.lowerBound == first + 1 && $0.count > quarter } == true,
+                    "#1062: past the first timed-out range's upper end the cap lifts: \(lifted.map { "\($0)" } ?? "none")")
+        }
+    }
+
+    @Test("A range starting exactly at the cap's upper end is still capped; the next one past it is not")
+    @MainActor
+    func rangeStartingAtTheCapEndIsCapped() async throws {
+        let server = Array(1...5000)
+        let messages = SyncConfig.catchUpListingRangeMessages
+        try await Self.withWorld("width-cap-edge", server: server, local: server, rangeMessages: messages) { w in
+            let through = 2000, cap = messages / 2
+            let state = IMAPCatchUpState(
+                epoch: UInt32(Self.epoch),
+                listing: IMAPCatchUpState.Listing(nextUid: through, rangeWidth: 2 * messages, widthCap: cap, widthCapThrough: through))
+            let raw = try #require(state.encoded())
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [raw, folderId])
+            }
+            let clock = CatchUpTestClock()
+            let atEnd = try await Self.nextRange(w, clock)
+            #expect(atEnd == through...(through + cap - 1), "#1062: a range starting at the cap's upper end is capped: \(atEnd.map { "\($0)" } ?? "none")")
+            let past = try await Self.nextRange(w, clock)
+            #expect(past.map { $0.lowerBound == through + cap && $0.count > cap } == true,
+                    "#1062: the range after it starts past the end and is not capped: \(past.map { "\($0)" } ?? "none")")
+        }
+    }
+
+    @Test("A one-UID listing range that times out again: the stored width stays 1, the listing does not move past it, and the call reports no progress")
+    @MainActor
+    func failingOneUIDRangeStaysUnconfirmed() async throws {
+        let server = Array(1...20)
+        try await Self.withWorld("one-uid-timeout", server: server, local: server) { w in
+            try await Self.setListing(w, nextUid: 7, rangeWidth: 1)
+            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
+            defer { w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil) }
+            let start = w.server.recordedCommands().count
+            let read = try await w.read(CatchUpContext(
+                deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages,
+                requestTimeoutSeconds: Self.scaledTimeout))
+            #expect(Self.listingRanges(w.server.recordedCommands().dropFirst(start)).first == 7...7, "setup: the one-UID range was asked")
+            let result = try #require(read.results.first, "setup: the folder was worked")
+            let listing = try #require(IMAPCatchUpState.decode(result.newState)?.listing, "#1062: the listing stays in progress")
+            #expect(listing.nextUid == 7, "#1062: the listing never moves past a range that did not answer")
+            #expect(listing.rangeWidth == 1, "#1062: a one-UID range that fails keeps the width 1")
+            #expect(!result.madeProgress, "#1062: a repeat failure at width 1 is no progress, so the run stops")
+            // Let the late answer free the connection before the world closes.
+            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
+        }
+    }
+
+    @Test("A one-UID listing range already capped at width 1 that times out again: the cap it writes again is no progress")
+    @MainActor
+    func cappedOneUIDRangeTimeoutIsNoProgress() async throws {
+        let server = Array(1...20)
+        try await Self.withWorld("one-uid-capped-timeout", server: server, local: server) { w in
+            try await Self.setListing(w, nextUid: 7, rangeWidth: 1, widthCap: 1, widthCapThrough: 7)
+            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
+            defer { w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil) }
+            let start = w.server.recordedCommands().count
+            let read = try await w.read(CatchUpContext(
+                deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages,
+                requestTimeoutSeconds: Self.scaledTimeout))
+            #expect(Self.listingRanges(w.server.recordedCommands().dropFirst(start)).first == 7...7, "setup: the one-UID range was asked")
+            let result = try #require(read.results.first, "setup: the folder was worked")
+            let listing = try #require(IMAPCatchUpState.decode(result.newState)?.listing, "#1062: the listing stays in progress")
+            #expect(listing.nextUid == 7, "#1062: the listing never moves past a range that did not answer")
+            #expect(listing.rangeWidth == 1, "#1062: a one-UID range that fails keeps the width 1")
+            #expect(!result.madeProgress, "#1062: a timeout under a stored cap is no progress, so the run stops")
+            // Let the late answer free the connection before the world closes.
+            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
+        }
+    }
+
+    @Test("A stored listing written before the width field: the first range is sized from the folder's EXISTS and UIDNEXT")
+    @MainActor
+    func listingWithoutStoredWidthSizesFromTheFolder() async throws {
+        let server = Array(1...20) + Array(100_001...100_020) + Array(200_001...200_020)
+        try await Self.withWorld("no-stored-width", server: server, local: server) { w in
+            let folderId = w.folderId
+            let raw = "{\"epoch\":\(Self.epoch),\"listing\":{\"nextUid\":1}}"
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [raw, folderId])
+            }
+            #expect(try w.catchUpState()?.listing?.rangeWidth == nil, "setup: the stored listing has no width")
+            let folder = try w.folder()
+            let expected = IMAPProvider.listingRangeSpan(
+                messages: w.rangeMessages, exists: folder.totalCount, uidNext: folder.lastKnownUidNext)
+            #expect(expected != SyncConfig.catchUpListingMinRangeSpan && expected != SyncConfig.catchUpListingMaxRangeSpan,
+                    "setup: the folder's width is neither clamp: \(expected)")
+            let start = w.server.recordedCommands().count
+            await w.slice(maxRequests: 1, clock: CatchUpTestClock())
+            let first = Self.listingRanges(w.server.recordedCommands().dropFirst(start)).first
+            #expect(first == 1...expected, "#1062: sized from EXISTS and UIDNEXT: \(first.map { "\($0)" } ?? "none")")
+        }
+    }
+}

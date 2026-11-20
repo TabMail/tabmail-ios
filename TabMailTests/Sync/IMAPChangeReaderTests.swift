@@ -49,6 +49,7 @@ struct IMAPChangeReaderTests {
         func firstNumericId(folderId: String, atLeast lower: Int) async throws -> Int? {
             uids(folderId).filter { $0 >= lower }.min()
         }
+        func lastNumericId(folderId: String) async throws -> Int? { uids(folderId).max() }
         /// Runs once, at the next held-row lookup (mid-read of a folder).
         private let onHeldLookup = Mutex<(@Sendable () async -> Void)?>(nil)
         func runOnceAtNextHeldLookup(_ hook: @escaping @Sendable () async -> Void) { onHeldLookup.withLock { $0 = hook } }

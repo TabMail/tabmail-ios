@@ -832,10 +832,37 @@ enum SyncConfig {
     /// its cursor is valid, so a Gmail folder is listed only the first time and
     /// after a lapse of the cursor (`GmailProvider.catchUpPlan`).
     static let catchUpFullCheckIntervalSeconds: TimeInterval = 86_400
-    /// Width of one IMAP listing range, in UIDs (`UID FETCH lo:hi (UID FLAGS)`).
-    /// About 50 bytes per message on the wire, so a dense range stays far inside
-    /// the request timeout even on a slow link.
-    static let catchUpListingRangeSpan = 1000
+    /// About how many messages one IMAP listing range holds (`UID FETCH lo:hi
+    /// (UID FLAGS)`, then one membership `UID SEARCH` of the same range). The
+    /// first range's width in UIDs is sized from the folder's EXISTS and UIDNEXT
+    /// (`IMAPProvider.listingRangeSpan`), each later one from the previous
+    /// range's own count (`IMAPProvider.nextListingRangeSpan`), so a listing
+    /// costs about EXISTS / this many ranges however sparse or bunched the UID
+    /// space is (#1062). A listing range that times out is halved by the walk's
+    /// rule (`UIDWalkCursor.halves`) and the next call asks the half. About 50 bytes per
+    /// message on the wire, so a range stays far inside the request timeout even
+    /// on a slow link.
+    /// *Superseded (#1062):* `catchUpListingRangeSpan = 1000`, a fixed width in
+    /// UIDs, which made a listing's cost grow with UIDNEXT, not with the folder.
+    static let catchUpListingRangeMessages = 1000
+    /// Narrowest IMAP listing range, in UIDs, whatever the folder's density.
+    static let catchUpListingMinRangeSpan = 1000
+    /// Widest IMAP listing range, in UIDs: a range that held few messages makes
+    /// the next one wider, never wider than this, so a dense stretch after a
+    /// sparse one is reached by a bounded range (a range that still times out
+    /// is halved).
+    static let catchUpListingMaxRangeSpan = 10_000_000
+    /// Most missing UIDs one catch-up load request fetches by header (#1062): one
+    /// `UID FETCH` of ENVELOPE, INTERNALDATE, FLAGS, BODYSTRUCTURE and the header,
+    /// charged one request of the slice's budget, so it stays well inside
+    /// `catchUpRequestTimeoutSeconds` on a slow link.
+    /// *Superseded (#1062):* 100, which a slow link could not answer in time.
+    static let catchUpLoadBatchSize = 20
+    /// Most UIDs a catch-up listing carries from one call to the next in a range
+    /// it listed but could not finish (`IMAPCatchUpState.CarriedRange`, #1062).
+    /// A range holding more is cut at the UID that reaches this count, and the
+    /// rest is listed again later, so the carry stays small and still moves.
+    static let catchUpCarriedUidCap = 1000
     /// Most local rows one Gmail listing range covers. A range is taken from the
     /// folder's local rows in provider-date order, so this bounds the membership
     /// listing of a dense folder to about one page.

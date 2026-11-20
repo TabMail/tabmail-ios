@@ -386,6 +386,7 @@ actor SyncEngine {
     func scheduleMaintenanceInBackground(includePrune: Bool = false) {
         maintenanceTask?.cancel()
         let pool = AppDatabase.backgroundPool
+        let pruneOrder = pruneOrderByAccount()
         maintenanceTask = Task.detached(priority: .utility) {
             // Capture undo-protected IDs via MainActor hop (UndoService is @MainActor)
             let undoProtectedBodyIds = await MainActor.run {
@@ -393,7 +394,7 @@ actor SyncEngine {
             }
             await SyncEngine.runWALMaintenance(
                 dbPool: pool, includePrune: includePrune,
-                undoProtectedBodyIds: undoProtectedBodyIds
+                undoProtectedBodyIds: undoProtectedBodyIds, pruneOrder: pruneOrder
             )
             await SyncEngine.checkpointWALThrottled(truncate: includePrune)
             await SyncEngine.runBodyAssetMaintenance()
@@ -431,12 +432,13 @@ actor SyncEngine {
     nonisolated static func runWALMaintenance(
         dbPool: PrioritizedDatabase,
         includePrune: Bool,
-        undoProtectedBodyIds: Set<String>
+        undoProtectedBodyIds: Set<String>,
+        pruneOrder: [String: StaleWindowMode]
     ) async {
         func shouldRun() -> Bool { !Task.isCancelled && !DatabaseSuspension.isSuspended }
         let t0 = CFAbsoluteTimeGetCurrent()
         if includePrune && shouldRun() {
-            runPruneIfOverBudget(dbPool: dbPool)
+            runPruneIfOverBudget(dbPool: dbPool, pruneOrder: pruneOrder)
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
@@ -829,11 +831,10 @@ actor SyncEngine {
             // due: the next foreground pass lists the folders still untracked
             // (tracked ones get no window listing) instead of waiting for the
             // next scheduled full sync.
-            // A folder an unproven move dropped the bookmark of gets its one
-            // self-heal pass before the baseline below may track it again.
-            await queue.execute(priority: .headerFetch) {
-                await self.healFoldersAfterAnUnprovenMove(account: account)
-            }
+            // A folder an unproven move dropped the bookmark of stays untracked
+            // (`commitChangeBaseline`) until the catch-up's clean listing clears
+            // what it is owed (#1062).
+            // *Superseded (#1062):* its one self-heal pass ran here.
 
             if let changePass, changePass.fromReader {
                 // The reader's bookmark was read BEFORE these listings; store a
@@ -861,9 +862,6 @@ actor SyncEngine {
             // Post-full-sync maintenance
             await queue.execute(priority: .bodyFetch) {
                 await self.sweepStaleActionTags(account: account, provider: provider)
-            }
-            await queue.execute(priority: .bodyFetch) {
-                _ = await self.selfHealRecentMessages(account: account)
             }
         }
 

@@ -63,6 +63,24 @@ struct ChangeSeamFenceTests {
         }
     }
 
+    @Test("the engine's older-mail check and the repair of missing messages name no concrete provider and test no account provider (#1061)")
+    func missingMessageRepairIsProviderBlind() throws {
+        let files = try Self.sources().filter {
+            $0.relativePath.hasPrefix("TabMail/Services/Sync/SyncEngineSelfHeal")
+                || $0.relativePath == "TabMail/Services/Sync/SyncEngineCatchUp.swift"
+        }
+        #expect(!files.isEmpty, "precondition: the engine's catch-up file was read")
+        for file in files {
+            for term in [
+                "GmailProvider", "ExchangeProvider", "IMAPProvider", "DemoProvider",
+                ".provider ==", ".provider !=", "as? IMAP", "as! IMAP", "provider as?", "provider as!",
+                "case .gmail", "case .outlook", "case .imap",
+            ] {
+                #expect(!file.source.contains(term), "\(file.relativePath) names \(term)")
+            }
+        }
+    }
+
     @Test("the release boundary's re-read of retired actions names no concrete provider and tests no account provider (#876)")
     func retiredActionRecheckIsProviderBlind() throws {
         let source = try Self.file(try Self.sources(), "TabMail/Services/Sync/SyncEngineRetiredActionRecheck.swift")

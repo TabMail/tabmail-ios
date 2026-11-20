@@ -106,9 +106,14 @@ struct IMAPCatchUpTests {
         await world.engine.runCatchUp(provider: world.provider, folderIds: [world.folderId], context: context)
     }
 
+    /// About how many messages one listing range holds here: 1, so every range
+    /// has the minimum width (`SyncConfig.catchUpListingMinRangeSpan` UIDs), the
+    /// layout these fixtures place their messages across (#1062).
+    static let rangeMessages = 1
+
     /// A budget that never runs out.
     private static func unlimited() -> CatchUpContext {
-        CatchUpContext(deadline: .distantFuture, clock: { Date() })
+        CatchUpContext(deadline: .distantFuture, clock: { Date() }, listingRangeMessages: rangeMessages)
     }
 
     /// A budget of exactly ONE listing request per pass: the clock advances one
@@ -118,7 +123,8 @@ struct IMAPCatchUpTests {
         let fetchesBefore = fetchCount(server)
         return CatchUpContext(
             deadline: start.addingTimeInterval(1),
-            clock: { start.addingTimeInterval(Double(fetchCount(server) - fetchesBefore)) })
+            clock: { start.addingTimeInterval(Double(fetchCount(server) - fetchesBefore)) },
+            listingRangeMessages: rangeMessages)
     }
 
     /// Runs `body` with NetworkMonitor's cached expensive flag set to `expensive`
@@ -296,8 +302,9 @@ struct IMAPCatchUpTests {
     // MARK: - The catch-up is not the backfill
 
     /// A folder with a partial backfill: the device holds UIDs 4...6 of a mailbox
-    /// that runs from 1 to 10. The catch-up may look only at what the device holds.
-    @Test("With a partial backfill, nothing outside the local range is listed and nothing is inserted")
+    /// that runs from 1 to 10. The catch-up loads nothing below the load floor and
+    /// still reconciles the flags and removals of the rows the device holds.
+    @Test("With a partial backfill, nothing below the load floor is inserted and cached rows are still reconciled")
     func staysInsideTheLocalRange() async throws {
         try await Self.withWorld("cu-frontier", serverUIDs: [1, 2, 3, 4, 6, 7, 8, 9, 10], localUIDs: [4, 5, 6]) { world async throws in
             world.server.setFlags(["\\Seen"], in: Self.path, uid: 6)
@@ -308,11 +315,12 @@ struct IMAPCatchUpTests {
                 .filter { $0.uppercased().hasPrefix("UID FETCH") || $0.uppercased().hasPrefix("UID SEARCH") }
             #expect(sent.contains { $0.uppercased().hasPrefix("UID FETCH") }, "precondition: the folder was listed")
             #expect(sent.contains { $0.uppercased().hasPrefix("UID SEARCH") }, "precondition: the removal proof ran")
-            for command in sent {
-                let named = command.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
-                #expect(named.allSatisfy { (4...6).contains($0) }, "\(command) names a UID the device does not hold")
-            }
             let rows = try Self.rows(world)
+            // Nothing below the load floor (the lowest UID the device holds) is inserted.
+            let belowFloor = rows.keys.compactMap { Int($0) }.filter { $0 < 4 }
+            #expect(belowFloor.isEmpty, "a message below the load floor was inserted: \(belowFloor.sorted())")
+            // Cached reconciliation still runs: UID 5's removal is proven and UID 6's flag is updated.
+            #expect(rows["5"] == nil, "the cached row the server expunged is removed")
             #expect(Set(rows.keys) == ["4", "6"], "UID 5 is gone from the server; no other row appears: \(rows.keys.sorted())")
             #expect(rows["6"]?.isRead == true)
         }
@@ -800,10 +808,11 @@ struct IMAPCatchUpTests {
             let interval: TimeInterval = 30
             // One second per UID FETCH: a slice lists one range. The deadline is far
             // away, so only the removal can end the run before the second range.
-            let run = SyncEngine.CatchUpRun(
+            var run = SyncEngine.CatchUpRun(
                 storageLimitInForce: false,
                 deadline: base.addingTimeInterval(1_000), sliceSeconds: 1, intervalSeconds: interval,
                 clock: { base.addingTimeInterval(Double(Self.fetchCount(server) - fetchesBefore)) })
+            run.listingRangeMessages = Self.rangeMessages
             let engine = world.engine
             let catchUp = Task { await engine.runCatchUpRun(account: account, run: run) }
 

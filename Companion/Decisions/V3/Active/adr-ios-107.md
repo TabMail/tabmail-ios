@@ -316,7 +316,8 @@ The owner's rulings of 2026-11-09:
      whenever a listing was tried, whether or not it succeeded; a completion is an attempt). A folder
      whose requests keep failing or timing out therefore goes behind the others and cannot hold
      their catch-up past the 7-day bound.
-   - **Listing.** Ranges of `SyncConfig.catchUpListingRangeSpan` UIDs start at the first LOCAL UID at
+   - **Listing.** *Superseded 2026-11-20 (#1062): ranges are cut on UIDs from the held range's start,
+     with a membership proof and direct loads; see the amendment of that date.* Ranges of `SyncConfig.catchUpListingRangeSpan` UIDs start at the first LOCAL UID at
      or above the cursor. For each range:
      - **Request 1:** SELECT, then `UID FETCH lo:hi (UID FLAGS)` on one folder connection. The range's
        epoch is this SELECT's UIDVALIDITY, and a mismatch applies nothing.
@@ -326,7 +327,8 @@ The owner's rulings of 2026-11-09:
        absence proof) under the same epoch decides the removals.
      - A record without a UID makes the range unanswerable.
      - When the budget is spent before request 2, the range's flag updates still apply but the cursor
-       stays, so the range is listed again.
+       stays, so the range is listed again. *Superseded 2026-11-20 (#1062): such a stop, and a failed
+       SEARCH, are held under the bounded hold, see the amendment of that date.*
      - The cursor (`listing.nextUid`) is kept in the state across passes.
    - **The FIRST-stamp invariant.** The completion stamp is the HIGHESTMODSEQ taken BEFORE THE FIRST
      range: this pass's STATUS value, captured when the listing starts and carried unchanged in
@@ -337,7 +339,9 @@ The owner's rulings of 2026-11-09:
        `Mailbox.Selection.highestModSequence` is NIOIMAPCore's type, which the app does not import, and
        STATUS of the same pass is already a stamp taken before every range. The per-range SELECT
        supplies the per-range EPOCH, which is what removal safety needs.
-   - **The request stays inside the local range.** Each FETCH runs from the range's first local UID
+   - **The request stays inside the local range.** *Superseded 2026-11-20 (#1062): the upper bound is
+     the larger of the last local UID and the bookmark's (else the listing's own) UIDNEXT - 1; see the
+     amendment of that date.* Each FETCH runs from the range's first local UID
      to its LAST local UID, not to the end of the span. Mail above the highest local UID belongs to
      delta and full sync; mail below the lowest belongs to the backfill.
    - **The first stamp of a new folder.** The full sync's folder insert writes STATUS HIGHESTMODSEQ
@@ -1088,3 +1092,138 @@ foreground backfill worker and the background processing job.
 
 Keywords: scans always run, any network, low battery, Low Power Mode, walk held, walkAllowed,
 backfillWalkAllowed, backfillPowerState, backgroundBackfillPlan, download gate, #1063.
+
+### Amendment (2026-11-20, #1062): missing mail is found by UID; the date repair is gone
+
+The IMAP catch-up now finds and loads a message the server holds in the folder's held range with no
+local row, whatever its date. The date-based self-heal (`SyncEngineSelfHeal.swift`) is deleted.
+Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
+
+- **Ranges are cut on UIDs, not on local rows.** The lower bound is where the held range starts
+  (`heldRangeStart`: 1 once the older-mail walk is complete, else its cursor + 1); under a storage limit
+  it is the first local UID, so pruned mail is neither listed nor loaded. Below the load start a listing
+  only checks local rows. The upper bound is the larger of the last local UID and, with a change
+  bookmark of the same epoch, the bookmark's UIDNEXT - 1 (by the bookmark, not by tracking), else the
+  listing's own SELECT UIDNEXT - 1.
+- **UID-range membership proof.** A FETCH can be short, so a UID in the load range that is absent from
+  the FETCH and has no local row is never read as absent: when the range has one, `UID SEARCH` over the
+  whole load range (with the removal candidates) proves membership under the same epoch. A UID SEARCH
+  finds but the FETCH did not answer is unresolved (its flags, `\Deleted` included, are unknown).
+- **Direct loads.** Missing UIDs (listed, not `\Deleted`, no local row, in the load range) load by
+  header in batches of `SyncConfig.catchUpLoadBatchSize`, each charged before it is sent; a UID the
+  header FETCH does not answer is checked by SEARCH: gone is done, present is held. Loads bind to their
+  observed epoch and are inserted through the walk's insert tail.
+- **The bounded hold.** `listing.loadHeldSince` belongs to the UID at `listing.nextUid`, the earliest
+  unresolved UID. It survives budget stops, SEARCH failures and later successful loads of later UIDs,
+  and resets only when that UID resolves or the earliest unresolved UID advances. Past
+  `SyncConfig.backfillPageHoldMinutes` the held and unasked UIDs count as done (`listing.passedOver`),
+  the range moves on, and the listing completes as NOT clean. A stop before the membership proof (the
+  slice's budget is spent by the FETCH, or the SEARCH fails) leaves the range unresolved from its start
+  under the same hold, so a slow link that spends every slice on the FETCH cannot stall repair.
+  *Replaces:* "When the budget is spent before request 2 [...] the cursor stays, so the range is listed again."
+- **Clean and unclean completion; retry.** A folder owed a check (`FolderChangeState.selfHealOwed`, set
+  by `dropChangeBookmark(selfHealDue:)` after an unproven move) is settled only by a CLEAN completed
+  listing that started at or after the mark (`lapseCountAtStart >= selfHealLapse`); the apply then calls
+  `markListingDue`, so the next scheduled full sync lists the folder and `commitChangeBaseline` tracks it
+  again. A completion that does not settle the mark (unclean, or started before it), and a mark landing
+  during the read, re-mark the lapse on the state just written (also when it was NULL) and record it in
+  `selfHealLapse`: the obligation survives, so a later listing still repairs the missing UID even when a
+  bookmark keeps the daily and MODSEQ checks off (the bookmark-based planning rule is unchanged).
+- **Unknown epoch fails closed.** A folder whose epoch is unknown is not listed and loads nothing; the
+  epochless date repair is not replaced (accepted limitation).
+- **Review fixes (2026-11-20, #1062), current where they differ from the bullets above:**
+  - *Range size.* A range's width in UIDs is sized from the folder's EXISTS and UIDNEXT (first the
+    stored STATUS values, then each listing SELECT's own): mean UIDs per message times
+    `SyncConfig.catchUpListingRangeMessages`, never below `SyncConfig.catchUpListingMinRangeSpan`
+    (`IMAPProvider.listingRangeSpan`). A listing costs about EXISTS / that many ranges, however sparse
+    the UID space; each range has ONE membership SEARCH, asked as the range itself (plus the removal
+    candidates) and never expanded (`searchMembership`). *Replaces:* fixed 1000-UID ranges
+    (`catchUpListingRangeSpan`), which made a sparse folder cost one or two requests per 1000 UIDs.
+  - *Range size, current (second review round).* Only the FIRST range is sized from EXISTS and
+    UIDNEXT (a stored count of 0 reads as unknown: the minimum width). Each later range's width comes
+    from the previous range's own count (`IMAPProvider.nextListingRangeSpan`), within
+    `catchUpListingMinRangeSpan...catchUpListingMaxRangeSpan`, so a bunched folder never puts most of
+    itself in one range. A listing range that times out, or whose answer is too large or undecodable
+    (`UIDWalkCursor.failureCallsForSmallerRange`), is cut by the walk's one splitting rule
+    (`UIDWalkCursor.halves`, #1006) to the half next to where the listing stands in
+    its direction of travel (the listing runs upward, so the LOWER half; the walk runs downward). That
+    half's width is stored in the listing (`IMAPCatchUpState.Listing.rangeWidth`, an optional JSON field,
+    no migration) and the folder stops for the rest of the call: the timed-out request still holds the
+    folder's connection until its late answer, so no retry in the same call. The listing keeps its place
+    (decision 8); the next call asks from there with the stored width, and every answered range
+    re-sizes it from its own count, so the next range need not be the other half. A one-UID range that
+    fails stays unconfirmed: the listing never moves past it and the next call asks it again. With no
+    stored width, the first range is sized from EXISTS and UIDNEXT. Header-load batches are never split.
+    *Superseded (2026-11-20, same review train):* "is asked again as its halves ... the half next to
+    where the listing stands first ..., the other next", a retry of both halves inside the same call,
+    which could not work while the timed-out request still held the folder's connection. *Replaces:* the width recomputed from each SELECT's EXISTS and UIDNEXT, and a
+    listing failure that ended the folder's pass with no split.
+  - *Width cap after a timeout, current (third review round).* A range that times out also stores a
+    width cap (`IMAPCatchUpState.Listing.widthCap`, the stored half width) together with the upper end
+    of the range that timed out (`widthCapThrough`); repeated timeouts before the listing moves past
+    keep the smallest cap and the highest end. While the listing stands at or below that end, no range
+    is wider than the cap, whatever a range's count (or `catchUpListingMinRangeSpan`) would size it to;
+    once the next range starts past that end, the cap is dropped and widths follow the counts again.
+    Both fields are optional JSON (no migration) and go with the listing when it completes. Why: the
+    listing returns to a place it already reached (a held UID, a budget stop), and re-sizing from a
+    count alone asked the width that had timed out again from there, so a slow link timed out at the
+    same range on every call. Why it lifts: a cap kept for the rest of the listing would narrow every
+    later range after one slow stretch, down to one UID after repeated timeouts, and a large folder
+    would never complete its listing (flags, removals and missing-mail loads would stop with it).
+  - *Carried range, current (fourth review round).* A range the budget stops after its listing FETCH
+    (before the membership SEARCH) or after its proof (before a header batch) is carried in the
+    listing (`IMAPCatchUpState.Listing.carried`: the range, its unproven candidates, the missing UIDs,
+    the `\Deleted` ones it listed, whether it is proven, and a held UID). The next call goes on with it
+    before it lists anything new, so no call throws away a request it already paid for and any slice
+    budget that fits one request converges. UIDs only (metadata, ADR-004), at most
+    `SyncConfig.catchUpCarriedUidCap`: past it the range is cut at the UID that reaches the cap and the
+    rest is listed again later. It lives in the opaque catch-up state, so it goes with it: under
+    another UIDVALIDITY (the state's `epoch`) and with a re-created folder row (whose state starts
+    empty). A carried UID re-read as local since is not loaded again; an expunged one finds nothing.
+    A held UID keeps its first hold while the carry runs and is passed over at the bound. A failed
+    SEARCH still holds the range from its start. Superseded: "a budget stop before the proof holds
+    the range from `lo`", which made a slice that fits only the listing and the proof list the same
+    range forever. No migration.
+    *Fifth review round, current:* the carry stores the load floor its range was listed under
+    (`loadsFrom`); the resume loads only from the higher of that and the current floor, so a rising
+    floor (a walk reset, a prune) loads nothing below it and a range listed with no floor proves only
+    its candidates. Carried UIDs (missing, `\Deleted`, unanswered, the held one) now local are
+    dropped, the held one with its hold. A budget stop before the SEARCH for UIDs a load batch did
+    not answer carries that SEARCH (`unanswered`). A failed SEARCH or load keeps the carry within the
+    hold bound, so the retry pays only for what failed. The header load compares the SELECT's
+    UIDVALIDITY before its FETCH and sends nothing under another numbering. The slice reads the load
+    floor at the start of its turn and drops carried UIDs outside it. A Settings reset takes the
+    account's sync turn (ADR-IOS-104 amendment 2026-11-20), so no slice runs between its read and its
+    write and nothing read before a reset is written after it; there is no compare-and-set on the
+    state. A re-created folder row is a new insert whose state starts empty; an existing row's
+    folder-list update never writes it. Superseded: "a failed SEARCH or load drops the carry".
+    *Replaces:* "every answered range re-sizes it from its own count" with no bound after a timeout.
+  - *Range bounds.* Only FETCH records inside the range asked for count; an unsolicited FETCH for
+    another UID is no part of the listing (the #755 rule).
+  - *Load floor before the walk starts.* With no walk cursor, the load floor is the folder's lowest held
+    UID: new mail beyond the window is a scan's to load, and a scan never waits for the walk's download
+    gates (#1063). Only mail older than every local row waits for the walk. *Replaces:* "before the walk
+    has started, below the window is the walk's to load" (nothing loaded).
+  - *Load floor before the walk starts, current (second review round).* The floor is the lowest UID a
+    window listing of the folder reached (`CatchUpWindowFloor`, kept under `windowFloor` in the
+    folder's `catchUpState` JSON by the window merge, `SyncEngine.recordCatchUpWindowFloor`, as the
+    lowest any window listing in the epoch reached; the catch-up apply carries it across its own state
+    writes; a turnover clears it with the state). Under a storage limit, the higher of that and the
+    lowest held UID. No floor recorded yet: nothing is loaded until a window listing records one. Rows
+    infinite scroll writes far below the window never pull it down, so older mail stays the walk's,
+    which waits for Wi-Fi under Wi-Fi-only. After the walk starts, the walk-cursor rule stands. No
+    migration (the state column is opaque JSON). *Replaces:* the lowest held UID as the floor, which
+    let infinite-scroll rows pull it down over old mail.
+  - *Storage limit.* The load floor is the lowest held UID, and the prune deletes lowest UIDs first on
+    IMAP (ADR-IOS-006 current note), so nothing pruned is listed for load or fetched again. The insert's
+    date skip is deleted. *Replaces:* the date skip in `insertCatchUpLoads`.
+  - *Header batches.* `SyncConfig.catchUpLoadBatchSize` (20) UIDs per FETCH. A record the client cannot
+    read fails only that UID (held like an unanswered one, logged when debug logging is on); a batch that
+    fails as a whole stops the loads there and the next slice asks it again. No split, no retry within
+    the slice.
+
+(missing message, catch-up by UID, membership proof, direct load, bounded hold, loadHeldSince,
+passedOver, unclean completion, re-arm lapse, selfHealOwed, selfHealLapse, markListingDue, slow link,
+budget stop, SEARCH failure, date self-heal removed, range sized by EXISTS and UIDNEXT, sparse folder,
+unsolicited FETCH, walk not started, UID-ordered prune, header batch size, width cap, widthCap,
+widthCapThrough, timed-out width)

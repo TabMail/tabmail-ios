@@ -1,6 +1,27 @@
 
 ## ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
 
+> **Current note (2026-11-20, #1062).** The prune deletes each folder oldest-first in that folder's
+> SYNC ORDER, the fetch's ordering dimension (ADR-IOS-042): an IMAP folder loses its LOWEST UIDs
+> first (`CAST(messageId AS INTEGER)`, the form `SyncEngine.selectStaleHeaders` uses); a Gmail or
+> Exchange folder its oldest DATES first, as before. Bodies and headers are pruned in the same order.
+> The order comes from each account's `EmailProvider.staleWindowMode`, resolved by the caller
+> (`SyncEngine.pruneOrderByAccount`) and passed to `SyncEngine.runPruneIfOverBudget`; an account with
+> no registered provider is not pruned in that pass. So an IMAP folder under a limit holds one
+> contiguous top range of UIDs, its lowest held UID is a clean floor, and the IMAP catch-up loads
+> only above it (ADR-IOS-107, #1062); the catch-up insert's date skip is gone.
+> **Trade-off (Archive):** an IMAP Archive keeps its most recently ARCHIVED mail (highest UIDs), not
+> its newest-DATED mail: an old message archived today is kept, a recent one archived long ago may be
+> pruned. **No migration and no cleanup:** a store already pruned by date keeps its date-holes; the
+> catch-up downloads them once (they sit above the lowest held UID), and later prunes, now by UID,
+> settle the store into one contiguous top range. *Superseded:* decision 2's "oldest messages are
+> pruned" meant oldest by date for every provider; on IMAP that left pruned holes throughout the UID
+> range that every catch-up listing downloaded again.
+> **Gmail and Exchange under a limit (accepted):** their catch-up stops at the folder's oldest local
+> row by `providerDate`, while the prune orders by `date`, so a loaded message older by `date` than the
+> folder's oldest kept row can be inserted and pruned again at the next pass. Rare (those providers
+> list again only after a lapse) and harmless: it costs one download, never a kept message.
+>
 > **Current note (2026-11-12).** While a storage limit is in force, a Gmail catch-up listing goes no
 > lower than a folder's oldest local row, so the catch-up's direct load brings no pruned old mail
 > back; the re-arm (and its decline) is gone (ADR-IOS-107 decision 8, "the direct load"). The

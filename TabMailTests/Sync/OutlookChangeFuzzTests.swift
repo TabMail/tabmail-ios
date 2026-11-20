@@ -96,6 +96,12 @@ struct OutlookChangeFuzzTests {
 
     @Test("Seeded schedules keep queued reads, never put a row in the wrong folder, and converge")
     func fuzz() async throws {
+        // Debug-gated diagnostics for a replay: `TEST_RUNNER_TABMAIL_TEST_DEBUG_LOG=1`
+        // turns the app's debug logs on for this test, so a red seed shows its
+        // mechanism in the log. Off by default.
+        let debugLog = ProcessInfo.processInfo.environment["TABMAIL_TEST_DEBUG_LOG"] == "1"
+        if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true } }
+        defer { if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } } }
         let base = FuzzConfig.seed
         for iteration in 0..<FuzzConfig.iterations {
             var rng = SplitMix64(seed: base &+ UInt64(iteration))

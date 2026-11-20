@@ -79,8 +79,9 @@ extension SyncEngine {
     /// `.init(nil)` means "the premise is that the folder is UNSTAMPED", which is
     /// a real and common crawl state (a folder holding rows of unproven epoch,
     /// which `bootstrapCrawledFolderUidValidity` refuses to stamp) and MUST still
-    /// be guarded. Round 13 removed self-heal from the unguarded list — see
-    /// `SyncEngine.selfHealFolder`.
+    /// be guarded. Round 13 removed self-heal from the unguarded list (its
+    /// successor, the catch-up's load of missing UIDs, inserts premised too:
+    /// `SyncEngine.applyCatchUpResult`, #1062).
     ///
     /// ⚠ **A nil premise is NOT a missing folder row**, and
     /// `crawlWalkWriteAllowed` no longer treats them alike: a row that is gone
@@ -113,12 +114,13 @@ extension SyncEngine {
         folderRole: FolderRole,
         isInInbox: Bool,
         epochPremise: SyncEngine.CrawlEpochPremise,
-        observedEpoch: UInt32?
+        observedEpoch: UInt32?,
+        catchUpReadStartedAt: Date? = nil
     ) async -> SyncEngine.BackfillBatchOutcome {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
             folderRole: folderRole, isInInbox: isInInbox, epochPremise: epochPremise,
-            observedEpoch: observedEpoch, catchUpReadStartedAt: nil
+            observedEpoch: observedEpoch, catchUpReadStartedAt: catchUpReadStartedAt
         )
         guard !result.refused else { return .refused }
         return .landed(

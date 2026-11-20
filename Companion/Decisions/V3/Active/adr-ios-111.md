@@ -849,7 +849,8 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    only updates or removes rows it holds, so a message such a move left in a folder below the window
    (a move that retired with no effect, its source message older than the window, with backfill
    complete) would stay missing. So a bookmark this rule drops also owes the folder ONE self-heal
-   pass before it is tracked again (2026-11-16): `dropChangeBookmark`
+   pass before it is tracked again (2026-11-16; *the self-heal pass below is superseded 2026-11-20
+   (#1062): the IMAP catch-up's UID listing repairs the folder instead, see the amendment of that date*): `dropChangeBookmark`
    counts one more retirement in `FolderChangeState.selfHealOwed`, whether or not the folder held a
    bookmark (a folder awaiting its first baseline is tracked after its next listing, which does not
    reach below the window either; without a bookmark only the mark is written, no listing is made
@@ -1013,3 +1014,15 @@ invalidateListingCounters, ListingOutcome, runListing, listingCounterColumns,
 inWindow, anyUID, unprovenListingAccounts, unprovenListingPasses, sweepCoverage, windowedSweepUIDBounds,
 windowRecordsAreConsistent, heldServerRowCount, adoptFullSyncFolderList, setReconnectsInsideCommands, ListingRouteFenceTests, syncFolderMessages, knownModSeq, NOMODSEQ, listingDueToken, oweDeepListing, answerEpoch, isCondStoreSelectRefusal, answeredInWindow, armListingDueIfHeldExceeds, folderWalkDone, listingDue, progressTotal, ProgressTotal, uidWalkProgress, folder counters one
 writer, #755, #985, #990, #997.
+
+### Amendment 2026-11-20 (#1062): the owed check is the catch-up's UID listing
+
+The self-heal pass an unproven move owes a folder (`healFoldersAfterAnUnprovenMove`,
+`selfHealRecentMessages(forceSingleFolder:)`, the 90-day date reach) is deleted. The mark
+(`FolderChangeState.selfHealOwed`, `selfHealLapse`) is now settled by the IMAP catch-up (ADR-IOS-107,
+amendment 2026-11-20): a CLEAN completed listing that started after the mark loads every missing UID
+in the held range by UID and calls `markListingDue`, so the next scheduled full sync lists the folder
+and `commitChangeBaseline` tracks it again. An unclean completion (a UID passed over at the hold
+bound) or one that started before the mark re-marks the catch-up lapse, so a folder holding a new
+bookmark is still listed again until the mark settles. (selfHealDue, owed check, unproven move,
+catch-up, re-arm, #1062)

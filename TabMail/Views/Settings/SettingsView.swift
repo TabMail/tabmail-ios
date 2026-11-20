@@ -641,9 +641,16 @@ struct SettingsView: View {
 
         // 2. Authoritative GRDB transaction (preserve accounts + folders).
         // Nothing in a sibling database is touched unless this commits.
+        // It runs in every account's sync turn (ADR-IOS-104), taken in sorted
+        // order before the writer opens: no pass writes what it read before
+        // the wipe after it (#1062).
         do {
-            try await AppDatabase.dbPool.write { db in
-                try Self.localIndexWipeTxn(db)
+            let pool = AppDatabase.dbPool
+            let accountIds = try await pool.read { db in try String.fetchAll(db, sql: "SELECT id FROM account") }
+            try await AccountManager.shared.syncEngine.withSyncTurns(accountIds: accountIds) {
+                try await pool.write { db in
+                    try Self.localIndexWipeTxn(db)
+                }
             }
         } catch {
             BackgroundSyncLogger.logDebug("[NukeDB] Authoritative database wipe failed: \(error)")
