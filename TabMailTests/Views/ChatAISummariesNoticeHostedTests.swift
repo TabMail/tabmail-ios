@@ -568,6 +568,17 @@ struct ChatAISummariesNoticeHostedTests {
     // MARK: - After a report
 
     /// Opens the popover with the glyph and presses "Report a concern"; returns once the sheet shows.
+    /// The popover and its report sheet are both up, and neither is still being presented.
+    private static func presentationSettled(_ controller: UIViewController) -> Bool {
+        var chain: [UIViewController] = []
+        var current = controller.presentedViewController
+        while let next = current {
+            chain.append(next)
+            current = next.presentedViewController
+        }
+        return chain.count == 2 && chain.allSatisfy { !$0.isBeingPresented && !$0.isBeingDismissed }
+    }
+
     private static func openReport(in controller: UIViewController) async throws {
         let glyph = try #require(element(AISummariesNotice.accessibilityLabel, in: controller.view))
         #expect(glyph.accessibilityActivate())
@@ -1084,6 +1095,10 @@ struct ChatAISummariesNoticeHostedTests {
                 try await Self.hosting(button) { controller in
                     try await Self.openReport(in: controller)
                     try await Self.pressReport(in: controller, held: held)
+                    // Close only once the popover and its sheet have finished presenting: a dismiss
+                    // that lands mid-presentation leaves them up.
+                    try await Self.waitUntil { Self.presentationSettled(controller) }
+                    #expect(Self.presentationSettled(controller), "control: the popover and its sheet are on screen")
                     // The system closes the popover and its sheet; the button stays mounted.
                     controller.presentedViewController?.dismiss(animated: false)
                     try await Self.waitUntil { controller.presentedViewController == nil }
