@@ -20,8 +20,8 @@ import Testing
 /// through a `ComposeGenerationCursor`), the real held Outbox row,
 /// `PendingSendService.present` and `undo()` (what the toast's Undo button
 /// calls, synchronously), `UndoReopenCompose.composeView(for:)`, and the close
-/// decision's own functions (`ComposeDraftGuards.baseline`, `.hasChanges`,
-/// `.hasContent`, `.closeAction`).
+/// decision Close calls (`ComposeDraftGuards.closeDecision`, with
+/// `.hasContent`).
 ///
 /// `.serialized` + `.processGlobalState`: rebinds `AppDatabase.shared` and uses
 /// `PendingSendService.shared`. example.com addresses only; every instant
@@ -325,11 +325,19 @@ struct UndoSendReturnsToDraftsTests {
 
     private static func close(
         current: ComposeDraftGuards.Baseline, loadedIsUnsaved: Bool,
-        readState: ComposeDraftGuards.ReadState = .loaded, hasUnsettledWork: Bool = false
+        readState: ComposeDraftGuards.ReadState = .loaded, hasContent: Bool = true,
+        hasUnsettledWork: Bool = false
     ) -> ComposeDraftGuards.CloseAction {
         ComposeDraftGuards.closeDecision(ComposeDraftGuards.CloseState(
             readState: readState, loaded: loadedFields, current: current,
-            loadedIsUnsaved: loadedIsUnsaved, hasContent: true, hasUnsettledWork: hasUnsettledWork))
+            loadedIsUnsaved: loadedIsUnsaved, hasContent: hasContent, hasUnsettledWork: hasUnsettledWork))
+    }
+
+    @Test("Close of a compose emptied to nothing asks before deleting a loaded draft and deletes a new one")
+    func closeOfEmptiedCompose() {
+        #expect(Self.close(current: .empty, loadedIsUnsaved: false, hasContent: false) == .promptDelete)
+        #expect(Self.close(current: .empty, loadedIsUnsaved: false, readState: .notFound, hasContent: false)
+                == .deleteThenDismiss)
     }
 
     @Test("Close of loaded content left unchanged asks to save only when the content is unsaved")
@@ -384,6 +392,8 @@ struct UndoSendReturnsToDraftsTests {
             "loaded: loadedBaseline,",
             "current: currentBaseline(),",
             "loadedIsUnsaved: prefillTreatAsUnsavedChanges,",
+            "readState: draftReadState,",
+            "hasContent: hasContent,",
         ] {
             #expect(body.contains(wiring), "closeCompose() lacks `\(wiring)`")
         }
