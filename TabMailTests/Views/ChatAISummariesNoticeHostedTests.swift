@@ -343,6 +343,7 @@ struct ChatAISummariesNoticeHostedTests {
                 let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))
                 #expect(glyph.accessibilityActivate())
                 try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "control: the second tap opens it")
                 controller.presentedViewController?.dismiss(animated: false)
                 try await Self.waitUntil { controller.presentedViewController == nil }
                 try await Task.sleep(for: .seconds(1))
@@ -491,6 +492,59 @@ struct ChatAISummariesNoticeHostedTests {
                 #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.title),
                         "held back on re-entry: the old request is gone")
                 #expect(firstOpen.isDue(landed: true, tipsAllowed: true), "and it was never used up")
+                notice.willMove(toParent: nil)
+                notice.view.removeFromSuperview()
+                notice.removeFromParent()
+            }
+        }
+    }
+
+    // MARK: - A tap always shows it
+
+    @Test("After the notice was seen, a tap opens it and it stays open")
+    func aTapReopensASeenNotice() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let firstOpen = Self.freshFirstOpen()
+        firstOpen.markShown()
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(Self.button(landed: true, firstOpen: firstOpen, tipsAllowed: true)) { controller in
+                try await Task.sleep(for: .seconds(1))
+                #expect(controller.presentedViewController == nil, "control: seen, so the landing opens nothing")
+                let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))
+                #expect(glyph.accessibilityActivate())
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "the tap opens it")
+                try await Task.sleep(for: .seconds(1))
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "and it stays open")
+            }
+        }
+    }
+
+    @Test("A tap on a waiting automatic request stays open even when another chat shows the notice first")
+    func aTapOverAWaitingRequestStaysOpen() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let firstOpen = Self.freshFirstOpen()
+        try await HostedAccessibility.withAutomation {
+            let blocker = UIViewController()
+            try await Self.hosting(Color.clear) { controller in
+                controller.present(blocker, animated: false)
+                try await Self.waitUntil { controller.presentedViewController === blocker }
+                // Lands while it cannot present: the automatic request waits.
+                let notice = UIHostingController(rootView: Self.button(landed: true, firstOpen: firstOpen, tipsAllowed: true))
+                controller.addChild(notice)
+                controller.view.addSubview(notice.view)
+                notice.view.frame = controller.view.bounds
+                notice.didMove(toParent: controller)
+                try await Task.sleep(for: .seconds(1))
+                let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: notice.view))
+                #expect(glyph.accessibilityActivate(), "the user taps")
+                firstOpen.markShown()  // another chat shows it first
+                blocker.dismiss(animated: false)
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "the tapped notice opens")
+                try await Task.sleep(for: .seconds(1))
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "and it stays open")
+                controller.presentedViewController?.dismiss(animated: false)
                 notice.willMove(toParent: nil)
                 notice.view.removeFromSuperview()
                 notice.removeFromParent()
