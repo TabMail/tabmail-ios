@@ -620,11 +620,13 @@ struct ChatReplyFieldTests {
         #expect(Self.count("TextField(placeholder, text: typedText,", in: text) == 1)
         #expect(Self.count("Binding(get: { inputText }, set: { fieldFill.apply(.put($0)) })", in: text) == 1)
         #expect(Self.count("dictation.isActive || speech.isRecording || speech.isStarting", in: text) == 1)
-        // ONE API: the view only reads the words; every change is a `fieldFill.apply`.
+        // ONE API: the view only reads the words and whether they are the sent words (both
+        // read-only state); every change is a `fieldFill.apply`.
         #expect(Self.count("var inputText: String { fieldFill.words }", in: text) == 1)
         #expect(Self.count("var inputText", in: text) == 1)
         #expect(Self.count("fieldFill.", in: text)
-                == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text),
+                == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text)
+                    + Self.count("fieldFill.holdsSentWords", in: text),
                 "nothing else touches the field's state")
         // Each change, where it happens: typing (above), both dictations, both sends, and an Edit.
         #expect(Self.count("fieldFill.apply(.startHearing) speech.start(locale: speechLocale, auto: auto) { transcript in fieldFill.apply(.heard(transcript))", in: text) == 1)

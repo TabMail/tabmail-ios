@@ -856,6 +856,8 @@ struct ChatReplyRecoveryTests {
                         "control: the unchanged sent words offer Retry")
 
                 // An edit (cleared and written again, even to the same text, is new words).
+                // Right after the request ends, Retry can show a moment before the field is mounted again.
+                try await Self.waitUntil { Self.type("", in: chat.view) }
                 #expect(Self.type("", in: chat.view))
                 try await Task.sleep(for: .milliseconds(200))
                 #expect(Self.type(edited, in: chat.view))
@@ -883,11 +885,16 @@ struct ChatReplyRecoveryTests {
         ChatPillState.shared.removeAllSessions()
         ChatPillState.shared.aiService = backend.service
         ChatFieldWords.shared = ChatFieldWords()
+        // The inbox pill shows its field only with AI on (else it offers Subscribe); set as the
+        // chat view's tests do.
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        saved.setChatView(on: true)
         defer {
             ChatPillState.shared.aiService = .shared
             ChatPillState.shared.removeAllSessions()
             ChatFieldWords.shared = ChatFieldWords()
             backend.http.close()
+            saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
         try await HostedAccessibility.withAutomation {
@@ -902,6 +909,8 @@ struct ChatReplyRecoveryTests {
                 #expect(backend.bodies.count == 1, "control: the request went out once and was cut off")
 
                 // The cut-off left a recovery: the empty field offers Retry.
+                // Right after the request ends, Retry can show a moment before the field is mounted again.
+                try await Self.waitUntil { Self.type("", in: view) }
                 #expect(Self.type("", in: view), "control: the pill's field is empty")
                 try await Self.waitUntil { HostedAccessibility.identifiers(in: view).contains("chatRetry") }
                 #expect(HostedAccessibility.identifiers(in: view).contains("chatRetry"),
