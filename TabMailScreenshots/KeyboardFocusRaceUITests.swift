@@ -121,7 +121,8 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         let suggestion = app.buttons.containing(NSPredicate(format: "label CONTAINS %@", "suggested@example.com")).firstMatch
         XCTAssertTrue(suggestion.waitForExistence(timeout: focusSeconds), "control: the suggestion shows")
         suggestion.tap()
-        let chipRemove = app.buttons["Remove suggested@example.com"].firstMatch
+        // The chip shows the picked contact's name.
+        let chipRemove = app.buttons["Remove Suggested Person"].firstMatch
         XCTAssertTrue(chipRemove.waitForExistence(timeout: focusSeconds), "the pick added the chip")
         let hidden = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: suggestion)
         XCTAssertEqual(XCTWaiter.wait(for: [hidden], timeout: focusSeconds), .completed, "control: the list hid")
@@ -134,6 +135,60 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         empty.tap()
         let closed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.keyboards.firstMatch)
         XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: focusSeconds), .completed, "a tap below the field closed the keyboard")
+    }
+
+    /// A rejected chip's own remove is drawn inside the recipient field's box: pressing it keeps the
+    /// keyboard and removes the chip.
+    func testRejectedChipRemoveInsideTheFieldKeepsTheKeyboard() {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-chip")
+        defer { app.terminate() }
+
+        let input = app.textFields["recipientInput-to"].firstMatch
+        XCTAssertTrue(input.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
+        let remove = app.buttons["Remove notanaddress"].firstMatch
+        XCTAssertTrue(remove.waitForExistence(timeout: waitSeconds), "control: the rejected chip shows its remove")
+        input.tap()
+        XCTAssertTrue(waitForFocus(input, timeout: focusSeconds), "control: the recipient input has the keyboard")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: focusSeconds), "control: the keyboard is up")
+        remove.tap()
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: remove)
+        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: focusSeconds), .completed, "the rejected chip is gone")
+        XCTAssertNotEqual(input.value as? String, "notanaddress", "control: removing is not editing")
+        RunLoop.current.run(until: Date().addingTimeInterval(holdSeconds))
+        XCTAssertTrue(waitForFocus(input, timeout: focusSeconds), "the input kept the keyboard after the rejected chip's remove")
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up")
+    }
+
+    /// A view drawn over part of a marked recipient field is not the field: a tap on it closes the keyboard.
+    func testTapOnAViewOverAFieldClosesTheKeyboard() {
+        tapClosesTheKeyboard(on: "keyboardFocusCover")
+    }
+
+    /// The part of a marked recipient field scrolled out of its scroll view is not drawn: a tap on
+    /// the empty area where it would be closes the keyboard.
+    func testTapOverTheClippedPartOfAFieldClosesTheKeyboard() {
+        tapClosesTheKeyboard(on: "keyboardFocusClippedArea")
+    }
+
+    /// With "Other field" holding the keyboard on the covered fixture, a tap on `identifier` closes it.
+    private func tapClosesTheKeyboard(on identifier: String) {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-covered")
+        defer { app.terminate() }
+
+        let other = app.textFields["Other field"].firstMatch
+        XCTAssertTrue(other.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
+        let target = app.descendants(matching: .any)[identifier].firstMatch
+        XCTAssertTrue(target.waitForExistence(timeout: waitSeconds), "control: the tap target shows")
+        other.tap()
+        other.typeText("Cover text")
+        XCTAssertTrue(waitForFocus(other, timeout: focusSeconds), "control: the other field has the keyboard")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: focusSeconds), "control: the keyboard is up")
+        // Near the top of the target: over the field the cover lies on, or just below the scroll view.
+        target.coordinate(withNormalizedOffset: CGVector(dx: singleLineOffset, dy: caretTapOffset)).tap()
+        let closed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.keyboards.firstMatch)
+        XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: focusSeconds), .completed, "the tap closed the keyboard")
     }
 
     /// An attachment's remove sits outside every field's box, so its tap closes the keyboard.

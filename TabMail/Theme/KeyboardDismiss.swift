@@ -66,9 +66,9 @@ extension KeyboardDismissView: UIGestureRecognizerDelegate {
         }
         // A control drawn inside a text field's own box (a clear button, a token's remove) counts as
         // a tap on the field. SwiftUI draws those controls without a UIView of their own, so the box is
-        // marked (`textInputBox()`) and the touch is matched against the marked boxes' frames.
-        return !TextInputBoxMarkerView.contains(touch, in: window)
-    }
+        // marked (`textInputBox()`), and UIKit's own hit testing says whether the marked box is what
+        // the touch hits: frontmost, not covered, not clipped away.
+        return !TextInputBoxMarkerView.isHit(by: touch, in: window)
     }
 
     /// The dismiss tap only watches (`cancelsTouchesInView = false`), so it runs alongside every other
@@ -80,30 +80,32 @@ extension KeyboardDismissView: UIGestureRecognizerDelegate {
     }
 }
 
-/// Marks the frame of a text field's own box: drawn behind the box, so it is exactly as large.
+/// Covers a text field's own box, laid over it so it is exactly as large and sits above the box's
+/// own controls but below anything drawn later over the box. It never takes a touch: its hit test
+/// answers only while the dismiss tap probes, so the box's controls get every real touch.
 private final class TextInputBoxMarkerView: UIView {
-    private static let marked = NSHashTable<TextInputBoxMarkerView>.weakObjects()
+    /// Set only for the duration of one `isHit` probe, on the main thread.
+    private static var probing = false
 
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        if window == nil { Self.marked.remove(self) } else { Self.marked.add(self) }
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard Self.probing else { return nil }
+        return super.hitTest(point, with: event)
     }
 
-    /// Whether the touch lands inside a marked box shown in `window`.
-    static func contains(_ touch: UITouch, in window: UIWindow?) -> Bool {
+    /// Whether UIKit's hit testing, at the touch's point in `window`, lands on a marked box. A view
+    /// drawn over the box takes the hit first, and a box scrolled or clipped out of its container
+    /// is outside its ancestors' bounds, so neither counts.
+    static func isHit(by touch: UITouch, in window: UIWindow?) -> Bool {
         guard let window else { return false }
-        return marked.allObjects.contains { marker in
-            marker.window === window && !marker.isHidden
-                && marker.bounds.contains(touch.location(in: marker))
-        }
+        probing = true
+        defer { probing = false }
+        return window.hitTest(touch.location(in: window), with: nil) is TextInputBoxMarkerView
     }
 }
 
 private struct TextInputBoxMarker: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
-        let view = TextInputBoxMarkerView()
-        view.isUserInteractionEnabled = false
-        return view
+        TextInputBoxMarkerView()
     }
 
     func updateUIView(_: UIView, context: Context) {}
@@ -113,7 +115,7 @@ extension View {
     /// Marks this view as a text field's own box: a tap on a control inside it (a clear button, a
     /// token's remove) counts as a tap on the field and keeps the keyboard (the keyboard dismiss rule).
     func textInputBox() -> some View {
-        background(TextInputBoxMarker())
+        overlay(TextInputBoxMarker())
     }
 
     /// Dismiss the keyboard when the user taps outside any text input.

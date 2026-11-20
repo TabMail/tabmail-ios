@@ -16,6 +16,9 @@ import SwiftUI
 ///   an attachment row below the field, whose remove sits outside every box and closes the keyboard;
 ///   and one contact suggestion while the To field is focused, which counts as the field, with an
 ///   empty area right below the field (where the list was) for a tap outside it;
+/// - `--keyboard-focus-covered`: a recipient field with a view drawn over part of it, and a recipient
+///   field in a short scroll view whose lower part is clipped away over an empty area, for taps on
+///   what covers or replaces a marked box (both close the keyboard);
 /// - `--keyboard-focus-bullet`: a bullet list's Add (`BulletListEditor`);
 /// - `--keyboard-focus-search`: a button presenting search in a sheet, as the inbox does (`SearchView`);
 /// - `--keyboard-focus-fork`: the inbox chat with one past session, for "Fork and re-send";
@@ -31,6 +34,16 @@ struct KeyboardFocusTestScene: View {
     static let attachmentName = "fixture-attachment.pdf"
     static let suggestion = ContactResult(name: "Suggested Person", email: "suggested@example.com")
     static let chipEmptyAreaIdentifier = "keyboardFocusChipEmptyArea"
+    /// Three addresses, so a recipient field is three chip lines tall.
+    static let manyRecipients = ["one@example.com", "two@example.com", "three@example.com"]
+    static let coverIdentifier = "keyboardFocusCover"
+    /// The cover's size: wide and tall enough to tap, narrower than the field it lies over.
+    static let coverSize = CGSize(width: 120, height: 40)
+    static let clippedAreaIdentifier = "keyboardFocusClippedArea"
+    /// The clipping scroll view's height and the space above its field, so only the field's first
+    /// chip line shows and the rest is clipped away over the empty area below.
+    static let clipViewportHeight: CGFloat = 60
+    static let clipLeadSpace: CGFloat = 30
     static let forkSessionId = "keyboard-focus-fixture-session"
     static let forkUserText = "Keyboard focus fixture question"
     /// The multi-line field's height in lines, so it is backed by a text view with room to tap in.
@@ -43,7 +56,7 @@ struct KeyboardFocusTestScene: View {
     static let emptyAreaHeight: CGFloat = 80
 
     private enum Mode {
-        case template, chip, bullet, search, fork, caret
+        case template, chip, bullet, search, fork, caret, covered
     }
 
     private let mode: Mode = {
@@ -53,6 +66,7 @@ struct KeyboardFocusTestScene: View {
         if arguments.contains("--keyboard-focus-search") { return .search }
         if arguments.contains("--keyboard-focus-fork") { return .fork }
         if arguments.contains("--keyboard-focus-caret") { return .caret }
+        if arguments.contains("--keyboard-focus-covered") { return .covered }
         return .template
     }()
 
@@ -64,6 +78,10 @@ struct KeyboardFocusTestScene: View {
         .filling(to: RecipientEntry([KeyboardFocusTestScene.tokenRecipient, KeyboardFocusTestScene.rejectedRecipient]))
     @State private var showCc = false
     @State private var hasAttachment = true
+    @State private var coveredRecipients = ComposeDraftGuards.Recipients()
+        .filling(to: RecipientEntry(KeyboardFocusTestScene.manyRecipients))
+    @State private var clippedRecipients = ComposeDraftGuards.Recipients()
+        .filling(to: RecipientEntry(KeyboardFocusTestScene.manyRecipients))
     @State private var revealedChipKey: String?
     @State private var showSearch = false
     @State private var chatExpanded = false
@@ -98,6 +116,36 @@ struct KeyboardFocusTestScene: View {
                                 Text(Self.attachmentName)
                             }
                         }
+                        Spacer()
+                    }
+                    .padding()
+                    .dismissKeyboardOnTap()
+                case .covered:
+                    VStack(alignment: .leading, spacing: 16) {
+                        TextField("Other field", text: $other)
+                        RecipientTokenField(
+                            role: .to, recipients: $coveredRecipients, showCc: $showCc, searchResults: [],
+                            onFocus: {}, revealedChipKey: $revealedChipKey)
+                            .overlay(alignment: .bottomTrailing) {
+                                Color.gray
+                                    .frame(width: Self.coverSize.width, height: Self.coverSize.height)
+                                    .accessibilityElement()
+                                    .accessibilityIdentifier(Self.coverIdentifier)
+                            }
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 0) {
+                                Color.clear.frame(height: Self.clipLeadSpace)
+                                RecipientTokenField(
+                                    role: .to, recipients: $clippedRecipients, showCc: $showCc, searchResults: [],
+                                    onFocus: {}, revealedChipKey: $revealedChipKey)
+                            }
+                        }
+                        .scrollDisabled(true)
+                        .frame(height: Self.clipViewportHeight)
+                        Color.clear
+                            .frame(height: Self.emptyAreaHeight)
+                            .accessibilityElement()
+                            .accessibilityIdentifier(Self.clippedAreaIdentifier)
                         Spacer()
                     }
                     .padding()
@@ -157,7 +205,7 @@ struct KeyboardFocusTestScene: View {
             case .fork:
                 try? await Self.seedPastSession()
                 AISubscriptionGate.shared.openGate()
-            case .chip, .bullet, .search, .caret:
+            case .chip, .bullet, .search, .caret, .covered:
                 break
             }
             ready = true
