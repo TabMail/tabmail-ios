@@ -534,6 +534,51 @@ struct ChatFieldWordsTests {
         }
     }
 
+    @Test("A change that changes nothing while the chat's read is held is no intention: the saved words still load")
+    func noOpChangeLetsTheSavedWordsLoad() async throws {
+        try await Self.withStore { _, storage, store in
+            let key = ChatFieldWords.key(for: Self.header("noop-1", thread: "no-op"))
+            store.apply(.put("Saved words"), to: key)
+            await store.written()
+
+            let run = ChatFieldWords(storage: storage.storage)
+            storage.hold(readsOf: key)
+            let loading = Task { await run.load(key) }
+            #expect(await storage.waitForReads(of: key), "control: the read started")
+            // An answer with no send open and an echo of the empty field change nothing.
+            run.apply(.answered, to: key)
+            run.apply(.put(""), to: key)
+            #expect(run.fill(for: key) == ChatFieldFill(), "control: the fill is unchanged")
+            storage.release(readsOf: key)
+            await loading.value
+            #expect(run.fill(for: key).words == "Saved words", "the saved words load: \(run.fill(for: key).words)")
+        }
+    }
+
+    @Test("A confirmation card after an unchanged field send empties its words before the answer; a card from a request with no field key leaves them",
+          arguments: [true, false])
+    func confirmationCardEmptiesTheFieldSend(fromField: Bool) async throws {
+        try await Self.withStore { _, _, store in
+            let previous = ChatFieldWords.shared
+            ChatFieldWords.shared = store
+            defer { ChatFieldWords.shared = previous }
+            let key = ChatFieldWords.key(for: Self.header("card-1", thread: "card-\(fromField)"))
+            store.apply(.put("Archive these"), to: key)
+            store.apply(.sentFromField, to: key)
+            let card = AgentToolRouter.ActionConfirmation(
+                action: .archive, emails: [], contacts: [], calendarEvents: [], templates: [], onRespond: { _ in })
+            let session = ChatPillState.Session()
+            SessionUISink(session: session, fieldWordsKey: fromField ? key : nil).deliverConfirmation(card)
+            #expect(session.chatMessages.count == 1, "control: the card was delivered")
+            let fill = store.fill(for: key)
+            if fromField {
+                #expect(fill.words == "" && fill.atSend == "Archive these", "the card emptied the sent words, the send still open: \(fill)")
+            } else {
+                #expect(fill.words == "Archive these" && fill.holdsSentWords, "another request's card leaves the words: \(fill)")
+            }
+        }
+    }
+
     @Test("A failed read keeps the stored words for the next read, in this run and the next")
     func failedReadKeepsTheStoredWords() async throws {
         try await Self.withStore { pool, storage, store in
