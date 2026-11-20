@@ -323,12 +323,25 @@ final class ChatSwipeUITests: XCTestCase {
         _ = restingMinY(of: working)
         XCTAssertLessThanOrEqual(working.frame.maxY, replyField(in: app).frame.minY + 1,
                                  "the working bubble is a chat row above the field: \(working.frame)")
+        XCTAssertGreaterThanOrEqual(working.frame.minY, bubble(3, in: app).frame.maxY - 1,
+                                    "the working bubble is the last chat row, below the newest email: \(working.frame)")
         app.buttons["Release the AI Suggestion"].tap()
         XCTAssertTrue(ghost.waitForExistence(timeout: 5), "the stored suggestion fills the working bubble in")
         XCTAssertTrue(working.waitForNonExistence(timeout: 3), "one row: the working bubble became the ghost")
         _ = restingMinY(of: ghost)
         XCTAssertLessThanOrEqual(ghost.frame.maxY, replyField(in: app).frame.minY + 1,
                                  "the re-pin keeps the grown ghost above the field: \(ghost.frame)")
+    }
+
+    /// Opened on a stored AI Suggestion, the chat shows the ghost and never the working bubble.
+    func testReadySuggestionOpensOnTheGhostWithNoWorkingBubble() {
+        let app = launchIntoChat(readyAtOpen: true)
+        let working = app.descendants(matching: .any)["chat.aiSuggestion.writing"].firstMatch
+        let ghost = app.descendants(matching: .any)["chat.aiSuggestion"].firstMatch
+        XCTAssertTrue(ghost.waitForExistence(timeout: 5), "the stored suggestion shows as the ghost")
+        XCTAssertFalse(working.exists, "no working bubble on a ready suggestion")
+        XCTAssertGreaterThanOrEqual(ghost.frame.minY, bubble(3, in: app).frame.maxY - 1,
+                                    "the ghost is the last chat row: \(ghost.frame)")
     }
 
     /// Opened at the Unread line, a tap on the jump button ends that landing for good: the AI
@@ -553,7 +566,8 @@ final class ChatSwipeUITests: XCTestCase {
 
     private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false,
                                 lateSuggestion: Bool = false, unread: Bool = false,
-                                suggestionOnJump: Bool = false, writing: Bool = false) -> XCUIApplication {
+                                suggestionOnJump: Bool = false, writing: Bool = false,
+                                readyAtOpen: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
@@ -564,6 +578,7 @@ final class ChatSwipeUITests: XCTestCase {
             + (lateSuggestion ? ["--chat-swipe-late-suggestion"] : [])
             + (suggestionOnJump ? ["--chat-swipe-suggestion-on-jump"] : [])
             + (writing ? ["--chat-swipe-writing"] : [])
+            + (readyAtOpen ? ["--chat-swipe-ready"] : [])
             + (host == .tutorialCard ? ["--chat-swipe-tutorial-card"] : [])
         app.launch()
         switch host {
