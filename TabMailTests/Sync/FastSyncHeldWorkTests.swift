@@ -136,8 +136,8 @@ struct FastSyncHeldWorkTests {
           arguments: DownloadGate.allCases, Remaining.allCases)
     func foregroundHeldThenMoving(_ gate: DownloadGate, _ remaining: Remaining) async throws {
         try await Self.withAccount("held1098-fg-\(gate.rawValue)-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, _ in
-            try await Self.withPower(DownloadGateHarness.power(gate)) {
-                try await DownloadGateHarness.withNetwork(expensive: gate == .expensiveNetwork) {
+            await Self.withPower(DownloadGateHarness.power(gate)) {
+                await DownloadGateHarness.withNetwork(expensive: gate == .expensiveNetwork) {
                     if remaining == .bodies { await Self.queueBody(account.id, expectHeld: true) }
                     let held = await Self.decide([account])
                     #expect(!held.holdAwake, "only held \(remaining) left under \(gate): the screen may lock")
@@ -157,8 +157,8 @@ struct FastSyncHeldWorkTests {
     @Test("foreground: held older-mail bodies with an unfinished walk that can move keep the screen awake and show no caption")
     func heldBodiesButWalkMovingHolds() async throws {
         try await Self.withAccount("held1098-fg-walk-moving", walkDone: false) { account, _ in
-            try await Self.withPower(Self.openPower) {
-                try await DownloadGateHarness.withNetwork(expensive: false) {
+            await Self.withPower(Self.openPower) {
+                await DownloadGateHarness.withNetwork(expensive: false) {
                     // Hold the body queue under Wi-Fi-only on cellular, then the
                     // network turns unmetered: the queue still reads held until its
                     // re-check, but the walk can move now.
@@ -177,8 +177,8 @@ struct FastSyncHeldWorkTests {
           arguments: Remaining.allCases)
     func activeQueueWorkHoldsWhileOlderWorkHeld(_ remaining: Remaining) async throws {
         try await Self.withAccount("held1098-fg-active-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, _ in
-            try await Self.withPower(Self.openPower) {
-                try await DownloadGateHarness.withNetwork(expensive: true) {
+            await Self.withPower(Self.openPower) {
+                await DownloadGateHarness.withNetwork(expensive: true) {
                     if remaining == .bodies { await Self.queueBody(account.id, expectHeld: true) }
                     let item = ActiveBodyQueue.Item(
                         headerId: "\(account.id):INBOX:9", accountId: account.id,
@@ -195,8 +195,8 @@ struct FastSyncHeldWorkTests {
     @Test("foreground: nothing left releases the lock without the Waiting for Wi-Fi caption")
     func nothingLeftShowsNoCaption() async throws {
         try await Self.withAccount("held1098-fg-done", walkDone: true) { account, _ in
-            try await Self.withPower(DownloadGateHarness.power(.lowPowerMode)) {
-                try await DownloadGateHarness.withNetwork(expensive: true) {
+            await Self.withPower(DownloadGateHarness.power(.lowPowerMode)) {
+                await DownloadGateHarness.withNetwork(expensive: true) {
                     let decision = await Self.decide([account])
                     #expect(!decision.holdAwake)
                     #expect(!decision.waitingForWiFi, "nothing is held when nothing is left")
@@ -214,8 +214,8 @@ struct FastSyncHeldWorkTests {
             // The job lifts the power gates (it sets fast sync and runs on power);
             // NetworkMonitor says unmetered, the job's own measurement decides.
             let jobPower = (fastSync: true, lowPowerMode: false, onPower: true, batteryLevel: Float(1))
-            try await Self.withPower(jobPower) {
-                try await DownloadGateHarness.withNetwork(expensive: false) {
+            await Self.withPower(jobPower) {
+                await DownloadGateHarness.withNetwork(expensive: false) {
                     let onCellular = await Self.decideInJob(onWiFi: false) {
                         if remaining == .bodies { await Self.queueBody(account.id, expectHeld: true) }
                         return await Self.decide([account])
@@ -305,8 +305,8 @@ struct FastSyncHeldWorkTests {
           arguments: Beside.allCases, Remaining.allCases)
     func onlyARunningWalkHoldsBesideHeldWork(_ kind: Beside, _ remaining: Remaining) async throws {
         try await Self.withAccount("held1098-run-\(kind.rawValue)-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, provider in
-            try await Self.withPower(Self.openPower) {
-                try await DownloadGateHarness.withNetwork(expensive: true) {
+            await Self.withPower(Self.openPower) {
+                await DownloadGateHarness.withNetwork(expensive: true) {
                     if remaining == .bodies { await Self.queueBody(account.id, expectHeld: true) }
                     let engine = SyncEngine()
                     let finish = await Self.latch(kind, account: account, provider: provider, engine: engine)
@@ -333,8 +333,8 @@ struct FastSyncHeldWorkTests {
           arguments: Remaining.allCases)
     func aiJobBesideHeldWorkReleases(_ remaining: Remaining) async throws {
         try await Self.withAccount("held1098-ai-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, _ in
-            try await Self.withPower(Self.openPower) {
-                try await DownloadGateHarness.withNetwork(expensive: true) {
+            await Self.withPower(Self.openPower) {
+                await DownloadGateHarness.withNetwork(expensive: true) {
                     if remaining == .bodies { await Self.queueBody(account.id, expectHeld: true) }
                     // Dispatch suppressed: the job stays queued, as one waiting out
                     // a retry backoff or an offline spell does.
@@ -432,8 +432,8 @@ struct FastSyncHeldWorkTests {
           arguments: Beside.allCases, Remaining.allCases)
     func overlappingRunsOnlyWalksHold(_ kind: Beside, _ remaining: Remaining) async throws {
         try await Self.withAccount("held1098-overlap-\(kind.rawValue)-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, provider in
-            try await Self.withPower(Self.openPower) {
-                try await DownloadGateHarness.withNetwork(expensive: true) {
+            await Self.withPower(Self.openPower) {
+                await DownloadGateHarness.withNetwork(expensive: true) {
                     if remaining == .bodies { await Self.queueBody(account.id, expectHeld: true) }
                     let engine = SyncEngine()
                     let finishers = await Self.latchTwo(kind, account: account, provider: provider, engine: engine)
@@ -463,8 +463,8 @@ struct FastSyncHeldWorkTests {
     @Test("foreground: a header walk admitted before the gate closed keeps the screen awake until it ends")
     func admittedWalkHoldsAfterGateCloses() async throws {
         try await Self.withAccount("held1098-fg-admitted-walk", walkDone: false) { account, _ in
-            try await Self.withPower(Self.openPower) {
-                try await DownloadGateHarness.withNetwork(expensive: false) {
+            await Self.withPower(Self.openPower) {
+                await DownloadGateHarness.withNetwork(expensive: false) {
                     let engine = SyncEngine()
                     let entered = HeldWorkLatch()
                     let gate = HeldWorkLatch()
@@ -493,8 +493,8 @@ struct FastSyncHeldWorkTests {
     func jobAdmittedWalkHoldsAfterGateCloses() async throws {
         try await Self.withAccount("held1098-job-admitted-walk", walkDone: false) { account, _ in
             let jobPower = (fastSync: true, lowPowerMode: false, onPower: true, batteryLevel: Float(1))
-            try await Self.withPower(jobPower) {
-                try await DownloadGateHarness.withNetwork(expensive: false) {
+            await Self.withPower(jobPower) {
+                await DownloadGateHarness.withNetwork(expensive: false) {
                     let engine = SyncEngine()
                     let after = DecisionBox()
                     let during = await Self.decideInJob(onWiFi: true) {
@@ -527,8 +527,8 @@ struct FastSyncHeldWorkTests {
     @Test("foreground: an older-mail body batch still downloading beside a refused pending body keeps the screen awake; once it ends the lock releases")
     func activeOlderBodyBatchBesideRefusedItemHolds() async throws {
         try await Self.withAccount("held1098-fg-active-batch", walkDone: true) { account, provider in
-            try await Self.withPower(Self.openPower) {
-                try await DownloadGateHarness.withNetwork(expensive: false) {
+            await Self.withPower(Self.openPower) {
+                await DownloadGateHarness.withNetwork(expensive: false) {
                     let fetch = HeldWorkLatch()
                     await provider.setFetchMessageHook { await fetch.wait() }
                     await Self.queueBody(account.id, expectHeld: false)
@@ -560,8 +560,8 @@ struct FastSyncHeldWorkTests {
     @Test("a Wi-Fi-only change while a poll is suspended: both decisions keep the poll's starting value; the next poll uses the new one")
     func wifiOnlyChangeMidPollKeepsSnapshot() async throws {
         try await Self.withAccount("held1098-snapshot", walkDone: false) { account, _ in
-            try await Self.withPower(Self.openPower) {
-                try await DownloadGateHarness.withNetwork(expensive: true, wifiOnly: true) {
+            await Self.withPower(Self.openPower) {
+                await DownloadGateHarness.withNetwork(expensive: true, wifiOnly: true) {
                     let flipped = HeldWorkFlag()
                     SyncEngine.backfillPowerReadHookForTesting.withLock {
                         $0 = {
@@ -630,7 +630,8 @@ struct FastSyncHeldWorkTests {
             #expect(moving.holdAwake)
 
             // The keep-awake effect, through the screen's own modifier.
-            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 10, height: 10))
+            let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            let window = UIWindow(windowScene: scene)
             let host = UIHostingController(rootView: KeepAwakeProbe(active: moving.holdAwake))
             window.rootViewController = host
             window.isHidden = false

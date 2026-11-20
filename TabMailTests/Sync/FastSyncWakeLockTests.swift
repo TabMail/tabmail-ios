@@ -111,7 +111,7 @@ struct FastSyncWakeLockTests {
             $0 = (fastSync: false, lowPowerMode: false, onPower: true, batteryLevel: 1)
         }
         defer { SyncEngine.backfillPowerStateForTesting.withLock { $0 = nil } }
-        try await DownloadGateHarness.withNetwork(expensive: false) {
+        await DownloadGateHarness.withNetwork(expensive: false) {
             #expect(await Self.holdsAwake([done, other]), "an unfinished or undiscovered account keeps the screen awake")
         }
     }
