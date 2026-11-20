@@ -85,6 +85,10 @@ chat history the same key already keeps, and goes with that thread's AI data and
   to the user (`ChatFieldFill.apply(.answered)` clears `atSend`, `holdsSentWords` and `composing`), so
   they are kept like typed words and show again after a relaunch. Before, they showed for the run but
   were never kept.
+- Settings' "Delete All Email Index Data" (`SettingsView.localIndexWipeStatements`) keeps the unsent field
+  words (2026-11-20, review r7 R1): its alert promises unsent drafts are kept, and the words live while
+  the thread's emails are on the device, so after the resync each thread's unsent words show again even
+  though its chat history is gone. Deliberate; not a leftover.
 - A field send's transitions (confirmation card, the agent's answer, a compose card opening, its reply
   going out) are applied by the request lifecycle to the chat key captured at send
   (`ToolInvocation.fieldWordsKey`, `SessionUISink.fieldWordsKey`,
