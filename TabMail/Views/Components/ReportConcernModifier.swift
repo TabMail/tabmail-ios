@@ -120,18 +120,26 @@ struct ReportConcernSheetModifier: ViewModifier {
     var onFinish: (() -> Void)?
 
     @State private var showSubmitted = false
+    /// The backend took the report: "Report Submitted" shows once the sheet has gone.
+    @State private var submitted = false
     @State private var selectedCategory: ReportCategory = .offensive
     @State private var reason = ""
     @State private var isSubmitting = false
 
     func body(content view: Content) -> some View {
         view
-            .sheet(isPresented: $isPresented) {
+            .sheet(isPresented: $isPresented, onDismiss: {
+                // The alert waits until the sheet has gone: UIKit refuses to present it while the
+                // sheet is still closing.
+                if submitted {
+                    submitted = false
+                    showSubmitted = true
+                } else {
+                    // Cancel, a swipe down, or a report the backend did not take.
+                    onFinish?()
+                }
+            }) {
                 reportSheet
-            }
-            .onChange(of: isPresented) { _, shows in
-                // Cancel, a swipe down, or a report the backend did not take.
-                if !shows, !showSubmitted { onFinish?() }
             }
             .alert("Report Submitted", isPresented: $showSubmitted) {
                 Button("OK", role: .cancel) { onFinish?() }
@@ -193,10 +201,8 @@ struct ReportConcernSheetModifier: ViewModifier {
         Task {
             let success = await send(contentType, content(), selectedCategory, reason.isEmpty ? nil : reason)
             isSubmitting = false
+            submitted = success
             isPresented = false
-            if success {
-                showSubmitted = true
-            }
             selectedCategory = .offensive
             reason = ""
         }
