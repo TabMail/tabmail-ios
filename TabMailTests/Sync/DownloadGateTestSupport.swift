@@ -98,7 +98,7 @@ enum DownloadGateHarness {
     /// Runs the real backfill worker for `account` with `power` as its power
     /// snapshot and its waits between cycles handed to a `WorkerSleeps`, then
     /// stops it (the account is removed from the engine).
-    static func withWorker(
+    nonisolated(nonsending) static func withWorker(
         _ engine: SyncEngine, account: Account,
         power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float),
         _ body: (WorkerSleeps) async throws -> Void
