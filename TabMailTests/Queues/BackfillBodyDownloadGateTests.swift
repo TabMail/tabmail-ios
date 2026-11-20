@@ -702,7 +702,7 @@ struct BackfillBodyDownloadGateTests {
     }
 
     /// The facts of a network path, classified by the production rule
-    /// (`SyncEngine.onUnmeteredWiFi`), with what every Wi-Fi-only download
+    /// (`SyncEngine.onUnmeteredNetwork`), with what every Wi-Fi-only download
     /// decision must do on it.
     struct PathCase: Sendable, CustomTestStringConvertible {
         let name: String
@@ -713,13 +713,14 @@ struct BackfillBodyDownloadGateTests {
         static let all: [PathCase] = [
             PathCase(name: "personal-hotspot", facts: DownloadGateHarness.personalHotspot, downloads: false),
             PathCase(name: "unmetered-wifi", facts: DownloadGateHarness.unmeteredWiFi, downloads: true),
+            PathCase(name: "wired", facts: DownloadGateHarness.wired, downloads: true),
             PathCase(name: "cellular", facts: DownloadGateHarness.cellular, downloads: false),
-            PathCase(name: "unsatisfied-wifi",
-                     facts: NetworkPathFacts(satisfied: false, usesWiFi: true, isExpensive: false), downloads: false),
+            PathCase(name: "unsatisfied",
+                     facts: NetworkPathFacts(satisfied: false, isExpensive: false), downloads: false),
         ]
     }
 
-    @Test("with Wi-Fi-only on, \"on Wi-Fi\" means unmetered Wi-Fi for all three decisions: the foreground gate, the job's bodies and the job's walk",
+    @Test("with Wi-Fi-only on, \"on Wi-Fi\" means an unmetered network for all three decisions: the foreground gate, the job's bodies and the job's walk",
           arguments: PathCase.all)
     @MainActor
     func pathFactsDecideEveryWiFiOnlyDownload(_ input: PathCase) async throws {

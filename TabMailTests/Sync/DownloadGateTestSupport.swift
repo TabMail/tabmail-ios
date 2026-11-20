@@ -23,11 +23,14 @@ enum BackfillRunner: String, CaseIterable, Sendable, CustomTestStringConvertible
 }
 
 enum DownloadGateHarness {
-    /// A satisfied path of each kind the Wi-Fi-only rule tells apart: unmetered
-    /// Wi-Fi, cellular, and a Personal Hotspot (Wi-Fi that iOS marks expensive).
-    static let unmeteredWiFi = NetworkPathFacts(satisfied: true, usesWiFi: true, isExpensive: false)
-    static let cellular = NetworkPathFacts(satisfied: true, usesWiFi: false, isExpensive: true)
-    static let personalHotspot = NetworkPathFacts(satisfied: true, usesWiFi: true, isExpensive: true)
+    /// Satisfied paths as iOS reports them (the facts carry no interface: the
+    /// Wi-Fi-only rule asks only whether the network is metered): unmetered
+    /// Wi-Fi, wired Ethernet, cellular, and a Personal Hotspot (Wi-Fi that iOS
+    /// marks expensive).
+    static let unmeteredWiFi = NetworkPathFacts(satisfied: true, isExpensive: false)
+    static let wired = NetworkPathFacts(satisfied: true, isExpensive: false)
+    static let cellular = NetworkPathFacts(satisfied: true, isExpensive: true)
+    static let personalHotspot = NetworkPathFacts(satisfied: true, isExpensive: true)
 
     /// `withPath` on cellular when `expensive`, else unmetered Wi-Fi.
     static func withNetwork(
@@ -38,7 +41,7 @@ enum DownloadGateHarness {
 
     /// Runs `body` with one network path seen by both readers, NetworkMonitor's
     /// cached path (the foreground gate) and the background job's measurement
-    /// (classified by the production rule, `SyncEngine.onUnmeteredWiFi`), and the
+    /// (classified by the production rule, `SyncEngine.onUnmeteredNetwork`), and the
     /// Wi-Fi-only setting set, restoring all of them, so a test never depends on
     /// the network of the machine it runs on.
     static func withPath(

@@ -131,7 +131,7 @@ final class SyncScheduler {
 
     /// Key for WiFi-only background backfill setting (default: true).
     /// Gates the backward crawl (history backfill) and older-mail body downloads
-    /// (`BackfillBodyQueue`, #1064): both need unmetered Wi-Fi when it is on. Sync,
+    /// (`BackfillBodyQueue`, #1064): both need an unmetered network when it is on. Sync,
     /// new-mail and opened-message bodies (`ActiveBodyQueue`, on-demand fetches),
     /// AI processing, and embeddings run regardless of network type.
     nonisolated static let wifiOnlyKey = "backgroundSyncWiFiOnly"
@@ -1541,7 +1541,7 @@ final class SyncScheduler {
     /// `measureJobPathFacts` uses a live NWPathMonitor, so a test cannot choose its answer.
     nonisolated static let jobOnWiFiMeasurementForTesting = Mutex<Bool?>(nil)
     /// Path-facts variant: the measurement classifies these facts with the
-    /// production rule (`SyncEngine.onUnmeteredWiFi`) instead of a live path.
+    /// production rule (`SyncEngine.onUnmeteredNetwork`) instead of a live path.
     nonisolated static let jobPathFactsForTesting = Mutex<NetworkPathFacts?>(nil)
     /// Held variant: when set, the measurement awaits it and returns its answer,
     /// so a test can keep the reading unknown while the job's work runs.
@@ -1550,17 +1550,18 @@ final class SyncScheduler {
 
     /// The background processing job's one Wi-Fi measurement, started at job start
     /// concurrently with the job's work (`handleBackgroundAIProcessing`, #1064):
-    /// true only on unmetered Wi-Fi (`SyncEngine.onUnmeteredWiFi`, the rule the
-    /// foreground gate applies too), so a Personal Hotspot is not Wi-Fi. A path
-    /// not reported within `SyncConfig.wifiCheckTimeoutSeconds` is not Wi-Fi.
+    /// true only on an unmetered network (`SyncEngine.onUnmeteredNetwork`, the rule
+    /// the foreground gate applies too), so a Personal Hotspot is metered and wired
+    /// Ethernet is not. A path not reported within `SyncConfig.wifiCheckTimeoutSeconds`
+    /// counts as metered.
     nonisolated static func measureJobOnWiFi() async -> Bool {
         #if DEBUG
         if let hold = jobOnWiFiMeasurementHoldForTesting.withLock({ $0 }) { return await hold() }
         if let onWiFi = jobOnWiFiMeasurementForTesting.withLock({ $0 }) { return onWiFi }
-        if let facts = jobPathFactsForTesting.withLock({ $0 }) { return SyncEngine.onUnmeteredWiFi(facts) }
+        if let facts = jobPathFactsForTesting.withLock({ $0 }) { return SyncEngine.onUnmeteredNetwork(facts) }
         #endif
         guard let facts = await measureJobPathFacts() else { return false }
-        return SyncEngine.onUnmeteredWiFi(facts)
+        return SyncEngine.onUnmeteredNetwork(facts)
     }
 
     /// The current network path's facts from one NWPathMonitor update, or nil when

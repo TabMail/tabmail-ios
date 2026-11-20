@@ -8,22 +8,21 @@ import Synchronization
 import UIKit
 
 /// The facts of one network path that the Wi-Fi-only download rule reads
-/// (`SyncEngine.onUnmeteredWiFi`, #1064): whether the path is satisfied, whether
-/// it uses Wi-Fi, and whether iOS marks it expensive. A Personal Hotspot is a
-/// satisfied Wi-Fi path that is expensive.
+/// (`SyncEngine.onUnmeteredNetwork`, #1064): whether the path is satisfied and
+/// whether iOS marks it expensive. The interface does not matter: the setting
+/// saves metered data, so a Personal Hotspot (Wi-Fi marked expensive) is
+/// metered and wired Ethernet is not.
 struct NetworkPathFacts: Sendable, Equatable {
     let satisfied: Bool
-    let usesWiFi: Bool
     let isExpensive: Bool
 
-    init(satisfied: Bool, usesWiFi: Bool, isExpensive: Bool) {
+    init(satisfied: Bool, isExpensive: Bool) {
         self.satisfied = satisfied
-        self.usesWiFi = usesWiFi
         self.isExpensive = isExpensive
     }
 
     init(path: NWPath) {
-        self.init(satisfied: path.status == .satisfied, usesWiFi: path.usesInterfaceType(.wifi), isExpensive: path.isExpensive)
+        self.init(satisfied: path.status == .satisfied, isExpensive: path.isExpensive)
     }
 }
 
@@ -54,7 +53,7 @@ final class NetworkMonitor {
     /// The latest path update's facts for the Wi-Fi-only download rule; nil until
     /// the first path update, like `expensiveMutex` (#1064).
     nonisolated private static let pathFactsMutex = Mutex<NetworkPathFacts?>(
-        initialExpensive.map { NetworkPathFacts(satisfied: true, usesWiFi: !$0, isExpensive: $0) })
+        initialExpensive.map { NetworkPathFacts(satisfied: true, isExpensive: $0) })
 
     #if DEBUG
     /// The unit-test host never starts the monitor (no scene reaches RootView's
@@ -85,11 +84,11 @@ final class NetworkMonitor {
     /// Scoped fixtures set an expensive (cellular) network, or nil for a network
     /// no path update has reported yet, and restore the prior cached value when
     /// they end.
-    /// The path facts follow: an expensive network is cellular, a cheap one Wi-Fi.
-    /// A test of a metered Wi-Fi path (a Personal Hotspot) uses `setPathFactsForTesting`.
+    /// The path facts follow: a satisfied path with the same expensive flag.
+    /// A test of an unsatisfied path uses `setPathFactsForTesting`.
     nonisolated static func setExpensiveForTesting(_ expensive: Bool?) {
         expensiveMutex.withLock { $0 = expensive }
-        pathFactsMutex.withLock { $0 = expensive.map { NetworkPathFacts(satisfied: true, usesWiFi: !$0, isExpensive: $0) } }
+        pathFactsMutex.withLock { $0 = expensive.map { NetworkPathFacts(satisfied: true, isExpensive: $0) } }
     }
 
     /// Sets the path facts (and the expensive flag they carry), or nil for a
@@ -115,7 +114,7 @@ final class NetworkMonitor {
 
     /// The latest path's facts, or nil while no path update has reported the
     /// network. The older-mail download gate reads them through
-    /// `SyncEngine.onUnmeteredWiFi` and holds on nil, as the job's measurement
+    /// `SyncEngine.onUnmeteredNetwork` and holds on nil, as the job's measurement
     /// holds on its timeout (#1064).
     nonisolated static func checkPathFactsIfKnown() -> NetworkPathFacts? {
         pathFactsMutex.withLock { $0 }

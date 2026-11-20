@@ -42,12 +42,13 @@
 > (`NetworkMonitor.checkExpensiveIfKnown() == nil`) counts as expensive, so Wi-Fi-only holds both the
 > walk and the bodies until the first path update, as `isOnWiFi()` holds on its timeout.
 > *Corrected again 2026-11-20 (#1064 review):* two rules replace parts of the correction above, which is
-> kept as written. (1) For Wi-Fi-only, "on Wi-Fi" means unmetered Wi-Fi everywhere: one predicate,
-> `SyncEngine.onUnmeteredWiFi(NetworkPathFacts)` (path satisfied, uses Wi-Fi, not expensive), is read by
+> kept as written. (1) For Wi-Fi-only, "on Wi-Fi" means an unmetered network everywhere: one predicate,
+> `SyncEngine.onUnmeteredNetwork(NetworkPathFacts)` (path satisfied and not expensive, whatever the
+> interface: the setting saves metered data, so wired Ethernet counts), is read by
 > the foreground gate (`backfillDownloadsAllowed`, from `NetworkMonitor.checkPathFactsIfKnown()`) and by
 > the job's measurement (`measureJobOnWiFi` over `measureJobPathFacts`, which replaces `isOnWiFi()`; its
 > only caller), whose one value the job's body gate and walk share. A Personal Hotspot (satisfied Wi-Fi
-> marked expensive) is therefore not Wi-Fi: the old `isOnWiFi()` returned true for it, so the job walked and
+> marked expensive) is therefore metered: the old `isOnWiFi()` returned true for it, so the job walked and
 > downloaded on a metered hotspot. The job walk is deliberately tightened on hotspots too. The timeout
 > and the hold while unknown are unchanged. (2) While the reading is unknown, each account's scan-only
 > pre-pass is cancelled the moment the reading lands (at most `wifiCheckTimeoutSeconds`, seen within the

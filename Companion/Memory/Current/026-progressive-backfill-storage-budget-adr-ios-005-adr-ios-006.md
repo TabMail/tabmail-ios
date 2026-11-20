@@ -8,8 +8,9 @@
 > from terminated never starts. Outside the job, a network NetworkMonitor has not reported yet counts as
 > expensive (`checkExpensiveIfKnown() == nil`), so Wi-Fi-only holds until the first path update
 > (ADR-IOS-005 amendment of 2026-11-20 and its correction). The text below is kept as written.
-> *Update (2026-11-20, #1064 review):* "on Wi-Fi" for Wi-Fi-only is unmetered Wi-Fi everywhere, one
-> predicate `SyncEngine.onUnmeteredWiFi` (a Personal Hotspot is not Wi-Fi) read by the foreground gate and
+> *Update (2026-11-20, #1064 review):* "on Wi-Fi" for Wi-Fi-only is an unmetered network everywhere
+> (satisfied, not expensive, any interface), one predicate `SyncEngine.onUnmeteredNetwork` (a Personal
+> Hotspot is metered, wired Ethernet is not) read by the foreground gate and
 > the job's measurement; and the job's scan-only pre-pass ends when the reading lands, after which the
 > account runs its normal pipeline with the whole budget (`runBackgroundBackfill(budget:)`), so the walk
 > gets the same budget whether the reading was early or late (ADR-IOS-005 second correction).

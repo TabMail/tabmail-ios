@@ -1054,9 +1054,9 @@ foreground backfill worker and the background processing job.
   correction). In the background job the walk and the bodies decide with the job's one Wi-Fi
   measurement, taken concurrently with the job's work: scans never wait for the reading, and the walk
   and the bodies hold until it lands; outside it, a network NetworkMonitor has not reported yet holds under Wi-Fi-only.
-  *Note (2026-11-20, #1064 review):* "on Wi-Fi" is unmetered Wi-Fi for all three decisions (the foreground
-  gate, the job's bodies, the job's walk) through one predicate, `SyncEngine.onUnmeteredWiFi`, so a
-  Personal Hotspot holds them. The job's scan-only pre-pass ends when the reading lands; the account then
+  *Note (2026-11-20, #1064 review):* "on Wi-Fi" is an unmetered network (satisfied, not expensive, any
+  interface) for all three decisions (the foreground gate, the job's bodies, the job's walk) through one
+  predicate, `SyncEngine.onUnmeteredNetwork`, so a Personal Hotspot holds them and wired Ethernet does not. The job's scan-only pre-pass ends when the reading lands; the account then
   runs its normal pipeline with the full budget, so the pre-pass never takes budget from the walk; scans
   still run first in that pipeline's catch-up as before (ADR-IOS-005, second correction of 2026-11-20).
   `ActiveBodyQueue` and opened messages are not gated; scans and the direct load are unchanged.
