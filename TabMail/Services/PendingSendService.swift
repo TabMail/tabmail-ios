@@ -129,7 +129,7 @@ enum PendingSendToastPhase: Equatable, Sendable {
 ///   continues through its own hold → drain → send flow (its Undo is forfeited).
 /// - Toast phase rendering lives in PendingSendToast (TimelineView, wall-clock).
 ///   This service only stores `current` and an auto-dismiss Task.
-/// - `undo()` attempts a confirmed cancellation regardless of whether compose
+/// - `undoAndReopen()` attempts a confirmed cancellation regardless of whether compose
 ///   reconstruction succeeds. Reopen is permitted only after that cancellation.
 /// - The Draft row is retained and the reopen is bound to its exact generation.
 @Observable
@@ -330,25 +330,6 @@ final class PendingSendService {
         }
     }
 
-    /// User tapped Undo. Only reachable while the toast is in phase 1 — the Undo
-    /// button is rendered only while `PendingSendToastPhase.resolve` answers
-    /// `.undoable`, i.e. strictly before `Pending.undoDeadline`, which is the
-    /// row's durable `holdUntil` less the drain's claim buffer.
-    ///
-    /// Read exact retained authority first, then attempt confirmed cancellation.
-    /// A refused cancellation leaves the toast in place. Reopen requires both the
-    /// confirmed cancellation and exact retained authority.
-    ///
-    /// The read's THREE answers are routed separately — see
-    /// `RetainedAuthorityOutcome` for why collapsing them was the defect.
-    func undo() -> ReopenSnapshot? {
-        guard let p = current else { return nil }
-        let outcome = undo(p)
-        if outcome != .refused { undoneSendIds.insert(p.id) }
-        if case .reopen(let snapshot) = outcome { return snapshot }
-        return nil
-    }
-
     /// Undo, then reopen the compose: the one path for the toast's Undo and a chat bubble's.
     /// `pending` is the send to cancel; nil means the toast's `current`. The reopen is admitted to
     /// `reopenQueue` in the same main-actor turn as the cancellation, and the queue takes every
@@ -357,13 +338,23 @@ final class PendingSendService {
         guard let p = pending ?? current, !undoneSendIds.contains(p.id) else { return }
         switch undo(p) {
         case .reopen(let snapshot):
-            undoneSendIds.insert(p.id)
+            endUndone(p.id)
             reopenQueue.append(snapshot)
         case .cancelled:
-            undoneSendIds.insert(p.id)
+            endUndone(p.id)
         case .refused:
             break
         }
+    }
+
+    /// A send cancelled by Undo: a repeated Undo for it is a no-op, and it no longer has an Undo
+    /// owner, so `isSending` (the tutorial coach card's progress) stops counting it at once rather
+    /// than when its owner would have expired.
+    private func endUndone(_ outboxId: String) {
+        undoneSendIds.insert(outboxId)
+        undoOwners[outboxId] = nil
+        ownerExpiry[outboxId]?.cancel()
+        ownerExpiry[outboxId] = nil
     }
 
     /// What one Undo did: cancelled the send and has its compose to reopen; cancelled it with
@@ -375,7 +366,10 @@ final class PendingSendService {
         case refused
     }
 
-    /// `undo()` for any send still in its window, not only the toast's (a chat bubble's send).
+    /// Undo for any send still in its window, the toast's or a chat bubble's: read exact retained
+    /// authority first, then attempt confirmed cancellation. A refused cancellation leaves the toast
+    /// in place. Reopen requires both the confirmed cancellation and exact retained authority. The
+    /// read's THREE answers are routed separately (see `RetainedAuthorityOutcome`).
     /// Clears the toast only when it is this send's.
     private func undo(_ p: Pending) -> UndoOutcome {
         switch retainedAuthorityOutcome(for: p) {
@@ -464,7 +458,7 @@ final class PendingSendService {
     /// Shape follows `SearchView.ResultTapOutcome` (`afa7889ee`, `IOS-IMAP-001`) —
     /// and its correction: an enum with no silent case does not by itself prevent a
     /// silent path, so what actually holds the invariant here is that every arm of
-    /// `undo()` leaves an observable end state (a snapshot, a cleared toast, or
+    /// `undoAndReopen()` leaves an observable end state (a reopen, a cleared toast, or
     /// `undoFailureMessage`), which is what the tests assert.
     ///
     /// ⚠️ **THAT SENTENCE WAS FALSE WHERE IT WAS WRITTEN, FOR TWO OF THE FIVE EXITS
@@ -472,10 +466,12 @@ final class PendingSendService {
     /// them contain a `guard discardOutboxMessageConfirmed(…) else { return nil }`,
     /// and BOTH of those inner returns left no snapshot, no cleared toast and no
     /// `undoFailureMessage`. Predicate to re-derive the exit count rather than trust
-    /// it: count `return` statements inside `undo(_:)` and `undo()` — **six**. One per
-    /// enum case (3) and the two discard-refusal guards in `undo(_:)`, plus `undo()`'s
-    /// `guard let p = current` early return, which is the one exit with nothing to observe because there was
-    /// no toast to begin with. The enum is a roster of ANSWERS, never of exits, which
+    /// it: count the exits of `undoAndReopen()` and the `undo(_:)` it calls — **six**. One
+    /// per enum case (3) and the two discard-refusal guards in `undo(_:)`, plus
+    /// `undoAndReopen()`'s guard return (no toast, or a send already undone), the one exit with
+    /// nothing new to observe. (Before 2026-11 the toast called a separate `undo()` whose own
+    /// `guard let p = current` was that sixth exit; it was removed when both presenters moved to
+    /// `undoAndReopen()`.) The enum is a roster of ANSWERS, never of exits, which
     /// is precisely how a documented invariant went on reading as evidence that the
     /// work was done (`MIS-018`'s tell).
     private enum RetainedAuthorityOutcome {

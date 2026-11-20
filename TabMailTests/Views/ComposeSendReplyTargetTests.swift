@@ -405,7 +405,7 @@ struct ComposeSendReplyTargetTests {
             references: ["root@example.com"], observedUidValidity: 100,
             actionTag: .reply)
         // A FORWARD draft: `forward:`-keyed and `isForward` on the row, which is what
-        // `PendingSendService.undo()` retains when the user taps Undo on the toast.
+        // `PendingSendService.undoAndReopen()` retains when the user taps Undo on the toast.
         let draftId = "forward:acc1:orig@example.com"
         try await insertDraft(
             pool, id: draftId, replyToId: parent.id,
@@ -420,7 +420,7 @@ struct ComposeSendReplyTargetTests {
         #expect(before?.isReplied == false)
         #expect(before?.actionTag == .reply)
 
-        // THE PRODUCTION REOPEN. `PendingSendService.undo()` RETAINS the Draft row and
+        // THE PRODUCTION REOPEN. `PendingSendService.undoAndReopen()` RETAINS the Draft row and
         // returns this snapshot; `RootView` presents `UndoReopenCompose` with it.
         let snapshot = PendingSendService.ReopenSnapshot(
             id: "outbox-undo-1",

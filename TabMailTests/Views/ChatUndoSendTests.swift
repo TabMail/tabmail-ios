@@ -448,6 +448,63 @@ struct ChatUndoSendTests {
         #expect(service.undoFailureMessage == nil)
     }
 
+    @Test("A bubble-owned send counts as sending through its window, and stops counting the moment its Undo is confirmed")
+    func confirmedBubbleUndoEndsSending() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        service.dismiss()
+        while service.reopenSnapshot != nil { service.finishReopen() }
+        let fixture = try await Self.makeFixture(pool)
+        let row = try await Self.queueReply(fixture, draftId: "draft-sending")
+        let hold = Date().addingTimeInterval(3600)
+        try await Self.setHold(pool, row.id, hold)
+        #expect(!service.isSending, "control: nothing is sending")
+        service.present(outboxId: row.id, draftId: "draft-sending", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
+        #expect(service.visibleToast == nil && service.isSending,
+                "a send whose Undo is on its bubble is sending (the coach card shows progress) with no toast")
+
+        let chat: Set<String> = [EmailFilter.normalizeMessageId(try #require(fixture.parent.rfc822MessageId))]
+        let bubbles = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
+        let bubble = try #require(bubbles.first { $0.id == row.id })
+        bubble.undo()
+        #expect(try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) } == nil, "control: the Undo was confirmed")
+        #expect(!service.isSending, "a cancelled send is no longer sending, at once")
+        #expect(service.undoOwner(for: row.id) == nil, "and has no Undo owner left")
+    }
+
+    @Test("The bubble's Undo does nothing for a send whose Undo is on the toast")
+    func bubbleUndoRefusesAToastOwnedSend() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        while service.reopenSnapshot != nil { service.finishReopen() }
+        let fixture = try await Self.makeFixture(pool)
+        let row = try await Self.queueReply(fixture, draftId: "draft-toast-owned")
+        let hold = Date().addingTimeInterval(3600)
+        try await Self.setHold(pool, row.id, hold)
+        service.present(outboxId: row.id, draftId: "draft-toast-owned", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .toast)
+        let chat: Set<String> = [EmailFilter.normalizeMessageId(try #require(fixture.parent.rfc822MessageId))]
+        let bubbles = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
+        let bubble = try #require(bubbles.first { $0.id == row.id })
+        #expect(bubble.undoSecondsLeft(at: Date()) != nil, "control: the send is still in its window")
+
+        bubble.undo()
+        #expect(try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) } != nil, "nothing is cancelled")
+        #expect(service.reopenQueue.isEmpty, "nothing reopens")
+        #expect(service.visibleToast?.id == row.id, "the toast keeps the send's one Undo")
+    }
+
     @Test("A toast-owned reply whose toast another send replaces, or the user closes, keeps exactly one Undo: its bubble's")
     func replacedToastHandsUndoToTheBubble() async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()

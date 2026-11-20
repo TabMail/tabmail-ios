@@ -419,7 +419,7 @@ struct RootView: View {
         } message: {
             Text(demoStartError ?? tutorial.startError ?? "")
         }
-        // Undo-send was not confirmed. `PendingSendService.undo()` made no
+        // Undo-send was not confirmed. `PendingSendService.undoAndReopen()` made no
         // cancellation change and left the toast in place. The durable Send may
         // still be queued or may already be sending, so this alert says only that
         // the Undo attempt did not take; it never promises the message was stopped.

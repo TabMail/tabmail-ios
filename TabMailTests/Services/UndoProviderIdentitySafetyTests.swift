@@ -1323,7 +1323,7 @@ struct UndoProviderIdentitySafetyTests {
             toSummary: "To: recipient@example.com", holdUntil: outbox.holdUntil)
         let refuser = OutboxDeleteCommitRefuser()
         fixture.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
-        let snapshot = PendingSendService.shared.undo()
+        let snapshot = PendingSendService.shared.tapToastUndo()
         fixture.pool.remove(transactionObserver: refuser)
         try #require(snapshot == nil, "precondition: the Send's Undo is refused")
         try #require(refuser.refusals.withLock { $0 } == 1, "precondition: the cancellation commit was refused")
