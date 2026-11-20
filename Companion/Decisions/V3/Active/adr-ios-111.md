@@ -77,6 +77,9 @@ and that capture was a lapse, so a new account listed every folder twice for the
    runs it after the pass, in slices. The pass lists and then stores the candidate; the catch-up's listing
    comes later. The candidate was still read before every listing, so a change made during the catch-up's
    listing is in the history the next read takes. "runs the catch-up" above is superseded.
+   **Superseded in part 2026-11-19 (#1060; see the #755 amendment item 3):** an unproven listing no longer fails
+   the pass. It withholds the full-sync stamp and the folder is listed again on the next pass; the text above is
+   kept as written.
 6. **Refusal.** One transaction clears the bookmark, untracks every folder, marks one lapse for each
    folder's catch-up and makes the full sync due (`applyChangeRefusal`); the same pass then reads again with
    no bookmark, so the re-list and the new candidate happen in that pass and exactly one catch-up check runs.
