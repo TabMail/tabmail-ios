@@ -69,6 +69,13 @@ extension DynamicIslandChat {
                             .opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1)
                     } else {
                         inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask")
+                            // The drag up's VoiceOver equivalent, on the element VoiceOver
+                            // focuses; only while the panel is closed.
+                            .accessibilityActions {
+                                if let showChat = field.showChat, !isExpanded {
+                                    Button(ChatThreadView.showChatActionName) { showChat() }
+                                }
+                            }
                         if showsExample, let example = field.example {
                             exampleLine(example)
                         }

@@ -25,6 +25,16 @@ struct ChatReplyField: Equatable {
     var tutorialMove: TutorialCoordinator.FieldMove? = nil
     /// How far a drag up has swelled the field toward the panel (`ChatFieldDrag`); 0 at rest.
     var swell: CGFloat = 0
+    /// VoiceOver's "Show TabMail chat" (`ChatThreadView.showChatActionName`), the drag up's
+    /// equivalent, offered on the text field VoiceOver focuses; nil offers nothing (the panel open,
+    /// the tutorial). Left out of `==`: a closure cannot be compared, and a new closure for the
+    /// same field must not count as a change.
+    var showChat: (() -> Void)? = nil
+
+    static func == (lhs: ChatReplyField, rhs: ChatReplyField) -> Bool {
+        lhs.example == rhs.example && lhs.isNoReply == rhs.isNoReply && lhs.clearCount == rhs.clearCount
+            && lhs.onlyTo == rhs.onlyTo && lhs.tutorialMove == rhs.tutorialMove && lhs.swell == rhs.swell
+    }
 
     var placeholder: String { isNoReply ? "Ask anything" : "Reply or ask anything" }
 

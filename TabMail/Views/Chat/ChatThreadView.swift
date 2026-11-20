@@ -857,7 +857,11 @@ struct ChatThreadView: View {
                     clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
                     tutorialMove: tutorialMove(thread),
-                    swell: fieldDragProgress.swell),
+                    swell: fieldDragProgress.swell,
+                    // The drag's VoiceOver equivalent (decision 12: every chat swipe has a named
+                    // action), on the text field VoiceOver focuses; not over the panel or the tutorial.
+                    showChat: chatExpanded || TutorialCoordinator.shared.isRunning
+                        ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } }),
                 onFieldSend: { _ in fieldComposeOpened = false })
             // Drag the field up: it swells under the finger and opens the TabMail chat panel. Not
             // in the tutorial, whose steps open the chat themselves.
@@ -871,12 +875,6 @@ struct ChatThreadView: View {
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.replyPillId)
-            // The drag's VoiceOver equivalent (decision 12: every chat swipe has a named action).
-            .accessibilityActions {
-                if !chatExpanded && !TutorialCoordinator.shared.isRunning {
-                    Button(Self.showChatActionName) { withAnimation(Self.pillSpring) { chatExpanded = true } }
-                }
-            }
         }
         // Once, above the field and its notices: what the drag up shows. An inline tip in an overlay
         // on the whole stack, outside the field's frame and its accessibility container: it pushes
