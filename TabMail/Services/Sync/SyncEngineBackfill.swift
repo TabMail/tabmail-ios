@@ -289,14 +289,12 @@ extension SyncEngine {
                 while !Task.isCancelled {
                     // One power and network snapshot per cycle decides the gates.
                     // The gates hold only the walk (downloads); the cycle, and so
-                    // the folder scans, always runs (#1063). Uses checkExpensive()
-                    // (Mutex-backed) as the Wi-Fi proxy: on iOS, expensive ==
-                    // cellular/hotspot.
-                    guard let power = await self?.backfillPowerState() else { break }
-                    let wifiOnly = UserDefaults.standard.object(forKey: SyncScheduler.wifiOnlyKey) as? Bool ?? true
-                    let walkAllowed = Self.backfillWalkAllowed(
-                        fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
-                        batteryLevel: power.batteryLevel, wifiOnly: wifiOnly, expensive: NetworkMonitor.checkExpensive())
+                    // the folder scans, always runs (#1063). This is the decision
+                    // BackfillBodyQueue reads, so a worker still alive during the
+                    // background processing job walks only when the job's rule and
+                    // its one network measurement allow it (#1064).
+                    guard self != nil else { break }
+                    let (walkAllowed, power) = await Self.backfillDownloadDecisionNow()
                     let powerHeld = !Self.backfillWalkAllowed(
                         fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
                         batteryLevel: power.batteryLevel, wifiOnly: false, expensive: false)

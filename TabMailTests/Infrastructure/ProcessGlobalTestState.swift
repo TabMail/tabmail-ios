@@ -77,9 +77,19 @@ enum ProcessGlobalTestState {
             // a queued test wipe the entries the RUNNING test just recorded.
             await AccountManager.shared.clearRecentlyCompletedForTesting()
             AccountManager.shared.clearActionCompletionsForTesting()
-            try await $ownerToken.withValue(acquiredOwnerToken) {
-                try await function()
+            // 🚨 Also INSIDE the critical section, on both exits: a scope must not
+            // hand the next one an outbox drain still holding `isDrainingOutbox`
+            // through its post-send gap, or that test's `reconcileOutbox()` skips
+            // (#1106). Settling here composes across suites, like the clear above.
+            do {
+                try await $ownerToken.withValue(acquiredOwnerToken) {
+                    try await function()
+                }
+            } catch {
+                await OutboxDrainLatch.settleOrRecord()
+                throw error
             }
+            await OutboxDrainLatch.settleOrRecord()
         }
     }
 

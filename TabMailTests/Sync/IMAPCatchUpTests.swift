@@ -125,7 +125,7 @@ struct IMAPCatchUpTests {
     /// (its debug-only test hook), restoring the prior value afterwards, so a test
     /// never depends on the network of the machine it runs on.
     private static func withNetwork(expensive: Bool, _ body: () async throws -> Void) async throws {
-        let saved = NetworkMonitor.checkExpensive()
+        let saved = NetworkMonitor.checkExpensiveIfKnown()
         NetworkMonitor.setExpensiveForTesting(expensive)
         defer { NetworkMonitor.setExpensiveForTesting(saved) }
         try await body()

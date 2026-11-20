@@ -1,3 +1,49 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Amendment (2026-11-20, #1064).** The walk's download gates (the Wi-Fi-only setting on an
+> expensive network, a battery below 20% off power, and Low Power Mode off power) now also hold
+> older-mail body downloads (`BackfillBodyQueue`). A refused dispatch keeps its items pending without
+> spending a retry and re-checks the gate on `SyncConfig.backfillBodyGateRecheckSeconds`. In the
+> background processing job the job's walk decision applies; the job's synthetic Fast Sync is never
+> treated as a user's (the job flag and Fast Sync change, and are read, in one MainActor step).
+> Bodies the user opens and new mail (`ActiveBodyQueue`) and folder scans are not held. The text
+> below is kept as written.
+> *Corrected 2026-11-20 (#1064 review):* "the job's walk decision applies" held only when NetworkMonitor
+> was running. A job that launches the app from terminated never starts it (only RootView's `.task`
+> does), and its unset flag read as "not metered", so bodies downloaded on cellular while the job's walk
+> was held. Now the job measures Wi-Fi once (`SyncScheduler.measureJobOnWiFi`, i.e. `isOnWiFi()`,
+> bounded by `SyncConfig.wifiCheckTimeoutSeconds`) concurrently with its work: the job flag, its Fast
+> Sync and the work start at once, so scans (listings, change checks, the catch-up) never wait for the
+> reading. `SyncEngine.backgroundProcessingJobOnWiFi` is unknown (nil) until the reading lands, then
+> true/false; while unknown, the body gate's job branch and the job's walk hold (the walk waits for
+> the reading after its account's scans ran, `SyncScheduler.runBackgroundBackfill`; the body queue's
+> gate watcher picks up the lift). Once it lands, the job's walk and the body gate's job branch both
+> decide with that one value (2026-11-20). Outside the job, a network NetworkMonitor has not reported yet
+> (`NetworkMonitor.checkExpensiveIfKnown() == nil`) counts as expensive, so Wi-Fi-only holds both the
+> walk and the bodies until the first path update, as `isOnWiFi()` holds on its timeout.
+> *Corrected again 2026-11-20 (#1064 review):* two rules replace parts of the correction above, which is
+> kept as written. (1) For Wi-Fi-only, "on Wi-Fi" means an unmetered network everywhere: one predicate,
+> `SyncEngine.onUnmeteredNetwork(NetworkPathFacts)` (path satisfied and not expensive, whatever the
+> interface: the setting saves metered data, so wired Ethernet counts), is read by
+> the foreground gate (`backfillDownloadsAllowed`, from `NetworkMonitor.checkPathFactsIfKnown()`) and by
+> the job's measurement (`measureJobOnWiFi` over `measureJobPathFacts`, which replaces `isOnWiFi()`; its
+> only caller), whose one value the job's body gate and walk share. A Personal Hotspot (satisfied Wi-Fi
+> marked expensive) is therefore metered: the old `isOnWiFi()` returned true for it, so the job walked and
+> downloaded on a metered hotspot. The job walk is deliberately tightened on hotspots too. The timeout
+> and the hold while unknown are unchanged. (2) While the reading is unknown, each account's scan-only
+> pre-pass is cancelled the moment the reading lands (at most `wifiCheckTimeoutSeconds`, seen within the
+> re-check interval); then the account runs exactly what it would have run with the reading known at
+> the start, the same pipeline (walk if allowed, then the catch-up) with the same budget
+> (`runBackgroundBackfill(budget:)`, each run's deadline taken when it starts). Before, the pre-pass used
+> the shared deadline and a productive catch-up could spend all of it, leaving the walk none. Tests:
+> `BackfillBodyDownloadGateTests.pathFactsDecideEveryWiFiOnlyDownload`,
+> `GmailCatchUpTests.jobWalkBudgetIsTheSameWhetherTheReadingIsEarlyOrLate`.
+> *Corrected a third time 2026-11-20 (#1064 review):* a backfill worker that is still running when the
+> background processing job starts (it outlives the foreground) decides its walk with the same call as
+> the bodies, `SyncEngine.backfillDownloadDecisionNow`: in the job, the job's rule and its one network
+> measurement (held while unknown), never NetworkMonitor's cached path or the job's synthetic Fast Sync.
+> Its scans still run every cycle. Test: `GmailCatchUpTests.workerDuringJobFollowsTheJobDecision`.
+> This note was moved above the body, which is kept as written.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-005: Progressive Background Backfill
 
