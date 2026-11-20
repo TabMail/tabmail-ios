@@ -115,19 +115,17 @@ struct ChatSuggestionBubbleTests {
         }
     }
 
-    /// What the open compose card shows, read fresh from the top of the chat's presentation
-    /// chain on every call, after a layout pass: the card's suggestion lands after it opens (an
-    /// async draft read), and the accessibility walk forces no layout, so without one a poll can
-    /// keep reading the layout from before the suggestion. Laid out the way the repo's other
-    /// hosted-view polls do (`window.layoutIfNeeded()` per poll). Never the chat behind the
-    /// card, whose ghost holds the same words.
-    private static func cardTexts(_ chat: Chat) -> [String] {
-        var top = chat.controller.presentedViewController
-        while let next = top?.presentedViewController { top = next }
-        guard let card = top?.view else { return [] }
-        card.window?.layoutIfNeeded()
-        card.layoutIfNeeded()
-        return HostedAccessibility.labels(in: card) + fieldTexts(card)
+    /// The compose card the chat presented, captured once it is open: the chat's own presented
+    /// view controller, never the top of the presentation chain, which can be something the
+    /// card itself presents. Both card tests read this one view.
+    private static func openCard(_ chat: Chat) async throws -> UIView {
+        try await waitUntil { chat.controller.presentedViewController != nil }
+        return try #require(chat.controller.presentedViewController?.view, "the compose card opened")
+    }
+
+    /// What the card shows: its accessibility labels and the text of its fields.
+    private static func cardTexts(_ card: UIView) -> [String] {
+        HostedAccessibility.labels(in: card) + fieldTexts(card)
     }
 
     private static func ghost(in view: UIView) -> NSObject? {
@@ -177,11 +175,10 @@ struct ChatSuggestionBubbleTests {
             #expect(ghost.accessibilityLabel == "\(ChatSuggestionConfig.label): Yes, Tuesday works for me.",
                     "the ghost still reads as one element: \(String(describing: ghost.accessibilityLabel))")
             #expect(ghost.accessibilityActivate(), "the ghost takes a tap")
-            try await Self.waitUntil { chat.controller.presentedViewController != nil }
-            let card = try #require(chat.controller.presentedViewController?.view, "the compose card opened")
+            let card = try await Self.openCard(chat)
             var found: [String] = []
             try await Self.waitUntil {
-                found = HostedAccessibility.labels(in: card) + Self.fieldTexts(card)
+                found = Self.cardTexts(card)
                 return found.contains { $0.contains("Yes, Tuesday works for me.") }
             }
             #expect(found.contains { $0.contains("Hello Sam") }, "the full email is on the card: \(found)")
@@ -214,11 +211,10 @@ struct ChatSuggestionBubbleTests {
             #expect(ghost.accessibilityLabel == "\(ChatSuggestionConfig.label): Yes, Tuesday works for me.",
                     "the ghost still reads as one element: \(String(describing: ghost.accessibilityLabel))")
             #expect(ghost.accessibilityActivate(), "the ghost takes a tap")
-            try await Self.waitUntil { chat.controller.presentedViewController != nil }
-            #expect(chat.controller.presentedViewController?.view != nil, "the compose card opened")
+            let card = try await Self.openCard(chat)
             var found: [String] = []
             try await Self.waitUntil {
-                found = Self.cardTexts(chat)
+                found = Self.cardTexts(card)
                 return found.contains { $0.contains("Yes, Tuesday works for me.") }
             }
             #expect(found.contains { $0.contains("Yes, Tuesday works for me.") }, "the card holds the suggestion: \(found)")
