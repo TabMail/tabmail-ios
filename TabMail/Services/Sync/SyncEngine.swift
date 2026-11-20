@@ -63,14 +63,12 @@ actor SyncEngine {
     var syncPassRunning: Set<String> = []
     var syncPassWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
 
-    /// Header walks (`runBackfillWalk`) and catch-up runs (`runCatchUpRun`)
-    /// executing now, foreground or job. A walk admitted before a download gate
-    /// closed keeps running on its own snapshot, and the catch-up runs under every
-    /// gate, so Fast Sync's keep-awake lock reads this, not the gate, to know they
-    /// are still progressing (#1098).
+    /// Header walks (`runBackfillWalk`) executing now, foreground or job. A walk
+    /// admitted before a download gate closed keeps running on its own snapshot,
+    /// so Fast Sync's keep-awake lock reads this, not the gate, to know the walk
+    /// is still progressing (#1098).
     var runningBackfillWalks = 0
-    var runningCatchUpRuns = 0
-    var backfillOrCatchUpRunning: Bool { runningBackfillWalks > 0 || runningCatchUpRuns > 0 }
+    var backfillWalkRunning: Bool { runningBackfillWalks > 0 }
 
     /// Embedding rebuild task (one at a time).
 

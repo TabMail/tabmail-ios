@@ -180,24 +180,9 @@ actor BackfillAIQueue {
         storage.isEmpty && activeBatchCount == 0
     }
 
-    /// Test-only seam (precedent: `ActiveAIQueue.setDispatchSuppressedForTesting`):
-    /// keeps an enqueued refinement pending so a test can observe the queue busy.
-    private var dispatchSuppressedForTesting = false
-    func setDispatchSuppressedForTesting(_ suppressed: Bool) {
-        dispatchSuppressedForTesting = suppressed
-    }
-
-    /// Test-only seam: empties the in-memory queue (GRDB rows untouched).
-    func clearForTesting() {
-        storage.clearAll()
-        backoff.removeAll()
-        backoffRetryCount.removeAll()
-    }
-
     // MARK: - Dispatch (private)
 
     private func scheduleDispatch() {
-        guard !dispatchSuppressedForTesting else { return }
         guard activeBatchCount < maxActiveBatches else { return }
         guard storage.pendingCount > 0 else { return }
         debounceTask?.cancel()

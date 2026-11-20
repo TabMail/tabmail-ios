@@ -42,19 +42,15 @@ struct FastSyncView: View {
     /// older-mail walk and BackfillBodyQueue both obey
     /// (`SyncEngine.backfillDownloadsAllowedNow`, foreground or job), read once
     /// per poll; `backfillBodyHeld` is the queue's own held state confirmed by
-    /// that read (#1098). `activeAIIdle`, `backfillAIIdle` and
-    /// `walkOrCatchUpRunning` are work the gate does not stop: AI jobs, catch-up
-    /// scans, and a header walk admitted before the gate closed, read from their
-    /// owners (`ActiveAIQueue`, `BackfillAIQueue`, `SyncEngine`). Defaults hold
-    /// awake until the first poll.
+    /// that read (#1098). `walkRunning` is a header walk executing now, read from
+    /// `SyncEngine`: one admitted before the gate closed still makes progress.
+    /// Defaults hold awake until the first poll.
     struct KeepAwakePoll: Sendable {
         var activeBodyIdle = false
         var backfillBodyIdle = false
         var backfillBodyHeld = false
         var downloadsHeld = false
-        var activeAIIdle = false
-        var backfillAIIdle = false
-        var walkOrCatchUpRunning = true
+        var walkRunning = true
         var walkDoneByAccount: [String: Bool] = [:]
     }
 
@@ -107,21 +103,18 @@ struct FastSyncView: View {
     /// Work held by the download gate does not count (#1098): an unfinished walk
     /// while `downloadsHeld`, and older-mail bodies while `backfillBodyHeld`, cannot
     /// move, so they never pin the screen awake. New-mail bodies are not gated.
-    /// Work running regardless of the gate always holds: a header walk or
-    /// catch-up executing now (a walk admitted before the gate closed runs on its
-    /// own snapshot) and either AI queue non-idle.
+    /// A header walk executing now always holds: one admitted before the gate
+    /// closed runs on its own snapshot. The inputs are the walk and the two body
+    /// queues only; AI queues and catch-up scans never hold the screen awake.
     nonisolated static func keepScreenAwakeWhileWorking(
         accountHeadersDone: [Bool],
         activeBodyIdle: Bool,
         backfillBodyIdle: Bool,
         downloadsHeld: Bool,
         backfillBodyHeld: Bool,
-        activeAIIdle: Bool,
-        backfillAIIdle: Bool,
-        walkOrCatchUpRunning: Bool
+        walkRunning: Bool
     ) -> Bool {
-        if walkOrCatchUpRunning { return true }
-        if !activeAIIdle || !backfillAIIdle { return true }
+        if walkRunning { return true }
         if accountHeadersDone.contains(false) && !downloadsHeld { return true }
         if !activeBodyIdle { return true }
         if !backfillBodyIdle && !backfillBodyHeld { return true }
@@ -139,9 +132,7 @@ struct FastSyncView: View {
             backfillBodyIdle: poll.backfillBodyIdle,
             downloadsHeld: poll.downloadsHeld,
             backfillBodyHeld: poll.backfillBodyHeld,
-            activeAIIdle: poll.activeAIIdle,
-            backfillAIIdle: poll.backfillAIIdle,
-            walkOrCatchUpRunning: poll.walkOrCatchUpRunning
+            walkRunning: poll.walkRunning
         )
     }
 
@@ -228,16 +219,14 @@ struct FastSyncView: View {
         keepAwakePoll = await Self.pollKeepAwakeInputs(accounts: navigationStore.accounts, engine: manager.syncEngine)
     }
 
-    /// One poll of the keep-awake inputs: both body queues' and both AI queues'
-    /// idle state, running walks and catch-ups, the download gate (one read: its
+    /// One poll of the keep-awake inputs: both body queues' idle state, a running
+    /// header walk, the download gate (one read: its
     /// Wi-Fi-only snapshot serves both decisions), and each account's header walk
     /// read from its folder rows.
     static func pollKeepAwakeInputs(accounts: [Account], engine: SyncEngine) async -> KeepAwakePoll {
         var poll = KeepAwakePoll()
         poll.downloadsHeld = !(await SyncEngine.backfillDownloadsAllowedNow())
-        poll.walkOrCatchUpRunning = await engine.backfillOrCatchUpRunning
-        poll.activeAIIdle = await ActiveAIQueue.shared.isIdle
-        poll.backfillAIIdle = await BackfillAIQueue.shared.isIdle
+        poll.walkRunning = await engine.backfillWalkRunning
         poll.activeBodyIdle = await ActiveBodyQueue.shared.isIdle
         poll.backfillBodyIdle = await BackfillBodyQueue.shared.isIdle
         // The queue's held flag can be stale; the live gate confirms it.

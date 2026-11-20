@@ -49,12 +49,9 @@ struct FastSyncWakeLockTests {
         // Items an earlier test left in the shared queues are not this test's.
         await ActiveBodyQueue.shared.emptyForTesting()
         await BackfillBodyQueue.shared.emptyForTesting()
-        await ActiveAIQueue.shared.clearForTesting()
-        await BackfillAIQueue.shared.clearForTesting()
         let poll = await FastSyncView.pollKeepAwakeInputs(accounts: accounts, engine: SyncEngine())
         #expect(poll.activeBodyIdle && poll.backfillBodyIdle, "precondition: both body queues are idle")
-        #expect(poll.activeAIIdle && poll.backfillAIIdle && !poll.walkOrCatchUpRunning,
-                "precondition: no AI job, walk or catch-up runs")
+        #expect(!poll.walkRunning, "precondition: no header walk runs")
         return FastSyncView.holdAwake(accounts: accounts, poll: poll)
     }
 

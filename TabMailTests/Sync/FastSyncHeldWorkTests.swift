@@ -14,7 +14,9 @@ import Testing
 /// When everything left is held by the download gates (the older-mail walk gate,
 /// #1063, and BackfillBodyQueue's gate, #1064), the lock releases and the
 /// "~X remaining" line reads "Waiting for Wi-Fi"; the moment anything can move,
-/// the lock is held again and the caption goes. Driven through the screen's own
+/// the lock is held again and the caption goes. The lock's inputs are the walk
+/// and the two body queues only: AI queues and catch-up scans never hold it.
+/// Driven through the screen's own
 /// poll (`FastSyncView.pollKeepAwakeInputs`, real folder rows, the real shared
 /// body queues, the real gate decision) and its decisions (`holdAwake`,
 /// `waitingForWiFi`), on the foreground path and inside the BGProcessing job.
@@ -82,8 +84,6 @@ struct FastSyncHeldWorkTests {
     private static func emptyAIQueues() async {
         await ActiveAIQueue.shared.clearForTesting()
         await ActiveAIQueue.shared.setDispatchSuppressedForTesting(false)
-        await BackfillAIQueue.shared.clearForTesting()
-        await BackfillAIQueue.shared.setDispatchSuppressedForTesting(false)
     }
 
     /// Queues one older-mail body on the shared queue and, when the gate is
@@ -244,14 +244,29 @@ struct FastSyncHeldWorkTests {
         }
     }
 
-    // MARK: - Runnable work beside held work (F1, F2)
+    // MARK: - Work beside held work
 
-    /// Work the download gate does not stop, each read from its own owner.
-    enum RunnableOwner: String, CaseIterable, Sendable, CustomTestStringConvertible {
-        /// A new-mail AI job pending in ActiveAIQueue.
-        case activeAI
-        /// A refinement pending in BackfillAIQueue.
-        case backfillAI
+    private static func fetchStarted(_ provider: MockEmailProvider) async -> Bool {
+        await provider.callLog.contains { $0.hasPrefix("fetchMessage(") }
+    }
+
+    /// Registers `account` on `engine` with a one-slot provider queue whose slot
+    /// is taken, so a catch-up run's slice parks on it. Returns the queue and
+    /// what frees the slot.
+    private static func occupiedSlot(
+        _ account: Account, provider: MockEmailProvider, engine: SyncEngine
+    ) async -> (queue: ProviderWorkQueue, free: @Sendable () async -> Void) {
+        let queue = ProviderWorkQueue(provider: provider, maxConcurrency: 1)
+        await engine.register(accountId: account.id, provider: provider, workQueue: queue)
+        let entered = HeldWorkLatch()
+        let slot = HeldWorkLatch()
+        let occupier = Task { await queue.execute(priority: .headerFetch) { await entered.open(); await slot.wait() } }
+        await entered.wait()
+        return (queue, { await slot.open(); await occupier.value })
+    }
+
+    /// Work beside held work, each read from its own owner.
+    enum Beside: String, CaseIterable, Sendable, CustomTestStringConvertible {
         /// A catch-up run (`SyncEngine.runCatchUpRun`) parked on its provider slot.
         case catchUp
         /// A header walk (`SyncEngine.runBackfillWalk`) parked after it started.
@@ -259,46 +274,18 @@ struct FastSyncHeldWorkTests {
         var testDescription: String { rawValue }
     }
 
-    private static func fetchStarted(_ provider: MockEmailProvider) async -> Bool {
-        await provider.callLog.contains { $0.hasPrefix("fetchMessage(") }
-    }
-
-    /// Latches `owner`'s work running on `engine` and returns what finishes it.
+    /// Latches `kind` running on `engine` and returns what finishes it.
     private static func latch(
-        _ owner: RunnableOwner, account: Account, provider: MockEmailProvider, engine: SyncEngine
+        _ kind: Beside, account: Account, provider: MockEmailProvider, engine: SyncEngine
     ) async -> @Sendable () async -> Void {
-        switch owner {
-        case .activeAI:
-            await ActiveAIQueue.shared.setDispatchSuppressedForTesting(true)
-            await ActiveAIQueue.shared.enqueue(headerId: "\(account.id):INBOX:11", accountId: account.id, windowExempt: true)
-            #expect(!(await ActiveAIQueue.shared.isIdle), "precondition: the AI job is pending")
-            return {
-                await ActiveAIQueue.shared.clearForTesting()
-                await ActiveAIQueue.shared.setDispatchSuppressedForTesting(false)
-            }
-        case .backfillAI:
-            await BackfillAIQueue.shared.setDispatchSuppressedForTesting(true)
-            await BackfillAIQueue.shared.enqueueKBRefine(KBRefineSnapshot(
-                sessionId: "\(account.id)-kb", enqueuedAt: Int64(Date().timeIntervalSince1970 * 1000), turns: []))
-            #expect(!(await BackfillAIQueue.shared.isIdle), "precondition: the refinement is pending")
-            return {
-                await BackfillAIQueue.shared.clearForTesting()
-                await BackfillAIQueue.shared.setDispatchSuppressedForTesting(false)
-            }
+        switch kind {
         case .catchUp:
-            // The provider's only slot is taken, so the run's slice waits on it.
-            let queue = ProviderWorkQueue(provider: provider, maxConcurrency: 1)
-            await engine.register(accountId: account.id, provider: provider, workQueue: queue)
-            let entered = HeldWorkLatch()
-            let slot = HeldWorkLatch()
-            let occupier = Task { await queue.execute(priority: .headerFetch) { await entered.open(); await slot.wait() } }
-            await entered.wait()
+            let (queue, free) = await occupiedSlot(account, provider: provider, engine: engine)
             let run = Task { await engine.runCatchUpRun(account: account, run: .snapshot(deadline: nil)) }
-            #expect(await pollUntil { await engine.backfillOrCatchUpRunning }, "precondition: the catch-up run started")
+            #expect(await pollUntil { await queue.waitingCount == 1 }, "precondition: the catch-up run waits on its provider slot")
             return {
-                await slot.open()
+                await free()
                 _ = await run.value
-                await occupier.value
             }
         case .headerWalk:
             let entered = HeldWorkLatch()
@@ -314,40 +301,87 @@ struct FastSyncHeldWorkTests {
         }
     }
 
-    @Test("foreground: runnable AI, catch-up or header-walk work beside held work keeps the screen awake with no caption; once it finishes the lock releases and the caption shows",
-          arguments: RunnableOwner.allCases, Remaining.allCases)
-    func runnableOwnerHoldsBesideHeldWork(_ owner: RunnableOwner, _ remaining: Remaining) async throws {
-        try await Self.withAccount("held1098-run-\(owner.rawValue)-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, provider in
+    @Test("foreground: a running header walk beside held work keeps the screen awake with no caption; a running catch-up scan does not, the lock stays released and the caption shown; after either ends the lock is released and the caption shown",
+          arguments: Beside.allCases, Remaining.allCases)
+    func onlyARunningWalkHoldsBesideHeldWork(_ kind: Beside, _ remaining: Remaining) async throws {
+        try await Self.withAccount("held1098-run-\(kind.rawValue)-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, provider in
             try await Self.withPower(Self.openPower) {
                 try await DownloadGateHarness.withNetwork(expensive: true) {
                     if remaining == .bodies { await Self.queueBody(account.id, expectHeld: true) }
                     let engine = SyncEngine()
-                    let finish = await Self.latch(owner, account: account, provider: provider, engine: engine)
+                    let finish = await Self.latch(kind, account: account, provider: provider, engine: engine)
                     let running = await Self.decide([account], engine: engine)
-                    #expect(running.holdAwake, "\(owner) is progressing beside held \(remaining): the screen stays awake")
-                    #expect(!running.waitingForWiFi, "\(owner) is progressing: no Waiting for Wi-Fi")
+                    if kind == .headerWalk {
+                        #expect(running.holdAwake, "a header walk is progressing beside held \(remaining): the screen stays awake")
+                        #expect(!running.waitingForWiFi, "a header walk is progressing: no Waiting for Wi-Fi")
+                    } else {
+                        #expect(!running.holdAwake, "a catch-up scan beside held \(remaining) never holds the screen awake")
+                        #expect(running.waitingForWiFi, "a catch-up scan beside held \(remaining): the caption reads Waiting for Wi-Fi")
+                    }
 
                     await finish()
                     #expect(await Self.pollUntil {
                         let after = await Self.decide([account], engine: engine)
                         return !after.holdAwake && after.waitingForWiFi
-                    }, "\(owner) finished, only held \(remaining) left: the lock releases and the caption shows")
+                    }, "\(kind) finished, only held \(remaining) left: the lock is released and the caption shows")
+                }
+            }
+        }
+    }
+
+    @Test("foreground: a pending AI job beside held work leaves the lock released and the caption shown",
+          arguments: Remaining.allCases)
+    func aiJobBesideHeldWorkReleases(_ remaining: Remaining) async throws {
+        try await Self.withAccount("held1098-ai-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, _ in
+            try await Self.withPower(Self.openPower) {
+                try await DownloadGateHarness.withNetwork(expensive: true) {
+                    if remaining == .bodies { await Self.queueBody(account.id, expectHeld: true) }
+                    // Dispatch suppressed: the job stays queued, as one waiting out
+                    // a retry backoff or an offline spell does.
+                    await ActiveAIQueue.shared.setDispatchSuppressedForTesting(true)
+                    await ActiveAIQueue.shared.enqueue(headerId: "\(account.id):INBOX:11", accountId: account.id, windowExempt: true)
+                    #expect(!(await ActiveAIQueue.shared.isIdle), "precondition: the AI job is queued")
+                    let decision = await Self.decide([account])
+                    #expect(!decision.holdAwake, "an AI job never holds the screen awake beside held \(remaining)")
+                    #expect(decision.waitingForWiFi, "an AI job beside held \(remaining): the caption reads Waiting for Wi-Fi")
+                }
+            }
+        }
+    }
+
+    @Test("foreground: a held state stays steady across a full worker cycle that runs a catch-up: the lock stays released and the caption shown during and after it",
+          arguments: Remaining.allCases)
+    func heldStateSteadyAcrossWorkerCycle(_ remaining: Remaining) async throws {
+        try await Self.withAccount("held1098-cycle-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, provider in
+            try await Self.withPower(Self.openPower) {
+                try await DownloadGateHarness.withNetwork(expensive: true) {
+                    if remaining == .bodies { await Self.queueBody(account.id, expectHeld: true) }
+                    let engine = SyncEngine()
+                    let (queue, free) = await Self.occupiedSlot(account, provider: provider, engine: engine)
+                    try await DownloadGateHarness.withWorker(engine, account: account, power: Self.openPower) { sleeps in
+                        let before = await Self.decide([account], engine: engine)
+                        #expect(!before.holdAwake && before.waitingForWiFi, "before the cycle's catch-up: released, caption shown")
+
+                        #expect(await Self.pollUntil { await queue.waitingCount == 1 },
+                                "precondition: the cycle's catch-up waits on its provider slot")
+                        let during = await Self.decide([account], engine: engine)
+                        #expect(!during.holdAwake, "the cycle's catch-up runs: the lock stays released")
+                        #expect(during.waitingForWiFi, "the cycle's catch-up runs: the caption stays")
+
+                        await free()
+                        #expect(await sleeps.waitFor(count: 1), "the worker's cycle never ended")
+                        let after = await Self.decide([account], engine: engine)
+                        #expect(!after.holdAwake, "the cycle ended: the lock stays released")
+                        #expect(after.waitingForWiFi, "the cycle ended: the caption stays")
+                    }
                 }
             }
         }
     }
 
     /// Two runs of the same kind on one engine at once, as the job runs accounts concurrently.
-    enum OverlappingKind: String, CaseIterable, Sendable, CustomTestStringConvertible {
-        case headerWalk
-        case catchUp
-        var testDescription: String { rawValue }
-    }
-
-    /// Starts two overlapping `kind` runs on `engine`, each parked on its own latch;
-    /// returns one finisher per run, in start order.
     private static func latchTwo(
-        _ kind: OverlappingKind, account: Account, provider: MockEmailProvider, engine: SyncEngine
+        _ kind: Beside, account: Account, provider: MockEmailProvider, engine: SyncEngine
     ) async -> [@Sendable () async -> Void] {
         switch kind {
         case .headerWalk:
@@ -377,27 +411,21 @@ struct FastSyncHeldWorkTests {
             for index in 0..<2 {
                 var runAccount = account
                 runAccount.id = "\(account.id)-run\(index)"
-                let queue = ProviderWorkQueue(provider: provider, maxConcurrency: 1)
-                await engine.register(accountId: runAccount.id, provider: provider, workQueue: queue)
-                let entered = HeldWorkLatch()
-                let slot = HeldWorkLatch()
-                let occupier = Task { await queue.execute(priority: .headerFetch) { await entered.open(); await slot.wait() } }
-                await entered.wait()
+                let (queue, free) = await occupiedSlot(runAccount, provider: provider, engine: engine)
                 let run = Task { await engine.runCatchUpRun(account: runAccount, run: .snapshot(deadline: nil)) }
-                #expect(await pollUntil { await engine.backfillOrCatchUpRunning }, "precondition: catch-up run \(index) started")
+                #expect(await pollUntil { await queue.waitingCount == 1 }, "precondition: catch-up run \(index) waits on its provider slot")
                 finishers.append {
-                    await slot.open()
+                    await free()
                     _ = await run.value
-                    await occupier.value
                 }
             }
             return finishers
         }
     }
 
-    @Test("foreground: two overlapping walks or catch-up runs on one engine keep the screen awake until the second ends; then the lock releases and the caption shows",
-          arguments: OverlappingKind.allCases, Remaining.allCases)
-    func overlappingRunsHoldUntilLastEnds(_ kind: OverlappingKind, _ remaining: Remaining) async throws {
+    @Test("foreground: two overlapping walks keep the screen awake until the second ends; two overlapping catch-up runs never do; once both end the lock is released and the caption shown",
+          arguments: Beside.allCases, Remaining.allCases)
+    func overlappingRunsOnlyWalksHold(_ kind: Beside, _ remaining: Remaining) async throws {
         try await Self.withAccount("held1098-overlap-\(kind.rawValue)-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, provider in
             try await Self.withPower(Self.openPower) {
                 try await DownloadGateHarness.withNetwork(expensive: true) {
@@ -405,22 +433,23 @@ struct FastSyncHeldWorkTests {
                     let engine = SyncEngine()
                     let finishers = await Self.latchTwo(kind, account: account, provider: provider, engine: engine)
                     guard finishers.count == 2 else { return }
+                    let holds = kind == .headerWalk
 
                     let both = await Self.decide([account], engine: engine)
-                    #expect(both.holdAwake, "two \(kind) runs are progressing: the screen stays awake")
-                    #expect(!both.waitingForWiFi)
+                    #expect(both.holdAwake == holds, "two \(kind) runs: the screen stays awake only for walks")
+                    #expect(both.waitingForWiFi == !holds)
 
                     await finishers[0]()
                     let one = await Self.decide([account], engine: engine)
-                    #expect(one.holdAwake, "the second \(kind) run is still progressing: the screen stays awake")
-                    #expect(!one.waitingForWiFi, "the second \(kind) run is still progressing: no Waiting for Wi-Fi")
+                    #expect(one.holdAwake == holds, "one \(kind) run left: the screen stays awake only for a walk")
+                    #expect(one.waitingForWiFi == !holds)
 
                     await finishers[1]()
                     SyncEngine.backfillWalkStartedHookForTesting.withLock { $0 = nil }
                     #expect(await Self.pollUntil {
                         let after = await Self.decide([account], engine: engine)
                         return !after.holdAwake && after.waitingForWiFi
-                    }, "both \(kind) runs ended, only held \(remaining) left: the lock releases and the caption shows")
+                    }, "both \(kind) runs ended, only held \(remaining) left: the lock is released and the caption shows")
                 }
             }
         }
@@ -571,9 +600,7 @@ struct FastSyncHeldWorkTests {
             backfillBodyIdle: phase == .walk,
             backfillBodyHeld: phase == .indexing && held,
             downloadsHeld: held,
-            activeAIIdle: true,
-            backfillAIIdle: true,
-            walkOrCatchUpRunning: false,
+            walkRunning: false,
             walkDoneByAccount: [id: phase == .indexing])
     }
 
@@ -616,6 +643,25 @@ struct FastSyncHeldWorkTests {
         FastSyncView.close(stopFastSync: { await stopped.open() }, dismiss: { _ = dismissed.set() })
         #expect(dismissed.isSet, "Done dismisses the sheet")
         await stopped.wait()
+    }
+
+    @Test("presentation: Done and Stop Fast Sync both close the sheet through close, the only dismissal path")
+    func doneAndStopGoThroughClose() throws {
+        let source = try UserLabelProviderBoundaryFenceTests.code(of:
+            UserLabelProviderBoundaryFenceTests.load("TabMail/Views/Settings/FastSyncView.swift"))
+        for anchor in ["Button(\"Done\")", "Button(role: .destructive)"] {
+            guard let start = source.range(of: anchor) else {
+                Issue.record("\(anchor) not found in FastSyncView")
+                continue
+            }
+            let action = source[start.upperBound...].prefix(200)
+            #expect(action.contains("Self.close("), "\(anchor) does not close through FastSyncView.close")
+        }
+        let dismissCalls = source.components(separatedBy: "dismiss()").count - 1
+        let throughClose = source.components(separatedBy: "dismiss: { dismiss() }").count - 1
+        // close's own body calls its parameter once; every other call is a handed-in closure.
+        #expect(throughClose == 2, "Done and Stop each hand dismiss to close")
+        #expect(dismissCalls == throughClose + 1, "a dismiss() outside close closes the sheet another way")
     }
 
     /// Runs `body` inside a real BGProcessing job whose Wi-Fi measurement is `onWiFi`.
