@@ -354,8 +354,19 @@ struct ChatUnreadLine: View {
 struct ChatSenderLine: View {
     let item: ChatThread.Item
 
-    @State private var showsOnlyList = false
+    @State private var showsOnlyList: Bool
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    /// `showsOnlyList`: the full "replied only to" list starts open.
+    init(item: ChatThread.Item, showsOnlyList: Bool = false) {
+        self.item = item
+        _showsOnlyList = State(initialValue: showsOnlyList)
+    }
+
+    /// The label's tap: opens the full "replied only to" list.
+    func openRecipientList() {
+        showsOnlyList = true
+    }
 
     /// The sender's name (group chats), or "You" on the user's own email, with a gray
     /// "(replied only to …)" when the email did not go to everyone. One line; tap the
@@ -396,7 +407,7 @@ struct ChatSenderLine: View {
     }
 
     private func onlyToLabel(_ only: ChatThread.OnlyTo) -> some View {
-        Button { showsOnlyList = true } label: {
+        Button { openRecipientList() } label: {
             Text("(replied only to \(only.label()))")
                 .font(.caption)
                 .foregroundStyle(Theme.textSecondary)

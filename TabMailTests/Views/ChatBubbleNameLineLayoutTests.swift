@@ -74,12 +74,67 @@ struct ChatBubbleNameLineLayoutTests {
         #expect(line.width <= Self.column + 0.5)
     }
 
+    @Test("The open recipient list shows every recipient, in the one-line and the stacked layout",
+          arguments: [DynamicTypeSize.large, .accessibility5])
+    func openListShowsEveryRecipient(size: DynamicTypeSize) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        let only = ChatThread.OnlyTo(includesYou: true, people: Self.manyPeople)
+        #expect(only.label().contains("+"), "control: the label shows only some of the names")
+        // The state the label's tap sets (`openRecipientList`; the fence below pins the tap to it).
+        let line = ChatSenderLine(item: Self.item(name: "Alex", onlyTo: only), showsOnlyList: true)
+        let controller = UIHostingController(rootView: line.environment(\.dynamicTypeSize, size))
+        let window = UIWindow(windowScene: try Self.scene())
+        window.frame = CGRect(x: 0, y: 0, width: Self.screenWidth, height: 800)
+        window.rootViewController = controller
+        window.isHidden = false
+        defer { window.isHidden = true }
+        try await HostedAccessibility.withAutomation {
+            let deadline = Date().addingTimeInterval(Self.presentWait)
+            while controller.presentedViewController == nil, Date() < deadline {
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            let list = try #require(controller.presentedViewController?.view, "the recipient list did not open")
+            var labels: [String] = []
+            while Date() < deadline {
+                labels = HostedAccessibility.labels(in: list)
+                if labels.contains("Alex replied only to") { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            #expect(labels.contains("Alex replied only to"), "the list's title: \(labels)")
+            for name in ["You"] + Self.manyPeople.map(\.name) {
+                #expect(labels.contains(name), "\(name) is missing from the list: \(labels)")
+            }
+        }
+    }
+
+    @Test("Source fence: the label's tap opens the recipient list through openRecipientList")
+    func labelTapOpensTheList() throws {
+        let source = try String(contentsOf: Self.bubbleSource, encoding: .utf8)
+        #expect(source.contains("Button { openRecipientList() } label: {"),
+                "the \"replied only to\" label must call openRecipientList()")
+        let method = try #require(source.range(of: "func openRecipientList() {"), "openRecipientList() is gone")
+        let body = source[method.upperBound...].prefix { $0 != "}" }
+        #expect(body.contains("showsOnlyList = true"), "openRecipientList() must open the list")
+    }
+
     // MARK: - Fixtures
 
     private static let onlyTo = ChatThread.OnlyTo(
         includesYou: true, people: [ChatThread.Person(address: "sam@example.com", name: "Sam")])
 
-    private static func item(name: String) -> ChatThread.Item {
+    private static let manyPeople = ["Sam", "Riley", "Jordan", "Casey"].map {
+        ChatThread.Person(address: "\($0.lowercased())@example.com", name: $0)
+    }
+    private static let presentWait: TimeInterval = 5
+    private static var bubbleSource: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // Views
+            .deletingLastPathComponent() // TabMailTests
+            .deletingLastPathComponent() // repo root
+            .appendingPathComponent("TabMail/Views/Chat/ChatBubbleView.swift")
+    }
+
+    private static func item(name: String, onlyTo: ChatThread.OnlyTo = ChatBubbleNameLineLayoutTests.onlyTo) -> ChatThread.Item {
         var header = MessageHeader(
             messageId: "1", subject: "Plans", from: name, fromAddress: "alex@example.com",
             to: "me@example.com", date: Date(), snippet: "snippet",
@@ -96,10 +151,15 @@ struct ChatBubbleNameLineLayoutTests {
         let window: UIWindow
     }
 
-    private static func host(_ view: some View, size: DynamicTypeSize) throws -> Host {
+    private static func scene() throws -> UIWindowScene {
         guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else {
             throw HostingFailure("no UIWindowScene is available")
         }
+        return scene
+    }
+
+    private static func host(_ view: some View, size: DynamicTypeSize) throws -> Host {
+        let scene = try scene()
         let controller = UIHostingController(rootView: view.environment(\.dynamicTypeSize, size))
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: screenWidth, height: 1600)
