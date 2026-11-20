@@ -12,8 +12,10 @@ import SwiftUI
 /// as the reply field's focus marker (`chatReplyFieldFocus`); it draws nothing (clear text in the
 /// background, so no layout change).
 ///
-/// The label reads `drags=<n> watching=<0|1> base=<0|1> seen=<n> move=<points> frozen=<0|1>`:
-/// `base` once the drag's start had the newest row's place, `seen` the row's reports since.
+/// The label reads `drags=<n> watching=<0|1> base=<0|1> at=<points> move=<points> held=<0|1>
+/// frozen=<0|1>`: `base` once the drag's start had the newest row's place, `at` the newest row's
+/// last reported top, `held` whether the freeze was still held halfway through the cooldown after
+/// the settle (`heldAtSettle`), `frozen` whether it is held now.
 enum ChatFieldDragMarker {
     static let identifier = "chatFieldDragMarker"
 
@@ -60,16 +62,18 @@ enum ChatFieldDragMarker {
     final class Probe {
         static let shared = Probe()
         static let isActive = ProcessInfo.processInfo.arguments.contains("--chat-swipe-ui-test")
-        /// How long after a let-go the move is still recorded: past the field's settle
-        /// (`ChatThreadView.fieldDragSettle`), which also ends the freeze.
-        static let watchAfterLetGo: Duration = .milliseconds(1500)
+        /// When after a let-go the freeze is sampled: inside its hold, halfway through the cooldown
+        /// that follows the field's settle.
+        static var sampleAfterLetGo: Duration { ChatThreadView.fieldDragSettle + ChatViewLayout.freezeCooldown / 2 }
+        /// How long after a let-go the move is still recorded: the settle and the cooldown, so the
+        /// freeze is released by the end, twice over for margin.
+        static var watchAfterLetGo: Duration { (ChatThreadView.fieldDragSettle + ChatViewLayout.freezeCooldown) * 2 }
 
         private(set) var drags = 0
         private(set) var watching = false
         private(set) var largestMove: CGFloat = 0
-        /// The newest row's reports while the last drag was watched: 0 means `largestMove`
-        /// measured nothing.
-        private(set) var seen = 0
+        /// Whether the freeze was held at `sampleAfterLetGo` after the last let-go.
+        private(set) var heldAtSettle = false
         private var newestMinY: CGFloat?
         private var baseline: CGFloat?
         private var watchToken: UUID?
@@ -77,7 +81,6 @@ enum ChatFieldDragMarker {
         func newestMoved(to minY: CGFloat) {
             newestMinY = minY
             guard watching, let baseline else { return }
-            seen += 1
             largestMove = max(largestMove, abs(minY - baseline))
         }
 
@@ -88,13 +91,16 @@ enum ChatFieldDragMarker {
                 watchToken = nil
                 baseline = newestMinY
                 largestMove = 0
-                seen = 0
+                heldAtSettle = false
                 return
             }
             let token = UUID()
             watchToken = token
             Task { @MainActor in
-                try? await Task.sleep(for: Self.watchAfterLetGo)
+                try? await Task.sleep(for: Self.sampleAfterLetGo)
+                guard self.watchToken == token else { return }
+                self.heldAtSettle = PreviewFreezeGate.shared.isFrozen
+                try? await Task.sleep(for: Self.watchAfterLetGo - Self.sampleAfterLetGo)
                 guard self.watchToken == token else { return }
                 self.watching = false
             }
@@ -102,7 +108,8 @@ enum ChatFieldDragMarker {
 
         var label: String {
             let move = String(format: "%.1f", largestMove)
-            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) seen=\(seen) move=\(move) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0)"
+            let at = String(format: "%.1f", newestMinY ?? -1)
+            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0)"
         }
     }
 
