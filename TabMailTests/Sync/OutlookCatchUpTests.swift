@@ -437,13 +437,21 @@ struct OutlookCatchUpTests {
     /// More messages to read again than the folder may keep (`changeRecheckLimit`)
     /// in a folder holding its own bookmark: this pass's additions are cut (#903),
     /// the bookmark is dropped and a listing armed (ADR-IOS-111 amendment
-    /// 2026-11-17, #751). The folder re-reads from a fresh baseline, so no cut
-    /// arrival is skipped, and the listing heals a state the delta never delivered.
-    @Test("A hidden flag change in a folder whose re-read list overflowed is corrected, and the folder re-reads from a fresh baseline")
+    /// 2026-11-17, #751), and a later bookmark the same pass carries is not
+    /// stored. The folder re-reads from a fresh baseline, which heals the read
+    /// state and flag the delta never delivered (`mergeChangeRecord`, as
+    /// `baselineCorrectsStoredFlags` pins). The armed listing then makes the
+    /// repair only it can: it removes a stored row deleted on the server, which
+    /// a baseline never removes (and it loads mail below the held range).
+    @Test("An overflowed re-read list drops the bookmark: the re-baseline heals a hidden flag change, and the armed listing removes a message deleted on the server")
     func recheckOverflowRebaselinesAndHealsAFlag() async throws {
         let c = Clock()
-        try await Self.withWorld(seeds: [Self.seed("f-1", in: Self.archive, at: c.daysAgo(5), isRead: true, isFlagged: true)]) { w, engine in
+        try await Self.withWorld(seeds: [
+            Self.seed("f-1", in: Self.archive, at: c.daysAgo(5), isRead: true, isFlagged: true),
+            Self.seed("d-1", in: Self.archive, at: c.daysAgo(6)),
+        ]) { w, engine in
             try w.insertRow("f-1", in: w.archive, date: c.daysAgo(5), isRead: true, isFlagged: true)
+            try w.insertRow("d-1", in: w.archive, date: c.daysAgo(6))
             try await w.baselineAll()
             let first = try #require(try await Self.untilListed(w, engine, w.archive).flatMap { _ in try Self.state(w, w.archive)?.lastCompletedAt })
             // A change the delta never delivered: the phone holds a stale state.
@@ -456,10 +464,13 @@ struct OutlookCatchUpTests {
             for id in unreadable { w.server.answerBatchItem(providerMessageId: id, status: 500, body: nil) }
             let full = FolderChangeState(tracking: true, recheck: unreadable).encoded
             let archiveId = w.folderId(w.archive)
+            // The pass carries a later bookmark, as a real read always does; it
+            // must not be stored over the drop.
+            let laterBookmark = try #require(try w.folder(w.archive).changeCursor)
             try await w.pool.write { db in
                 try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [full, archiveId])
                 _ = try SyncEngine.applyFolderChanges(
-                    FolderChanges(folderId: archiveId, status: .tracked, rereadLater: ["rr-new"]), db: db)
+                    FolderChanges(folderId: archiveId, status: .tracked, rereadLater: ["rr-new"], cursor: laterBookmark), db: db)
             }
             #expect(try w.cursor(w.archive) == nil, "the overflow dropped the Archive's bookmark, so it re-baselines")
             #expect(try Self.state(w, w.archive)?.lapsedSinceLastListing == true, "the overflow armed a listing")
@@ -467,11 +478,18 @@ struct OutlookCatchUpTests {
             #expect(!recheck.contains("rr-new"), "this pass's own addition was cut")
             #expect(Set(unreadable).isSubset(of: Set(recheck)), "every stored id remains")
 
+            // Deleted on the server after the overflow; kept off the forced-500 list.
+            w.server.deleteFromOtherClient(providerMessageId: "d-1")
             try await w.baselineAll()
+            let healed = try #require(try w.row("f-1", in: w.archive))
+            #expect(healed.isRead && healed.isFlagged, "the re-baseline healed the stale read state and flag")
+            #expect(try w.row("d-1", in: w.archive) != nil, "precondition: the re-baseline did not remove the server-side deletion")
+
             #expect(try await Self.untilListed(w, engine, w.archive, after: first) != nil, "no new listing after the overflow")
 
+            #expect(try w.row("d-1", in: w.archive) == nil, "the armed listing removed the message deleted on the server")
             let row = try #require(try w.row("f-1", in: w.archive))
-            #expect(row.isRead && row.isFlagged, "the stale read state and flag were not healed")
+            #expect(row.isRead && row.isFlagged, "the healed read state and flag stay healed")
         }
     }
 
