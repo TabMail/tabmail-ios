@@ -371,11 +371,13 @@ struct ChatAISummariesNoticeHostedTests {
     @MainActor
     final class HeldSend {
         var started = 0
+        var categories: [ReportCategory] = []
         private var answer: CheckedContinuation<Bool, Never>?
 
         var send: ReportConcernSend {
-            { [self] _, _, _, _ in
+            { [self] _, _, category, _ in
                 started += 1
+                categories.append(category)
                 return await withCheckedContinuation { answer = $0 }
             }
         }
@@ -392,15 +394,81 @@ struct ChatAISummariesNoticeHostedTests {
         var open = true
     }
 
+    /// Counts the sheet's `onFinish` calls.
+    @MainActor
+    final class Finishes {
+        var count = 0
+    }
+
     /// A caller kept on screen across two reports, as a long-press caller is.
     private struct RetainedHost: View {
         @Bindable var state: SheetState
         let send: ReportConcernSend
+        var finishes = Finishes()
 
         var body: some View {
             Color.clear.reportConcernSheet(isPresented: $state.open, contentType: .suggestedReply,
+                                           content: { "pressed reply" }, send: send,
+                                           onFinish: { [finishes] in finishes.count += 1 })
+        }
+    }
+
+    /// Whether an owner is in the hierarchy; removing it destroys its state.
+    @MainActor @Observable
+    final class Alive {
+        var on = true
+    }
+
+    /// A caller that owns its own presentation state, as the long-press wrapper does.
+    private struct OwnedHost: View {
+        let send: ReportConcernSend
+        @State private var open = true
+
+        var body: some View {
+            Color.clear.reportConcernSheet(isPresented: $open, contentType: .suggestedReply,
                                            content: { "pressed reply" }, send: send)
         }
+    }
+
+    /// Removes and recreates `owner` as `alive` changes, as a reload or navigation change does.
+    private struct OwnerSwitch<Owner: View>: View {
+        let alive: Alive
+        @ViewBuilder let owner: () -> Owner
+
+        var body: some View {
+            VStack {
+                if alive.on { owner() }
+                Spacer()
+            }
+        }
+    }
+
+    private static func sheetIsUp(_ controller: UIViewController) -> Bool {
+        presentedLabels(controller).contains(ReportConcernSheetText.storedForReview)
+    }
+
+    private static func isEnabled(_ label: String, in view: UIView) -> Bool {
+        element(label, in: view).map { !$0.accessibilityTraits.contains(.notEnabled) } ?? false
+    }
+
+    /// Presses Report on the sheet on top and waits for `held` to receive the send.
+    private static func pressReport(in controller: UIViewController, held: HeldSend, sends: Int = 1) async throws {
+        let sheetView = try #require(topPresented(controller)?.view, "control: the sheet appeared")
+        let submit = try #require(element("Report", in: sheetView))
+        #expect(submit.accessibilityActivate())
+        try await waitUntil { held.started == sends }
+        #expect(held.started == sends, "control: the send started")
+    }
+
+    /// Cancels the sheet on top and checks that nothing, no alert either, is presented after.
+    private static func cancelShowsNothing(in controller: UIViewController) async throws {
+        let sheetView = try #require(topPresented(controller)?.view, "control: a sheet to cancel")
+        let cancel = try #require(element("Cancel", in: sheetView))
+        #expect(cancel.accessibilityActivate())
+        try await waitUntil { controller.presentedViewController == nil }
+        try await Task.sleep(for: .seconds(1))
+        #expect(controller.presentedViewController == nil,
+                "a cancelled report shows nothing: \(String(describing: topPresented(controller)))")
     }
 
     @Test("While a report is sending the sheet stays; its answer shows once; a later cancelled report shows nothing")
@@ -717,6 +785,176 @@ struct ChatAISummariesNoticeHostedTests {
                 notice.willMove(toParent: nil)
                 notice.view.removeFromSuperview()
                 notice.removeFromParent()
+            }
+        }
+    }
+
+    // MARK: - An answer that outlives its sheet
+
+    @Test("A sheet closed by its caller while sending: an answer before the next report changes nothing")
+    func aClosedSheetsAnswerBeforeTheNextReport() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let held = HeldSend()
+        let state = SheetState()
+        let finishes = Finishes()
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(RetainedHost(state: state, send: held.send, finishes: finishes)) { controller in
+                try await Self.waitUntil { Self.sheetIsUp(controller) }
+                try await Self.pressReport(in: controller, held: held)
+                state.open = false  // the caller closes it while the report is sending
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                #expect(controller.presentedViewController == nil, "control: the sheet closed")
+                let finished = finishes.count
+                held.release(true)
+                try await Task.sleep(for: .seconds(1))
+                #expect(controller.presentedViewController == nil, "the old answer shows nothing")
+                #expect(finishes.count == finished, "and finishes nothing")
+                state.open = true
+                try await Self.waitUntil { Self.sheetIsUp(controller) }
+                let sheetView = try #require(Self.topPresented(controller)?.view, "control: the next sheet appeared")
+                #expect(Self.isEnabled("Report", in: sheetView) && Self.isEnabled("Cancel", in: sheetView),
+                        "the next report starts afresh")
+                try await Self.cancelShowsNothing(in: controller)
+                #expect(finishes.count == finished + 1, "only the next report's own finish")
+            }
+        }
+    }
+
+    @Test("A sheet closed by its caller while sending: an answer during the next report leaves it alone")
+    func aClosedSheetsAnswerDuringTheNextReport() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let held = HeldSend()
+        let state = SheetState()
+        let finishes = Finishes()
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(RetainedHost(state: state, send: held.send, finishes: finishes)) { controller in
+                try await Self.waitUntil { Self.sheetIsUp(controller) }
+                try await Self.pressReport(in: controller, held: held)
+                state.open = false
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                state.open = true
+                try await Self.waitUntil { Self.sheetIsUp(controller) }
+                #expect(Self.sheetIsUp(controller), "control: the next sheet appeared")
+                let finished = finishes.count
+                held.release(true)
+                try await Task.sleep(for: .seconds(1))
+                #expect(Self.sheetIsUp(controller) && state.open, "the old answer does not close the next sheet")
+                let sheetView = try #require(Self.topPresented(controller)?.view)
+                #expect(Self.isEnabled("Report", in: sheetView) && Self.isEnabled("Cancel", in: sheetView),
+                        "nor changes its state")
+                #expect(finishes.count == finished, "nor finishes it")
+                try await Self.cancelShowsNothing(in: controller)
+            }
+        }
+    }
+
+    @Test("An owner removed while sending, then recreated: its old answer reaches nothing, before or after")
+    func aRemovedOwnersAnswerReachesNothing() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        for answerFirst in [true, false] {
+            let held = HeldSend()
+            let alive = Alive()
+            try await HostedAccessibility.withAutomation {
+                try await Self.hosting(OwnerSwitch(alive: alive) { OwnedHost(send: held.send) }) { controller in
+                    try await Self.waitUntil { Self.sheetIsUp(controller) }
+                    try await Self.pressReport(in: controller, held: held)
+                    alive.on = false  // a reload removes the owner while the report is sending
+                    try await Self.waitUntil { controller.presentedViewController == nil }
+                    #expect(controller.presentedViewController == nil, "control: the owner and its sheet are gone")
+                    if answerFirst {
+                        held.release(true)
+                        try await Task.sleep(for: .seconds(1))
+                        #expect(controller.presentedViewController == nil, "answer first: nothing shows")
+                    }
+                    alive.on = true
+                    try await Self.waitUntil { Self.sheetIsUp(controller) }
+                    #expect(Self.sheetIsUp(controller), "control: the recreated owner's sheet appeared")
+                    if !answerFirst {
+                        held.release(true)
+                        try await Task.sleep(for: .seconds(1))
+                        #expect(Self.sheetIsUp(controller), "answer after: the new sheet stays")
+                    }
+                    let sheetView = try #require(Self.topPresented(controller)?.view)
+                    #expect(Self.isEnabled("Report", in: sheetView), "the new sheet starts afresh")
+                    try await Self.cancelShowsNothing(in: controller)
+                }
+            }
+        }
+    }
+
+    @Test("The notice's report: an answer from a removed notice never reaches the next notice's report")
+    func aRemovedNoticesAnswerReachesNothing() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let held = HeldSend()
+        let alive = Alive()
+        let firstOpen = Self.freshFirstOpen()
+        try await HostedAccessibility.withAutomation {
+            let notice = OwnerSwitch(alive: alive) {
+                AISummariesNoticeButton(landed: false, reportContent: { "Summary" }, firstOpen: firstOpen,
+                                        tipsAllowed: { true }, send: held.send)
+            }
+            try await Self.hosting(notice) { controller in
+                try await Self.openReport(in: controller)
+                try await Self.pressReport(in: controller, held: held)
+                alive.on = false  // the chat is removed while the report is sending
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                #expect(controller.presentedViewController == nil, "control: the notice and its report are gone")
+                alive.on = true
+                try await Self.waitUntil { Self.element(AISummariesNotice.accessibilityLabel, in: controller.view) != nil }
+                try await Self.openReport(in: controller)
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "control: the next report's sheet")
+                held.release(true)
+                try await Task.sleep(for: .seconds(1))
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
+                        "the old answer does not close the next report")
+                try await Self.cancelShowsNothing(in: controller)
+            }
+        }
+    }
+
+    @Test("A report sending in another category cannot be cancelled either")
+    func anotherCategoryCannotBeCancelledWhileSending() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let held = HeldSend()
+        let state = SheetState()
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(RetainedHost(state: state, send: held.send)) { controller in
+                try await Self.waitUntil { Self.sheetIsUp(controller) }
+                let sheetView = try #require(Self.topPresented(controller)?.view)
+                let inaccurate = try #require(Self.element(ReportCategory.inaccurate.displayName, in: sheetView),
+                                              "\(HostedAccessibility.labels(in: sheetView))")
+                #expect(inaccurate.accessibilityActivate())
+                try await Self.pressReport(in: controller, held: held)
+                #expect(held.categories == [.inaccurate], "control: sent as Inaccurate")
+                #expect(!Self.isEnabled("Cancel", in: sheetView), "Cancel is disabled while sending")
+                _ = Self.element("Cancel", in: sheetView)?.accessibilityActivate()
+                try await Task.sleep(for: .seconds(1))
+                #expect(Self.sheetIsUp(controller) && state.open, "the sheet stays")
+                held.release(false)
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                try await Task.sleep(for: .seconds(1))
+                #expect(controller.presentedViewController == nil, "a report not taken closes with no alert")
+            }
+        }
+    }
+
+    @Test("A swipe down while a report is sending does not close the sheet")
+    func aSwipeCannotCloseASendingSheet() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let held = HeldSend()
+        let state = SheetState()
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(RetainedHost(state: state, send: held.send)) { controller in
+                try await Self.waitUntil { Self.sheetIsUp(controller) }
+                let sheet = try #require(Self.topPresented(controller))
+                #expect(!sheet.isModalInPresentation, "control: before sending, a swipe may close it")
+                try await Self.pressReport(in: controller, held: held)
+                try await Self.waitUntil { sheet.isModalInPresentation }
+                #expect(sheet.isModalInPresentation, "while sending, a swipe cannot close it")
+                try await Task.sleep(for: .seconds(1))
+                #expect(Self.sheetIsUp(controller) && state.open, "the sheet stays")
+                held.release(false)
+                try await Self.waitUntil { controller.presentedViewController == nil }
             }
         }
     }
