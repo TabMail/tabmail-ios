@@ -49,7 +49,11 @@ struct RootView: View {
     /// App Store age assurance (`AppStoreAgeCheck`), asked at launch and on
     /// every foreground. `.minor` / `.unconfirmed` cover the whole app.
     @State private var appStoreAge: AppStoreAgeCheck.Status = .notChecked
-    @State private var isCheckingAppStoreAge = false
+    /// Orders the age check and the significant update notice (`AppStoreAgeCheck.Runner`).
+    @State private var appStoreAgeRunner = AppStoreAgeCheck.Runner()
+    /// Set when an earlier significant update notice for this version never
+    /// returned: the banner offers it instead of an unasked call (#1010).
+    @State private var significantUpdateBannerVersion: String?
     @Environment(\.requestAgeRange) private var requestAgeRange
     /// Set while signing out after a failed age check: the person has just
     /// read why, so the generic "Signed Out" alert is not shown on top.
@@ -175,6 +179,11 @@ struct RootView: View {
                                 await cancelDeletion()
                             }
                         }
+                        if let version = significantUpdateBannerVersion {
+                            SignificantUpdateBanner(version: version) {
+                                Task { await openSignificantUpdateNotice() }
+                            }
+                        }
                         MailNavigationView(initialSelection: nil)
                     }
                 }
@@ -264,6 +273,11 @@ struct RootView: View {
                 if let deletionDate = pendingDeletionDate {
                     DeletionBanner(deletionDate: deletionDate) {
                         await cancelDeletion()
+                    }
+                }
+                if let version = significantUpdateBannerVersion {
+                    SignificantUpdateBanner(version: version) {
+                        Task { await openSignificantUpdateNotice() }
                     }
                 }
                 MailNavigationView()
@@ -950,18 +964,34 @@ struct RootView: View {
     // MARK: - Age Checks
 
     /// Ask the App Store for the person's age (`AppStoreAgeCheck`). A failed
-    /// region lookup (`.notChecked`) keeps the previous answer.
+    /// region lookup (`.notChecked`) keeps the previous answer. A notice that
+    /// never returns does not hold up later age checks (`AppStoreAgeCheck.Runner`).
     private func checkAppStoreAge() async {
-        guard !ScreenshotMode.isActive, !isCheckingAppStoreAge else { return }
-        isCheckingAppStoreAge = true
-        defer { isCheckingAppStoreAge = false }
-        let status = await AppStoreAgeCheck.run(request: requestAgeRange)
-        let shown = AppStoreAgeCheck.shown(previous: appStoreAge, checked: status)
-        if shown != appStoreAge {
-            withAnimation { appStoreAge = shown }
+        guard !ScreenshotMode.isActive else { return }
+        await appStoreAgeRunner.pass(
+            check: { await AppStoreAgeCheck.run(request: requestAgeRange) },
+            apply: { status in
+                let shown = AppStoreAgeCheck.shown(previous: appStoreAge, checked: status)
+                if shown != appStoreAge {
+                    withAnimation { appStoreAge = shown }
+                }
+            },
+            hasStalledNotice: { AppStoreAgeCheck.SignificantUpdate.hasStalledNotice() },
+            acknowledge: { await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate()) }
+        )
+    }
+
+    /// The banner's tap: the person opens Apple's notice themselves.
+    private func openSignificantUpdateNotice() async {
+        await appStoreAgeRunner.acknowledgeOnly {
+            await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate(userAsked: true))
         }
-        if status == .allowed {
-            await AppStoreAgeCheck.acknowledgeSignificantUpdate()
+    }
+
+    private func applySignificantUpdate(_ outcome: AppStoreAgeCheck.SignificantUpdate.Outcome) {
+        switch outcome {
+        case .none: significantUpdateBannerVersion = nil
+        case .offerBanner(let version): significantUpdateBannerVersion = version
         }
     }
 
