@@ -44,8 +44,8 @@ struct KeyboardFocusTestScene: View {
     /// chip line shows and the rest is clipped away over the empty area below.
     static let clipViewportHeight: CGFloat = 60
     static let clipLeadSpace: CGFloat = 30
-    static let forkSessionId = "keyboard-focus-fixture-session"
-    static let forkUserText = "Keyboard focus fixture question"
+    nonisolated static let forkSessionId = "keyboard-focus-fixture-session"
+    nonisolated static let forkUserText = "Keyboard focus fixture question"
     /// The multi-line field's height in lines, so it is backed by a text view with room to tap in.
     static let multiLineLines = 3...6
     static let textEditorIdentifier = "keyboardFocusTextEditor"
