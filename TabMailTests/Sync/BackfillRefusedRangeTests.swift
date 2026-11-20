@@ -130,7 +130,6 @@ struct BackfillRefusedRangeTests {
         let server = FakeIMAPServer(capabilities: capabilities, mailboxes: mailboxes)
         server.setUidValidity(epoch, for: path)
         if let otherFolder { server.setUidValidity(epoch, for: otherFolder.path) }
-        server.honorSearchUIDSetCriterion()
         try server.start()
         let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try await pool.write { db in

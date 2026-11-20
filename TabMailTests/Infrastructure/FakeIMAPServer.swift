@@ -380,12 +380,14 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// window — infinite-scroll paging, whose cursor IS the window — opts in via
         /// `honorSearchDateCriteria()`.
         var honorsSearchDateCriteria = false
-        /// Whether UID SEARCH honours a `UID <set>` search key (RFC 3501 §6.4.4).
-        /// `false` by default for the same reason as `honorsSearchDateCriteria`:
-        /// this fake has always answered with the whole mailbox. A fixture whose
-        /// subject is the backfill UID walk's per-range SEARCH opts in via
-        /// `honorSearchUIDSetCriterion()`, or every range finds every message.
-        var honorsSearchUIDSetCriterion = false
+        /// Whether UID SEARCH honours a `UID <set>` search key (RFC 3501 §6.4.4):
+        /// a conforming server answers only UIDs in the set, where `n:*` with the
+        /// mailbox's highest UID below `n` still matches that highest UID (§6.4.8,
+        /// §9 `seq-number`). `true` by default (#1076): answering outside the set
+        /// made catch-up and change-read fixtures fail on a server no real client
+        /// meets. An ADVERSARIAL fixture that pins the client's refusal of an
+        /// over-broad answer opts out via `ignoreSearchUIDSetCriterion()`.
+        var honorsSearchUIDSetCriterion = true
         /// B1 (ADR-IOS-068/D4) — mailboxes whose APPEND is accepted, assigned a
         /// UID and acknowledged normally, but whose tagged OK omits the
         /// `APPENDUID` response code even though this server advertises UIDPLUS.
@@ -1309,13 +1311,12 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.honorsSearchDateCriteria = true }
     }
 
-    /// Test seam: make UID SEARCH answer only with the messages whose UID is in
-    /// the search's `UID <set>` key, instead of the whole mailbox. Required by a
-    /// fixture that walks a folder by UID range (the backfill UID walk), where a
-    /// server that ignores the range lets every range fetch every message. Off
-    /// by default; see `State.honorsSearchUIDSetCriterion`.
-    func honorSearchUIDSetCriterion() {
-        withState { $0.honorsSearchUIDSetCriterion = true }
+    /// Test seam (adversarial): make UID SEARCH ignore the search's `UID <set>`
+    /// key and answer with the whole mailbox, as a non-conforming server would.
+    /// Only for fixtures that pin the client's refusal of an over-broad answer;
+    /// see `State.honorsSearchUIDSetCriterion`.
+    func ignoreSearchUIDSetCriterion() {
+        withState { $0.honorsSearchUIDSetCriterion = false }
     }
 
     /// RFC 3501 §6.4.4 at DAY granularity, which is all the wire form carries
@@ -2963,46 +2964,46 @@ final class FakeIMAPServer: @unchecked Sendable {
             // RFC 4731: a client that asked RETURN (…) of a server advertising
             // ESEARCH gets an ESEARCH answer, never an untagged SEARCH.
             let esearch = capabilities.contains("ESEARCH") && subargs.uppercased().contains("RETURN")
-            // Honor HEADER "Message-ID" "<...>" criterion when present; otherwise
-            // return all UIDs (legacy behavior). Minimal filter to support
-            // IMAPProvider's remaining exact-identity probe paths.
+            // Every supported search key narrows ONE answer (RFC 3501 §6.4.4: keys
+            // are ANDed): a HEADER "Message-ID" "<...>" key, the SINCE / BEFORE
+            // date keys when the fixture opted in, and every `UID <set>` key,
+            // each intersecting the others (#1076).
             let upper = subargs.uppercased()
+            var messageIDQuery: String?
+            let bracketSet = CharacterSet(charactersIn: "<>")
             if let range = upper.range(of: "HEADER \"MESSAGE-ID\"") {
-                // Next quoted string after the criterion is the Message-ID pattern.
+                // Next quoted string after the criterion is the Message-ID pattern,
+                // compared without angle brackets on either side.
                 let after = subargs[range.upperBound...]
-                let quoted = Self.firstQuoted(String(after)) ?? ""
-                // Strip any angle brackets on both sides. `messageID` comes
-                // from the raw header value and typically includes "<...>".
-                let bracketSet = CharacterSet(charactersIn: "<>")
-                let bareQuery = quoted.trimmingCharacters(in: bracketSet)
-                let matched = withState { $0.messagesByMailbox[mailbox] ?? [] }
-                    .filter {
-                        $0.messageID.trimmingCharacters(in: bracketSet).contains(bareQuery)
-                    }
-                    .map { String($0.uid) }
-                return Self.uidSearchReply(tag: tag, uids: matched, esearch: esearch, request: subargs)
+                messageIDQuery = (Self.firstQuoted(String(after)) ?? "").trimmingCharacters(in: bracketSet)
             }
-            if let answer = withState({ $0.searchAnswerAllByMailbox[mailbox] }) {
+            // The answer-wide seams below model a mailbox's whole-scan answer;
+            // the exact-identity probe has never gone through them.
+            if messageIDQuery == nil, let answer = withState({ $0.searchAnswerAllByMailbox[mailbox] }) {
                 let data = answer.isEmpty ? "" : " ALL \(answer)"
                 return "* ESEARCH (TAG \"\(tag)\") UID\(data)\r\n\(tag) OK UID SEARCH completed\r\n"
             }
             let all = withState { $0.messagesByMailbox[mailbox] ?? [] }
-            passHeldGate(Self.searchSnapshotGateKey(mailbox))
+            if messageIDQuery == nil { passHeldGate(Self.searchSnapshotGateKey(mailbox)) }
             let honorsDates = withState { $0.honorsSearchDateCriteria }
-            let dateFiltered = honorsDates
-                ? all.filter { Self.matchesSearchDateCriteria($0, args: subargs) }
-                : all
-            // The `UID <set>` key, when the fixture opted in: the token after a
-            // standalone `UID` in the search arguments.
+            // Every `UID <set>` key, unless the fixture opted out: the token after
+            // each standalone `UID` in the search arguments, resolved against the
+            // SNAPSHOT `all` (not the live mailbox, which a held gate may have
+            // changed since), and intersected with one another.
             let tokens = subargs.split(separator: " ").map(String.init)
-            let uidSetKey = withState { $0.honorsSearchUIDSetCriterion }
-                ? tokens.firstIndex { $0.uppercased() == "UID" }
-                    .flatMap { $0 + 1 < tokens.count ? tokens[$0 + 1] : nil }
-                : nil
-            let uidSet = uidSetKey.map { Set(parseUIDSet($0, in: mailbox)) }
-            let omitted = withState { $0.searchOmittedUIDsByMailbox[mailbox] ?? [] }
-            let uids = dateFiltered
-                .filter { uidSet?.contains($0.uid) ?? true }
+            let snapshotUIDs = all.map(\.uid)
+            let uidSets: [Set<Int>] = withState { $0.honorsSearchUIDSetCriterion }
+                ? tokens.indices
+                    .filter { tokens[$0].uppercased() == "UID" && $0 + 1 < tokens.count }
+                    .map { Set(Self.resolveUIDSet(tokens[$0 + 1], againstMailboxUIDs: snapshotUIDs)) }
+                : []
+            let omitted: Set<Int> = messageIDQuery == nil ? withState { $0.searchOmittedUIDsByMailbox[mailbox] ?? [] } : []
+            let uids = all
+                .filter { message in
+                    messageIDQuery.map { message.messageID.trimmingCharacters(in: bracketSet).contains($0) } ?? true
+                }
+                .filter { !honorsDates || Self.matchesSearchDateCriteria($0, args: subargs) }
+                .filter { message in uidSets.allSatisfy { $0.contains(message.uid) } }
                 .filter { !omitted.contains($0.uid) }
                 .map { String($0.uid) }
             return Self.uidSearchReply(tag: tag, uids: uids, esearch: esearch, request: subargs)

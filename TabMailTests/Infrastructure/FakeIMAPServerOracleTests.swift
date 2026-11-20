@@ -1197,6 +1197,121 @@ struct FakeIMAPServerOracleTests {
         }
         #expect(stray.isEmpty, "a stopped server's late answer reached a socket opened after stop(): \(stray)")
     }
+
+    /// RFC 3501 §6.4.4 / §6.4.8 / §9: a `UID SEARCH UID <set>` answers only UIDs
+    /// in the set, and in `n:*` the `*` is the mailbox's highest UID, so with that
+    /// UID below `n` the range still matches the last message (#1076). Pins the
+    /// default fake, with no opt-in: RED while it answered the whole mailbox.
+    @Test("UID SEARCH answers only UIDs inside the requested UID set, n:* included")
+    func uidSearchAnswersWithinTheRequestedSet() throws {
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [1, 2, 3, 7, 8].map { Self.message(uid: $0, id: "search-set-\($0)@example.com") },
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "s1", "LOGIN \(server.username) \(server.password)")
+        _ = try client.command(tag: "s2", "SELECT INBOX")
+
+        // Each case asserts the exact untagged answer (UIDs in mailbox order)
+        // and the tagged OK, so an empty answer is a successful empty SEARCH,
+        // not a failed or unparsed one.
+        let cases: [(criteria: String, expected: [Int])] = [
+            ("UID 2:7", [2, 3, 7]),
+            ("UID 4:6", []),
+            ("UID 1,8", [1, 8]),
+            ("UID 3:*", [3, 7, 8]),
+            // `*` is 8 here, so 20:* is 8:20 and matches the last message only.
+            ("UID 20:*", [8]),
+            // Keys are ANDed (§6.4.4): a header match outside the UID set is no match.
+            ("UID 2:7 HEADER \"Message-ID\" \"<search-set-1@example.com>\"", []),
+            ("UID 1:2 HEADER \"Message-ID\" \"<search-set-1@example.com>\"", [1]),
+            // Two UID keys intersect: 7 is the only UID in both, unlike either one alone.
+            ("UID 2:7 UID 7:8", [7]),
+            // Disjoint UID keys match nothing.
+            ("UID 1:2 UID 7:8", []),
+        ]
+        for (index, item) in cases.enumerated() {
+            let tag = "q\(index)"
+            let reply = try client.command(tag: tag, "UID SEARCH \(item.criteria)")
+            let lines = reply.split(separator: "\r\n", omittingEmptySubsequences: true).map(String.init)
+            let untagged = (["* SEARCH"] + item.expected.map(String.init)).joined(separator: " ")
+            #expect(lines.contains(untagged), "UID SEARCH \(item.criteria) answered \(lines)")
+            #expect(lines.filter { $0.hasPrefix("* SEARCH") }.count == 1, "one SEARCH answer: \(lines)")
+            #expect(lines.contains("\(tag) OK UID SEARCH completed"), "tagged OK for \(item.criteria): \(lines)")
+        }
+        _ = try client.command(tag: "s9", "LOGOUT")
+    }
+
+    /// RFC 3501 §6.4.4: search keys are ANDed, so with date criteria honoured a
+    /// `HEADER "Message-ID"` probe whose UID key matches a message still answers
+    /// nothing when its `SINCE` / `BEFORE` excludes that message (#1076). Pins
+    /// the conjunction of the Message-ID probe with the date keys, which the
+    /// sibling oracle above never enables.
+    @Test("UID SEARCH ANDs a Message-ID probe with SINCE / BEFORE when dates are honoured")
+    func uidSearchANDsMessageIDProbeWithDateCriteria() throws {
+        // Dates relative to today, at UTC noon so the day the fake derives from
+        // INTERNALDATE is unambiguous.
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let todayNoon = utc.date(byAdding: .hour, value: 12, to: utc.startOfDay(for: Date()))!
+        func daysAgo(_ days: Int) -> Date { utc.date(byAdding: .day, value: -days, to: todayNoon)! }
+
+        let header = DateFormatter()
+        header.locale = Locale(identifier: "en_US_POSIX")
+        header.timeZone = TimeZone(identifier: "UTC")
+        header.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        let criterion = DateFormatter()
+        criterion.locale = Locale(identifier: "en_US_POSIX")
+        criterion.timeZone = TimeZone(identifier: "UTC")
+        criterion.dateFormat = "d-MMM-yyyy"
+        func day(_ days: Int) -> String { criterion.string(from: daysAgo(days)) }
+
+        // UID 1 is 20 days old, UID 2 is 10 days old, UID 3 is 2 days old.
+        let ages = [1: 20, 2: 10, 3: 2]
+        let messages = ages.keys.sorted().map { uid in
+            let text = Self.rfc822(messageId: "search-date-\(uid)@example.com")
+                .replacingOccurrences(of: "Date: Thu, 01 Jan 2026 00:00:00 +0000",
+                                      with: "Date: \(header.string(from: daysAgo(ages[uid]!)))")
+            return FakeIMAPServer.makeMessage(uid: uid, rfc822Text: text)
+        }
+        let server = FakeIMAPServer(mailboxes: ["INBOX": messages])
+        server.honorSearchDateCriteria()
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "s1", "LOGIN \(server.username) \(server.password)")
+        _ = try client.command(tag: "s2", "SELECT INBOX")
+
+        let probe = "HEADER \"Message-ID\" \"<search-date-2@example.com>\""
+        let cases: [(criteria: String, expected: [Int])] = [
+            // UID and Message-ID match UID 2, but SINCE is after its date.
+            ("UID 1:3 \(probe) SINCE \(day(5))", []),
+            // UID and Message-ID match UID 2, but BEFORE is before its date.
+            ("UID 1:3 \(probe) BEFORE \(day(15))", []),
+            // Both date keys present, window excludes UID 2 (it is older than 5 days).
+            ("UID 2 \(probe) SINCE \(day(5)) BEFORE \(day(1))", []),
+            // Control: every key matches UID 2.
+            ("UID 1:3 \(probe) SINCE \(day(15)) BEFORE \(day(5))", [2]),
+            ("UID 2 \(probe) SINCE \(day(12))", [2]),
+        ]
+        for (index, item) in cases.enumerated() {
+            let tag = "d\(index)"
+            let reply = try client.command(tag: tag, "UID SEARCH \(item.criteria)")
+            let lines = reply.split(separator: "\r\n", omittingEmptySubsequences: true).map(String.init)
+            let untagged = (["* SEARCH"] + item.expected.map(String.init)).joined(separator: " ")
+            #expect(lines.contains(untagged), "UID SEARCH \(item.criteria) answered \(lines)")
+            #expect(lines.filter { $0.hasPrefix("* SEARCH") }.count == 1, "one SEARCH answer: \(lines)")
+            #expect(lines.contains("\(tag) OK UID SEARCH completed"), "tagged OK for \(item.criteria): \(lines)")
+        }
+        _ = try client.command(tag: "s9", "LOGOUT")
+    }
 }
 
 /// A minimal raw-socket IMAP client: enough to log in, select, and issue a

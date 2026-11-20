@@ -123,8 +123,6 @@ struct BackfillUIDWalkRaceTests {
             capabilities: capabilities,
             mailboxes: ["INBOX": [], path: serverUIDs.map(message(uid:))])
         server.setUidValidity(epoch, for: path)
-        // Each range's SEARCH finds only the UIDs in that range, as on a real server.
-        server.honorSearchUIDSetCriterion()
         try server.start()
         let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try await pool.write { db in

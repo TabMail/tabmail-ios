@@ -98,7 +98,6 @@ struct ReplyParentLoadedAfterReplyTests {
             """)
         let server = FakeIMAPServer(mailboxes: ["INBOX": [message], "Sent": []])
         server.setUidValidity(epoch, for: "INBOX")
-        server.honorSearchUIDSetCriterion()
         try server.start()
         defer { server.stop() }
         let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
