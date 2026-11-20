@@ -782,6 +782,61 @@ struct ChatReplyRecoveryTests {
         }
     }
 
+    /// The sheet's "Re-send message" and "Rewind and re-send" send with no field and leave the
+    /// field's sent words in place; when that request is cut off, its recovery carries no field key.
+    @Test("The field's unchanged sent words offer Send, not Retry, when the cut-off request is not the field's own",
+          arguments: Failure.allCases)
+    func otherRequestsCutOffLeavesTheFieldWordsOnSend(failure: Failure) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let backend = Backend(failure: failure, asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await withChat(backend, tag: "other-cutoff-\(failure.rawValue)") { chat in
+                let sent = "Tell them Friday works"
+                let key = ChatFieldWords.key(for: chat.email)
+                #expect(Self.type(sent, in: chat.view), "control: the field takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 1, "control: the request went out once and failed")
+                #expect(ChatFieldWords.shared.fill(for: key).words == sent, "control: the sent words wait in the field")
+
+                // The recovery a sheet re-send records when it is cut off: no field key.
+                let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: chat.email))
+                session.lastFailedSend = nil
+                if session.pendingResume == nil {
+                    session.pendingResume = .init(
+                        request: CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil), fieldReply: nil)
+                }
+                session.pendingResume?.fieldWordsKey = nil
+                try await Self.waitUntil {
+                    let ids = HostedAccessibility.identifiers(in: chat.view)
+                    return ids.contains("chatSend") && !ids.contains("chatRetry")
+                }
+                let other = HostedAccessibility.identifiers(in: chat.view)
+                #expect(other.contains("chatSend") && !other.contains("chatRetry"),
+                        "another request's cut-off leaves the field's words on Send: \(other)")
+
+                // Control: the same recovery as the field's own request offers Retry.
+                session.pendingResume?.fieldWordsKey = key
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
+                #expect(HostedAccessibility.identifiers(in: chat.view).contains("chatRetry"),
+                        "control: the field's own cut-off offers Retry: \(HostedAccessibility.identifiers(in: chat.view))")
+
+                // Back to another request's cut-off: Send sends the words anew.
+                session.pendingResume?.fieldWordsKey = nil
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatSend") }
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 2, "Send makes a new request")
+                try await Task.sleep(for: .milliseconds(300))
+                let turns = try await Self.userTurns(in: chat)
+                #expect(turns == 2, "Send adds a new user turn: \(turns)")
+            }
+        }
+    }
+
     @Test("Edited words in a cut-off request's field turn Retry back into Send, which sends the new words",
           arguments: [false, true])
     func editedFieldWordsSendAnew(sameText: Bool) async throws {
@@ -845,6 +900,12 @@ struct ChatReplyRecoveryTests {
                         "control: the pill's Send takes a tap: \(HostedAccessibility.identifiers(in: view))")
                 try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
                 #expect(backend.bodies.count == 1, "control: the request went out once and was cut off")
+
+                // The cut-off left a recovery: the empty field offers Retry.
+                #expect(Self.type("", in: view), "control: the pill's field is empty")
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: view).contains("chatRetry") }
+                #expect(HostedAccessibility.identifiers(in: view).contains("chatRetry"),
+                        "control: the cut-off can be resumed: \(HostedAccessibility.identifiers(in: view))")
 
                 #expect(Self.type("And next week", in: view), "control: the pill takes new words")
                 try await Task.sleep(for: .milliseconds(500))

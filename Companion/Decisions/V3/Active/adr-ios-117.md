@@ -83,7 +83,7 @@ chat history the same key already keeps, and goes with that thread's AI data and
   its words as it strands its chat; the purge deletes them once the old key has no email.
 - Words typed in a field whose send is still in flight are not kept until the send completes; a send
   that then fails keeps its own retry in the chat.
-- A cut-off field request whose sent words are still in the field, unedited (`ChatFieldFill.holdsSentWords`), shows the field's Retry (`chatRetry`) in Send's place; it resumes the request with no new user turn. Any edit turns it back into Send, which sends the new words.
+- A cut-off field request whose sent words are still in the field, unedited (`ChatFieldFill.holdsSentWords`), shows the field's Retry (`chatRetry`) in Send's place only when the cut-off request is the field's own request (its recovery carries the field's words key); it resumes that request with no new user turn. Another request's cut-off (a sheet re-send) leaves the held words on Send. Any edit turns it back into Send, which sends the new words.
 - A reply compose card that opened for the field's send and closed unsent (2026-11-20 ruling, review r7
   N1): the agent's answer, which comes once the card is done, empties nothing and hands the words back
   to the user (`ChatFieldFill.apply(.answered)` clears `atSend`, `holdsSentWords` and `composing`), so
