@@ -97,6 +97,74 @@ struct ComposeEditMarkerTests {
             _ = try await Self.edit("Response: Done.\nSubject: Re: Offsite\nBody: \(Self.body)")
         }
     }
+
+    /// The context a new email's or a forward's compose edit sends (`EmailComposeTool.runComposeEdit`
+    /// builds these modes; reply has its own case above).
+    static func context(mode: String) -> ComposeEditContext {
+        ComposeEditContext(
+            recipients: ["pat@example.com"], toRecipients: ["pat@example.com"], ccRecipients: [], bccRecipients: [],
+            toDisplayNames: [:], ccDisplayNames: [:], bccDisplayNames: [:],
+            senderName: "Alex", senderEmail: "alex@example.com", mode: mode,
+            compositionPrompt: "", kbText: "",
+            relatedDate: mode == "edit_forward" ? "yesterday" : "",
+            relatedSubject: mode == "edit_forward" ? "Offsite" : "",
+            relatedFrom: mode == "edit_forward" ? "Sam <sam@example.com>" : "",
+            relatedTo: mode == "edit_forward" ? "alex@example.com" : "", relatedCc: "",
+            bodyText: mode == "edit_forward" ? "Are you in?" : "")
+    }
+
+    /// Every `"mode"` value anywhere in a request's JSON.
+    static func modes(in value: Any) -> [String] {
+        if let object = value as? [String: Any] {
+            let own = (object["mode"] as? String).map { [$0] } ?? []
+            return own + object.values.flatMap { modes(in: $0) }
+        }
+        if let array = value as? [Any] { return array.flatMap { modes(in: $0) } }
+        return []
+    }
+
+    /// THE SYSTEM PROPERTY: the shared compose editor reads the 2.0.0 JSON for every mode its callers
+    /// send (a new email, a forward), not only a reply; a malformed edit fails and puts no field in a
+    /// draft. Through the real `performInlineEdit` request path against a fake backend.
+    @Test("A new email's and a forward's compose edit read the backend's JSON; a malformed one fails",
+          arguments: ["edit_new", "edit_forward"], [true, false])
+    func everyModeReadsTheJSON(mode: String, wellFormed: Bool) async throws {
+        let saved = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
+        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+        defer { AIService.optOutStore.set(saved, forKey: AIService.optOutAllAIKey) }
+        let version = OSAllocatedUnfairLock<String?>(initialState: nil)
+        let answer = wellFormed
+            ? ComposeEditJSON.make(response: "Wrote it.", subject: "Offsite plans", body: Self.body,
+                                   textMessage: "I will attend.", changeCommand: "")
+            : ComposeEditJSON.make(response: "Wrote it.", subject: "Offsite plans", body: Self.body,
+                                   textMessage: "I will attend.", changeCommand: "", drop: "body")
+        let http = Self.backend(answer, version: version)
+        defer { http.close() }
+        let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+        let edit: () async throws -> InlineEditResult = {
+            try await service.performInlineEdit(
+                currentSubject: "", currentBody: "", context: Self.context(mode: mode),
+                instruction: "tell Pat I will attend", chatHistory: [])
+        }
+        if wellFormed {
+            let result = try await edit()
+            #expect(result.response == "Wrote it.")
+            #expect(result.subject == "Offsite plans")
+            #expect(result.body == Self.body, "the JSON's body becomes the draft's body")
+            #expect(result.textMessage == "I will attend.")
+            #expect(result.changeCommand == nil, "an empty command is no command")
+            #expect(result.toDelta == nil && result.ccDelta == nil && result.bccDelta == nil)
+        } else {
+            await #expect(throws: InlineEditFailure.self, "a malformed edit fails; no draft field changes") {
+                _ = try await edit()
+            }
+        }
+        // The request went out once, as this mode (positive control that the mode reached the wire).
+        let calls = http.recordedCalls()
+        #expect(calls.count == 1)
+        let sent = calls.first?.body.flatMap { try? JSONSerialization.jsonObject(with: $0) }
+        #expect(sent.map { Self.modes(in: $0) }?.contains(mode) == true, "the request carries mode \(mode)")
+    }
 }
 
 /// A request from the chat's reply field while its AI Suggestion shows (ADR-IOS-114).

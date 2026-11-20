@@ -128,3 +128,84 @@ struct EmailForwardToolTests {
         #expect(result.contains("request parameter is required"))
     }
 }
+
+/// A forward the agent asks for with a compose request, on an IMAP email whose folder's numbering
+/// is being reset (ADR-IOS-114, the one identity-checked body read).
+///
+/// THE SYSTEM PROPERTY pinned here: a forward whose email is no longer provably the row at its
+/// address (a UIDVALIDITY reset is pending, so a resync can seat another email there) never sends
+/// that row's body to the model and never opens a forward card; it reports that the email changed.
+/// The same request on an email that still holds opens the forward card for it.
+///
+/// The model's call is short-circuited by the AI opt-out (no network): the property is whether the
+/// request gets past the body read at all, seen as the forward card the request then opens.
+@Suite("A forward's body read refuses an email that is no longer itself", .serialized, .processGlobalState)
+@MainActor
+struct EmailForwardToolBodyReadTests {
+
+    @Test("A pending reset refuses the forward with no card; an unchanged email opens its forward card",
+          arguments: [true, false])
+    func resetRefusesTheForward(resetPending: Bool) async throws {
+        let store = AIService.optOutStore
+        let previous = store.object(forKey: AIService.optOutAllAIKey)
+        defer {
+            if let previous {
+                store.set(previous, forKey: AIService.optOutAllAIKey)
+            } else {
+                store.removeObject(forKey: AIService.optOutAllAIKey)
+            }
+        }
+        AIService.writeOptOutFlag(true)
+
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, provider: .imap)
+        try TestDatabase.insertFolder(db)
+        let inserted = try TestDatabase.insertMessageHeader(
+            db, messageId: "7", subject: "Offsite", rfc822MessageId: "<offsite@example.com>")
+        let id = inserted.id, folderId = inserted.folderId
+        try await db.write { db in
+            try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 111 WHERE id = ?", arguments: [folderId])
+            try db.execute(sql: "UPDATE messageHeader SET observedUidValidity = 111 WHERE id = ?", arguments: [id])
+            try MessageBody(contentKey: ContentKey(rawValue: id), htmlContent: "<p>Are you in for the offsite?</p>").insert(db)
+            if resetPending {
+                // The reset reaction's first step: the folder is marked, the old row still sits there.
+                try db.execute(sql: "UPDATE folder SET uidValidityResetPendingAt = ? WHERE id = ?",
+                               arguments: [Date(), folderId])
+            }
+        }
+        let header = try #require(try await db.read { try MessageHeader.fetchOne($0, key: id) })
+        let translator = MockChatIdTranslator()
+        await translator.seed(header.id, as: 1)
+        let router = AgentToolRouter()
+        let tool = EmailForwardTool(context: ToolContext(db: db, translator: translator, router: router))
+        let arguments: [String: JSONValue] = [
+            "unique_id": .int(1),
+            "to": .array([.string("pat@example.com")]),
+            "request": .string("Tell Pat about the offsite"),
+        ]
+
+        // Bounded: a forward that wrongly opens its card is cancelled, never awaited forever.
+        let task = Task { @MainActor in try await tool.execute(arguments: arguments) }
+        var card: AgentToolRouter.ComposeRequest?
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, card == nil {
+            card = router.pendingCompose
+            if card == nil { try await Task.sleep(for: .milliseconds(10)) }
+        }
+        card?.onOutcome(.cancelled)
+        let output = try await task.value
+
+        if resetPending {
+            #expect(card == nil, "no forward card opens for an email that may no longer be itself")
+            #expect(router.composeQueueDepth == 0, "nothing is queued either")
+            #expect(output.hasPrefix("Failed: ") && output.contains("email changed"), "the agent is told: \(output)")
+        } else {
+            // Control: the same request on an unchanged email gets past the read and opens its card.
+            let opened = try #require(card, "control: the forward card opens")
+            #expect(opened.mode == .forward)
+            #expect(opened.replyTo?.id == header.id && opened.replyTo?.rfc822MessageId == "<offsite@example.com>")
+            #expect(opened.to == ["pat@example.com"])
+            #expect(!output.contains("email changed"))
+        }
+    }
+}

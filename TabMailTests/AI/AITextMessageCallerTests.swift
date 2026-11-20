@@ -623,6 +623,40 @@ struct AITextMessageCallerTests {
         }
     }
 
+    /// THE SYSTEM PROPERTY: the stored AI Suggestion is the email's own account's Reply All draft.
+    /// A card whose From was changed to another account recomputes a reply for that card alone: the
+    /// card gets it, and the stored suggestion (header and cache) stays as it was. Control: the same
+    /// recompute from the email's own account stores it.
+    @Test("A recompute from another sender stays in its card; from the email's own account it is stored",
+          arguments: [true, false])
+    func composeRecomputeFromAnotherSender(otherSender: Bool) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(replyTextMessage: "Earlier text")
+            let other = try FolderEpochTestFixture.makeAccount(id: "acc2", provider: .imap, pool: fixture.pool)
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+            let before = try #require(try fixture.row())
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: fixture.header, account: otherSender ? other : fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            #expect(backend.prompts == ["system_prompt_compose"], "the reply is asked for once")
+            #expect(suggestion?.body == Self.replyBody, "the card gets the recomputed reply")
+            let row = try #require(try fixture.row())
+            if otherSender {
+                #expect(row.suggestion == before.suggestion, "another sender's reply is never stored as the email's suggestion")
+                #expect(row.cachedReply == before.cachedReply && row.replyTextMessage == "Earlier text")
+                #expect(try fixture.cache()?.cachedReply == nil, "nor in the cache")
+            } else {
+                #expect(row.cachedReply == Self.replyBody)
+                #expect(row.replyTextMessage == Self.replyText)
+                #expect(row.replyChangeCommand == Self.replyCommand)
+                #expect(try fixture.cache()?.cachedReply == Self.replyBody, "control: stored in the cache too")
+            }
+        }
+    }
+
     /// The bug this guards: a card's Recompute, then Discard while it waits, then a reopened card's
     /// Recompute that finishes first. The first card's late write landed last, and the AI
     /// Suggestion showed the superseded reply.
