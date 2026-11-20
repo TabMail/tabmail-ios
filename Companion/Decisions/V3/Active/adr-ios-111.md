@@ -1107,6 +1107,13 @@ unchanged (RFC 7162).
    sync lists the folder and removes a gone message; a live one stays and the folder is tracked again after
    its next baseline. The cost is one listing per such merge; tabmail-ios#1089 (P4) tracks the per-UID
    record of proven removals that would avoid it. No new persisted state.
+   **Amended 2026-11-20 (review): the newly covered arrival range is proven too.** A staged UID equal to the
+   stored UIDNEXT is not claimed by the stored bookmark, so a merge between the read's lookup and its apply
+   kept tracking, and the new bookmark then covered a row nothing checked (a permanent ghost when the server
+   had expunged it). The CONDSTORE read now also reports `FolderChanges.arrivalRowsProof` for [N0, N1 of the
+   bookmark it writes): the arrivals the server listed plus the moved-in rows its own lookup found. The apply
+   checks it as it checks `heldRowsProof`; any other held row there keeps the stored bookmark, so the next
+   read finds the row moved-in and checks it. The staged row is kept; no new persisted state.
 7. **The turn.** A standalone `syncFolderMessages` lists inside `oneSyncAtATime`, which is re-entrant for the
    task holding it (`@TaskLocal heldSyncTurn`).
 8. The catch-up's MODSEQ freshness for a folder with a same-epoch bookmark is the bookmark's MODSEQ alone.
@@ -1118,4 +1125,4 @@ before); a progress-only bookmark write fails a concurrent crawl range or load-o
 
 Keywords: IMAPChangeMode, CHANGEDSINCE, flagsChangedSince, messageCount, provenFrom, pendingCheck,
 IMAPRemovalCheckProgress, imapChangeRemovalCheckWindow, numericIdsBelow, IMAPChangeCountMismatch, mustList,
-heldRowsProof, fromServerInsertAllowed, ChangeInsertPremise, stagedRowProvenGone, heldSyncTurn, #755.
+heldRowsProof, arrivalRowsProof, fromServerInsertAllowed, ChangeInsertPremise, stagedRowProvenGone, heldSyncTurn, #755.

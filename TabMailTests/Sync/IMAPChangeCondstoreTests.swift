@@ -328,6 +328,94 @@ struct IMAPChangeCondstoreTests {
         }
     }
 
+    // MARK: - A staged UID at the old UIDNEXT merged between the read and the apply
+
+    /// A tracked inbox holding 1 (bookmark UIDNEXT 2). UID 2 arrives; with
+    /// `expunged` it is expunged again before the next read. The raced pass:
+    /// the real reader reads the inbox (the database's rows), then the real
+    /// staging merge inserts a notification row for 2 (the stored bookmark does
+    /// not claim 2 yet, so the merge keeps it), then the read is applied. Then
+    /// ordinary foreground passes run until the folder settles.
+    struct ArrivalRaceOutcome {
+        var racedApplyRejected = true
+        var afterRace: IMAPChangeCursor?
+        var rowsAfterRace: Set<String> = []
+        var staged = false
+        var rows: Set<String> = []
+        var trackedAfter = false
+        var finalUidNext: UInt32?
+    }
+
+    static func stagedArrivalMergedBetweenReadAndApply(_ name: String, expunged: Bool) async throws -> ArrivalRaceOutcome {
+        var outcome = ArrivalRaceOutcome()
+        try await E.withWorld(name, capabilities: Self.condstore, serverUIDs: [1], localUIDs: [1]) { w in
+            w.server.honorSearchUIDSetCriterion()
+            w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
+            try await Self.foregroundPass(w)
+            try #require(try Self.tracked(w), "setup: the baseline pass's listing and commit track the folder")
+            try #require(IMAPChangeCursor.decode(try w.folder().changeCursor)?.uidNext == 2, "setup: the bookmark's UIDNEXT is 2")
+
+            Self.add([2], to: w.server, E.path)
+            _ = w.server.qresyncHighestModSeq(for: E.path)  // the server has assigned UID 2
+            if expunged { Self.remove([2], from: w.server, E.path) }
+
+            let folder = try w.folder()
+            let issuedWith = folder.changeCursor
+            let request = ChangeRequest(
+                folders: [ChangeFolder(
+                    id: folder.id, path: folder.path, role: folder.role, cursor: issuedWith, isSynced: true,
+                    heldSince: folder.oldestSyncedDate, addressEpoch: SyncEngine.knownUidValidity(folder.lastKnownUidValidity),
+                    olderMailComplete: folder.backfillComplete, olderMailCursor: folder.backfillUidCursor)],
+                scope: .all, recheck: [:], context: ChangeContext(onProgress: { _ in }),
+                localRows: SyncEngineCatchUpRowReader(pool: AppDatabase.syncPool))
+            let set = try #require(try await w.provider.fetchChanges(since: ChangeCursor(account: nil), request: request))
+            var raced = try #require(set.folders.first { $0.folderId == folder.id })
+            try #require(R.isTracked(raced.status), "setup: the raced read is tracked, got \(raced.status)")
+            raced.readFrom = FolderChanges.ReadFrom(cursor: issuedWith)
+
+            outcome.staged = try await Self.stageAndMerge(2, w)
+            try #require(try w.uids().contains("2"), "setup: the merge inserted 2 between the read and the apply")
+            let racedChanges = raced
+            let applied = try await w.pool.write { db in try SyncEngine.applyFolderChanges(racedChanges, db: db) }
+            outcome.racedApplyRejected = applied.rejected
+            outcome.afterRace = IMAPChangeCursor.decode(try w.folder().changeCursor)
+            outcome.rowsAfterRace = try w.uids()
+
+            for _ in 0..<IMAPChangeCondstoreCheckTests.raceSettlePassCap {
+                try await Self.foregroundPass(w)
+                if try (expunged ? !w.uids().contains("2") : true) && Self.tracked(w) { break }
+            }
+            try await Self.foregroundPass(w)  // and it stays settled
+            outcome.rows = try w.uids()
+            outcome.trackedAfter = try Self.tracked(w)
+            outcome.finalUidNext = IMAPChangeCursor.decode(try w.folder().changeCursor)?.uidNext
+        }
+        return outcome
+    }
+
+    @Test("A staged UID at the old UIDNEXT that the merge inserts between the read and the apply is never covered unchecked: the bookmark stays, ordinary passes remove the expunged message and track the folder")
+    func stagedArrivalAtOldUidNextMergedBeforeApplyIsNotAGhost() async throws {
+        let outcome = try await Self.stagedArrivalMergedBetweenReadAndApply("cs-nse-arrival-gone", expunged: true)
+        #expect(!outcome.racedApplyRejected, "the raced apply reached the proof")
+        #expect(outcome.afterRace?.uidNext == 2, "the bookmark covered UID 2 without checking it: \(String(describing: outcome.afterRace))")
+        #expect(outcome.staged, "the staged payload is kept")
+        #expect(outcome.rows == ["1"], "the expunged staged message stays as a ghost: \(outcome.rows)")
+        #expect(outcome.trackedAfter, "the folder is tracked again")
+        #expect(outcome.finalUidNext == 3, "the bookmark moves on past 2: \(String(describing: outcome.finalUidNext))")
+    }
+
+    @Test("Control: a staged live arrival at the old UIDNEXT merged between the read and the apply stays, and the bookmark moves on in the same apply")
+    func stagedLiveArrivalAtOldUidNextMergedBeforeApplyStays() async throws {
+        let outcome = try await Self.stagedArrivalMergedBetweenReadAndApply("cs-nse-arrival-live", expunged: false)
+        #expect(!outcome.racedApplyRejected, "the raced apply reached the proof")
+        #expect(outcome.afterRace?.uidNext == 3, "a read that fetched the arrival covers it: \(String(describing: outcome.afterRace))")
+        #expect(outcome.rowsAfterRace == ["1", "2"], "the live arrival is held after the race: \(outcome.rowsAfterRace)")
+        #expect(outcome.staged, "the staged payload is kept")
+        #expect(outcome.rows == ["1", "2"], "the live arrival survives ordinary passes: \(outcome.rows)")
+        #expect(outcome.trackedAfter, "the folder stays tracked")
+        #expect(outcome.finalUidNext == 3)
+    }
+
     @Test("A staged notification for a live older message the window never loaded merges into a tracked folder, survives the next sync, and the folder is tracked again")
     func stagedLiveOlderMessageMergesAfterATrackedRead() async throws {
         let world = Self.partlyLoaded()

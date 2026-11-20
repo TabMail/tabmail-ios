@@ -159,6 +159,9 @@ extension IMAPProvider {
         changes.cursor = IMAPChangeCursor(
             uidValidity: served, highestModSeq: committed?.highestModSeq ?? modseq,
             uidNext: committed?.uidNext ?? uidNext, messageCount: committed?.messageCount ?? m1).encoded
+        // The newly covered range holds only rows this read accounted for.
+        changes.arrivalRowsProof = Self.arrivalRowsProof(
+            from: cursor.uidNext, below: committed?.uidNext ?? uidNext, arrivals: arrivals, movedIn: movedIn)
         if let check, created, owed > 0 {
             // S-18: held rows left below the window are the catch-up's.
             let below = try await request.localRows?.rows(
@@ -242,6 +245,22 @@ extension IMAPProvider {
             searched.formUnion(uids.map { Int($0) })
             changes.heldRowsProof = .init(lowerId: Int(lowest), upperId: top, checkedIds: searched)
         }
+    }
+
+    /// The proof for the UIDs a new bookmark newly covers, [lower, upper): the
+    /// arrivals the server listed and the moved-in rows the read's own lookup
+    /// found there (each fetched or re-read by this read). A row inserted after
+    /// that lookup is in neither, so the apply keeps the stored bookmark (#755).
+    nonisolated static func arrivalRowsProof(
+        from lower: UInt32, below upper: UInt32, arrivals: MessageIdentifierSet<UID>, movedIn: [UInt32]
+    ) -> FolderChanges.HeldRowsProof? {
+        guard upper > lower else { return nil }
+        var checked = Set(movedIn.map { Int($0) })
+        for range in arrivals.ranges {
+            let low = max(range.lowerBound, Int(lower)), high = min(range.upperBound, Int(upper) - 1)
+            if low <= high { checked.formUnion(low...high) }
+        }
+        return .init(lowerId: Int(lower), upperId: Int(upper) - 1, checkedIds: checked)
     }
 
     /// The folder's held UIDs in [lower, upper) the arrivals set does not hold:

@@ -106,13 +106,16 @@ extension SyncEngine {
         // A row that came meanwhile was not checked (also when another one
         // left, keeping the count), so the bookmark stays; a checked row that
         // left (moved out, or a proven removal) does not invalidate it.
-        let heldRowsHold = try changes.heldRowsProof.map { proof in
+        // The same for the range the new bookmark newly covers: a row the
+        // notification merge inserted there after the read looked would be
+        // covered without ever being checked (#755).
+        let heldRowsHold = try [changes.heldRowsProof, changes.arrivalRowsProof].compactMap { $0 }.allSatisfy { proof in
             let held = try Int.fetchAll(db, sql: """
                 SELECT CAST(messageId AS INTEGER) FROM messageHeader
                 WHERE folderId = ? AND CAST(messageId AS INTEGER) BETWEEN ? AND ?
                 """, arguments: [folder.id, proof.lowerId, proof.upperId])
             return held.allSatisfy(proof.checkedIds.contains)
-        } ?? true
+        }
 
         // Shields, read INSIDE this transaction.
         let snapshot = try PendingOperationSnapshot.load(accountId: accountId, db: db)
