@@ -949,9 +949,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (`ChatFieldDrag.Progress`) reset with the pill's spring, so a cancelled drag (the panel opening on
    an agent answer mid-drag, a system interruption) springs back too; the let-go only decides
    whether the panel opens. The drag holds the user-interaction freeze through `ChatSwipeHold` under
-   its own id (`ChatThreadView.fieldDragHoldId`) from its start until `swipeSettleHold` after it
-   ends, finished or cancelled. VoiceOver opens the panel with the field's named action "Show
-   TabMail chat". Not in the tutorial, whose steps open the chat themselves. The panel stays dimmed
+   its own id (`ChatThreadView.fieldDragHoldId`) from its start until its swell has settled
+   (`fieldDragSettle`) after it ends, finished or cancelled: the settle's one timer releases the
+   freeze and lets the bar take the field's height, so the hold always lasts at least the settle.
+   VoiceOver opens the panel with the named action "Show TabMail chat" on the element it focuses:
+   the text field, the sent words while the agent works, the waveform while dictating
+   (`showChatAction`), only while the panel is closed. Not in the tutorial, whose steps open the chat themselves. The panel stays dimmed
    with the rest of the chat as built (the ghost dims with it). Tests: `ChatFieldDragTests`,
    `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel`,
    `testShortDragUpOnTheReplyFieldSettlesBack` and `testDraggedOpenPanelClosesOnCloseAndOnTheDim`
@@ -960,7 +963,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `ChatFieldDragMarker` (the newest row's largest move from the drag's start until well after the
    settle), by `testDragThatOpensThePanelReleasesTheFreeze` (the same marker's freeze state), by
    `ChatReplyFieldTests.fieldDragSettleFences` (the token at the drag's start, the bar's gate, the
-   unconditional release) and `fieldDragSettleIsThePillSpring`. The VoiceOver action:
+   release in the settle's timer under no condition) and `fieldDragSettleIsThePillSpring` (the hold
+   lasts at least the settle). The VoiceOver action:
    `ChatThreadLayoutTests.showChatActionOpensThePanel`.
 
 20. **The first-time drag tip (amendment 2026-11-20).** Once, above the collapsed reply field, a

@@ -911,8 +911,10 @@ struct ChatThreadView: View {
     }
 
     /// A drag on the field began or ended (finished or cancelled). It holds the interaction freeze
-    /// under its own id from its start until it has let go and settled (`swipeSettleHold`), ends
-    /// the tip once, and keeps the bar at its resting height until the swell has settled.
+    /// under its own id from its start, ends the tip once, and keeps the bar at its resting height.
+    /// One timer ends both once the swell has settled (`fieldDragSettle`): the freeze is released
+    /// and the bar takes the field's height. A newer drag replaces the token and holds the freeze
+    /// itself, so an older settle does nothing; the chat going away releases it (`onDisappear`).
     private func fieldDragChanged(_ dragging: Bool) {
         if dragging {
             ChatSwipeHold.shared.begin(Self.fieldDragHoldId)
@@ -920,13 +922,13 @@ struct ChatThreadView: View {
             fieldSettleToken = UUID()
             return
         }
-        ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: ChatViewLayout.swipeSettleHold)
         let token = UUID()
         fieldSettleToken = token
         Task { @MainActor in
             try? await Task.sleep(for: Self.fieldDragSettle)
             guard fieldSettleToken == token else { return }
             fieldSettleToken = nil
+            ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)
             if !chatExpanded { pillHeight = fieldMeasuredHeight }
         }
     }

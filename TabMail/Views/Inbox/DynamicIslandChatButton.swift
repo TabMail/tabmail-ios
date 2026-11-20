@@ -862,8 +862,10 @@ struct DynamicIslandChat: View {
         inputSelection = .init(insertionPoint: inputText.endIndex)
     }
 
-    /// The input field, with the dictation waveform over it while listening.
-    func inputField(placeholder: String) -> some View {
+    /// The input field, with the dictation waveform over it while listening. `showChat`: the chat's
+    /// reply field's "Show TabMail chat" (`showChatAction`), on the field and, while dictation hides
+    /// the field from VoiceOver, on the waveform VoiceOver focuses instead.
+    func inputField(placeholder: String, showChat: (() -> Void)? = nil) -> some View {
         // Dictating: the field's text dims behind the waveform. Tap it to stop listening; the
         // text is appended when it comes back.
         TextField(placeholder, text: typedText, selection: $inputSelection, axis: .vertical)
@@ -876,11 +878,13 @@ struct DynamicIslandChat: View {
             .allowsHitTesting(!dictation.isActive)
             // VoiceOver reads the waveform instead of the dimmed field.
             .accessibilityHidden(dictation.isActive)
+            .showChatAction(showChat, isExpanded: isExpanded)
             .overlay {
                 if dictation.isActive {
                     DictationPillView(controller: dictation)
                         .contentShape(Rectangle())
                         .onTapGesture { dictation.finish() }
+                        .showChatAction(showChat, isExpanded: isExpanded)
                 }
             }
     }

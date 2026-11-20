@@ -67,15 +67,11 @@ extension DynamicIslandChat {
                             .lineLimit(1...6)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1)
+                            // The drag stays on while the agent works: so does its VoiceOver action.
+                            .showChatAction(field.showChat, isExpanded: isExpanded)
                     } else {
-                        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask")
-                            // The drag up's VoiceOver equivalent, on the element VoiceOver
-                            // focuses; only while the panel is closed.
-                            .accessibilityActions {
-                                if let showChat = field.showChat, !isExpanded {
-                                    Button(ChatThreadView.showChatActionName) { showChat() }
-                                }
-                            }
+                        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask",
+                                   showChat: field.showChat)
                         if showsExample, let example = field.example {
                             exampleLine(example)
                         }
@@ -111,4 +107,18 @@ extension DynamicIslandChat {
 
     /// The "e.g." line, as tests find it.
     static let exampleLineId = "chatExampleLine"
+}
+
+extension View {
+    /// The chat reply field's drag up as VoiceOver's "Show TabMail chat"
+    /// (`ChatThreadView.showChatActionName`), on the element VoiceOver focuses: the text field, the
+    /// sent words while the agent works, the waveform while dictating. Only while the panel is
+    /// closed; nil offers nothing (any other pill, the panel open, the tutorial).
+    func showChatAction(_ showChat: (() -> Void)?, isExpanded: Bool) -> some View {
+        accessibilityActions {
+            if let showChat, !isExpanded {
+                Button(ChatThreadView.showChatActionName) { showChat() }
+            }
+        }
+    }
 }
