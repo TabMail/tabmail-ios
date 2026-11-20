@@ -16,7 +16,8 @@ import SwiftUI
 /// - `--keyboard-focus-search`: a button presenting search in a sheet, as the inbox does (`SearchView`);
 /// - `--keyboard-focus-fork`: the inbox chat with one past session, for "Fork and re-send";
 /// - `--keyboard-focus-caret`: a single-line and a multi-line field, for a tap inside a field that
-///   already has the keyboard (the tap lands on the field's internal subviews).
+///   already has the keyboard (the tap lands on the field's internal subviews), and a `TextEditor`;
+///   also for selecting a word and Copy/Paste from the edit menu in each.
 /// Each screen also has an "Other field" that can hold the keyboard first.
 struct KeyboardFocusTestScene: View {
     static let templateId = "keyboard-focus-fixture-template"
@@ -25,6 +26,9 @@ struct KeyboardFocusTestScene: View {
     static let forkUserText = "Keyboard focus fixture question"
     /// The multi-line field's height in lines, so it is backed by a text view with room to tap in.
     static let multiLineLines = 3...6
+    static let textEditorIdentifier = "keyboardFocusTextEditor"
+    /// The text editor's height, so it has room to tap and select in.
+    static let textEditorHeight: CGFloat = 120
 
     private enum Mode {
         case template, chip, bullet, search, fork, caret
@@ -43,6 +47,7 @@ struct KeyboardFocusTestScene: View {
     @State private var ready = false
     @State private var other = ""
     @State private var multiLine = ""
+    @State private var editorText = ""
     @State private var recipients = ComposeDraftGuards.Recipients()
         .filling(to: RecipientEntry([KeyboardFocusTestScene.rejectedRecipient]))
     @State private var showCc = false
@@ -99,6 +104,9 @@ struct KeyboardFocusTestScene: View {
                         TextField("Other field", text: $other)
                         TextField("Multi-line field", text: $multiLine, axis: .vertical)
                             .lineLimit(Self.multiLineLines)
+                        TextEditor(text: $editorText)
+                            .frame(height: Self.textEditorHeight)
+                            .accessibilityIdentifier(Self.textEditorIdentifier)
                         Spacer()
                     }
                     .padding()
