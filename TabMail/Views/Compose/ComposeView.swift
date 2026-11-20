@@ -1836,11 +1836,7 @@ struct ComposeView: View {
             // (manual New, contact, reply, replyAll, forward, agent compose, agent draft).
             .onAppear { performLifecycleAppear() }
             .onDisappear { performDisappear() }
-            .onChange(of: showingSuggestion) { old, new in
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[ComposeView] showingSuggestion \(old)->\(new) instance=\(instanceToken) suggestionLen=\(currentSuggestion?.count ?? -1)")
-                }
-            }
+            .onChange(of: showingSuggestion) { old, new in logShowingSuggestionChange(old, new) }
             .onChange(of: selectedAccount) {
                 currentSignature = selectedAccount?.signature ?? ""
             }
@@ -1983,6 +1979,12 @@ struct ComposeView: View {
     }
 
     /// Debug-gated: the suggestion bubble entering or leaving the card.
+    private func logShowingSuggestionChange(_ old: Bool, _ new: Bool) {
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] showingSuggestion \(old)->\(new) instance=\(instanceToken) suggestionLen=\(currentSuggestion?.count ?? -1)")
+        }
+    }
+
     private func logSuggestionBubble(_ event: String) {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ComposeView] suggestion bubble \(event) instance=\(instanceToken) showing=\(showingSuggestion)")
@@ -2519,8 +2521,8 @@ struct ComposeView: View {
         }
         draftReadState = ComposeDraftGuards.readState(readResult)
         if DebugModeManager.isLoggingEnabled() {
-            let row = (try? readResult.get()).flatMap { $0 }
-            BackgroundSyncLogger.logDebug("[ComposeView] draft read instance=\(instanceToken) draftId=\(draftId) found=\(row != nil) bodyLen=\(row?.body.count ?? -1) suggestedBodyLen=\(suggestedBody?.count ?? -1)")
+            let row = try? readResult.get()
+            BackgroundSyncLogger.logDebug("[ComposeView] draft read instance=\(instanceToken) draftId=\(draftId) state=\(draftReadState) bodyLen=\(row?.body.count ?? -1) suggestedBodyLen=\(suggestedBody?.count ?? -1)")
         }
         guard case .success(let loaded) = readResult else {
             draftReadState = .error

@@ -750,9 +750,6 @@ struct ChatThreadView: View {
         TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)
     }
 
-    /// A tap on the AI Suggestion: the Reply All compose card with it written out (the suggestion
-    /// shows only while the reply goes to everyone). In the tutorial only the step that asks for it
-    /// opens the card.
     /// Debug-gated: each build of the ready card's content, with the draft it names.
     static func logReadyCard(_ ready: ChatReadyReply) {
         if DebugModeManager.isLoggingEnabled() {
@@ -760,6 +757,9 @@ struct ChatThreadView: View {
         }
     }
 
+    /// A tap on the AI Suggestion: the Reply All compose card with it written out (the suggestion
+    /// shows only while the reply goes to everyone). In the tutorial only the step that asks for it
+    /// opens the card.
     private func openSuggestion(on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {
         if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion {
             _ = TutorialCoordinator.shared.admits(.other)
