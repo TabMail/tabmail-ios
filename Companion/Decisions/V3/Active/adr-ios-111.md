@@ -489,7 +489,9 @@ list keeps its first ids and arms the catch-up" for ids already stored, and its 
 release boundary.
 Tests: `ReleaseBoundaryRecheckTests` (`manyRetiredLabelIdsDrainInACheckedFolder`,
 `applyCutsOnlyThisPassesAdditions`, `overflowKeepsEveryRetiredId`,
-`favouriteCustomFolderKeepsEveryRetiredId`), `OutlookCatchUpTests.recheckOverflowHealsAFlag`,
+`favouriteCustomFolderKeepsEveryRetiredId`), `OutlookCatchUpTests.recheckOverflowRebaselinesAndHealsAFlag` (renamed 2026-11-20, #1107, from
+`recheckOverflowHealsAFlag`: it now asserts the dropped bookmark of the 2026-11-17 amendment and
+re-baselines before the listing),
 `ChangeApplyTests.recheckOverflowArmsCatchUp`.
 Keywords: changeRecheckLimit, overflow, stored ids never cut, this pass's additions, retired ids
 drain, #903.
@@ -520,6 +522,9 @@ holds), and the bookmark would otherwise move past a cut arrival. A folder with 
    The listing the dropped bookmark makes due expands the last verb, so cut ids inside the listing
    window get their arrows back. The #903 limitation remains for mail older than the listing window.
 This PR adds no new limitation.
+Tests (added 2026-11-20, #1107): `OutlookCatchUpTests.recheckOverflowRebaselinesAndHealsAFlag` (a real
+read whose cut arrival answers 500 drops the bookmark and stores none of the read's later one, makes the
+full sync due, and the re-baseline loads the cut arrival), `IMAPMoveIntoTrackedFolderTests.cutArrivalLandsAfterTheListing`.
 Keywords: cutDropsBookmark, overflow, own bookmark, re-baseline, listed again, delta pages, cellular
 Inbox, last verb, listing window, #751, #903.
 
