@@ -918,6 +918,18 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    on the last line. The Stop and Retry glyphs keep their size. Tests:
    `ChatThreadLayoutTests.fieldButtonsOnTheLastLine`, `ChatReplyFieldTests.everyOpenBarSharesTheRow`.
 
+18. **The field is the chat's bottom bar (amendment 2026-11-20).** The reply field is the scroll
+   view's `.safeAreaBar(edge: .bottom, spacing: 0)`, as the header is its top bar (decision 15), so
+   the chat scrolls under it and the system blurs the strip below it, as in Messages; no field
+   floats over the chat in a `ZStack` any more. There is one field, always in the bar: the bar is a
+   slot of the collapsed field's measured height, and the opened pill grows upward out of it as an
+   overlay, so the bar's inset, and the chat under the panel, do not move when it opens. The field
+   keeps its 8 pt above the safe-area line (or the keyboard) inside the bar. The last row keeps only
+   `pillGap` (the inset keeps the field's room), and the landing is issued again when the bottom
+   inset changes (the field's height and the keyboard arrive as that inset). Tests:
+   `ChatThreadLayoutTests.chatScrollsBehindTheField` and `openingThePillKeepsTheChat`,
+   `ChatReplyFieldTests.messagesLayout` (the bottom bar, no plain bottom inset).
+
 ## The longer index line (routed 2026-11-09)
 
 The DECISIONS.md row grew with each decision of the chat view; it moved here when the index went

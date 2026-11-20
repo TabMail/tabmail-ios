@@ -172,6 +172,53 @@ struct ChatThreadLayoutTests {
         }
     }
 
+    @Test("The chat scrolls behind the reply field: the field is the scroll view's bottom bar")
+    func chatScrollsBehindTheField() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosted(earlier: 2) { window, controller, _ in
+                let id = ChatThreadView.replyPillId
+                try await Self.waitFor { Self.frame(of: id, in: controller.view).map { $0.height > 0 } ?? false }
+                try await Task.sleep(for: .milliseconds(500))
+                let field = try #require(Self.frame(of: id, in: controller.view))
+                let scroll = try #require(Self.scrollViews(controller.view).max { $0.contentSize.height < $1.contentSize.height })
+                let scrollBottom = scroll.convert(scroll.bounds, to: nil).maxY
+                // The scroll view's content area ends at the field's top: the system knows the
+                // field is a bar (which is what draws the edge blur under it), not a spacer row.
+                #expect(scroll.adjustedContentInset.bottom >= scrollBottom - field.minY - 1,
+                        "inset \(scroll.adjustedContentInset.bottom), scroll bottom \(scrollBottom), field top \(field.minY)")
+                let newest = try #require(HostedAccessibility.elements(under: controller.view)
+                    .last { $0.accessibilityLabel?.contains(" said: Lunch?") == true }?.accessibilityFrame,
+                    "labels: \(HostedAccessibility.labels(in: controller.view).prefix(30))")
+                #expect(newest.maxY <= field.minY + 0.5 && newest.maxY >= field.minY - ChatViewLayout.pillGap - ChatViewLayout.bubbleSpacing - 1,
+                        "the newest row \(newest) sits right above the field \(field)")
+                _ = window
+            }
+        }
+    }
+
+    @Test("Opening the pill does not move the chat under it")
+    func openingThePillKeepsTheChat() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosted(earlier: 2) { _, controller, parent in
+                let id = ChatThreadView.replyPillId
+                try await Self.waitFor { Self.frame(of: id, in: controller.view).map { $0.height > 0 } ?? false }
+                try await Task.sleep(for: .milliseconds(500))
+                @MainActor func newest() -> CGRect? {
+                    HostedAccessibility.elements(under: controller.view)
+                        .last { $0.accessibilityLabel?.contains(" said: Lunch?") == true }?.accessibilityFrame
+                }
+                let before = try #require(newest(), "labels: \(HostedAccessibility.labels(in: controller.view).prefix(30))")
+                NotificationCenter.default.post(name: .openMessageWithChat, object: nil, userInfo: ["messageId": parent.id])
+                try await Self.waitFor { Self.frame(of: "chatClose", in: controller.view) != nil }
+                try await Task.sleep(for: .seconds(1))
+                let after = try #require(newest(), "the newest bubble is still there under the panel")
+                #expect(abs(after.minY - before.minY) < 1, "before \(before), after \(after)")
+            }
+        }
+    }
+
     @Test("With the largest text, the opened pill fits between the navigation bar, which stays, and the safe area")
     func openedPillFitsUnderTheBar() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")

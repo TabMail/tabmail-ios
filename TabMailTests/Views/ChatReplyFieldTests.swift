@@ -634,6 +634,11 @@ struct ChatReplyFieldTests {
         #expect(Self.count(".safeAreaBar(edge: .top, spacing: 0) { VStack(spacing: 0) { ChatSubjectLine(subject: subject(thread), labels: context.labels) tutorialCard(thread) }", in: chat) == 1,
                 "the subject and the coach card form the chat's top bar")
         #expect(Self.count(".safeAreaInset(edge: .top", in: chat) == 0, "no plain top inset: it has no scroll-edge backdrop")
+        // The field is the chat's bottom bar, so the strip under it blurs as in Messages; a plain
+        // inset or a sibling over the scroll view has no scroll-edge effect.
+        #expect(Self.count(".safeAreaBar(edge: .bottom, spacing: 0) {", in: chat) == 1, "the field is the bottom bar")
+        #expect(Self.count(".safeAreaInset(edge: .bottom", in: chat) == 0)
+        #expect(Self.count("ZStack(alignment: .bottom)", in: chat) == 0, "no field floating over the chat")
         let header = try Self.source("TabMail/Views/Chat/ChatHeaderView.swift")
         #expect(Self.count(".background(.bar)", in: header) == 0)
         #expect(Self.count("Text(subject)", in: header) == 1, "the subject only in the thin line")

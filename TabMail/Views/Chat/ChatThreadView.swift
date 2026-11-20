@@ -60,6 +60,8 @@ struct ChatThreadView: View {
     /// last bubble and the jump button. The field grows to six lines, so it is measured;
     /// the open sheet keeps the last collapsed height, so the thread does not move under it.
     @State private var pillHeight = ChatViewLayout.pillStartHeight
+    /// The chat's own height: the opened pill grows upward out of the bottom bar into it.
+    @State private var chatAreaHeight: CGFloat = 0
     @State private var chatInputFocused = false
     @State private var chatWorking = false
     /// The ready AI Suggestion's compose card: the email it answers, and how it opens.
@@ -299,7 +301,7 @@ struct ChatThreadView: View {
     @ViewBuilder
     private func chatContent(_ thread: ChatThread) -> some View {
         let offersArchive = viewModel.chatHasInboxCopy
-        ZStack(alignment: .bottom) {
+        Group {
             ScrollViewReader { proxy in
                 ScrollView {
                     // A plain stack: every row has its real height, so one scroll lands where it
@@ -321,7 +323,8 @@ struct ChatThreadView: View {
                                 openSuggestion(on: newest, tutorialMove: move)
                             }
                         }
-                        Color.clear.frame(height: pillHeight + ChatViewLayout.pillGap).id(Self.bottomId)
+                        // The bottom bar's inset keeps the field's room; only the gap is added here.
+                        Color.clear.frame(height: ChatViewLayout.pillGap).id(Self.bottomId)
                     }
                     .padding(.top, 8)
                 }
@@ -358,9 +361,10 @@ struct ChatThreadView: View {
                 }
                 // The first scroll can be dropped while the screen is still settling (memory 036),
                 // and late content (attachment chips, a summary) changes the heights: the landing
-                // is issued again on every size change until a scroll begins.
+                // is issued again on every size change until a scroll begins. The field's height
+                // and the keyboard arrive as the bottom bar's inset, so it counts too.
                 .onScrollGeometryChange(for: [CGFloat].self) { geo in
-                    [geo.containerSize.height, geo.contentSize.height]
+                    [geo.containerSize.height, geo.contentSize.height, geo.contentInsets.bottom]
                 } action: { old, new in
                     #if DEBUG
                     NSLog("[cv9diag] size %@ -> %@ target=%@", String(describing: old), String(describing: new), String(describing: scrollTarget?.id))
@@ -417,19 +421,30 @@ struct ChatThreadView: View {
                         .transition(.opacity)
                 }
             }
-
-            if let newest = thread.newest {
-                pill(on: newest)
-                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                        if !chatExpanded { pillHeight = height }
-                    }
-                    // ...and above the reply field.
-                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
-                        pillTop = $0
-                        swipeOpen.reach(top: headerBottom, bottom: $0)
-                    }
+            // The reply field is the chat's bottom bar, as in Messages: the chat scrolls under it
+            // and the system blurs the strip below it. One field, always here. The bar is a slot
+            // of the collapsed field's height; the opened pill grows upward out of it (an overlay,
+            // not clipped), so the inset, and the chat under the panel, do not move.
+            .safeAreaBar(edge: .bottom, spacing: 0) {
+                if let newest = thread.newest {
+                    Color.clear
+                        .frame(height: pillHeight)
+                        .overlay(alignment: .bottom) {
+                            pill(on: newest)
+                                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                                    if !chatExpanded { pillHeight = height }
+                                }
+                                // ...and above the reply field.
+                                .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
+                                    pillTop = $0
+                                    swipeOpen.reach(top: headerBottom, bottom: $0)
+                                }
+                                .frame(height: max(chatAreaHeight, pillHeight), alignment: .bottom)
+                        }
+                }
             }
         }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { chatAreaHeight = $0 }
         // While a swipe is open, a drag or tap anywhere else on the screen only closes it. The
         // closer's anchor fills the space every swipe frame is measured in.
         .background(ChatSwipeCloser(open: swipeOpen))
@@ -487,7 +502,8 @@ struct ChatThreadView: View {
         }
         .buttonStyle(.plain)
         .padding(.trailing)
-        .padding(.bottom, pillHeight + ChatViewLayout.pillGap)
+        // Above the bottom bar, whose inset the overlay already keeps clear.
+        .padding(.bottom, ChatViewLayout.pillGap)
         .transition(.opacity)
         .accessibilityLabel("Jump to the newest email")
     }
