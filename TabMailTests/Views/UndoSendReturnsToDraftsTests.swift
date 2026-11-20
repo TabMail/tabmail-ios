@@ -4,21 +4,24 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
-/// A confirmed Undo Send returns the message to Drafts at once (ADR-IOS-065, as
-/// superseded on v3): with no further gesture the words are in a Drafts entry
-/// and a server save of them is queued, and a copy saved to the server before
-/// Send gets the words that were sent. The reopened compose then edits that
-/// same draft, with no second Drafts entry.
+/// After Undo Send, Close without typing never drops the words (ADR-IOS-065, as
+/// superseded on v3). The confirmed Undo returns the message to Drafts in the
+/// cancellation's own write: a Drafts entry and a queued server save exist at
+/// once, with no further gesture. If that return fails, the cancellation still
+/// stands and the reopened compose holds the message as unsaved, so Close asks
+/// to save it. No committed state has the Outbox row gone with the return
+/// half-written.
 ///
-/// Runs production throughout: the row write Send makes (`DraftStore.saveAsync`
-/// through a `ComposeGenerationCursor`), the real Outbox row and
-/// `PendingSendService.present` / `undoAndReturnToDrafts` (the entry the Undo
-/// button calls), `UndoReopenCompose.composeView(for:)`, and the compose's own
-/// save (cursor from the loaded row, `saveAsync`, `queueDraftSave`). Assertions
-/// are on what the user can reach, never on the route.
+/// Production throughout: the row write Send makes (`DraftStore.saveAsync`
+/// through a `ComposeGenerationCursor`), the real held Outbox row,
+/// `PendingSendService.present` and `undo()` (what the toast's Undo button
+/// calls, synchronously), `UndoReopenCompose.composeView(for:)`, and the close
+/// decision's own functions (`ComposeDraftGuards.baseline`, `.hasChanges`,
+/// `.hasContent`, `.closeAction`).
 ///
 /// `.serialized` + `.processGlobalState`: rebinds `AppDatabase.shared` and uses
 /// `PendingSendService.shared`. example.com addresses only; every instant
@@ -61,18 +64,20 @@ struct UndoSendReturnsToDraftsTests {
 
     private func finish(_ fixture: Fixture) {
         PendingSendService.shared.dismiss()
+        PendingSendService.shared.dismissUndoFailure()
         InstalledTestDatabaseLifetime.finish(
             previous: fixture.previous, pool: fixture.pool, directory: fixture.directory)
     }
 
-    private func draft(_ id: String, _ fixture: Fixture, body: String, updatedAt: Double) -> Draft {
-        Draft(
+    private func draft(_ id: String, _ fixture: Fixture, body: String) -> Draft {
+        let now = Date().timeIntervalSince1970
+        return Draft(
             id: id, accountId: fixture.accountId,
             toJSON: Draft.encodeStringArray(["recipient@example.com"]),
             ccJSON: Draft.encodeStringArray([]), bccJSON: Draft.encodeStringArray([]),
             subject: "Quarterly plan", body: body,
             replyToId: nil, isForward: false, editHistoryJSON: nil,
-            createdAt: updatedAt, updatedAt: updatedAt)
+            createdAt: now, updatedAt: now)
     }
 
     private func row(_ fixture: Fixture, _ id: String) async throws -> Draft {
@@ -80,10 +85,8 @@ struct UndoSendReturnsToDraftsTests {
     }
 
     /// Send: the row written through the compose's cursor, then the held Outbox
-    /// row and its Undo toast. Then Undo, as the button does.
-    private func sendThenUndo(
-        _ fixture: Fixture, _ sent: Draft, cursor: ComposeGenerationCursor
-    ) async throws -> PendingSendService.ReopenSnapshot {
+    /// row and its Undo toast. Returns the Outbox row's id.
+    private func send(_ fixture: Fixture, _ sent: Draft, cursor: ComposeGenerationCursor) async throws -> String {
         _ = try await cursor.admit { epoch, predecessor in
             try await DraftStore.shared.saveAsync(sent, epoch: epoch, expectedPredecessor: predecessor)
         }
@@ -99,29 +102,31 @@ struct UndoSendReturnsToDraftsTests {
         PendingSendService.shared.present(
             outboxId: held.id, draftId: sent.id, instanceEpoch: cursor.newEpoch,
             toSummary: "To: recipient@example.com", holdUntil: held.holdUntil)
-        let snapshot = try #require(await PendingSendService.shared.undoAndReturnToDrafts(),
-                                    "precondition: the Undo was confirmed")
-        let outboxLeft = try await fixture.pool.read { db in try OutboxMessage.fetchOne(db, key: held.id) }
-        try #require(outboxLeft == nil, "precondition: the Outbox row is gone")
-        return snapshot
+        return held.id
     }
 
-    /// Every Drafts-folder entry for the draft, with its body.
-    private func draftsEntries(_ fixture: Fixture, draftId: String) async throws -> [(MessageHeader, MessageBody?)] {
-        let bare = PendingOperation.draftPlaceholderMessageId(draftId: draftId, instanceEpoch: nil)
-        return try await fixture.pool.read { db in
+    private func outboxRow(_ fixture: Fixture, _ id: String) async throws -> OutboxMessage? {
+        try await fixture.pool.read { db in try OutboxMessage.fetchOne(db, key: id) }
+    }
+
+    /// Every header in the Drafts folder, native or placeholder, with its body.
+    private func allDraftsEntries(_ fixture: Fixture) async throws -> [(MessageHeader, MessageBody?)] {
+        try await fixture.pool.read { db in
             try MessageHeader
                 .filter(Column("folderId") == fixture.draftsFolderId)
                 .fetchAll(db)
-                .filter { $0.messageId.hasPrefix(bare) }
-                .map { header in
-                    (header, try MessageBody.filter(Column("id") == header.id).fetchOne(db))
-                }
+                .map { header in (header, try MessageBody.filter(Column("id") == header.id).fetchOne(db)) }
         }
     }
 
-    /// The message is in Drafts with `words` (one entry), and a server save of
-    /// the row, which holds `words` and is pushable, is queued.
+    private func serverSaves(_ fixture: Fixture, _ draftId: String) async throws -> [PendingOperation] {
+        try await fixture.pool.read { db in
+            try PendingOperation.fetchAll(db).filter { $0.draftId == draftId && $0.type == .saveDraft }
+        }
+    }
+
+    /// The message is in exactly one Drafts entry with `words`, and a server save
+    /// of the row, which holds `words` and is pushable, is queued.
     private func expectInDraftsAndQueuedForServer(
         _ fixture: Fixture, draftId: String, words: String
     ) async throws {
@@ -129,95 +134,216 @@ struct UndoSendReturnsToDraftsTests {
         #expect(saved.body == words)
         #expect(saved.serverPushStatus == nil || saved.serverPushStatus == "dirty",
                 "the row must be pushable, got \(saved.serverPushStatus ?? "nil")")
-        let entries = try await draftsEntries(fixture, draftId: draftId)
+        let entries = try await allDraftsEntries(fixture)
         #expect(entries.count == 1, "expected one Drafts entry, got \(entries.count)")
         guard entries.count == 1 else { return }
         #expect(entries[0].0.snippet.contains(words))
         #expect(entries[0].1?.htmlContent?.contains(words) == true)
-        let serverSaves = try await fixture.pool.read { db in
-            try PendingOperation.fetchAll(db).filter { $0.draftId == draftId && $0.type == .saveDraft }
-        }
-        #expect(!serverSaves.isEmpty, "no server save queued for the message")
-        #expect(serverSaves.allSatisfy { $0.instanceEpoch == saved.instanceEpoch })
+        let saves = try await serverSaves(fixture, draftId)
+        #expect(!saves.isEmpty, "no server save queued for the message")
+        #expect(saves.allSatisfy { $0.instanceEpoch == saved.instanceEpoch })
     }
 
-    @Test("After a confirmed Undo, a message never saved to the server is in Drafts and queued for the server")
-    func neverSavedMessageReturnsToDrafts() async throws {
+    /// The close decision the reopened compose makes when the user closes it
+    /// without typing: its fields are exactly the kept row.
+    private func closeWithoutTyping(
+        _ compose: ComposeView, loaded: Draft
+    ) -> ComposeDraftGuards.CloseAction {
+        let current = ComposeDraftGuards.Baseline(
+            subject: loaded.subject, body: loaded.body,
+            to: loaded.toArray, cc: loaded.ccArray, bcc: loaded.bccArray,
+            attachmentsFingerprint: [])
+        let baseline = ComposeDraftGuards.baseline(
+            afterLoading: current, treatAsUnsavedChanges: compose.prefillTreatAsUnsavedChanges)
+        return ComposeDraftGuards.closeAction(
+            readState: .loaded,
+            hasContent: ComposeDraftGuards.hasContent(
+                subject: loaded.subject, body: loaded.body,
+                to: loaded.toArray, cc: loaded.ccArray, bcc: loaded.bccArray,
+                toInput: "", ccInput: "", bccInput: "", hasAttachments: false),
+            hasChanges: ComposeDraftGuards.hasChanges(current: current, baseline: baseline))
+    }
+
+    // MARK: - The confirmed Undo returns the message to Drafts
+
+    @Test("Undo of a message never saved to the server puts it in Drafts and queues the server copy, and Close just closes")
+    func undoReturnsNeverSavedMessageToDrafts() async throws {
         let fixture = try makeFixture()
         defer { finish(fixture) }
         let draftId = "draft-\(UUID().uuidString)"
         let words = "Here are the numbers for next quarter."
         let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
-        _ = try await sendThenUndo(
-            fixture, draft(draftId, fixture, body: words, updatedAt: Date().timeIntervalSince1970),
-            cursor: cursor)
+        let outboxId = try await send(fixture, draft(draftId, fixture, body: words), cursor: cursor)
+
+        let snapshot = try #require(PendingSendService.shared.undo(), "the Undo was not confirmed")
+
+        #expect(try await outboxRow(fixture, outboxId) == nil)
+        #expect(snapshot.returnedToDrafts)
+        #expect(try await row(fixture, draftId).instanceEpoch == cursor.newEpoch,
+                "the return to Drafts must keep the row's generation")
         try await expectInDraftsAndQueuedForServer(fixture, draftId: draftId, words: words)
+        let compose = UndoReopenCompose.composeView(for: snapshot)
+        #expect(closeWithoutTyping(compose, loaded: try await row(fixture, draftId)) == .dismiss)
     }
 
-    @Test("After a confirmed Undo, a copy saved to the server before Send gets the words that were sent")
-    func serverCopyGetsLatestWords() async throws {
+    @Test("Undo of a draft saved to the server before Send gives its Drafts entry and server save the words that were sent")
+    func undoGivesTheSentWordsToAnEarlierSavedDraft() async throws {
         let fixture = try makeFixture()
         defer { finish(fixture) }
         let draftId = "draft-\(UUID().uuidString)"
         let older = "First version of the plan."
         let latest = "Final version of the plan, with the new dates."
         let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
-        let start = Date().timeIntervalSince1970
 
-        // Saved and pushed before Send: a Drafts entry and a server copy of `older`.
-        let first = draft(draftId, fixture, body: older, updatedAt: start)
+        // Saved to Drafts before Send, through the normal save.
+        let first = draft(draftId, fixture, body: older)
         _ = try await cursor.admit { epoch, predecessor in
             try await DraftStore.shared.saveAsync(first, epoch: epoch, expectedPredecessor: predecessor)
         }
         #expect(await AccountManager.shared.queueDraftSave(draftId: draftId, accountId: fixture.accountId))
-        try await fixture.pool.write { db in
-            try PendingOperation.filter(Column("draftId") == draftId).deleteAll(db)
-            try db.execute(
-                sql: "UPDATE draft SET serverPushStatus = 'pushed', serverDraftId = ? WHERE id = ?",
-                arguments: ["server-copy-1", draftId])
-        }
 
-        // Edited, then sent: Send writes `latest`, keeping the server linkage.
-        var sent = draft(draftId, fixture, body: latest, updatedAt: start + 1)
-        sent.serverDraftId = "server-copy-1"
-        sent.serverPushStatus = "pushed"
-        _ = try await sendThenUndo(fixture, sent, cursor: cursor)
+        // Edited, then sent.
+        var sent = draft(draftId, fixture, body: latest)
+        sent.updatedAt = max(sent.updatedAt, try await row(fixture, draftId).updatedAt) + 1
+        _ = try await send(fixture, sent, cursor: cursor)
 
+        let snapshot = try #require(PendingSendService.shared.undo(), "the Undo was not confirmed")
+        #expect(snapshot.returnedToDrafts)
         try await expectInDraftsAndQueuedForServer(fixture, draftId: draftId, words: latest)
-        #expect(try await row(fixture, draftId).serverDraftId == "server-copy-1",
-                "the save must update the existing server copy")
     }
 
-    @Test("The compose reopened by Undo edits that same draft, with no second Drafts entry")
-    func reopenedComposeEditsTheSameDraft() async throws {
+    @Test("A second Undo tap changes nothing: one Drafts entry, one server save")
+    func doubleTapReturnsOnce() async throws {
+        let fixture = try makeFixture()
+        defer { finish(fixture) }
+        let draftId = "draft-\(UUID().uuidString)"
+        let words = "One copy only."
+        let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
+        _ = try await send(fixture, draft(draftId, fixture, body: words), cursor: cursor)
+
+        #expect(PendingSendService.shared.undo() != nil)
+        #expect(PendingSendService.shared.undo() == nil)
+
+        try await expectInDraftsAndQueuedForServer(fixture, draftId: draftId, words: words)
+        #expect(try await serverSaves(fixture, draftId).count == 1)
+    }
+
+    // MARK: - A failed return keeps the words reachable
+
+    @Test("If the return to Drafts fails, the Undo still stands and Close asks to save the message")
+    func failedReturnOpensUnsavedAndCloseAsksToSave() async throws {
+        let fixture = try makeFixture()
+        defer { finish(fixture) }
+        let draftId = "draft-\(UUID().uuidString)"
+        let words = "Words that must not be lost."
+        let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
+        let outboxId = try await send(fixture, draft(draftId, fixture, body: words), cursor: cursor)
+        let before = try await row(fixture, draftId)
+        // The admission's server save cannot be written.
+        try await fixture.pool.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER refuse_draft_save BEFORE INSERT ON pendingOperation
+                BEGIN SELECT RAISE(ABORT, 'refused for the test'); END
+                """)
+        }
+
+        let snapshot = try #require(PendingSendService.shared.undo(), "the cancellation must still stand")
+
+        #expect(!snapshot.returnedToDrafts)
+        #expect(try await outboxRow(fixture, outboxId) == nil)
+        let after = try await row(fixture, draftId)
+        #expect(after.body == words)
+        #expect(after.instanceEpoch == before.instanceEpoch)
+        #expect(after.updatedAt == before.updatedAt, "the failed save must roll back whole")
+        #expect(try await allDraftsEntries(fixture).isEmpty, "a half-written Drafts entry remained")
+        let compose = UndoReopenCompose.composeView(for: snapshot)
+        #expect(compose.prefillTreatAsUnsavedChanges)
+        #expect(closeWithoutTyping(compose, loaded: after) == .promptSave,
+                "Close without typing would drop the words")
+    }
+
+    @Test("An Undo whose write does not commit changes nothing: the Send stays, no Drafts entry, no server save")
+    func uncommittedUndoIsAllOrNothing() async throws {
         let fixture = try makeFixture()
         defer { finish(fixture) }
         let draftId = "draft-\(UUID().uuidString)"
         let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
-        let snapshot = try await sendThenUndo(
-            fixture,
-            draft(draftId, fixture, body: "Sent words.", updatedAt: Date().timeIntervalSince1970),
-            cursor: cursor)
+        let outboxId = try await send(fixture, draft(draftId, fixture, body: "Still queued."), cursor: cursor)
+        let before = try await row(fixture, draftId)
+        // The process ends before the write commits: the commit is refused after
+        // the cancellation and the return to Drafts both ran inside it.
+        let refuser = CommitRefuser()
+        fixture.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
 
-        // The reopened compose binds the kept row and builds its cursor from it,
-        // as its loader does; the user edits and saves.
-        let compose = UndoReopenCompose.composeView(for: snapshot)
-        let loaded = try await row(fixture, draftId)
-        #expect(compose.retainedDraftAuthority?.matches(loaded) == true)
-        #expect(compose.prefillDraftId == draftId)
-        let observed = loaded.instanceEpoch.flatMap { $0.isEmpty ? nil : $0 }
-        let composeCursor = ComposeGenerationCursor(
-            newEpoch: observed ?? UUID().uuidString, initialExpectedPredecessor: observed)
-        var edited = loaded
-        edited.body = "Edited after Undo."
-        edited.updatedAt = max(loaded.updatedAt, Date().timeIntervalSince1970) + 1
-        let editedSnapshot = edited
-        let result = try await composeCursor.admit { epoch, predecessor in
-            try await DraftStore.shared.saveAsync(editedSnapshot, epoch: epoch, expectedPredecessor: predecessor)
+        let snapshot = PendingSendService.shared.undo()
+        fixture.pool.remove(transactionObserver: refuser)
+
+        #expect(snapshot == nil)
+        #expect(refuser.refusals.withLock { $0 } == 1)
+        #expect(refuser.sawDraftsWrite.withLock { $0 }, "the return to Drafts did not run inside the write")
+        #expect(try await outboxRow(fixture, outboxId) != nil, "the Send must still be held")
+        #expect(try await allDraftsEntries(fixture).isEmpty)
+        #expect(try await serverSaves(fixture, draftId).isEmpty)
+        #expect(try await row(fixture, draftId).updatedAt == before.updatedAt)
+    }
+
+    /// Refuses the commit of a write that deletes an Outbox row, recording
+    /// whether that same write also wrote a Drafts header.
+    private final class CommitRefuser: TransactionObserver, Sendable {
+        struct Refused: Error {}
+        private let deletingOutbox = Mutex(false)
+        let sawDraftsWrite = Mutex(false)
+        let refusals = Mutex(0)
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            switch eventKind {
+            case .delete(let table): return table == OutboxMessage.databaseTableName
+            case .insert(let table): return table == MessageHeader.databaseTableName
+            default: return false
+            }
         }
-        #expect(result == .applied)
-        #expect(await AccountManager.shared.queueDraftSave(draftId: draftId, accountId: fixture.accountId))
+        func databaseDidChange(with event: DatabaseEvent) {
+            if event.tableName == OutboxMessage.databaseTableName {
+                deletingOutbox.withLock { $0 = true }
+            } else {
+                sawDraftsWrite.withLock { $0 = true }
+            }
+        }
+        func databaseWillCommit() throws {
+            if deletingOutbox.withLock({ $0 }) {
+                refusals.withLock { $0 += 1 }
+                throw Refused()
+            }
+        }
+        func databaseDidCommit(_ db: Database) { deletingOutbox.withLock { $0 = false } }
+        func databaseDidRollback(_ db: Database) { deletingOutbox.withLock { $0 = false } }
+    }
 
-        try await expectInDraftsAndQueuedForServer(fixture, draftId: draftId, words: "Edited after Undo.")
+    // MARK: - The close decision behind a failed return
+
+    @Test("A compose opened as unsaved asks to save unchanged content; one opened as saved closes")
+    func unsavedBaselineDrivesTheClosePrompt() {
+        let loaded = ComposeDraftGuards.Baseline(
+            subject: "Quarterly plan", body: "Words.", to: ["recipient@example.com"], cc: [], bcc: [],
+            attachmentsFingerprint: [])
+        for (unsaved, expected) in [(true, ComposeDraftGuards.CloseAction.promptSave), (false, .dismiss)] {
+            let baseline = ComposeDraftGuards.baseline(afterLoading: loaded, treatAsUnsavedChanges: unsaved)
+            let action = ComposeDraftGuards.closeAction(
+                readState: .loaded, hasContent: true,
+                hasChanges: ComposeDraftGuards.hasChanges(current: loaded, baseline: baseline))
+            #expect(action == expected, "treatAsUnsavedChanges: \(unsaved)")
+        }
+    }
+
+    @Test("The reopened compose opens as unsaved exactly when the return to Drafts failed")
+    func reopenFlagFollowsTheReturn() {
+        let authority = PendingSendService.RetainedDraftAuthority(
+            draftId: "draft-\(UUID().uuidString)", accountId: "account-\(UUID().uuidString)",
+            instanceEpoch: UUID().uuidString)
+        for returned in [true, false] {
+            let compose = UndoReopenCompose.composeView(for: PendingSendService.ReopenSnapshot(
+                id: "outbox-\(UUID().uuidString)", authority: authority, returnedToDrafts: returned))
+            #expect(compose.prefillTreatAsUnsavedChanges == !returned)
+            #expect(compose.retainedDraftAuthority == authority)
+        }
     }
 }

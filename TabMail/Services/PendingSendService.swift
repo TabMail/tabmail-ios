@@ -183,6 +183,9 @@ final class PendingSendService {
     struct ReopenSnapshot: Identifiable, Sendable {
         let id: String  // outboxId — unique identifier for fullScreenCover(item:)
         let authority: RetainedDraftAuthority
+        /// Whether the confirmed Undo also saved the kept row back to Drafts.
+        /// `false` reopens the compose as unsaved, so Close asks to save it.
+        let returnedToDrafts: Bool
     }
 
     private(set) var current: Pending?
@@ -296,7 +299,11 @@ final class PendingSendService {
             current = nil
             return nil
         case .verified(let authority):
-            guard AccountManager.shared.discardOutboxMessageConfirmed(p.id) else {
+            // The cancellation and the kept draft's return to Drafts commit in one
+            // write, in this same synchronous turn (ADR-IOS-065, as superseded on v3).
+            let outcome = AccountManager.shared.discardOutboxMessageReturningDraftConfirmed(
+                p.id, authority: authority)
+            guard outcome.cancelled else {
                 // R16-9 — same arm, same reason as `.mismatchOrAbsent` above. This is
                 // the arm where the user had a reopenable draft in hand, so a silent
                 // `nil` here reads as "Undo did nothing at all".
@@ -305,61 +312,9 @@ final class PendingSendService {
             }
             dismissTask?.cancel()
             current = nil
-            return ReopenSnapshot(id: p.id, authority: authority)
+            return ReopenSnapshot(
+                id: p.id, authority: authority, returnedToDrafts: outcome.returnedToDrafts)
         }
-    }
-
-    /// Undo, and once the cancellation is confirmed, put the message back in
-    /// Drafts before the compose reopens (ADR-IOS-065, as superseded on v3).
-    ///
-    /// Send writes only the local Draft row: a message never saved to the server
-    /// has no Drafts entry and no server copy, and one saved earlier has a server
-    /// copy older than what was sent. Saving the kept row here, through the same
-    /// row write and Drafts admission every draft save uses, makes the Drafts entry
-    /// and queues the server copy at once, so closing the reopened compose without
-    /// typing, or the app ending while it is open, keeps the message.
-    ///
-    /// The cancellation itself stays in `undo()`, synchronous, before any await.
-    func undoAndReturnToDrafts() async -> ReopenSnapshot? {
-        guard let snapshot = undo() else { return nil }
-        _ = await Self.saveRetainedDraft(snapshot.authority)
-        return snapshot
-    }
-
-    /// The kept row through the normal draft save: the row write at the row's
-    /// own generation (so the epoch neither rotates nor is re-minted, and a row
-    /// that changed generation since the Undo is refused), then
-    /// `AccountManager.queueDraftSave`. `false` if the row is gone, changed, or
-    /// either step failed; the row is left as it was.
-    static func saveRetainedDraft(_ authority: RetainedDraftAuthority) async -> Bool {
-        do {
-            guard var draft = try await AppDatabase.dbPool.read({ db in
-                try Draft.fetchOne(db, key: authority.draftId)
-            }), authority.matches(draft) else {
-                logRestore("kept draft absent or changed: \(authority.draftId)")
-                return false
-            }
-            draft.updatedAt = max(draft.updatedAt, Date().timeIntervalSince1970)
-            let result = try await DraftStore.shared.saveAsync(
-                draft, epoch: authority.instanceEpoch,
-                expectedPredecessor: authority.instanceEpoch)
-            guard result == .applied else {
-                logRestore("kept draft save not applied: \(authority.draftId)")
-                return false
-            }
-        } catch {
-            logRestore("kept draft save failed: \(authority.draftId) \(error)")
-            return false
-        }
-        let admitted = await AccountManager.shared.queueDraftSave(
-            draftId: authority.draftId, accountId: authority.accountId)
-        if !admitted { logRestore("kept draft Drafts admission failed: \(authority.draftId)") }
-        return admitted
-    }
-
-    private static func logRestore(_ message: String) {
-        guard DebugModeManager.isLoggingEnabled() else { return }
-        BackgroundSyncLogger.logDebug("[UndoSend] \(message)")
     }
 
     /// The ONE string for "the cancellation was not confirmed, so nothing was

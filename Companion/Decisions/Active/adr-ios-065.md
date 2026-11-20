@@ -4,15 +4,27 @@
 **Date:** 2026-07-26. **Spec:** the close-state design.
 
 **Status:** **Superseded on v3 by saving the draft when Undo Send is confirmed (#1086).** Why: the
-email returns to Drafts at once, as most mail clients do, so no close prompt is needed. Once Undo's
-cancellation is confirmed (the Outbox row is gone), `PendingSendService.undoAndReturnToDrafts` saves
-the kept Draft row through the normal draft save (the row write at the row's own generation, then
-`AccountManager.queueDraftSave`) BEFORE the compose reopens. The Drafts entry exists and the server
-copy is queued, carrying the words that were sent, even over an older server copy. Closing without
-typing just closes; the app ending while the reopened compose is open loses nothing; editing
-afterwards is editing an ordinary draft. The save runs at the row's own epoch, so it neither rotates
-nor re-mints it (ADR-IOS-070 item 1). The close prompt and its wording are unchanged. Pinned by
-`UndoSendReturnsToDraftsTests`. The text below is the original 2026-07-26 decision, kept as written.
+email returns to Drafts at once, as most mail clients do, so no close prompt is needed.
+- `PendingSendService.undo()`'s confirmed arm calls
+  `AccountManager.discardOutboxMessageReturningDraftConfirmed`, which in ONE synchronous write (the Undo
+  tap's own turn, before the drain's claim) cancels the held Outbox row and, in a savepoint, saves the
+  kept row at its own generation (`DraftStore.admitSave` with that generation as both new and expected,
+  so it neither rotates nor is re-minted) and admits it to Drafts (`admitDraftToDrafts`, the database
+  half of `queueDraftSave`). No committed state has the Outbox row gone and the message half-returned.
+- The Drafts entry and the server save carry the words that were sent, also over an older server copy.
+  Closing without typing just closes; editing afterwards is editing an ordinary draft.
+- If the savepoint fails, the cancellation still commits and the compose reopens as unsaved
+  (`ReopenSnapshot.returnedToDrafts == false` -> `prefillTreatAsUnsavedChanges`, whose empty baseline is
+  `ComposeDraftGuards.baseline`), so Close shows the existing save prompt. A failure followed by the
+  process ending before the user acts is tracked as a P4 to measure (#1091).
+- A draft already uploaded keeps its one Drafts entry: the admission updates the entry under the row's
+  server id (the same exact header id `queueDraftDelete` derives) instead of adding a placeholder. This
+  also fixes the duplicate on an offline edit-save. Gmail's uploaded entry is keyed by the contained
+  message id, which the row does not store, so Gmail still gets a placeholder (#1094).
+- The close prompt and its wording are unchanged. Pinned by `UndoSendReturnsToDraftsTests` and
+  `UploadedDraftSingleEntryTests`.
+
+The text below is the original 2026-07-26 decision, kept as written.
 
 **Context.** After Undo Send, closing compose without typing **silently discarded the user's draft**. Send initiation removes the Drafts header and admits a `.deleteDraft` for the server copy; nothing restored either. `UndoReopenCompose` passes `prefillTreatAsUnsavedChanges: true` AND `prefillDraftId`, but with the retained row present the row-load branch snapshotted the loaded content as baseline and returned before reaching the guard honouring that flag — so `hasChanges` was false and the close resolved to `.dismiss`.
 

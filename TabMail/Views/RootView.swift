@@ -376,10 +376,8 @@ struct RootView: View {
                 PendingSendToast(
                     pending: pending,
                     onUndo: {
-                        Task {
-                            if let snapshot = await pendingSendService.undoAndReturnToDrafts() {
-                                reopenSnapshot = snapshot
-                            }
+                        if let snapshot = pendingSendService.undo() {
+                            reopenSnapshot = snapshot
                         }
                     },
                     onDismiss: { pendingSendService.dismiss() }
@@ -450,8 +448,9 @@ struct RootView: View {
         // Undo-Send reopen: the Outbox cancellation was confirmed and the Draft
         // row remains durable. UndoReopenCompose resolves the snapshot's exact
         // owner/generation authority and binds the fresh ComposeView to that row;
-        // `undoAndReturnToDrafts` has already saved that row to Drafts, so the
-        // compose edits an ordinary draft.
+        // `PendingSendService.undo()` already returned that row to Drafts in the
+        // cancellation's own write, or reports that it did not (the compose then
+        // opens as unsaved).
         .fullScreenCover(item: $reopenSnapshot) { snapshot in
             UndoReopenCompose(snapshot: snapshot)
         }

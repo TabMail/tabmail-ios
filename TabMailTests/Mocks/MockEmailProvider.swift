@@ -437,8 +437,12 @@ actor MockEmailProvider: EmailProvider {
     let saveDraftResult: DraftSaveOutcome
     let saveDraftThrows: Error?
 
+    /// Every draft payload `saveDraft` was given, with the server copy it named.
+    var savedDraftPayloads: [(draft: DraftMessage, existingIdentity: DraftDeleteIdentity?)] = []
+
     func saveDraft(_ draft: DraftMessage, existingIdentity: DraftDeleteIdentity?, draftsFolderPath: String) async throws -> DraftSaveOutcome {
         callLog.append("saveDraft(existingIdentity:\(String(describing: existingIdentity)),draftsFolderPath:\(draftsFolderPath))")
+        savedDraftPayloads.append((draft, existingIdentity))
         if let saveDraftHook { await saveDraftHook() }
         if let error = saveDraftThrows { throw error }
         return saveDraftResult

@@ -2517,10 +2517,7 @@ extension AccountManager {
 
     /// Look up the Drafts folder path for an account.
     func draftsFolderPath(accountId: String) async throws -> String {
-        try await dbPool.read { db in
-            try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.drafts.rawValue)
-                .fetchOne(db)?.path ?? "Drafts"
-        }
+        try await dbPool.read { db in try Self.draftsFolderPath(db: db, accountId: accountId) }
     }
 
     /// Queue a draft save to the server's Drafts folder via PendingOperation.
@@ -2529,115 +2526,155 @@ extension AccountManager {
     @discardableResult
     func queueDraftSave(draftId: String, accountId: String) async -> Bool {
         do {
-            let folderPath = try await draftsFolderPath(accountId: accountId)
-            let ftsInfo = try await dbPool.write {
-                db -> (record: FTSHeaderRecord, bodyText: String)? in
-                guard let draft = try Draft.fetchOne(db, key: draftId),
-                      draft.accountId == accountId,
-                      let instanceEpoch = draft.instanceEpoch,
-                      !instanceEpoch.isEmpty else {
-                    return nil
-                }
-
-                let folderId = "\(accountId):\(folderPath)"
-                let placeholderMessageId = PendingOperation.draftPlaceholderMessageId(
-                    draftId: draft.id, instanceEpoch: instanceEpoch)
-                let placeholderHeaderId = PendingOperation.draftPlaceholderHeaderPK(
-                    accountId: accountId,
-                    draftsFolderPath: folderPath,
-                    draftId: draft.id,
-                    instanceEpoch: instanceEpoch)
-                let account = try Account.fetchOne(db, key: accountId)
-                let senderEmail = account?.emailAddress ?? accountId
-                let senderName = account?.displayName ?? senderEmail
-                let snippet = EmailFilter.snippetFromPlainText(draft.body)
-                // Header text the Drafts list, search and Reply All read: only the
-                // entries that are addresses, each written to read back as itself
-                // (ADR-IOS-092). The draft keeps every entry as written.
-                let to = RecipientEntry(draft.toArray).headerText
-                let cc = RecipientEntry(draft.ccArray).headerText
-                let bcc = RecipientEntry(draft.bccArray).headerText
-
-                var header = try MessageHeader.fetchOne(db, key: placeholderHeaderId)
-                    ?? MessageHeader(
-                        messageId: placeholderMessageId,
-                        subject: draft.subject,
-                        from: senderName,
-                        fromAddress: senderEmail,
-                        to: to,
-                        date: Date(timeIntervalSince1970: draft.updatedAt),
-                        snippet: snippet,
-                        folderId: folderId,
-                        accountId: accountId,
-                        folderPath: folderPath,
-                        isInInbox: false)
-                header.subject = draft.subject
-                header.to = to
-                header.cc = cc
-                header.bcc = bcc
-                header.snippet = snippet
-                header.date = Date(timeIntervalSince1970: draft.updatedAt)
-                // On a date-windowed provider, sync judges this placeholder stale
-                // only when its provider date is at or above the oldest draft on
-                // a partial Drafts page, which holds the newest drafts. Following
-                // each save keeps it there; left at its first save, it falls
-                // below that page once enough newer drafts exist and is not
-                // reconciled away while that lasts.
-                header.providerDate = header.date
-                header.isRead = true
-                header.observedUidValidity = nil
-                try header.save(db)
-                try MessageBody(
-                    contentKey: ContentKey(rawValue: placeholderHeaderId),
-                    htmlContent: MessageBody.plainTextToHTML(draft.body)
-                ).save(db)
-
-                var saveDraftOp = PendingOperation.draftSave(
-                    draftId: draft.id,
-                    accountId: accountId,
-                    folderPath: folderPath,
-                    instanceEpoch: instanceEpoch)
-                try saveDraftOp.insert(db)
-
-                return (
-                    FTSHeaderRecord(
-                        contentKey: ContentKey(rawValue: placeholderHeaderId),
-                        headerId: placeholderHeaderId,
-                        messageId: placeholderMessageId,
-                        subject: draft.subject,
-                        from: "\(senderName) <\(senderEmail)>",
-                        to: to,
-                        cc: cc,
-                        bcc: bcc,
-                        dateMs: Int64(draft.updatedAt * 1000),
-                        folderId: folderId),
-                    draft.body)
+            let admission = try await dbPool.write { db in
+                try Self.admitDraftToDrafts(db: db, draftId: draftId, accountId: accountId)
             }
-
-            guard let ftsInfo else { return false }
-            do {
-                _ = try await SearchIndex.shared.indexHeaders([ftsInfo.record])
-                if !ftsInfo.bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    _ = try await SearchIndex.shared.updateBodies([(
-                        contentKey: ftsInfo.record.contentKey,
-                        body: ftsInfo.bodyText)])
-                }
-            } catch {
-                BackgroundSyncLogger.logDebug("[Queue] WARNING: FTS indexing failed for draft \(ftsInfo.record.headerId): \(error)")
-            }
-            try? await dbPool.write { db in
-                try db.execute(
-                    sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
-                    arguments: [ftsInfo.record.headerId])
-            }
-            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-            Task { await drainPendingQueue() }
+            guard let admission else { return false }
+            await finishDraftsAdmission(admission)
             return true
         } catch {
             BackgroundSyncLogger.logDebug("[Queue] ERROR: queueDraftSave failed: \(error)")
             return false
         }
     }
+
+    /// What one Drafts admission wrote, for the work that follows its commit.
+    struct DraftsAdmission: Sendable {
+        let record: FTSHeaderRecord
+        let bodyText: String
+    }
+
+    /// The Drafts folder path for an account, inside a transaction.
+    static func draftsFolderPath(db: Database, accountId: String) throws -> String {
+        try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.drafts.rawValue)
+            .fetchOne(db)?.path ?? "Drafts"
+    }
+
+    /// The database half of `queueDraftSave`, so it can join a larger write:
+    /// the row's Drafts entry (its uploaded entry when one exists under the
+    /// row's server id, otherwise the optimistic placeholder at the row's own
+    /// generation) with its body, and the `.saveDraft` operation that pushes it.
+    /// `nil` when the row is absent, owned by another account, or has no
+    /// generation.
+    static func admitDraftToDrafts(db: Database, draftId: String, accountId: String) throws -> DraftsAdmission? {
+        let folderPath = try draftsFolderPath(db: db, accountId: accountId)
+        guard let draft = try Draft.fetchOne(db, key: draftId),
+              draft.accountId == accountId,
+              let instanceEpoch = draft.instanceEpoch,
+              !instanceEpoch.isEmpty else {
+            return nil
+        }
+
+        let folderId = "\(accountId):\(folderPath)"
+        let placeholderMessageId = PendingOperation.draftPlaceholderMessageId(
+            draftId: draft.id, instanceEpoch: instanceEpoch)
+        let placeholderHeaderId = PendingOperation.draftPlaceholderHeaderPK(
+            accountId: accountId,
+            draftsFolderPath: folderPath,
+            draftId: draft.id,
+            instanceEpoch: instanceEpoch)
+        let account = try Account.fetchOne(db, key: accountId)
+        let senderEmail = account?.emailAddress ?? accountId
+        let senderName = account?.displayName ?? senderEmail
+        let snippet = EmailFilter.snippetFromPlainText(draft.body)
+        // Header text the Drafts list, search and Reply All read: only the
+        // entries that are addresses, each written to read back as itself
+        // (ADR-IOS-092). The draft keeps every entry as written.
+        let to = RecipientEntry(draft.toArray).headerText
+        let cc = RecipientEntry(draft.ccArray).headerText
+        let bcc = RecipientEntry(draft.bccArray).headerText
+
+        // A draft already uploaded has its Drafts entry under the server copy's
+        // own key once the push completes (`DraftStore.applyPushCompletion`), the
+        // exact provider-native header id `queueDraftDelete` also derives from
+        // `serverDraftId`. Update that entry rather than adding a placeholder
+        // beside it. Where the row's id does not name the moved entry (Gmail, whose
+        // entry is keyed by the contained message id), nothing matches and the
+        // placeholder is used as before.
+        let nativeHeaderId = draft.serverDraftId.flatMap { $0.isEmpty ? nil : "\(accountId):\(folderPath):\($0)" }
+        let nativeHeader = try nativeHeaderId.flatMap { try MessageHeader.fetchOne(db, key: $0) }
+        let entryHeaderId = nativeHeader?.id ?? placeholderHeaderId
+
+        var header = try nativeHeader
+            ?? MessageHeader.fetchOne(db, key: placeholderHeaderId)
+            ?? MessageHeader(
+                messageId: placeholderMessageId,
+                subject: draft.subject,
+                from: senderName,
+                fromAddress: senderEmail,
+                to: to,
+                date: Date(timeIntervalSince1970: draft.updatedAt),
+                snippet: snippet,
+                folderId: folderId,
+                accountId: accountId,
+                folderPath: folderPath,
+                isInInbox: false)
+        header.subject = draft.subject
+        header.to = to
+        header.cc = cc
+        header.bcc = bcc
+        header.snippet = snippet
+        header.date = Date(timeIntervalSince1970: draft.updatedAt)
+        // On a date-windowed provider, sync judges this placeholder stale
+        // only when its provider date is at or above the oldest draft on
+        // a partial Drafts page, which holds the newest drafts. Following
+        // each save keeps it there; left at its first save, it falls
+        // below that page once enough newer drafts exist and is not
+        // reconciled away while that lasts.
+        header.providerDate = header.date
+        header.isRead = true
+        if nativeHeader == nil { header.observedUidValidity = nil }
+        try header.save(db)
+        try MessageBody(
+            contentKey: ContentKey(rawValue: entryHeaderId),
+            htmlContent: MessageBody.plainTextToHTML(draft.body)
+        ).save(db)
+
+        var saveDraftOp = PendingOperation.draftSave(
+            draftId: draft.id,
+            accountId: accountId,
+            folderPath: folderPath,
+            instanceEpoch: instanceEpoch)
+        try saveDraftOp.insert(db)
+
+        return DraftsAdmission(
+            record: FTSHeaderRecord(
+                contentKey: ContentKey(rawValue: entryHeaderId),
+                headerId: entryHeaderId,
+                messageId: header.messageId,
+                subject: draft.subject,
+                from: "\(senderName) <\(senderEmail)>",
+                to: to,
+                cc: cc,
+                bcc: bcc,
+                dateMs: Int64(draft.updatedAt * 1000),
+                folderId: folderId),
+            bodyText: draft.body)
+    }
+
+    /// The work after a Drafts admission commits: search indexing, then the
+    /// header becomes visible, then the queue drains.
+    func finishDraftsAdmission(_ admission: DraftsAdmission) async {
+        let ftsInfo = admission
+        do {
+            _ = try await SearchIndex.shared.indexHeaders([ftsInfo.record])
+            if !ftsInfo.bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                _ = try await SearchIndex.shared.updateBodies([(
+                    contentKey: ftsInfo.record.contentKey,
+                    body: ftsInfo.bodyText)])
+            }
+        } catch {
+            BackgroundSyncLogger.logDebug("[Queue] WARNING: FTS indexing failed for draft \(ftsInfo.record.headerId): \(error)")
+        }
+        try? await dbPool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
+                arguments: [ftsInfo.record.headerId])
+        }
+        NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+        Task { await drainPendingQueue() }
+    }
+
     /// Queue a draft delete from the server's Drafts folder via PendingOperation.
     /// Optimistically removes the MessageHeader from the Drafts folder immediately.
     ///
