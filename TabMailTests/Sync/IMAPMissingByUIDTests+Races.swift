@@ -120,15 +120,42 @@ extension IMAPMissingByUIDTests {
                                    arguments: [fresh, folderId])
                 }
             }
+            let stateBefore = try w.folder().catchUpState
             let outcome = await w.engine.applyCatchUpResult(
                 result, windowMode: .uid, readStartedAt: read.readStartedAt, selfHealOwedAtRead: read.owedAtRead)
             if resetCompletes {
                 #expect(outcome == .skipped, "#1062: nothing read under the old epoch applies")
+                #expect(try w.folder().catchUpState == stateBefore, "#1062: no catch-up state from the old epoch is written")
                 let heldAfter = try w.held()
                 #expect(heldAfter.isEmpty, "#1062: no row from the old numbering enters the folder: \(heldAfter)")
             } else {
                 #expect(try w.held().contains(12), "#1062 control: under the same epoch the load lands")
             }
+        }
+    }
+
+    @Test("A UIDVALIDITY purge that has run but not yet stamped the new epoch, between the read and the apply: nothing is inserted and no state is written")
+    @MainActor
+    func purgeInFlightBetweenReadAndApplyWritesNothing() async throws {
+        try await Self.withWorld("c1-pending", server: Array(1...20) + Array(1001...1060), local: Array(1...20) + Array(1011...1060)) { w in
+            try await w.dropLocal([12])
+            try await w.markOwed()
+            let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages))
+            let result = try #require(read.results.first)
+            #expect(result.loaded.contains { $0.id == "12" }, "setup: the read loaded the missing message")
+            // The purge step ran: rows and state gone, the reset marker set, the
+            // stored epoch still the OLD one (the new stamp comes later).
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try db.execute(sql: "DELETE FROM messageHeader WHERE folderId = ?", arguments: [folderId])
+                try db.execute(sql: "UPDATE folder SET catchUpState = NULL, uidValidityResetPendingAt = ? WHERE id = ?",
+                               arguments: [Date(), folderId])
+            }
+            let outcome = await w.engine.applyCatchUpResult(
+                result, windowMode: .uid, readStartedAt: read.readStartedAt, selfHealOwedAtRead: read.owedAtRead)
+            #expect(outcome == .skipped, "#1062: nothing read before the purge applies")
+            #expect(try w.held().isEmpty, "#1062: no row is inserted during the purge: \(try w.held())")
+            #expect(try w.folder().catchUpState == nil, "#1062: no catch-up state is written over the purge")
         }
     }
 
