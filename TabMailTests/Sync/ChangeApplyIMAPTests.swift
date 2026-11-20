@@ -140,7 +140,7 @@ struct ChangeApplyIMAPTests {
     }
 
     static func setCompletedCatchUp(_ w: Base.World, _ folderIds: [String]) throws {
-        let completed = IMAPCatchUpState(epoch: 1, completionStamp: 5, lastCompletedAt: Date(), listing: nil, createdAt: nil)
+        let completed = IMAPCatchUpState(epoch: 1, completionStamp: 5, lastCompletedAt: Date(), listing: nil)
         try w.pool.write { db in
             for id in folderIds {
                 try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [completed.encoded(), id])

@@ -67,13 +67,13 @@ struct OutlookCatchUpTests {
     }
 
     /// A budget that never runs out (the Graph allowance still bounds a call).
-    static func unlimited(expensive: Bool = false, storageLimit: Bool = false, at clock: @escaping @Sendable () -> Date = { Date() }) -> CatchUpContext {
-        CatchUpContext(isExpensiveNetwork: expensive, deadline: .distantFuture, clock: clock, storageLimitInForce: storageLimit)
+    static func unlimited(storageLimit: Bool = false, at clock: @escaping @Sendable () -> Date = { Date() }) -> CatchUpContext {
+        CatchUpContext(deadline: .distantFuture, clock: clock, storageLimitInForce: storageLimit)
     }
 
     /// A slice of at most `requests` requests.
     static func requests(_ requests: Int) -> CatchUpContext {
-        CatchUpContext(isExpensiveNetwork: false, deadline: .distantFuture, clock: { Date() }, maxRequests: requests)
+        CatchUpContext(deadline: .distantFuture, clock: { Date() }, maxRequests: requests)
     }
 
     /// One catch-up call for `paths`, applied by the engine. True on progress.
@@ -357,6 +357,50 @@ struct OutlookCatchUpTests {
             #expect(try await Self.untilListed(w, engine, w.archive) != nil)
 
             #expect(try w.row("x3", in: w.archive) != nil, "the passed-over message never loaded")
+        }
+    }
+
+    // MARK: - Scans never wait for a download gate (#1063)
+
+    /// A tracking Archive with no completed listing and an unfinished walk: `a-1`
+    /// was read and flagged on the server while the phone holds a stale state,
+    /// `a-2` sits inside the local range with no local row (the scan's direct
+    /// load), and `a-old` is older than every local row (the walk's). Under every
+    /// download gate, in the worker's cycle and in the background job, the first
+    /// listing runs in that one call, the state is healed and the missing message
+    /// arrives; the walk stays held (except the job under a low battery, which
+    /// has no battery gate).
+    @Test("A due Outlook scan runs under every download gate, in the worker and the job; a missing message loads; the walk stays held",
+          arguments: DownloadGate.allCases, BackfillRunner.allCases)
+    func scanRunsUnderEveryDownloadGate(gate: DownloadGate, runner: BackfillRunner) async throws {
+        let c = Clock()
+        try await Self.withWorld(seeds: [
+            Self.seed("a-1", in: Self.archive, at: c.daysAgo(5), isRead: true, isFlagged: true),
+            Self.seed("a-2", in: Self.archive, at: c.daysAgo(4)),
+            Self.seed("a-3", in: Self.archive, at: c.daysAgo(3)),
+            Self.seed("a-old", in: Self.archive, at: c.daysAgo(60)),
+        ], heldSince: nil, walkComplete: false) { w, engine in
+            try w.insertRow("a-1", in: w.archive, date: c.daysAgo(5), isRead: true, isFlagged: true)
+            try w.insertRow("a-3", in: w.archive, date: c.daysAgo(3))
+            try await w.baselineAll()
+            // A change the delta never delivered: the phone holds a stale state.
+            try Self.setLocal(w, "a-1", in: w.archive, isRead: false, isFlagged: false)
+            #expect(try Self.state(w, w.archive) == nil, "precondition: no listing yet")
+            let listingsBefore = w.server.requestCounts().listings
+
+            try await DownloadGateHarness.runOnce(engine, account: try w.account(), gate: gate, runner: runner)
+            let walkHeld = !DownloadGateHarness.walkExpected(gate, runner)
+
+            let row = try #require(try w.row("a-1", in: w.archive))
+            #expect(row.isRead && row.isFlagged, "the scan healed the stale state under \(gate)")
+            #expect(try w.row("a-2", in: w.archive) != nil, "a listed message no local row held loads with the scan under \(gate)")
+            if walkHeld {
+                #expect(w.server.requestCounts().listings == listingsBefore, "the held walk listed no page")
+                #expect(try w.row("a-old", in: w.archive) == nil, "the held walk loaded nothing older than every local row")
+            } else {
+                #expect(w.server.requestCounts().listings > listingsBefore, "the allowed walk listed a page")
+                #expect(try w.row("a-old", in: w.archive) != nil, "the allowed walk loaded the message older than every local row")
+            }
         }
     }
 
@@ -755,63 +799,6 @@ struct OutlookCatchUpTests {
         }
     }
 
-    /// 28, on mobile data: the listing's wait and the first read's wait both
-    /// count from first sight, so they run side by side even while the gate
-    /// holds. Once both bounds have passed, the listing waits only for the first
-    /// read itself, and starts in the first cycle after it completes, not a
-    /// whole wait later.
-    @Test("28: on mobile data the listing's and the first read's waits run side by side; the listing starts right after the first read")
-    func mobileWaitsRunSideBySide() async throws {
-        let c = Clock()
-        try await Self.withWorld(seeds: [Self.seed("a-1", in: Self.archive, at: c.daysAgo(5))]) { w, engine in
-            try w.insertRow("a-1", in: w.archive, date: c.daysAgo(5))
-            let t0 = Date()
-            let wait = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
-            func mobile(_ t: Date) -> CatchUpContext { Self.unlimited(expensive: true, at: { t }) }
-
-            // First sight, by the catch-up and by the change reader, on mobile data.
-            await Self.pass(w, engine, [w.archive], context: mobile(t0))
-            try await w.read(now: t0, expensive: true)
-            #expect(try w.cursor(w.archive)?.phase != .tracking, "precondition: the first read waits on mobile data")
-            #expect(try Self.state(w, w.archive)?.createdAt == t0, "the listing's wait did not start at first sight while the gate held")
-
-            // Both bounds have passed; the first read has not run yet.
-            let t1 = t0.addingTimeInterval(wait)
-            await Self.pass(w, engine, [w.archive], context: mobile(t1))
-            #expect(w.server.requestCounts().dateFilteredListings == 0, "a listing started before the folder's first read")
-            var reads = 0
-            while try w.cursor(w.archive)?.phase != .tracking, reads < 10 {
-                try await w.read(now: t1, expensive: true)
-                reads += 1
-            }
-            #expect(try w.cursor(w.archive)?.phase == .tracking, "precondition: past its bound the first read ran on mobile data")
-
-            await Self.pass(w, engine, [w.archive], context: mobile(t1))
-            #expect(w.server.requestCounts().dateFilteredListings > 0, "the listing waited again after the first read instead of starting")
-        }
-    }
-
-    /// On an expensive network the first listing waits up to the wait bound
-    /// from the catch-up's first sight of the folder.
-    @Test("On an expensive network a folder's first listing waits until the bound, counted from first sight")
-    func expensiveNetworkWaits() async throws {
-        let c = Clock()
-        try await Self.withWorld(seeds: [Self.seed("a-1", in: Self.archive, at: c.daysAgo(5))]) { w, engine in
-            try w.insertRow("a-1", in: w.archive, date: c.daysAgo(5))
-            try await w.baselineAll()
-            let t0 = Date()
-            let before = w.server.requestCounts().total
-            await Self.pass(w, engine, [w.archive], context: Self.unlimited(expensive: true, at: { t0 }))
-            #expect(try Self.state(w, w.archive)?.createdAt == t0, "first sight was not recorded")
-            let wait = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
-            await Self.pass(w, engine, [w.archive], context: Self.unlimited(expensive: true, at: { t0.addingTimeInterval(wait - 1) }))
-            #expect(w.server.requestCounts().total == before, "a request went out on an expensive network before the bound")
-
-            await Self.pass(w, engine, [w.archive], context: Self.unlimited(expensive: true, at: { t0.addingTimeInterval(wait) }))
-            #expect(w.server.requestCounts().dateFilteredListings > 0, "no listing after the bound")
-        }
-    }
-
     /// A Settings reset clears the walk and the change bookmark but not the
     /// catch-up state. Once the folder tracks again and its walk completes, a
     /// new listing runs, and heals what the re-download left.
@@ -868,13 +855,13 @@ struct OutlookCatchUpTests {
 
     // MARK: - The plan
 
-    @Test("The per-folder plan: expensive wait, a listing in progress, the tracking gate, and the three reasons to list")
+    @Test("The per-folder plan: a listing in progress, the tracking gate, and the three reasons to list")
     func plan() {
         let now = Date()
-        func plan(_ s: ExchangeCatchUpState?, gate: Bool = true, walk: Bool = true, expensive: Bool = false) -> ExchangeProvider.CatchUpPlan {
-            ExchangeProvider.catchUpPlan(state: s, trackingGateOpen: gate, walkComplete: walk, isExpensiveNetwork: expensive, now: now)
+        func plan(_ s: ExchangeCatchUpState?, gate: Bool = true, walk: Bool = true) -> ExchangeProvider.CatchUpPlan {
+            ExchangeProvider.catchUpPlan(state: s, trackingGateOpen: gate, walkComplete: walk)
         }
-        let fresh = ExchangeCatchUpState(createdAt: now)
+        let fresh = ExchangeCatchUpState(lastAttemptAt: now)
         var done = fresh
         done.lastCompletedAt = now
         var lapsed = done
@@ -891,6 +878,5 @@ struct OutlookCatchUpTests {
         #expect(plan(lapsed) == .list(.init(lapseCountAtStart: 1)), "a lapse lists again")
         #expect(plan(walkSeen) == .list(.init()), "a walk completed since lists again")
         #expect(plan(walkSeen, walk: false) == .none, "not while the walk is unfinished")
-        #expect(plan(fresh, expensive: true) == .none, "an expensive network waits")
     }
 }

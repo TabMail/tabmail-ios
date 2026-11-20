@@ -110,7 +110,8 @@ actor SyncEngine {
     ///   .aggressive — plugged in. Full throughput, UI stays responsive (priority lock).
     ///   .normal     — on battery. Moderate progress, reasonable drain.
     ///   .low        — thermal throttling. Minimal resource usage.
-    /// Note: Low Power Mode and battery < 20% pause backfill entirely (getShouldPauseBackfill).
+    /// Note: Low Power Mode and battery < 20% hold only the walk; the folder scans
+    /// still run (backfillWalkAllowed, #1063).
     /// Reads UIDevice state via MainActor hop — always returns latest power state.
     func getBackfillProfile() async -> BackfillProfile {
         await MainActor.run {
@@ -128,20 +129,50 @@ actor SyncEngine {
         }
     }
 
-    /// Whether backfill should be paused entirely.
-    /// Pauses when: battery < 20% (not charging), or Low Power Mode enabled.
-    /// Fast sync mode bypasses this gate entirely.
-    /// Reads UIDevice state via MainActor hop.
-    func getShouldPauseBackfill() async -> Bool {
-        await MainActor.run {
-            let isFastSync = AccountManagerState.shared.fastSyncModeActive
-            if isFastSync { return false }
-            let isOnPower = UIDevice.current.batteryState == .charging || UIDevice.current.batteryState == .full
-            if ProcessInfo.processInfo.isLowPowerModeEnabled && !isOnPower { return true }
-            let level = UIDevice.current.batteryLevel
-            // batteryLevel returns -1 if monitoring not enabled (shouldn't happen — set in TabMailApp.init)
-            return !isOnPower && level >= 0 && level < 0.20
+    /// The device's power state for the backfill worker's gates, read once at the
+    /// top of each cycle (MainActor hop): fast sync, Low Power Mode, external power
+    /// and the battery level (-1 when unknown).
+    func backfillPowerState() async -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
+        #if DEBUG
+        if let state = Self.backfillPowerStateForTesting.withLock({ $0 }) { return state }
+        #endif
+        return await MainActor.run {
+            let battery = UIDevice.current.batteryState
+            return (AccountManagerState.shared.fastSyncModeActive, ProcessInfo.processInfo.isLowPowerModeEnabled,
+                    battery == .charging || battery == .full, UIDevice.current.batteryLevel)
         }
+    }
+
+    #if DEBUG
+    /// Test seams for the backfill worker, nil (the default) in normal use: the
+    /// power state `backfillPowerState` returns instead of the device's, and the
+    /// wait between cycles, called with its length in seconds instead of
+    /// sleeping. They exist because a simulator cannot enter Low Power Mode and
+    /// no test can wait out the worker's pauses.
+    nonisolated static let backfillPowerStateForTesting =
+        Mutex<(fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float)?>(nil)
+    nonisolated static let backfillSleepForTesting = Mutex<(@Sendable (TimeInterval) async -> Void)?>(nil)
+    #endif
+
+    /// The worker's wait between cycles.
+    nonisolated static func backfillSleep(seconds: TimeInterval) async {
+        #if DEBUG
+        if let sleeper = backfillSleepForTesting.withLock({ $0 }) { await sleeper(seconds); return }
+        #endif
+        try? await Task.sleep(for: .seconds(seconds))
+    }
+
+    /// The foreground worker's walk decision for one cycle, from one snapshot.
+    /// The cycle always runs, so the folder scans (the catch-up) always run; the
+    /// gates hold only the walk, which downloads mail (#1063). Low Power Mode off
+    /// power, or battery below 20% off power, holds it (fast sync lifts both), and
+    /// so does the Wi-Fi-only setting on an expensive network.
+    nonisolated static func backfillWalkAllowed(
+        fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float, wifiOnly: Bool, expensive: Bool
+    ) -> Bool {
+        // batteryLevel is -1 when monitoring is off (it is set in TabMailApp.init).
+        let powerHeld = !fastSync && !onPower && (lowPowerMode || (batteryLevel >= 0 && batteryLevel < 0.20))
+        return !powerHeld && !(wifiOnly && expensive)
     }
 
     func register(accountId: String, provider: any EmailProvider, workQueue: ProviderWorkQueue) {

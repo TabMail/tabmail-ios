@@ -106,9 +106,9 @@ struct IMAPCatchUpTests {
         await world.engine.runCatchUp(provider: world.provider, folderIds: [world.folderId], context: context)
     }
 
-    /// A non-expensive network and a budget that never runs out.
-    private static func unlimited(expensive: Bool = false) -> CatchUpContext {
-        CatchUpContext(isExpensiveNetwork: expensive, deadline: .distantFuture, clock: { Date() })
+    /// A budget that never runs out.
+    private static func unlimited() -> CatchUpContext {
+        CatchUpContext(deadline: .distantFuture, clock: { Date() })
     }
 
     /// A budget of exactly ONE listing request per pass: the clock advances one
@@ -117,7 +117,7 @@ struct IMAPCatchUpTests {
         let start = Date()
         let fetchesBefore = fetchCount(server)
         return CatchUpContext(
-            isExpensiveNetwork: false, deadline: start.addingTimeInterval(1),
+            deadline: start.addingTimeInterval(1),
             clock: { start.addingTimeInterval(Double(fetchCount(server) - fetchesBefore)) })
     }
 
@@ -171,9 +171,10 @@ struct IMAPCatchUpTests {
 
     /// The step runs in the backfill worker (#766): after one `fullSync`, a
     /// foreground backfill call (`runBackfill`, the worker's cycle) leaves every
-    /// syncable folder with a known epoch with a completed catch-up state. Enabled
-    /// only on a non-expensive network, because the first listing of a folder is a
-    /// full check, which waits for one. *Superseded:* "The step sits at the end of
+    /// syncable folder with a known epoch with a completed catch-up state.
+    /// *Superseded (#1063):* "Enabled only on a non-expensive network, because the
+    /// first listing of a folder is a full check, which waits for one."
+    /// *Superseded:* "The step sits at the end of
     /// the real full sync: after one `fullSync`, every syncable folder [...]".
     @Test("A backfill cycle after the full sync runs the catch-up")
     func backfillCycleRunsTheCatchUp() async throws {
@@ -679,37 +680,13 @@ struct IMAPCatchUpTests {
         }
     }
 
-    @Test("The daily check waits for a non-expensive network; a MODSEQ change does not")
-    func dailyCheckDeferredOnExpensiveNetwork() async throws {
-        try await Self.withWorld("cu-expensive", serverUIDs: [1, 2], localUIDs: [1, 2]) { world in
-            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
-            let modseq = try #require(try Self.storedModSeq(world))
-            // Daily check overdue, nothing else signals a change.
-            try Self.setState(IMAPCatchUpState(
-                epoch: Self.epoch, completionStamp: modseq,
-                lastCompletedAt: Date().addingTimeInterval(-2 * SyncConfig.catchUpFullCheckIntervalSeconds),
-                listing: nil), world)
-
-            await Self.pass(world, context: Self.unlimited(expensive: true))
-            #expect(Self.fetchCount(world.server) == 0, "the daily check does not run on an expensive network")
-
-            await Self.pass(world, context: Self.unlimited(expensive: false))
-            #expect(try Self.rows(world)["2"]?.isRead == true, "it runs on the next non-expensive pass")
-
-            // Now a real change: on an expensive network the MODSEQ evidence still lists.
-            world.server.setFlags(["\\Flagged"], in: Self.path, uid: 1)
-            try await Self.refreshModSeq(world)
-            await Self.pass(world, context: Self.unlimited(expensive: true))
-            #expect(try Self.rows(world)["1"]?.isFlagged == true)
-        }
-    }
-
-    /// The catch-up ignores the Wi-Fi-only setting but keeps IMAP's own network
-    /// rule (ADR-IOS-107 decision 2, 2026-11-12): on a cellular network with
-    /// Wi-Fi-only on, the backfill call the worker and the background job make
-    /// (walk held back) runs no daily full listing; a non-expensive network does.
-    @Test("With Wi-Fi-only on and only cellular, a backfill cycle runs no IMAP daily listing; a non-expensive network does")
-    func wifiOnlyCellularKeepsTheDailyRule() async throws {
+    /// The catch-up ignores the Wi-Fi-only setting and every other download gate
+    /// (ADR-IOS-107, #1063): on a cellular network with Wi-Fi-only on, the backfill
+    /// call the worker and the background job make (walk held back) runs the due
+    /// daily listing at once. *Superseded (#1063):* it ran no daily listing on
+    /// cellular and waited for a non-expensive network.
+    @Test("With Wi-Fi-only on and only cellular, a backfill cycle runs the due IMAP daily listing")
+    func wifiOnlyCellularRunsTheDailyListing() async throws {
         try await Self.withWorld("cu-wifi-only-cellular", serverUIDs: [1, 2], localUIDs: [1, 2]) { world in
             let accountId = world.accountId
             let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
@@ -725,17 +702,82 @@ struct IMAPCatchUpTests {
                 listing: nil)
             try Self.setState(overdue, world)
 
-            try await GmailCatchUpTests.withCellularAndWiFiOnly { () async throws in
+            try await DownloadGateHarness.withNetwork(expensive: true) { () async throws in
                 _ = await world.engine.runBackfill(account: account, walkAllowed: false)
-                #expect(Self.fetchCount(world.server) == 0, "no daily listing on cellular")
-                #expect(try Self.rows(world)["2"]?.isRead == false)
-                #expect(try Self.state(world) == overdue, "the daily check is still due")
-            }
-            try await Self.withNetwork(expensive: false) { () async throws in
-                _ = await world.engine.runBackfill(account: account)
-                #expect(try Self.rows(world)["2"]?.isRead == true, "the daily listing runs on a non-expensive network")
+                #expect(Self.fetchCount(world.server) > 0, "the daily listing runs on cellular")
+                #expect(try Self.rows(world)["2"]?.isRead == true, "the read reaches the device")
+                #expect(try Self.state(world) != overdue, "the daily check is no longer due")
             }
             await world.engine.remove(accountId: world.accountId)
+        }
+    }
+
+    // MARK: - Scans never wait for a download gate (#1063)
+
+    /// The daily check is due and the server marked UID 2 read; UID 1 is on the
+    /// server below every local row, so only the walk would load it. Under every
+    /// download gate, in the worker's cycle and in the background job, the daily
+    /// listing runs in that one call and the read reaches the device; the walk
+    /// stays held (except the job under a low battery, which has no battery gate).
+    @Test("A due IMAP scan runs under every download gate, in the worker and the job; the walk stays held",
+          arguments: DownloadGate.allCases, BackfillRunner.allCases)
+    func scanRunsUnderEveryDownloadGate(gate: DownloadGate, runner: BackfillRunner) async throws {
+        try await Self.withWorld("cu-gate-\(gate.rawValue)-\(runner.rawValue)", serverUIDs: [1, 2, 3], localUIDs: [2, 3]) { world in
+            let accountId = world.accountId
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+            await world.engine.register(
+                accountId: accountId, provider: world.provider,
+                workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
+            let modseq = try #require(try Self.storedModSeq(world))
+            // Daily check overdue, nothing else signals a change.
+            try Self.setState(IMAPCatchUpState(
+                epoch: Self.epoch, completionStamp: modseq,
+                lastCompletedAt: Date().addingTimeInterval(-2 * SyncConfig.catchUpFullCheckIntervalSeconds),
+                listing: nil), world)
+            let commandsBefore = world.server.recordedCommands().count
+
+            try await DownloadGateHarness.runOnce(world.engine, account: account, gate: gate, runner: runner)
+            let walkHeld = !DownloadGateHarness.walkExpected(gate, runner)
+            await world.engine.remove(accountId: accountId)
+
+            #expect(try Self.rows(world)["2"]?.isRead == true, "the scan applied the server's read under \(gate)")
+            let state = try Self.state(world)
+            #expect(state?.lastCompletedAt.map { $0 > Date().addingTimeInterval(-60) } == true, "the daily listing completed")
+            if walkHeld {
+                let searches = world.server.recordedCommands().dropFirst(commandsBefore)
+                    .filter { $0.uppercased().hasPrefix("UID SEARCH") }
+                #expect(searches.isEmpty, "the held walk sent no range SEARCH: \(searches)")
+                #expect(try Self.rows(world)["1"] == nil, "the held walk loaded nothing below the local rows")
+            } else {
+                let searches = world.server.recordedCommands().dropFirst(commandsBefore)
+                    .filter { $0.uppercased().hasPrefix("UID SEARCH") }
+                #expect(!searches.isEmpty, "the allowed walk sent its range SEARCH")
+                #expect(try Self.rows(world)["1"] != nil, "the allowed walk loaded the message below the local rows")
+            }
+        }
+    }
+
+    /// A folder the catch-up has never seen lists at once on an expensive network:
+    /// its first listing is a scan, not a download.
+    @Test("A folder never listed lists at once on an expensive network")
+    func firstListingRunsAtOnceOnAnExpensiveNetwork() async throws {
+        try await Self.withWorld("cu-first-on-cellular", serverUIDs: [1, 2], localUIDs: [1, 2]) { world in
+            let accountId = world.accountId
+            let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
+            await world.engine.register(
+                accountId: accountId, provider: world.provider,
+                workQueue: ProviderWorkQueue(provider: world.provider, maxConcurrency: 1))
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
+            #expect(try Self.state(world) == nil, "precondition: no state")
+
+            try await DownloadGateHarness.withNetwork(expensive: true) { () async throws in
+                _ = await world.engine.runBackfillCycle(account: account, walkAllowed: false)
+            }
+            await world.engine.remove(accountId: accountId)
+
+            #expect(try Self.rows(world)["2"]?.isRead == true, "the first listing ran on the expensive network")
+            #expect(try Self.state(world)?.lastCompletedAt != nil)
         }
     }
 
@@ -759,7 +801,7 @@ struct IMAPCatchUpTests {
             // One second per UID FETCH: a slice lists one range. The deadline is far
             // away, so only the removal can end the run before the second range.
             let run = SyncEngine.CatchUpRun(
-                isExpensiveNetwork: false, storageLimitInForce: false,
+                storageLimitInForce: false,
                 deadline: base.addingTimeInterval(1_000), sliceSeconds: 1, intervalSeconds: interval,
                 clock: { base.addingTimeInterval(Double(Self.fetchCount(server) - fetchesBefore)) })
             let engine = world.engine
@@ -787,31 +829,6 @@ struct IMAPCatchUpTests {
         }
     }
 
-    /// A device that is always on an expensive network (cellular, a hotspot, Low
-    /// Data Mode) must still get a full catch-up.
-    @Test("A folder never listed lists on an expensive network once it has waited long enough")
-    func expensiveNetworkWaitIsBounded() async throws {
-        try await Self.withWorld("cu-always-expensive", serverUIDs: [1, 2], localUIDs: [1, 2]) { world in
-            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2)
-
-            await Self.pass(world, context: Self.unlimited(expensive: true))
-            #expect(Self.fetchCount(world.server) == 0, "the first listing waits for a non-expensive network")
-            let waiting = try #require(try Self.state(world), "the first sight records when the wait began")
-            #expect(waiting.createdAt != nil && waiting.listing == nil && waiting.lastCompletedAt == nil)
-
-            await Self.pass(world, context: Self.unlimited(expensive: true))
-            #expect(Self.fetchCount(world.server) == 0, "and keeps waiting inside the limit")
-            #expect(try Self.state(world) == waiting, "without restarting the wait")
-
-            var waited = waiting
-            waited.createdAt = Date().addingTimeInterval(-SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds - 60)
-            try Self.setState(waited, world)
-            await Self.pass(world, context: Self.unlimited(expensive: true))
-            #expect(try Self.rows(world)["2"]?.isRead == true, "after the limit the network no longer holds the folder back")
-            #expect(try Self.state(world)?.lastCompletedAt != nil)
-        }
-    }
-
     @Test("The plan for a folder its change bookmark covers: listed only first, while a listing runs, or after a lapse (ADR-IOS-111)")
     func planTrackedFolder() {
         let now = Date()
@@ -820,28 +837,28 @@ struct IMAPCatchUpTests {
         typealias P = IMAPProvider
         func state(_ completed: Date?, lapses: Int? = nil, listed: Int? = nil,
                    listing: IMAPCatchUpState.Listing? = nil) -> IMAPCatchUpState {
-            var s = IMAPCatchUpState(epoch: 1, completionStamp: 5, lastCompletedAt: completed, listing: listing, createdAt: nil)
+            var s = IMAPCatchUpState(epoch: 1, completionStamp: 5, lastCompletedAt: completed, listing: listing)
             s.lapseCount = lapses
             s.listedLapseCount = listed
             return s
         }
         // Neither a moved MODSEQ nor the daily interval lists a tracked folder.
-        #expect(P.catchUpPlan(state: state(fresh), freshModSeq: 9, isExpensiveNetwork: false, now: now, isTracked: true) == .none)
-        #expect(P.catchUpPlan(state: state(stale), freshModSeq: 5, isExpensiveNetwork: false, now: now, isTracked: true) == .none)
+        #expect(P.catchUpPlan(state: state(fresh), freshModSeq: 9, now: now, isTracked: true) == .none)
+        #expect(P.catchUpPlan(state: state(stale), freshModSeq: 5, now: now, isTracked: true) == .none)
         // Its first listing still runs.
-        #expect(P.catchUpPlan(state: state(nil), freshModSeq: 5, isExpensiveNetwork: false, now: now, isTracked: true)
+        #expect(P.catchUpPlan(state: state(nil), freshModSeq: 5, now: now, isTracked: true)
                 == .list(.init(firstStamp: 5, nextUid: 1)))
         // A listing in progress continues.
         let resuming = IMAPCatchUpState.Listing(firstStamp: 3, nextUid: 2001)
-        #expect(P.catchUpPlan(state: state(fresh, listing: resuming), freshModSeq: 5, isExpensiveNetwork: false, now: now, isTracked: true)
+        #expect(P.catchUpPlan(state: state(fresh, listing: resuming), freshModSeq: 5, now: now, isTracked: true)
                 == .list(resuming))
         // A lapse after the last completed listing lists it, recording the lapse count it covers.
-        #expect(P.catchUpPlan(state: state(fresh, lapses: 2, listed: 1), freshModSeq: 5, isExpensiveNetwork: false, now: now, isTracked: true)
+        #expect(P.catchUpPlan(state: state(fresh, lapses: 2, listed: 1), freshModSeq: 5, now: now, isTracked: true)
                 == .list(.init(firstStamp: 5, nextUid: 1, lapseCountAtStart: 2)))
-        #expect(P.catchUpPlan(state: state(fresh, lapses: 2, listed: 2), freshModSeq: 5, isExpensiveNetwork: false, now: now, isTracked: true) == .none,
+        #expect(P.catchUpPlan(state: state(fresh, lapses: 2, listed: 2), freshModSeq: 5, now: now, isTracked: true) == .none,
                 "a lapse already covered by a completed listing lists nothing")
         // An untracked folder lists on a lapse too, inside the daily interval.
-        #expect(P.catchUpPlan(state: state(fresh, lapses: 1, listed: 0), freshModSeq: 5, isExpensiveNetwork: false, now: now)
+        #expect(P.catchUpPlan(state: state(fresh, lapses: 1, listed: 0), freshModSeq: 5, now: now)
                 == .list(.init(firstStamp: 5, nextUid: 1, lapseCountAtStart: 1)))
     }
 
@@ -891,52 +908,29 @@ struct IMAPCatchUpTests {
         }
     }
 
-    @Test("The plan: cheap check, interval, network")
+    @Test("The plan: cheap check, interval")
     func planDecision() {
         let now = Date()
         let fresh = now.addingTimeInterval(-60)
         let stale = now.addingTimeInterval(-2 * SyncConfig.catchUpFullCheckIntervalSeconds)
         func state(
-            _ stamp: Int?, _ completed: Date?, listing: IMAPCatchUpState.Listing? = nil, created: Date? = nil
+            _ stamp: Int?, _ completed: Date?, listing: IMAPCatchUpState.Listing? = nil
         ) -> IMAPCatchUpState {
-            IMAPCatchUpState(epoch: 1, completionStamp: stamp, lastCompletedAt: completed, listing: listing, createdAt: created)
+            IMAPCatchUpState(epoch: 1, completionStamp: stamp, lastCompletedAt: completed, listing: listing)
         }
         typealias P = IMAPProvider
-        #expect(P.catchUpPlan(state: state(5, fresh), freshModSeq: 5, isExpensiveNetwork: false, now: now) == .none)
-        #expect(P.catchUpPlan(state: state(5, fresh), freshModSeq: 6, isExpensiveNetwork: false, now: now)
+        #expect(P.catchUpPlan(state: state(5, fresh), freshModSeq: 5, now: now) == .none)
+        #expect(P.catchUpPlan(state: state(5, fresh), freshModSeq: 6, now: now)
                 == .list(.init(firstStamp: 6, nextUid: 1)))
-        #expect(P.catchUpPlan(state: state(5, stale), freshModSeq: 5, isExpensiveNetwork: false, now: now)
+        #expect(P.catchUpPlan(state: state(5, stale), freshModSeq: 5, now: now)
                 == .list(.init(firstStamp: 5, nextUid: 1)))
-        #expect(P.catchUpPlan(state: state(5, stale), freshModSeq: 5, isExpensiveNetwork: true, now: now) == .none)
-        #expect(P.catchUpPlan(state: nil, freshModSeq: 5, isExpensiveNetwork: true, now: now) == .none,
-                "a first-ever listing is a full check, not change evidence")
-        #expect(P.catchUpPlan(state: nil, freshModSeq: nil, isExpensiveNetwork: false, now: now)
+        #expect(P.catchUpPlan(state: nil, freshModSeq: 5, now: now)
+                == .list(.init(firstStamp: 5, nextUid: 1)), "a first-ever listing runs at once")
+        #expect(P.catchUpPlan(state: nil, freshModSeq: nil, now: now)
                 == .list(.init(firstStamp: nil, nextUid: 1)), "a server without CONDSTORE still gets the daily check")
         let resuming = IMAPCatchUpState.Listing(firstStamp: 3, nextUid: 2001)
-        #expect(P.catchUpPlan(state: state(3, fresh, listing: resuming), freshModSeq: 9, isExpensiveNetwork: false, now: now)
+        #expect(P.catchUpPlan(state: state(3, fresh, listing: resuming), freshModSeq: 9, now: now)
                 == .list(resuming), "a listing in progress keeps its first stamp")
-
-        // A listing in progress on an expensive network: it waits, unless MODSEQ moved.
-        let parked = IMAPCatchUpState.Listing(firstStamp: 5, nextUid: 2001)
-        #expect(P.catchUpPlan(state: state(5, stale, listing: parked), freshModSeq: 5, isExpensiveNetwork: true, now: now) == .none,
-                "continuing a full check waits for a non-expensive network")
-        #expect(P.catchUpPlan(state: state(5, stale, listing: parked), freshModSeq: 6, isExpensiveNetwork: true, now: now)
-                == .list(parked))
-
-        // The wait on an expensive network is bounded.
-        let limit = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
-        let tooLong = now.addingTimeInterval(-limit - 60)
-        let notYet = now.addingTimeInterval(-limit + 60)
-        #expect(P.catchUpPlan(state: state(nil, nil, created: tooLong), freshModSeq: 5, isExpensiveNetwork: true, now: now)
-                == .list(.init(firstStamp: 5, nextUid: 1)), "a folder never listed")
-        #expect(P.catchUpPlan(state: state(nil, nil, created: notYet), freshModSeq: 5, isExpensiveNetwork: true, now: now) == .none)
-        #expect(P.catchUpPlan(state: state(nil, tooLong), freshModSeq: nil, isExpensiveNetwork: true, now: now)
-                == .list(.init(firstStamp: nil, nextUid: 1)), "a server without CONDSTORE")
-        #expect(P.catchUpPlan(state: state(nil, notYet), freshModSeq: nil, isExpensiveNetwork: true, now: now) == .none)
-        #expect(P.catchUpPlan(state: state(5, tooLong, listing: parked), freshModSeq: 5, isExpensiveNetwork: true, now: now)
-                == .list(parked), "a parked listing")
-        #expect(P.catchUpPlan(state: state(5, tooLong, created: now), freshModSeq: 5, isExpensiveNetwork: true, now: now)
-                == .list(.init(firstStamp: 5, nextUid: 1)), "the wait counts from the last completed listing")
     }
 }
 
@@ -1040,11 +1034,11 @@ struct CatchUpApplyTests {
         let folder = try #require(try FolderEpochTestFixture.readFolder(accountId: "cua-default", path: "Archive", pool: w.pool))
         let results = await provider.catchUp(
             folders: [folder], localRows: SyncEngineCatchUpRowReader(pool: AppDatabase.syncPool),
-            context: CatchUpContext(isExpensiveNetwork: false, deadline: .distantFuture, clock: { Date() }))
+            context: CatchUpContext(deadline: .distantFuture, clock: { Date() }))
         #expect(results.isEmpty)
         await SyncEngine().runCatchUp(
             provider: provider, folderIds: [w.folderId],
-            context: CatchUpContext(isExpensiveNetwork: false, deadline: .distantFuture, clock: { Date() }))
+            context: CatchUpContext(deadline: .distantFuture, clock: { Date() }))
         #expect(try Self.catchUpState(w.pool, w.folderId) == nil)
         #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-default", path: "Archive", pool: w.pool) == 3)
     }

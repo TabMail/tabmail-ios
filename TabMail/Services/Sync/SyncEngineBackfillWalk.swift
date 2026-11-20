@@ -1066,11 +1066,11 @@ extension SyncEngine {
     /// deadline (a foreground cycle of `startBackfill`) the catch-up runs one slice.
     /// The catch-up's snapshot (`CatchUpRun`) is taken when the catch-up starts,
     /// after the walk, so a long foreground walk never hands it a network state
-    /// from before the walk. `walkAllowed` false (the Wi-Fi-only setting on an
-    /// expensive network, decided by the caller) skips the walk only: the catch-up
-    /// ignores Wi-Fi-only and keeps its own network rules (ADR-IOS-107 decision 2,
-    /// 2026-11-12), because it lists ids and labels and its repairs must not wait
-    /// for a Wi-Fi network that may never come.
+    /// from before the walk. `walkAllowed` false (a download gate, decided by the
+    /// caller: Wi-Fi-only on an expensive network, Low Power Mode, low battery)
+    /// skips the walk only: the catch-up is a scan and runs under every gate
+    /// (ADR-IOS-107, #1063), because it lists ids and labels and its repairs must
+    /// not wait for a network or a charge that may never come.
     func runBackfillCycle(account: Account, deadline: Date? = nil, walkAllowed: Bool) async -> BackfillCycle {
         let walked = walkAllowed ? await runBackfillWalk(account: account, deadline: deadline) : false
         guard !Task.isCancelled else { return BackfillCycle(walked: walked, caughtUp: false) }

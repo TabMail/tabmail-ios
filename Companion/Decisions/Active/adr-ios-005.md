@@ -9,6 +9,9 @@
 > *Amended 2026-11-12:* Wi-Fi-only holds back the walk only; the catch-up ignores it and keeps its own
 > network rules (ADR-IOS-107 decision 2). Battery and Low Power Mode still delay both. Catch-up progress
 > picks the worker's active delay only once every walk of the account is complete.
+> *Amended 2026-11-19 (#1063):* Wi-Fi-only, battery and Low Power Mode hold back the walk only; the
+> catch-up always runs (ADR-IOS-107, amendment of that date). "Battery and Low Power Mode still delay
+> both" above is superseded.
 > The notes below say "the full sync's catch-up"; read "the catch-up".
 >
 > **Current note (2026-11-12).** The full sync's catch-up never re-arms or otherwise writes the walk:

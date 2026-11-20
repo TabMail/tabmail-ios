@@ -142,9 +142,9 @@ struct GmailCatchUpTests {
 
     /// A budget that never runs out, on `clock`.
     private static func unlimited(
-        expensive: Bool = false, storageLimit: Bool = false, at clock: @escaping @Sendable () -> Date = { Date() }
+        storageLimit: Bool = false, at clock: @escaping @Sendable () -> Date = { Date() }
     ) -> CatchUpContext {
-        CatchUpContext(isExpensiveNetwork: expensive, deadline: .distantFuture, clock: clock, storageLimitInForce: storageLimit)
+        CatchUpContext(deadline: .distantFuture, clock: clock, storageLimitInForce: storageLimit)
     }
 
     /// A budget of exactly `requests` requests: the clock advances one second per
@@ -154,7 +154,7 @@ struct GmailCatchUpTests {
     ) -> CatchUpContext {
         let before = server.http.recordedCalls().count
         return CatchUpContext(
-            isExpensiveNetwork: false, deadline: base.addingTimeInterval(TimeInterval(requests)),
+            deadline: base.addingTimeInterval(TimeInterval(requests)),
             clock: { base.addingTimeInterval(TimeInterval(server.http.recordedCalls().count - before)) })
     }
 
@@ -896,77 +896,40 @@ struct GmailCatchUpTests {
 
     // MARK: - Schedule
 
-    @Test("On an expensive network a new folder records when its wait began and makes no request, until it has waited too long")
-    func expensiveNetworkWaits() async throws {
-        let clock = Clock()
-        let seeds = [Self.seed("i1", clock.daysAgo(30), [inboxPath, "UNREAD"])]
-        let local = [Local(id: "i1", path: inboxPath, date: clock.daysAgo(30))]
-        try await Self.withWorld("gcu-expensive", seeds: seeds, local: local) { world async throws in
-            // On the test's clock: the wait is counted from `createdAt`, so a wall
-            // clock that ran on during setup would leave `later` short of it.
-            let start = clock.now
-            await Self.pass(world, context: Self.unlimited(expensive: true, at: { start }))
-            await Self.pass(world, context: Self.unlimited(expensive: true, at: { start }))
-            #expect(world.server.http.recordedCalls().isEmpty, "no request on an expensive network before the wait is over")
-            let waiting = try #require(try Self.state(world, inboxPath))
-            #expect(waiting.createdAt != nil && waiting.lastCompletedAt == nil)
-            #expect(try Self.rows(world, inboxPath)["i1"]?.isRead == true)
-
-            let later = clock.now.addingTimeInterval(SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds + 1)
-            await Self.pass(world, context: Self.unlimited(expensive: true, at: { later }))
-            #expect(try Self.rows(world, inboxPath)["i1"]?.isRead == false, "after the wait the folder is listed anyway")
-        }
-    }
-
     /// A Gmail folder is listed in exactly three cases: its first listing (no
     /// listing completed yet), a listing in progress, and a lapse after the last
     /// completed listing started. There is no periodic re-check, however long ago
     /// the last listing completed. A lapse makes a new listing due at once, but
-    /// never interrupts one in progress and never restarts or skips the
-    /// expensive-network wait, which is counted from the last completed listing
-    /// (before the first, from `createdAt`).
+    /// never interrupts one in progress. The plan reads no network (#1063).
     @Test("The per-folder plan")
     func catchUpPlan() {
         let now = Clock().now
-        let maxWait = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
+        let maxWait = Self.week
         let fresh = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-60))
         let old = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-4 * maxWait))
         let running = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-60), listing: .init(nextBeforeSecond: 42))
         let lapsed = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-60), lapseCount: 3, listedLapseCount: 2)
-        let lapsedLongAgo = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-maxWait - 1), lapseCount: 3, listedLapseCount: 2)
         let lapseListed = GmailCatchUpState(lastCompletedAt: now.addingTimeInterval(-60), lapseCount: 3, listedLapseCount: 3)
-        let lapsedNeverListed = GmailCatchUpState(createdAt: now.addingTimeInterval(-60), lapseCount: 1)
+        let lapsedNeverListed = GmailCatchUpState(lastAttemptAt: now.addingTimeInterval(-60), lapseCount: 1)
         let lapsedWhileRunning = GmailCatchUpState(
             lastCompletedAt: now.addingTimeInterval(-60), listing: .init(nextBeforeSecond: 42, lapseCountAtStart: 3),
             lapseCount: 4, listedLapseCount: 2)
-        let waiting = GmailCatchUpState(createdAt: now.addingTimeInterval(-60))
-        let longWait = GmailCatchUpState(createdAt: now.addingTimeInterval(-maxWait - 1))
+        let neverListed = GmailCatchUpState(lastAttemptAt: now.addingTimeInterval(-60))
 
-        #expect(GmailProvider.catchUpPlan(state: nil, isExpensiveNetwork: false, now: now) == .list(.init()))
-        #expect(GmailProvider.catchUpPlan(state: nil, isExpensiveNetwork: true, now: now) == .none)
-        #expect(GmailProvider.catchUpPlan(state: waiting, isExpensiveNetwork: false, now: now) == .list(.init()),
-                "a folder whose first listing waited for the network is listed once it may be")
-        #expect(GmailProvider.catchUpPlan(state: fresh, isExpensiveNetwork: false, now: now) == .none, "not every pass")
-        #expect(GmailProvider.catchUpPlan(state: old, isExpensiveNetwork: false, now: now) == .none,
+        #expect(GmailProvider.catchUpPlan(state: nil) == .list(.init()))
+        #expect(GmailProvider.catchUpPlan(state: neverListed) == .list(.init()),
+                "a folder with no completed listing is listed")
+        #expect(GmailProvider.catchUpPlan(state: fresh) == .none, "not every pass")
+        #expect(GmailProvider.catchUpPlan(state: old) == .none,
                 "no periodic re-check, however long ago the last listing completed")
-        #expect(GmailProvider.catchUpPlan(state: old, isExpensiveNetwork: true, now: now) == .none,
-                "the expensive-network wait being over makes nothing due")
-        #expect(GmailProvider.catchUpPlan(state: waiting, isExpensiveNetwork: true, now: now) == .none,
-                "a folder with no completed listing waits for a non-expensive network")
-        #expect(GmailProvider.catchUpPlan(state: running, isExpensiveNetwork: false, now: now) == .list(.init(nextBeforeSecond: 42)))
-        #expect(GmailProvider.catchUpPlan(state: longWait, isExpensiveNetwork: true, now: now) == .list(.init()))
-        #expect(GmailProvider.catchUpPlan(state: lapsed, isExpensiveNetwork: false, now: now) == .list(.init(lapseCountAtStart: 3)),
+        #expect(GmailProvider.catchUpPlan(state: running) == .list(.init(nextBeforeSecond: 42)))
+        #expect(GmailProvider.catchUpPlan(state: lapsed) == .list(.init(lapseCountAtStart: 3)),
                 "a lapse after the last listing started makes a new one due at once, recording the count it covers")
-        #expect(GmailProvider.catchUpPlan(state: lapseListed, isExpensiveNetwork: false, now: now) == .none,
+        #expect(GmailProvider.catchUpPlan(state: lapseListed) == .none,
                 "a lapse a completed listing already covered asks for nothing")
-        #expect(GmailProvider.catchUpPlan(state: lapsedNeverListed, isExpensiveNetwork: false, now: now) == .list(.init(lapseCountAtStart: 1)))
-        #expect(GmailProvider.catchUpPlan(state: lapsedWhileRunning, isExpensiveNetwork: false, now: now)
+        #expect(GmailProvider.catchUpPlan(state: lapsedNeverListed) == .list(.init(lapseCountAtStart: 1)))
+        #expect(GmailProvider.catchUpPlan(state: lapsedWhileRunning)
                 == .list(.init(nextBeforeSecond: 42, lapseCountAtStart: 3)), "a lapse never interrupts a listing in progress")
-        #expect(GmailProvider.catchUpPlan(state: lapsed, isExpensiveNetwork: true, now: now) == .none,
-                "a lapse does not restart the expensive-network wait, and does not skip it")
-        #expect(GmailProvider.catchUpPlan(state: lapsedLongAgo, isExpensiveNetwork: true, now: now) == .list(.init(lapseCountAtStart: 3)),
-                "a lapsed folder that has waited as long as the wait allows is listed on any network")
-        #expect(GmailProvider.catchUpPlan(state: lapsedNeverListed, isExpensiveNetwork: true, now: now) == .none)
     }
 
     /// The schedule end to end: a tracked Gmail folder whose listing completed
@@ -1010,7 +973,7 @@ struct GmailCatchUpTests {
         func imapPlan(completedAgo: TimeInterval) -> IMAPProvider.CatchUpPlan {
             IMAPProvider.catchUpPlan(
                 state: IMAPCatchUpState(epoch: 1, completionStamp: 7, lastCompletedAt: now.addingTimeInterval(-completedAgo), listing: nil),
-                freshModSeq: 7, isExpensiveNetwork: false, now: now)
+                freshModSeq: 7, now: now)
         }
         #expect(imapPlan(completedAgo: day - 60) == .none, "IMAP: not again within the day")
         #expect(imapPlan(completedAgo: day) == .list(.init(firstStamp: 7, nextUid: 1)), "IMAP: again after a day")
@@ -1102,7 +1065,7 @@ struct GmailCatchUpTests {
         let now = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
         let running = GmailCatchUpState(
             lastCompletedAt: now.addingTimeInterval(-60), listing: .init(nextBeforeSecond: 42, toEpoch: true, pendingCandidates: ["c1"]),
-            createdAt: now.addingTimeInterval(-600), lastAttemptAt: now.addingTimeInterval(-30))
+            lastAttemptAt: now.addingTimeInterval(-30))
         let runningJSON = try #require(running.encoded())
         let states: [String: String?] = [
             inboxPath: runningJSON, allMailPath: nil, labelPath: "not json", "Label_8": "[1]", "Label_9": "{}",
@@ -1218,8 +1181,8 @@ struct GmailCatchUpTests {
         let engine = try source("TabMail/Services/Sync/SyncEngineCatchUp.swift")
         #expect(engine.components(separatedBy: "StorageEstimator").count == 2,
                 "the engine reads the storage limit once, in the run's snapshot (CatchUpRun.snapshot)")
-        #expect(engine.components(separatedBy: "NetworkMonitor").count == 2,
-                "the engine reads the network state once, in the run's snapshot (CatchUpRun.snapshot); no slice re-reads it")
+        #expect(!engine.contains("NetworkMonitor"),
+                "a scan reads no network state (#1063); superseded: the engine read it once, in the run's snapshot")
         #expect(!gmail.contains("UserDefaults"), "no setting is read mid-pass: what the pass needs comes from the CatchUpContext snapshot")
         for path in ["TabMail/Providers/ExchangeProviderCatchUp.swift", "TabMail/Providers/CatchUpListing.swift"] {
             let text = try source(path)
@@ -1545,9 +1508,9 @@ struct GmailCatchUpTests {
                     case .walk:
                         _ = await stepper.step(engine: engine, account: account)
                     case .check:
-                        // 0 to 2 expensive-network waits. A check lists a folder only
-                        // on its first listing, a listing in progress, or after a lapse.
-                        now = now.addingTimeInterval(TimeInterval(rng.pick(Int(2 * SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds) + 1)))
+                        // 0 to 2 weeks. A check lists a folder only on its first
+                        // listing, a listing in progress, or after a lapse.
+                        now = now.addingTimeInterval(TimeInterval(rng.pick(Int(2 * Self.week) + 1)))
                         let budget = Self.rearmPropertyMinCheckBudget + rng.pick(Self.rearmPropertyCheckBudgetSpread)
                         let requestsBefore = world.server.http.recordedCalls().count
                         await engine.runCatchUp(
@@ -1839,10 +1802,12 @@ struct GmailCatchUpTests {
         }
     }
 
-    /// Checks an expensive-network wait and an hour apart. Each check is started
-    /// by a lapse; the spacing keeps every check past the previous one's hold
-    /// bound.
-    private static let checkSpacing = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds + 3_600
+    /// One week, the spacing unit of the seeded checks below.
+    static let week: TimeInterval = 7 * 86_400
+
+    /// Checks a week and an hour apart. Each check is started by a lapse; the
+    /// spacing keeps every check past the previous one's hold bound.
+    private static let checkSpacing = week + 3_600
 
     /// The clock of check `check`.
     private static func checkDay(_ clock: Clock, _ check: Int) -> Date {
@@ -3140,29 +3105,161 @@ struct GmailCatchUpTests {
         }
     }
 
-    /// A lapse neither restarts nor skips the expensive-network wait: it is
-    /// still counted from when the catch-up first saw the folder.
-    @Test("A lapse does not restart the expensive-network wait")
-    func lapseKeepsTheExpensiveNetworkWait() async throws {
+    // MARK: - Scans never wait for a download gate (#1063)
+
+    /// A lapsed Inbox whose walk is unfinished: `g0` was marked unread on the
+    /// server, `moved` sits inside the local range with no local row (the scan's
+    /// direct load), and `old` is older than every local row (the walk's). Under
+    /// every download gate, in the worker's cycle and in the background job, the
+    /// listing runs in that one call, the change and the missing message arrive,
+    /// and the walk stays held (except the job under a low battery, which has no
+    /// battery gate).
+    @Test("A due Gmail scan runs under every download gate, in the worker and the job; a missing message loads; the walk stays held",
+          arguments: DownloadGate.allCases, BackfillRunner.allCases)
+    func scanRunsUnderEveryDownloadGate(gate: DownloadGate, runner: BackfillRunner) async throws {
         let clock = Clock()
-        let seeds = [Self.seed("i1", clock.daysAgo(30), [inboxPath, "UNREAD"])]
-        let local = [Local(id: "i1", path: inboxPath, date: clock.daysAgo(30))]
-        try await Self.withWorld("gcu-lapse-wait", seeds: seeds, local: local) { world async throws in
-            let start = clock.now
-            let wait = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
-            await Self.pass(world, [inboxPath], context: Self.unlimited(expensive: true, at: { start }))
-            #expect(try Self.state(world, inboxPath)?.createdAt == start, "precondition: the wait began")
+        var (seeds, local) = Self.rangesWorld(clock, count: 3)
+        seeds.append(Self.seed("moved", clock.daysAgo(135), [inboxPath]))
+        seeds.append(Self.seed("old", clock.daysAgo(300), [inboxPath]))
+        try await Self.withWorld("gcu-gate-\(gate.rawValue)-\(runner.rawValue)", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let folderId = world.folderId(inboxPath)
+            let lapsed = GmailCatchUpState(
+                lastCompletedAt: Date().addingTimeInterval(-3_600), lapseCount: 1, listedLapseCount: 0).encoded()
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ?, backfillComplete = 0 WHERE id = ?", arguments: [lapsed, folderId])
+            }
+            world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
+            let account = try await Self.account(world)
 
-            try await Self.lapse(world)
-            let almost = start.addingTimeInterval(wait - 60)
-            await Self.pass(world, [inboxPath], context: Self.unlimited(expensive: true, at: { almost }))
-            #expect(world.server.http.recordedCalls().isEmpty, "a lapse does not skip the wait")
+            try await DownloadGateHarness.runOnce(world.engine, account: account, gate: gate, runner: runner)
+            let walkHeld = !DownloadGateHarness.walkExpected(gate, runner)
 
-            try await Self.lapse(world)
-            let over = start.addingTimeInterval(wait + 1)
-            await Self.pass(world, [inboxPath], context: Self.unlimited(expensive: true, at: { over }))
-            #expect(try Self.rows(world, inboxPath)["i1"]?.isRead == false,
-                    "the wait counted from before the lapses is over: the folder is listed")
+            #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the lapsed folder was listed under \(gate)")
+            let rows = try Self.rows(world, inboxPath)
+            #expect(rows["g0"]?.isRead == false, "the lapsed change arrives under \(gate)")
+            #expect(rows["moved"] != nil, "a listed message no local row held loads with the scan under \(gate)")
+            if walkHeld {
+                let pages = world.server.http.recordedCalls().map(\.url).filter { $0.contains("/messages?") && !$0.contains("after") }
+                #expect(pages.isEmpty, "the held walk listed no page: \(pages)")
+                #expect(rows["old"] == nil, "the held walk loaded nothing older than every local row")
+            } else {
+                let pages = world.server.http.recordedCalls().map(\.url).filter { $0.contains("/messages?") && !$0.contains("after") }
+                #expect(!pages.isEmpty, "the allowed walk listed a page")
+                #expect(rows["old"] != nil, "the allowed walk loaded the message older than every local row")
+            }
+        }
+    }
+
+    /// A lapse that came while a listing ran: the completing pass starts the new
+    /// listing at once on an expensive network too, so a change in a range the
+    /// first listing had already passed arrives in the same run.
+    @Test("On cellular, a listing that completes after a lapse starts the next listing at once")
+    func lapseDuringListingRelistsAtOnceOnCellular() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.rangesWorld(clock, count: 3)
+        try await Self.withWorld("gcu-lapse-cellular", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let folderId = world.folderId(inboxPath)
+            // Ranges go newest first: g2's range is already listed.
+            let passedNewest = Int(clock.daysAgo(130).timeIntervalSince1970)
+            let running = GmailCatchUpState(
+                lastCompletedAt: Date().addingTimeInterval(-3_600),
+                listing: .init(nextBeforeSecond: passedNewest, lapseCountAtStart: 0),
+                lapseCount: 1, listedLapseCount: 0).encoded()
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [running, folderId])
+            }
+            world.server.applyLabelChange(providerMessageId: "g2", add: ["UNREAD"])
+            let account = try await Self.account(world)
+
+            try await DownloadGateHarness.withNetwork(expensive: true) { () async throws in
+                let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
+                _ = await world.engine.performBackfill(account: account, deadline: deadline, walkAllowed: false)
+            }
+
+            #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the listing after the lapse ran and completed")
+            #expect(try Self.rows(world, inboxPath)["g2"]?.isRead == false, "the change in the passed range arrives")
+        }
+    }
+
+    // MARK: - The worker's wait while the walk is held (#1063)
+
+    /// A lapsed Inbox whose walk is `walkComplete` or not, with `g0` marked unread
+    /// on the server.
+    private static func heldWalkWorld(
+        _ name: String, walkComplete: Bool, _ body: (World, Account) async throws -> Void
+    ) async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.rangesWorld(clock, count: 3)
+        try await Self.withWorld(name, seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let folderId = world.folderId(inboxPath)
+            let lapsed = GmailCatchUpState(
+                lastCompletedAt: Date().addingTimeInterval(-3_600), lapseCount: 1, listedLapseCount: 0).encoded()
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ?, backfillComplete = ? WHERE id = ?",
+                               arguments: [lapsed, walkComplete ? 1 : 0, folderId])
+            }
+            world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
+            try await body(world, try await Self.account(world))
+        }
+    }
+
+    /// The real worker with its walk held, by a power gate or by Wi-Fi-only on
+    /// cellular. The first cycle's scan repairs the lapsed change before any wait,
+    /// and the wait after it is the normal one (the catch-up made progress). The
+    /// next cycle has nothing to do, so the worker waits 60 s (a power gate) or
+    /// 30 s (Wi-Fi-only); no cycle starts inside that wait, and the next one runs
+    /// after it. The walk never sends a request.
+    @Test("With the walk held, the worker scans first, then waits 60 s for a power gate or 30 s for Wi-Fi-only, and retries after the wait",
+          arguments: [DownloadGate.lowPowerMode, .lowBattery, .expensiveNetwork])
+    func heldWalkWaitsThenRetries(gate: DownloadGate) async throws {
+        try await Self.heldWalkWorld("gcu-held-wait-\(gate.rawValue)", walkComplete: false) { world, account in
+            try await DownloadGateHarness.withNetwork(expensive: gate == .expensiveNetwork) { () async throws in
+                try await DownloadGateHarness.withWorker(world.engine, account: account, power: DownloadGateHarness.power(gate)) { sleeps async throws in
+                    #expect(await sleeps.waitFor(count: 1), "the first cycle never ended")
+                    #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the scan ran before the first wait")
+                    #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the lapsed change arrived before the first wait")
+                    let profile = await world.engine.getBackfillProfile()
+                    let productive = SyncEngine.backfillInterCycleDelay(
+                        cycle: .init(walked: false, caughtUp: true), walkComplete: false, profile: profile)
+                    #expect(sleeps.recorded.first == productive, "a productive cycle waits the normal delay: \(sleeps.recorded)")
+
+                    sleeps.release()
+                    #expect(await sleeps.waitFor(count: 2), "the idle cycle never ended")
+                    let held: TimeInterval = gate == .expensiveNetwork ? 30 : 60
+                    #expect(sleeps.recorded.dropFirst().first == held, "the held walk's wait under \(gate): \(sleeps.recorded)")
+
+                    // A lapse makes the next cycle list again; inside the wait, no cycle starts.
+                    try await Self.lapse(world)
+                    try? await Task.sleep(for: .milliseconds(500))
+                    #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "a cycle started inside the wait")
+                    #expect(sleeps.recorded.count == 2)
+
+                    sleeps.release()
+                    let retried = try await Self.eventually(seconds: 30, poll: .milliseconds(20)) {
+                        try Self.state(world, inboxPath)?.listedLapseCount == 2
+                    }
+                    #expect(retried, "the worker never retried after the wait")
+                }
+            }
+            let pages = world.server.http.recordedCalls().map(\.url).filter { $0.contains("/messages?") && !$0.contains("after") }
+            #expect(pages.isEmpty, "the held walk listed a page: \(pages)")
+        }
+    }
+
+    /// The control: with the walk complete, a cycle with nothing to do ends the
+    /// worker; it does not wait for a held walk.
+    @Test("With the walk complete, the worker stops after an idle cycle instead of waiting for a held walk")
+    func completedWalkStopsTheWorker() async throws {
+        try await Self.heldWalkWorld("gcu-held-wait-done", walkComplete: true) { world, account in
+            try await DownloadGateHarness.withNetwork(expensive: false) { () async throws in
+                try await DownloadGateHarness.withWorker(world.engine, account: account, power: DownloadGateHarness.power(.lowPowerMode)) { sleeps async throws in
+                    #expect(await sleeps.waitFor(count: 1), "the first cycle never ended")
+                    #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the scan ran")
+                    sleeps.release()
+                    #expect(await sleeps.waitFor(count: 2, seconds: 2) == false,
+                            "the worker waited again with its walk complete: \(sleeps.recorded)")
+                }
+            }
         }
     }
 
@@ -3184,7 +3281,7 @@ struct GmailCatchUpTests {
     ) -> SyncEngine.CatchUpRun {
         let before = server.http.recordedCalls().count
         return SyncEngine.CatchUpRun(
-            isExpensiveNetwork: false, storageLimitInForce: false,
+            storageLimitInForce: false,
             deadline: deadline.map { base.addingTimeInterval(TimeInterval($0)) } ?? .distantFuture,
             sliceSeconds: TimeInterval(slice), intervalSeconds: TimeInterval(slice),
             clock: { base.addingTimeInterval(TimeInterval(server.http.recordedCalls().count - before)) })
@@ -3476,105 +3573,6 @@ struct GmailCatchUpTests {
             #expect(try Self.state(world, inboxPath)?.listing != nil, "precondition: the listing needs more slices")
             #expect(Date() <= deadline.addingTimeInterval(window / 4),
                     "the job never waits for a slice window past its deadline")
-        }
-    }
-
-    // MARK: - The Wi-Fi-only setting holds back the walk, not the catch-up (#766)
-
-    /// Runs `body` on a simulated expensive (cellular) network with the Wi-Fi-only
-    /// setting on, then restores both.
-    static func withCellularAndWiFiOnly(_ body: () async throws -> Void) async throws {
-        let key = "backgroundSyncWiFiOnly"
-        let savedSetting = UserDefaults.standard.object(forKey: key)
-        let savedExpensive = NetworkMonitor.checkExpensive()
-        UserDefaults.standard.set(true, forKey: key)
-        NetworkMonitor.setExpensiveForTesting(true)
-        defer {
-            UserDefaults.standard.set(savedSetting, forKey: key)
-            NetworkMonitor.setExpensiveForTesting(savedExpensive)
-        }
-        try await body()
-    }
-
-    /// A folder whose last listing completed longer ago than the expensive-network
-    /// wait, with a lapse since: a listing is due, and on an expensive network it
-    /// no longer waits for a non-expensive one.
-    private static func lapsedPastTheWait(_ world: World, _ path: String) throws {
-        let state = GmailCatchUpState(
-            lastCompletedAt: Date().addingTimeInterval(-SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds - 60),
-            lapseCount: 1, listedLapseCount: 0)
-        let raw = state.encoded()
-        let folderId = world.folderId(path)
-        try world.pool.write { db in
-            try db.execute(sql: "UPDATE folder SET catchUpState = ?, backfillComplete = 0 WHERE id = ?", arguments: [raw, folderId])
-        }
-    }
-
-    /// The walk's own requests: its page lists (no `after:` bound) and its
-    /// `format=full` loads.
-    private static func walkRequests(_ server: StatefulGmailActionServer) -> [String] {
-        server.http.recordedCalls().map(\.url).filter {
-            ($0.contains("/messages?") && !$0.contains("after")) || $0.contains("format=full")
-        }
-    }
-
-    /// The foreground backfill worker on a cellular network with Wi-Fi-only on:
-    /// the walk stays paused, as before; the catch-up runs under its own network
-    /// rule, so a lapsed folder whose expensive-network wait has passed is listed
-    /// and its changes arrive (ADR-IOS-107 decision 2, 2026-11-12).
-    @Test("With Wi-Fi-only on and only cellular, the worker's catch-up lists a lapsed folder past its wait; the walk stays paused")
-    func wifiOnlyHoldsTheWorkerWalkNotTheCatchUp() async throws {
-        let clock = Clock()
-        let (seeds, local) = Self.rangesWorld(clock, count: 3)
-        try await Self.withWorld("gcu-wifi-only-worker", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
-            try await Self.withCellularAndWiFiOnly {
-                try Self.lapsedPastTheWait(world, inboxPath)
-                world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
-                let account = try await Self.account(world)
-
-                await world.engine.startBackfill(account: account)
-                let listed = try await Self.eventually(seconds: 30, poll: .milliseconds(100)) {
-                    try Self.state(world, inboxPath)?.listedLapseCount == 1
-                }
-                await world.engine.remove(accountId: world.accountId)
-
-                #expect(listed, "the catch-up listed the lapsed folder on cellular with Wi-Fi-only on")
-                #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the lapsed change arrives")
-                #expect(Self.walkRequests(world.server).isEmpty,
-                        "the walk stays paused on cellular with Wi-Fi-only on: \(Self.walkRequests(world.server))")
-            }
-        }
-    }
-
-    /// The background processing job on a cellular network with Wi-Fi-only on:
-    /// its decision (`SyncScheduler.backgroundBackfillPlan`) holds back the walk
-    /// only, and the backfill it runs lists the lapsed folder. Low Power Mode
-    /// still skips the whole backfill.
-    @Test("With Wi-Fi-only on and off Wi-Fi, the background job runs the catch-up, not the walk; Low Power Mode skips both")
-    func wifiOnlyHoldsTheJobWalkNotTheCatchUp() async throws {
-        typealias S = SyncScheduler
-        #expect(S.backgroundBackfillPlan(isLowPowerMode: true, wifiOnly: true, onWiFi: false) == .skip)
-        #expect(S.backgroundBackfillPlan(isLowPowerMode: true, wifiOnly: false, onWiFi: true) == .skip)
-        #expect(S.backgroundBackfillPlan(isLowPowerMode: false, wifiOnly: true, onWiFi: true) == .run(walkAllowed: true))
-        #expect(S.backgroundBackfillPlan(isLowPowerMode: false, wifiOnly: false, onWiFi: false) == .run(walkAllowed: true))
-        let offWiFi = S.backgroundBackfillPlan(isLowPowerMode: false, wifiOnly: true, onWiFi: false)
-        #expect(offWiFi == .run(walkAllowed: false), "Wi-Fi-only off Wi-Fi still runs the backfill, without the walk")
-        guard case .run(let walkAllowed) = offWiFi else { return }
-
-        let clock = Clock()
-        let (seeds, local) = Self.rangesWorld(clock, count: 3)
-        try await Self.withWorld("gcu-wifi-only-job", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
-            try await Self.withCellularAndWiFiOnly {
-                try Self.lapsedPastTheWait(world, inboxPath)
-                world.server.applyLabelChange(providerMessageId: "g0", add: ["UNREAD"])
-                let account = try await Self.account(world)
-
-                let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
-                #expect(await world.engine.performBackfill(account: account, deadline: deadline, walkAllowed: walkAllowed))
-                #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the job listed the lapsed folder")
-                #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the lapsed change arrives")
-                #expect(Self.walkRequests(world.server).isEmpty, "the job's walk stays held back off Wi-Fi")
-            }
         }
     }
 

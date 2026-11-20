@@ -287,12 +287,19 @@ extension SyncEngine {
                 await self?.updateBackfillProgressForAccount(account)
 
                 while !Task.isCancelled {
-                    // Pause backfill entirely when battery is low (<20%) and not charging
-                    if await self?.getShouldPauseBackfill() == true {
-                        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) PAUSED — low battery / Low Power Mode (retry in 60s)")
-                        try? await Task.sleep(for: .seconds(60))
-                        continue
-                    }
+                    // One power and network snapshot per cycle decides the gates.
+                    // The gates hold only the walk (downloads); the cycle, and so
+                    // the folder scans, always runs (#1063). Uses checkExpensive()
+                    // (Mutex-backed) as the Wi-Fi proxy: on iOS, expensive ==
+                    // cellular/hotspot.
+                    guard let power = await self?.backfillPowerState() else { break }
+                    let wifiOnly = UserDefaults.standard.object(forKey: SyncScheduler.wifiOnlyKey) as? Bool ?? true
+                    let walkAllowed = Self.backfillWalkAllowed(
+                        fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
+                        batteryLevel: power.batteryLevel, wifiOnly: wifiOnly, expensive: NetworkMonitor.checkExpensive())
+                    let powerHeld = !Self.backfillWalkAllowed(
+                        fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
+                        batteryLevel: power.batteryLevel, wifiOnly: false, expensive: false)
 
                     // PAUSE THE WHOLE CRAWL while a privileged merge holds the gate.
                     // The per-write facade yield only steps the GRDB writes aside;
@@ -301,17 +308,10 @@ extension SyncEngine {
                     // No-op when nothing privileged is active.
                     await PriorityGate.shared.yield("backfill-walk")
 
-                    // Pause the WALK when user has WiFi-only setting enabled and we're on cellular.
-                    // Uses checkExpensive() (Mutex-backed) as WiFi proxy — on iOS, expensive == cellular/hotspot.
-                    // Pauses (not stops) so the walk resumes instantly when WiFi returns or setting is toggled.
-                    // The catch-up ignores the setting (ADR-IOS-107 decision 2, 2026-11-12): it lists ids and
-                    // labels under its own network rules, and its repairs must not wait for a Wi-Fi network
-                    // that may never come. *Superseded:* the setting paused the whole cycle.
-                    let wifiOnly = UserDefaults.standard.object(forKey: "backgroundSyncWiFiOnly") as? Bool ?? true
-                    let walkAllowed = !(wifiOnly && NetworkMonitor.checkExpensive())
                     if !walkAllowed {
-                        BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) walk paused — WiFi-only enabled, on cellular")
-                        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) walk PAUSED — WiFi-only enabled, on cellular (the catch-up still runs)")
+                        let reason = powerHeld ? "low battery / Low Power Mode" : "WiFi-only enabled, on cellular"
+                        BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) walk paused — \(reason)")
+                        BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) walk PAUSED: \(reason) (the catch-up still runs)")
                     }
 
                     guard !Task.isCancelled else { BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) cancelled"); break }
@@ -328,11 +328,12 @@ extension SyncEngine {
                         BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) no work, walkDone=\(walkDone)")
                         BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) cycle no work, walkDone=\(walkDone)")
                         guard walkDone else {
-                            // A walk held back by Wi-Fi-only retries after the setting's pause.
+                            // A held walk retries after its gate's pause: 60 s for a
+                            // power gate, 30 s for Wi-Fi-only.
                             let sleepDelay = walkAllowed
                                 ? Self.backfillInterCycleDelay(cycle: cycle, walkComplete: walkDone, profile: profile)
-                                : 30
-                            try? await Task.sleep(for: .seconds(sleepDelay))
+                                : (powerHeld ? 60 : 30)
+                            await Self.backfillSleep(seconds: sleepDelay)
                             continue
                         }
 
@@ -341,7 +342,7 @@ extension SyncEngine {
                     }
 
                     let sleepSeconds = Self.backfillInterCycleDelay(cycle: cycle, walkComplete: walkDone, profile: profile)
-                    try? await Task.sleep(for: .seconds(sleepSeconds))
+                    await Self.backfillSleep(seconds: sleepSeconds)
                 }
 
                 // Only clear dictionary if this task is still the current generation.

@@ -1113,10 +1113,11 @@ nothing is ever decided about a UID whose numbering is unproven (ADR-IOS-107). C
   starts after the budget is spent, the removal proof included.
 - **Not the backfill.** With a partial backfill, no command names a UID below the lowest local UID or
   above the highest, and no row is inserted.
-- **Always-expensive network.** After `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` without a
-  completed listing, a folder lists on an expensive network: one never listed, one on a server
-  without CONDSTORE, and one whose listing was parked. The first sight of a folder on an expensive
-  network writes when the wait began and makes no request.
+- **Scans under every download gate (#1063).** A due scan runs on an expensive network, below 20%
+  battery and in Low Power Mode, in the worker and in the background job, and the walk stays held
+  (`scanRunsUnderEveryDownloadGate` per provider); a folder never listed lists at once on an
+  expensive network. *Superseded:* "Always-expensive network. After the expensive-network wait bound
+  without a completed listing, a folder lists on an expensive network [...]".
 - **A new folder.** A folder the full sync itself created follows an older-mail change on the next
   pass.
 - **A just-completed user action** wins over a stale listing, per message.

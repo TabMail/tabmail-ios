@@ -11,13 +11,10 @@ import os
 /// (ADR-004), and never a page link or an offset: a listing resumes at a date.
 struct ExchangeCatchUpState: Codable, Equatable, Sendable {
     /// When the last listing completed. Until one has, the folder's first
-    /// listing is due; after it, the expensive-network wait counts from here.
+    /// listing is due.
     var lastCompletedAt: Date?
     /// The listing in progress, if any.
     var listing: Listing?
-    /// When the catch-up first saw the folder. Until a listing completes, the
-    /// expensive-network wait is counted from here.
-    var createdAt: Date?
     /// When the catch-up last tried a listing for the folder, whether or not it
     /// succeeded. Drives the order (`CatchUpSchedule.leastRecentlyAttemptedFirst`).
     var lastAttemptAt: Date?
@@ -142,26 +139,20 @@ extension ExchangeProvider {
         case list(ExchangeCatchUpState.Listing)
     }
 
-    /// The per-folder decision, in order:
-    /// 1. on an expensive network, nothing until the folder has waited
-    ///    `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` since its last
-    ///    completed listing (or since the catch-up first saw it);
-    /// 2. a listing in progress continues (a lapse never interrupts one);
-    /// 3. no new listing starts while the tracking gate is closed
+    /// The per-folder decision, the same on every network, battery level and
+    /// power mode (a scan always runs; only downloads wait, #1063), in order:
+    /// 1. a listing in progress continues (a lapse never interrupts one);
+    /// 2. no new listing starts while the tracking gate is closed
     ///    (`catchUpTrackingGateOpen`);
-    /// 4. a new listing starts when none has completed yet, when a lapse came
+    /// 3. a new listing starts when none has completed yet, when a lapse came
     ///    after the last one started (`ExchangeCatchUpState.lapsedSinceLastListing`),
     ///    or when the walk is complete and was seen unfinished since the last
     ///    listing started (`ExchangeCatchUpState.walkIncompleteSeen`);
-    /// 5. otherwise nothing: while the folder's change cursor is valid the delta
+    /// 4. otherwise nothing: while the folder's change cursor is valid the delta
     ///    follows it, and a lapse is what loses changes.
     nonisolated static func catchUpPlan(
-        state: ExchangeCatchUpState?, trackingGateOpen: Bool, walkComplete: Bool,
-        isExpensiveNetwork: Bool, now: Date
+        state: ExchangeCatchUpState?, trackingGateOpen: Bool, walkComplete: Bool
     ) -> CatchUpPlan {
-        let waitedTooLong = CatchUpSchedule.waitedTooLong(
-            hasState: state != nil, lastCompletedAt: state?.lastCompletedAt, createdAt: state?.createdAt, now: now)
-        if isExpensiveNetwork && !waitedTooLong { return .none }
         if let listing = state?.listing { return .list(listing) }
         guard trackingGateOpen else { return .none }
         if state?.lastCompletedAt == nil || state?.lapsedSinceLastListing == true
@@ -297,16 +288,14 @@ extension ExchangeProvider {
         guard !folder.path.isEmpty, folder.uidValidityResetPendingAt == nil else { return nil }
 
         let state = ExchangeCatchUpState.decode(folder.catchUpState)
-        var newState = state ?? ExchangeCatchUpState(createdAt: context.clock())
+        var newState = state ?? ExchangeCatchUpState()
         if !folder.backfillComplete { newState.walkIncompleteSeen = true }
         let gateOpen = Self.catchUpTrackingGateOpen(folder)
         let plan = Self.catchUpPlan(
-            state: newState, trackingGateOpen: gateOpen, walkComplete: folder.backfillComplete,
-            isExpensiveNetwork: context.isExpensiveNetwork, now: context.clock())
+            state: newState, trackingGateOpen: gateOpen, walkComplete: folder.backfillComplete)
         guard case .list(var listing) = plan else {
-            // Nothing to list. The first sight of the folder (so the
-            // expensive-network wait has a start, even while the gate holds) and
-            // an unfinished walk seen are recorded; no request is made.
+            // Nothing to list. An unfinished walk seen is recorded; no request
+            // is made.
             guard newState != state else { return nil }
             var waiting = CatchUpFolderResult(folderId: folder.id, epoch: nil)
             waiting.newState = newState.encoded()
@@ -354,8 +343,7 @@ extension ExchangeProvider {
                         var settled = newState
                         settled.listing = nil
                         guard case .list(var next) = Self.catchUpPlan(
-                            state: settled, trackingGateOpen: gateOpen, walkComplete: folder.backfillComplete,
-                            isExpensiveNetwork: context.isExpensiveNetwork, now: context.clock()) else {
+                            state: settled, trackingGateOpen: gateOpen, walkComplete: folder.backfillComplete) else {
                             listingDone = true
                             break rangeLoop
                         }
