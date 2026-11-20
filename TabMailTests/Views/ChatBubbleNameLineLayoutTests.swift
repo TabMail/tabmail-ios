@@ -9,7 +9,7 @@ import UIKit
 
 /// The sender line above a group-chat bubble.
 ///
-/// THE SYSTEM PROPERTY pinned here: at the largest accessibility text size nothing of the bubble
+/// THE SYSTEM PROPERTY pinned here: at every accessibility text size nothing of the bubble
 /// is drawn past its column (so off the screen); the sender's name stays one line, and the
 /// "(replied only to …)" label is laid out in full below it. At a normal size the name and the
 /// label stay together on one line. The bubble is hosted for real in a `UIWindow`; what it draws
@@ -18,16 +18,19 @@ import UIKit
 @MainActor
 struct ChatBubbleNameLineLayoutTests {
     private static let screenWidth: CGFloat = 390
-    private static let largest = DynamicTypeSize.accessibility5
     private static let longName = "Alexandra Montgomery-Fitzgerald Wellington"
     private static var column: CGFloat { screenWidth * ChatViewLayout.bubbleMaxWidthFraction }
     private static var labelText: String { "(replied only to \(onlyTo.label()))" }
 
-    @Test("At the largest text size nothing is drawn past the bubble column")
-    func nothingRunsPastTheColumnAtLargestSize() throws {
+    /// Every accessibility text size, and every normal one as the controls.
+    nonisolated private static let accessibilitySizes: [DynamicTypeSize] = DynamicTypeSize.allCases.filter(\.isAccessibilitySize)
+    nonisolated private static let normalSizes: [DynamicTypeSize] = DynamicTypeSize.allCases.filter { !$0.isAccessibilitySize }
+
+    @Test("At every accessibility text size nothing is drawn past the bubble column", arguments: accessibilitySizes)
+    func nothingRunsPastTheColumnAtAccessibilitySizes(size: DynamicTypeSize) throws {
         let host = try Self.host(ChatBubbleView(
             item: Self.item(name: Self.longName), isGroup: true, extras: nil, isHighlighted: false, onOpen: {}
-        ), size: Self.largest)
+        ), size: size)
         defer { host.window.isHidden = true }
         let drawn = Self.inkFrames(in: host.window)
         try #require(!drawn.isEmpty, "nothing was drawn")
@@ -42,16 +45,16 @@ struct ChatBubbleNameLineLayoutTests {
         }
     }
 
-    @Test("At the largest text size the name is one line and the label is laid out in full below it")
-    func nameOneLineLabelInFullAtLargestSize() throws {
+    @Test("At every accessibility text size the name is one line and the label is laid out in full below it",
+          arguments: accessibilitySizes)
+    func nameOneLineLabelInFullAtAccessibilitySizes(size: DynamicTypeSize) throws {
         let sender = ChatSenderLine(
             item: Self.item(name: Self.longName))
-        let line = Self.fittedSize(sender, width: Self.column, size: Self.largest)
-        let oneLine = Self.fittedSize(Text("Ag").font(.caption), width: Self.column, size: Self.largest).height
-        let label = Self.fittedSize(Text(Self.labelText).font(.caption), width: Self.column, size: Self.largest)
-        let name = Self.fittedSize(Text(Self.longName).font(.caption).fontWeight(.medium), width: Self.column, size: Self.largest)
+        let line = Self.fittedSize(sender, width: Self.column, size: size)
+        let oneLine = Self.fittedSize(Text("Ag").font(.caption), width: Self.column, size: size).height
+        let label = Self.fittedSize(Text(Self.labelText).font(.caption), width: Self.column, size: size)
+        let name = Self.fittedSize(Text(Self.longName).font(.caption).fontWeight(.medium), width: Self.column, size: size)
         #expect(name.height > oneLine * 1.5, "control: the long name would wrap if allowed")
-        #expect(label.height > oneLine * 1.5, "control: the label needs more than one line here")
         #expect(line.width <= Self.column + 0.5, "the sender line is \(line.width) wide; the column is \(Self.column)")
         #expect(line.height >= oneLine + label.height - 0.5,
                 "the label is not laid out in full under the name: \(line.height) < \(oneLine) + \(label.height)")
@@ -59,13 +62,13 @@ struct ChatBubbleNameLineLayoutTests {
                 "the name takes more than one line: \(line.height)")
     }
 
-    @Test("At a normal text size the name and the label stay on one line")
-    func oneLineAtNormalSize() throws {
+    @Test("At every normal text size the name and the label stay on one line", arguments: normalSizes)
+    func oneLineAtNormalSizes(size: DynamicTypeSize) throws {
         let sender = ChatSenderLine(
             item: Self.item(name: "Alex"))
-        let line = Self.fittedSize(sender, width: Self.column, size: .large)
-        let oneLine = Self.fittedSize(Text("Ag").font(.caption), width: Self.column, size: .large).height
-        let label = Self.fittedSize(Text(Self.labelText).font(.caption), width: .greatestFiniteMagnitude, size: .large)
+        let line = Self.fittedSize(sender, width: Self.column, size: size)
+        let oneLine = Self.fittedSize(Text("Ag").font(.caption), width: Self.column, size: size).height
+        let label = Self.fittedSize(Text(Self.labelText).font(.caption), width: .greatestFiniteMagnitude, size: size)
         #expect(abs(line.height - oneLine) <= 1, "the line is \(line.height) tall; one line is \(oneLine)")
         #expect(line.width > label.width, "the name and the label are not side by side")
         #expect(line.width <= Self.column + 0.5)
