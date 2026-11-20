@@ -263,14 +263,27 @@ struct BackfillBodyDownloadGateTests {
             #expect(await eventually { await fetchCount(provider) > 0 }, "the batch never started")
             SyncEngine.backfillPowerStateForTesting.withLock { $0 = DownloadGateHarness.power(.lowPowerMode) }
 
+            // A second item arrives after the gate shut: its dispatch is refused
+            // and the queue is held while the first batch is still fetching.
+            await queue.enqueue([backfillItem(accountId, messageId: "8")])
+            #expect(await eventually { await queue.heldByDownloadGate },
+                    "precondition: the second item's dispatch was not refused while the first batch ran")
+            #expect(await fetchCount(provider) == 1, "precondition: only the first body is fetching")
+            #expect(!(await queue.isIdle), "precondition: the first batch is still active")
+
             let drained = TestBox(false)
             let drain = Task { await queue.awaitDrain(); drained.value.withLock { $0 = true } }
             try await Task.sleep(for: Self.settle)
-            #expect(!drained.value.withLock { $0 }, "awaitDrain returned while a batch was still running")
+            #expect(!drained.value.withLock { $0 }, "awaitDrain returned on a held queue while a batch was still running")
             #expect(!(await queue.isIdle))
 
             await release.open()
             #expect(await eventually { drained.value.withLock { $0 } }, "awaitDrain did not return after the batch ended")
+            #expect(await queue.queuedItemsForTesting.map(\.messageId) == ["8"],
+                    "the refused second item must stay pending")
+            #expect(!(await provider.callLog.contains { $0.hasPrefix("fetchMessage(") && $0.contains("id:8,") }),
+                    "the refused second body was downloaded under Low Power Mode")
+            #expect(await fetchCount(provider) == 1, "a body beyond the running batch was downloaded")
             drain.cancel()
         }
         await release.open()
