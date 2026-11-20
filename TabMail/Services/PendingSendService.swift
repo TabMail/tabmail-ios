@@ -183,6 +183,9 @@ final class PendingSendService {
     struct ReopenSnapshot: Identifiable, Sendable {
         let id: String  // outboxId — unique identifier for fullScreenCover(item:)
         let authority: RetainedDraftAuthority
+        /// Whether the confirmed Undo also saved the kept row back to Drafts.
+        /// `false` reopens the compose as unsaved, so Close asks to save it.
+        let returnedToDrafts: Bool
     }
 
     private(set) var current: Pending?
@@ -296,7 +299,11 @@ final class PendingSendService {
             current = nil
             return nil
         case .verified(let authority):
-            guard AccountManager.shared.discardOutboxMessageConfirmed(p.id) else {
+            // The cancellation and the kept draft's return to Drafts commit in one
+            // write, in this same synchronous turn (ADR-IOS-065, as superseded on v3).
+            let outcome = AccountManager.shared.discardOutboxMessageReturningDraftConfirmed(
+                p.id, authority: authority)
+            guard outcome.cancelled else {
                 // R16-9 — same arm, same reason as `.mismatchOrAbsent` above. This is
                 // the arm where the user had a reopenable draft in hand, so a silent
                 // `nil` here reads as "Undo did nothing at all".
@@ -305,7 +312,8 @@ final class PendingSendService {
             }
             dismissTask?.cancel()
             current = nil
-            return ReopenSnapshot(id: p.id, authority: authority)
+            return ReopenSnapshot(
+                id: p.id, authority: authority, returnedToDrafts: outcome.returnedToDrafts)
         }
     }
 

@@ -199,6 +199,46 @@ enum ComposeDraftGuards {
             || !bccInput.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
+    /// What a compose held when it opened, compared at Close to decide whether
+    /// anything changed. Attachments are a cheap fingerprint (count + filename +
+    /// size per attachment), not the data.
+    struct Baseline: Equatable {
+        var subject: String
+        var body: String
+        var to: [String]
+        var cc: [String]
+        var bcc: [String]
+        var attachmentsFingerprint: [String]
+
+        static let empty = Baseline(subject: "", body: "", to: [], cc: [], bcc: [], attachmentsFingerprint: [])
+    }
+
+    /// What the compose holds when the user presses Close.
+    struct CloseState: Equatable {
+        var readState: ReadState
+        /// The fields as they were when the compose finished loading or
+        /// prefilling.
+        var loaded: Baseline
+        /// The fields now.
+        var current: Baseline
+        /// The loaded content counts as unsaved, so Close asks to save it even
+        /// when nothing was typed: the compose reopened by Undo Send when its
+        /// save back to Drafts did not land, and the prefill callers that ask
+        /// for it.
+        var loadedIsUnsaved: Bool
+        var hasContent: Bool
+        /// Work Close must not drop silently: an attachment still being
+        /// prepared, or a visible suggestion.
+        var hasUnsettledWork: Bool
+    }
+
+    /// The action Close takes for `state`.
+    static func closeDecision(_ state: CloseState) -> CloseAction {
+        let baseline = state.loadedIsUnsaved ? Baseline.empty : state.loaded
+        let hasChanges = state.current != baseline || state.hasUnsettledWork
+        return closeAction(readState: state.readState, hasContent: state.hasContent, hasChanges: hasChanges)
+    }
+
     /// PORT — `v2final:ComposeDraftGuards.CloseAction`.
     enum CloseAction: Equatable {
         case promptSave        // unsaved changes → Save/Discard/Cancel prompt
@@ -1129,15 +1169,7 @@ struct ComposeView: View {
     /// See `ComposeDraftGuards.sendReplyTarget`.
     @State private var persistedReplyTargetClaim: ComposeDraftGuards.PersistedReplyTargetClaim?
     /// Snapshot of draft state at load time — used to detect actual changes for "Save?" prompt
-    @State private var initialSubject = ""
-    @State private var initialBody = ""
-    @State private var initialToTokens: [String] = []
-    @State private var initialCcTokens: [String] = []
-    @State private var initialBccTokens: [String] = []
-    /// Fingerprint of initial attachments for hasChanges detection. Comparing
-    /// full Data blobs would be slow for large attachments, so we use a cheap
-    /// summary (count + filename + size per attachment).
-    @State private var initialAttachmentsFingerprint: [String] = []
+    @State private var loadedBaseline = ComposeDraftGuards.Baseline.empty
     @FocusState private var bodyFocused: Bool
     @Environment(\.dismiss) private var dismiss
     @Environment(NavigationStore.self) private var navigationStore
@@ -2684,12 +2716,17 @@ struct ComposeView: View {
         prepopulate()
     }
 
-    /// Snapshot current field values so closeCompose can detect actual changes.
+    /// Record the fields as loaded or prefilled, for Close to compare against
+    /// (`ComposeDraftGuards.closeDecision`).
     private func snapshotInitialState() {
-        initialSubject = subject
-        initialBody = messageBody
-        (initialToTokens, initialCcTokens, initialBccTokens) = recipients.stored
-        initialAttachmentsFingerprint = attachmentsFingerprint(attachments)
+        loadedBaseline = currentBaseline()
+    }
+
+    private func currentBaseline() -> ComposeDraftGuards.Baseline {
+        let (to, cc, bcc) = recipients.stored
+        return ComposeDraftGuards.Baseline(
+            subject: subject, body: messageBody, to: to, cc: cc, bcc: bcc,
+            attachmentsFingerprint: attachmentsFingerprint(attachments))
     }
 
     @discardableResult
@@ -2787,16 +2824,14 @@ struct ComposeView: View {
             bcc: recipients.bcc.tokens + recipients.bcc.rejected,
             toInput: recipients.to.input, ccInput: recipients.cc.input, bccInput: recipients.bcc.input,
             hasAttachments: !attachments.isEmpty || attachmentLoadFailed || attachmentPreparationIsUnsettled)
-        let hasChanges = subject != initialSubject || messageBody != initialBody
-            || recipients.stored.to != initialToTokens
-            || recipients.stored.cc != initialCcTokens
-            || recipients.stored.bcc != initialBccTokens
-            || attachmentsFingerprint(attachments) != initialAttachmentsFingerprint
-            || attachmentPreparationIsUnsettled
-            || hasVisibleSuggestion
-        switch ComposeDraftGuards.closeAction(
-            readState: draftReadState, hasContent: hasContent, hasChanges: hasChanges
-        ) {
+        switch ComposeDraftGuards.closeDecision(ComposeDraftGuards.CloseState(
+            readState: draftReadState,
+            loaded: loadedBaseline,
+            current: currentBaseline(),
+            loadedIsUnsaved: prefillTreatAsUnsavedChanges,
+            hasContent: hasContent,
+            hasUnsettledWork: attachmentPreparationIsUnsettled || hasVisibleSuggestion
+        )) {
         case .promptSave:
             showDiscardPrompt = true
         case .promptDelete:
@@ -3214,11 +3249,7 @@ struct ComposeView: View {
             }
         }
 
-        // Undo-Send reopen path: DON'T snapshot initial state, so prefill
-        // content appears as "unsaved changes" and close → save prompt fires.
-        if !prefillTreatAsUnsavedChanges {
-            snapshotInitialState()
-        }
+        snapshotInitialState()
     }
 
     /// Download and re-attach the original message's attachments. Runs asynchronously; chips

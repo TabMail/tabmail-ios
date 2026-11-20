@@ -26,8 +26,10 @@ A record that describes a build no user ever ran cannot be *superseded*, because
      **Two carve-outs survive:** the purge-and-resync reaction to a UIDVALIDITY change, and the
      invariant-test layer.
    - **ADR-IOS-063** — defers a change to code that will not exist.
-   - **The epoch clause of ADR-IOS-065.** The restored Undo-Send close prompt is satisfied by the
-     base and survives; the epoch rotation does not.
+   - **The epoch clause of ADR-IOS-065.** The epoch rotation does not survive. *Amended (#1086):*
+     this item first said the restored Undo-Send close prompt "is satisfied by the base". It was not:
+     the v3 rebuild removed the prompt, and an unchanged undo-reopened draft closed silently without
+     reaching Drafts. #1086 fixes it by saving the draft when Undo Send is confirmed (see ADR-IOS-065).
 2. **ADR-IOS-059 is not withdrawn — its principle is ported.** *A folder role is never identity;
    Undo resolves by a recorded tuple and drops on any mismatch* is base-independent and exactly
    D4-shaped. It is folded into ADR-IOS-068 §6.
