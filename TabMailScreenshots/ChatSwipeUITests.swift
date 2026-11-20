@@ -162,8 +162,9 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertNotNil(marker, "control: the marker recorded one finished drag")
         guard let marker else { return }
         XCTAssertTrue(marker.hasBaseline, "control: the drag's start had the newest row's place")
-        XCTAssertGreaterThan(marker.seen, 0, "control: the newest row reported during the drag, so the move was measured")
+        XCTAssertEqual(marker.newestMinY, before, accuracy: 1, "control: the marker's newest row is the bubble read at rest")
         XCTAssertLessThan(marker.move, 1, "the chat stayed through the swell and the settle: moved \(marker.move)")
+        XCTAssertTrue(marker.heldAtSettle, "the freeze is still held through the cooldown after the settle")
         XCTAssertFalse(marker.frozen, "the freeze is released once the drag has settled")
         XCTAssertEqual(newest.frame.minY, before, accuracy: 1, "the chat is where it was once settled")
         XCTAssertFalse(app.buttons["chatClose"].exists, "control: the short drag did not open the panel")
@@ -176,6 +177,7 @@ final class ChatSwipeUITests: XCTestCase {
         let marker = dragMarker(afterDrags: 1, in: app)
         XCTAssertNotNil(marker, "control: the marker recorded one finished drag")
         guard let marker else { return }
+        XCTAssertTrue(marker.heldAtSettle, "the freeze is still held through the cooldown after the settle")
         XCTAssertFalse(marker.frozen, "the freeze is released after a drag that opened the panel")
         XCTAssertTrue(app.buttons["chatClose"].exists, "control: the panel is still open")
     }
@@ -705,9 +707,11 @@ final class ChatSwipeUITests: XCTestCase {
     private struct DragMarker {
         let drags: Int
         let watching: Bool
-        /// Whether the drag's start had the newest row's place, and how often the row reported since.
+        /// Whether the drag's start had the newest row's place, and the row's last reported top.
         let hasBaseline: Bool
-        let seen: Int
+        let newestMinY: CGFloat
+        /// Whether the freeze was still held halfway through the cooldown after the settle.
+        let heldAtSettle: Bool
         let move: CGFloat
         let frozen: Bool
     }
@@ -721,10 +725,10 @@ final class ChatSwipeUITests: XCTestCase {
             if pair.count == 2 { fields[pair[0]] = pair[1] }
         }
         guard let drags = fields["drags"].flatMap(Int.init), let watching = fields["watching"],
-              let base = fields["base"], let seen = fields["seen"].flatMap(Int.init),
+              let base = fields["base"], let at = fields["at"].flatMap(Double.init), let held = fields["held"],
               let move = fields["move"].flatMap(Double.init), let frozen = fields["frozen"] else { return nil }
-        return DragMarker(drags: drags, watching: watching == "1", hasBaseline: base == "1", seen: seen,
-                          move: CGFloat(move), frozen: frozen == "1")
+        return DragMarker(drags: drags, watching: watching == "1", hasBaseline: base == "1", newestMinY: CGFloat(at),
+                          heldAtSettle: held == "1", move: CGFloat(move), frozen: frozen == "1")
     }
 
     /// The marker once it has seen `drags` drags and stopped watching the last one.

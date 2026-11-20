@@ -63,7 +63,9 @@ struct ChatReplyRecoveryTests {
         }
         private let record = Record()
 
-        init(failure: Failure, asksForReply: Bool = true) {
+        /// `holdFirst`: the first request is answered (as `failure`) only once it is signalled, so
+        /// the agent keeps working until then.
+        init(failure: Failure, asksForReply: Bool = true, holdFirst: DispatchSemaphore? = nil) {
             http.register(path: "/completions/chat", method: "POST") { [record] request in
                 let body = String(decoding: request.body ?? Data(), as: UTF8.self)
                 let count = record.bodies.withLock { bodies in
@@ -71,9 +73,14 @@ struct ChatReplyRecoveryTests {
                     return bodies.count
                 }
                 if count == 1 {
-                    switch failure {
-                    case .connectionLost: return .transportError(.networkConnectionLost)
-                    case .serverError: return .status(500)
+                    let failed: FakeHTTP.CannedResponse = switch failure {
+                    case .connectionLost: .transportError(.networkConnectionLost)
+                    case .serverError: .status(500)
+                    }
+                    guard let holdFirst else { return failed }
+                    return .parked {
+                        holdFirst.wait()
+                        return failed
                     }
                 }
                 let final: [String: Any]
@@ -355,6 +362,40 @@ struct ChatReplyRecoveryTests {
                 }
                 #expect(Self.addresses(card["to"]).union(Self.addresses(card["cc"])) == ["alex@example.com", "david@example.com", "sam@example.com"],
                         "everyone: \(card)")
+            }
+        }
+    }
+
+    @Test("While the agent works on a field request, VoiceOver's \"Show TabMail chat\" on the field's words still opens the panel")
+    func showChatWhileTheAgentWorks() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let release = DispatchSemaphore(value: 0)
+        let backend = Backend(failure: .serverError, asksForReply: false, holdFirst: release)
+        try await HostedAccessibility.withAutomation {
+            try await withChat(backend, tag: "show-chat-working") { chat in
+                defer { release.signal() }
+                let name = ChatThreadView.showChatActionName
+                #expect(Self.type("Tell them Friday works", in: chat.view), "control: the field takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 1 && ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 1 && ActiveAgentTracker.shared.anyWorking,
+                        "control: the request is out and the agent is working")
+                func carrier() -> NSObject? {
+                    HostedAccessibility.elements(under: chat.view).first {
+                        $0.isAccessibilityElement && HostedAccessibility.identifier(of: $0) != ChatThreadView.replyPillId
+                            && ($0.accessibilityCustomActions?.contains { $0.name == name } ?? false)
+                    }
+                }
+                try await Self.waitUntil { carrier() != nil }
+                let element = try #require(carrier(), "an element VoiceOver focuses carries the action while the agent works: \(HostedAccessibility.labels(in: chat.view).prefix(20))")
+                #expect(ActiveAgentTracker.shared.anyWorking, "control: still working")
+                let action = try #require(element.accessibilityCustomActions?.first { $0.name == name })
+                let handler = try #require(action.actionHandler, "control: a SwiftUI action has a handler")
+                #expect(handler(action), "the action runs")
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatClose") }
+                #expect(HostedAccessibility.identifiers(in: chat.view).contains("chatClose"), "the panel opened")
             }
         }
     }

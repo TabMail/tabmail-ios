@@ -1959,7 +1959,7 @@ struct DictationOptOutFlagTests {
     @Test func theWaveformDimsTheInputInPlace() throws {
         let source = try flatPillSource()
         // The one input field, used by the pill's input bar and the chat's reply field.
-        let field = String(try slice(source, from: "func inputField(placeholder: String) -> some View {", to: "var trailingButton: some View"))
+        let field = String(try slice(source, from: "func inputField(placeholder: String, showChat: (() -> Void)? = nil) -> some View {", to: "var trailingButton: some View"))
         // The field dims and ignores touches beneath the overlay, which stays full strength and
         // tappable: both modifiers come before it.
         let beneath = try slice(field, from: "TextField(placeholder, text: typedText, selection: $inputSelection, axis: .vertical)", to: ".overlay {")
