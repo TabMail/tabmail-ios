@@ -114,6 +114,45 @@ struct ChatReplyFieldTests {
         #expect(!AIWorkingRule.anyAISourceEnabled(demoHidesAI: false, optedOutAllAI: true, deviceSyncAuto: false, subscribed: true))
         #expect(AIWorkingRule.anyAISourceEnabled(demoHidesAI: false, optedOutAllAI: true, deviceSyncAuto: true, subscribed: true))
         #expect(!AIWorkingRule.anyAISourceEnabled(demoHidesAI: false, optedOutAllAI: false, deviceSyncAuto: false, subscribed: false))
+        #expect(AIWorkingRule.anyAISourceEnabled(demoHidesAI: false, optedOutAllAI: false, deviceSyncAuto: false, subscribed: true),
+                "the ordinary user: not in a demo, not opted out, Device Sync auto off, subscribed")
+    }
+
+    @Test("The inbox row's thread forms: shimmer while any tagged member awaits its reply, spinner while not every Inbox member is tagged")
+    func rowThreadFormRules() {
+        // Shimmer, thread form: the row passes replyProcessed = !anyMemberStillProcessingReply.
+        for (anyMemberStillProcessingReply, expected) in [(true, true), (false, false)] {
+            #expect(AIWorkingRule.writesReply(tagged: true, replyProcessed: !anyMemberStillProcessingReply, subscribed: true) == expected,
+                    "thread with a member awaiting its reply: \(anyMemberStillProcessingReply)")
+        }
+        #expect(!AIWorkingRule.writesReply(tagged: false, replyProcessed: false, subscribed: true), "untagged thread: no shimmer")
+        #expect(!AIWorkingRule.writesReply(tagged: true, replyProcessed: false, subscribed: false), "not subscribed: no shimmer")
+        // Spinner, thread form: the row passes tagged = allMembersTagged.
+        for (allMembersTagged, expected) in [(true, false), (false, true)] {
+            #expect(AIWorkingRule.classifies(tagged: allMembersTagged, inInbox: true, aiSourceEnabled: true) == expected,
+                    "every Inbox member tagged: \(allMembersTagged)")
+        }
+        #expect(!AIWorkingRule.classifies(tagged: false, inInbox: false, aiSourceEnabled: true), "outside the Inbox: no spinner")
+        #expect(!AIWorkingRule.classifies(tagged: false, inInbox: true, aiSourceEnabled: false), "no AI source: no spinner")
+        // A demo with AI declined hides every AI source, so a seeded untagged row shows no spinner.
+        let demoSource = AIWorkingRule.anyAISourceEnabled(demoHidesAI: true, optedOutAllAI: false, deviceSyncAuto: false, subscribed: true)
+        #expect(!AIWorkingRule.classifies(tagged: false, inInbox: true, aiSourceEnabled: demoSource))
+    }
+
+    @Test("The inbox row reads the one AI-working rule with the thread-form inputs")
+    func rowWorkingRuleWiring() throws {
+        let text = try Self.source("TabMail/Views/Inbox/MessageRowView.swift")
+        #expect(Self.count("AIWorkingRule.anyAISourceEnabled( demoHidesAI: DemoModeStore.shared.hidesAIContent, optedOutAllAI: optOutAllAI, deviceSyncAuto: DeviceSyncService.shared.isAutoEnabled, subscribed: AISubscriptionGate.shared.isActive)", in: text) == 1,
+                "the row's AI source is the shared rule, demo included")
+        #expect(Self.count("AIWorkingRule.classifies(tagged: effectiveTag != nil, inInbox: message.isInInbox, aiSourceEnabled: anyAISourceEnabled)", in: text) == 1,
+                "the single row's spinner")
+        #expect(Self.count("let replyProcessed = threadInfo.map { !$0.anyMemberStillProcessingReply } ?? message.isReplyProcessed", in: text) == 1,
+                "a thread is processed only when no member still awaits its reply")
+        #expect(Self.count("AIWorkingRule.writesReply(tagged: effectiveTag != nil, replyProcessed: replyProcessed, subscribed: AISubscriptionGate.shared.isActive)", in: text) == 1,
+                "the shimmer")
+        #expect(Self.count("AIWorkingRule.classifies(tagged: threadInfo.allMembersTagged, inInbox: message.isInInbox, aiSourceEnabled: anyAISourceEnabled)", in: text) == 1,
+                "the thread spinner")
+        #expect(Self.count("AIWorkingRule.", in: text) == 4, "no inline copy of the rule")
     }
 
     @Test("The AI Suggestion's row is the working bubble while the reply is written, then the ghost")
