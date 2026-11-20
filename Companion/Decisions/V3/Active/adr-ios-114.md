@@ -906,6 +906,18 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `suggestionNeverEntersTheField`, `ChatReplyFieldTests.suggestionText` and `exampleFromConfig`,
    `TutorialChatViewTests.fieldText`.
 
+17. **The field, compact (amendment 2026-11-20).** Every open field bar (the chat's reply field,
+   the opened pill's input bar in the inbox, over a draft and on an email, and the tutorial's
+   copy) draws one row, `ChatFieldBarRow`, with the `ChatViewLayout.field*` values: the mic glyph
+   12 pt in from the field's edge, 10 pt from glyph to text, the 28 pt Send circle 6 pt in, 10 pt
+   above and below the text. The buttons sit on the text's LAST line, not its middle, and stay
+   there as the field grows; each lays out at its glyph's width and one line's height while its
+   tap area stays 44 pt tall and may reach past the field's edge. One line is 42 pt, the collapsed
+   field's corner `min(height / 2, 21)`. The collapsed Chat pill keeps its size. The line height
+   scales with the text size (`@ScaledMetric`), so at the largest sizes the buttons still centre
+   on the last line. The Stop and Retry glyphs keep their size. Tests:
+   `ChatThreadLayoutTests.fieldButtonsOnTheLastLine`, `ChatReplyFieldTests.everyOpenBarSharesTheRow`.
+
 ## The longer index line (routed 2026-11-09)
 
 The DECISIONS.md row grew with each decision of the chat view; it moved here when the index went

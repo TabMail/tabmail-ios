@@ -405,7 +405,8 @@ struct DynamicIslandChat: View {
                 collapsedPill
             }
         }
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: isExpanded ? 24 : 100))
+        .glassEffect(.regular, in: RoundedRectangle(
+            cornerRadius: isExpanded ? 24 : (replyField != nil ? ChatViewLayout.fieldCornerRadius : 100)))
         .overlay {
             // Guided tutorial: the step's next move is opening this chat.
             if !isExpanded
@@ -807,15 +808,13 @@ struct DynamicIslandChat: View {
     // MARK: - Expanded input bar
 
     private var expandedInputBar: some View {
-        HStack(spacing: 10) {
+        ChatFieldBarRow {
             micButton
-
+        } text: {
             inputField(placeholder: PillDictationMode.placeholder(isCompose: isComposeMode, offNote: dictationOffNote))
-
+        } send: {
             trailingButton
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
         .animation(nil, value: isTextFieldFocused)
         .animation(nil, value: isWorking)
     }
@@ -838,9 +837,10 @@ struct DynamicIslandChat: View {
         } label: {
             Image(systemName: micSymbol)
                 .contentTransition(.symbolEffect(.replace))
-                .font(.title3)
+                .font(.body)
                 .foregroundStyle(dictation.phase == .listening || speech.isRecording ? .red : Theme.accent)
-                .frame(width: 28, height: 28)
+                .frame(width: ChatViewLayout.fieldMicTapWidth, height: ChatViewLayout.fieldTapSize)
+                .contentShape(Rectangle())
         }
         // Dictation is transcribed on the AI backend (off without a connection), or on this iPhone
         // when opted out of AI (off if the language has no on-device model).
@@ -948,7 +948,8 @@ struct DynamicIslandChat: View {
                 }
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
+                    .resizable()
+                    .frame(width: ChatViewLayout.fieldSendSize, height: ChatViewLayout.fieldSendSize)
                     .foregroundStyle(canTapSend ? Theme.accent : .secondary.opacity(0.3))
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())

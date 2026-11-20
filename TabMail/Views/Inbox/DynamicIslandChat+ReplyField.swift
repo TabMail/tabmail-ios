@@ -56,8 +56,9 @@ extension DynamicIslandChat {
                     .frame(maxWidth: .infinity)
                     .transition(.opacity)
             }
-            HStack(spacing: 10) {
+            ChatFieldBarRow {
                 micButton
+            } text: {
                 VStack(alignment: .leading, spacing: 2) {
                     if isWorking, let sent = fieldSentText {
                         Text(sent)
@@ -71,11 +72,10 @@ extension DynamicIslandChat {
                         }
                     }
                 }
+            } send: {
                 trailingButton
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
     }
 
     /// The "e.g." line shows under the empty field, signed in, while nothing is being said.

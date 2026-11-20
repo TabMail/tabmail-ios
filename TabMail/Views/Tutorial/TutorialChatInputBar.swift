@@ -37,31 +37,32 @@ struct TutorialChatInputBar: View {
         }
     }
 
+    /// The same row as the real bar (`ChatFieldBarRow`).
     private var inputRow: some View {
-        HStack(spacing: 10) {
+        ChatFieldBarRow {
             Image(systemName: "mic")
-                .font(.title3)
+                .font(.body)
                 .foregroundStyle(prompt == nil ? AnyShapeStyle(.secondary.opacity(0.3)) : AnyShapeStyle(Theme.accent))
-                .frame(width: 28, height: 28)
+                .frame(width: ChatViewLayout.fieldMicTapWidth, height: ChatViewLayout.fieldTapSize)
                 .accessibilityHidden(true)
-
+        } text: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(prompt ?? "Chat follows the tutorial steps")
                     .foregroundStyle(prompt == nil ? Theme.textSecondary : Theme.textPrimary)
                     .lineLimit(1...6)
                     .accessibilityIdentifier("tutorial-chat-input")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
+        } send: {
             Button {
                 guard prompt != nil else { return }
                 tooltipClosedFor = prompt
                 send()
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
+                    .resizable()
+                    .frame(width: ChatViewLayout.fieldSendSize, height: ChatViewLayout.fieldSendSize)
                     .foregroundStyle(prompt == nil || isWorking ? AnyShapeStyle(.secondary.opacity(0.3)) : AnyShapeStyle(Theme.accent))
-                    .frame(width: 44, height: 44)
+                    .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                     .contentShape(Rectangle())
             }
             .disabled(prompt == nil || isWorking)
@@ -73,8 +74,6 @@ struct TutorialChatInputBar: View {
             .accessibilityLabel("Send")
             .accessibilityIdentifier("tutorial-chat-send")
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
     }
 }
 

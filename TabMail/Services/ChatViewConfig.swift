@@ -103,6 +103,29 @@ enum ChatViewLayout {
     /// The AI Suggestion's dashed outline: its line width and its dash and gap lengths.
     static let suggestionStrokeWidth: CGFloat = 1.5
     static let suggestionDash: [CGFloat] = [6, 4]
+
+    // Every open field bar's row (`ChatFieldBarRow`): the chat's reply field, the opened pill's
+    // input bar (inbox, edit mode over a draft, the per-message pill) and the tutorial's copy.
+    // Measured from the visible glyphs. The collapsed Chat pill keeps its own size.
+    /// The field's edge to the mic glyph.
+    static let fieldMicInset: CGFloat = 12
+    /// The mic glyph's width at the body size.
+    static let fieldMicGlyphWidth: CGFloat = 13
+    /// The mic's tap width; it may reach past the field's edge into the side margin.
+    static let fieldMicTapWidth: CGFloat = 38
+    /// Between a button's glyph and the text.
+    static let fieldTextGap: CGFloat = 10
+    /// The Send circle's diameter, and its distance from the field's edge.
+    static let fieldSendSize: CGFloat = 28
+    static let fieldSendInset: CGFloat = 6
+    /// Every field button's tap height and the Send button's tap width.
+    static let fieldTapSize: CGFloat = 44
+    /// Above and below the text.
+    static let fieldVerticalPadding: CGFloat = 10
+    /// One line of body text at the default size: the buttons sit centred on the last line.
+    static let fieldLineHeight: CGFloat = 22
+    /// The collapsed reply field's corner: a capsule at one line (42 / 2), then fixed as it grows.
+    static let fieldCornerRadius: CGFloat = 21
 }
 
 /// The AI Suggestion in the chat: the ghost of the user's next message, and the field's hint.

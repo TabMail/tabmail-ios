@@ -645,6 +645,29 @@ struct ChatReplyFieldTests {
         #expect(Self.count(hide, in: try Self.source("TabMail/Views/Message/MessageDetailView.swift")) == 1)
     }
 
+    @Test("Every open field bar draws the one row, and the collapsed Chat pill keeps its size")
+    func everyOpenBarSharesTheRow() throws {
+        // The chat's reply field, the opened pill's input bar (inbox, edit mode over a draft and
+        // the per-message pill are this one view) and the tutorial's copy read the same values.
+        let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
+        let pill = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        let tutorial = try Self.source("TabMail/Views/Tutorial/TutorialChatInputBar.swift")
+        #expect(Self.count("ChatFieldBarRow {", in: field) == 1)
+        #expect(Self.count("ChatFieldBarRow {", in: pill) == 1, "the opened pill's input bar")
+        #expect(Self.count("ChatFieldBarRow {", in: tutorial) == 1)
+        // (The tutorial's tooltip keeps its own padding.)
+        for (name, text) in [("field", field), ("pill", pill)] {
+            #expect(Self.count("HStack(spacing: 10) { micButton", in: text) == 0, "\(name): no centred row of its own")
+            #expect(Self.count(".padding(.horizontal, 14) .padding(.vertical, 10)", in: text) == 0, "\(name): no old bar padding")
+        }
+        // The collapsed Chat pill: today's padding and wand.
+        #expect(Self.count(".padding(.horizontal, 22) .padding(.vertical, 12)", in: pill) == 1)
+        #expect(Self.count("ChatPillWandIcon(isWorking: isWorking || ActiveAgentTracker.shared.anyWorking, size: 24)", in: pill) == 1)
+        // One line is the line plus the padding above and below; the corner is half of it.
+        #expect(ChatViewLayout.fieldLineHeight + 2 * ChatViewLayout.fieldVerticalPadding == 42)
+        #expect(ChatViewLayout.fieldCornerRadius * 2 == 42)
+    }
+
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")

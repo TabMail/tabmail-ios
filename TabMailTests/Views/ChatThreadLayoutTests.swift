@@ -145,6 +145,33 @@ struct ChatThreadLayoutTests {
         }
     }
 
+    @Test("A one-line field is 42 tall, with the mic and Send centred on its line, inset as drawn")
+    func fieldButtonsOnTheLastLine() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosted { _, controller, _ in
+                let id = ChatThreadView.replyPillId
+                try await Self.waitFor { Self.frame(of: "chatSend", in: controller.view) != nil }
+                try await Task.sleep(for: .milliseconds(300))
+                let field = try #require(Self.frame(of: id, in: controller.view))
+                let send = try #require(Self.frame(of: "chatSend", in: controller.view))
+                let mic = try #require(HostedAccessibility.elements(under: controller.view)
+                    .first { $0.accessibilityLabel == "Dictate" }?.accessibilityFrame,
+                    "labels: \(HostedAccessibility.labels(in: controller.view).prefix(30))")
+                // No TabMail session here, so no "e.g." line: one line.
+                #expect(abs(field.height - 42) < 1, "one-line field \(field.height)")
+                let lineMid = field.maxY - ChatViewLayout.fieldVerticalPadding - ChatViewLayout.fieldLineHeight / 2
+                #expect(abs(send.midY - lineMid) < 1, "Send \(send) on the line at \(lineMid)")
+                #expect(abs(mic.midY - lineMid) < 1, "mic \(mic) on the line at \(lineMid)")
+                #expect(abs(send.midX - (field.maxX - ChatViewLayout.fieldSendInset - ChatViewLayout.fieldSendSize / 2)) < 1,
+                        "Send circle 6 in from the edge: \(send), field \(field)")
+                #expect(abs(mic.midX - (field.minX + ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2)) < 1,
+                        "mic 12 in from the edge: \(mic), field \(field)")
+                #expect(send.height >= 44 && mic.height >= 44, "tap areas stay 44 tall")
+            }
+        }
+    }
+
     @Test("With the largest text, the opened pill fits between the navigation bar, which stays, and the safe area")
     func openedPillFitsUnderTheBar() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
