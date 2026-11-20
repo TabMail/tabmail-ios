@@ -51,8 +51,7 @@ struct FastSyncWakeLockTests {
         await BackfillBodyQueue.shared.emptyForTesting()
         let poll = await FastSyncView.pollKeepAwakeInputs(accounts: accounts, engine: SyncEngine())
         #expect(poll.activeBodyIdle && poll.backfillBodyIdle, "precondition: both body queues are idle")
-        return FastSyncView.holdAwake(accounts: accounts, walkDoneByAccount: poll.walkDoneByAccount,
-                                      activeBodyIdle: poll.activeBodyIdle, backfillBodyIdle: poll.backfillBodyIdle)
+        return FastSyncView.holdAwake(accounts: accounts, poll: poll)
     }
 
     @Test("Every real folder walked and both queues idle: the lock releases whether progress is missing, stale or complete",
@@ -105,6 +104,14 @@ struct FastSyncWakeLockTests {
             try Self.setWalkComplete(false, accountId: other.id, path: "Archive", pool: pool)
         }
         Self.publish(.complete, for: [done, other])
-        #expect(await Self.holdsAwake([done, other]), "an unfinished or undiscovered account keeps the screen awake")
+        // The download gate is open, so the unfinished walk can move (a held walk
+        // releases the lock, #1098; pinned in FastSyncHeldWorkTests).
+        SyncEngine.backfillPowerStateForTesting.withLock {
+            $0 = (fastSync: false, lowPowerMode: false, onPower: true, batteryLevel: 1)
+        }
+        defer { SyncEngine.backfillPowerStateForTesting.withLock { $0 = nil } }
+        try await DownloadGateHarness.withNetwork(expensive: false) {
+            #expect(await Self.holdsAwake([done, other]), "an unfinished or undiscovered account keeps the screen awake")
+        }
     }
 }
