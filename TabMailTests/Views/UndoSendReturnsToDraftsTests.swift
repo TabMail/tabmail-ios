@@ -424,7 +424,16 @@ struct UndoSendReturnsToDraftsTests {
             attachmentsFingerprint: [])
         let baseline = ComposeDraftGuards.baseline(
             afterLoading: fields, treatAsUnsavedChanges: compose.prefillTreatAsUnsavedChanges)
-        #expect(ComposeDraftGuards.hasChanges(current: fields, baseline: baseline) == !returned)
-        #expect(closeWithoutTyping(compose, loaded: loaded) == (returned ? .dismiss : .promptSave))
+        let changes = ComposeDraftGuards.hasChanges(current: fields, baseline: baseline)
+        let decision = closeWithoutTyping(compose, loaded: loaded)
+        if returned {
+            #expect(compose.prefillTreatAsUnsavedChanges == false)
+            #expect(changes == false)
+            #expect(decision == .dismiss)
+        } else {
+            #expect(compose.prefillTreatAsUnsavedChanges == true)
+            #expect(changes == true)
+            #expect(decision == .promptSave)
+        }
     }
 }
