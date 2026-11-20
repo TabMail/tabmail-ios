@@ -726,6 +726,7 @@ struct ChangeApplyTests {
                 Set(try Folder.filter(Column("accountId") == w.accountId).fetchAll(db).map(\.path))
             }
             #expect(paths == ["INBOX", "Archive", "Label_9"])
+            #expect(outcome.fromReader, "the folder list came through the change reader's pass")
         }
     }
 

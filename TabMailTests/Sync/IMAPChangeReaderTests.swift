@@ -90,7 +90,7 @@ struct IMAPChangeReaderTests {
         // A conforming server answers `UID SEARCH UID <set>` within the set; the
         // adversarial fixture (`overbroadUIDSearch`) answers with the whole
         // mailbox, which the reader must refuse (#755).
-        if !overbroadUIDSearch { server.honorSearchUIDSetCriterion() }
+        if overbroadUIDSearch { server.ignoreSearchUIDSetCriterion() }
         server.setUidValidity(epoch, for: inboxPath)
         server.setUidValidity(epoch, for: archivePath)
         try server.start()

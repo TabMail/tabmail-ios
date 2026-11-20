@@ -1197,6 +1197,44 @@ struct FakeIMAPServerOracleTests {
         }
         #expect(stray.isEmpty, "a stopped server's late answer reached a socket opened after stop(): \(stray)")
     }
+
+    /// RFC 3501 §6.4.4 / §6.4.8 / §9: a `UID SEARCH UID <set>` answers only UIDs
+    /// in the set, and in `n:*` the `*` is the mailbox's highest UID, so with that
+    /// UID below `n` the range still matches the last message (#1076). Pins the
+    /// default fake, with no opt-in: RED while it answered the whole mailbox.
+    @Test("UID SEARCH answers only UIDs inside the requested UID set, n:* included")
+    func uidSearchAnswersWithinTheRequestedSet() throws {
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [1, 2, 3, 7, 8].map { Self.message(uid: $0, id: "search-set-\($0)@example.com") },
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "s1", "LOGIN \(server.username) \(server.password)")
+        _ = try client.command(tag: "s2", "SELECT INBOX")
+
+        func answer(_ tag: String, _ set: String) throws -> Set<Int> {
+            let reply = try client.command(tag: tag, "UID SEARCH UID \(set)")
+            let line = reply.split(separator: "\r\n").first { $0.hasPrefix("* SEARCH") } ?? ""
+            return Set(line.split(separator: " ").dropFirst(2).compactMap { Int($0) })
+        }
+        let cases: [(set: String, expected: Set<Int>)] = [
+            ("2:7", [2, 3, 7]),
+            ("4:6", []),
+            ("1,8", [1, 8]),
+            ("3:*", [3, 7, 8]),
+            // `*` is 8 here, so 20:* is 8:20 and matches the last message only.
+            ("20:*", [8]),
+        ]
+        for (index, item) in cases.enumerated() {
+            let got = try answer("q\(index)", item.set)
+            #expect(got == item.expected, "UID SEARCH UID \(item.set) answered \(got.sorted())")
+        }
+        _ = try client.command(tag: "s9", "LOGOUT")
+    }
 }
 
 /// A minimal raw-socket IMAP client: enough to log in, select, and issue a
