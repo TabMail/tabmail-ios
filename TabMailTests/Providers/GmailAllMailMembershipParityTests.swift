@@ -15,7 +15,7 @@ struct GmailAllMailMembershipParityTests {
         [], ["UNREAD"], ["STARRED", "IMPORTANT"], ["CATEGORY_PROMOTIONS"], ["Label_1"],
         ["INBOX"], ["INBOX", "UNREAD"], ["SENT"], ["SENT", "Label_1"], ["TRASH"],
         ["SPAM"], ["DRAFT"], ["CHAT"], ["TRASH", "Label_1"], ["INBOX", "SENT", "TRASH", "SPAM", "DRAFT"],
-        ["SENT", "TRASH"], ["Label_1", "SPAM"],
+        ["SENT", "TRASH"], ["Label_1", "SPAM"], ["STARRED", "TRASH"], ["STARRED", "SPAM"],
     ]
 
     @Test("The listing query is the excluded labels' -in: tokens, in order")
