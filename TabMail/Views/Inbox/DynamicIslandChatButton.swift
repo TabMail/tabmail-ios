@@ -2967,7 +2967,8 @@ private struct ReplyFieldFocusMarker: ViewModifier {
 
     #if DEBUG
     private struct Marker: ViewModifier {
-        static let isActive = ProcessInfo.processInfo.arguments.contains("--chat-swipe-ui-test")
+        static let isActive = ["--chat-swipe-ui-test", "--keyboard-focus-ui-test"]
+            .contains(where: ProcessInfo.processInfo.arguments.contains)
         let focused: Bool
         @State private var shown = false
 

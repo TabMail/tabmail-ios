@@ -6,6 +6,7 @@
 - ScrollViews with text input should also use `.scrollDismissesKeyboard(.interactively)`.
 - The keyboard reappears naturally when the user taps a text field — no special handling needed.
 - The dismiss tap runs alongside every other recognizer (`shouldRecognizeSimultaneouslyWith` returns true), so a tap on a button, chip or bubble also drops the keyboard; only text fields and text views are excluded (2026-11-19).
+- A control whose action deliberately focuses an input (a template's plus, a bullet list's Add, a rejected recipient chip, "Fork and re-send", opening search) keeps or moves the keyboard focus to that input: the dismiss tap's `endEditing` runs synchronously in the same tap, before the control's action sets focus, so the action wins. Pinned by `KeyboardFocusRaceUITests` (2026-11-19).
 - Do NOT add manual keyboard dismiss buttons (toolbar chevrons, floating buttons, etc.). The tap-outside gesture handles everything.
 
 ---
