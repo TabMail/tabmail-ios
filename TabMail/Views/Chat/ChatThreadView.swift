@@ -87,8 +87,6 @@ struct ChatThreadView: View {
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet.
     @State private var fieldComposeOpened = false
-    /// Bumps to empty the field.
-    @State private var fieldClearCount = 0
     /// The chat's replies still in the outbox (`ChatUnsentReply`), read from the database.
     @State private var unsentReplies: [ChatUnsentReply] = []
     /// Who the next reply goes to; Reply All until changed in Reply to.
@@ -896,7 +894,6 @@ struct ChatThreadView: View {
                 replyField: ChatReplyField(
                     example: ChatReplyField.example(shown: shown, configured: example),
                     isNoReply: isNoReply,
-                    clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
                     tutorialMove: tutorialMove(thread),
                     suggestion: shown),
@@ -945,21 +942,21 @@ struct ChatThreadView: View {
     }
 
     /// The agent finished a request from the field with something to say: the sheet rises with
-    /// the request and the answer, and the field empties. After a compose card the reply
-    /// was the point, so nothing opens.
+    /// the request and the answer. After a compose card the reply was the point, so nothing opens.
+    /// The field's words are the request's to complete, on its own chat key (`ChatFieldWords`,
+    /// `.answered`), not this view's.
     private func agentAnswered() {
         guard !fieldComposeOpened else { return }
-        fieldClearCount += 1
         withAnimation(Self.pillSpring) { chatExpanded = true }
     }
 
-    /// A compose card from the chat closed. Sent: the field empties; a reply shows as its queued
-    /// email's bubble, read from the outbox.
+    /// A compose card from the chat closed. Sent: a reply shows as its queued email's bubble, read
+    /// from the outbox. The field's words are emptied by the request that opened the card, on its
+    /// own chat key (`AgentToolRouter.enqueueComposeAndAwaitOutcome`).
     private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {
         guard case .sent = outcome else { return }
         // A reply sent clears "Replying only to"; the next one is a Reply All again.
         if replyTo != nil { replyTarget = .replyAll }
-        fieldClearCount += 1
     }
 
     private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {

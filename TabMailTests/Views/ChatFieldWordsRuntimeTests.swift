@@ -30,6 +30,11 @@ import UIKit
 ///  8. Words typed in a chat pushed inside a sheet, as Search opens chats, survive the sheet's
 ///     dismissal, by its own dismiss and by a UIKit programmatic teardown, and are in the field
 ///     when the chat opens again, in this run and the next.
+///  9. A request from the field transitions the words of the chat it was SENT from: an earlier
+///     request's card and answer, landing after the pill moved to another chat, leave that chat's
+///     unsent words in the field, in storage and in a new run; an answer that lands after the chat
+///     was torn down still empties the words sent, so they never return on reopen; newer words
+///     typed while the agent works stay.
 @Suite("Chat field words kept on Back", .serialized, .processGlobalState)
 @MainActor
 struct ChatFieldWordsRuntimeTests {
@@ -61,7 +66,7 @@ struct ChatFieldWordsRuntimeTests {
         var body: some View {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded,
-                replyField: replyField ? ChatReplyField(example: nil, isNoReply: false, clearCount: 0) : nil)
+                replyField: replyField ? ChatReplyField(example: nil, isNoReply: false) : nil)
             .environment(\.hasTabMailSession, true)
         }
     }
@@ -102,7 +107,7 @@ struct ChatFieldWordsRuntimeTests {
         var body: some View {
             DynamicIslandChat(
                 message: message, isExpanded: $expanded,
-                replyField: ChatReplyField(example: nil, isNoReply: false, clearCount: 0))
+                replyField: ChatReplyField(example: nil, isNoReply: false))
         }
     }
 
@@ -462,6 +467,159 @@ struct ChatFieldWordsRuntimeTests {
             await ChatFieldWords.shared.written()
             let stored5 = try Self.stored(pool)
             #expect(stored5 == [ChatFieldWords.key(for: first): "Words for A", ChatFieldWords.key(for: second): "Words for B"])
+        }
+    }
+
+    // MARK: - 9. A request's card and completion land on the chat it was sent from
+
+    @Test("An earlier request's card and answer, landing after the pill moved to another chat, never touch that chat's unsent words")
+    func olderRequestNeverClearsAnotherChatsWords() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted buttons")
+        try await HostedAccessibility.withAutomation { try await olderRequestNeverClearsAnotherChatsWordsBody() }
+    }
+
+    private func olderRequestNeverClearsAnotherChatsWordsBody() async throws {
+        let (pool, directory, previous) = try ThreadChatTests.install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        ChatFieldWords.shared = ChatFieldWords()
+        defer { ChatFieldWords.shared = ChatFieldWords() }
+        let templateName = "Field words card \(UUID().uuidString.prefix(8))"
+        defer {
+            if let made = PromptStore.shared.templates.first(where: { $0.name == templateName }) {
+                PromptStore.shared.deleteTemplate(id: made.id)
+            }
+        }
+        // Two chats: A's email in one account and thread, B's in another (its own chat key).
+        let first = ThreadChatTests.header("301", from: "Ann Example", rfc: "words-1@example.com",
+                                           thread: "words-thread-a", minutesAgo: 30)
+        let newer = ThreadChatTests.header(
+            "302", account: ThreadChatTests.accountB, from: "Bea Example", rfc: "words-2@example.com",
+            inReplyTo: "words-1@example.com", thread: "words-2@example.com", minutesAgo: 1)
+        let keyA = ChatFieldWords.key(for: first)
+        let keyB = ChatFieldWords.key(for: newer)
+        #expect(keyA != keyB, "control: two chats")
+        try ThreadChatTests.insert(first, pool: pool)
+        // B has unsent words of its own, kept on the device.
+        let wordsB = "Words for B, not sent"
+        ChatFieldWords.shared.apply(.put(wordsB), to: keyB)
+        await ChatFieldWords.shared.written()
+        let backend = ThreadChatTests.Backend(cardWords: "Make it a template", templateName: templateName, hold: true)
+        try await ThreadChatTests.withBackend(backend, chatView: true) {
+            let host = Host(first)
+            let pill = try await Self.mount(PillView(host: host, replyField: true))
+            defer { pill.close() }
+            // A's request goes out from the collapsed field; its words stay, pulsing.
+            try await ThreadChatTests.ask("Make it a template", in: pill.view, backend: backend, answered: false)
+            let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
+            #expect(asked, "control: A's request reached the backend")
+            // The pill moves to B while A's request runs.
+            try ThreadChatTests.insert(newer, pool: pool)
+            host.message = newer
+            try await Self.settle()
+            #expect(Self.fieldTexts(pill.view).contains(wordsB), "control: the field shows B's words: \(Self.fieldTexts(pill.view))")
+
+            // A's card arrives, then Create lets A's request answer.
+            backend.proceed.signal()
+            try await ThreadChatTests.wait { ThreadChatTests.shows("Create", in: pill.view) }
+            #expect(host.expanded, "control: the card opens the sheet on the shown chat")
+            #expect(ChatFieldWords.shared.fill(for: keyB).words == wordsB, "A's card left B's words")
+            let create = HostedAccessibility.elements(under: pill.view).first { $0.accessibilityLabel == "Create" }
+            #expect(create?.accessibilityActivate() == true, "Create takes a tap")
+            try await ThreadChatTests.wait { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
+            #expect(backend.bodies.count == 2, "control: A's request went on and answered")
+            host.expanded = false
+            try await Task.sleep(for: .milliseconds(600))
+
+            #expect(Self.fieldTexts(pill.view).contains(wordsB), "B's field still holds B's words: \(Self.fieldTexts(pill.view))")
+            #expect(ChatFieldWords.shared.fill(for: keyA).words.isEmpty, "A's sent words finished: the card and answer emptied them")
+            await ChatFieldWords.shared.written()
+            let stored = try Self.stored(pool)
+            #expect(stored == [keyB: wordsB], "only B's words are kept: \(stored)")
+        }
+        // A fresh store, as the next app run: B's words come back, A's sent words do not.
+        await Self.newRun { PrioritizedDatabase(pool: pool) }
+        await ChatFieldWords.shared.load(keyB)
+        await ChatFieldWords.shared.load(keyA)
+        #expect(ChatFieldWords.shared.fill(for: keyB).words == wordsB, "the next run shows B's words")
+        #expect(ChatFieldWords.shared.fill(for: keyA).words.isEmpty, "and none of A's")
+    }
+
+    /// How the field's send ends in `completionLandsOnTheSendsChat`.
+    enum SendEnd: String, CaseIterable, CustomTestStringConvertible {
+        /// Same chat, same screen: the answer empties the words sent.
+        case answered
+        /// Same chat: newer words typed while the agent works stay after its answer.
+        case newerWordsTyped
+        /// Back tears the chat down before the answer; the chat opens again after it.
+        case backBeforeTheAnswer
+        var testDescription: String { rawValue }
+    }
+
+    @Test("A field send's answer empties only the words sent, on its own chat, also when the chat was closed before the answer",
+          arguments: SendEnd.allCases)
+    func completionLandsOnTheSendsChat(_ end: SendEnd) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
+        try await HostedAccessibility.withAutomation { try await completionLandsOnTheSendsChatBody(end) }
+    }
+
+    private func completionLandsOnTheSendsChatBody(_ end: SendEnd) async throws {
+        try await Self.withDatabase { pool in
+            _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
+            try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
+            let email = Self.header("done-\(end.rawValue)", thread: "done-thread-\(end.rawValue)")
+            try await pool.write { try email.insert($0) }
+            let key = ChatFieldWords.key(for: email)
+            let sent = "When is the meeting"
+            let newerWords = "Also ask about lunch"
+            let backend = ThreadChatTests.Backend(holdAnswers: true)
+            try await ThreadChatTests.withBackend(backend, chatView: true) {
+                let host = Host(email)
+                let pill = try await Self.mount(PillView(host: host, replyField: true))
+                var closed = false
+                defer { if !closed { pill.close() } }
+                try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
+                let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
+                #expect(asked, "control: the request reached the backend")
+                #expect(ChatFieldWords.shared.fill(for: key).words == sent, "control: the sent words stay while it works")
+                switch end {
+                case .answered:
+                    break
+                case .newerWordsTyped:
+                    // The user opens the chat and writes more while the agent works.
+                    host.expanded = true
+                    try await Task.sleep(for: .milliseconds(600))
+                    #expect(Self.type(newerWords, in: pill.view), "the open sheet has a native editable field")
+                    try await Self.settle()
+                    host.expanded = false
+                    try await Task.sleep(for: .milliseconds(600))
+                case .backBeforeTheAnswer:
+                    pill.close()
+                    closed = true
+                    try await Self.settle()
+                }
+                backend.proceed.signal()
+                try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
+                try await Self.settle()
+                let expected = end == .newerWordsTyped ? newerWords : ""
+                #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                        "the answer emptied only the words sent: \(ChatFieldWords.shared.fill(for: key).words)")
+                if !closed {
+                    let texts = Self.fieldTexts(pill.view)
+                    #expect(!texts.contains(sent), "the sent words left the field: \(texts)")
+                    #expect(end != .newerWordsTyped || texts.contains(newerWords), "newer words stay: \(texts)")
+                }
+            }
+            try await Self.open(email) { view in
+                let texts = Self.fieldTexts(view)
+                #expect(!texts.contains(sent), "the sent words never come back on reopen: \(texts)")
+                #expect(end != .newerWordsTyped || texts.contains(newerWords), "newer words are there: \(texts)")
+            }
+            await ChatFieldWords.shared.written()
+            let stored = try Self.stored(pool)
+            #expect(stored == (end == .newerWordsTyped ? [key: newerWords] : [:]), "\(stored)")
+            await Self.newRun { PrioritizedDatabase(pool: pool) }
+            await ChatFieldWords.shared.load(key)
+            #expect(!ChatFieldWords.shared.fill(for: key).words.contains(sent), "nor in the next run")
         }
     }
 

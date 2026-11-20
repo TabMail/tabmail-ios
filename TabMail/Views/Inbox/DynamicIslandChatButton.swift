@@ -655,13 +655,10 @@ struct DynamicIslandChat: View {
                 speech.stop()
             }
         }
-        // Reply field (chat view): a clear empties the words that were sent; a confirmation card
-        // while collapsed opens the sheet, which takes the request.
-        .onChange(of: replyField?.clearCount) { _, _ in
-            fieldSentText = nil
-            // Words written after the send this completes are newer, and stay (`ChatFieldFill`).
-            fieldFill.apply(.completed)
-        }
+        // Reply field (chat view): a confirmation card while collapsed opens the sheet, which takes
+        // the request. The field's words are not changed here: the request's own transitions
+        // (card, answer, sent compose) land on the chat key it was sent under, in `ChatFieldWords`
+        // (`SessionUISink`, `sendAgentChat`, `AgentToolRouter.enqueueComposeAndAwaitOutcome`).
         // The thread's chat, read as the pill appears and whenever it is about a newer email, so a
         // card raised in any key of the thread opens the sheet while collapsed (ADR-IOS-114).
         .task(id: message?.id) {
@@ -676,7 +673,6 @@ struct DynamicIslandChat: View {
         }
         .onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
-            fieldFill.apply(.confirmationCard)
             fieldSentText = nil
             withAnimation(expandSpring) { isExpanded = true }
         }
@@ -2474,8 +2470,11 @@ struct DynamicIslandChat: View {
         // Captured with the session id: a demo turn is written only while its demo runs.
         let admission = DemoModeStore.shared.chatAdmission
         let capturedSessionKey = sessionKey
-        // Sent from the reply field: the request carries the field's send as it started.
+        // Sent from the reply field: the request carries the field's send as it started, and the
+        // chat key its words were sent under, where its card, answer and sent compose land
+        // (ADR-IOS-117), whichever chat this pill shows by then, and whether or not it still exists.
         let fieldReply = field?.fieldReply
+        let fieldWordsKey = field.map { ChatFieldWords.key(for: $0.message) }
 
         activeChatTask = Task {
             // Ensure email context is registered before building enrichedText.
@@ -2572,7 +2571,8 @@ struct DynamicIslandChat: View {
                 // by) the session that launched the turn — never a global slot that
                 // other mounted pills race for.
                 let invocation = ToolInvocation(
-                    uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)
+                    uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: sessionKey,
+                    fieldReply: fieldReply, fieldWordsKey: fieldWordsKey)
                 let response: ChatResponse?
                 response = try await TutorialChatScript.response(for: script, invocation: invocation) {
                     try await ChatPillState.shared.aiService.sendChatMessage(
@@ -2651,6 +2651,11 @@ struct DynamicIslandChat: View {
                     animate: true
                 ))
                 BackgroundSyncLogger.logDebug("[AIChatRender] chatMessages appended (count=\(chatMessages.count)), about to set isWorking=false")
+                // The agent answered the field's send: it completes on the send's own chat key.
+                if let fieldWordsKey {
+                    ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)
+                    fieldSentText = nil
+                }
                 if !isExpanded {
                     if let onAgentReply {
                         // Parent view handles the toast (InboxView, ComposeView)
@@ -2679,7 +2684,7 @@ struct DynamicIslandChat: View {
                     // no `lastFailedSend` (that's the separate fork/resend pathway). The field's
                     // request goes with it, for the resumed turn's tools.
                     BackgroundSyncLogger.logChatError("Connection lost (resumable): \(error.localizedDescription)", userMessage: text)
-                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply)
+                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply, fieldWordsKey: fieldWordsKey)
                 } else {
                     // Connection/server error — enable retry
                     BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: text)
@@ -2745,7 +2750,8 @@ struct DynamicIslandChat: View {
                     request: resume.request,
                     onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
                     invocation: ToolInvocation(
-                        uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply)
+                        uiSink: SessionUISink(session: session, fieldWordsKey: resume.fieldWordsKey), sessionKey: sessionKey,
+                        fieldReply: resume.fieldReply, fieldWordsKey: resume.fieldWordsKey)
                 )
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."
@@ -2789,6 +2795,10 @@ struct DynamicIslandChat: View {
                     timestamp: Date(),
                     animate: true
                 ))
+                if let fieldWordsKey = resume.fieldWordsKey {
+                    ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)
+                    fieldSentText = nil
+                }
                 if !isExpanded {
                     if let onAgentReply {
                         onAgentReply(displayText)
@@ -2808,7 +2818,8 @@ struct DynamicIslandChat: View {
                 } else if let resumable = error as? ChatConnectionLostError {
                     // Cut off again — keep the affordance armed with the latest checkpoint.
                     BackgroundSyncLogger.logChatError("Connection lost again (resumable)", userMessage: "(resumed)")
-                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply)
+                    pendingResume = .init(
+                        request: resumable.resumeRequest, fieldReply: resume.fieldReply, fieldWordsKey: resume.fieldWordsKey)
                 } else {
                     // Non-transient failure — surface it; the user's message still has
                     // the fork/resend context menu for a fresh attempt.

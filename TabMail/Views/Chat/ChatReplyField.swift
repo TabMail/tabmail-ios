@@ -16,9 +16,6 @@ struct ChatReplyField: Equatable {
     let example: String?
     /// The newest email is from a no-reply address.
     let isNoReply: Bool
-    /// Changes when the field must empty: the reply went out, or the agent answered in the
-    /// sheet.
-    let clearCount: Int
     /// The reply goes only to these people; nil for Reply All.
     var onlyTo: [ChatThread.Person]? = nil
     /// In the tutorial, what the read-only field holds and sends (part 2); nil holds nothing.
@@ -126,6 +123,9 @@ struct ChatFieldFill: Equatable {
     private(set) var atSend: String?
     /// How many changes the words have had: the change counter a live transcript compares.
     private(set) var changes = 0
+    /// A compose card opened for the field's send: the reply is the point, so the agent's closing
+    /// answer completes nothing; the card's own send does (`completed`).
+    private(set) var composing = false
     /// The live transcript in progress: the words it adds to, and the change count of its own last
     /// write. Ends when anything else changes the words.
     private var hearing: Hearing?
@@ -151,9 +151,13 @@ struct ChatFieldFill: Equatable {
         case sentFromSheet
         /// Send from the collapsed field: the words stay, pulsing, until the send completes.
         case sentFromField
-        /// The last send completed (the reply went out, or the agent answered in the sheet): it
-        /// empties the words only if they are still the words sent, or none.
+        /// The last send completed (its compose card's reply went out): it empties the words only
+        /// if they are still the words sent, or none.
         case completed
+        /// The agent answered the field's send: `completed`, unless a compose card opened for it.
+        case answered
+        /// A compose card opened for the field's send (`composing`).
+        case composeOpened
         /// A confirmation card opened the sheet: the same check, and the send is still open.
         case confirmationCard
     }
@@ -184,9 +188,17 @@ struct ChatFieldFill: Equatable {
             words = ""
         case .sentFromField:
             atSend = words
+            composing = false
         case .completed:
             if clears { words = "" }
             atSend = nil
+            composing = false
+        case .answered:
+            guard !composing else { return }
+            if clears { words = "" }
+            atSend = nil
+        case .composeOpened:
+            composing = true
         case .confirmationCard:
             if clears { words = "" }
         }

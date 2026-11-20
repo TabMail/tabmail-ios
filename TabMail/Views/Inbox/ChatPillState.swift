@@ -122,6 +122,8 @@ final class ChatPillState {
         struct PendingResume {
             let request: CompletionsRequest
             let fieldReply: ChatFieldReply?
+            /// The chat key the field's words were sent under (`ToolInvocation.fieldWordsKey`).
+            var fieldWordsKey: String? = nil
         }
         /// Buffer 1 (display): shown on the "new session" page. Swapped from Buffer 2
         /// on pill expand for instant display. Stable while being shown.

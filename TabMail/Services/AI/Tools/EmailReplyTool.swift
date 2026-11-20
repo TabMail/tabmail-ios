@@ -274,7 +274,7 @@ struct EmailReplyTool: AgentTool, Sendable {
         // The helper threads onOutcome + outcomeState into ComposeRequest so
         // the MainActor-isolated ComposeView callback resumes this tool's
         // continuation.
-        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome { onOutcome, state in
+        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome(fieldWordsKey: invocation.fieldWordsKey) { onOutcome, state in
             AgentToolRouter.ComposeRequest(
                 mode: .reply,
                 replyTo: header,

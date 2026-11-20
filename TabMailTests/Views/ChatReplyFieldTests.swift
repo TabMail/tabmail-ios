@@ -294,8 +294,8 @@ struct ChatReplyFieldTests {
 
     @Test("The placeholder offers a reply only when the sender takes replies")
     func placeholder() {
-        #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).placeholder == "Reply or ask anything")
-        #expect(ChatReplyField(example: nil, isNoReply: true, clearCount: 0).placeholder == "Ask anything")
+        #expect(ChatReplyField(example: nil, isNoReply: false).placeholder == "Reply or ask anything")
+        #expect(ChatReplyField(example: nil, isNoReply: true).placeholder == "Ask anything")
     }
 
     // MARK: - 2. The "e.g." line
@@ -644,7 +644,8 @@ struct ChatReplyFieldTests {
                 "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
         #expect(Self.count("guard case .sent = outcome else { return }", in: ended) == 1)
-        #expect(Self.count("fieldClearCount += 1", in: ended) == 1, "only after a send")
+        #expect(Self.count("ChatFieldWords", in: ended) == 0 && Self.count("fieldFill", in: ended) == 0,
+                "the view never completes the field: the request does, on its own key (ChatFieldWordsRuntimeTests)")
         // The bubbles are the database's: one observation keyed by the chat's Message-IDs.
         #expect(Self.count("for try await found in ChatUnsentReply.changes(answering: messageIds) {", in: text) == 1)
         // A reply filed or gone reloads the chat's emails, so a sent reply's copy takes its place.
@@ -1097,13 +1098,13 @@ struct ChatReplyFieldTests {
         #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) }", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
         #expect(Self.count("let fieldReply = field?.fieldReply", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)", in: island) == 1,
+        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: sessionKey, fieldReply: fieldReply, fieldWordsKey: fieldWordsKey)", in: island) == 1,
                 "and travel with the request to the agent's tools")
         // A recovered send keeps them: the resume carries the cut-off send's request, the retry the
         // failed send as it was sent (ChatReplyRecoveryTests sends both through the real chat).
-        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply)", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply)", in: island) == 1)
-        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply)", in: island) == 1)
+        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply, fieldWordsKey: fieldWordsKey)", in: island) == 1)
+        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: resume.fieldWordsKey), sessionKey: sessionKey, fieldReply: resume.fieldReply, fieldWordsKey: resume.fieldWordsKey)", in: island) == 1)
+        #expect(Self.count("pendingResume = .init( request: resumable.resumeRequest, fieldReply: resume.fieldReply, fieldWordsKey: resume.fieldWordsKey)", in: island) == 1)
         #expect(Self.count("lastFailedSend = .init(text: text, field: field)", in: island) == 1)
         #expect(Self.count("sendAgentChat(failed.text, field: failed.field)", in: island) == 1)
         #expect(Self.count("replyField?.onlyTo", in: island) == 0 && Self.count("replyField?.isNoReply", in: island) == 0,

@@ -68,11 +68,19 @@ chat history the same key already keeps, and goes with that thread's AI data and
   its words as it strands its chat; the purge deletes them once the old key has no email.
 - Words typed in a field whose send is still in flight are not kept until the send completes; a send
   that then fails keeps its own retry in the chat.
+- A field send's transitions (confirmation card, the agent's answer, a compose card opening, its reply
+  going out) are applied by the request lifecycle to the chat key captured at send
+  (`ToolInvocation.fieldWordsKey`, `SessionUISink.fieldWordsKey`,
+  `AgentToolRouter.enqueueComposeAndAwaitOutcome(fieldWordsKey:)`), never by a view to the chat it
+  shows then. Reason (review 2026-11-20): applied on the displayed key, an earlier request's card
+  emptied and deleted ANOTHER chat's unsent words after the pill moved; delivered through a view
+  counter, an answer after Back never reached the store and the sent words came back on reopen. The
+  view counter (`ChatReplyField.clearCount`) is gone; the view keeps only presentation (sheet rising).
 
 **Tests:** `ChatFieldWordsRuntimeTests` (Back and reopen, the newer email of the thread, another thread
 and another account never show them, a new store after a restart, two pills on one chat, a failed or left
 read, an emptying before the read lands, a pill moving between chats while reads are held, the email
-screen's pill and the inbox control, a demo's words through `DemoModeService.exit`, a chat opened from the Search sheet over the sheet's dismissal), `ChatFieldWordsTests`
+screen's pill and the inbox control, a demo's words through `DemoModeService.exit`, a chat opened from the Search sheet over the sheet's dismissal, an earlier request's card and answer after the pill moved to another chat, an answer after the chat was torn down, newer words typed while the agent works), `SearchChatWordsUITests` (the real Search route: type, Back, Done, reopen), `ChatFieldWordsTests`
 (store restart, keying, clearing on send and on an emptied field, every newer intention against a held
 read, a late read, a failed read, reads landing only on their own chat, writes during a write and a failed
 write, a removed account's or ended demo's words never handed to a write again, no words in failure logs, purge with the thread's AI data per account and for a threadless email,

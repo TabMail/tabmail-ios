@@ -22,6 +22,11 @@ import SwiftUI
 /// and is what is kept. A read that fails changes nothing, so the stored words stay for the next
 /// read. Every change lands in memory at once and is written behind it, in order, the newest words
 /// of a key winning, so Back and an immediate reopen never race the write.
+///
+/// A field send's own transitions (its confirmation card, the agent's answer, its compose card
+/// opening and its reply going out) are applied here by the request, on the key captured when it was
+/// sent (`ToolInvocation.fieldWordsKey`), never by a view on the chat it shows by then: a pill that
+/// moved to another chat, or a chat closed before the answer, cannot misroute or miss them.
 @MainActor
 @Observable
 final class ChatFieldWords {

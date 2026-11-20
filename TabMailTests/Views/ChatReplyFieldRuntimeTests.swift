@@ -48,8 +48,6 @@ struct ChatReplyFieldRuntimeTests {
 
     @Observable final class Host {
         var message: MessageHeader
-        /// `ChatThreadView.fieldClearCount`: a send or an answer from the field bumps it.
-        var clearCount = 0
         /// The chat sheet is open.
         var expanded = false
         /// The agent is answering the user's words.
@@ -68,7 +66,7 @@ struct ChatReplyFieldRuntimeTests {
         var body: some View {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded, isWorking: $host.working,
-                replyField: ChatReplyField(example: host.example, isNoReply: false, clearCount: host.clearCount),
+                replyField: ChatReplyField(example: host.example, isNoReply: false),
                 onFieldSend: { host.fieldSends.append($0) })
             .environment(\.hasTabMailSession, host.signedIn)
         }
@@ -181,7 +179,8 @@ struct ChatReplyFieldRuntimeTests {
             #expect(Self.type("My question", in: controller.view), "the mounted pill has a native editable field")
             try await Self.settle()
             #expect(Self.fieldTexts(controller.view).contains("My question"), "control: the edit reached the field")
-            host.clearCount += 1
+            // A send's completion lands on the chat key the send was made under (ADR-IOS-117).
+            ChatFieldWords.shared.apply(.completed, to: ChatFieldWords.key(for: host.message))
             try await Self.settle()
             let texts = Self.fieldTexts(controller.view)
             #expect(!texts.contains("My question"), "the completion emptied the field: \(texts)")
@@ -364,15 +363,18 @@ struct ChatReplyFieldRuntimeTests {
         return String(rest[..<(rest.range(of: "private func ")?.lowerBound ?? rest.endIndex)])
     }
 
-    @Test("A sent compose card and an agent answer from the field each empty the field; a cancelled card does not")
+    @Test("A sent compose card and an agent answer from the field complete on the request's own chat key, never the view's")
     func clearWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(text.components(separatedBy: "clearCount: fieldClearCount").count == 2, "the field gets the count once")
-        #expect(text.components(separatedBy: "fieldClearCount += 1").count == 3, "only the two completions")
-        let answered = try Self.function("private func agentAnswered() {", in: text)
-        #expect(answered.contains("guard !fieldComposeOpened else { return } fieldClearCount += 1"))
-        let ended = try Self.function("private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
-        #expect(ended.contains("guard case .sent = outcome else { return }"))
-        #expect(ended.components(separatedBy: "fieldClearCount += 1").count == 2, "the field empties only after a send")
+        #expect(!text.contains("fieldClearCount"), "no view counter carries a completion")
+        let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        #expect(!island.contains("fieldFill.apply(.completed)") && !island.contains("fieldFill.apply(.confirmationCard)"),
+                "the pill never applies a request's transition to the chat it shows")
+        #expect(island.components(separatedBy: "ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)").count == 3,
+                "a send's and a resume's answer complete on the key captured at send")
+        let router = try Self.source("TabMail/Services/AI/AgentToolRouter.swift")
+        #expect(router.contains("if case .sent = outcome, let fieldWordsKey { ChatFieldWords.shared.apply(.completed, to: fieldWordsKey) }"))
+        let sink = try Self.source("TabMail/Services/AI/Tools/ToolInvocation.swift")
+        #expect(sink.contains("if let fieldWordsKey { ChatFieldWords.shared.apply(.confirmationCard, to: fieldWordsKey) }"))
     }
 }
