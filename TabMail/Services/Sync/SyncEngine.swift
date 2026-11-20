@@ -185,7 +185,16 @@ actor SyncEngine {
     /// setting and the network. Older-mail body downloads (BackfillBodyQueue) are
     /// held by the same rules as the walk (#1064); ActiveBodyQueue is not gated.
     nonisolated static func backfillDownloadsAllowedNow() async -> Bool {
-        let power = await currentBackfillPowerState()
+        backfillDownloadsAllowed(power: await currentBackfillPowerState())
+    }
+
+    /// The walk gate for a given power snapshot, with the Wi-Fi-only setting and
+    /// the network read now. The one rule shared by the walk and BackfillBodyQueue.
+    /// Uses checkExpensive() (Mutex-backed) as the Wi-Fi proxy: on iOS,
+    /// expensive == cellular/hotspot.
+    nonisolated static func backfillDownloadsAllowed(
+        power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float)
+    ) -> Bool {
         let wifiOnly = UserDefaults.standard.object(forKey: SyncScheduler.wifiOnlyKey) as? Bool ?? true
         return backfillWalkAllowed(
             fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
