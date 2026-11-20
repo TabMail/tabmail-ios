@@ -39,7 +39,7 @@ struct BackfillBodyDownloadGateTests {
     private func withAccount(
         _ accountId: String, provider: MockEmailProvider,
         power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), expensive: Bool,
-        _ body: () async throws -> Void
+        wifiOnly: Bool = true, _ body: () async throws -> Void
     ) async throws {
         await AccountManager.shared.installBodyGateTestProvider(
             accountId: accountId, provider: provider, queue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
@@ -47,7 +47,7 @@ struct BackfillBodyDownloadGateTests {
         defer { SyncEngine.backfillPowerStateForTesting.withLock { $0 = nil } }
         NetworkMonitor.setConnectedForTesting(true)
         do {
-            try await DownloadGateHarness.withNetwork(expensive: expensive) { try await body() }
+            try await DownloadGateHarness.withNetwork(expensive: expensive, wifiOnly: wifiOnly) { try await body() }
         } catch {
             await AccountManager.shared.removeBodyGateTestProvider(accountId: accountId)
             throw error
@@ -149,6 +149,74 @@ struct BackfillBodyDownloadGateTests {
         await queue.cancelAllInFlight()
     }
 
+    @Test("refused dispatches beyond the retry limit keep the item pending and spend no retry")
+    func repeatedRefusalsSpendNoRetry() async throws {
+        let accountId = "gate1064-retries"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        let held = backfillItem(accountId)
+        try await withAccount(accountId, provider: provider, gate: .lowPowerMode) {
+            await queue.enqueue([held])
+            try await Task.sleep(for: Self.settle)
+            // Each new item triggers a fresh dispatch that collects and refuses the held one too.
+            for round in 0...SyncConfig.maxQueueRetries {
+                await queue.enqueue([backfillItem(accountId, messageId: "\(100 + round)")])
+                try await Task.sleep(for: Self.settle)
+            }
+            #expect(await fetchCount(provider) == 0, "a body was downloaded under Low Power Mode")
+            #expect(await queue.queuedItemsForTesting.map(\.messageId).contains("7"),
+                    "repeated refusals dropped the item past the retry limit")
+
+            openGate()
+            #expect(await eventually {
+                await provider.callLog.contains { $0.hasPrefix("fetchMessage(id:7,") }
+            }, "the repeatedly refused item was not admitted after the gate lifted")
+        }
+        await queue.cancelAllInFlight()
+    }
+
+    @Test("Wi-Fi-only off: an older-mail body downloads on an expensive network")
+    func wifiOnlyOffDownloadsOnExpensiveNetwork() async throws {
+        let accountId = "gate1064-wifi-off"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        try await withAccount(accountId, provider: provider, power: Self.openPower, expensive: true, wifiOnly: false) {
+            await queue.enqueue([backfillItem(accountId)])
+            #expect(await eventually { await fetchCount(provider) > 0 },
+                    "the body was held on an expensive network with Wi-Fi-only off")
+        }
+        await queue.cancelAllInFlight()
+    }
+
+    @Test("a Wi-Fi-only change during a parked decision applies to the next decision, not the parked one")
+    func wifiOnlyChangeMidDecisionKeepsSnapshot() async throws {
+        let accountId = "gate1064-wifi-snapshot"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        let parked = TestBox(false)
+        let admit = TestLatch()
+        SyncEngine.backfillPowerReadHookForTesting.withLock {
+            $0 = {
+                parked.value.withLock { $0 = true }
+                await admit.wait()
+            }
+        }
+        defer { SyncEngine.backfillPowerReadHookForTesting.withLock { $0 = nil } }
+        try await withAccount(accountId, provider: provider, power: Self.openPower, expensive: true, wifiOnly: false) {
+            await queue.enqueue([backfillItem(accountId)])
+            #expect(await eventually { parked.value.withLock { $0 } }, "the admission never reached the power read")
+            // The Settings toggle writes the preference to UserDefaults.
+            UserDefaults.standard.set(true, forKey: SyncScheduler.wifiOnlyKey)
+            await admit.open()
+            #expect(await eventually { await fetchCount(provider) > 0 },
+                    "the parked decision read the new Wi-Fi-only value instead of its snapshot")
+            #expect(!(await SyncEngine.backfillDownloadsAllowedNow()),
+                    "a new decision did not see Wi-Fi-only turned on")
+        }
+        await admit.open()
+        await queue.cancelAllInFlight()
+    }
+
     @Test("a held older-mail body stays held across full gate re-checks, then downloads when the gate opens",
           arguments: DownloadGate.allCases)
     func heldAcrossRechecksThenDownloaded(_ gate: DownloadGate) async throws {
@@ -243,7 +311,23 @@ struct BackfillBodyDownloadGateTests {
             await queue.enqueue([backfillItem(accountId)])
             try await Task.sleep(for: Self.settle)
             #expect(await fetchCount(provider) == 0, "the body was downloaded under Low Power Mode")
+
+            // Count power reads with the gate kept closed. The re-check span covers
+            // several watcher intervals.
+            let reads = TestBox(0)
+            SyncEngine.backfillPowerReadHookForTesting.withLock { $0 = { reads.value.withLock { $0 += 1 } } }
+            defer { SyncEngine.backfillPowerReadHookForTesting.withLock { $0 = nil } }
+            let span: Duration = .seconds(SyncConfig.backfillBodyGateRecheckSeconds * 3) + Self.settle
+            // Positive control: the live watcher keeps reading the gate.
+            try await Task.sleep(for: span)
+            #expect(reads.value.withLock { $0 } > 0, "the live gate watcher never re-checked")
+
             await queue.cancelAllInFlight()
+            try await Task.sleep(for: Self.settle)
+            let afterCancel = reads.value.withLock { $0 }
+            try await Task.sleep(for: span)
+            #expect(reads.value.withLock { $0 } == afterCancel, "a cancelled queue's gate watcher kept polling")
+            SyncEngine.backfillPowerReadHookForTesting.withLock { $0 = nil }
             openGate()
             try await Task.sleep(for: Self.deadline)
             #expect(await fetchCount(provider) == 0, "a cancelled queue downloaded once the gate opened")
