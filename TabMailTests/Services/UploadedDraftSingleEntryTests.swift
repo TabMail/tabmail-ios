@@ -43,6 +43,18 @@ struct UploadedDraftSingleEntryTests {
 
         var serverId: String { self == .imap ? "4242" : "demo-draft-4242" }
 
+        /// The address a replacement upload returns: the old copy is deleted and
+        /// the new one appended under a different id.
+        var replacement: DraftCreatedAddress {
+            switch self {
+            case .imap: .imap(folder: UploadedDraftSingleEntryTests.draftsPath,
+                              uidValidity: UploadedDraftSingleEntryTests.imapEpoch, uid: 4343)
+            case .demo: .demo(localId: "demo-draft-4343")
+            }
+        }
+
+        var replacementServerId: String { self == .imap ? "4343" : "demo-draft-4343" }
+
         var identity: DraftDeleteIdentity {
             switch self {
             case .imap: .imap(folder: UploadedDraftSingleEntryTests.draftsPath,
@@ -182,6 +194,27 @@ struct UploadedDraftSingleEntryTests {
                 "the upload named \(String(describing: last.existingIdentity))")
     }
 
+    /// After a replacement upload that returned a new id: exactly one Drafts
+    /// entry, under the new id, and it is this draft's (its words, its message
+    /// id and the row's RFC Message-ID).
+    private func expectOneEntryAfterReplacement(
+        _ fixture: Fixture, draftId: String, words: String
+    ) async throws {
+        let newHeaderId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: Self.draftsPath,
+            messageId: fixture.kind.replacementServerId)
+        let draft = try await row(fixture, draftId)
+        #expect(draft.serverDraftId == fixture.kind.replacementServerId)
+        let entries = try await allDraftsEntries(fixture)
+        #expect(entries.count == 1, "Drafts shows \(entries.count) entries: \(entries.map(\.0.id))")
+        guard entries.count == 1 else { return }
+        #expect(entries[0].0.id == newHeaderId)
+        #expect(entries[0].0.messageId == fixture.kind.replacementServerId)
+        #expect(entries[0].0.rfc822MessageId == draft.rfc822MessageId)
+        #expect(entries[0].0.snippet.contains(words))
+        #expect(entries[0].1?.htmlContent?.contains(words) == true)
+    }
+
     @Test("Undo Send of an uploaded draft keeps one Drafts entry with the words sent", arguments: Kind.allCases)
     func undoOfUploadedDraftKeepsOneEntry(_ kind: Kind) async throws {
         let fixture = try makeFixture(kind)
@@ -210,6 +243,63 @@ struct UploadedDraftSingleEntryTests {
         try await expectOneEntryAndUpload(
             fixture, draftId: uploaded.draftId, serverHeaderId: uploaded.serverHeaderId,
             mock: mock, words: latest)
+    }
+
+    @Test("A replacement upload with a new id leaves one Drafts entry, this draft's", arguments: Kind.allCases)
+    func replacementUploadMovesTheOneEntry(_ kind: Kind) async throws {
+        let fixture = try makeFixture(kind)
+        defer { finish(fixture) }
+        let mock = MockEmailProvider(saveDraftResult: .created(kind.created))
+        let uploaded = try await uploadedDraft(fixture, mock: mock)
+        let edited = "Edited before the replacement upload."
+
+        try await write(fixture, draftId: uploaded.draftId, body: edited, cursor: uploaded.cursor)
+        #expect(await AccountManager.shared.queueDraftSave(
+            draftId: uploaded.draftId, accountId: fixture.accountId))
+        await mock.setSaveDraftResult(.created(kind.replacement))
+        #expect(try await push(fixture, draftId: uploaded.draftId, mock: mock) == .completed)
+
+        try await expectOneEntryAfterReplacement(fixture, draftId: uploaded.draftId, words: edited)
+    }
+
+    @Test("After a UIDVALIDITY reset, saving an uploaded draft leaves the message now at its UID unchanged")
+    func uidValidityResetLeavesOtherMessageUnchanged() async throws {
+        let fixture = try makeFixture(.imap)
+        defer { finish(fixture) }
+        let mock = MockEmailProvider(saveDraftResult: .created(Kind.imap.created))
+        let uploaded = try await uploadedDraft(fixture, mock: mock)
+
+        // The mailbox is renumbered; UID 4242 now belongs to another message.
+        let otherSubject = "Another message"
+        let otherBody = "<p>Words of another message.</p>"
+        let newEpoch = Self.imapEpoch + 1
+        try await fixture.pool.write { db in
+            var folder = try #require(try Folder.fetchOne(db, key: fixture.draftsFolderId))
+            folder.lastKnownUidValidity = newEpoch
+            try folder.update(db)
+            var other = try #require(try MessageHeader.fetchOne(db, key: uploaded.serverHeaderId))
+            other.subject = otherSubject
+            other.snippet = "Words of another message."
+            other.observedUidValidity = newEpoch
+            try other.update(db)
+            try MessageBody(contentKey: ContentKey(rawValue: uploaded.serverHeaderId), htmlContent: otherBody).save(db)
+        }
+
+        let edited = "Edited after the reset."
+        try await write(fixture, draftId: uploaded.draftId, body: edited, cursor: uploaded.cursor)
+        #expect(await AccountManager.shared.queueDraftSave(
+            draftId: uploaded.draftId, accountId: fixture.accountId))
+
+        let entries = try await allDraftsEntries(fixture)
+        let other = try #require(entries.first { $0.0.id == uploaded.serverHeaderId })
+        #expect(other.0.subject == otherSubject)
+        #expect(other.0.snippet == "Words of another message.")
+        #expect(other.0.observedUidValidity == newEpoch)
+        #expect(other.1?.htmlContent == otherBody)
+        let own = entries.filter { $0.0.id != uploaded.serverHeaderId }
+        #expect(own.count == 1, "the draft's own entry: \(own.map(\.0.id))")
+        guard own.count == 1 else { return }
+        #expect(own[0].1?.htmlContent?.contains(edited) == true)
     }
 
     @Test("An offline edit-save of an uploaded draft keeps one Drafts entry with the new words", arguments: Kind.allCases)

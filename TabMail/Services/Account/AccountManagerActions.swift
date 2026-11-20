@@ -2590,8 +2590,12 @@ extension AccountManager {
         // `serverDraftId`. Update that entry rather than adding a placeholder
         // beside it. Where the row's id does not name the moved entry (Gmail, whose
         // entry is keyed by the contained message id), nothing matches and the
-        // placeholder is used as before.
-        let nativeHeaderId = draft.serverDraftId.flatMap { $0.isEmpty ? nil : "\(accountId):\(folderPath):\($0)" }
+        // placeholder is used as before. The stored address is reused only when
+        // it is proved to name this folder's copy (mailbox and UIDVALIDITY on
+        // IMAP); otherwise the draft's own placeholder is used and any header
+        // under that UID, which may now be another message, is left untouched.
+        let nativeHeaderId = try provedServerDraftHeaderId(
+            for: draft, accountId: accountId, folderPath: folderPath, db: db)
         let nativeHeader = try nativeHeaderId.flatMap { try MessageHeader.fetchOne(db, key: $0) }
         let entryHeaderId = nativeHeader?.id ?? placeholderHeaderId
 
@@ -2650,6 +2654,71 @@ extension AccountManager {
                 dateMs: Int64(draft.updatedAt * 1000),
                 folderId: folderId),
             bodyText: draft.body)
+    }
+
+    /// The provider-native address a draft identity names in `folderPath`, or a
+    /// thrown `actionIdentityResolutionFailed` when the address cannot be proved
+    /// to belong there. An IMAP address must name this mailbox, a positive UID
+    /// and the folder's current UIDVALIDITY; any other kind must be non-empty.
+    /// `exactHeaderId` is the header id the server copy is stored under.
+    static func validatedDraftAddress(
+        _ identity: DraftDeleteIdentity,
+        accountId: String,
+        folderPath: String,
+        db: Database
+    ) throws -> (encodedId: String, addressKind: DraftDeleteAddressKind, mintedUidValidity: Int?) {
+        switch identity {
+        case .imap(let addressFolder, let uidValidity, let uid):
+            guard addressFolder == folderPath,
+                  uid > 0,
+                  uidValidity > 0,
+                  let folder = try Folder.fetchOne(db, key: "\(accountId):\(folderPath)"),
+                  folder.lastKnownUidValidity == uidValidity else {
+                throw ProviderError.actionIdentityResolutionFailed(String(uid))
+            }
+            return (String(uid), .providerResource, uidValidity)
+        case .gmail(let resourceId):
+            guard !resourceId.isEmpty else { throw ProviderError.actionIdentityResolutionFailed(resourceId) }
+            return (resourceId, .providerResource, nil)
+        case .gmailContainedMessage(let messageId):
+            guard !messageId.isEmpty else { throw ProviderError.actionIdentityResolutionFailed(messageId) }
+            return (messageId, .gmailContainedMessage, nil)
+        case .outlook(let graphId):
+            guard !graphId.isEmpty else { throw ProviderError.actionIdentityResolutionFailed(graphId) }
+            return (graphId, .providerResource, nil)
+        case .demo(let localId):
+            guard !localId.isEmpty else { throw ProviderError.actionIdentityResolutionFailed(localId) }
+            return (localId, .providerResource, nil)
+        }
+    }
+
+    /// The header id of the server copy a draft row records, only when the row's
+    /// stored address is proved to belong to this Drafts folder by
+    /// `validatedDraftAddress`, the check draft deletion uses. A row carrying an
+    /// IMAP address (mailbox and UIDVALIDITY), or any row in a folder that has a
+    /// UIDVALIDITY, is checked as an IMAP address; a row without one is checked
+    /// by its id alone. `nil` when ownership cannot be proved.
+    static func provedServerDraftHeaderId(
+        for draft: Draft,
+        accountId: String,
+        folderPath: String,
+        db: Database
+    ) throws -> String? {
+        guard let serverId = draft.serverDraftId, !serverId.isEmpty else { return nil }
+        let folder = try Folder.fetchOne(db, key: "\(accountId):\(folderPath)")
+        let identity: DraftDeleteIdentity
+        if draft.serverDraftFolderPath != nil || draft.serverDraftUidValidity != nil
+            || folder?.lastKnownUidValidity != nil {
+            guard let addressFolder = draft.serverDraftFolderPath,
+                  let epoch = draft.serverDraftUidValidity,
+                  let uid = Int(serverId) else { return nil }
+            identity = .imap(folder: addressFolder, uidValidity: epoch, uid: uid)
+        } else {
+            identity = .demo(localId: serverId)
+        }
+        guard let address = try? validatedDraftAddress(
+            identity, accountId: accountId, folderPath: folderPath, db: db) else { return nil }
+        return "\(accountId):\(folderPath):\(address.encodedId)"
     }
 
     /// The work after a Drafts admission commits: search indexing, then the
@@ -2714,50 +2783,8 @@ extension AccountManager {
             }
             let deletedAttachmentDir = try await dbPool.write { db -> String? in
                 let folderId = "\(accountId):\(folderPath)"
-                let encodedId: String
-                let addressKind: DraftDeleteAddressKind
-                let mintedUidValidity: Int?
-                switch identity {
-                case .imap(let addressFolder, let uidValidity, let uid):
-                    guard addressFolder == folderPath,
-                          uid > 0,
-                          uidValidity > 0,
-                          let folder = try Folder.fetchOne(db, key: folderId),
-                          folder.lastKnownUidValidity == uidValidity else {
-                        throw ProviderError.actionIdentityResolutionFailed(String(uid))
-                    }
-                    encodedId = String(uid)
-                    addressKind = .providerResource
-                    mintedUidValidity = uidValidity
-                case .gmail(let resourceId):
-                    guard !resourceId.isEmpty else {
-                        throw ProviderError.actionIdentityResolutionFailed(resourceId)
-                    }
-                    encodedId = resourceId
-                    addressKind = .providerResource
-                    mintedUidValidity = nil
-                case .gmailContainedMessage(let messageId):
-                    guard !messageId.isEmpty else {
-                        throw ProviderError.actionIdentityResolutionFailed(messageId)
-                    }
-                    encodedId = messageId
-                    addressKind = .gmailContainedMessage
-                    mintedUidValidity = nil
-                case .outlook(let graphId):
-                    guard !graphId.isEmpty else {
-                        throw ProviderError.actionIdentityResolutionFailed(graphId)
-                    }
-                    encodedId = graphId
-                    addressKind = .providerResource
-                    mintedUidValidity = nil
-                case .demo(let localId):
-                    guard !localId.isEmpty else {
-                        throw ProviderError.actionIdentityResolutionFailed(localId)
-                    }
-                    encodedId = localId
-                    addressKind = .providerResource
-                    mintedUidValidity = nil
-                }
+                let (encodedId, addressKind, mintedUidValidity) = try Self.validatedDraftAddress(
+                    identity, accountId: accountId, folderPath: folderPath, db: db)
 
                 // Display removal follows only an exact provider-native header id.
                 let exactHeaderId = "\(accountId):\(folderPath):\(encodedId)"

@@ -434,8 +434,12 @@ actor MockEmailProvider: EmailProvider {
 
     // MARK: - Draft Operations
 
-    let saveDraftResult: DraftSaveOutcome
+    private(set) var saveDraftResult: DraftSaveOutcome
     let saveDraftThrows: Error?
+
+    /// What later `saveDraft` calls return, for a server that gives a replaced
+    /// copy a new address.
+    func setSaveDraftResult(_ result: DraftSaveOutcome) { saveDraftResult = result }
 
     /// Every draft payload `saveDraft` was given, with the server copy it named.
     var savedDraftPayloads: [(draft: DraftMessage, existingIdentity: DraftDeleteIdentity?)] = []

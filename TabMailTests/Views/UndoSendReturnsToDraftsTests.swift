@@ -346,4 +346,33 @@ struct UndoSendReturnsToDraftsTests {
             #expect(compose.retainedDraftAuthority == authority)
         }
     }
+    // MARK: - The compose applies the flag where it records its baseline
+
+    /// Source fence on the one call that turns the reopen flag into the close
+    /// decision: `ComposeView.snapshotInitialState` must pass the compose's own
+    /// `prefillTreatAsUnsavedChanges` to `ComposeDraftGuards.baseline`, so a
+    /// failed return opens with unsaved changes and Close asks to save.
+    /// `closeWithoutTyping` above exercises the guards it feeds. Hosting the
+    /// loaded compose and pressing Close is not practical in a unit test: the
+    /// view loads the row through an async `.task`, needs the live account,
+    /// keyboard and attachment environment, and its Close button and alert are
+    /// private SwiftUI state with no handle a test can drive or read.
+    @Test("The compose records its baseline with its own unsaved-changes flag")
+    func composeBaselineUsesTheReopenFlag() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(contentsOf: projectRoot
+            .appendingPathComponent("TabMail/Views/Compose/ComposeView.swift"), encoding: .utf8)
+        let start = try #require(source.range(of: "private func snapshotInitialState() {"))
+        let tail = source[start.upperBound...]
+        let end = try #require(tail.range(of: "private func currentBaseline()"))
+        let body = tail[..<end.lowerBound].split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        #expect(body.contains(
+            "initialBaseline = ComposeDraftGuards.baseline( afterLoading: currentBaseline(), treatAsUnsavedChanges: prefillTreatAsUnsavedChanges)"),
+            "snapshotInitialState reads: \(body)")
+        #expect(source.contains("ComposeDraftGuards.hasChanges(current: currentBaseline(), baseline: initialBaseline)"),
+                "hasChanges must compare against the recorded baseline")
+    }
 }
