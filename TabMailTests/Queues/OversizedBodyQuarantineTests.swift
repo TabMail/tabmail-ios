@@ -1987,7 +1987,10 @@ struct FastSyncKeepAwakeTests {
             activeBodyIdle: activeIdle,
             backfillBodyIdle: backfillIdle,
             downloadsHeld: false,
-            backfillBodyHeld: false
+            backfillBodyHeld: false,
+            activeAIIdle: true,
+            backfillAIIdle: true,
+            walkOrCatchUpRunning: false
         ) == false, "an oversized-only remainder must not pin the screen awake")
 
         // Durable writes escape the actor — settle them inside this test's scope.
@@ -2007,7 +2010,10 @@ struct FastSyncKeepAwakeTests {
             activeBodyIdle: activeIdle,
             backfillBodyIdle: true,
             downloadsHeld: false,
-            backfillBodyHeld: false
+            backfillBodyHeld: false,
+            activeAIIdle: true,
+            backfillAIIdle: true,
+            walkOrCatchUpRunning: false
         ) == true, "the screen stays awake while bodies are actually being fetched")
     }
 
@@ -2023,7 +2029,10 @@ struct FastSyncKeepAwakeTests {
             activeBodyIdle: true,
             backfillBodyIdle: backfillIdle,
             downloadsHeld: false,
-            backfillBodyHeld: false
+            backfillBodyHeld: false,
+            activeAIIdle: true,
+            backfillAIIdle: true,
+            walkOrCatchUpRunning: false
         ) == true)
     }
 
@@ -2038,7 +2047,10 @@ struct FastSyncKeepAwakeTests {
             activeBodyIdle: true,
             backfillBodyIdle: true,
             downloadsHeld: false,
-            backfillBodyHeld: false
+            backfillBodyHeld: false,
+            activeAIIdle: true,
+            backfillAIIdle: true,
+            walkOrCatchUpRunning: false
         ) == true)
     }
 

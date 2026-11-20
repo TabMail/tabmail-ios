@@ -1084,6 +1084,11 @@ extension SyncEngine {
     /// After walking all folders, runs a cleanup pass for any remaining empty bodies.
     /// Returns true if any work was done.
     func runBackfillWalk(account: Account, deadline: Date? = nil) async -> Bool {
+        runningBackfillWalks += 1
+        defer { runningBackfillWalks -= 1 }
+        #if DEBUG
+        if let hook = Self.backfillWalkStartedHookForTesting.withLock({ $0 }) { await hook() }
+        #endif
         var didWork = false
         let fastSync = await getIsFastSync()
         let isPastDeadline: () -> Bool = {

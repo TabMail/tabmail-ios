@@ -42,12 +42,19 @@ struct FastSyncView: View {
     /// older-mail walk and BackfillBodyQueue both obey
     /// (`SyncEngine.backfillDownloadsAllowedNow`, foreground or job), read once
     /// per poll; `backfillBodyHeld` is the queue's own held state confirmed by
-    /// that read (#1098).
+    /// that read (#1098). `activeAIIdle`, `backfillAIIdle` and
+    /// `walkOrCatchUpRunning` are work the gate does not stop: AI jobs, catch-up
+    /// scans, and a header walk admitted before the gate closed, read from their
+    /// owners (`ActiveAIQueue`, `BackfillAIQueue`, `SyncEngine`). Defaults hold
+    /// awake until the first poll.
     struct KeepAwakePoll: Sendable {
         var activeBodyIdle = false
         var backfillBodyIdle = false
         var backfillBodyHeld = false
         var downloadsHeld = false
+        var activeAIIdle = false
+        var backfillAIIdle = false
+        var walkOrCatchUpRunning = true
         var walkDoneByAccount: [String: Bool] = [:]
     }
 
@@ -100,23 +107,25 @@ struct FastSyncView: View {
     /// Work held by the download gate does not count (#1098): an unfinished walk
     /// while `downloadsHeld`, and older-mail bodies while `backfillBodyHeld`, cannot
     /// move, so they never pin the screen awake. New-mail bodies are not gated.
+    /// Work running regardless of the gate always holds: a header walk or
+    /// catch-up executing now (a walk admitted before the gate closed runs on its
+    /// own snapshot) and either AI queue non-idle.
     nonisolated static func keepScreenAwakeWhileWorking(
         accountHeadersDone: [Bool],
         activeBodyIdle: Bool,
         backfillBodyIdle: Bool,
         downloadsHeld: Bool,
-        backfillBodyHeld: Bool
+        backfillBodyHeld: Bool,
+        activeAIIdle: Bool,
+        backfillAIIdle: Bool,
+        walkOrCatchUpRunning: Bool
     ) -> Bool {
+        if walkOrCatchUpRunning { return true }
+        if !activeAIIdle || !backfillAIIdle { return true }
         if accountHeadersDone.contains(false) && !downloadsHeld { return true }
         if !activeBodyIdle { return true }
         if !backfillBodyIdle && !backfillBodyHeld { return true }
         return false
-    }
-
-    /// Live keep-awake value — maps the current SwiftUI state into the pure
-    /// predicate (`holdAwake(accounts:poll:)`).
-    private var holdAwake: Bool {
-        Self.holdAwake(accounts: navigationStore.accounts, poll: keepAwakePoll)
     }
 
     /// The keep-awake decision from one poll: an account's header walk is done
@@ -129,7 +138,10 @@ struct FastSyncView: View {
             activeBodyIdle: poll.activeBodyIdle,
             backfillBodyIdle: poll.backfillBodyIdle,
             downloadsHeld: poll.downloadsHeld,
-            backfillBodyHeld: poll.backfillBodyHeld
+            backfillBodyHeld: poll.backfillBodyHeld,
+            activeAIIdle: poll.activeAIIdle,
+            backfillAIIdle: poll.backfillAIIdle,
+            walkOrCatchUpRunning: poll.walkOrCatchUpRunning
         )
     }
 
@@ -138,6 +150,72 @@ struct FastSyncView: View {
     static func waitingForWiFi(accounts: [Account], poll: KeepAwakePoll) -> Bool {
         let workLeft = accounts.contains { poll.walkDoneByAccount[$0.id] != true } || !poll.backfillBodyIdle
         return workLeft && !holdAwake(accounts: accounts, poll: poll)
+    }
+
+    /// Which progress the aggregate bar shows.
+    enum ProgressPhase: Equatable, Sendable {
+        /// Header walk under way (UIDs walked of the UID scope).
+        case walk
+        /// Bodies being indexed (indexed of total).
+        case indexing
+        /// Nothing measurable yet.
+        case starting
+    }
+
+    /// What the screen shows for one poll and one progress map. Pure, so the
+    /// caption, phase, completion and keep-awake decision are assertable without
+    /// hosting SwiftUI; `body` renders exactly this.
+    struct Presentation: Equatable, Sendable {
+        /// nil when no account has published progress (no aggregate bar).
+        var phase: ProgressPhase?
+        /// The one line under the aggregate bar: "Waiting for Wi-Fi" while
+        /// everything left is held, otherwise the estimate, or nothing.
+        var statusLine: String?
+        /// "Sync Complete" is shown.
+        var syncComplete: Bool
+        /// The keep-awake lock is held (`keepScreenAwake(while:)`).
+        var holdAwake: Bool
+    }
+
+    static let waitingForWiFiText = "Waiting for Wi-Fi"
+
+    static func presentation(accounts: [Account], progress: [String: BackfillProgress], poll: KeepAwakePoll) -> Presentation {
+        let complete = allAccountsComplete(accountIds: accounts.map(\.id), progress: progress)
+        let hold = holdAwake(accounts: accounts, poll: poll)
+        let all = Array(progress.values)
+        guard !all.isEmpty else {
+            return Presentation(phase: nil, statusLine: nil, syncComplete: complete, holdAwake: hold)
+        }
+        let uidScope = all.reduce(0) { $0 + $1.uidTotal }
+        let uidWalked = all.reduce(0) { $0 + $1.uidWalked }
+        let totalEmails = all.reduce(0) { $0 + $1.totalEmails }
+        // UID progress only while actively walking (not 100% and not all done);
+        // once UIDs hit 100% or headers are done, the indexing view.
+        let phase: ProgressPhase
+        if !all.allSatisfy(\.headersDone) && uidScope > 0 && uidWalked < uidScope {
+            phase = .walk
+        } else if totalEmails > 0 {
+            phase = .indexing
+        } else {
+            phase = .starting
+        }
+        var status: String?
+        if !complete {
+            if waitingForWiFi(accounts: accounts, poll: poll) {
+                status = waitingForWiFiText
+            } else if let eta = all.compactMap(\.estimatedSecondsRemaining).max() {
+                status = "~\(formatETA(eta)) remaining"
+            }
+        }
+        return Presentation(phase: phase, statusLine: status, syncComplete: complete, holdAwake: hold)
+    }
+
+    /// Done and Stop Fast Sync: turn Fast Sync off and close the sheet. The only
+    /// way the sheet closes; held work never closes it.
+    @MainActor
+    static func close(stopFastSync: @escaping @MainActor () async -> Void, dismiss: () -> Void) {
+        Task { await stopFastSync() }
+        dismiss()
     }
 
     /// Poll the keep-awake inputs into `@State`.
@@ -150,12 +228,16 @@ struct FastSyncView: View {
         keepAwakePoll = await Self.pollKeepAwakeInputs(accounts: navigationStore.accounts, engine: manager.syncEngine)
     }
 
-    /// One poll of the keep-awake inputs: both body queues' idle state, the
-    /// download gate (one read), and each account's header walk read from its
-    /// folder rows.
+    /// One poll of the keep-awake inputs: both body queues' and both AI queues'
+    /// idle state, running walks and catch-ups, the download gate (one read: its
+    /// Wi-Fi-only snapshot serves both decisions), and each account's header walk
+    /// read from its folder rows.
     static func pollKeepAwakeInputs(accounts: [Account], engine: SyncEngine) async -> KeepAwakePoll {
         var poll = KeepAwakePoll()
         poll.downloadsHeld = !(await SyncEngine.backfillDownloadsAllowedNow())
+        poll.walkOrCatchUpRunning = await engine.backfillOrCatchUpRunning
+        poll.activeAIIdle = await ActiveAIQueue.shared.isIdle
+        poll.backfillAIIdle = await BackfillAIQueue.shared.isIdle
         poll.activeBodyIdle = await ActiveBodyQueue.shared.isIdle
         poll.backfillBodyIdle = await BackfillBodyQueue.shared.isIdle
         // The queue's held flag can be stale; the live gate confirms it.
@@ -168,7 +250,7 @@ struct FastSyncView: View {
         return poll
     }
 
-    private func formatETA(_ seconds: Double) -> String {
+    static func formatETA(_ seconds: Double) -> String {
         if seconds < 60 { return "<1 min" }
         if seconds < 3600 { return "\(Int(seconds / 60)) min" }
         let hours = Int(seconds / 3600)
@@ -191,6 +273,8 @@ struct FastSyncView: View {
 
     var body: some View {
         let _ = refreshTick // force re-evaluation on timer
+        let presentation = Self.presentation(
+            accounts: navigationStore.accounts, progress: state.backfillProgressByAccount, poll: keepAwakePoll)
         NavigationStack {
             ScrollView {
                 VStack(spacing: 24) {
@@ -208,15 +292,12 @@ struct FastSyncView: View {
 
                     // Aggregate progress bar across all accounts
                     let allProgress = Array(state.backfillProgressByAccount.values)
-                    if !allProgress.isEmpty {
+                    if !allProgress.isEmpty, let phase = presentation.phase {
                         let totalEmails = allProgress.reduce(0) { $0 + $1.totalEmails }
                         let totalIndexed = allProgress.reduce(0) { $0 + $1.ftsIndexed }
                         let totalUidScope = allProgress.reduce(0) { $0 + $1.uidTotal }
                         let totalUidWalked = allProgress.reduce(0) { $0 + $1.uidWalked }
-                        let allHeadersDone = allProgress.allSatisfy(\.headersDone)
-                        // Show UID progress only while actively walking (not 100% AND not all done).
-                        // Once UIDs hit 100% or headers are done, switch to FTS indexing view.
-                        let showUidWalk = !allHeadersDone && totalUidScope > 0 && totalUidWalked < totalUidScope
+                        let showUidWalk = phase == .walk
                         let fraction: Double = showUidWalk
                             ? min(1.0, Double(totalUidWalked) / Double(totalUidScope))
                             : (totalEmails > 0 ? min(1.0, Double(totalIndexed) / Double(totalEmails)) : 0.0)
@@ -230,7 +311,7 @@ struct FastSyncView: View {
                                     Text("\(totalUidWalked.formatted()) / \(totalUidScope.formatted()) UIDs walked (\(pct)%)")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
-                                } else if totalEmails > 0 {
+                                } else if phase == .indexing {
                                     let pct = Int(Double(totalIndexed) / Double(totalEmails) * 100)
                                     Text("\(totalIndexed.formatted()) / \(totalEmails.formatted()) indexed (\(pct)%)")
                                         .font(.caption)
@@ -247,12 +328,8 @@ struct FastSyncView: View {
                                         .font(.caption)
                                 }
                             }
-                            if !isAllComplete && Self.waitingForWiFi(accounts: navigationStore.accounts, poll: keepAwakePoll) {
-                                Text("Waiting for Wi-Fi")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            } else if !isAllComplete, let eta = allProgress.compactMap(\.estimatedSecondsRemaining).max() {
-                                Text("~\(formatETA(eta)) remaining")
+                            if let statusLine = presentation.statusLine {
+                                Text(statusLine)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -272,7 +349,7 @@ struct FastSyncView: View {
                                     email: account.emailAddress,
                                     progress: progress,
                                     formatCount: formatCount,
-                                    formatETA: formatETA
+                                    formatETA: Self.formatETA
                                 )
                             }
                         }
@@ -284,15 +361,14 @@ struct FastSyncView: View {
                     }
 
                     // Completion state
-                    if isAllComplete {
+                    if presentation.syncComplete {
                         Label("Sync Complete", systemImage: "checkmark.circle.fill")
                             .font(.headline)
                             .foregroundStyle(.green)
                     }
 
                     Button(role: .destructive) {
-                        Task { await manager.setFastSyncMode(false) }
-                        dismiss()
+                        Self.close(stopFastSync: { await AccountManager.shared.setFastSyncMode(false) }, dismiss: { dismiss() })
                     } label: {
                         Text("Stop Fast Sync")
                             .frame(maxWidth: .infinity)
@@ -306,13 +382,12 @@ struct FastSyncView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") {
-                        Task { await manager.setFastSyncMode(false) }
-                        dismiss()
+                        Self.close(stopFastSync: { await AccountManager.shared.setFastSyncMode(false) }, dismiss: { dismiss() })
                     }
                 }
             }
         }
-        .keepScreenAwake(while: holdAwake)
+        .keepScreenAwake(while: presentation.holdAwake)
         .onAppear {
             Task { await manager.setFastSyncMode(true) }
             Task {

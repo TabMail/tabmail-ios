@@ -203,6 +203,8 @@ extension SyncEngine {
     /// the deadline ends the run.
     func runCatchUpRun(account: Account, run: CatchUpRun) async -> Bool {
         guard let queue = workQueues[account.id] else { return false }
+        runningCatchUpRuns += 1
+        defer { runningCatchUpRuns -= 1 }
         let provider = queue.provider
         let accountId = account.id
         var madeProgress = false

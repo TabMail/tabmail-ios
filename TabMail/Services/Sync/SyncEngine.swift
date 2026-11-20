@@ -63,6 +63,15 @@ actor SyncEngine {
     var syncPassRunning: Set<String> = []
     var syncPassWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
 
+    /// Header walks (`runBackfillWalk`) and catch-up runs (`runCatchUpRun`)
+    /// executing now, foreground or job. A walk admitted before a download gate
+    /// closed keeps running on its own snapshot, and the catch-up runs under every
+    /// gate, so Fast Sync's keep-awake lock reads this, not the gate, to know they
+    /// are still progressing (#1098).
+    var runningBackfillWalks = 0
+    var runningCatchUpRuns = 0
+    var backfillOrCatchUpRunning: Bool { runningBackfillWalks > 0 || runningCatchUpRuns > 0 }
+
     /// Embedding rebuild task (one at a time).
 
     /// One-shot flag so the `recoverIncompleteHeaders` EXPLAIN QUERY PLAN probe
@@ -176,6 +185,9 @@ actor SyncEngine {
     /// the decision uses it, so a test can let the job end across that gap.
     nonisolated static let backfillAdmissionDecisionHookForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
     nonisolated static let backfillSleepForTesting = Mutex<(@Sendable (TimeInterval) async -> Void)?>(nil)
+    /// Awaited at the start of every header walk, after it counts itself running,
+    /// so a test can hold a walk in progress.
+    nonisolated static let backfillWalkStartedHookForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
     #endif
 
     /// The worker's wait between cycles.
