@@ -682,6 +682,115 @@ struct ChatUndoSendTests {
         #expect(try drawn() == "solid", "and solid once sent")
     }
 
+    @Test("In a mounted chat under Reduce Motion, the bubble turns solid when the outbox row records the send (observed from the database)")
+    func mountedChatTurnsSolidWhenSent() async throws {
+        #expect(HostedAccessibility.isAvailable && HostedAccessibility.canSetReduceMotion,
+                "control: the test can read the chat and set Reduce Motion")
+        try await HostedAccessibility.withAutomation { @MainActor in
+            try await HostedAccessibility.withReduceMotion(true) { @MainActor in try await mountedSentBody() }
+        }
+    }
+
+    private func mountedSentBody() async throws {
+        #expect(UIAccessibility.isReduceMotionEnabled, "control: Reduce Motion is on")
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        let fixture = try await Self.makeFixture(pool)
+        let row = try await Self.queueReply(fixture, draftId: "draft-db-sent")
+        try await Self.setHold(pool, row.id, Date().addingTimeInterval(3600))
+        let chat = try Self.host(fixture)
+        defer { chat.close() }
+        func drawn() throws -> String? {
+            let view = chat.controller.view!
+            guard let frame = Self.bubbleFrame(in: view) else { return nil }
+            let image = UIGraphicsImageRenderer(bounds: view.bounds).image { _ in
+                view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+            }
+            let pixel = Self.color(of: image, at: CGPoint(x: frame.minX + 1, y: frame.maxY - 1))
+            if pixel.isClose(to: Palette.chatUndoSendPendingTint, in: view.traitCollection) { return "pending" }
+            if pixel.isClose(to: Theme.accent, in: view.traitCollection) { return "solid" }
+            return "other"
+        }
+        try await Self.waitFor { (try? drawn()) == "pending" }
+        #expect(try drawn() == "pending", "control: queued, the bubble is pending")
+
+        // The provider took the email: the outbox row records it and stays (its Sent copy is not
+        // in the chat yet).
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE outboxMessage SET sentAt = ?, sentMessageId = ? WHERE id = ?",
+                           arguments: [Date(), "sent-copy@example.com", row.id])
+        }
+        #expect(try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) } != nil, "control: the row stays")
+        try await Self.waitFor { (try? drawn()) == "solid" }
+        #expect(try drawn() == "solid", "the chat observed the send: solid")
+        #expect(chat.count("Sending") >= 1, "control: still the unsent reply's bubble, not yet the Sent copy")
+    }
+
+    @Test("A mounted toast-owned bubble gains its Undo, with its own deadline, when its toast is replaced, and keeps it across a third send")
+    func mountedBubbleGainsUndoOnHandover() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation { @MainActor in try await handoverBody() }
+    }
+
+    private func handoverBody() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        service.dismiss()
+        saved.setChatView(on: true)
+        let fixture = try await Self.makeFixture(pool)
+        let reply = try await Self.queueReply(fixture, draftId: "draft-hand-reply")
+        let second = try await Self.queueReply(fixture, draftId: "draft-hand-second", newEmail: true)
+        let third = try await Self.queueReply(fixture, draftId: "draft-hand-third", newEmail: true)
+        let undoLeft: TimeInterval = 30
+        let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + undoLeft)
+        try await Self.setHold(pool, reply.id, hold)
+        // The reply was sent with the chat view off: its Undo is on the toast.
+        service.present(outboxId: reply.id, draftId: "draft-hand-reply", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .toast)
+
+        let chat = try Self.host(fixture)
+        defer { chat.close() }
+        try await Self.waitFor { chat.count("Sending") >= 1 }
+        #expect(chat.count("Sending") >= 1, "control: the reply's bubble is mounted")
+        #expect(!chat.hasUndo(), "the toast owns its Undo: none on the bubble")
+
+        func undo() -> [(label: String?, value: String?)] {
+            HostedAccessibility.labelsAndValues(of: ChatUndoSendStatus.undoId, in: chat.controller.view)
+        }
+        func secondsLeft() -> Int? {
+            undo().first?.value.flatMap { Int($0.split(separator: " ").first ?? "") }
+        }
+        func fromOriginalDeadline() -> Bool {
+            let expected = OutboxCancellationPolicy.undoDeadline(for: hold).timeIntervalSinceNow
+            return secondsLeft().map { abs(Double($0) - expected) <= 1.5 } == true
+        }
+
+        // A second send's toast replaces the reply's: the mounted bubble takes the Undo.
+        service.present(outboxId: second.id, draftId: "draft-hand-second", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold.addingTimeInterval(3), owner: .toast)
+        try await Self.waitFor { chat.hasUndo() }
+        #expect(undo().count == 1, "the mounted bubble now offers the one Undo")
+        #expect(fromOriginalDeadline(), "counting down to the reply's own deadline")
+
+        // A third send replaces the second's toast: the reply keeps its one Undo, same deadline.
+        service.present(outboxId: third.id, draftId: "draft-hand-third", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold.addingTimeInterval(6), owner: .toast)
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(undo().count == 1 && fromOriginalDeadline(), "still one Undo on the bubble, the reply's own deadline")
+        #expect(service.undoOwner(for: reply.id) == .bubble && service.visibleToast?.id == third.id)
+    }
+
     /// The frame of the bubble's text element, in `view`'s coordinates.
     private static func bubbleFrame(in view: UIView) -> CGRect? {
         HostedAccessibility.elements(under: view)
