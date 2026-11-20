@@ -387,6 +387,39 @@ final class ChatSwipeUITests: XCTestCase {
         return XCTWaiter.wait(for: [shown], timeout: timeout) == .completed
     }
 
+    /// With a reply draft already saved for the email, a tap on the ghost opens a card that shows
+    /// its body and the AI Suggestion, and Use Suggestion puts the suggestion in the body. A
+    /// screenshot of the card is attached whatever the outcome.
+    func testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody() {
+        let app = launchIntoChat(savedDraft: true)
+        addTeardownBlock {
+            let shot = XCTAttachment(screenshot: app.screenshot())
+            shot.name = "saved-draft-ghost-card"
+            shot.lifetime = .keepAlways
+            self.add(shot)
+        }
+        let ghost = app.descendants(matching: .any)["chat.aiSuggestion"].firstMatch
+        XCTAssertTrue(ghost.waitForExistence(timeout: 10), "control: the ghost shows")
+        ghost.tap()
+        let use = app.buttons["Use Suggestion"]
+        XCTAssertTrue(use.waitForExistence(timeout: 10), "the card shows Use Suggestion")
+        XCTAssertTrue(use.isHittable, "Use Suggestion can be tapped")
+        let body = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
+            Self.suggestion, Self.suggestion)).firstMatch
+        XCTAssertTrue(body.waitForExistence(timeout: 5), "the card's body area shows the suggestion")
+        XCTAssertTrue(body.isHittable, "the card's body area is on screen")
+        XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
+            Self.savedDraftWords, Self.savedDraftWords)).firstMatch.exists, "never the saved draft's words")
+        use.tap()
+        let editor = app.textViews.matching(NSPredicate(format: "value CONTAINS %@", Self.suggestion)).firstMatch
+        XCTAssertTrue(editor.waitForExistence(timeout: 5), "Use Suggestion puts the suggestion in the body")
+        XCTAssertTrue(editor.isHittable, "the body editor is on screen")
+    }
+
+    /// The fixture's AI Suggestion and saved draft (`ChatSwipeTestScene`).
+    private static let suggestion = "Sounds good, see you Tuesday."
+    private static let savedDraftWords = "My own words, not sent yet"
+
     func testOpenActionsTapOnAnotherBubbleClosesAndDropsTheKeyboard() {
         let app = launchIntoChat()
         let field = replyField(in: app)
@@ -533,7 +566,7 @@ final class ChatSwipeUITests: XCTestCase {
 
     private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false,
                                 lateSuggestion: Bool = false, unread: Bool = false,
-                                suggestionOnJump: Bool = false) -> XCUIApplication {
+                                suggestionOnJump: Bool = false, savedDraft: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
@@ -544,6 +577,7 @@ final class ChatSwipeUITests: XCTestCase {
             + (lateSuggestion ? ["--chat-swipe-late-suggestion"] : [])
             + (suggestionOnJump ? ["--chat-swipe-suggestion-on-jump"] : [])
             + (host == .tutorialCard ? ["--chat-swipe-tutorial-card"] : [])
+            + (savedDraft ? ["--chat-swipe-saved-draft"] : [])
         app.launch()
         switch host {
         case .stack, .tutorialCard:

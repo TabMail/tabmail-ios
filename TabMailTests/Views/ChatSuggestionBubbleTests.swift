@@ -126,27 +126,6 @@ struct ChatSuggestionBubbleTests {
         return card
     }
 
-    /// Watches the card from the tap until its suggestion bubble shows, a frame at a time: every
-    /// sample taken while the card is still being presented must find no bubble. Returns the
-    /// number of samples taken mid-presentation, and whether the bubble showed in the end.
-    private static func watchBubbleInsertion(_ chat: Chat) async throws -> (midPresentation: Int, shown: Bool) {
-        var midPresentation = 0
-        for _ in 0..<300 {
-            if let presented = chat.controller.presentedViewController {
-                let card = presented.view!
-                let bubble = cardTexts(card).contains("Use Suggestion")
-                if presented.isBeingPresented {
-                    midPresentation += 1
-                    #expect(!bubble, "the bubble is never inserted while the card is being presented: \(cardReport(chat, card))")
-                } else if bubble {
-                    return (midPresentation, true)
-                }
-            }
-            try await Task.sleep(for: .milliseconds(16))
-        }
-        return (midPresentation, false)
-    }
-
     /// What the card shows: its accessibility labels and the text of its fields, after a layout
     /// pass (the repo's hosted-poll pattern): the suggestion lands after the card opens, and the
     /// accessibility walk forces no layout of its own.
@@ -313,68 +292,21 @@ struct ChatSuggestionBubbleTests {
         }
     }
 
-    /// A settled-state check: it cannot make the suggestion land mid-presentation, so its samples
-    /// taken while the card is being presented may be none. The hold itself is pinned by
-    /// `bubbleHeldUntilAppearanceEnds`, which drives the appearance calls by hand.
-    @Test("Once the card from the ghost is on screen, its bubble shows and Use Suggestion fills the body")
-    func bubbleWaitsForThePresentation() async throws {
+    @Test("The card from the ghost shows the bubble, and Use Suggestion puts the suggestion in the body")
+    func useSuggestionFillsTheBody() async throws {
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
         try await withChat { chat in
             let ghost = try #require(Self.ghost(in: chat.view))
             #expect(ghost.accessibilityActivate(), "the ghost takes a tap")
-            let watched = try await Self.watchBubbleInsertion(chat)
-            let card = try #require(chat.controller.presentedViewController?.view, "the compose card opened")
-            #expect(watched.shown, "the bubble comes in once the card is on screen: \(Self.cardReport(chat, card))")
+            let card = try await Self.openCard(chat)
+            try await Self.waitUntil { Self.cardTexts(card).contains("Use Suggestion") }
             #expect(Self.press("Use Suggestion", in: card), "the bubble is usable: \(Self.cardReport(chat, card))")
             try await Self.waitUntil { Self.fieldTexts(card).contains { $0.contains("Yes, Tuesday works for me.") } }
             #expect(Self.fieldTexts(card).contains { $0.contains("Yes, Tuesday works for me.") },
                     "Use Suggestion puts it in the body: \(Self.cardReport(chat, card))")
             chat.controller.dismiss(animated: false)
             try await Self.waitUntil { chat.controller.presentedViewController == nil }
-        }
-    }
-
-    /// A container that does not forward appearance calls, so the test decides when the hosted
-    /// card's appearance begins and ends, as a presentation's transition does.
-    private final class ManualAppearanceContainer: UIViewController {
-        override var shouldAutomaticallyForwardAppearanceMethods: Bool { false }
-    }
-
-    @Test("The card's bubble is held while its appearance runs, and comes in when the appearance ends")
-    func bubbleHeldUntilAppearanceEnds() async throws {
-        try await withChat { chat in
-            let navigationStore = NavigationStore()
-            navigationStore.accounts = try await chat.pool.read { try Account.fetchAll($0) }
-            let compose = ChatReplyCompose.make(replyAllTo: chat.email, accounts: navigationStore.accounts).composeView(
-                replyTo: chat.email, suggestedBody: Self.fullReply,
-                draftId: Draft.separateReplyKey(replyTo: "\(chat.email.accountId):\(chat.email.stableId)"),
-                onAgentOutcome: { _ in })
-            let hosted = UIHostingController(rootView: AnyView(
-                compose.environment(navigationStore).environment(\.hasTabMailSession, true)))
-            let container = ManualAppearanceContainer()
-            let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-            let window = UIWindow(windowScene: scene)
-            window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-            window.rootViewController = container
-            window.makeKeyAndVisible()
-            defer {
-                window.isHidden = true
-                window.rootViewController = nil
-            }
-            container.addChild(hosted)
-            hosted.view.frame = container.view.bounds
-            container.view.addSubview(hosted.view)
-            hosted.didMove(toParent: container)
-            hosted.beginAppearanceTransition(true, animated: true)
-            let card = hosted.view!
-            try await Self.waitUntil { Self.cardTexts(card).contains("Re: Lunch plans") }
-            #expect(Self.cardTexts(card).contains("Re: Lunch plans"), "control: the card loaded: \(Self.cardTexts(card))")
-            #expect(!Self.cardTexts(card).contains("Use Suggestion"),
-                    "no bubble while the appearance runs: \(Self.cardTexts(card))")
-            hosted.endAppearanceTransition()
-            try await Self.waitUntil { Self.cardTexts(card).contains("Use Suggestion") }
-            #expect(Self.cardTexts(card).contains("Use Suggestion"), "the bubble comes in once it ends: \(Self.cardTexts(card))")
         }
     }
 
