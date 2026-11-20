@@ -760,7 +760,7 @@ struct ChatReplyRecoveryTests {
                         "after the resumed answer: \(ChatFieldWords.shared.fill(for: key).words)")
                 #expect(ChatFieldWords.shared.fill(for: otherKey).words == otherWords, "another chat's words stay")
                 await ChatFieldWords.shared.written()
-                let stored = try chat.pool.read { try ChatFieldWordsRecord.fetchAll($0) }
+                let stored = try await chat.pool.read { try ChatFieldWordsRecord.fetchAll($0) }
                 let byKey = Dictionary(uniqueKeysWithValues: stored.map { ($0.sessionId, $0.words) })
                 var want = [otherKey: otherWords]
                 if retyped { want[key] = sent }

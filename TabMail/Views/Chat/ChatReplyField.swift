@@ -228,7 +228,7 @@ struct ChatFieldFill: Equatable {
     /// completed it, or nothing was sent), a later card, compose or answer of the same request
     /// leaves the words: they are newer than the send.
     private var clears: Bool {
-        guard let atSend else { return false }
+        guard atSend != nil else { return false }
         return holdsSentWords || words.isEmpty
     }
 }
