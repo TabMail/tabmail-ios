@@ -1826,15 +1826,6 @@ enum NSEDataBridge {
                             }
                             continue
                         }
-                        // A message the folder's change bookmark proves gone is
-                        // never re-created from its staged copy (#755): same
-                        // skip-and-delete disposition.
-                        if try Self.stagedRowProvenGone(msg, db: db) {
-                            localDiscoveredOldEpoch.append(StaleByMoveRow(id: msg.id, headerId: MessageIdentity.headerId(
-                                accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
-                            )))
-                            continue
-                        }
                         // ARM 2 — the folder is mid-reaction. KEEP for retry,
                         // NEVER delete: the stored epoch is still the OLD one by
                         // construction, so no comparison is decisive yet. Same
@@ -2146,15 +2137,6 @@ enum NSEDataBridge {
                             if DebugModeManager.isLoggingEnabled() {
                                 print("[NSEDataBridge] Merge phase 2: \(msg.id) OLD-EPOCH in-txn (folder \(msgFolderId) turned over after this row was staged) — skip-and-delete")
                             }
-                            continue
-                        }
-                        // A message the folder's change bookmark proves gone is
-                        // never re-created from its staged copy (#755): same
-                        // skip-and-delete disposition.
-                        if try Self.stagedRowProvenGone(msg, db: db) {
-                            localDiscoveredOldEpoch.append(StaleByMoveRow(id: msg.id, headerId: MessageIdentity.headerId(
-                                accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId
-                            )))
                             continue
                         }
                         // ARM 2 — folder mid-reaction: KEEP for retry, never delete.
@@ -3641,20 +3623,6 @@ enum NSEDataBridge {
                 cacheKey, msg.summaryBlurb, msg.summaryTodos,
                 msg.actionTag, Date(timeIntervalSince1970: msg.processedAt)
             ])
-    }
-
-    /// A staged IMAP message the folder does not hold, below the UIDNEXT of a
-    /// change bookmark a tracked read wrote (`IMAPChangeCursor.provesGone`):
-    /// every live message below it was inserted or listed for a re-read, so the
-    /// staged copy is of a message proven gone (#755). Never true for a folder
-    /// without such a bookmark, or for a provider whose ids are not UIDs.
-    static func stagedRowProvenGone(_ msg: StagedMessage, db: GRDB.Database) throws -> Bool {
-        guard let uid = UInt32(msg.messageId) else { return false }
-        let folderId = MessageIdentity.folderId(accountId: msg.accountId, folderPath: msg.folderPath)
-        let headerId = MessageIdentity.headerId(accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId)
-        guard try !MessageHeader.exists(db, key: headerId) else { return false }
-        let cursor = try String.fetchOne(db, sql: "SELECT changeCursor FROM folder WHERE id = ?", arguments: [folderId])
-        return IMAPChangeCursor.provesGone(uid: uid, cursor: cursor)
     }
 
     /// Body of the "insert new MessageHeader from NSE staging" branch of

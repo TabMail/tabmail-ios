@@ -92,6 +92,12 @@ extension IMAPProvider {
         }
         let uidNext = selection.uidNext.value
         guard uidNext != 0 else { throw IMAPChangeReadIncomplete(folder: folder.path, missing: "UIDNEXT") }
+        // S-26: a bookmark stores count 0 only once `UID SEARCH ALL` reads
+        // empty. Otherwise the SELECT contradicts the folder: untracked this
+        // pass, the prior bookmark kept.
+        if m1 == 0, await !searchReadsEmpty(server: server) {
+            return try await untracked(folder, observation: observation, ids: recheckIds, server: server, request: request)
+        }
 
         // S-15: changed flags from the lowest held UID (or the held range) up.
         let lowestHeld = try await request.localRows?.firstNumericId(folderId: folder.id, atLeast: 1)
@@ -148,16 +154,11 @@ extension IMAPProvider {
         changes.rereadLater += proven.rereadLater
         changes.heldRowsProof = proven.heldRowsProof
 
-        // A bookmark never stores count 0 while this read saw live UIDs (S-26).
-        if m1 == 0, !arrivals.isEmpty || !changes.records.isEmpty {
-            throw IMAPChangeCountMismatch(folder: folder.path)
-        }
         // A finished check commits the bookmark of the pass that started it.
         let committed = created ? nil : check?.pending
         changes.cursor = IMAPChangeCursor(
             uidValidity: served, highestModSeq: committed?.highestModSeq ?? modseq,
-            uidNext: committed?.uidNext ?? uidNext, messageCount: committed?.messageCount ?? m1,
-            provenFrom: cursor.uidNext).encoded
+            uidNext: committed?.uidNext ?? uidNext, messageCount: committed?.messageCount ?? m1).encoded
         if let check, created, owed > 0 {
             // S-18: held rows left below the window are the catch-up's.
             let below = try await request.localRows?.rows(

@@ -277,4 +277,58 @@ struct IMAPChangeCondstoreCheckTests {
         _ = try await pool.write { db in try SyncEngine.applyFolderChanges(agreeing, db: db) }
         #expect(try await pool.read { db in try String.fetchOne(db, sql: "SELECT changeCursor FROM folder WHERE id = ?", arguments: [folderId]) } == agreeing.cursor)
     }
+
+    // MARK: - An established bookmark and a SELECT that says EXISTS 0
+
+    /// Bookmark at count 3, UIDNEXT 4; then UID 4 comes and goes so the next
+    /// read SELECTs with nothing to read.
+    static func trackedThreeWithASpentUID(_ w: IMAPChangeEngineTests.World) async throws {
+        w.server.honorSearchUIDSetCriterion()
+        w.server.setExpungeKeepsHighestModSeq(true, for: IMAPChangeEngineTests.path)
+        _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+        _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+        #expect(try cursor(w.folder().changeCursor).messageCount == 3, "setup: an established bookmark")
+        C.add([4], to: w.server, IMAPChangeEngineTests.path)
+        C.remove([4], from: w.server, IMAPChangeEngineTests.path)
+    }
+
+    @Test("An established bookmark is not poisoned by a SELECT that says EXISTS 0 while SEARCH lists the live UIDs; the next read applies a flag change")
+    func existsZeroOverAnEstablishedBookmarkKeepsIt() async throws {
+        let path = IMAPChangeEngineTests.path
+        try await IMAPChangeEngineTests.withWorld(
+            "cs-exists0", capabilities: C.condstore, serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3]
+        ) { w in
+            try await Self.trackedThreeWithASpentUID(w)
+            w.server.setSelectExists(0, forNext: 1, of: path)
+            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            #expect(try Self.cursor(w.folder().changeCursor).messageCount == 3, "the count is not poisoned")
+            #expect(try w.uids() == ["1", "2", "3"], "the live rows survive")
+
+            w.server.setFlags(["\\Seen"], in: path, uid: 2)
+            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            let folderId = w.folderId
+            let read = try await w.pool.read { db in
+                try Bool.fetchOne(db, sql: "SELECT isRead FROM messageHeader WHERE folderId = ? AND messageId = '2'",
+                                  arguments: [folderId])
+            }
+            #expect(read == true, "the next read applies the flag change")
+            let folder = try w.folder()
+            #expect(FolderChangeState(raw: folder.changeState).tracking, "still tracked")
+            #expect(try Self.cursor(folder.changeCursor).failingSince == nil, "no failure waits for the lapse")
+        }
+    }
+
+    @Test("Control: a folder the server truly emptied stores count 0 and removes its rows")
+    func trulyEmptiedFolderStoresCountZero() async throws {
+        let path = IMAPChangeEngineTests.path
+        try await IMAPChangeEngineTests.withWorld(
+            "cs-empty", capabilities: C.condstore, serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3]
+        ) { w in
+            try await Self.trackedThreeWithASpentUID(w)
+            C.remove([1, 2, 3], from: w.server, path)
+            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            #expect(try w.uids().isEmpty, "the removed messages are gone")
+            #expect(try Self.cursor(w.folder().changeCursor).messageCount == 0)
+        }
+    }
 }

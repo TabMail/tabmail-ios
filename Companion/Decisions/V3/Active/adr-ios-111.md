@@ -1054,8 +1054,11 @@ unchanged (RFC 7162).
    generation check. No retry across modes. The engine never sees the mode.
 2. **The bookmark carries MESSAGES** (`IMAPChangeCursor.messageCount`, the SELECT's EXISTS, both modes; a count
    outside 0...UInt32.max does not decode). A CONDSTORE read of a bookmark without it starts a baseline. A
-   tracked read also writes `provenFrom`. A first baseline whose SELECT says EXISTS 0 stores its bookmark only
-   after `UID SEARCH ALL` on the same selection reads empty (`listed(within:)`).
+   tracked read also wrote `provenFrom` (removed 2026-11-19, see clause 6). A bookmark stores EXISTS 0 only after
+   `UID SEARCH ALL` on the same selection reads empty (`searchReadsEmpty`, `listed(within:)`): on a first
+   baseline, and (amended 2026-11-19, review) on a tracked CONDSTORE read too, where a SELECT saying EXISTS 0
+   while SEARCH still finds UIDs leaves the folder untracked that pass with its prior bookmark kept. Committing
+   that count would make every later read's owed count negative and fail until the failure lapse.
 3. **The read** (`IMAPProviderChangesCondstore.swift`): STATUS fast path only when MESSAGES, UIDNEXT, HIGHESTMODSEQ
    and UIDVALIDITY all equal the bookmark's, no re-read list and no pending check. Otherwise SELECT (epoch
    refusal; NOMODSEQ or no EXISTS untracked; no UIDVALIDITY/UIDNEXT fails), `UID FETCH lo:N1-1 (UID FLAGS)
@@ -1085,6 +1088,13 @@ unchanged (RFC 7162).
    only while both are byte-equal in their write transaction; a refused crawl range fails (nothing advances),
    a refused load-older page reports more to load. The notification merge refuses a staged UID the folder does
    not hold below the UIDNEXT of a `provenFrom` bookmark (`NSEDataBridge.stagedRowProvenGone`, skip-and-delete).
+   **Amended 2026-11-19 (review): that merge refusal is removed, with `provenFrom` and
+   `IMAPChangeCursor.provesGone`.** UIDNEXT is not per-UID evidence: a live older UID the window never loaded,
+   or a header the prune removed, also sits below it unheld, and its staged notification payload was deleted.
+   Unproven staging stays for merge or retry; a staged copy of a message a read proved gone can therefore be
+   merged back as a header, which a later listing or removal check removes again. It also kept an IMAP
+   bookmark reading out of the notification merge, above the provider boundary. Any replacement needs
+   positive per-UID evidence.
 7. **The turn.** A standalone `syncFolderMessages` lists inside `oneSyncAtATime`, which is re-entrant for the
    task holding it (`@TaskLocal heldSyncTurn`).
 8. The catch-up's MODSEQ freshness for a folder with a same-epoch bookmark is the bookmark's MODSEQ alone.

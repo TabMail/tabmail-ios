@@ -707,7 +707,7 @@ struct BackfillUIDWalkRaceTests {
                 return IMAPChangeCursor(uidValidity: epoch, highestModSeq: highestModSeq, uidNext: uidNext).encoded
             case .condstore:
                 return IMAPChangeCursor(uidValidity: epoch, highestModSeq: highestModSeq, uidNext: uidNext,
-                                        messageCount: 3, provenFrom: uidNext).encoded
+                                        messageCount: 3).encoded
             }
         }
     }

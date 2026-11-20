@@ -77,22 +77,16 @@ struct IMAPChangeCursor: Codable, Equatable, Sendable {
     /// CONDSTORE read needs it (its removals are counted from it) and starts a
     /// baseline without it; a QRESYNC read does not use it.
     var messageCount: Int?
-    /// Set by a tracked read: the bookmark's UIDNEXT it read from. Under such a
-    /// bookmark every live message below `uidNext` was inserted or listed for
-    /// a re-read, so a UID below it the folder does not hold is gone
-    /// (`provesGone(uid:)`). A baseline carries none.
-    var provenFrom: UInt32?
     /// A CONDSTORE removal check that did not finish in one pass (#755).
     var pendingCheck: IMAPRemovalCheckProgress?
 
     init(uidValidity: UInt32, highestModSeq: UInt64, uidNext: UInt32, failingSince: Date? = nil,
-         messageCount: Int? = nil, provenFrom: UInt32? = nil) {
+         messageCount: Int? = nil) {
         self.uidValidity = uidValidity
         self.highestModSeq = highestModSeq
         self.uidNext = uidNext
         self.failingSince = failingSince
         self.messageCount = messageCount
-        self.provenFrom = provenFrom
     }
 
     /// Nil for no bookmark or an unreadable one (the folder starts a baseline).
@@ -104,13 +98,6 @@ struct IMAPChangeCursor: Codable, Equatable, Sendable {
               cursor.messageCount.map({ (0...Int(UInt32.max)).contains($0) }) ?? true
         else { return nil }
         return cursor
-    }
-
-    /// The bookmark proves `uid` gone from a folder that does not hold it: a
-    /// tracked read wrote it and the UID is below its UIDNEXT.
-    static func provesGone(uid: UInt32, cursor raw: String?) -> Bool {
-        guard let cursor = decode(raw), cursor.provenFrom != nil else { return false }
-        return uid < cursor.uidNext
     }
 
     /// The same checkpoint with no failure time.
@@ -468,7 +455,7 @@ extension IMAPProvider {
             folderId: folder.id, status: .tracked, addressEpoch: Int(served),
             cursor: IMAPChangeCursor(
                 uidValidity: served, highestModSeq: modseq, uidNext: uidNext,
-                messageCount: selection.reportedMessageCount, provenFrom: cursor.uidNext).encoded)
+                messageCount: selection.reportedMessageCount).encoded)
 
         // Removals: VANISHED, never expanded; only UIDs the folder holds.
         var vanished = resync.vanishedEarlier
@@ -630,14 +617,8 @@ extension IMAPProvider {
         // A bookmark never stores count 0 while the same selection holds live
         // UIDs (#755): EXISTS 0 is believed only once `UID SEARCH ALL` reads
         // empty; found UIDs, an unlisted answer or a refusal store no bookmark.
-        if count == 0 {
-            let all = MessageIdentifierSet<UID>(UID(1)...UID(UInt32.max))
-            let found: ExtendedSearchResult<UID>? = try? await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
-                try await server.extendedSearch(identifierSet: all, criteria: [.all])
-            }
-            guard let listed = try? found?.listed(within: all), listed.isEmpty else {
-                return try await untracked(folder, observation: observation, ids: ids, server: server, request: request)
-            }
+        if count == 0, await !searchReadsEmpty(server: server) {
+            return try await untracked(folder, observation: observation, ids: ids, server: server, request: request)
         }
         var changes = FolderChanges(
             folderId: folder.id, status: .baselineReady, addressEpoch: Int(served),
@@ -650,6 +631,18 @@ extension IMAPProvider {
             changes.rereadLater += answer.unreadable
         }
         return changes
+    }
+
+    /// The selected mailbox's `UID SEARCH ALL` reads empty: the only evidence
+    /// that lets a bookmark store EXISTS 0 (#755). Found UIDs, an unlisted
+    /// answer or a refusal are not.
+    func searchReadsEmpty(server: IMAPServer) async -> Bool {
+        let all = MessageIdentifierSet<UID>(UID(1)...UID(UInt32.max))
+        let found: ExtendedSearchResult<UID>? = try? await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+            try await server.extendedSearch(identifierSet: all, criteria: [.all])
+        }
+        guard let listed = try? found?.listed(within: all) else { return false }
+        return listed.isEmpty
     }
 
     /// A folder no bookmark can cover, with its re-read list answered.
