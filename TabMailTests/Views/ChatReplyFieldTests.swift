@@ -762,8 +762,8 @@ struct ChatReplyFieldTests {
         // an unspecified order.
         #expect(Self.count("if !chatExpanded && fieldSettleToken == nil && !fieldDragProgress.isDragging { pillHeight = height }", in: chat) == 1)
         // Every let-go releases the freeze, a let-go that opens the panel included, from the
-        // settle's own timer: right after the settle and the token's check, under no condition.
-        let release = "try? await Task.sleep(for: Self.fieldDragSettle) guard fieldSettleToken == token else { return } fieldSettleToken = nil ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)"
+        // settle's own timer chain: the settle, the bar, then the freeze's cooldown, then the release.
+        let release = "try? await Task.sleep(for: Self.fieldDragSettle) guard fieldSettleToken == token else { return } fieldSettleToken = nil if !chatExpanded { pillHeight = fieldMeasuredHeight } try? await Task.sleep(for: ChatViewLayout.freezeCooldown) guard fieldSettleToken == nil else { return } ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)"
         #expect(Self.count(release, in: letGo) == 1)
         let beforeRelease = try #require(letGo.range(of: release))
         #expect(!letGo[..<beforeRelease.lowerBound].contains("if "), "the timer starts under no condition")
@@ -775,13 +775,18 @@ struct ChatReplyFieldTests {
         #expect(spring.settlingDuration > 0, "control: the spring settles")
         #expect(ChatThreadView.fieldDragSettle == .seconds(spring.settlingDuration))
         #expect(ChatThreadView.fieldDragSettle > .zero)
-        // The freeze is held at least as long as the settle: its only release on a let-go comes
-        // after the settle's sleep (`fieldDragSettleFences`), and no shorter timer releases it.
+        // freezeRelease >= fieldDragSettle + cooldown: the only let-go release comes after the
+        // settle's sleep and then the cooldown's, and no shorter timer releases it.
+        #expect(ChatViewLayout.freezeCooldown > .zero, "control: the freeze rule's cooldown")
+        #expect(ChatViewLayout.freezeCooldown + .seconds(ChatViewLayout.swipeSpringResponse) == ChatViewLayout.swipeSettleHold,
+                "the same cooldown the swipes' hold carries")
         let chatText = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chatText)
         let sleep = try #require(changed.range(of: "try? await Task.sleep(for: Self.fieldDragSettle)"))
         let release = try #require(changed.range(of: "ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)"))
-        #expect(sleep.upperBound <= release.lowerBound, "hold >= fieldDragSettle")
+        let cooldown = try #require(changed.range(of: "try? await Task.sleep(for: ChatViewLayout.freezeCooldown)"))
+        #expect(sleep.upperBound <= cooldown.lowerBound && cooldown.upperBound <= release.lowerBound,
+                "freezeRelease >= fieldDragSettle + cooldown")
         #expect(Self.count("ChatSwipeHold.shared.release(", in: changed) == 0)
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(Self.count("private static let pillSpring = Animation.spring(pillSpringModel)", in: chat) == 1)
