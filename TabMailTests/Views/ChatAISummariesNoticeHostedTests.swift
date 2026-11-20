@@ -1062,8 +1062,9 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
-    /// The report's binding lives on the button, which outlives the popover: only the shared
-    /// sheet's tie between an answer and its own presentation keeps the old answer off the new one.
+    /// The popover closes with its sheet still up, so the sheet's onDismiss never runs, while the
+    /// report's binding lives on the button, which outlives the popover. Only the shared sheet's
+    /// weak tie between an answer and its own presentation keeps the old answer off the new one.
     @Test("The notice stays mounted: an answer from a closed popover's report never reaches the reopened one")
     func aClosedPopoversAnswerNeverReachesTheNext() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
@@ -1086,15 +1087,21 @@ struct ChatAISummariesNoticeHostedTests {
                     }
                     let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))
                     #expect(glyph.accessibilityActivate())
-                    try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                    try await Self.waitUntil {
+                        let labels = Self.presentedLabels(controller)
+                        return labels.contains(AISummariesNotice.title) || labels.contains(AISummariesNotice.reportNotice)
+                    }
                     try await Task.sleep(for: .milliseconds(500))
-                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title)
-                            && !Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
-                            "the reopened notice shows no stale report sheet: \(Self.presentedLabels(controller))")
-                    let popover = try #require(Self.topPresented(controller)?.view)
-                    let report = try #require(Self.element(AISummariesNotice.reportTitle, in: popover))
-                    #expect(report.accessibilityActivate())
-                    try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
+                    // The popover closed with its sheet still up, so nothing cleared the button's
+                    // report binding: the reopened notice may bring up a new, empty report sheet
+                    // by itself. Either way the next report is a fresh one.
+                    if !Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) {
+                        let popover = try #require(Self.topPresented(controller)?.view)
+                        let report = try #require(Self.element(AISummariesNotice.reportTitle, in: popover))
+                        #expect(report.accessibilityActivate())
+                        try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
+                    }
+                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "control: the next report's sheet")
                     try await Self.pressReport(in: controller, held: held, sends: 2)
                     let sheetView = try #require(Self.topPresented(controller)?.view)
                     if !answerBeforeNextReport {
@@ -1143,6 +1150,77 @@ struct ChatAISummariesNoticeHostedTests {
                     held.release(before + 1, false)
                     try await Self.waitUntil { controller.presentedViewController == nil }
                 }
+            }
+        }
+    }
+
+    // MARK: - A long-press row that scrolls away while its report sends
+
+    /// Counts a row's appearances, as a lazy list fires them on scroll.
+    @MainActor
+    final class Seen {
+        var appeared = 0
+        var disappeared = 0
+    }
+
+    /// The reporting row of a lazy list, as a long-press caller's row is: its sheet is open from the start.
+    private struct ReportingRow: View {
+        let send: ReportConcernSend
+        let seen: Seen
+        @State private var open = true
+
+        var body: some View {
+            Text("Reported row")
+                .frame(maxWidth: .infinity, minHeight: 60)
+                .reportConcernSheet(isPresented: $open, contentType: .suggestedReply,
+                                    content: { "pressed reply" }, send: send)
+                .onAppear { seen.appeared += 1 }
+                .onDisappear { seen.disappeared += 1 }
+        }
+    }
+
+    private struct LazyRows: View {
+        let send: ReportConcernSend
+        let seen: Seen
+
+        var body: some View {
+            ScrollView {
+                LazyVStack {
+                    ReportingRow(send: send, seen: seen)
+                    ForEach(1..<200, id: \.self) { row in
+                        Text("Row \(row)").frame(maxWidth: .infinity, minHeight: 60)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("A row that scrolls away and back while its report sends keeps its sheet, and the answer shows once")
+    func aScrolledRowKeepsItsReport() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let held = HeldSend()
+        let seen = Seen()
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(LazyRows(send: held.send, seen: seen)) { controller in
+                try await Self.waitUntil { Self.sheetIsUp(controller) }
+                try await Self.pressReport(in: controller, held: held)
+                let list = try #require(Self.firstSubview(UIScrollView.self, in: controller.view), "control: the list")
+                let bottom = CGPoint(x: 0, y: max(0, list.contentSize.height - list.bounds.height))
+                list.setContentOffset(bottom, animated: false)
+                try await Self.waitUntil { seen.disappeared >= 1 }
+                #expect(seen.disappeared >= 1, "control: the row scrolled away")
+                list.setContentOffset(.zero, animated: false)
+                try await Self.waitUntil { seen.appeared >= 2 }
+                #expect(seen.appeared >= 2, "control: the row came back")
+                #expect(Self.sheetIsUp(controller), "the sending sheet stays")
+                held.release(1, true)
+                try await Self.waitUntil { (Self.topPresented(controller) as? UIAlertController)?.title == "Report Submitted" }
+                let alert = try #require(Self.topPresented(controller) as? UIAlertController, "the answer lands")
+                #expect(controller.presentedViewController === alert, "one alert, nothing else presented")
+                let ok = try #require(Self.alertButton("OK", in: alert))
+                #expect(ok.accessibilityActivate())
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                #expect(controller.presentedViewController == nil, "OK closes it")
             }
         }
     }

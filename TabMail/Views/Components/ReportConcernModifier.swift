@@ -148,15 +148,6 @@ struct ReportConcernSheetModifier: ViewModifier {
                 selectedCategory = .offensive
                 reason = ""
             }
-            // The view presenting the sheet has gone, so the sheet has too, even when nothing
-            // ran its onDismiss (a parent removed it with the sheet still up): retire this
-            // presentation so an answer still on its way acts on nothing, and record that no
-            // sheet is up, so the caller's binding does not reopen it with a later view.
-            .onDisappear {
-                presentation.next()
-                isSubmitting = false
-                isPresented = false
-            }
             .sheet(isPresented: $isPresented, onDismiss: {
                 // This presentation has ended: an answer still on its way acts on nothing.
                 presentation.next()
@@ -232,13 +223,15 @@ struct ReportConcernSheetModifier: ViewModifier {
 
     private func submit() {
         isSubmitting = true
-        let sending = presentation
-        let sentFor = sending.current
-        Task {
+        let sentFor = presentation.current
+        // Held weakly: the view that owns this sheet's state (the notice's popover content, or a
+        // long-press caller's row) may be destroyed while the report sends, and its answer then
+        // acts on nothing. A view that only scrolls out of sight keeps its state and its answer.
+        Task { [weak sending = presentation] in
             let success = await send(contentType, content(), selectedCategory, reason.isEmpty ? nil : reason)
-            // The presentation that sent this has ended: its answer touches nothing, not even
-            // the caller's binding, which may now show a later report.
-            guard sending.current == sentFor else { return }
+            // The presentation that sent this has ended or its owner is gone: its answer touches
+            // nothing, not even the caller's binding, which may now show a later report.
+            guard let sending, sending.current == sentFor else { return }
             isSubmitting = false
             submitted = success
             isPresented = false
