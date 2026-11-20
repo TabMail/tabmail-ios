@@ -55,6 +55,12 @@ enum AISummariesNotice {
             .filter { $0 != MessageHeader.noContentSummary }
             .joined(separator: reportSeparator)
     }
+
+    /// The report for a chat as it is shown: its emails, oldest first, then the user's replies
+    /// still sending or not sent, which the chat shows after them.
+    static func reportContent(items: [ChatThread.Item], unsent: [ChatUnsentReply]) -> String {
+        reportContent(oldestFirst: items.map(\.textMessage) + unsent.map(\.textMessage))
+    }
 }
 
 /// The glyph and its popover. Sits at the trailing edge of the subject line.
@@ -63,6 +69,9 @@ struct AISummariesNoticeButton: View {
     let landed: Bool
     /// The report's content, built when the report is sent.
     let reportContent: () -> String
+    /// The install's first-open flag and the tip gate, read once when the chat lands.
+    var firstOpen = AISummariesNotice.FirstOpen()
+    var tipsAllowed: () -> Bool = { AISummariesNotice.tipsAllowed() }
 
     @State private var showsNotice = false
     @State private var reportRequested = false
@@ -94,7 +103,7 @@ struct AISummariesNoticeButton: View {
                             content: reportContent, contentNotice: AISummariesNotice.reportNotice)
         .task(id: landed) {
             // One decision per open, read once from the flag and the tip gate.
-            if AISummariesNotice.FirstOpen().claim(landed: landed, tipsAllowed: AISummariesNotice.tipsAllowed()) {
+            if firstOpen.claim(landed: landed, tipsAllowed: tipsAllowed()) {
                 showsNotice = true
             }
         }

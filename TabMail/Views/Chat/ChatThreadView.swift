@@ -345,7 +345,7 @@ struct ChatThreadView: View {
             .safeAreaBar(edge: .top, spacing: 0) {
                 VStack(spacing: 0) {
                     ChatSubjectLine(subject: subject(thread), labels: context.labels, landed: didInitialScroll,
-                                    reportContent: { AISummariesNotice.reportContent(oldestFirst: thread.items.map(\.textMessage)) })
+                                    reportContent: { AISummariesNotice.reportContent(items: thread.items, unsent: unsentReplies) })
                     tutorialCard(thread)
                 }
             }
