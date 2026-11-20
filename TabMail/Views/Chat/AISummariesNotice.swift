@@ -222,7 +222,7 @@ private struct AISummariesNoticePopover: View {
 
 /// Calls `onWindow` when UIKit puts this view in a window, which happens only for a presentation
 /// that is actually shown.
-private struct WindowProbe: UIViewRepresentable {
+struct WindowProbe: UIViewRepresentable {
     let onWindow: () -> Void
     /// Runs when the probe leaves its window.
     var onDetach: () -> Void = {}

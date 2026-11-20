@@ -650,6 +650,22 @@ struct ChatAISummariesNoticeHostedTests {
 
     // MARK: - A landing that cannot present
 
+    @Test("The window probe reports a window only when it gets one; leaving a window reports a detach, never a window")
+    func theProbeMarksOnlyOnAttach() async throws {
+        var windows = 0
+        var detaches = 0
+        let probe = WindowProbe.Probe()
+        probe.onWindow = { windows += 1 }
+        probe.onDetach = { detaches += 1 }
+        try await Self.hosting(Color.clear) { controller in
+            controller.view.addSubview(probe)
+            #expect(windows == 1 && detaches == 0, "attached: one window, no detach")
+            probe.removeFromSuperview()
+            #expect(windows == 1, "leaving the window does not report a window")
+            #expect(detaches == 1, "leaving the window reports a detach")
+        }
+    }
+
     @Test("A landing that could not present the notice leaves it for the next open; once shown it never opens again")
     func anUnpresentedNoticeIsNotUsedUp() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted view")
