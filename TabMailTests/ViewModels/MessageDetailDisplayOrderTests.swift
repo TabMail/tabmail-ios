@@ -184,16 +184,6 @@ struct MessageDetailDisplayOrderTests {
         }
     }
 
-    /// Lets the held reader go and waits until it has published.
-    @MainActor
-    private func release(_ gate: Gate) async throws {
-        // Time for a refresh that is not held to read and publish first.
-        try await Task.sleep(for: .milliseconds(300))
-        gate.open()
-        try await waitUntil { gate.passed }
-        try await Task.sleep(for: .milliseconds(100))
-    }
-
     /// Waits until the newer value is on screen (a reader outside the turns let
     /// it through) or another reader waits for the held one's turn. Ordered by
     /// the turn state, not by time.
@@ -210,9 +200,10 @@ struct MessageDetailDisplayOrderTests {
         #expect(vm.displayTurnIsIdleForTesting)
     }
 
+    /// The action tests start the shared manager's unstructured drain work, which
+    /// can outlive the test: the installed pool closes only at process exit.
     private func cleanUp(_ pool: DatabasePool, _ dir: URL, _ previous: AppDatabase?) {
-        AppDatabase.shared.withLock { $0 = previous }
-        TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
     }
 
     // MARK: - Thread scan against a point refresh
@@ -245,12 +236,17 @@ struct MessageDetailDisplayOrderTests {
         #expect(gate.reached)
 
         // Recompute saves a new suggestion; its refresh reads after the save.
+        let shown = Recorder(vm, .threadMessages) { vm.threadMessages.first?.summaryBlurb }
         try await save(summary: "new suggestion", for: newest.id, in: pool)
-        try await release(gate)
+        try await waitShownOrQueued(vm) { vm.threadMessages.first?.summaryBlurb == "new suggestion" }
+        gate.open()
+        // The held reader has published once it is past its hold point.
+        try await waitUntil { gate.passed }
+        try await waitIdle(vm)
 
-        try await waitUntil { vm.threadMessages.first?.summaryBlurb == "new suggestion" }
         #expect(vm.threadMessages.map(\.id) == [newest.id])
         #expect(vm.threadMessages.map(\.summaryBlurb) == ["new suggestion"])
+        #expect(shown.neverWentBack(from: "new suggestion", to: "old suggestion"), "shown: \(shown.values)")
     }
 
     @MainActor
@@ -283,6 +279,7 @@ struct MessageDetailDisplayOrderTests {
         #expect(gate.reached)
 
         // The rewritten reply is stored and its notice posted, as the AI writers do.
+        let shown = Recorder(vm, .threadMessages) { vm.threadMessages.first?.cachedReply }
         let newestId = newest.id
         try await pool.write { db in
             try db.execute(
@@ -290,17 +287,21 @@ struct MessageDetailDisplayOrderTests {
                 arguments: ["new reply", "new reply text", newestId])
         }
         NotificationCenter.default.post(name: .messageDataDidChange, object: newestId)
-        try await release(gate)
+        try await waitShownOrQueued(vm) { vm.threadMessages.first?.cachedReply == "new reply" }
+        gate.open()
+        // The held reader has published once it is past its hold point.
+        try await waitUntil { gate.passed }
+        try await waitIdle(vm)
 
-        try await waitUntil { vm.threadMessages.first?.cachedReply == "new reply" }
+        #expect(shown.neverWentBack(from: "new reply", to: "old reply"), "shown: \(shown.values)")
         #expect(vm.threadMessages.map(\.id) == [newestId])
         #expect(vm.threadMessages.map(\.cachedReply) == ["new reply"])
         #expect(vm.threadMessages.map(\.replyTextMessage) == ["new reply text"])
         // The chat's AI Suggestion, read from the thread's newest email, is the new one.
-        let shown = vm.threadMessages.first.flatMap {
+        let suggestion = vm.threadMessages.first.flatMap {
             ChatReplyField.suggestionText(newest: $0, usersTurn: false, onlyTo: nil)
         }
-        #expect(shown == "new reply text")
+        #expect(suggestion == "new reply text")
     }
 
     @MainActor
@@ -330,10 +331,15 @@ struct MessageDetailDisplayOrderTests {
         #expect(gate.reached)
 
         // Its summary is saved before the scan shows it.
+        let shown = Recorder(vm, .threadMessages) { vm.threadMessages.first?.summaryBlurb }
         try await save(summary: "new summary", for: earlier.id, in: pool)
-        try await release(gate)
+        try await waitShownOrQueued(vm) { vm.threadMessages.first?.summaryBlurb == "new summary" }
+        gate.open()
+        // The held reader has published once it is past its hold point.
+        try await waitUntil { gate.passed }
+        try await waitIdle(vm)
 
-        try await waitUntil { vm.threadMessages.first?.summaryBlurb == "new summary" }
+        #expect(shown.neverWentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
         #expect(vm.threadMessages.map(\.id) == [earlier.id])
         #expect(vm.threadMessages.map(\.summaryBlurb) == ["new summary"])
     }
@@ -371,12 +377,16 @@ struct MessageDetailDisplayOrderTests {
         try await waitUntil(seconds: 6) { gate.reached }
         #expect(gate.reached)
 
+        let shown = Recorder(vm, .message) { vm.message?.summaryBlurb }
         try await save(summary: "new summary", for: openedId, in: pool)
-        try await release(gate)
+        try await waitShownOrQueued(vm) { vm.message?.summaryBlurb == "new summary" }
+        gate.open()
+        try await waitUntil { gate.passed }
+        try await waitIdle(vm)
 
-        try await waitUntil { vm.message?.summaryBlurb == "new summary" }
         #expect(vm.message?.summaryBlurb == "new summary")
         #expect(vm.messageBody?.htmlContent == "<p>fetched</p>")
+        #expect(shown.neverWentBack(from: "new summary", to: "old summary"), "shown: \(shown.values)")
     }
 
     @MainActor
@@ -866,7 +876,7 @@ struct MessageDetailDisplayOrderTests {
     }
 
     @MainActor
-    @Test("an overlay change on another email costs a held scan one more read and changes nothing it shows")
+    @Test("an overlay change on another email costs a held scan at most one more read and changes nothing it shows")
     func overlayChangeElsewhereCostsOneRead() async throws {
         let (pool, dir, previous) = try makePool()
         defer { cleanUp(pool, dir, previous) }
@@ -882,10 +892,60 @@ struct MessageDetailDisplayOrderTests {
         try await waitUntil { gate.passed }
         try await waitIdle(vm)
 
-        #expect(vm.displayRereadCountForTesting - before == 1)
+        // At most one extra read; an implementation that ignores another email's
+        // overlay change reads none.
+        #expect(vm.displayRereadCountForTesting - before <= 1)
         #expect(shown.isComplete)
         #expect(shown.values.allSatisfy { $0 == shownBefore }, "shown: \(shown.values.map { $0.map(\.id) })")
         #expect(vm.threadMessages.map(\.id) == [member.id])
+    }
+
+    @MainActor
+    @Test("an overlay registered elsewhere that retires while a scan reads the older row never shows the older state")
+    func overlayRetiringUnderHeldScanNeverGoesBack() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let member = header("retired", summary: "member")
+        let opened = header("opened", summary: "opened", references: [member.rfc822MessageId!])
+        try insert(member, into: pool)
+        try insert(opened, into: pool)
+        let memberId = member.id
+        defer { AccountManager.shared.removeOverlayEntries(ids: [memberId]) }
+        // Another screen's read is pending: its overlay exists before this view
+        // model loads, and this view model changes nothing itself.
+        AccountManager.shared.registerMutation(id: memberId, mutation: .init(isRead: true))
+        let vm = MessageDetailViewModel(
+            messageId: opened.id, dbPool: pool, fetchBodyOverride: { _ in },
+            observeNotifications: true)
+        vm._testSeedMessage(opened)
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        try await waitUntil { vm.threadMessages.first?.isRead == true }
+        #expect(vm.threadMessages.map(\.isRead) == [true])
+
+        // A scan reads the stored row, still unread, and is held.
+        let gate = Gate()
+        vm._displayReadHook = { point in
+            if point == .threadScan, !gate.reached { await gate.hold() }
+        }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        try await waitUntil { gate.reached }
+        #expect(gate.reached)
+        let shown = Recorder(vm, .threadMessages) {
+            vm.threadMessages.first(where: { $0.id == memberId })?.isRead
+        }
+
+        // The read commits and its overlay retires, as the queue does.
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE id = ?", arguments: [memberId])
+        }
+        AccountManager.shared.removeOverlayEntries(ids: [memberId])
+        gate.open()
+        try await waitUntil { gate.passed }
+        try await waitIdle(vm)
+
+        #expect(vm.threadMessages.first?.isRead == true)
+        #expect(shown.isComplete)
+        #expect(!shown.values.contains(false), "shown: \(shown.values)")
     }
 
     // MARK: - Bodies that only fill an empty slot
