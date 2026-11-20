@@ -170,7 +170,21 @@ struct TabMailApp: App {
         // promptly without racing the first render.
 
         // Configure TipKit for onboarding hints
-        if ScreenshotMode.isActive || ScreenshotMode.isSplashMode {
+        #if DEBUG
+        let showsFieldDragTip = ProcessInfo.processInfo.arguments.contains("--chat-field-drag-tip")
+        #else
+        let showsFieldDragTip = false
+        #endif
+        if showsFieldDragTip {
+            // Debug UI tests only: a fresh datastore with the chat field's drag tip forced on, so
+            // every launch shows it as a first-time user sees it.
+            try? Tips.resetDatastore()
+            Tips.showTipsForTesting([ChatFieldDragTip.self])
+            try? Tips.configure([
+                .displayFrequency(.immediate),
+                .datastoreLocation(.applicationDefault)
+            ])
+        } else if ScreenshotMode.isActive || ScreenshotMode.isSplashMode {
             // Suppress all tips in screenshot mode
             try? Tips.configure([
                 .datastoreLocation(.applicationDefault)

@@ -940,8 +940,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    swell, or a flick's predicted swell, reaches `fieldDragOpenDistance`, and otherwise the field
    settles back. Only a drag more up than sideways counts, so the chat's sideways swipes are
    unchanged. The swell is not the field's room: from the drag's start until its swell has
-   settled (`ChatViewLayout.fieldDragSettle`) the bar keeps its resting height, so the chat does not
-   move during the swell or the settle. The drag's state is a `@GestureState`
+   settled (`ChatThreadView.fieldDragSettle`, the pill spring's own `settlingDuration`, so the two
+   cannot drift apart) the bar keeps its resting height, so the chat does not move during the swell
+   or the settle. The bar also ignores the field's height while the drag is in progress
+   (`fieldDragProgress.isDragging`): the drag's start queues the bar's geometry action and the
+   `onChange` that sets the settle token together, and SwiftUI runs deferred actions in an
+   unspecified order. The drag's state is a `@GestureState`
    (`ChatFieldDrag.Progress`) reset with the pill's spring, so a cancelled drag (the panel opening on
    an agent answer mid-drag, a system interruption) springs back too; the let-go only decides
    whether the panel opens. The drag holds the user-interaction freeze through `ChatSwipeHold` under
@@ -950,8 +954,14 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    TabMail chat". Not in the tutorial, whose steps open the chat themselves. The panel stays dimmed
    with the rest of the chat as built (the ghost dims with it). Tests: `ChatFieldDragTests`,
    `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel`,
-   `testShortDragUpOnTheReplyFieldSettlesBack` and `testDraggedOpenPanelClosesOnCloseAndOnTheDim`,
-   `testShortDragOnTheReplyFieldKeepsTheChat`, `ChatReplyFieldTests.fieldDragWiring`.
+   `testShortDragUpOnTheReplyFieldSettlesBack` and `testDraggedOpenPanelClosesOnCloseAndOnTheDim`
+   (taps), `ChatReplyFieldTests.fieldDragWiring`. The swell and the settle are covered by
+   `ChatSwipeUITests.testShortDragOnTheReplyFieldKeepsTheChat`, which reads the debug marker
+   `ChatFieldDragMarker` (the newest row's largest move from the drag's start until well after the
+   settle), by `testDragThatOpensThePanelReleasesTheFreeze` (the same marker's freeze state), by
+   `ChatReplyFieldTests.fieldDragSettleFences` (the token at the drag's start, the bar's gate, the
+   unconditional release) and `fieldDragSettleIsThePillSpring`. The VoiceOver action:
+   `ChatThreadLayoutTests.showChatActionOpensThePanel`.
 
 20. **The first-time drag tip (amendment 2026-11-20).** Once, above the collapsed reply field, a
    tip in today's TipKit style (`ChatFieldDragTip`, behind the onboarding gate, shown at most once)
@@ -960,9 +970,13 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    pushes no layout and takes no touch from the field, so the user's first tap focuses the field
    and their first drag opens the panel (a popover tip would swallow that first touch). It goes
    away for good when a drag starts, the field takes focus, the panel opens, or on its own close
-   button (`invalidate(reason: .actionPerformed)`), and is not shown over the open panel or in the
-   tutorial; there is no tutorial step for it. Tests: `ChatReplyFieldTests.fieldDragTip`,
-   `ChatFieldDragTests.firstDragWithTheTipOpens`.
+   button (TipKit invalidates it with `.tipClosed`; the drag, the focus and the panel opening call
+   `ChatFieldDragTip.close()`, `invalidate(reason: .actionPerformed)`), and is not shown over the open panel or in the
+   tutorial; there is no tutorial step for it. The overlay hangs on the whole stack in
+   `pill(on:)`, so it sits above "Replying only to" and the no-reply notice, never over them. Tests:
+   `ChatReplyFieldTests.fieldDragTip`, `ChatFieldDragTests.firstDragWithTheTipOpens`,
+   `ChatSwipeUITests.testFieldDragTipShowsAndLeavesTheFieldItsTouches` (launched with
+   `--chat-field-drag-tip`, which resets the TipKit datastore and forces the tip on).
 
 21. **A new email rises into the open chat (amendment 2026-11-20).** When the newest email changes
    after the chat has landed (`ChatArrival.isArrival`), the new bubble rises from behind the reply

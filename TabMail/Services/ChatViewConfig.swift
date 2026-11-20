@@ -132,10 +132,11 @@ enum ChatViewLayout {
     static let fieldDragMinimumDistance: CGFloat = 10
     static let fieldDragMaxSwell: CGFloat = 220
     static let fieldDragOpenDistance: CGFloat = 60
-    /// After a drag on the field lets go, how long the bar keeps its resting height while the swell
-    /// springs back (the pill's spring, response 0.45, damping 0.82, is at rest by then), so the
-    /// chat does not follow the settling field.
-    static let fieldDragSettle: Duration = .milliseconds(900)
+    /// The pill's spring (the panel opening and closing, the field's swell springing back): its
+    /// response in seconds and its damping ratio. A drag's settle lasts this spring's own settling
+    /// duration (`ChatThreadView.fieldDragSettle`).
+    static let pillSpringResponse: Double = 0.45
+    static let pillSpringDamping: Double = 0.82
     /// A new email's arrival in the open chat (`ChatArrival`): it rises from behind the field over
     /// this long; under Reduce Motion the space opens at once and it fades in over the second.
     static let arrivalRiseDuration: Double = 0.42

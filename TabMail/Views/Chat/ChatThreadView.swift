@@ -106,7 +106,14 @@ struct ChatThreadView: View {
     private static let chatSwipeId = "chat-swipe"
     /// What a drag on the reply field holds the interaction freeze under (`ChatSwipeHold`).
     static let fieldDragHoldId = "chat-field-drag"
-    private static let pillSpring = Animation.spring(response: 0.45, dampingFraction: 0.82)
+    /// The pill's spring, as a model so its settling duration can be read.
+    static let pillSpringModel = Spring(
+        response: ChatViewLayout.pillSpringResponse, dampingRatio: ChatViewLayout.pillSpringDamping)
+    private static let pillSpring = Animation.spring(pillSpringModel)
+    /// After a drag on the field lets go, how long the bar keeps its resting height while the swell
+    /// springs back: the pill's spring's own settling duration (about 0.6 s for response 0.45 and
+    /// damping 0.82), so the chat does not follow the settling field.
+    static let fieldDragSettle: Duration = .seconds(pillSpringModel.settlingDuration)
 
     init(messageId: String, expectedRfc822MessageId: String? = nil, highlightsOpenedMessage: Bool = false) {
         self._viewModel = State(initialValue: MessageDetailViewModel(
@@ -332,6 +339,8 @@ struct ChatThreadView: View {
                                     ChatArrival.style(reduceMotion: reduceMotion),
                                     isArrivalRow: item.id == thread.items.last?.id
                                         && ChatArrival.animates(landed: didInitialScroll, newestIsOwn: item.isOwn)))
+                                // Debug UI tests only: where the newest row sits during a field drag.
+                                .modifier(ChatFieldDragMarker.Row(isNewest: item.id == thread.items.last?.id))
                         }
                         // Replies still in the outbox.
                         ForEach(unsentReplies) { reply in
@@ -473,7 +482,11 @@ struct ChatThreadView: View {
                                     fieldMeasuredHeight = height
                                     // A drag's swell, and its settle, are not the field's room: the
                                     // chat stays put (the resting height is taken once it settles).
-                                    if !chatExpanded && fieldSettleToken == nil { pillHeight = height }
+                                    // `isDragging` is read too because the drag's start queues this
+                                    // action and the `onChange` that sets the token together, and
+                                    // SwiftUI runs deferred actions in an unspecified order: the
+                                    // token alone could let the first swollen height through.
+                                    if !chatExpanded && fieldSettleToken == nil && !fieldDragProgress.isDragging { pillHeight = height }
                                 }
                                 // ...and above the reply field.
                                 .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
@@ -850,6 +863,8 @@ struct ChatThreadView: View {
             // in the tutorial, whose steps open the chat themselves.
             .simultaneousGesture(fieldDragGesture, isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning)
             .onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }
+            // Debug UI tests only: what the drag did to the chat (`ChatFieldDragMarker`).
+            .modifier(ChatFieldDragMarker.Field(dragging: fieldDragProgress.isDragging))
             // A tap on the field (it takes focus) or the panel opening ends the tip.
             .onChange(of: chatInputFocused) { _, focused in if focused { ChatFieldDragTip.close() } }
             .onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close() } }
@@ -862,16 +877,17 @@ struct ChatThreadView: View {
                     Button(Self.showChatActionName) { withAnimation(Self.pillSpring) { chatExpanded = true } }
                 }
             }
-            // Once, above the field: what the drag up shows. An inline tip in an overlay, outside
-            // the field's frame and its accessibility container: it pushes no layout and takes no
-            // touch from the field, so the first tap focuses the field and the first drag opens the
-            // panel. Not over the tutorial or the panel.
-            .overlay(alignment: .top) {
-                if !chatExpanded && !TutorialCoordinator.shared.isRunning {
-                    TipView(ChatFieldDragTip(), arrowEdge: .bottom)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .alignmentGuide(.top) { $0[.bottom] }
-                }
+        }
+        // Once, above the field and its notices: what the drag up shows. An inline tip in an overlay
+        // on the whole stack, outside the field's frame and its accessibility container: it pushes
+        // no layout and takes no touch from the field, "Replying only to" or the no-reply notice, so
+        // the first tap focuses the field and the first drag opens the panel. Not over the tutorial
+        // or the panel.
+        .overlay(alignment: .top) {
+            if !chatExpanded && !TutorialCoordinator.shared.isRunning {
+                TipView(ChatFieldDragTip(), arrowEdge: .bottom)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .alignmentGuide(.top) { $0[.bottom] }
             }
         }
         .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)
@@ -910,7 +926,7 @@ struct ChatThreadView: View {
         let token = UUID()
         fieldSettleToken = token
         Task { @MainActor in
-            try? await Task.sleep(for: ChatViewLayout.fieldDragSettle)
+            try? await Task.sleep(for: Self.fieldDragSettle)
             guard fieldSettleToken == token else { return }
             fieldSettleToken = nil
             if !chatExpanded { pillHeight = fieldMeasuredHeight }
