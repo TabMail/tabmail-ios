@@ -161,6 +161,8 @@ final class ChatSwipeUITests: XCTestCase {
         let marker = dragMarker(afterDrags: 1, in: app)
         XCTAssertNotNil(marker, "control: the marker recorded one finished drag")
         guard let marker else { return }
+        XCTAssertTrue(marker.hasBaseline, "control: the drag's start had the newest row's place")
+        XCTAssertGreaterThan(marker.seen, 0, "control: the newest row reported during the drag, so the move was measured")
         XCTAssertLessThan(marker.move, 1, "the chat stayed through the swell and the settle: moved \(marker.move)")
         XCTAssertFalse(marker.frozen, "the freeze is released once the drag has settled")
         XCTAssertEqual(newest.frame.minY, before, accuracy: 1, "the chat is where it was once settled")
@@ -700,7 +702,15 @@ final class ChatSwipeUITests: XCTestCase {
 
     /// What the app's `chatFieldDragMarker` recorded: the newest row's largest move during and
     /// after the last field drag, and whether the interaction freeze is held.
-    private struct DragMarker { let drags: Int; let watching: Bool; let move: CGFloat; let frozen: Bool }
+    private struct DragMarker {
+        let drags: Int
+        let watching: Bool
+        /// Whether the drag's start had the newest row's place, and how often the row reported since.
+        let hasBaseline: Bool
+        let seen: Int
+        let move: CGFloat
+        let frozen: Bool
+    }
 
     private func readDragMarker(in app: XCUIApplication) -> DragMarker? {
         let marker = app.descendants(matching: .any)["chatFieldDragMarker"].firstMatch
@@ -711,8 +721,10 @@ final class ChatSwipeUITests: XCTestCase {
             if pair.count == 2 { fields[pair[0]] = pair[1] }
         }
         guard let drags = fields["drags"].flatMap(Int.init), let watching = fields["watching"],
+              let base = fields["base"], let seen = fields["seen"].flatMap(Int.init),
               let move = fields["move"].flatMap(Double.init), let frozen = fields["frozen"] else { return nil }
-        return DragMarker(drags: drags, watching: watching == "1", move: CGFloat(move), frozen: frozen == "1")
+        return DragMarker(drags: drags, watching: watching == "1", hasBaseline: base == "1", seen: seen,
+                          move: CGFloat(move), frozen: frozen == "1")
     }
 
     /// The marker once it has seen `drags` drags and stopped watching the last one.

@@ -222,9 +222,13 @@ struct ChatThreadLayoutTests {
                 #expect(handler(action), "the action runs")
                 try await Self.waitFor { Self.frame(of: "chatClose", in: controller.view) != nil }
                 #expect(Self.frame(of: "chatClose", in: controller.view) != nil, "the panel opened")
-                let stillOffered = HostedAccessibility.elements(under: controller.view)
-                    .contains { $0.accessibilityCustomActions?.contains { $0.name == name } ?? false }
-                #expect(!stillOffered, "the action is gone while the panel is open")
+                func stillOffered() -> Bool {
+                    HostedAccessibility.elements(under: controller.view)
+                        .contains { $0.accessibilityCustomActions?.contains { $0.name == name } ?? false }
+                }
+                // The collapsed field's element may linger through its removal animation.
+                try await Self.waitFor { !stillOffered() }
+                #expect(!stillOffered(), "the action is gone while the panel is open")
             }
         }
     }
