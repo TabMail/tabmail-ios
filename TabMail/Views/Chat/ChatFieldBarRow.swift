@@ -55,3 +55,23 @@ private struct FieldButtonSlot: ViewModifier {
             .padding(.vertical, -(ChatViewLayout.fieldTapSize - lineHeight) / 2)
     }
 }
+
+/// Dragging the collapsed reply field up opens the TabMail chat panel: while the finger moves the
+/// field swells upward under it, and the let-go opens the panel once the swell, or a flick's
+/// predicted swell, reaches `ChatViewLayout.fieldDragOpenDistance`; otherwise it settles back.
+/// Only a drag that goes more up than sideways swells the field, so a sideways swipe stays a swipe.
+enum ChatFieldDrag {
+    /// How far the field swells for a drag of `translation`.
+    static func swell(translation: CGSize) -> CGFloat {
+        let up = -translation.height
+        guard up > 0, up > abs(translation.width) else { return 0 }
+        return min(up, ChatViewLayout.fieldDragMaxSwell)
+    }
+
+    /// Whether letting go here opens the panel.
+    static func opens(translation: CGSize, predictedEndTranslation: CGSize) -> Bool {
+        let predicted = -predictedEndTranslation.height
+        let flickedUp = predicted > abs(predictedEndTranslation.width) && predicted >= ChatViewLayout.fieldDragOpenDistance
+        return swell(translation: translation) >= ChatViewLayout.fieldDragOpenDistance || flickedUp
+    }
+}

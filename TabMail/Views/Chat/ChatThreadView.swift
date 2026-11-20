@@ -62,6 +62,8 @@ struct ChatThreadView: View {
     @State private var pillHeight = ChatViewLayout.pillStartHeight
     /// The chat's own height: the opened pill grows upward out of the bottom bar into it.
     @State private var chatAreaHeight: CGFloat = 0
+    /// How far a drag up has swelled the collapsed field (`ChatFieldDrag`); 0 at rest.
+    @State private var fieldSwell: CGFloat = 0
     @State private var chatInputFocused = false
     @State private var chatWorking = false
     /// The ready AI Suggestion's compose card: the email it answers, and how it opens.
@@ -432,7 +434,8 @@ struct ChatThreadView: View {
                         .overlay(alignment: .bottom) {
                             pill(on: newest)
                                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                                    if !chatExpanded { pillHeight = height }
+                                    // A drag's swell is not the field's room: the chat stays put.
+                                    if !chatExpanded && fieldSwell == 0 { pillHeight = height }
                                 }
                                 // ...and above the reply field.
                                 .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
@@ -802,8 +805,12 @@ struct ChatThreadView: View {
                     isNoReply: isNoReply,
                     clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
-                    tutorialMove: tutorialMove(thread)),
+                    tutorialMove: tutorialMove(thread),
+                    swell: fieldSwell),
                 onFieldSend: { _ in fieldComposeOpened = false })
+            // Drag the field up: it swells under the finger and opens the TabMail chat panel. Not
+            // in the tutorial, whose steps open the chat themselves.
+            .simultaneousGesture(fieldDrag, isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning)
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.replyPillId)
@@ -811,6 +818,22 @@ struct ChatThreadView: View {
         .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)
         .padding(.bottom, ChatViewLayout.fieldBottomGap)
         .animation(Self.pillSpring, value: chatExpanded)
+    }
+
+    /// The drag up on the collapsed field (`ChatFieldDrag`).
+    private var fieldDrag: some Gesture {
+        DragGesture(minimumDistance: ChatViewLayout.fieldDragMinimumDistance)
+            .onChanged { value in
+                fieldSwell = ChatFieldDrag.swell(translation: value.translation)
+            }
+            .onEnded { value in
+                let opens = ChatFieldDrag.opens(
+                    translation: value.translation, predictedEndTranslation: value.predictedEndTranslation)
+                withAnimation(Self.pillSpring) {
+                    fieldSwell = 0
+                    if opens { chatExpanded = true }
+                }
+            }
     }
 
     /// The gray line above the field when the reply is not a Reply All; tap for everyone.

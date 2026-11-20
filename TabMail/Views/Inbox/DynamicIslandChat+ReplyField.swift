@@ -76,6 +76,8 @@ extension DynamicIslandChat {
                 trailingButton
             }
         }
+        // A drag up swells the field itself toward the panel, its top following the finger.
+        .padding(.top, field.swell)
     }
 
     /// The "e.g." line shows under the empty field, signed in, while nothing is being said.

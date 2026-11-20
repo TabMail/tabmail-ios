@@ -126,6 +126,12 @@ enum ChatViewLayout {
     static let fieldLineHeight: CGFloat = 22
     /// The collapsed reply field's corner: a capsule at one line (42 / 2), then fixed as it grows.
     static let fieldCornerRadius: CGFloat = 21
+    /// Dragging the reply field up (`ChatFieldDrag`): the movement before it counts as a drag,
+    /// how far the field may swell under the finger, and the swell (or a flick's predicted
+    /// swell) that opens the panel on let-go.
+    static let fieldDragMinimumDistance: CGFloat = 10
+    static let fieldDragMaxSwell: CGFloat = 220
+    static let fieldDragOpenDistance: CGFloat = 60
 }
 
 /// The AI Suggestion in the chat: the ghost of the user's next message, and the field's hint.

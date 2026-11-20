@@ -116,6 +116,29 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "it only closed the actions")
     }
 
+    func testDragUpOnTheReplyFieldOpensTheChatPanel() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        XCTAssertTrue(field.isHittable, "control: the reply field is on screen")
+        XCTAssertFalse(app.buttons["chatClose"].exists, "control: the panel is closed")
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -200)))
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag opened the TabMail chat panel")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    func testShortDragUpOnTheReplyFieldSettlesBack() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        XCTAssertTrue(field.isHittable, "control: the reply field is on screen")
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        // Slow and short: under the open distance, with no flick.
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -25)),
+                    withVelocity: .slow, thenHoldForDuration: 0.3)
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "a short drag does not open the panel")
+        XCTAssertTrue(replyField(in: app).isHittable, "the field settled back")
+    }
+
     func testOpenActionsDragOnTheHeaderOnlyCloses() {
         let app = launchIntoChat()
         openBubble(2, in: app)

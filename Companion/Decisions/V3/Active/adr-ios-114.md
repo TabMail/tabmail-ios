@@ -930,6 +930,19 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `ChatThreadLayoutTests.chatScrollsBehindTheField` and `openingThePillKeepsTheChat`,
    `ChatReplyFieldTests.messagesLayout` (the bottom bar, no plain bottom inset).
 
+19. **Drag the field up to open the TabMail chat (amendment 2026-11-20).** Until now the panel
+   opened only on an agent answer, a confirmation card or `.openMessageWithChat`. A drag up on the
+   collapsed reply field now opens it too, and the field itself swells into the panel: while the
+   finger moves, the field's top follows it (`ChatReplyField.swell`, `ChatFieldDrag.swell`, at most
+   `ChatViewLayout.fieldDragMaxSwell`); on let-go the panel opens with the pill's spring once the
+   swell, or a flick's predicted swell, reaches `fieldDragOpenDistance`, and otherwise the field
+   settles back. Only a drag more up than sideways counts, so the chat's sideways swipes are
+   unchanged. The swell is not the field's room: the bar keeps its collapsed height, so the chat
+   does not move. Not in the tutorial, whose steps open the chat themselves. The panel stays dimmed
+   with the rest of the chat as built (the ghost dims with it). Tests: `ChatFieldDragTests`,
+   `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel` and
+   `testShortDragUpOnTheReplyFieldSettlesBack`.
+
 ## The longer index line (routed 2026-11-09)
 
 The DECISIONS.md row grew with each decision of the chat view; it moved here when the index went
