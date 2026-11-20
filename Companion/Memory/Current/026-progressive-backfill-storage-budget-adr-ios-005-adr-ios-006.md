@@ -1,3 +1,13 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Note (2026-11-20, #1064).** The "Power-aware backfill" entry below says the gates hold back the walk
+> only. Since #1064 the same gates also hold older-mail body downloads (`BackfillBodyQueue`); new mail
+> (`ActiveBodyQueue`), opened messages and scans are not held. In the background processing job the walk
+> and the bodies decide with the job's one Wi-Fi measurement, taken at job start
+> (`SyncEngine.backgroundProcessingJobOnWiFi`), never NetworkMonitor, which a job that launched the app
+> from terminated never starts. Outside the job, a network NetworkMonitor has not reported yet counts as
+> expensive (`checkExpensiveIfKnown() == nil`), so Wi-Fi-only holds until the first path update
+> (ADR-IOS-005 amendment of 2026-11-20 and its correction). The text below is kept as written.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Progressive Backfill & Storage Budget (ADR-IOS-005, ADR-IOS-006)
 - **No age cutoff** — backfill always walks to completion: IMAP walks UID range from UIDNEXT-1 to UID 1, Gmail/Exchange exhausts all page tokens. Storage budget is the only gate.

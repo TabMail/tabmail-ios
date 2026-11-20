@@ -28,6 +28,15 @@
 > treated as a user's (the job flag and Fast Sync change, and are read, in one MainActor step).
 > Bodies the user opens and new mail (`ActiveBodyQueue`) and folder scans are not held. The text
 > below is kept as written.
+> *Corrected 2026-11-20 (#1064 review):* "the job's walk decision applies" held only when NetworkMonitor
+> was running. A job that launches the app from terminated never starts it (only RootView's `.task`
+> does), and its unset flag read as "not metered", so bodies downloaded on cellular while the job's walk
+> was held. Now the job measures Wi-Fi once at job start (`SyncScheduler.measureJobOnWiFi`, i.e.
+> `isOnWiFi()`) and publishes it with the job flag in one MainActor step
+> (`SyncEngine.backgroundProcessingJobOnWiFi`); the job's walk and the body gate's job branch both
+> decide with that one value. Outside the job, a network NetworkMonitor has not reported yet
+> (`NetworkMonitor.checkExpensiveIfKnown() == nil`) counts as expensive, so Wi-Fi-only holds both the
+> walk and the bodies until the first path update, as `isOnWiFi()` holds on its timeout.
 
 > **Current note (2026-11-11).** A completed walk can be re-armed by the full sync's catch-up when
 > old mail moves into the folder (ADR-IOS-107 decision 8), but never while a storage limit is in

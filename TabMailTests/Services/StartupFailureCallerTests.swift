@@ -279,6 +279,9 @@ private final class BackgroundReadinessFixture {
                 }
             }
         )
+        // The processing job measures Wi-Fi once at start; a fixed answer keeps the
+        // live NWPathMonitor (and its timeout) out of these lifetime tests.
+        SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = true }
         scheduler = SyncScheduler(
             backgroundReadiness: { await startup.awaitLaunchReady(background: true) },
             backgroundWork: { inboxOnly in
@@ -291,6 +294,10 @@ private final class BackgroundReadinessFixture {
             refreshNetworkAvailable: connected,
             pollActive: pollActive
         )
+    }
+
+    deinit {
+        SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = nil }
     }
 
     func start(processing: Bool, expireBeforeRegistration: Bool = false) {

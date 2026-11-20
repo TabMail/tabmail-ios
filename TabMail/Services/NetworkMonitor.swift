@@ -26,7 +26,26 @@ final class NetworkMonitor {
     /// Mutex-backed values for nonisolated reads from background actors.
     /// Written alongside @Observable properties on MainActor.
     nonisolated private static let connectedMutex = Mutex(true)
-    nonisolated private static let expensiveMutex = Mutex(false)
+    /// The latest path update's expensive flag; nil until the first path update
+    /// (an unknown network). Only a started monitor writes it, and only RootView's
+    /// `.task` starts it, so a process launched into the background (a background
+    /// processing job, a silent push) keeps it unknown (#1064).
+    nonisolated private static let expensiveMutex = Mutex<Bool?>(initialExpensive)
+
+    #if DEBUG
+    /// The unit-test host never starts the monitor (no scene reaches RootView's
+    /// `.task`), and its suites were written against an unmetered network, so the
+    /// test host starts from that known value. Tests of the unknown state set it
+    /// explicitly with `setExpensiveForTesting(nil)`.
+    nonisolated private static let initialExpensive: Bool? = {
+        let environment = ProcessInfo.processInfo.environment
+        let isUnitTestHost = environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+        return isUnitTestHost ? false : nil
+    }()
+    #else
+    nonisolated private static let initialExpensive: Bool? = nil
+    #endif
 
     /// Read connectivity from any isolation context without MainActor hop.
     nonisolated static func checkConnected() -> Bool {
@@ -39,15 +58,25 @@ final class NetworkMonitor {
         connectedMutex.withLock { $0 = connected }
     }
 
-    /// Scoped fixtures set an expensive (cellular) network and restore the prior
-    /// cached value when they end.
-    nonisolated static func setExpensiveForTesting(_ expensive: Bool) {
+    /// Scoped fixtures set an expensive (cellular) network, or nil for a network
+    /// no path update has reported yet, and restore the prior cached value when
+    /// they end.
+    nonisolated static func setExpensiveForTesting(_ expensive: Bool?) {
         expensiveMutex.withLock { $0 = expensive }
     }
     #endif
 
     /// Read expensive-network flag from any isolation context without MainActor hop.
+    /// An unknown network (no path update yet) reads as not expensive, as it
+    /// always has for these callers; a download gate reads `checkExpensiveIfKnown`.
     nonisolated static func checkExpensive() -> Bool {
+        expensiveMutex.withLock { $0 } ?? false
+    }
+
+    /// The expensive-network flag, or nil while no path update has reported the
+    /// network (the monitor is not started yet). The older-mail download gate
+    /// holds on nil, as `SyncScheduler.isOnWiFi()` holds on its timeout (#1064).
+    nonisolated static func checkExpensiveIfKnown() -> Bool? {
         expensiveMutex.withLock { $0 }
     }
 

@@ -1049,6 +1049,11 @@ foreground backfill worker and the background processing job.
   (`SyncEngineBackfillWalk`). The body queues have no gate (unchanged; tabmail-ios #1064 tracks that
   gap). A message the scan finds missing is loaded with it (the direct load follows the scan): a missing
   message is the scan's result, and holding it keeps the mailbox wrong.
+  *Note (2026-11-20, #1064):* "The body queues have no gate" above is superseded: `BackfillBodyQueue`
+  (older-mail bodies) now follows the walk's download gates (ADR-IOS-005, amendment of 2026-11-20 and its
+  correction). In the background job the walk and the bodies decide with the job's one Wi-Fi
+  measurement; outside it, a network NetworkMonitor has not reported yet holds under Wi-Fi-only.
+  `ActiveBodyQueue` and opened messages are not gated; scans and the direct load are unchanged.
 - **Pacing is unchanged:** 2 s slices, `catchUpSliceMaxRequests`, the slice window, the 3 s request
   timeout. A worker cycle whose walk a power gate holds still sleeps 60 s when it did no work, and one
   whose walk only Wi-Fi-only holds sleeps 30 s, so the wake cadence is unchanged. A cycle that made

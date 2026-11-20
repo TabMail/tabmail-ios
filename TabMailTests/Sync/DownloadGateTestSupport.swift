@@ -23,20 +23,24 @@ enum BackfillRunner: String, CaseIterable, Sendable, CustomTestStringConvertible
 }
 
 enum DownloadGateHarness {
-    /// Runs `body` with NetworkMonitor's cached expensive flag and the Wi-Fi-only
-    /// setting set, restoring both, so a test never depends on the network of the
-    /// machine it runs on.
+    /// Runs `body` with NetworkMonitor's cached expensive flag, the background
+    /// job's Wi-Fi measurement (on Wi-Fi exactly when the network is not
+    /// expensive) and the Wi-Fi-only setting set, restoring all three, so a test
+    /// never depends on the network of the machine it runs on.
     static func withNetwork(
         expensive: Bool, wifiOnly: Bool = true, _ body: () async throws -> Void
     ) async rethrows {
         let key = SyncScheduler.wifiOnlyKey
         let savedSetting = UserDefaults.standard.object(forKey: key)
-        let savedExpensive = NetworkMonitor.checkExpensive()
+        let savedExpensive = NetworkMonitor.checkExpensiveIfKnown()
+        let savedJobOnWiFi = SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 }
         UserDefaults.standard.set(wifiOnly, forKey: key)
         NetworkMonitor.setExpensiveForTesting(expensive)
+        SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = !expensive }
         defer {
             UserDefaults.standard.set(savedSetting, forKey: key)
             NetworkMonitor.setExpensiveForTesting(savedExpensive)
+            SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = savedJobOnWiFi }
         }
         try await body()
     }

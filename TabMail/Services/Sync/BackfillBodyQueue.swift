@@ -169,6 +169,8 @@ actor BackfillBodyQueue {
     private(set) var heldByDownloadGate = false
     /// Polls the download gate while held and re-dispatches once it lifts.
     private var gateWatchTask: Task<Void, Never>?
+    /// Identifies the watcher in `gateWatchTask`; bumped each time one is armed.
+    private var gateWatchSequence: UInt64 = 0
 
     /// Test-only seam: snapshot of the underlying `QueueStorage` bookkeeping so the
     /// oversized-defer tests can assert the item was removed, was NOT marked
@@ -516,16 +518,29 @@ actor BackfillBodyQueue {
 
     private func scheduleDispatchOnGateLift() {
         guard gateWatchTask == nil else { return }
+        gateWatchSequence &+= 1
+        let watcherId = gateWatchSequence
         gateWatchTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(SyncConfig.backfillBodyGateRecheckSeconds))
                 guard !Task.isCancelled else { return }
                 if await SyncEngine.backfillDownloadsAllowedNow() {
-                    await self?.gateLifted()
+                    // A dispatch that passed the gate may have cancelled this
+                    // watcher while it was inside the read.
+                    guard !Task.isCancelled else { return }
+                    await self?.watcherSawGateLift(watcherId: watcherId)
                     return
                 }
             }
         }
+    }
+
+    /// The watcher `watcherId` saw the gate open. Acts only while that watcher
+    /// still owns the slot: a cancelled watcher never clears (or orphans) a newer
+    /// watcher's slot.
+    private func watcherSawGateLift(watcherId: UInt64) {
+        guard gateWatchTask != nil, gateWatchSequence == watcherId else { return }
+        gateLifted()
     }
 
     private func gateLifted() {
@@ -580,9 +595,9 @@ actor BackfillBodyQueue {
 
         // #1064: older-mail bodies follow the backfill walk's download gate
         // (Wi-Fi-only on an expensive network, low battery or Low Power Mode off
-        // power). In the background job this gate tests for a not-expensive
-        // network while the job's own walk tests isOnWiFi; both refuse
-        // cellular. Decided after
+        // power). In the background job this gate and the job's walk decide
+        // with the same Wi-Fi measurement, taken once at job start; outside the
+        // job a network NetworkMonitor has not reported yet holds. Decided after
         // the waits above, immediately before any batch launches (no await
         // follows). A refusal releases the candidates to pending without
         // spending a retry and arms a watch that re-dispatches once the gate

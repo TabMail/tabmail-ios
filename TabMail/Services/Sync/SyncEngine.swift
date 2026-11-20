@@ -142,12 +142,14 @@ actor SyncEngine {
         await currentBackfillPowerAndJobState().power
     }
 
-    /// The power state together with the background-job flag, both read in ONE
-    /// MainActor step. The job sets and clears its synthetic Fast Sync and the job
-    /// flag together in one MainActor step (`SyncScheduler.handleBackgroundAIProcessing`),
-    /// so a reader never pairs the job's Fast Sync with "no job" (#1064).
+    /// The power state together with the background-job flag and the job's Wi-Fi
+    /// measurement, all read in ONE MainActor step. The job sets and clears its
+    /// synthetic Fast Sync, the job flag and its Wi-Fi measurement together in one
+    /// MainActor step (`SyncScheduler.handleBackgroundAIProcessing`), so a reader
+    /// never pairs the job's Fast Sync with "no job", nor the job with another
+    /// job's network (#1064).
     nonisolated static func currentBackfillPowerAndJobState() async
-        -> (power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), jobActive: Bool)
+        -> (power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), jobActive: Bool, jobOnWiFi: Bool)
     {
         #if DEBUG
         if let hook = Self.backfillPowerReadHookForTesting.withLock({ $0 }) { await hook() }
@@ -157,7 +159,8 @@ actor SyncEngine {
             return await MainActor.run {
                 ((state.fastSync || AccountManagerState.shared.fastSyncModeActive, state.lowPowerMode,
                   state.onPower, state.batteryLevel),
-                 backgroundProcessingJobActive.withLock { $0 })
+                 backgroundProcessingJobActive.withLock { $0 },
+                 backgroundProcessingJobOnWiFi.withLock { $0 })
             }
         }
         #endif
@@ -165,7 +168,8 @@ actor SyncEngine {
             let battery = UIDevice.current.batteryState
             return ((AccountManagerState.shared.fastSyncModeActive, ProcessInfo.processInfo.isLowPowerModeEnabled,
                      battery == .charging || battery == .full, UIDevice.current.batteryLevel),
-                    backgroundProcessingJobActive.withLock { $0 })
+                    backgroundProcessingJobActive.withLock { $0 },
+                    backgroundProcessingJobOnWiFi.withLock { $0 })
         }
     }
 
@@ -219,6 +223,15 @@ actor SyncEngine {
     /// job's own walk decision (`SyncScheduler.backgroundBackfillPlan`, #1064).
     nonisolated static let backgroundProcessingJobActive = Mutex<Bool>(false)
 
+    /// The running job's Wi-Fi state, measured once at job start with
+    /// `SyncScheduler.isOnWiFi()` (`SyncScheduler.measureJobOnWiFi`) and published
+    /// with `backgroundProcessingJobActive` in the same MainActor step. Both the
+    /// job's walk and the body gate's job branch decide with this one value, so
+    /// one decision has one network input (#1064). The job may launch the app
+    /// from terminated, where NetworkMonitor never starts; this does not read it.
+    /// False outside a job (never read then).
+    nonisolated static let backgroundProcessingJobOnWiFi = Mutex<Bool>(false)
+
     /// One older-mail body download decision (BackfillBodyQueue, #1064). Each call
     /// is its own operation: the Wi-Fi-only preference is snapshotted first, before
     /// any suspension. The job context is a live fact, read after the suspension in the
@@ -226,32 +239,37 @@ actor SyncEngine {
     /// job's synthetic Fast Sync and its flag change together, so a job entering or
     /// ending around the read can never make the job's Fast Sync count as a user's.
     /// In the job the job's
-    /// walk decision applies; otherwise the foreground walk's rule. ActiveBodyQueue
-    /// is not gated.
+    /// walk decision applies, with the job's own Wi-Fi measurement; otherwise the
+    /// foreground walk's rule, where a network NetworkMonitor has not reported yet
+    /// holds. ActiveBodyQueue is not gated.
     nonisolated static func backfillDownloadsAllowedNow() async -> Bool {
         let wifiOnly = backfillWifiOnlySetting()
-        let (power, jobActive) = await currentBackfillPowerAndJobState()
+        let (power, jobActive, jobOnWiFi) = await currentBackfillPowerAndJobState()
         #if DEBUG
         if let hook = backfillAdmissionDecisionHookForTesting.withLock({ $0 }) { await hook() }
         #endif
         if jobActive {
-            // Wi-Fi proxy as in the walk gate: on iOS, expensive == cellular/hotspot.
+            // The job's walk decision with the job's walk input: its Wi-Fi state
+            // measured once at job start (`isOnWiFi`), never NetworkMonitor, which a
+            // job that launched the app from terminated never starts (#1064).
             return SyncScheduler.backgroundBackfillPlan(
-                isLowPowerMode: power.lowPowerMode, wifiOnly: wifiOnly, onWiFi: !NetworkMonitor.checkExpensive())
+                isLowPowerMode: power.lowPowerMode, wifiOnly: wifiOnly, onWiFi: jobOnWiFi)
         }
         return backfillDownloadsAllowed(power: power, wifiOnly: wifiOnly)
     }
 
     /// The foreground walk gate for a power snapshot and the Wi-Fi-only value the
     /// caller captured, with the network read now. Shared by the walk and
-    /// BackfillBodyQueue. Uses checkExpensive() (Mutex-backed) as the Wi-Fi proxy:
-    /// on iOS, expensive == cellular/hotspot.
+    /// BackfillBodyQueue. Uses NetworkMonitor's expensive flag (Mutex-backed) as the
+    /// Wi-Fi proxy: on iOS, expensive == cellular/hotspot. A network no path update
+    /// has reported yet counts as expensive, so Wi-Fi-only holds until the monitor
+    /// knows (as `SyncScheduler.isOnWiFi()` holds on its timeout, #1064).
     nonisolated static func backfillDownloadsAllowed(
         power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), wifiOnly: Bool
     ) -> Bool {
         backfillWalkAllowed(
             fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
-            batteryLevel: power.batteryLevel, wifiOnly: wifiOnly, expensive: NetworkMonitor.checkExpensive())
+            batteryLevel: power.batteryLevel, wifiOnly: wifiOnly, expensive: NetworkMonitor.checkExpensiveIfKnown() ?? true)
     }
 
     func register(accountId: String, provider: any EmailProvider, workQueue: ProviderWorkQueue) {

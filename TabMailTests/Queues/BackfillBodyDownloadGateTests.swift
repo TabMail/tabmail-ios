@@ -10,9 +10,9 @@ import Testing
 
 /// #1064: older-mail body downloads (BackfillBodyQueue) follow the backfill walk's
 /// download gates (Wi-Fi-only on an expensive network, battery below 20% off
-/// power, Low Power Mode off power; in the background job, the body gate tests
-/// for a not-expensive network while the job's walk tests isOnWiFi, both
-/// refusing cellular). ActiveBodyQueue (new mail) and a message the user opens are not
+/// power, Low Power Mode off power; in the background job, the body gate and the
+/// job's walk decide with the job's one Wi-Fi measurement; outside the job, a
+/// network NetworkMonitor has not reported yet holds). ActiveBodyQueue (new mail) and a message the user opens are not
 /// gated. The observables are the provider (a held download never reaches it)
 /// and the queue's pending items.
 @Suite("Older-mail body downloads follow the walk gate", .serialized, .processGlobalState)
@@ -77,6 +77,17 @@ struct BackfillBodyDownloadGateTests {
         return await condition()
     }
 
+    /// `eventually` for closures that cannot capture the suite (the job's work hook).
+    private static func pollUntil(_ condition: () async -> Bool) async -> Bool {
+        let clock = ContinuousClock()
+        let end = clock.now.advanced(by: deadline)
+        while clock.now < end {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return await condition()
+    }
+
     /// Runs `awaitDrain` bounded by `Self.deadline`; true when it returned in time.
     private func drains(_ queue: BackfillBodyQueue) async -> Bool {
         await withTaskGroup(of: Bool.self) { group in
@@ -102,6 +113,7 @@ struct BackfillBodyDownloadGateTests {
         let queue = BackfillBodyQueue()
         try await withAccount(accountId, provider: provider, gate: gate) {
             await queue.enqueue([backfillItem(accountId)])
+            #expect(await eventually { await queue.heldByDownloadGate }, "precondition: the dispatch was not refused under \(gate)")
             try await Task.sleep(for: Self.settle)
             #expect(await fetchCount(provider) == 0, "the body was downloaded under \(gate)")
             #expect(await queue.queuedItemsForTesting.map(\.messageId) == ["7"], "the held item must stay pending")
@@ -157,6 +169,7 @@ struct BackfillBodyDownloadGateTests {
         let held = backfillItem(accountId)
         try await withAccount(accountId, provider: provider, gate: .lowPowerMode) {
             await queue.enqueue([held])
+            #expect(await eventually { await queue.heldByDownloadGate }, "precondition: the first dispatch was not refused")
             try await Task.sleep(for: Self.settle)
             // Each new item triggers a fresh dispatch that collects and refuses the held one too.
             for round in 0...SyncConfig.maxQueueRetries {
@@ -227,6 +240,7 @@ struct BackfillBodyDownloadGateTests {
         let refusedSpan: Duration = .seconds(SyncConfig.backfillBodyGateRecheckSeconds * 2)
         try await withAccount(accountId, provider: provider, gate: gate) {
             await queue.enqueue([backfillItem(accountId)])
+            #expect(await eventually { await queue.heldByDownloadGate }, "precondition: the dispatch was not refused under \(gate)")
             try await Task.sleep(for: Self.settle + refusedSpan)
             #expect(await fetchCount(provider) == 0, "the body was downloaded under \(gate) during a re-check")
             #expect(await queue.queuedItemsForTesting.map(\.messageId) == ["7"],
@@ -322,6 +336,7 @@ struct BackfillBodyDownloadGateTests {
         let queue = BackfillBodyQueue()
         try await withAccount(accountId, provider: provider, gate: .lowPowerMode) {
             await queue.enqueue([backfillItem(accountId)])
+            #expect(await eventually { await queue.heldByDownloadGate }, "precondition: the dispatch was not refused")
             try await Task.sleep(for: Self.settle)
             #expect(await fetchCount(provider) == 0, "the body was downloaded under Low Power Mode")
 
@@ -360,6 +375,7 @@ struct BackfillBodyDownloadGateTests {
             try await Task.sleep(for: Self.settle)
             SyncEngine.backfillPowerStateForTesting.withLock { $0 = DownloadGateHarness.power(.lowPowerMode) }
             await PriorityGate.shared.end()
+            #expect(await eventually { await queue.heldByDownloadGate }, "precondition: the parked dispatch was not refused")
             try await Task.sleep(for: Self.settle)
             #expect(await fetchCount(provider) == 0, "a batch started after the gate shut")
             #expect(await queue.queuedItemsForTesting.map(\.messageId) == ["7"], "the refused item must stay pending")
@@ -387,6 +403,7 @@ struct BackfillBodyDownloadGateTests {
                 backgroundReadiness: { true },
                 backgroundWork: { _ in
                     await queue.enqueue([item])
+                    _ = await Self.pollUntil { await queue.heldByDownloadGate }
                     try? await Task.sleep(for: Self.settle)
                     let count = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count
                     fetchesDuringJob.value.withLock { $0 = count }
@@ -437,6 +454,7 @@ struct BackfillBodyDownloadGateTests {
                     // Inside the real job: the power read now sees the job's Fast Sync.
                     SyncEngine.backfillPowerStateForTesting.withLock { $0 = jobPower }
                     await admit.open()
+                    _ = await Self.pollUntil { await queue.heldByDownloadGate }
                     try? await Task.sleep(for: settle)
                     let count = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count
                     fetchesDuringJob.value.withLock { $0 = count }
@@ -501,6 +519,7 @@ struct BackfillBodyDownloadGateTests {
 
             // The job has ended; the parked decision now completes.
             await decide.open()
+            #expect(await eventually { await queue.heldByDownloadGate }, "precondition: the parked decision was not refused")
             try await Task.sleep(for: Self.settle)
             #expect(await fetchCount(provider) == 0,
                     "a decision spanning job exit downloaded an older-mail body under Low Power Mode")
@@ -510,42 +529,142 @@ struct BackfillBodyDownloadGateTests {
         await queue.cancelAllInFlight()
     }
 
-    @Test("in the background job, Wi-Fi-only on an expensive network holds older-mail bodies until the network is unmetered")
+    @Test("in the background job, Wi-Fi-only holds older-mail bodies when the job measured cellular, whatever NetworkMonitor says; a later job that measures Wi-Fi downloads them")
     @MainActor
     func backgroundJobWifiOnlyExpensiveHoldsThenResumes() async throws {
         let accountId = "gate1064-job-wifi"
         let provider = MockEmailProvider()
         let queue = BackfillBodyQueue()
         let item = backfillItem(accountId)
-        let fetchesWhileExpensive = TestBox<Int?>(nil)
-        let pendingWhileExpensive = TestBox<[String]?>(nil)
-        let resumedInJob = TestBox(false)
-        let deadline = Self.deadline
+        let fetchesOnCellular = TestBox<Int?>(nil)
+        let pendingOnCellular = TestBox<[String]?>(nil)
+        let resumedInSecondJob = TestBox(false)
         // The job sets fast sync; Low Power Mode off; the harness keeps Wi-Fi-only on.
         let jobPower = (fastSync: true, lowPowerMode: false, onPower: true, batteryLevel: Float(1))
-        try await withAccount(accountId, provider: provider, power: jobPower, expensive: true) {
-            let context = BGTaskContext(label: "gate1064-job-wifi", completion: { _ in })
+        try await withAccount(accountId, provider: provider, power: jobPower, expensive: false) {
+            // NetworkMonitor reports an unmetered network, but the job's own
+            // measurement says cellular: the job's measurement decides.
+            SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = false }
+            let first = BGTaskContext(label: "gate1064-job-wifi-1", completion: { _ in })
+            let onCellular = SyncScheduler(
+                backgroundReadiness: { true },
+                backgroundWork: { _ in
+                    await queue.enqueue([item])
+                    _ = await Self.pollUntil { await queue.heldByDownloadGate }
+                    try? await Task.sleep(for: Self.settle)
+                    let count = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count
+                    fetchesOnCellular.value.withLock { $0 = count }
+                    let pending = await queue.queuedItemsForTesting.map(\.messageId)
+                    pendingOnCellular.value.withLock { $0 = pending }
+                    // Still inside the job: the monitor becomes unknown, so the
+                    // queue's watcher cannot download between the two jobs.
+                    NetworkMonitor.setExpensiveForTesting(nil)
+                },
+                processingHasWork: { false },
+                backgroundSchedule: { _ in },
+                refreshNetworkAvailable: true
+            )
+            onCellular.handleBackgroundAIProcessing(context: first) { _ in }
+            await first.waitForTaskForTesting()
+
+            // The next job measures Wi-Fi; NetworkMonitor stays unknown.
+            SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = true }
+            let second = BGTaskContext(label: "gate1064-job-wifi-2", completion: { _ in })
+            let onWiFi = SyncScheduler(
+                backgroundReadiness: { true },
+                backgroundWork: { _ in
+                    let resumed = await Self.pollUntil {
+                        await provider.callLog.contains { $0.hasPrefix("fetchMessage(") }
+                    }
+                    resumedInSecondJob.value.withLock { $0 = resumed }
+                },
+                processingHasWork: { false },
+                backgroundSchedule: { _ in },
+                refreshNetworkAvailable: true
+            )
+            onWiFi.handleBackgroundAIProcessing(context: second) { _ in }
+            await second.waitForTaskForTesting()
+        }
+        await queue.cancelAllInFlight()
+        #expect(fetchesOnCellular.value.withLock { $0 } == 0,
+                "an older-mail body downloaded in a job that measured cellular with Wi-Fi-only on")
+        #expect(pendingOnCellular.value.withLock { $0 } == ["7"], "the held item must stay pending in the job")
+        #expect(resumedInSecondJob.value.withLock { $0 }, "the download did not resume in a job that measured Wi-Fi")
+    }
+
+    /// One background-job input set for the body gate (#1064): Low Power Mode,
+    /// the Wi-Fi-only setting, the job's own Wi-Fi measurement, and what
+    /// NetworkMonitor holds (nil: never started, as in a job that launched the app
+    /// from terminated).
+    struct JobNetworkCase: Sendable, CustomTestStringConvertible {
+        let lowPowerMode: Bool
+        let wifiOnly: Bool
+        let jobOnWiFi: Bool
+        let monitorExpensive: Bool?
+
+        var label: String {
+            let monitor = monitorExpensive.map { $0 ? "expensive" : "unmetered" } ?? "unknown"
+            return "lpm-\(lowPowerMode)-wifiOnly-\(wifiOnly)-jobOnWiFi-\(jobOnWiFi)-monitor-\(monitor)"
+        }
+        var testDescription: String { label }
+
+        static let all: [JobNetworkCase] = {
+            let monitors: [Bool?] = [nil, false]
+            var cases: [JobNetworkCase] = []
+            for lowPowerMode in [false, true] {
+                for wifiOnly in [false, true] {
+                    for jobOnWiFi in [false, true] {
+                        for monitor in monitors {
+                            cases.append(JobNetworkCase(
+                                lowPowerMode: lowPowerMode, wifiOnly: wifiOnly,
+                                jobOnWiFi: jobOnWiFi, monitorExpensive: monitor))
+                        }
+                    }
+                }
+            }
+            return cases
+        }()
+    }
+
+    private struct JobOutcome: Sendable {
+        let fetched: Int
+        let held: Bool
+        let pending: [String]
+    }
+
+    @Test("in the background job, older-mail bodies are held exactly when the job's walk is held, from the job's own Wi-Fi measurement",
+          arguments: JobNetworkCase.all)
+    @MainActor
+    func backgroundJobBodiesFollowTheJobWalkDecision(_ input: JobNetworkCase) async throws {
+        let accountId = "gate1064-jobnet-\(input.label)"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        let item = backfillItem(accountId)
+        // The job's walk decision for these inputs: its rule, fed the job's measurement.
+        let walkAllowed = SyncScheduler.backgroundBackfillPlan(
+            isLowPowerMode: input.lowPowerMode, wifiOnly: input.wifiOnly, onWiFi: input.jobOnWiFi)
+        let outcome = TestBox<JobOutcome?>(nil)
+        let settle = Self.settle
+        // Device readings: on battery with a healthy level; the job adds its Fast Sync.
+        let power = (fastSync: false, lowPowerMode: input.lowPowerMode, onPower: false, batteryLevel: Float(0.8))
+        try await withAccount(accountId, provider: provider, power: power, expensive: false, wifiOnly: input.wifiOnly) {
+            NetworkMonitor.setExpensiveForTesting(input.monitorExpensive)
+            SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = input.jobOnWiFi }
+            let context = BGTaskContext(label: "gate1064-jobnet", completion: { _ in })
             let scheduler = SyncScheduler(
                 backgroundReadiness: { true },
                 backgroundWork: { _ in
                     await queue.enqueue([item])
-                    try? await Task.sleep(for: Self.settle)
-                    let count = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count
-                    fetchesWhileExpensive.value.withLock { $0 = count }
-                    let pending = await queue.queuedItemsForTesting.map(\.messageId)
-                    pendingWhileExpensive.value.withLock { $0 = pending }
-
-                    // Still inside the job: the network becomes unmetered.
-                    NetworkMonitor.setExpensiveForTesting(false)
-                    let clock = ContinuousClock()
-                    let end = clock.now.advanced(by: deadline)
-                    while clock.now < end {
-                        if await provider.callLog.contains(where: { $0.hasPrefix("fetchMessage(") }) {
-                            resumedInJob.value.withLock { $0 = true }
-                            break
-                        }
-                        try? await Task.sleep(for: .milliseconds(100))
+                    if walkAllowed {
+                        _ = await Self.pollUntil { await provider.callLog.contains { $0.hasPrefix("fetchMessage(") } }
+                    } else {
+                        _ = await Self.pollUntil { await queue.heldByDownloadGate }
+                        try? await Task.sleep(for: settle)
                     }
+                    let fetched = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count
+                    let held = await queue.heldByDownloadGate
+                    let pending = await queue.queuedItemsForTesting.map(\.messageId)
+                    outcome.value.withLock { $0 = JobOutcome(fetched: fetched, held: held, pending: pending) }
                 },
                 processingHasWork: { false },
                 backgroundSchedule: { _ in },
@@ -555,10 +674,37 @@ struct BackfillBodyDownloadGateTests {
             await context.waitForTaskForTesting()
         }
         await queue.cancelAllInFlight()
-        #expect(fetchesWhileExpensive.value.withLock { $0 } == 0,
-                "an older-mail body downloaded in the job on an expensive network with Wi-Fi-only on")
-        #expect(pendingWhileExpensive.value.withLock { $0 } == ["7"], "the held item must stay pending in the job")
-        #expect(resumedInJob.value.withLock { $0 }, "the download did not resume in the job once the network was unmetered")
+        let result = try #require(outcome.value.withLock { $0 }, "the job's work never ran")
+        if walkAllowed {
+            #expect(result.fetched > 0, "the job's walk runs but the older-mail body was held (\(input.label))")
+        } else {
+            #expect(result.held, "the job's walk is held but the body dispatch was not refused (\(input.label))")
+            #expect(result.fetched == 0, "the job's walk is held but an older-mail body downloaded (\(input.label))")
+            #expect(result.pending == ["7"], "the held item must stay pending (\(input.label))")
+        }
+    }
+
+    @Test("outside the job, a network NetworkMonitor has not reported yet holds older-mail bodies until a path update reports it unmetered")
+    func unknownNetworkHoldsUntilUnmeteredPathUpdate() async throws {
+        let accountId = "gate1064-unknown-network"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        try await withAccount(accountId, provider: provider, power: Self.openPower, expensive: false) {
+            // No path update yet (the monitor is not started).
+            NetworkMonitor.setExpensiveForTesting(nil)
+            await queue.enqueue([backfillItem(accountId)])
+            #expect(await eventually { await queue.heldByDownloadGate },
+                    "the dispatch was not refused on a network the monitor has not reported")
+            try await Task.sleep(for: Self.settle)
+            #expect(await fetchCount(provider) == 0, "an older-mail body downloaded on an unknown network with Wi-Fi-only on")
+            #expect(await queue.queuedItemsForTesting.map(\.messageId) == ["7"], "the held item must stay pending")
+
+            // The first path update reports an unmetered network.
+            NetworkMonitor.setExpensiveForTesting(false)
+            #expect(await eventually { await fetchCount(provider) > 0 },
+                    "the held body was not downloaded once the network was reported unmetered")
+        }
+        await queue.cancelAllInFlight()
     }
 
     @Test("a user's Fast Sync still lifts Low Power Mode for older-mail bodies outside the job")
