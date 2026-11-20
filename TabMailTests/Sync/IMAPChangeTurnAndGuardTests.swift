@@ -290,7 +290,10 @@ struct IMAPChangeTurnAndGuardTests {
 
         try await Self.waitUntil { holderDone.flag.withLock { $0 } && drainDone.flag.withLock { $0 } }
         let settle = Date().addingTimeInterval(Self.raceBoundSeconds)
-        while await waiters() > 0 || (await engine.syncPassRunning.contains(accountId)), Date() < settle {
+        while Date() < settle {
+            let waiting = await waiters()
+            let passRunning = await engine.syncPassRunning.contains(accountId)
+            if waiting == 0, !passRunning { break }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         // A listing would log in and SELECT within this watch.

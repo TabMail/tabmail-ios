@@ -295,7 +295,7 @@ struct IMAPChangeCondstoreTests {
                 try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [id])
             }
         }
-        let account = try #require(try w.pool.read { db in try Account.fetchOne(db, key: id) })
+        let account = try #require(try await w.pool.read { db in try Account.fetchOne(db, key: id) })
         _ = try await w.engine.sync(account: account)
     }
 
