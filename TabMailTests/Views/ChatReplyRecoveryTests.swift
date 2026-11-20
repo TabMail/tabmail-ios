@@ -308,6 +308,19 @@ struct ChatReplyRecoveryTests {
         Set((field ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty })
     }
 
+    /// The chat's stored user turns.
+    private static func userTurns(in chat: Chat) async throws -> Int {
+        let session = ChatThreadKey.key(for: chat.email)
+        return try await chat.pool.read {
+            try ChatTurn.filter(Column("sessionId") == session && Column("role") == "user").fetchCount($0)
+        }
+    }
+
+    /// How many times `words` appear in `body`.
+    private static func occurrences(of words: String, in body: String?) -> Int {
+        (body ?? "").components(separatedBy: words).count - 1
+    }
+
     /// Polls `condition` for up to ten seconds; the caller asserts on it afterwards.
     private static func waitUntil(_ condition: @MainActor () async throws -> Bool) async throws {
         for _ in 0..<100 {
@@ -438,6 +451,16 @@ struct ChatReplyRecoveryTests {
                 #expect(HostedAccessibility.activate("chatSend", in: chat.view),
                         "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                // With the unchanged sent words still in the field: Retry (a resume) only for a
+                // cut-off; a plain failure keeps Send until the field is empty.
+                let cutOff = failure == .connectionLost
+                try await Self.waitUntil {
+                    let ids = HostedAccessibility.identifiers(in: chat.view)
+                    return ids.contains("chatRetry") == cutOff && ids.contains("chatSend") == !cutOff
+                }
+                let held = HostedAccessibility.identifiers(in: chat.view)
+                #expect(held.contains("chatRetry") == cutOff && held.contains("chatSend") == !cutOff,
+                        "unchanged sent words after \(failure): \(held)")
                 // The field can be replaced while the chat settles after a send; wait for it.
                 try await Self.waitUntil { Self.type("", in: chat.view) }
                 #expect(Self.type("", in: chat.view), "control: the field is emptied")
@@ -739,9 +762,14 @@ struct ChatReplyRecoveryTests {
                 #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
                         "control: the field's Retry takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 2 && backend.bodies.last?.contains("conversation_state") == true,
-                        "the request was resumed from its saved state, not sent again")
+                #expect(backend.bodies.count == 2, "control: one resumed request")
+                // A resume carries the sent words once; a re-send would carry them twice (the
+                // unanswered turn in history, then the new message).
+                #expect(Self.occurrences(of: sent, in: backend.bodies.last) == 1,
+                        "the sent words go once in the resumed request: \(backend.bodies.last?.suffix(600) ?? "")")
                 try await Task.sleep(for: .milliseconds(300))
+                let turns = try await Self.userTurns(in: chat)
+                #expect(turns == 1, "the resume adds no user turn: \(turns)")
 
                 #expect(ChatFieldWords.shared.fill(for: key).words == "",
                         "after the resumed answer: \(ChatFieldWords.shared.fill(for: key).words)")
@@ -784,8 +812,44 @@ struct ChatReplyRecoveryTests {
                         "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
                 #expect(backend.bodies.count == 2, "one new request")
-                #expect(backend.bodies.last?.contains("conversation_state") == false && backend.bodies.last?.contains(edited) == true,
-                        "Send sends the edited words as a new request, not a resume")
+                #expect(backend.bodies.last?.contains(edited) == true, "control: Send sends the edited words")
+                try await Task.sleep(for: .milliseconds(300))
+                let turns = try await Self.userTurns(in: chat)
+                #expect(turns == 2, "Send adds a new user turn, not a resume: \(turns)")
+            }
+        }
+    }
+
+    @Test("The inbox pill's own words typed after a cut-off offer Send, not Retry")
+    func inboxPillWordsAfterCutOffOfferSend() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let backend = Backend(failure: .connectionLost, asksForReply: false)
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        ChatPillState.shared.removeAllSessions()
+        ChatPillState.shared.aiService = backend.service
+        ChatFieldWords.shared = ChatFieldWords()
+        defer {
+            ChatPillState.shared.aiService = .shared
+            ChatPillState.shared.removeAllSessions()
+            ChatFieldWords.shared = ChatFieldWords()
+            backend.http.close()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        try await HostedAccessibility.withAutomation {
+            try await ThreadChatTests.withPill(nil) { host, view in
+                host.expanded = true
+                try await Task.sleep(for: .milliseconds(600))
+                #expect(Self.type("What is due this week", in: view), "control: the pill takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(HostedAccessibility.activate("chatSend", in: view),
+                        "control: the pill's Send takes a tap: \(HostedAccessibility.identifiers(in: view))")
+                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 1, "control: the request went out once and was cut off")
+
+                #expect(Self.type("And next week", in: view), "control: the pill takes new words")
+                try await Task.sleep(for: .milliseconds(500))
+                let ids = HostedAccessibility.identifiers(in: view)
+                #expect(ids.contains("chatSend") && !ids.contains("chatRetry"), "the pill's own words offer Send: \(ids)")
             }
         }
     }
