@@ -367,6 +367,86 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
+    /// A send the test holds until it releases the backend's answer.
+    @MainActor
+    final class HeldSend {
+        var started = 0
+        private var answer: CheckedContinuation<Bool, Never>?
+
+        var send: ReportConcernSend {
+            { [self] _, _, _, _ in
+                started += 1
+                return await withCheckedContinuation { answer = $0 }
+            }
+        }
+
+        func release(_ accepted: Bool) {
+            answer?.resume(returning: accepted)
+            answer = nil
+        }
+    }
+
+    /// Whether a retained caller's sheet is open, driven from the test.
+    @MainActor @Observable
+    final class SheetState {
+        var open = true
+    }
+
+    /// A caller kept on screen across two reports, as a long-press caller is.
+    private struct RetainedHost: View {
+        @Bindable var state: SheetState
+        let send: ReportConcernSend
+
+        var body: some View {
+            Color.clear.reportConcernSheet(isPresented: $state.open, contentType: .suggestedReply,
+                                           content: { "pressed reply" }, send: send)
+        }
+    }
+
+    @Test("While a report is sending the sheet stays; its answer shows once; a later cancelled report shows nothing")
+    func aSendingReportKeepsTheSheet() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let held = HeldSend()
+        let state = SheetState()
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(RetainedHost(state: state, send: held.send)) { controller in
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(ReportConcernSheetText.storedForReview) }
+                let sheetView = try #require(Self.topPresented(controller)?.view, "control: the sheet appeared")
+                let submit = try #require(Self.element("Report", in: sheetView))
+                #expect(submit.accessibilityActivate())
+                try await Self.waitUntil { held.started == 1 }
+                #expect(held.started == 1, "control: the send started")
+                // While the send is held, Cancel is disabled and the sheet stays.
+                try await Self.waitUntil { Self.element("Cancel", in: sheetView)?.accessibilityTraits.contains(.notEnabled) == true }
+                let cancel = try #require(Self.element("Cancel", in: sheetView))
+                #expect(cancel.accessibilityTraits.contains(.notEnabled), "Cancel is disabled while sending")
+                _ = cancel.accessibilityActivate()
+                try await Task.sleep(for: .seconds(1))
+                #expect(Self.presentedLabels(controller).contains(ReportConcernSheetText.storedForReview), "the sheet stays")
+                // The answer arrives: exactly one alert.
+                held.release(true)
+                try await Self.waitUntil { (Self.topPresented(controller) as? UIAlertController)?.title == "Report Submitted" }
+                let alert = try #require(Self.topPresented(controller) as? UIAlertController, "the alert shows")
+                #expect(controller.presentedViewController === alert, "only the alert is presented: \(String(describing: controller.presentedViewController))")
+                let ok = try #require(Self.element("OK", in: alert.view))
+                #expect(ok.accessibilityActivate())
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                #expect(controller.presentedViewController == nil, "control: the alert closed")
+                // The same caller reports again and cancels: no alert.
+                state.open = true
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(ReportConcernSheetText.storedForReview) }
+                let again = try #require(Self.topPresented(controller)?.view, "control: the sheet appeared again")
+                let cancelAgain = try #require(Self.element("Cancel", in: again))
+                #expect(cancelAgain.accessibilityActivate())
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                try await Task.sleep(for: .seconds(1))
+                #expect(controller.presentedViewController == nil,
+                        "a cancelled report shows no alert: \(String(describing: Self.topPresented(controller)))")
+                #expect(held.started == 1, "the cancelled report sent nothing")
+            }
+        }
+    }
+
     // MARK: - After a report
 
     /// Opens the popover with the glyph and presses "Report a concern"; returns once the sheet shows.
