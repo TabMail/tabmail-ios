@@ -976,6 +976,7 @@ struct RootView: View {
                     withAnimation { appStoreAge = shown }
                 }
             },
+            hasStalledNotice: { AppStoreAgeCheck.SignificantUpdate.hasStalledNotice() },
             acknowledge: { await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate()) }
         )
     }

@@ -94,7 +94,11 @@ ADR-034.
   never clears the marker, returned or thrown: a return records the version (banner goes), a throw
   keeps the banner, and every later version also goes through the banner (2026-11-19 review ruling;
   the first version of this fix ignored a marker for another version and cleared it after a tapped
-  throw). Apple documents a throw only "if the feature isn't available"; whether a user dismissal
+  throw). Review fixes (2026-11-19): a tapped notice that fails at any of Apple's three calls returns
+  `.offerBanner` at once; an already-handled version with a kept marker still asks `isRegulated` and clears
+  the marker where the rules no longer apply (no notice, no banner); a launch whose age lookup throws
+  (`.notChecked`) still runs the step when `SignificantUpdate.hasStalledNotice()` (via `Runner.pass`'s
+  `hasStalledNotice`), which with the marker set never calls Apple unasked. Apple documents a throw only "if the feature isn't available"; whether a user dismissal
   returns or throws is undocumented. The banner state is RootView
   `@State` set from the ZStack `.task`, so it appears when onboarding ends without a relaunch. Killing the app mid-notice also yields the banner (accepted). The
   marker is app state, not user data. Tests: `SignificantUpdateStuckNoticeTests`.

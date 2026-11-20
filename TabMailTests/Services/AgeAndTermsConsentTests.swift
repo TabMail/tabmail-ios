@@ -451,6 +451,65 @@ struct AppStoreAgeCheckRunnerGuardTests {
         #expect(!runner.isCheckingAge && !runner.isAcknowledging)
     }
 
+    /// #1010 C3: a launch whose age lookup could not answer (`.notChecked`)
+    /// still runs the step when a notice once stalled, so its banner appears.
+    /// A blocking answer, or no stored marker, leads to no step at all.
+    @Test(arguments: [
+        (AppStoreAgeCheck.Status.notChecked, true, true),
+        (AppStoreAgeCheck.Status.notChecked, false, false),
+        (AppStoreAgeCheck.Status.minor, true, false),
+        (AppStoreAgeCheck.Status.unconfirmed, true, false),
+        (AppStoreAgeCheck.Status.allowed, false, true),
+    ])
+    func aStalledNoticeIsResolvedWhenTheAgeLookupCouldNotAnswer(
+        status: AppStoreAgeCheck.Status, stalled: Bool, step: Bool
+    ) async {
+        let runner = AppStoreAgeCheck.Runner()
+        let calls = Calls()
+        await runner.pass(
+            check: { calls.checks += 1; return status },
+            apply: { calls.applied.append($0) },
+            hasStalledNotice: { stalled },
+            acknowledge: { calls.notices += 1 }
+        )
+        #expect(calls.applied == [status])
+        #expect(calls.notices == (step ? 1 : 0))
+        #expect(!runner.isCheckingAge && !runner.isAcknowledging)
+    }
+
+    /// #1010 C3 end to end: a stored marker and an age lookup that throws give
+    /// the banner through the real step, with no unasked call to Apple.
+    @Test func aStoredMarkerAndAThrowingAgeLookupOfferTheBanner() async {
+        struct Failure: Error {}
+        let runner = AppStoreAgeCheck.Runner()
+        var acknowledged: String? = "1.7"
+        var inProgress: String? = "1.8"
+        var asked: [String] = []
+        var outcome: AppStoreAgeCheck.SignificantUpdate.Outcome?
+        await runner.pass(
+            check: {
+                await AppStoreAgeCheck.decide(
+                    isRegulated: { asked.append("region"); throw Failure() },
+                    askAge: { asked.append("age"); return .declined })
+            },
+            apply: { _ in },
+            hasStalledNotice: { inProgress != nil },
+            acknowledge: {
+                outcome = await AppStoreAgeCheck.acknowledge(
+                    acknowledged: acknowledged, current: "1.8.0", inProgress: inProgress,
+                    isRegulated: { asked.append("region"); throw Failure() },
+                    requiresNotice: { asked.append("notice"); return true },
+                    show: { _ in asked.append("show") },
+                    record: { acknowledged = $0 },
+                    markInProgress: { inProgress = $0 })
+            }
+        )
+        #expect(outcome == .offerBanner(version: "1.8"))
+        #expect(asked == ["region", "region"], "no requirements question and no notice")
+        #expect(inProgress == "1.8")
+        #expect(acknowledged == "1.7")
+    }
+
     /// RootView's launch and foreground age check must go through the runner,
     /// and the banner's tap through its notice guard. A hosted SwiftUI view
     /// cannot be driven from a unit test, so this reads RootView's source.
@@ -470,6 +529,12 @@ struct AppStoreAgeCheckRunnerGuardTests {
         #expect(body.contains("AppStoreAgeCheck.acknowledgeSignificantUpdate()"))
         #expect(!text.contains("isCheckingAppStoreAge"), "no second age-check flag beside the runner's")
         #expect(text.contains("await appStoreAgeRunner.acknowledgeOnly {"), "the banner tap uses the notice guard")
+        #expect(body.contains("hasStalledNotice: { AppStoreAgeCheck.SignificantUpdate.hasStalledNotice() }"),
+                "a launch whose age lookup failed still resolves a stalled notice")
+        #expect(!body.contains("userAsked: true"), "the automatic pass never asks Apple on the person's behalf")
+        // Every trigger goes through checkAppStoreAge: launch, foreground, Try Again.
+        #expect(text.contains("Task { await checkAppStoreAge() }"), "foreground")
+        #expect(text.contains("AppStoreAgeGateView(status: appStoreAge) { await checkAppStoreAge() }"), "Try Again")
     }
 }
 
@@ -543,9 +608,12 @@ struct SignificantUpdateMarkerStorageTests {
     @MainActor
     final class Apple {
         var regulated = true
+        var showFails = false
         var asked: [String] = []
         var markerDuringShow: String??
     }
+
+    struct ShowFailure: Error {}
 
     private func withDefaults(_ body: @MainActor (UserDefaults) async throws -> Void) async throws {
         let name = "SignificantUpdateMarkerStorageTests.\(UUID().uuidString)"
@@ -561,6 +629,7 @@ struct SignificantUpdateMarkerStorageTests {
             show: { _ in
                 apple.asked.append("show")
                 apple.markerDuringShow = .some(defaults.string(forKey: Update.inProgressVersionKey))
+                if apple.showFails { throw ShowFailure() }
             }
         )
     }
@@ -607,11 +676,40 @@ struct SignificantUpdateMarkerStorageTests {
         }
     }
 
+    /// #1010 TC4: a tapped notice on a marked, eligible device through the
+    /// real defaults wrapper. Success records the version and keeps the
+    /// marker, so the next version goes through the banner; a throw records
+    /// nothing, keeps the marker and keeps the banner. Apple's notice is
+    /// called, which a wrapper that dropped `userAsked` would not do.
+    @Test(arguments: [false, true])
+    func aTappedMarkedNoticeThroughStoredSettings(showFails: Bool) async throws {
+        try await withDefaults { defaults in
+            defaults.set("1.7", forKey: Update.acknowledgedVersionKey)
+            defaults.set("1.8", forKey: Update.inProgressVersionKey)
+            let apple = Apple()
+            apple.showFails = showFails
+            let tapped = await AppStoreAgeCheck.acknowledgeSignificantUpdate(
+                userAsked: true, current: "1.8.0", defaults: defaults, apple: calls(apple, defaults: defaults))
+            #expect(apple.asked == ["region", "notice", "show"], "the tap reaches Apple's notice")
+            #expect(defaults.string(forKey: Update.inProgressVersionKey) == "1.8", "the marker is kept")
+            #expect(defaults.string(forKey: Update.acknowledgedVersionKey) == (showFails ? "1.7" : "1.8"))
+            #expect(tapped == (showFails ? .offerBanner(version: "1.8") : .none))
+
+            apple.showFails = false
+            apple.asked = []
+            let laterCurrent = showFails ? "1.8.1" : "1.9.0"
+            let later = await AppStoreAgeCheck.acknowledgeSignificantUpdate(
+                userAsked: false, current: laterCurrent, defaults: defaults, apple: calls(apple, defaults: defaults))
+            #expect(later == .offerBanner(version: showFails ? "1.8" : "1.9"), "the next launch offers the banner")
+            #expect(apple.asked == ["region"], "and calls no notice unasked")
+        }
+    }
+
     /// The production entry point reads `.standard`. In the Simulator the age
     /// rules do not apply, so a seeded marker there is read and cleared with
     /// no banner (the marker is only cleared when it was read). Both keys are
     /// restored.
-    @Test(.enabled(if: ProcessInfo.processInfo.isOperatingSystemAtLeast(
+    @Test(.processGlobalState, .enabled(if: ProcessInfo.processInfo.isOperatingSystemAtLeast(
         OperatingSystemVersion(majorVersion: 26, minorVersion: 4, patchVersion: 0))))
     func theProductionEntryReadsTheStandardMarker() async throws {
         let standard = UserDefaults.standard
@@ -664,6 +762,10 @@ struct SignificantUpdateBannerWiringTests {
 
         let automatic = try Self.body(of: "private func checkAppStoreAge() async {", in: root)
         #expect(automatic.contains("acknowledge: { await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate()) }"))
+        #expect(automatic.contains("hasStalledNotice: { AppStoreAgeCheck.SignificantUpdate.hasStalledNotice() }"))
+        #expect(!automatic.contains("userAsked: true"), "no unasked notice from launch, foreground or Try Again")
+        #expect(root.contains("// The App Store's age answer can change while backgrounded. Task { await checkAppStoreAge() }"), "foreground call")
+        #expect(root.contains("AppStoreAgeGateView(status: appStoreAge) { await checkAppStoreAge() }"), "Try Again call")
 
         let tap = try Self.body(of: "private func openSignificantUpdateNotice() async {", in: root)
         #expect(tap.contains("await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate(userAsked: true))"))
@@ -812,12 +914,90 @@ struct SignificantUpdateStuckNoticeTests {
 
         store.inProgress = "1.8"
         let tapped = await launch(store, current: "1.8.0", userAsked: true) { _ in throw Failure() }
-        #expect(tapped == .none)
+        #expect(tapped == .offerBanner(version: "1.8"), "the banner stays at once after a tapped notice fails")
         #expect(store.inProgress == "1.8", "a tapped notice that throws keeps the marker")
         #expect(store.acknowledged == "1.7", "nothing recorded")
         let next = await launch(store, current: "1.8.0") { store.shown.append($0) }
         #expect(next == .offerBanner(version: "1.8"), "the banner stays after a tapped notice fails")
         #expect(store.shown.isEmpty, "no unasked notice after a tapped one failed")
+    }
+
+    enum FailingCall: CaseIterable { case eligibility, requirements, show }
+
+    /// #1010 C1: a tapped notice on a marked device that fails at any of
+    /// Apple's three calls keeps the banner offered at once (RootView applies
+    /// this outcome right after the tap), the marker and the handled version.
+    @Test(arguments: FailingCall.allCases)
+    func aFailedTapKeepsTheBannerOffered(failing: FailingCall) async {
+        struct Failure: Error {}
+        let store = Store()
+        store.acknowledged = "1.7"
+        store.inProgress = "1.8"
+        let outcome = await AppStoreAgeCheck.acknowledge(
+            acknowledged: store.acknowledged, current: "1.8.2",
+            inProgress: store.inProgress, userAsked: true,
+            isRegulated: { if failing == .eligibility { throw Failure() }; return true },
+            requiresNotice: { if failing == .requirements { throw Failure() }; return true },
+            show: { version in
+                if failing == .show { throw Failure() }
+                store.shown.append(version)
+            },
+            record: { store.acknowledged = $0 },
+            markInProgress: { store.inProgress = $0 }
+        )
+        #expect(outcome == .offerBanner(version: "1.8"))
+        #expect(store.inProgress == "1.8", "the marker is kept")
+        #expect(store.acknowledged == "1.7", "nothing recorded")
+        #expect(store.shown.isEmpty)
+    }
+
+    /// #1010 TC2: a stored marker and a throwing rules question at launch give
+    /// the banner and nothing else.
+    @Test func aStoredMarkerAndAThrowingRulesQuestionOfferTheBanner() async {
+        struct Failure: Error {}
+        let store = Store()
+        store.acknowledged = "1.7"
+        store.inProgress = "1.8"
+        var asked: [String] = []
+        let outcome = await AppStoreAgeCheck.acknowledge(
+            acknowledged: store.acknowledged, current: "1.8.0",
+            inProgress: store.inProgress,
+            isRegulated: { asked.append("region"); throw Failure() },
+            requiresNotice: { asked.append("notice"); return true },
+            show: { asked.append("show"); store.shown.append($0) },
+            record: { store.acknowledged = $0 },
+            markInProgress: { store.inProgress = $0 }
+        )
+        #expect(outcome == .offerBanner(version: "1.8"))
+        #expect(asked == ["region"], "no requirements question and no notice")
+        #expect(store.inProgress == "1.8")
+        #expect(store.acknowledged == "1.7")
+    }
+
+    /// #1010 C2: after a tapped notice returned (version handled, marker kept),
+    /// a later launch of the same major.minor still clears the marker once the
+    /// age rules stop applying, and shows nothing; where they still apply the
+    /// marker stays and nothing is shown either.
+    @Test(arguments: [false, true])
+    func anAlreadyHandledVersionStillResolvesAKeptMarker(regulated: Bool) async {
+        let store = Store()
+        store.acknowledged = "1.8"
+        store.inProgress = "1.8"
+        var asked: [String] = []
+        let outcome = await AppStoreAgeCheck.acknowledge(
+            acknowledged: store.acknowledged, current: "1.8.4",
+            inProgress: store.inProgress,
+            isRegulated: { asked.append("region"); return regulated },
+            requiresNotice: { asked.append("notice"); return true },
+            show: { asked.append("show"); store.shown.append($0) },
+            record: { store.acknowledged = $0 },
+            markInProgress: { store.inProgress = $0 }
+        )
+        #expect(outcome == .none, "an already handled notice stays suppressed")
+        #expect(asked == ["region"], "eligibility is consulted, nothing else")
+        #expect(store.inProgress == (regulated ? "1.8" : nil))
+        #expect(store.acknowledged == "1.8")
+        #expect(store.shown.isEmpty)
     }
 
     /// At launch with a stuck marker for this version, the plain rules question

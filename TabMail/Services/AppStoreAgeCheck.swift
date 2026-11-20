@@ -129,9 +129,15 @@ enum AppStoreAgeCheck {
         /// `check` asks the App Store (`AppStoreAgeCheck.run`), `apply` shows
         /// its answer, `acknowledge` is `acknowledgeSignificantUpdate`. A pass
         /// that finds an age check already running does nothing.
+        /// `hasStalledNotice` reads the stored in-progress marker
+        /// (`SignificantUpdate.hasStalledNotice`): when the age lookup could
+        /// not answer (`.notChecked`) and a notice once stalled, the step still
+        /// runs so the banner is offered. With the marker set the step makes no
+        /// unasked call to Apple, so the notice itself still needs `.allowed`.
         func pass(
             check: () async -> Status,
             apply: (Status) -> Void,
+            hasStalledNotice: () -> Bool = { false },
             acknowledge: () async -> Void
         ) async {
             guard !isCheckingAge else { return }
@@ -139,7 +145,8 @@ enum AppStoreAgeCheck {
             let status = await check()
             isCheckingAge = false
             apply(status)
-            guard status == .allowed, !isAcknowledging else { return }
+            let offersStalledBanner = status == .notChecked && hasStalledNotice()
+            guard status == .allowed || offersStalledBanner, !isAcknowledging else { return }
             isAcknowledging = true
             await acknowledge()
             isAcknowledging = false
@@ -180,6 +187,11 @@ enum AppStoreAgeCheck {
         /// offered through a banner instead of shown unasked (owner 2026-11-18,
         /// issue #1010). App state, not user data.
         static let inProgressVersionKey = "AppStoreAgeCheck.significantUpdateInProgress"
+
+        /// A notice once stalled on this device: the in-progress marker is set.
+        static func hasStalledNotice(defaults: UserDefaults = .standard) -> Bool {
+            defaults.string(forKey: inProgressVersionKey) != nil
+        }
 
         /// What the step leaves for the screen.
         enum Outcome: Equatable {
@@ -318,6 +330,17 @@ enum AppStoreAgeCheck {
         guard let version = SignificantUpdate.majorMinor(current) else { return .none }
         switch SignificantUpdate.decide(acknowledged: acknowledged, current: current) {
         case .nothing:
+            // Already handled: no notice and no banner. A marker kept by a
+            // tapped notice is still cleared once the age rules stop applying,
+            // so a later version is not sent through the banner where they do
+            // not. A failed rules question keeps it until the next pass.
+            if inProgress != nil {
+                do {
+                    if try await !isRegulated() { markInProgress(nil) }
+                } catch {
+                    BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] Rules check for a kept notice marker failed, asking again on next foreground: \(error)")
+                }
+            }
             return .none
         case .record:
             record(version)
@@ -357,9 +380,11 @@ enum AppStoreAgeCheck {
                 }
                 record(version)
             } catch {
-                // The rules question failed: a stuck notice keeps its banner.
-                if stuckUnasked {
-                    BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] A notice never returned and the rules check failed; offering the banner: \(error)")
+                // A marked notice keeps its banner after any failure: the rules
+                // question (unasked), or a tapped notice's rules question,
+                // requirements question or notice. The marker stays.
+                if inProgress != nil {
+                    BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] A marked notice did not complete; keeping the banner: \(error)")
                     return .offerBanner(version: version)
                 }
                 BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] Significant update acknowledgment failed, asking again on next foreground: \(error)")
