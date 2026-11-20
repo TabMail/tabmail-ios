@@ -247,7 +247,64 @@ struct IMAPChangeCondstoreTests {
 
     // MARK: - The notification merge after a tracked read
 
-    @Test("A staged notification for a live older message the window never loaded merges after a tracked read that applied an arrival")
+    /// Stages a header-only notification row for `uid` in INBOX (as the
+    /// notification service writes one), then merges staging; returns whether
+    /// the staged row is still there after the merge.
+    static func stageAndMerge(_ uid: Int, _ w: E.World) async throws -> Bool {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("nse_staging.sqlite").path
+        _ = AppDatabase.createNSEStagingDB(atPath: path)
+        let staging = try DatabaseQueue(path: path)
+        defer { TestDatabaseTeardown.retire(pools: [], queues: [staging], directory: dir) }
+        let accountId = w.account.id
+        let id = "\(accountId):\(uid)"
+        try await staging.write { db in
+            try db.execute(sql: """
+                INSERT INTO nse_processed_message
+                    (id, accountId, accountEmail, provider, messageId, rfc822MessageId,
+                     folderPath, subject, senderName, senderEmail, snippet, date,
+                     processedAt, aiCompleted, notified, populated)
+                VALUES (?, ?, 'user@example.com', 'imap_new_mail', ?, ?, ?,
+                        'Staged subject', 'Sender', 'sender@example.com', 'snippet', ?, ?, 0, 0, 1)
+                """, arguments: [
+                    id, accountId, String(uid), "rfc-\(uid)@example.com", E.path,
+                    Date().timeIntervalSince1970, Date().timeIntervalSince1970,
+                ])
+        }
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        return try await staging.read { db in
+            try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM nse_processed_message WHERE id = ?)", arguments: [id]) ?? false
+        }
+    }
+
+    static func tracked(_ w: E.World) throws -> Bool {
+        let folder = try w.folder()
+        return FolderChangeState(raw: folder.changeState).tracking && folder.changeCursor != nil
+    }
+
+    @Test("A staged notification for a message a tracked read removed comes back with the merge, and the next sync removes it for good")
+    func stagedMessageARemovalProvedGoneIsSettledByTheNextSync() async throws {
+        try await E.withWorld("cs-nse-gone", capabilities: Self.condstore, serverUIDs: [1, 2, 3, 4], localUIDs: [1, 2, 3, 4]) { w in
+            w.server.honorSearchUIDSetCriterion()
+            w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
+            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            #expect(try Self.tracked(w), "setup: tracked")
+            Self.remove([2], from: w.server, E.path)
+            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            #expect(try !w.uids().contains("2"), "setup: the tracked read removed 2")
+
+            let kept = try await Self.stageAndMerge(2, w)
+            #expect(kept, "the staged row is kept")
+            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            #expect(try w.uids() == ["1", "3", "4"], "the next sync removes the merged-back message")
+            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            #expect(try w.uids() == ["1", "3", "4"], "and it stays gone")
+        }
+    }
+
+    @Test("A staged notification for a live older message the window never loaded merges into a tracked folder, survives the next sync, and the folder is tracked again")
     func stagedLiveOlderMessageMergesAfterATrackedRead() async throws {
         let world = Self.partlyLoaded()
         let arrival = world.server.count + 1
@@ -259,35 +316,16 @@ struct IMAPChangeCondstoreTests {
             Self.add([arrival], to: w.server, E.path)
             _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
             #expect(try w.uids().contains(String(arrival)), "setup: the tracked read applied the arrival")
+            #expect(try Self.tracked(w), "setup: tracked")
             #expect(try !w.uids().contains(String(live)), "setup: the live older message is not held")
 
-            let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let path = dir.appendingPathComponent("nse_staging.sqlite").path
-            _ = AppDatabase.createNSEStagingDB(atPath: path)
-            let staging = try DatabaseQueue(path: path)
-            defer { TestDatabaseTeardown.retire(pools: [], queues: [staging], directory: dir) }
-            let accountId = w.account.id
-            try await staging.write { db in
-                try db.execute(sql: """
-                    INSERT INTO nse_processed_message
-                        (id, accountId, accountEmail, provider, messageId, rfc822MessageId,
-                         folderPath, subject, senderName, senderEmail, snippet, date,
-                         processedAt, aiCompleted, notified, populated)
-                    VALUES (?, ?, 'user@example.com', 'imap_new_mail', ?, ?, ?,
-                            'Staged subject', 'Sender', 'sender@example.com', 'snippet', ?, ?, 0, 0, 1)
-                    """, arguments: [
-                        "\(accountId):\(live)", accountId, String(live), "rfc-\(live)@example.com", E.path,
-                        Date().timeIntervalSince1970, Date().timeIntervalSince1970,
-                    ])
-            }
-            await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+            let kept = try await Self.stageAndMerge(live, w)
             #expect(try w.uids().contains(String(live)), "the live staged message materialises")
-            let kept = try await staging.read { db in
-                try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM nse_processed_message WHERE id = ?)",
-                                  arguments: ["\(accountId):\(live)"]) ?? false
-            }
             #expect(kept, "its header-only staged copy stays for the rest of its stages")
+            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            #expect(try w.uids().contains(String(live)), "the live message survives the listing")
+            #expect(try Self.tracked(w), "the folder is tracked again")
         }
     }
 }

@@ -1095,6 +1095,15 @@ unchanged (RFC 7162).
    merged back as a header, which a later listing or removal check removes again. It also kept an IMAP
    bookmark reading out of the notification merge, above the provider boundary. Any replacement needs
    positive per-UID evidence.
+   **Amended again 2026-11-19 (review): the merge-back is settled by ending tracking.** A tracked folder is
+   never listed, healed or count-checked, so the merged-back header above could stay for good. Now, when the
+   notification merge inserts a header under an id the folder's change bookmark claims it already held
+   (`EmailProvider.changeBookmark(_:claimsHeld:)`, read by account type beside the protocol; IMAP: a UID below
+   the bookmark's UIDNEXT, either mode), the same transaction drops the bookmark as a refused read does
+   (`SyncEngine.endTrackingIfBookmarkClaimsHeld` -> `dropChangeBookmark`). The staged row is kept. The next full
+   sync lists the folder and removes a gone message; a live one stays and the folder is tracked again after
+   its next baseline. The cost is one listing per such merge; tabmail-ios#1089 (P4) tracks the per-UID
+   record of proven removals that would avoid it. No new persisted state.
 7. **The turn.** A standalone `syncFolderMessages` lists inside `oneSyncAtATime`, which is re-entrant for the
    task holding it (`@TaskLocal heldSyncTurn`).
 8. The catch-up's MODSEQ freshness for a folder with a same-epoch bookmark is the bookmark's MODSEQ alone.

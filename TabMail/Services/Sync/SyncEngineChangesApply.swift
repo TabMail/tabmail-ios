@@ -313,6 +313,25 @@ extension SyncEngine {
         try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
     }
 
+    /// A row inserted outside a change read (the notification merge) under an
+    /// id the folder's bookmark claims it already holds contradicts the
+    /// bookmark: the message may be one a read proved gone. The bookmark is
+    /// dropped as a refused read drops it, so the next full sync lists the
+    /// folder and settles the row (#755, ADR-IOS-111). Call inside the insert's
+    /// transaction.
+    nonisolated static func endTrackingIfBookmarkClaimsHeld(folderId: String, messageId: String, db: Database) throws {
+        guard let row = try Row.fetchOne(db, sql: """
+            SELECT folder.changeCursor AS cursor, account.id AS accountId, account.provider AS provider
+            FROM folder JOIN account ON account.id = folder.accountId WHERE folder.id = ?
+            """, arguments: [folderId]),
+              let cursor = String.fromDatabaseValue(row["cursor"] as DatabaseValue),
+              let accountId = String.fromDatabaseValue(row["accountId"] as DatabaseValue),
+              let provider = String.fromDatabaseValue(row["provider"] as DatabaseValue).flatMap(AccountProvider.init(rawValue:)),
+              changeBookmark(cursor, claimsHeld: messageId, accountId: accountId, provider: provider)
+        else { return }
+        try dropChangeBookmark(folderId: folderId, db: db)
+    }
+
     /// Arm one folder's catch-up: the same lapse mark `lapseDeltaCursor` sets on
     /// every folder, for this folder only (ADR-IOS-107).
     nonisolated static func markCatchUpLapse(folderId: String, db: Database) throws {

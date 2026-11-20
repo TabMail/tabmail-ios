@@ -407,6 +407,12 @@ protocol EmailProvider: Sendable {
     /// no sync will ever replace it.
     static var placeholderIdsAreAddressable: Bool { get }
 
+    /// Whether the folder change bookmark `cursor` (`Folder.changeCursor`)
+    /// claims the folder already holds every live message with `messageId`, so
+    /// a row inserted outside a change read under that id contradicts it
+    /// (#755): the notification merge then ends the folder's tracking.
+    static func changeBookmark(_ cursor: String, claimsHeld messageId: String) -> Bool
+
     /// T1.2b: the UIDVALIDITY the MOST RECENT SELECT of `folderPath` reported, or
     /// `nil` when that SELECT reported none, when this provider has never SELECTed
     /// the folder, or when the folder concept doesn't apply (every non-IMAP
@@ -630,6 +636,9 @@ extension EmailProvider {
     /// Default `false`: a provider that talks to a server cannot address a
     /// local placeholder id. `DemoProvider` overrides it.
     static var placeholderIdsAreAddressable: Bool { false }
+
+    /// Default `false`: a provider whose bookmark makes no such claim.
+    static func changeBookmark(_ cursor: String, claimsHeld messageId: String) -> Bool { false }
 
     /// Default for test doubles and the demo provider, whose drafts are never
     /// read back (only Gmail and Outlook drafts reload on open, and only drafts in a
@@ -1221,16 +1230,22 @@ func isSyntheticPlaceholderId(_ id: String) -> Bool {
 /// as IMAP but is served by `DemoProvider`; an account kind with no mail
 /// provider (CalDAV) answers `false`.
 func placeholderIdsAreAddressable(for account: Account) -> Bool {
-    let type: (any EmailProvider.Type)?
-    if account.id == DemoSeed.demoAccountId {
-        type = DemoProvider.self
-    } else {
-        switch account.provider {
-        case .gmail: type = GmailProvider.self
-        case .outlook: type = ExchangeProvider.self
-        case .imap, .icloud: type = IMAPProvider.self
-        case .caldav: type = nil
-        }
+    emailProviderType(accountId: account.id, provider: account.provider)?.placeholderIdsAreAddressable ?? false
+}
+
+/// `EmailProvider.changeBookmark(_:claimsHeld:)` of the provider type that
+/// serves the account, read without a provider instance inside a write.
+func changeBookmark(_ cursor: String, claimsHeld messageId: String, accountId: String, provider: AccountProvider) -> Bool {
+    emailProviderType(accountId: accountId, provider: provider)?.changeBookmark(cursor, claimsHeld: messageId) ?? false
+}
+
+/// The provider type that serves an account; nil for a kind with no mail provider.
+private func emailProviderType(accountId: String, provider: AccountProvider) -> (any EmailProvider.Type)? {
+    if accountId == DemoSeed.demoAccountId { return DemoProvider.self }
+    switch provider {
+    case .gmail: return GmailProvider.self
+    case .outlook: return ExchangeProvider.self
+    case .imap, .icloud: return IMAPProvider.self
+    case .caldav: return nil
     }
-    return type?.placeholderIdsAreAddressable ?? false
 }

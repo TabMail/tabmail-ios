@@ -100,6 +100,13 @@ struct IMAPChangeCursor: Codable, Equatable, Sendable {
         return cursor
     }
 
+    /// A UID below the bookmark's UIDNEXT: every live message there was held or
+    /// listed for a re-read when the bookmark was written (#755).
+    static func claimsHeld(uid messageId: String, cursor raw: String) -> Bool {
+        guard let uid = UInt32(messageId), let cursor = decode(raw) else { return false }
+        return uid < cursor.uidNext
+    }
+
     /// The same checkpoint with no failure time.
     var cleared: IMAPChangeCursor {
         var copy = self
@@ -171,6 +178,10 @@ struct IMAPChangeCountMismatch: Error, CustomStringConvertible {
 }
 
 extension IMAPProvider {
+    static func changeBookmark(_ cursor: String, claimsHeld messageId: String) -> Bool {
+        IMAPChangeCursor.claimsHeld(uid: messageId, cursor: cursor)
+    }
+
 
     func fetchChanges(since cursor: ChangeCursor, request: ChangeRequest) async throws -> ChangeSet? {
         let context = request.context
