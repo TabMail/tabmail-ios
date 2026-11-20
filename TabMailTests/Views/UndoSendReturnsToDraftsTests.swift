@@ -394,6 +394,7 @@ struct UndoSendReturnsToDraftsTests {
             "loadedIsUnsaved: prefillTreatAsUnsavedChanges,",
             "readState: draftReadState,",
             "hasContent: hasContent,",
+            "hasUnsettledWork: attachmentPreparationIsUnsettled || hasVisibleSuggestion",
         ] {
             #expect(body.contains(wiring), "closeCompose() lacks `\(wiring)`")
         }
