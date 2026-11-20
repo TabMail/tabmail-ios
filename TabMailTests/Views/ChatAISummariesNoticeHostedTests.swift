@@ -1067,8 +1067,9 @@ struct ChatAISummariesNoticeHostedTests {
 
     /// The system closes the popover while its report sheet is up and sending: nothing on the
     /// popover or the sheet runs, and the report's flag and presentation live on the button. The
-    /// button retires that presentation when the notice opens again, so the old answer, before or
-    /// after the next report starts sending, acts on nothing.
+    /// notice reopens with no sheet, and the next report's open retires the old presentation, so
+    /// the old answer, before or after the next report starts sending, shows, closes and changes
+    /// nothing.
     @Test("A popover the system closed while its report sends: the old answer never shows, closes or changes the next report")
     func aSystemClosedPopoversAnswerNeverReachesTheNext() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")

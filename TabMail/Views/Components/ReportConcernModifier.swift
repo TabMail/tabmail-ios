@@ -137,8 +137,8 @@ struct ReportConcernSheetModifier: ViewModifier {
     @State private var isSubmitting = false
     /// Set by a caller whose `isPresented` flag outlives the view this sheet is attached to (the
     /// notice's flag lives on its button, the sheet on the popover's content): the caller then
-    /// owns the presentation too and retires it whenever it opens that view again. Otherwise the sheet
-    /// owns it, with the same lifetime as its flag.
+    /// owns the presentation too, so it lives as long as the flag. Otherwise the sheet owns it, with the
+    /// same lifetime as its flag. Either way, only the open handler below advances it on an open.
     var ownerPresentation: ReportPresentation?
 
     @State private var ownPresentation = ReportPresentation()
@@ -162,7 +162,7 @@ struct ReportConcernSheetModifier: ViewModifier {
                 // The alert waits until the sheet has gone: UIKit refuses to present it while the
                 // sheet is still closing.
                 if submitted {
-                    submitted = false
+                    // The sheet's open handler clears `submitted` for the next presentation.
                     showSubmitted = true
                 } else {
                     // Cancel, a swipe down, or a report the backend did not take.
