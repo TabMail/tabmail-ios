@@ -729,6 +729,68 @@ struct SignificantUpdateMarkerStorageTests {
         #expect(standard.object(forKey: Update.inProgressVersionKey) == nil, "the stored marker was read and cleared")
         #expect(standard.string(forKey: Update.acknowledgedVersionKey) == "0.0")
     }
+
+    /// #1010 review TC: the real stored-marker probe. Only the in-progress
+    /// marker counts, for any version; the handled version alone does not.
+    @Test(.processGlobalState)
+    func theStalledNoticeProbeReadsOnlyTheStoredMarker() async throws {
+        try await withDefaults { defaults in
+            #expect(!Update.hasStalledNotice(defaults: defaults), "no marker")
+
+            defaults.set("1.8", forKey: Update.acknowledgedVersionKey)
+            #expect(!Update.hasStalledNotice(defaults: defaults), "a handled version alone is not a stalled notice")
+
+            defaults.set("1.8", forKey: Update.inProgressVersionKey)
+            #expect(Update.hasStalledNotice(defaults: defaults), "a marker for the current version")
+
+            defaults.set("1.7", forKey: Update.inProgressVersionKey)
+            #expect(Update.hasStalledNotice(defaults: defaults), "a marker for an older version")
+
+            defaults.removeObject(forKey: Update.inProgressVersionKey)
+            #expect(!Update.hasStalledNotice(defaults: defaults), "a cleared marker")
+        }
+    }
+
+    /// #1010 review TC: a `.notChecked` pass through the real probe and the
+    /// stored-settings step. With a stored marker the banner is offered and
+    /// the stored state is unchanged; with none the step does not run. In
+    /// both, no unasked notice is presented.
+    @Test(.processGlobalState, arguments: [true, false])
+    func aNotCheckedPassUsesTheRealProbeAndStoredStep(marked: Bool) async throws {
+        try await withDefaults { defaults in
+            defaults.set("1.7", forKey: Update.acknowledgedVersionKey)
+            if marked { defaults.set("1.8", forKey: Update.inProgressVersionKey) }
+            let apple = Apple()
+            let runner = AppStoreAgeCheck.Runner()
+            var steps = 0
+            var outcome: Update.Outcome?
+            await runner.pass(
+                check: { .notChecked },
+                apply: { _ in },
+                hasStalledNotice: { Update.hasStalledNotice(defaults: defaults) },
+                acknowledge: {
+                    steps += 1
+                    outcome = await AppStoreAgeCheck.acknowledgeSignificantUpdate(
+                        userAsked: false, current: "1.8.0", defaults: defaults,
+                        apple: calls(apple, defaults: defaults))
+                }
+            )
+            #expect(!apple.asked.contains("show"), "no unasked notice")
+            #expect(!apple.asked.contains("notice"))
+            #expect(defaults.string(forKey: Update.acknowledgedVersionKey) == "1.7")
+            if marked {
+                #expect(steps == 1)
+                #expect(outcome == .offerBanner(version: "1.8"))
+                #expect(apple.asked == ["region"])
+                #expect(defaults.string(forKey: Update.inProgressVersionKey) == "1.8")
+            } else {
+                #expect(steps == 0, "no step without a stored marker")
+                #expect(outcome == nil)
+                #expect(apple.asked.isEmpty)
+                #expect(defaults.object(forKey: Update.inProgressVersionKey) == nil)
+            }
+        }
+    }
 }
 
 /// Codex r2 TC-3: outcome, banner, Review button, request with `userAsked:
@@ -998,6 +1060,43 @@ struct SignificantUpdateStuckNoticeTests {
         #expect(store.inProgress == (regulated ? "1.8" : nil))
         #expect(store.acknowledged == "1.8")
         #expect(store.shown.isEmpty)
+    }
+
+    /// #1010 review TC: an already handled version with a kept marker and a
+    /// throwing rules question changes nothing and offers nothing; once the
+    /// version advances, the kept marker offers the banner, still unasked-free.
+    @Test func aHandledVersionWithAKeptMarkerAndAThrowingRulesQuestionChangesNothing() async {
+        struct Failure: Error {}
+        let store = Store()
+        store.acknowledged = "1.8"
+        store.inProgress = "1.8"
+        var asked: [String] = []
+        var marks: [String?] = []
+        func step(_ current: String) async -> AppStoreAgeCheck.SignificantUpdate.Outcome {
+            await AppStoreAgeCheck.acknowledge(
+                acknowledged: store.acknowledged, current: current,
+                inProgress: store.inProgress,
+                isRegulated: { asked.append("region"); throw Failure() },
+                requiresNotice: { asked.append("notice"); return true },
+                show: { asked.append("show"); store.shown.append($0) },
+                record: { asked.append("record"); store.acknowledged = $0 },
+                markInProgress: { marks.append($0); store.inProgress = $0 }
+            )
+        }
+        let handled = await step("1.8.4")
+        #expect(handled == .none)
+        #expect(asked == ["region"], "the rules are asked once, nothing else")
+        #expect(marks.isEmpty, "the marker is neither cleared nor rewritten")
+        #expect(store.inProgress == "1.8")
+        #expect(store.acknowledged == "1.8")
+
+        asked = []
+        let advanced = await step("1.9.0")
+        #expect(advanced == .offerBanner(version: "1.9"))
+        #expect(!asked.contains("show") && !asked.contains("notice"), "no unasked notice")
+        #expect(store.shown.isEmpty)
+        #expect(store.inProgress == "1.8")
+        #expect(store.acknowledged == "1.8")
     }
 
     /// At launch with a stuck marker for this version, the plain rules question
