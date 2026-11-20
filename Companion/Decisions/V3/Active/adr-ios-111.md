@@ -1073,8 +1073,8 @@ unchanged (RFC 7162).
    `CatchUpLocalRowReader.rows(folderId:numericIdsBelow:limit:)` (UID order, never date). A candidate is removed
    only when the FETCH and a confirming SEARCH both leave it out (`rereadIds`). Held rows left below the window
    arm the catch-up with the new bookmark (`armCatchUpWithBookmark`). The read reports
-   `FolderChanges.heldRowsProof {lowerId, upperId, count}`; the apply recounts that range before any removal and,
-   on a difference, keeps the stored bookmark.
+   `FolderChanges.heldRowsProof {lowerId, upperId, checkedIds}`; before any removal the apply re-reads the rows it
+   holds in that range and, when one is not among `checkedIds`, keeps the stored bookmark.
 5. **The cut.** The check is priced from its exact request count before the arrivals' FETCH. When it does not
    fit (or the budget runs out mid-check) the folder is reported `.untracked` with
    `UntrackedObservation.mustList` (listed the same pass), the bookmark keeps its reading position and carries

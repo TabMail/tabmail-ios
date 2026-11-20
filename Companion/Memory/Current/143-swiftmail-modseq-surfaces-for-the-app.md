@@ -16,7 +16,8 @@ designing anything that compares, stores or searches by an IMAP mod-sequence.
   Reading it as a number means importing a transitive module, so don't.
 - **`SearchCriteria.modSeq` takes NIOIMAPCore's `SearchModificationSequence`.** `UID SEARCH MODSEQ n`
   therefore has the same import problem.
-- **There is no `CHANGEDSINCE` FETCH modifier** in the fork.
+- **There was no `CHANGEDSINCE` FETCH modifier** in the fork (superseded: the fork now has
+  `fetchFlagsChangedSince`; see the 2026-11-19 note below).
 - **`.uidFlagsOnly`** is `[.flags]`, about 50 bytes per message, with a suggested chunk of 5000.
   `fetchMessageInfos(uidRange: ClosedRange<UID>, options:)` issues ONE
   `UID FETCH lo:hi (UID FLAGS)`.
