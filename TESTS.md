@@ -1372,3 +1372,22 @@ alert is up, and the two notice-only cases end the same way: an alert left up fa
 left it, with a diagnostic line, and is then dismissed so the next test starts clean. A further case refuses the Undo for other reasons on a Gmail
 account (the forward move never happened, the row is gone, the account is gone) and expects the same
 notice for each.
+
+## A stale move never redirects a deferred Undo after a folder reset
+
+`FolderResetGenerationTests.staleMoveNeverRedirectsADeferredUndoOfTheReplacement` runs the real
+UIDVALIDITY reset reaction against `FakeIMAPServer`, so a different email (the replacement) is
+re-seated at the shown id. The user archives the replacement and presses Undo while the archive is in
+flight, so the Undo waits as a deferred successor. A move of the same id stamped before the reset then
+arrives by one of five routes: a direct move that would retarget the Undo, a direct move back to
+Archive that would cancel it, an AI delete card of an RFC-less shown row (whose execution-time
+re-resolve hands `move` the optimistically archived row, still keyed by its INBOX id), a batch with a
+member already at the destination, and a batch with an unaffected member that moves for real. The
+stale arm expects the replacement back in INBOX under a new UID on the server (the archive and Undo
+really ran), the stale member terminal and reported through `.messageMovesRefused`, and other members
+acting; a post-reset stamp cancels or redirects the Undo as before. Final placement on the server is
+the oracle here; the wrong-message oracle cannot be armed on the shown email because the user's own
+archive and Undo of the replacement are legitimate. `replyDraftShapedIdIsJudgedByItsOwnFolder` and
+`generationScopeAndReDrive` pin `FolderResetGeneration.refuses(headerId:accountId:)`: an id is judged
+by the folder it names through `MessageIdentity.headerIdBelongsToFolder`, never a hand split, so a
+reply-draft id with extra colons is refused only when its own folder was reset.

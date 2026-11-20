@@ -53,6 +53,22 @@ enum FolderResetGeneration {
         }
     }
 
+    /// True when a stamp is bound and the folder whose address `headerId` names
+    /// finished a reset after it. An optimistically moved row keeps the id of
+    /// the folder it was shown in while its `folderPath` already names another.
+    static func refuses(headerId: String, accountId: String) -> Bool {
+        guard let stamp = gestureStamp else { return false }
+        let accountPrefix = MessageIdentity.folderId(accountId: accountId, folderPath: "")
+        return state.withLock { state in
+            state.lastReset.contains { folderId, reset in
+                reset > stamp && folderId.hasPrefix(accountPrefix)
+                    && MessageIdentity.headerIdBelongsToFolder(
+                        headerId, accountId: accountId,
+                        folderPath: String(folderId.dropFirst(accountPrefix.count)))
+            }
+        }
+    }
+
     /// True when a stamp is bound and `folderId` finished a reset after it.
     static func refuses(folderId: String) -> Bool {
         guard let stamp = gestureStamp else { return false }
