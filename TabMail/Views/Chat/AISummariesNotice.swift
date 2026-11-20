@@ -197,9 +197,9 @@ struct AISummariesNoticeButton: View {
 }
 
 /// Debug-only trace of the notice's presentations, with what each key window has presented.
-private func noticeDebugLog(_ tag: String, _ message: String) {
+@MainActor private func noticeDebugLog(_ tag: String, _ message: String) {
     #if DEBUG
-    let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows)
+    let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
     let presented = windows.compactMap { window -> String? in
         var chain: [String] = []
         var controller = window.rootViewController?.presentedViewController
