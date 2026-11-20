@@ -1379,10 +1379,11 @@ extension AccountManager {
                                 && Column("role") == FolderRole.sent.rawValue)
                             .fetchOne(db)
                     }) {
-                        _ = try await queue.execute(priority: .userAction) {
-                            try await self.syncEngine.syncFolderMessages(
-                                folder: folder, provider: queue.provider)
-                        }
+                        // No work-queue slot around it: the listing takes the
+                        // account's sync turn, and a slot held while waiting for
+                        // the turn can starve the turn's holder of a slot.
+                        _ = try await self.syncEngine.syncFolderMessages(
+                            folder: folder, provider: queue.provider)
                     }
                 } catch {
                     BackgroundSyncLogger.logDebug("[Outbox] Post-send Sent folder sync failed: \(error)")

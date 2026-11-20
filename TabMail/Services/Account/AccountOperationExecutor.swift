@@ -292,9 +292,9 @@ final class AccountOperationExecutor {
                     continue
                 }
                 do {
-                    _ = try await queue.execute(priority: .userAction) {
-                        try await manager.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
-                    }
+                    // No work-queue slot around it: the listing takes the
+                    // account's sync turn (see the post-send Sent sync).
+                    _ = try await manager.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
                     queueLog("[MoveTrace] post-drain sync — completed for \(folder.name)")
                 } catch {
                     queueLog("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")

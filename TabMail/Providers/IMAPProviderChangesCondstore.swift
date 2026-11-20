@@ -127,11 +127,10 @@ extension IMAPProvider {
         var proven = FolderChanges(folderId: folder.id, status: .tracked, addressEpoch: Int(served))
         if var progress = check {
             progress.unproven = Array(Set(progress.unproven).union(movedIn)).sorted()
-            let fits = try await removalCheckFits(progress, owed: owed, folderId: folder.id, request: request)
             let finished = try await runRemovalCheck(
                 &progress, folder: folder, server: server, request: request, into: &proven)
             check = progress
-            guard finished, fits else {
+            guard finished else {
                 // S-19: the cut lists the folder this pass; the bookmark keeps its
                 // reading position and carries the check's progress (S-18a).
                 var bookmark = cursor.cleared
@@ -196,19 +195,6 @@ extension IMAPProvider {
         cut.cursor = bookmark.encoded
         cut.armCatchUpWithBookmark = arm
         return cut
-    }
-
-    /// Whether the rest of the check, plus the arrivals' FETCH, fits the budget
-    /// left, priced from its exact request count (S-17).
-    private func removalCheckFits(
-        _ progress: IMAPRemovalCheckProgress, owed: Int, folderId: String, request: ChangeRequest
-    ) async throws -> Bool {
-        let chunk = SyncConfig.deletionReconcileChunkSize
-        let rows = try await request.localRows?.rows(
-            folderId: folderId, numericIdsBelow: Int(progress.nextBelow), limit: progress.remaining).count ?? 0
-        let chunks = { (n: Int) in (n + chunk - 1) / chunk }
-        let requests = chunks(rows) + 2 * chunks(owed) + 2 * chunks(progress.unproven.count) + 1
-        return Double(requests) * SyncConfig.changeReadRequestTimeoutSeconds <= request.context.secondsLeft
     }
 
     /// Runs the check while each step fits the budget: first the saved

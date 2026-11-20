@@ -1075,6 +1075,11 @@ unchanged (RFC 7162).
    the check's progress (`pendingCheck {pending, nextBelow, remaining, unproven}`). The pass that creates the
    check arms the catch-up (its bytes change, so the arm lands); later passes write progress only and never
    arm again: one lapse per check. A finished check commits the pending bookmark of the pass that started it.
+   *Amended 2026-11-19 (review):* the up-front price is removed. It counted the ORIGINAL owed removals on
+   every pass, so after a bulk expunge (owed above about 1000) a check that had finished never "fit" the
+   20 s budget and was cut on every pass, dropping the folder's flag changes for good. The check is
+   budgeted step by step (`runRemovalCheck` stops before a step the budget cannot pay), so only an
+   unfinished check cuts; the arrivals' FETCH keeps its own budget gate.
 6. **The from-server insert guard** (`SyncEngine.fromServerInsertAllowed`): the crawl (per range) and load older
    (per folder) snapshot the folder's `changeCursor` and `changeState` before their server read and insert
    only while both are byte-equal in their write transaction; a refused crawl range fails (nothing advances),

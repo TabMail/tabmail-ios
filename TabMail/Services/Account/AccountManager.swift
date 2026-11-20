@@ -402,6 +402,32 @@ actor AccountManager {
         workQueues.removeValue(forKey: accountId)
     }
 
+    #if DEBUG
+    /// Test seam: register `provider` for `account` exactly as `connectAccount`
+    /// does: one `ProviderWorkQueue`, sized by provider, shared by the outbox and
+    /// action drains (`workQueues`) and the sync engine. Without the network
+    /// connect or the initial sync. Undo with `disconnectProviderForTesting`.
+    func connectProviderForTesting(account: Account, provider: any EmailProvider) async {
+        providers[account.id] = provider
+        let concurrency: Int
+        switch account.provider {
+        case .gmail: concurrency = SyncConfig.gmailWorkQueueConcurrency
+        case .outlook: concurrency = SyncConfig.exchangeWorkQueueConcurrency
+        default: concurrency = SyncConfig.imapMaxConnectionCeiling
+        }
+        let queue = ProviderWorkQueue(provider: provider, maxConcurrency: concurrency)
+        workQueues[account.id] = queue
+        await syncEngine.register(accountId: account.id, provider: provider, workQueue: queue)
+    }
+
+    /// Test seam: undo `connectProviderForTesting`.
+    func disconnectProviderForTesting(accountId: String) async {
+        providers.removeValue(forKey: accountId)
+        workQueues.removeValue(forKey: accountId)
+        await syncEngine.remove(accountId: accountId)
+    }
+    #endif
+
     /// Test seam: the calendar sibling of `registerProviderForTesting`, so the
     /// calendar tools and `drainCalendarQueue` can be exercised against a
     /// `MockCalendarProvider` without a network account. Same replace-on-call
