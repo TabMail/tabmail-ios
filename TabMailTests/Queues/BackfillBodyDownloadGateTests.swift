@@ -302,7 +302,8 @@ struct BackfillBodyDownloadGateTests {
 
             await release.open()
             #expect(await eventually { drained.value.withLock { $0 } }, "awaitDrain did not return after the batch ended")
-            #expect(await queue.queuedItemsForTesting.map(\.messageId) == ["8"],
+            // "7" is back for a retry: this suite seeds no header rows, so its fetch fails.
+            #expect(Set(await queue.queuedItemsForTesting.map(\.messageId)) == ["7", "8"],
                     "the refused second item must stay pending")
             #expect(!(await provider.callLog.contains { $0.hasPrefix("fetchMessage(") && $0.contains("id:8,") }),
                     "the refused second body was downloaded under Low Power Mode")
