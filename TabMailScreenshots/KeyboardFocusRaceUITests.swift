@@ -8,7 +8,8 @@ import XCTest
 /// tap on a control whose action focuses a text field must still end with that field focused and the
 /// keyboard up: the dismiss tap's `endEditing` must never land after the control's focus change.
 /// The controls: a reply template's plus button, a rejected recipient chip, a bullet list's Add,
-/// search opened from its button, and chat's "Fork and re-send" (`KeyboardFocusTestScene`). A tap
+/// search opened from its button, and chat's "Fork and re-send" (`KeyboardFocusTestScene`). Chat's
+/// Send and mic sit outside the input's box, so their taps close the keyboard. A tap
 /// inside a field that already has the keyboard (to move the caret) must also leave the keyboard up,
 /// as must selecting a word and choosing Copy, then Paste, from the edit menu.
 @MainActor
@@ -305,6 +306,75 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         let focused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'focused'"), object: marker)
         XCTAssertEqual(XCTWaiter.wait(for: [focused], timeout: focusSeconds), .completed, "the input kept the keyboard after the menu closed")
         XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up")
+    }
+
+    /// Send sits outside the chat input's box: with text typed and the keyboard up, its tap sends
+    /// the text (it leaves the input) and closes the keyboard.
+    func testChatSendClosesTheKeyboard() {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-fork")
+        defer { app.terminate() }
+
+        let text = "Send fixture \(UUID().uuidString.prefix(6))"
+        let input = openChatInputWithText(text, in: app)
+        let send = app.buttons["chatSend"].firstMatch
+        XCTAssertTrue(send.waitForExistence(timeout: focusSeconds), "control: Send shows")
+        XCTAssertTrue(send.isEnabled, "control: Send is enabled with text typed")
+        send.tap()
+        let sent = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value != %@", text), object: input)
+        XCTAssertEqual(XCTWaiter.wait(for: [sent], timeout: focusSeconds), .completed, "Send acted: the text left the input")
+        assertChatKeyboardClosed(in: app, after: "Send")
+    }
+
+    /// The mic sits outside the chat input's box: with text typed and the keyboard up, its tap closes
+    /// the keyboard, and the mic acted (it no longer offers Dictate) or was disabled offline.
+    func testChatMicClosesTheKeyboard() {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-fork")
+        defer { app.terminate() }
+
+        _ = openChatInputWithText("Mic fixture \(UUID().uuidString.prefix(6))", in: app)
+        let mic = app.buttons["Dictate"].firstMatch
+        XCTAssertTrue(mic.waitForExistence(timeout: focusSeconds), "control: the mic shows")
+        let micEnabled = mic.isEnabled
+        mic.tap()
+        assertChatKeyboardClosed(in: app, after: "the mic")
+        if micEnabled {
+            let acted = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: mic)
+            XCTAssertEqual(XCTWaiter.wait(for: [acted], timeout: focusSeconds), .completed, "the mic acted: it no longer offers Dictate")
+        }
+    }
+
+    /// Opens the fork fixture's chat, types `text` into its input and returns the input once it has
+    /// the keyboard.
+    private func openChatInputWithText(_ text: String, in app: XCUIApplication) -> XCUIElement {
+        let pill = app.descendants(matching: .any)["chatPill"].firstMatch
+        XCTAssertTrue(pill.waitForExistence(timeout: waitSeconds), "control: the chat pill shows")
+        pill.tap()
+        // The first open asks once whether to auto-start dictation.
+        let noThanks = app.alerts["Auto-Enable Dictation"].buttons["No Thanks"]
+        if noThanks.waitForExistence(timeout: focusSeconds) { noThanks.tap() }
+        let input = app.descendants(matching: .any).matching(NSPredicate(
+            format: "(elementType == %d OR elementType == %d) AND placeholderValue != %@",
+            XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue,
+            "Other field")).firstMatch
+        XCTAssertTrue(input.waitForExistence(timeout: focusSeconds), "control: the chat input shows")
+        input.tap()
+        input.typeText(text)
+        let marker = app.descendants(matching: .any)["chatReplyFieldFocus"].firstMatch
+        XCTAssertTrue(marker.waitForExistence(timeout: focusSeconds), "control: the focus marker shows")
+        let focused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'focused'"), object: marker)
+        XCTAssertEqual(XCTWaiter.wait(for: [focused], timeout: focusSeconds), .completed, "control: the chat input has the keyboard")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: focusSeconds), "control: the keyboard is up")
+        return input
+    }
+
+    private func assertChatKeyboardClosed(in app: XCUIApplication, after control: String) {
+        let closed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.keyboards.firstMatch)
+        XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: focusSeconds), .completed, "\(control) closed the keyboard")
+        let marker = app.descendants(matching: .any)["chatReplyFieldFocus"].firstMatch
+        let unfocused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'unfocused'"), object: marker)
+        XCTAssertEqual(XCTWaiter.wait(for: [unfocused], timeout: focusSeconds), .completed, "and the chat input lost focus")
     }
 
     func testTapInsideAFocusedSingleLineFieldKeepsTheKeyboard() {
