@@ -63,7 +63,9 @@ struct FastSyncHeldWorkTests {
         try FastSyncWakeLockTests.setWalkComplete(walkDone, accountId: id, path: "INBOX", pool: pool)
         await AccountManager.shared.installHeldWorkTestProvider(
             accountId: id, provider: provider, queue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
+        let savedConnected = NetworkMonitor.checkConnected()
         NetworkMonitor.setConnectedForTesting(true)
+        defer { NetworkMonitor.setConnectedForTesting(savedConnected) }
         do {
             try await body(account, provider)
         } catch {
@@ -119,8 +121,9 @@ struct FastSyncHeldWorkTests {
         _ power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float),
         _ body: () async throws -> Void
     ) async rethrows {
+        let saved = SyncEngine.backfillPowerStateForTesting.withLock { $0 }
         SyncEngine.backfillPowerStateForTesting.withLock { $0 = power }
-        defer { SyncEngine.backfillPowerStateForTesting.withLock { $0 = nil } }
+        defer { SyncEngine.backfillPowerStateForTesting.withLock { $0 = saved } }
         try await body()
     }
 
@@ -672,7 +675,9 @@ struct FastSyncHeldWorkTests {
 
     /// Runs `body` inside a real BGProcessing job whose Wi-Fi measurement is `onWiFi`.
     private static func decideInJob(onWiFi: Bool, _ body: @escaping @Sendable () async -> Decision) async -> Decision? {
+        let savedMeasurement = SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 }
         SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = onWiFi }
+        defer { SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = savedMeasurement } }
         let result = Mutex<Decision?>(nil)
         let context = BGTaskContext(label: "held1098-job-\(onWiFi)", completion: { _ in })
         let scheduler = SyncScheduler(
