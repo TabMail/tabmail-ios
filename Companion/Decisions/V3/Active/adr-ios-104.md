@@ -81,7 +81,8 @@ account's pass does not wait).
 **Amended 2026-11-20 (tabmail-ios #1062): the Settings resets are turn-takers.** "Reset message data" (one
 account) and "Delete All Email Index Data" (every account) run their authoritative write transaction
 only through the engine entry points `SyncEngine.resetMessageData(accountId:)` and
-`SyncEngine.wipeLocalIndex()`, inside the sync turn of every account they write, through
+`SyncEngine.wipeLocalIndex()` (which own the transactions `resetMessageDataTxn` and `localIndexWipeTxn`,
+moved off the SwiftUI views), inside the sync turn of every account they write, through
 `SyncEngine.withSyncTurns(accountIds:)`, which
 takes the turns one after another through `oneSyncAtATime` in sorted, de-duplicated account-id order, so
 two callers needing overlapping accounts never wait on each other in a cycle. The turns are taken before

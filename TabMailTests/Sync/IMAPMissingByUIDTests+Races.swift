@@ -221,7 +221,7 @@ extension IMAPMissingByUIDTests {
 
     // MARK: - I4: a message the server holds but does not answer
 
-    @Test("A missing message the header FETCH does not answer while SEARCH finds it: the others load across a budget stop, the listing holds it, passes over it after the bound, settles the owed mark with it kept on the re-read list, and loads it at the next listing")
+    @Test("A missing message the header FETCH does not answer while SEARCH finds it: the others load across a budget stop, the listing holds it, passes over it after the bound, stays owed, and loads it at the next (daily) listing")
     @MainActor
     func unansweredMessageIsHeldThenPassedOver() async throws {
         let unanswered = 6
@@ -263,9 +263,7 @@ extension IMAPMissingByUIDTests {
             await w.slice(clock: clock)
             #expect(try w.catchUpState()?.listing == nil, "I4: the listing completes after the hold bound")
             #expect(!(try w.held()).contains(unanswered), "I4: setup: still unanswered")
-            #expect(!(try w.changeState()).selfHealDue, "#1062: a listing that started after the mark settles it, even after a pass-over")
-            #expect(Set(try w.changeState().recheck).isSuperset(of: [unanswered].map(String.init)),
-                    "#1062: I4: the passed-over UID stays on the re-read list: \(try w.changeState().recheck)")
+            #expect((try w.changeState()).selfHealDue, "#1062: an unclean completion does not settle the owed mark")
 
             // The server answers again: the next listing loads it and settles.
             w.server.suppressFetchInternalDate(in: Self.path, uids: [])
@@ -284,7 +282,7 @@ extension IMAPMissingByUIDTests {
         case searchError
     }
 
-    @Test("#1062: slices that load later messages but stop before proving the held UID keep the FIRST hold: the listing passes over once the bound from the first hold ends, completes as not clean, settles the owed mark with 6 kept on the re-read list, and the next listing restores the server's exact set",
+    @Test("#1062: slices that load later messages but stop before proving the held UID keep the FIRST hold: the listing passes over once the bound from the first hold ends, completes as not clean, stays owed, and the next (daily) listing restores the server's exact set",
           arguments: ProofStop.allCases)
     @MainActor
     func stopBeforeProvingTheHeldUIDKeepsTheFirstHold(_ stop: ProofStop) async throws {
@@ -348,9 +346,7 @@ extension IMAPMissingByUIDTests {
             }
             #expect(try w.catchUpState()?.listing == nil, "#1062: the listing completes once the bound from the first hold ends")
             #expect(!(try w.held()).contains(unanswered), "#1062: setup: 6 is still unanswered")
-            #expect(!(try w.changeState()).selfHealDue, "#1062: a listing that started after the mark settles it, even after a pass-over")
-            #expect(Set(try w.changeState().recheck).isSuperset(of: [unanswered].map(String.init)),
-                    "#1062: held 6: the passed-over UID stays on the re-read list: \(try w.changeState().recheck)")
+            #expect((try w.changeState()).selfHealDue, "#1062: an unclean completion does not settle the owed mark")
 
             w.server.suppressFetchInternalDate(in: Self.path, uids: [])
             clock.advance(by: Self.pastTheNextCheck)
@@ -362,7 +358,7 @@ extension IMAPMissingByUIDTests {
 
     // MARK: - a FLAGS reply that omits a message
 
-    @Test("#1062: a FLAGS FETCH that omits a server message with no local row, below the window, after a new bookmark: the omission does not settle the owed mark, the unclean completion settles the mark with the message kept on the re-read list, and once replies recover the next catch-up slice alone loads it",
+    @Test("#1062: a FLAGS FETCH that omits a server message with no local row, below the window, after a new bookmark: the omission does not settle the owed mark, the unclean completion keeps the folder owed, it is not relisted an hour later, and at the daily check a catch-up slice alone loads it",
           arguments: [false, true])
     @MainActor
     func omittedFlagsRecordDoesNotSettleTheMark(_ stateIsNull: Bool) async throws {
@@ -395,20 +391,24 @@ extension IMAPMissingByUIDTests {
                 slices += 1
             }
             #expect(try w.catchUpState()?.listing == nil, "#1062: the listing does not list the same range forever")
-            #expect(!(try w.changeState()).selfHealDue, "#1062: a listing that started after the mark settles it, even after a pass-over")
-            #expect(Set(try w.changeState().recheck).isSuperset(of: [omitted].map(String.init)),
-                    "#1062: omitted: the passed-over UID stays on the re-read list: \(try w.changeState().recheck)")
+            #expect((try w.changeState()).selfHealDue, "#1062: an unclean completion does not settle the owed mark")
 
-            #expect(try w.folder().changeCursor != nil, "#1062: setup: the folder holds a bookmark, so only a lapse lists it")
+            #expect(try w.folder().changeCursor != nil, "#1062: setup: the owed folder regained a bookmark")
             let afterPassOver = try #require(try w.catchUpState())
-            #expect(afterPassOver.lapsedSinceLastListing, "#1062: the unclean completion leaves a listing owed")
+            #expect(!afterPassOver.lapsedSinceLastListing, "#1062: an unclean completion re-marks nothing")
 
-            // Replies recover: a catch-up slice alone (no full sync) loads it,
-            // however long the device waits, and the mark settles.
+            // Replies recover. An hour later nothing lists the folder: no hourly relisting.
             w.server.suppressFetchRecord(in: Self.path, uids: [])
             clock.advance(by: Self.pastTheHold)
+            let hourStart = w.server.recordedCommands().count
             await w.slice(clock: clock)
-            #expect(try w.held().contains(omitted), "#1062: the re-armed listing loads the message once replies recover")
+            #expect(Self.listingRanges(w.server.recordedCommands().dropFirst(hourStart)).isEmpty,
+                    "#1062: the owed folder is not relisted an hour later")
+            // At the daily check, a catch-up slice alone (no full sync) lists it,
+            // though it holds a bookmark, loads the message and settles the mark.
+            clock.advance(by: Self.pastTheNextCheck)
+            await w.slice(clock: clock)
+            #expect(try w.held().contains(omitted), "#1062: the daily listing loads the message once replies recover")
             #expect(!(try w.changeState()).selfHealDue, "#1062: the clean listing settles the mark")
             try await w.makeFullSyncDue()
             try await w.normalSync()
@@ -435,9 +435,7 @@ extension IMAPMissingByUIDTests {
             #expect(try w.catchUpState()?.listing?.nextUid == gone[0], "empty reply: held at the first unanswered UID")
             clock.advance(by: Self.pastTheHold)
             await w.slice(clock: clock)
-            #expect(!(try w.changeState()).selfHealDue, "#1062: a listing that started after the mark settles it, even after a pass-over")
-            #expect(Set(try w.changeState().recheck).isSuperset(of: gone.map(String.init)),
-                    "#1062: empty reply: the passed-over UID stays on the re-read list: \(try w.changeState().recheck)")
+            #expect((try w.changeState()).selfHealDue, "#1062: an unclean completion does not settle the owed mark")
             w.server.suppressFetchInternalDate(in: Self.path, uids: [])
             clock.advance(by: Self.pastTheNextCheck)
             await w.slice(clock: clock)
@@ -485,9 +483,7 @@ extension IMAPMissingByUIDTests {
                 slices += 1
             }
             #expect(try w.catchUpState()?.listing == nil, "#1062: the listing completes after the hold bound instead of listing the same range forever")
-            #expect(!(try w.changeState()).selfHealDue, "#1062: a listing that started after the mark settles it, even after a pass-over")
-            #expect(Set(try w.changeState().recheck).isSuperset(of: [12].map(String.init)),
-                    "#1062: failed proof: the passed-over UID stays on the re-read list: \(try w.changeState().recheck)")
+            #expect((try w.changeState()).selfHealDue, "#1062: an unclean completion does not settle the owed mark")
             clock.advance(by: Self.pastTheNextCheck)
             await w.slice(clock: clock)
             try w.expectHeldExactly(server, "#1062")

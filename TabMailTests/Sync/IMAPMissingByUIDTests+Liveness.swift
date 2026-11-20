@@ -40,37 +40,68 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    @Test("An owed folder holding a message whose header never decodes: the mark settles within two listings, the folder is not listed again an hour later, and the message stays on the re-read list")
+    /// How many permanently undecodable records the owed folder holds.
+    static let undecodableCounts = [1, 2, 3]
+
+    @Test("An owed folder holding permanently undecodable records beside other missing mail: all the other mail loads, the mark never settles, and the folder is relisted at most once a day",
+          arguments: undecodableCounts)
     @MainActor
-    func undecodableMessageSettlesTheMarkAndStaysRetryable() async throws {
-        let broken = 12
+    func undecodableRecordsKeepTheMarkAndRelistDaily(_ count: Int) async throws {
+        let broken = Array([12, 15, 18].prefix(count))
+        let otherMissing = [11, 13, 14, 16, 17, 19, 1005]
         let server = Array(1...20) + Array(1001...1060)
-        try await Self.withWorld("owed-undecodable", server: server, local: server) { w in
+        try await Self.withWorld("owed-undecodable-\(count)", server: server, local: server) { w in
             var messages = server.map(Self.message)
-            messages[broken - 1] = Self.message(broken, date: "not a date")
+            for uid in broken { messages[uid - 1] = Self.message(uid, date: "not a date") }
             w.server.setMessages(messages, in: Self.path)
-            w.server.suppressFetchInternalDate(in: Self.path, uids: [broken])
-            try await w.dropLocal([broken])
+            w.server.suppressFetchInternalDate(in: Self.path, uids: Set(broken))
+            try await w.dropLocal(broken + otherMissing)
             try await w.markOwed()
             let clock = CatchUpTestClock()
-            var listings = 0
-            while (try w.changeState()).selfHealDue, listings < 2 {
-                await w.slice(clock: clock)
-                clock.advance(by: Self.pastTheHold)
-                await w.slice(clock: clock)
-                listings += 1
-            }
-            #expect(!(try w.changeState()).selfHealDue, "#1062: the owed mark settles within two listings")
-            #expect(try w.changeState().recheck.contains(String(broken)),
-                    "#1062: the undecodable message stays on the re-read list: \(try w.changeState().recheck)")
-            #expect(!(try w.held()).contains(broken), "setup: it never loaded")
-
-            // An hour later nothing lists the folder again.
+            await w.slice(clock: clock)
             clock.advance(by: Self.pastTheHold)
+            await w.slice(clock: clock)
+            #expect(try w.catchUpState()?.listing == nil, "setup: the listing completed after the hold bound")
+            let held = Set(try w.held())
+            #expect(Set(otherMissing).isSubset(of: held), "#1062: every other missing message loads: \(Set(otherMissing).subtracting(held).sorted())")
+            #expect(held.isDisjoint(with: broken), "setup: the undecodable records never load")
+            #expect((try w.changeState()).selfHealDue, "#1062: an unclean completion never settles the mark")
+
+            // Within the day nothing lists the folder again; the next listing
+            // comes only at the daily check, and it still does not settle.
+            for _ in 0..<3 {
+                clock.advance(by: Self.pastTheHold)
+                let start = w.server.recordedCommands().count
+                await w.slice(clock: clock)
+                let ranges = Self.listingRanges(w.server.recordedCommands().dropFirst(start))
+                #expect(ranges.isEmpty, "#1062: no relisting within the day: \(ranges)")
+            }
+            clock.advance(by: Self.pastTheNextCheck)
             let start = w.server.recordedCommands().count
             await w.slice(clock: clock)
-            let ranges = Self.listingRanges(w.server.recordedCommands().dropFirst(start))
-            #expect(ranges.isEmpty, "#1062: no hourly relisting after the mark settled: \(ranges)")
+            clock.advance(by: Self.pastTheHold)
+            await w.slice(clock: clock)
+            #expect(!Self.listingRanges(w.server.recordedCommands().dropFirst(start)).isEmpty, "#1062: the daily check lists it again")
+            #expect((try w.changeState()).selfHealDue, "#1062: \(count) unloadable record(s) never settle the mark")
+        }
+    }
+
+    @Test("An owed listing whose loads the apply skips as an over-age read completes unclean: the mark stays")
+    @MainActor
+    func overAgeSkippedLoadsDoNotSettle() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-over-age", server: server, local: server) { w in
+            try await w.dropLocal([12])
+            try await w.markOwed()
+            let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages))
+            let result = try #require(read.results.first)
+            #expect(result.completedListing?.clean == true && result.loaded.contains { $0.id == "12" },
+                    "setup: a clean completed listing that loaded the missing message")
+            let overAge = CatchUpWallClock.now().addingTimeInterval(-SyncConfig.catchUpCompletionLogRetentionSeconds - 60)
+            _ = await w.engine.applyCatchUpResult(
+                result, windowMode: .uid, readStartedAt: overAge, selfHealOwedAtRead: read.owedAtRead)
+            #expect(!(try w.held()).contains(12), "setup: the over-age read's load was skipped")
+            #expect((try w.changeState()).selfHealDue, "#1062: a listing whose loads were skipped does not settle the mark")
         }
     }
 

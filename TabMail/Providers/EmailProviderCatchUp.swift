@@ -165,9 +165,6 @@ struct CatchUpCompletedListing: Sendable, Equatable {
     /// Every missing message in the listed range was loaded or proven gone:
     /// none was passed over by the hold bound.
     let clean: Bool
-    /// The ids the listing passed over (#1062): the apply puts them on the
-    /// folder's re-read list, so settling an owed check never settles them.
-    var passedOverIds: [String] = []
 }
 
 /// The delta-cursor lapse marker every provider's catch-up state may carry

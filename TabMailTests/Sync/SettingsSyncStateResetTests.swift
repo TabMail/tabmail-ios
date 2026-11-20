@@ -8,8 +8,8 @@ import Testing
 @testable import TabMail
 
 /// The two Settings resets, "Reset message data" on one account
-/// (`AccountDetailView.resetMessageDataTxn`) and "Delete All Email Index Data"
-/// (`SettingsView.localIndexWipeTxn`), delete the local mail and must leave every
+/// (`SyncEngine.resetMessageDataTxn`) and "Delete All Email Index Data"
+/// (`SyncEngine.localIndexWipeTxn`), delete the local mail and must leave every
 /// folder they cover with no sync progress at all, so the next sync starts the
 /// folder like a new account's. A kept cursor describes rows that no longer exist
 /// (#501: the global wipe kept `lastKnownUidNext`; #848: neither reset cleared
@@ -24,9 +24,9 @@ struct SettingsSyncStateResetTests {
 
     /// The two user gestures that reset sync state.
     enum Wipe: String, CaseIterable, Sendable {
-        /// Reset Message Data on one account (`AccountDetailView.resetMessageDataTxn`).
+        /// Reset Message Data on one account (`SyncEngine.resetMessageDataTxn`).
         case accountReset
-        /// Delete All Email Index Data in Settings (`SettingsView.localIndexWipeTxn`).
+        /// Delete All Email Index Data in Settings (`SyncEngine.localIndexWipeTxn`).
         case settingsWipe
     }
 
@@ -136,8 +136,8 @@ struct SettingsSyncStateResetTests {
     static func run(_ wipe: Wipe, _ db: DatabaseQueue) throws {
         try db.write { conn in
             switch wipe {
-            case .accountReset: try AccountDetailView.resetMessageDataTxn(conn, accountId: resetAccountId)
-            case .settingsWipe: try SettingsView.localIndexWipeTxn(conn)
+            case .accountReset: try SyncEngine.resetMessageDataTxn(conn, accountId: resetAccountId)
+            case .settingsWipe: try SyncEngine.localIndexWipeTxn(conn)
             }
         }
     }

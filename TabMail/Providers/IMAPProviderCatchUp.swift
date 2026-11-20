@@ -54,11 +54,6 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
         /// A missing UID was counted done by that bound in this listing, so its
         /// completion is not clean.
         var passedOver: Bool?
-        /// The UIDs this listing passed over (#1062), at most
-        /// `SyncConfig.catchUpCarriedUidCap`: reported with its completion so the
-        /// apply puts them on the folder's re-read list, where they stay
-        /// retryable after the owed mark settles.
-        var passedOverUids: [UInt32]?
         /// The width in UIDs of this listing's next range (#1062): set after
         /// every range from that range's own count, and halved when a range
         /// times out, so the next call goes on from the same place with the
@@ -81,14 +76,6 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
         /// UIDVALIDITY (the state's `epoch`) or with a re-created folder row
         /// (whose state starts empty).
         var carried: CarriedRange?
-
-        /// Record `uids` as passed over, keeping the lowest
-        /// `SyncConfig.catchUpCarriedUidCap`.
-        mutating func passOver(_ uids: [UInt32]) {
-            guard !uids.isEmpty else { return }
-            let all = Set((passedOverUids ?? []) + uids).sorted()
-            passedOverUids = Array(all.prefix(SyncConfig.catchUpCarriedUidCap))
-        }
 
         /// This listing with the width cap left out: what counts as the listing
         /// moving (`madeProgress`).
@@ -228,7 +215,13 @@ extension IMAPProvider {
         let plan = Self.catchUpPlan(
             state: state, freshModSeq: folder.lastKnownHighestModSeq,
             now: context.clock(), rawLapseCount: CatchUpLapse.read(folder.catchUpState),
-            isTracked: bookmark != nil)
+            // Tracked: a bookmark held AND not owed a check. An owed folder can
+            // regain a bookmark from a change pass, and a tracked folder gets no
+            // daily check, so an owed folder whose listing completed unclean would
+            // never be listed again (#1062). Not `FolderChangeState.tracking`: that
+            // flag is off for a bookmarked folder before its baseline commits and
+            // can be left on with no bookmark (ADR-IOS-111 decision 4).
+            isTracked: bookmark != nil && !FolderChangeState(raw: folder.changeState).selfHealDue)
         guard case .list(var listing) = plan else { return nil }
 
         var result = CatchUpFolderResult(folderId: folder.id, epoch: epoch)
@@ -243,9 +236,11 @@ extension IMAPProvider {
 
         // The UID range listed (#1062). Its lower bound is where the range the
         // device holds the folder in starts (the older-mail walk's, as the change
-        // reader takes it); under a storage limit, the first local UID, so older
-        // mail is neither listed nor loaded (the prune deletes lowest UIDs first,
-        // so the first local UID is where kept mail ends, ADR-IOS-006). A server
+        // reader takes it); under a storage limit, loads start at the higher of
+        // that and the first local UID, so pruned mail is not loaded again (the
+        // prune deletes lowest UIDs first, so the first local UID is where kept
+        // mail ends, ADR-IOS-006) and rows infinite scroll cached below the walk's
+        // cursor never pull the floor down. A server
         // UID in the range that no local row holds is MISSING and is loaded, from
         // `loadsFrom` up. Before the walk has started, loads start at the lowest
         // UID a window listing of the folder reached (`CatchUpWindowFloor`; under
@@ -572,7 +567,6 @@ extension IMAPProvider {
                         listing.nextUid = Int(uid)
                     } else {
                         listing.passedOver = true
-                        listing.passOver([uid])
                         listing.loadHeldSince = nil
                         listing.nextUid = Int(stop)
                         heldUid = nil
@@ -622,7 +616,6 @@ extension IMAPProvider {
                     break rangeLoop
                 }
                 listing.passedOver = true
-                listing.passOver((held.map { [$0] } ?? []) + (left?.missing ?? []) + (left?.unanswered ?? []))
             }
             listing.loadHeldSince = nil
             listing.nextUid = hi + 1
@@ -641,8 +634,7 @@ extension IMAPProvider {
         result.newState = newState.encoded()
         if completed {
             result.completedListing = CatchUpCompletedListing(
-                lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true,
-                passedOverIds: (listing.passedOverUids ?? []).map(String.init))
+                lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true)
         }
         // Progress: the listing moved or completed, or something applies. A range
         // whose request failed before anything moved is no progress, so the

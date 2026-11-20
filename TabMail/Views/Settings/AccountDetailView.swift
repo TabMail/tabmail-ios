@@ -222,8 +222,6 @@ struct AccountDetailView: View {
                 .font(.subheadline)
             }
 
-
-
             if account.provider == .imap {
                 Section("Server Settings") {
                     LabeledContent("Username") {
@@ -595,30 +593,6 @@ struct AccountDetailView: View {
             }
             isResetting = false
         }
-    }
-
-    /// Authoritative account-scoped reset in one GRDB transaction. Split-out
-    /// for a real injected-ABORT test; no FTS/memory/UI side effect belongs here.
-    nonisolated static func resetMessageDataTxn(_ db: Database, accountId: String) throws {
-        try db.execute(
-            sql: "DELETE FROM messageHeader WHERE accountId = ?",
-            arguments: [accountId]
-        )
-        // Stage D (`v70_dropMessageBodyHeaderFK`) removed the body FK, so the
-        // content-key prefix delete must remain in this same transaction.
-        try db.execute(
-            sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
-            arguments: [MessageIdentity.escapeForLike(accountId) + ":%"]
-        )
-        try db.execute(
-            sql: "DELETE FROM messageAICache WHERE key LIKE ?",
-            arguments: [accountId + ":%"]
-        )
-        // Every cursor and bookmark goes with the rows, through the one list both
-        // Settings resets share: a tracked folder gets no window listing, so a kept
-        // bookmark would leave it empty until the backfill reached the newest mail
-        // (ADR-IOS-111).
-        try SyncEngine.resetSyncStateTxn(db, accountId: accountId)
     }
 
     // MARK: - Helpers

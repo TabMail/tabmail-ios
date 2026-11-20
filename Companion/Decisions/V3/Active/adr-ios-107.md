@@ -1124,15 +1124,19 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
   under the same hold, so a slow link that spends every slice on the FETCH cannot stall repair.
   *Replaces:* "When the budget is spent before request 2 [...] the cursor stays, so the range is listed again."
 - **Clean and unclean completion; retry.** A folder owed a check (`FolderChangeState.selfHealOwed`, set
-  by `dropChangeBookmark(selfHealDue:)` after an unproven move) is settled by a completed listing that
-  started at or after the mark (`lapseCountAtStart >= selfHealLapse`), clean or not (amended d1
-  2026-11-20: was CLEAN only, so a message that never decodes kept the folder untracked and relisted
-  hourly forever). The UIDs a listing passed over are not settled with the mark: they go on the folder's
-  re-read list (`FolderChangeState.recheck`, via `CatchUpCompletedListing.passedOverIds`), where the
-  change reader keeps asking for them. A listing's start count comes from the raw state's `lapseCount`
-  (`CatchUpLapse.read`) when the typed state is absent (floor-only, another epoch). The apply then calls
+  by `dropChangeBookmark(selfHealDue:)` after an unproven move) is settled ONLY by a CLEAN completed
+  listing that started at or after the mark (`lapseCountAtStart >= selfHealLapse`). Unclean: anything
+  passed over (held, unanswered, a range moved past after its membership SEARCH kept failing), or loads
+  the apply skipped as an over-age read. An unclean completion keeps the folder owed and re-marks
+  nothing: it is listed again at the daily full check, never hourly (amended d2 2026-11-20; the d1 rule
+  "settled by any completion, passed-over UIDs on the re-read list" is superseded: it recorded only the
+  lowest held UID per range and settled with mail on no retry path). An owed folder gets the daily and
+  MODSEQ checks even when it holds a bookmark (the plan's `isTracked` = bookmark held AND not owed),
+  because a change pass can store a bookmark on an owed folder. A listing's start count comes from the
+  raw state's `lapseCount` (`CatchUpLapse.read`) when the typed state is absent (floor-only, another
+  epoch). The apply then calls
   `markListingDue`, so the next scheduled full sync lists the folder and `commitChangeBaseline` tracks it
-  again. A completion that does not settle the mark (started before it), and a mark landing
+  again. A clean completion that started before the mark, and a mark landing
   during the read, re-mark the lapse on the state just written (also when it was NULL) and record it in
   `selfHealLapse`: the obligation survives, so a later listing still repairs the missing UID even when a
   bookmark keeps the daily and MODSEQ checks off (the bookmark-based planning rule is unchanged).
@@ -1240,4 +1244,4 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
 passedOver, unclean completion, re-arm lapse, selfHealOwed, selfHealLapse, markListingDue, slow link,
 budget stop, SEARCH failure, date self-heal removed, range sized by EXISTS and UIDNEXT, sparse folder,
 unsolicited FETCH, walk not started, UID-ordered prune, header batch size, width cap, widthCap,
-widthCapThrough, timed-out width, cap growth, passed-over re-read, storage-limit floor after the walk)
+widthCapThrough, timed-out width, cap growth, clean-only settle, daily relisting of owed folders, storage-limit floor after the walk)

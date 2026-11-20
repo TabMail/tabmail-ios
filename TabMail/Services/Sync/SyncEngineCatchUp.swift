@@ -588,18 +588,25 @@ extension SyncEngine {
         // `commitChangeBaseline` tracks it again from that pass's own read.
         var changeState = FolderChangeState(raw: folder.changeState)
         let markedDuringRead = selfHealOwedAtRead.map { changeState.selfHealOwed > $0 } ?? false
-        // Clean or not: a listing that passed a UID over settles the mark too, so
-        // a message that never loads cannot keep the folder relisted forever. The
-        // passed-over UIDs are not settled with it: they go on the folder's
-        // re-read list below, where the change reader keeps asking for them.
-        let settles = result.completedListing.map {
+        // Only a CLEAN completion settles the mark (#1062): every missing UID was
+        // loaded or proven gone. A listing that passed anything over, or whose
+        // loads this apply skipped as an over-age read, is unclean: the folder
+        // stays owed and is listed again at the daily full check (an owed folder
+        // gets it even with a bookmark, `IMAPProvider.catchUpPlan`), never sooner.
+        let skippedLoads = readIsOverAge && !result.loaded.isEmpty
+        let clean = result.completedListing.map { $0.clean && !skippedLoads } ?? false
+        let startedAfterMark = result.completedListing.map {
             $0.lapseCountAtStart >= (changeState.selfHealLapse ?? 0)
         } ?? false
-        // An owed listing that completed without settling the mark (it started
-        // before the mark) consumed the lapse that made it due; with a bookmark,
-        // nothing else lists the folder again. The obligation is re-armed once,
-        // and the next listing starts after the mark and settles it (#1062).
-        let completedUnsettled = changeState.selfHealDue && result.completedListing != nil && !settles
+        let settles = clean && startedAfterMark
+        // A clean owed listing that started before the mark may have passed the
+        // message the move left: the lapse is re-marked once, so the next listing
+        // starts after the mark and can settle it. An unclean completion re-marks
+        // nothing; it waits for the daily check.
+        let completedUnsettled = changeState.selfHealDue && clean && !startedAfterMark
+        if changeState.selfHealDue, result.completedListing != nil, !clean, DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[CatchUp] \(folder.id): owed listing completed unclean (passed over or skipped loads); still owed, relisted at the daily check")
+        }
         if markedDuringRead || completedUnsettled {
             // A mark landed while this read ran, or the owed listing completed
             // unsettled. The listing the result carries may have begun before
@@ -617,12 +624,6 @@ extension SyncEngine {
             changeState.selfHealOwed = 0
             changeState.selfHealLapse = nil
             changeState.markListingDue()
-            let passedOver = result.completedListing?.passedOverIds ?? []
-            let listed = Set(changeState.recheck)
-            changeState.recheck += passedOver.filter { !listed.contains($0) }
-            if !passedOver.isEmpty && DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CatchUp] \(folder.id): owed check settled by a listing that passed over \(passedOver.count) UID(s); they stay on the re-read list")
-            }
             try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [changeState.encoded, folder.id])
         }
         return .applied(updatedFlags: updatedFlags, removedIds: removedIds)

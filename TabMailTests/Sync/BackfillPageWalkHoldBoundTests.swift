@@ -337,9 +337,9 @@ struct BackfillPageWalkHoldBoundTests {
 
     /// The two user gestures that start a folder's walk over from the top.
     enum WalkRestartingWipe: String, CaseIterable, Sendable {
-        /// Reset Message Data on one account (`AccountDetailView.resetMessageDataTxn`).
+        /// Reset Message Data on one account (`SyncEngine.resetMessageDataTxn`).
         case accountReset
-        /// Delete All Email Index Data in Settings (`SettingsView.localIndexWipeTxn`).
+        /// Delete All Email Index Data in Settings (`SyncEngine.localIndexWipeTxn`).
         case settingsWipe
     }
 
@@ -367,8 +367,8 @@ struct BackfillPageWalkHoldBoundTests {
         #expect(try F.folder(accountId, "INBOX", pool: pool)?.backfillPageHeldSince != nil, "precondition: page 1 is held")
         try await pool.write { db in
             switch wipe {
-            case .accountReset: try AccountDetailView.resetMessageDataTxn(db, accountId: accountId)
-            case .settingsWipe: try SettingsView.localIndexWipeTxn(db)
+            case .accountReset: try SyncEngine.resetMessageDataTxn(db, accountId: accountId)
+            case .settingsWipe: try SyncEngine.localIndexWipeTxn(db)
             }
         }
         let wiped = try #require(try F.folder(accountId, "INBOX", pool: pool))

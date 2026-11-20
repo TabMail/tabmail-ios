@@ -1987,7 +1987,7 @@ struct OutlookQueueHandoffTests {
     /// This is `replayRetainedRetirements`' row-gone arm, and it is the mirror of
     /// the catch arm above: absence of the row is NOT a failure to commit. The
     /// writers that can delete a claimed row are the local wipes and resets —
-    /// here the real one, `SettingsView.localIndexWipeTxn`, the user's own
+    /// here the real one, `SyncEngine.localIndexWipeTxn`, the user's own
     /// "delete all local email data" gesture — which never join a running drain.
     /// So the row being gone is the user's NEWER decision winning, and replaying
     /// a retirement against a row nobody wants would re-key a header the wipe
@@ -2054,7 +2054,7 @@ struct OutlookQueueHandoffTests {
         f.pool.remove(transactionObserver: refuser)
 
         // THE USER'S NEWER DECISION, through its real transaction.
-        try await f.pool.write { db in try SettingsView.localIndexWipeTxn(db) }
+        try await f.pool.write { db in try SyncEngine.localIndexWipeTxn(db) }
         #expect(try queuedOperationCount(f) == 0,
                 "the wipe left the operation behind, so the row-gone arm is not reached")
         #expect(try rows(f).isEmpty, "the wipe left headers behind")

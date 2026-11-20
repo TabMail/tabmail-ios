@@ -35,7 +35,7 @@ extension SyncEngine {
     /// Nonisolated prune — runs entirely off the main thread. `pruneOrder` is each
     /// account's sync order (`pruneOrderByAccount`); bodies and headers are both
     /// pruned in it. An account with no resolved order (no registered provider)
-    /// is not pruned this pass.
+    /// is pruned oldest date first, as before #1062.
     /// *Superseded (#1062):* every folder was pruned oldest DATE first, which on
     /// IMAP left pruned holes throughout the UID range (UID and date are
     /// decorrelated, ADR-IOS-042) that every catch-up listing downloaded again.

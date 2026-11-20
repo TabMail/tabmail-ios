@@ -8,8 +8,8 @@ import GRDB
 extension SyncEngine {
     /// Clears every sync-state column a Settings reset owns, in the caller's
     /// transaction. `accountId` nil means every account. The one list for both
-    /// resets, "Reset message data" (`AccountDetailView.resetMessageDataTxn`) and
-    /// "Delete All Email Index Data" (`SettingsView.localIndexWipeTxn`): both delete
+    /// resets, "Reset message data" (`SyncEngine.resetMessageDataTxn`) and
+    /// "Delete All Email Index Data" (`SyncEngine.localIndexWipeTxn`): both delete
     /// the mail, so every cursor, bookmark and progress mark that describes the
     /// deleted rows goes with them, and the next sync starts each folder like a new
     /// account's (#501, #848; ADR-IOS-111 amendment 2026-11-14).

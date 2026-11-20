@@ -2230,7 +2230,7 @@ struct GmailCatchUpTests {
         }
     }
 
-    /// Settings' Delete All Email Index Data (`SettingsView.localIndexWipeTxn`)
+    /// Settings' Delete All Email Index Data (`SyncEngine.localIndexWipeTxn`)
     /// lands while a backfill walk iteration is in flight: the iteration has
     /// read the folder (its page token and row version) and is held at its page
     /// request, before its page-outcome write. The wipe deletes every header row,
@@ -2271,7 +2271,7 @@ struct GmailCatchUpTests {
 
             // Meanwhile: the Settings reset.
             let before = try Self.folder(world, labelPath)
-            try await world.pool.write { db in try SettingsView.localIndexWipeTxn(db) }
+            try await world.pool.write { db in try SyncEngine.localIndexWipeTxn(db) }
             let reset = try Self.folder(world, labelPath)
             #expect(try Self.rows(world, labelPath)["l1"] == nil, "precondition: the reset deleted l1's row")
             #expect(reset.backfillPageToken == nil && !reset.backfillComplete, "precondition: the reset put the walk at the top")

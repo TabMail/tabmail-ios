@@ -155,9 +155,9 @@ struct BackfillUIDWalkRaceTests {
     // MARK: - The three user resets
 
     enum UserReset: String, CaseIterable, Sendable, CustomStringConvertible {
-        /// Reset Message Data on the account (`AccountDetailView.resetMessageDataTxn`).
+        /// Reset Message Data on the account (`SyncEngine.resetMessageDataTxn`).
         case accountReset
-        /// Delete All Email Index Data in Settings (`SettingsView.localIndexWipeTxn`).
+        /// Delete All Email Index Data in Settings (`SyncEngine.localIndexWipeTxn`).
         case settingsWipe
         /// Smart Reindex (`SyncEngine.resetCrawlState`), after loaded messages
         /// went missing locally: the gap the user is repairing.
@@ -171,9 +171,9 @@ struct BackfillUIDWalkRaceTests {
             let accountId = walk.account.id
             switch self {
             case .accountReset:
-                try? await walk.pool.write { try AccountDetailView.resetMessageDataTxn($0, accountId: accountId) }
+                try? await walk.pool.write { try SyncEngine.resetMessageDataTxn($0, accountId: accountId) }
             case .settingsWipe:
-                try? await walk.pool.write { try SettingsView.localIndexWipeTxn($0) }
+                try? await walk.pool.write { try SyncEngine.localIndexWipeTxn($0) }
             case .smartReindex:
                 let folderId = walk.folderId
                 let ids = missingLocally.map(String.init)

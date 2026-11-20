@@ -1586,7 +1586,7 @@ struct QueueCoreInvariantTests {
     /// commands) pointing at a header id nothing will ever produce again.
     ///
     /// The rows are removed by the REAL producer rather than by a hand-written
-    /// `DELETE`: `AccountDetailView.resetMessageDataTxn`, the account-scoped
+    /// `DELETE`: `SyncEngine.resetMessageDataTxn`, the account-scoped
     /// "reset message data" gesture, which deletes every `messageHeader` of the
     /// account while deliberately leaving `pendingOperation` alone — so a move
     /// can genuinely be in flight across it and retire into an empty header
@@ -1609,7 +1609,7 @@ struct QueueCoreInvariantTests {
             folderPath: "INBOX", observedUidValidity: nil)
         try insertOp(survivingOp, fixture)
         try await fixture.pool.write { db in
-            try AccountDetailView.resetMessageDataTxn(db, accountId: fixture.accountId)
+            try SyncEngine.resetMessageDataTxn(db, accountId: fixture.accountId)
         }
         let (headerCount, opSurvived) = try await fixture.pool.read { db in
             (try MessageHeader.filter(Column("accountId") == fixture.accountId).fetchCount(db),
