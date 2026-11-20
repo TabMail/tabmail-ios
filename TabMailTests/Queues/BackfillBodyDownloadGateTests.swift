@@ -444,6 +444,59 @@ struct BackfillBodyDownloadGateTests {
         #expect(pendingDuringJob.value.withLock { $0 } == ["7"], "the refused item must stay pending")
     }
 
+    @Test("a decision that read power inside the job and is used after the job ends starts no batch under Low Power Mode")
+    @MainActor
+    func decisionSpanningJobExitUnderLowPowerModeStartsNoBatch() async throws {
+        let accountId = "gate1064-job-exit"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        let item = backfillItem(accountId)
+        let parked = TestBox(false)
+        let decide = TestLatch()
+        let deadline = Self.deadline
+        // Device readings only: no user Fast Sync, Low Power Mode, on battery. The
+        // job's own Fast Sync comes from the real handler.
+        let power = (fastSync: false, lowPowerMode: true, onPower: false, batteryLevel: Float(0.8))
+        SyncEngine.backfillAdmissionDecisionHookForTesting.withLock {
+            $0 = {
+                parked.value.withLock { $0 = true }
+                await decide.wait()
+            }
+        }
+        defer { SyncEngine.backfillAdmissionDecisionHookForTesting.withLock { $0 = nil } }
+        try await withAccount(accountId, provider: provider, power: power, expensive: false) {
+            let context = BGTaskContext(label: "gate1064-job-exit", completion: { _ in })
+            let scheduler = SyncScheduler(
+                backgroundReadiness: { true },
+                backgroundWork: { _ in
+                    // The decision reads power and the job flag inside the job, then parks.
+                    await queue.enqueue([item])
+                    let clock = ContinuousClock()
+                    let end = clock.now.advanced(by: deadline)
+                    while clock.now < end, !parked.value.withLock({ $0 }) {
+                        try? await Task.sleep(for: .milliseconds(50))
+                    }
+                },
+                processingHasWork: { false },
+                backgroundSchedule: { _ in },
+                refreshNetworkAvailable: true
+            )
+            scheduler.handleBackgroundAIProcessing(context: context) { _ in }
+            await context.waitForTaskForTesting()
+            #expect(parked.value.withLock { $0 }, "the decision never parked inside the job")
+            #expect(!SyncEngine.backgroundProcessingJobActive.withLock { $0 }, "precondition: the job has ended")
+
+            // The job has ended; the parked decision now completes.
+            await decide.open()
+            try await Task.sleep(for: Self.settle)
+            #expect(await fetchCount(provider) == 0,
+                    "a decision spanning job exit downloaded an older-mail body under Low Power Mode")
+            #expect(await queue.queuedItemsForTesting.map(\.messageId) == ["7"], "the refused item must stay pending")
+        }
+        await decide.open()
+        await queue.cancelAllInFlight()
+    }
+
     @Test("in the background job, Wi-Fi-only on an expensive network holds older-mail bodies until the network is unmetered")
     @MainActor
     func backgroundJobWifiOnlyExpensiveHoldsThenResumes() async throws {

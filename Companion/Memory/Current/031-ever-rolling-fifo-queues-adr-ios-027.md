@@ -13,4 +13,5 @@
 - **Boot-time recovery**: Every queue has `repopulateFromDatabase()` called from `SyncScheduler` on foreground return + BGProcessingTask.
 - **Queues**: `ActiveBodyQueue`, `ActiveAIQueue`, `BackfillEmbeddingQueue` — all follow identical pattern.
 - **No pause mechanism** — IMAP pool priority checkout handles user-vs-background contention naturally.
+  - *Note (2026-11-20, #1064):* `BackfillBodyQueue` holds older-mail body downloads under the walk's network and power gates (Wi-Fi-only, low battery, Low Power Mode; ADR-IOS-005 amendment). That hold is a network and power rule, not a pause mechanism: items stay pending, no retry is spent, and a gate watcher re-dispatches when it lifts.
 - Self-heal/consolidation should never need to do real work — purely a safety net.

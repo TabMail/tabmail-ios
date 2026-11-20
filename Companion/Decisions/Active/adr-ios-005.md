@@ -20,6 +20,15 @@
 > folder's oldest local row (ADR-IOS-107 decision 8, "the direct load"). The 2026-11-11 note below is
 > superseded and kept as written.
 >
+> **Amendment (2026-11-20, #1064).** The walk's download gates (the Wi-Fi-only setting on an
+> expensive network, a battery below 20% off power, and Low Power Mode off power) now also hold
+> older-mail body downloads (`BackfillBodyQueue`). A refused dispatch keeps its items pending without
+> spending a retry and re-checks the gate on `SyncConfig.backfillBodyGateRecheckSeconds`. In the
+> background processing job the job's walk decision applies; the job's synthetic Fast Sync is never
+> treated as a user's (the job flag and Fast Sync change, and are read, in one MainActor step).
+> Bodies the user opens and new mail (`ActiveBodyQueue`) and folder scans are not held. The text
+> below is kept as written.
+
 > **Current note (2026-11-11).** A completed walk can be re-armed by the full sync's catch-up when
 > old mail moves into the folder (ADR-IOS-107 decision 8), but never while a storage limit is in
 > force: then the catch-up loads no old mail back, because the limit means old mail is not kept

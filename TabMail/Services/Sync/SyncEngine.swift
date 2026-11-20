@@ -139,14 +139,33 @@ actor SyncEngine {
     /// The device's power state for the backfill gates, readable off the engine
     /// (BackfillBodyQueue reads it too, #1064).
     nonisolated static func currentBackfillPowerState() async -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
+        await currentBackfillPowerAndJobState().power
+    }
+
+    /// The power state together with the background-job flag, both read in ONE
+    /// MainActor step. The job sets and clears its synthetic Fast Sync and the job
+    /// flag together in one MainActor step (`SyncScheduler.handleBackgroundAIProcessing`),
+    /// so a reader never pairs the job's Fast Sync with "no job" (#1064).
+    nonisolated static func currentBackfillPowerAndJobState() async
+        -> (power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), jobActive: Bool)
+    {
         #if DEBUG
         if let hook = Self.backfillPowerReadHookForTesting.withLock({ $0 }) { await hook() }
-        if let state = Self.backfillPowerStateForTesting.withLock({ $0 }) { return state }
+        if let state = Self.backfillPowerStateForTesting.withLock({ $0 }) {
+            // The seam replaces the device readings; the app's Fast Sync flag and the
+            // job flag are still read live, so a test drives the real job entry/exit.
+            return await MainActor.run {
+                ((state.fastSync || AccountManagerState.shared.fastSyncModeActive, state.lowPowerMode,
+                  state.onPower, state.batteryLevel),
+                 backgroundProcessingJobActive.withLock { $0 })
+            }
+        }
         #endif
         return await MainActor.run {
             let battery = UIDevice.current.batteryState
-            return (AccountManagerState.shared.fastSyncModeActive, ProcessInfo.processInfo.isLowPowerModeEnabled,
-                    battery == .charging || battery == .full, UIDevice.current.batteryLevel)
+            return ((AccountManagerState.shared.fastSyncModeActive, ProcessInfo.processInfo.isLowPowerModeEnabled,
+                     battery == .charging || battery == .full, UIDevice.current.batteryLevel),
+                    backgroundProcessingJobActive.withLock { $0 })
         }
     }
 
@@ -161,6 +180,9 @@ actor SyncEngine {
     /// Awaited at the start of every power read, so a test can park an admission
     /// decision across the read the way the production MainActor hop suspends.
     nonisolated static let backfillPowerReadHookForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
+    /// Awaited in `backfillDownloadsAllowedNow` after the power/job read and before
+    /// the decision uses it, so a test can let the job end across that gap.
+    nonisolated static let backfillAdmissionDecisionHookForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
     nonisolated static let backfillSleepForTesting = Mutex<(@Sendable (TimeInterval) async -> Void)?>(nil)
     #endif
 
@@ -199,15 +221,20 @@ actor SyncEngine {
 
     /// One older-mail body download decision (BackfillBodyQueue, #1064). Each call
     /// is its own operation: the Wi-Fi-only preference is snapshotted first, before
-    /// any suspension. The job context is a live fact, read after the power await at
-    /// the admission decision, because the actor can interleave a job entry across
-    /// that await (which also sets the job's synthetic Fast Sync). In the job the job's
+    /// any suspension. The job context is a live fact, read after the suspension in the
+    /// same MainActor step as the power state (`currentBackfillPowerAndJobState`): the
+    /// job's synthetic Fast Sync and its flag change together, so a job entering or
+    /// ending around the read can never make the job's Fast Sync count as a user's.
+    /// In the job the job's
     /// walk decision applies; otherwise the foreground walk's rule. ActiveBodyQueue
     /// is not gated.
     nonisolated static func backfillDownloadsAllowedNow() async -> Bool {
         let wifiOnly = backfillWifiOnlySetting()
-        let power = await currentBackfillPowerState()
-        if backgroundProcessingJobActive.withLock({ $0 }) {
+        let (power, jobActive) = await currentBackfillPowerAndJobState()
+        #if DEBUG
+        if let hook = backfillAdmissionDecisionHookForTesting.withLock({ $0 }) { await hook() }
+        #endif
+        if jobActive {
             // Wi-Fi proxy as in the walk gate: on iOS, expensive == cellular/hotspot.
             return SyncScheduler.backgroundBackfillPlan(
                 isLowPowerMode: power.lowPowerMode, wifiOnly: wifiOnly, onWiFi: !NetworkMonitor.checkExpensive())

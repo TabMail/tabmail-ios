@@ -1386,13 +1386,19 @@ final class SyncScheduler {
 
             // Enable turbo/fast-sync mode — BGProcessing has minutes of budget,
             // maximize throughput by skipping delta sync pauses and using aggressive backfill.
+            // The fast-sync flag is the job's throughput switch, not a user's Fast
+            // Sync: older-mail body downloads during the job follow the job's walk
+            // decision instead (#1064). Both flags are set and cleared together in
+            // one MainActor step (this task is MainActor), and the body gate reads
+            // both in one MainActor step, so no reader pairs the job's Fast Sync with
+            // "no job". Clearing the job flag first and Fast Sync in a later task
+            // opened a window that admitted downloads under Low Power Mode.
             AccountManagerState.shared.fastSyncModeActive = true
-            defer { Task { @MainActor in AccountManagerState.shared.fastSyncModeActive = false } }
-            // The fast-sync flag above is the job's throughput switch, not a
-            // user's Fast Sync: older-mail body downloads during the job follow
-            // the job's walk decision instead (#1064).
             SyncEngine.backgroundProcessingJobActive.withLock { $0 = true }
-            defer { SyncEngine.backgroundProcessingJobActive.withLock { $0 = false } }
+            defer {
+                AccountManagerState.shared.fastSyncModeActive = false
+                SyncEngine.backgroundProcessingJobActive.withLock { $0 = false }
+            }
 
             #if DEBUG
             if let backgroundWorkHook = self.backgroundWorkHook {
