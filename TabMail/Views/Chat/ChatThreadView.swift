@@ -87,9 +87,15 @@ struct ChatThreadView: View {
     @State private var showsMove = false
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// Whether the AI Suggestion's row shows the ghost: follows `suggestionPhase` one step behind, so
-    /// the working bubble filling in is one animated transaction with its re-pin (`showSuggestion`).
-    @State private var suggestionFilled = false
+    /// Held only while a grow is pending: set when the AI Suggestion's row becomes Writing, cleared
+    /// inside the fill's `withAnimation` (`showSuggestion`), so the working bubble filling in is one
+    /// animated transaction with its re-pin. A ready suggestion with nothing held is the ghost, so
+    /// opening on one never shows the working bubble.
+    @State private var suggestionGrowPending = false
+    /// Set by `showSuggestion` on the fill under Reduce Motion: the ghost fades in. Every other
+    /// insertion of the ghost, and every removal, follows its transaction (at once).
+    @State private var ghostFadesIn = false
+    @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
 
     private static let bottomId = "chat-bottom"
     private static let unreadLineId = "chat-unread-line"
@@ -322,12 +328,16 @@ struct ChatThreadView: View {
                         // The AI Suggestion, where the reply lands once sent: the working bubble
                         // while it is written, then the ghost.
                         if let newest = thread.newest, let suggestion {
-                            if suggestionFilled, case .ready(let text) = suggestion {
+                            if !suggestionGrowPending, case .ready(let text) = suggestion {
                                 let move = tutorialMove(thread)
                                 ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) {
                                     openSuggestion(on: newest, tutorialMove: move)
                                 }
-                                .transition(.opacity.animation(.easeInOut(duration: ChatSuggestionConfig.ghostFadeDuration)))
+                                .transition(.asymmetric(
+                                    insertion: ghostFadesIn
+                                        ? .opacity.animation(.easeInOut(duration: ChatSuggestionConfig.ghostFadeDuration))
+                                        : .opacity,
+                                    removal: .opacity))
                             } else {
                                 ChatSuggestionWorkingBubble()
                                     .transition(.opacity)
@@ -746,18 +756,22 @@ struct ChatThreadView: View {
     /// The AI Suggestion's row, from `suggestionPhase`. The working bubble filling in grows the row
     /// into the ghost over `ChatSuggestionConfig.fillDuration`, and while the landing holds its
     /// target the re-pin scroll runs in the same transaction, so the growing row stays above the
-    /// field. Under Reduce Motion the ghost replaces it at once and fades in (its own transition).
-    /// Every other change shows at once.
+    /// field. Under Reduce Motion the ghost replaces it at once and fades in (`ghostFadesIn`).
+    /// Every other change, opening on a ready suggestion included, shows or removes at once.
     private func showSuggestion(_ new: ChatSuggestionPhase?, from old: ChatSuggestionPhase?, proxy: ScrollViewProxy) {
         guard ChatSuggestionPhase.fills(from: old, to: new) else {
-            suggestionFilled = new?.isReady ?? false
+            suggestionGrowPending = new == .writing
+            ghostFadesIn = false
             return
         }
         #if DEBUG
         NSLog("[cvwb] working bubble fills, re-pin=%d reduceMotion=%d", scrollTarget != nil ? 1 : 0, reduceMotion ? 1 : 0)
         #endif
+        ghostFadesIn = reduceMotion
+        // At rebase onto the reply field's arrival change (its own re-pin inside `withAnimation`
+        // for an arriving email), fold both re-pins into one helper and re-check this fill.
         withAnimation(reduceMotion ? nil : .easeInOut(duration: ChatSuggestionConfig.fillDuration)) {
-            suggestionFilled = true
+            suggestionGrowPending = false
             if let target = scrollTarget { proxy.scrollTo(target.id, anchor: target.anchor) }
         }
     }
@@ -775,8 +789,12 @@ struct ChatThreadView: View {
         guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking,
               context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }
         let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty
+        let subscribed = AISubscriptionGate.shared.isActive
+        let aiSourceEnabled = AIWorkingRule.anyAISourceEnabled(
+            demoHidesAI: DemoModeStore.shared.hidesAIContent, optedOutAllAI: optOutAllAI,
+            deviceSyncAuto: DeviceSyncService.shared.isAutoEnabled, subscribed: subscribed)
         return ChatReplyField.suggestionPhase(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only,
-                                              subscribed: AISubscriptionGate.shared.isActive)
+                                              aiSourceEnabled: aiSourceEnabled, subscribed: subscribed)
     }
 
     /// The tutorial's move in this chat, if it holds the practice email.

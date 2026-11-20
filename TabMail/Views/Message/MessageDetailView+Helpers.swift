@@ -52,13 +52,7 @@ enum MessageViewHelpers {
 
     /// Shimmer effect for WIP tag (tag assigned but reply not yet generated)
     static func showShimmer(_ message: MessageHeader) -> Bool {
-        showShimmer(message, subscribed: AISubscriptionGate.shared.isActive)
-    }
-
-    /// The same rule with the subscription passed in; the chat's AI Suggestion working bubble
-    /// asks it too (`ChatReplyField.suggestionPhase`).
-    static func showShimmer(_ message: MessageHeader, subscribed: Bool) -> Bool {
-        message.actionTag != nil && message.cachedReply == nil && subscribed
+        message.actionTag != nil && message.cachedReply == nil && AISubscriptionGate.shared.isActive
     }
 }
 

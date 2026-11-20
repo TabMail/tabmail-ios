@@ -38,16 +38,20 @@ struct ChatReplyField: Equatable {
     }
 
     /// The AI Suggestion's row under the newest email: `.ready` with the ghost's text once the
-    /// reply is stored (`suggestionText`), `.writing` while the AI still writes it (the inbox's
-    /// shimmer rule: the email is tagged and has no reply yet, `MessageViewHelpers.showShimmer`),
-    /// else nothing. Keyed by the newest email alone, so a new email that arrives above a ready
-    /// ghost puts the row back to `.writing` until its own suggestion is stored.
+    /// reply is stored (`suggestionText`), `.writing` while the AI still works on the email (the
+    /// inbox row's rule, `AIWorkingRule`: tagged with no reply processed, or untagged in the Inbox
+    /// with an AI source on), else nothing. A filtered email's empty-reply sentinel counts as
+    /// processed, so it never writes. Keyed by the newest email alone, so a new email that arrives
+    /// above a ready ghost, tagged or not yet, puts the row back to `.writing` until its own
+    /// suggestion is stored.
     static func suggestionPhase(
-        newest: MessageHeader, usersTurn: Bool, onlyTo: [ChatThread.Person]?, subscribed: Bool
+        newest: MessageHeader, usersTurn: Bool, onlyTo: [ChatThread.Person]?, aiSourceEnabled: Bool, subscribed: Bool
     ) -> ChatSuggestionPhase? {
         if let text = suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: onlyTo) { return .ready(text) }
         guard !usersTurn, onlyTo == nil, !EmailFilter.isNoReply(newest.fromAddress),
-              MessageViewHelpers.showShimmer(newest, subscribed: subscribed) else { return nil }
+              AIWorkingRule.isWorking(tagged: newest.actionTag != nil, replyProcessed: newest.cachedReply != nil,
+                                      inInbox: newest.isInInbox, aiSourceEnabled: aiSourceEnabled,
+                                      subscribed: subscribed) else { return nil }
         return .writing
     }
 

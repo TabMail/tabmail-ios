@@ -25,9 +25,9 @@ struct MessageRowView: View {
     /// When in demo with AI declined, treat all AI
     /// surfaces as off regardless of pre-baked content.
     private var anyAISourceEnabled: Bool {
-        let demoStore = DemoModeStore.shared
-        if demoStore.hidesAIContent { return false }
-        return (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
+        AIWorkingRule.anyAISourceEnabled(
+            demoHidesAI: DemoModeStore.shared.hidesAIContent, optedOutAllAI: optOutAllAI,
+            deviceSyncAuto: DeviceSyncService.shared.isAutoEnabled, subscribed: AISubscriptionGate.shared.isActive)
     }
 
     /// The chat view's switch, as the row can observe it: the Settings toggle and the opt-out are
@@ -197,7 +197,8 @@ struct MessageRowView: View {
                                     .controlSize(.mini)
                             }
                         }
-                    } else if message.isInInbox && anyAISourceEnabled {
+                    } else if AIWorkingRule.classifies(tagged: effectiveTag != nil, inInbox: message.isInInbox,
+                                                       aiSourceEnabled: anyAISourceEnabled) {
                         Spacer(minLength: 4)
                         ProgressView()
                             .controlSize(.mini)
@@ -250,18 +251,47 @@ struct MessageRowView: View {
     }
 
     private var showShimmer: Bool {
-        guard effectiveTag != nil, AISubscriptionGate.shared.isActive else { return false }
         // For threads: shimmer if ANY member with a tag is still awaiting reply processing
-        if let threadInfo {
-            return threadInfo.anyMemberStillProcessingReply
-        }
-        return !message.isReplyProcessed
+        let replyProcessed = threadInfo.map { !$0.anyMemberStillProcessingReply } ?? message.isReplyProcessed
+        return AIWorkingRule.writesReply(tagged: effectiveTag != nil, replyProcessed: replyProcessed,
+                                         subscribed: AISubscriptionGate.shared.isActive)
     }
 
     /// For thread rows: true when the thread has a tag but not all inbox members are tagged yet.
     private var threadMembersStillProcessing: Bool {
         guard let threadInfo else { return false }
-        return !threadInfo.allMembersTagged && anyAISourceEnabled
+        return AIWorkingRule.classifies(tagged: threadInfo.allMembersTagged, inInbox: message.isInInbox,
+                                        aiSourceEnabled: anyAISourceEnabled)
     }
 
+}
+
+/// "AI is working" on an email (or a thread, through its aggregates), the inbox row's rule. The
+/// inbox row draws case 1 as the tag chip's shimmer and case 2 as its spinner; the chat's AI
+/// Suggestion row shows "Writing" when the newest email meets either (`ChatReplyField.suggestionPhase`).
+/// One rule, so the two never disagree on whether the AI still works on an email.
+enum AIWorkingRule {
+    /// Any AI source on: AI not hidden by demo, AI not opted out (or Device Sync adopts the
+    /// desktop's results automatically), and subscribed.
+    static func anyAISourceEnabled(demoHidesAI: Bool, optedOutAllAI: Bool, deviceSyncAuto: Bool, subscribed: Bool) -> Bool {
+        !demoHidesAI && (!optedOutAllAI || deviceSyncAuto) && subscribed
+    }
+
+    /// Case 1: tagged, and its reply not processed yet. A filtered email's empty-reply sentinel
+    /// counts as processed. Thread form: any tagged member still awaits its reply.
+    static func writesReply(tagged: Bool, replyProcessed: Bool, subscribed: Bool) -> Bool {
+        tagged && !replyProcessed && subscribed
+    }
+
+    /// Case 2: not tagged yet, in the Inbox, with an AI source on. Thread form: not every Inbox
+    /// member is tagged.
+    static func classifies(tagged: Bool, inInbox: Bool, aiSourceEnabled: Bool) -> Bool {
+        !tagged && inInbox && aiSourceEnabled
+    }
+
+    /// Case 1 or case 2.
+    static func isWorking(tagged: Bool, replyProcessed: Bool, inInbox: Bool, aiSourceEnabled: Bool, subscribed: Bool) -> Bool {
+        writesReply(tagged: tagged, replyProcessed: replyProcessed, subscribed: subscribed)
+            || classifies(tagged: tagged, inInbox: inInbox, aiSourceEnabled: aiSourceEnabled)
+    }
 }

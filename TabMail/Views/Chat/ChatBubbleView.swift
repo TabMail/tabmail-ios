@@ -237,7 +237,7 @@ struct ChatSuggestionBubble: View {
 struct ChatSuggestionWorkingBubble: View {
     var body: some View {
         VStack(alignment: .trailing, spacing: 4) {
-            TimelineView(.animation) { context in
+            TimelineView(.animation(minimumInterval: ChatSuggestionConfig.dotFrameInterval)) { context in
                 let time = context.date.timeIntervalSinceReferenceDate
                 HStack(spacing: ChatSuggestionConfig.dotSpacing) {
                     ForEach(0..<3, id: \.self) { index in

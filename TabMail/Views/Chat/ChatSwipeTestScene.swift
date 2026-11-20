@@ -51,7 +51,10 @@ struct ChatSwipeTestScene: View {
     private let lateSuggestionRelease = ProcessInfo.processInfo.arguments.contains("--chat-swipe-late-suggestion")
     /// `--chat-swipe-writing`: the newest email is classified with no reply yet, so the chat shows
     /// the AI Suggestion's working bubble until "Release the AI Suggestion" stores the reply.
+    /// Without it the newest email is filtered, so no working bubble shows.
     nonisolated private static let writing = ProcessInfo.processInfo.arguments.contains("--chat-swipe-writing")
+    /// `--chat-swipe-ready`: the newest email's AI Suggestion is already stored as the chat opens.
+    nonisolated private static let readyAtOpen = ProcessInfo.processInfo.arguments.contains("--chat-swipe-ready")
     /// The late AI Suggestion's text message.
     nonisolated static let lateSuggestion = "Sounds good, see you Tuesday."
 
@@ -213,7 +216,20 @@ struct ChatSwipeTestScene: View {
                     header.headerComplete = true
                     header.bodyComplete = true
                     header.isRead = !Self.unread
-                    if Self.writing && index == Self.count - 1 { header.actionTag = .reply }
+                    if index == Self.count - 1 {
+                        // The AI's state on the newest email, under the shared "AI is working"
+                        // rule (`AIWorkingRule`): tagged with no reply yet writes; otherwise it is
+                        // filtered (the empty-reply sentinel), so no working bubble shows and a
+                        // released suggestion lands with none before it.
+                        if Self.readyAtOpen {
+                            header.actionTag = .reply
+                            header.cachedReply = "Hello,\n\n\(Self.lateSuggestion)\n\nThanks."
+                            header.replyTextMessage = Self.lateSuggestion
+                        } else {
+                            header.actionTag = Self.writing ? .reply : ActionTag.none
+                            if !Self.writing { header.cachedReply = "" }
+                        }
+                    }
                     header.summaryBlurb = "Note \(index)"
                     header.summaryTextMessage = index == 0 && Self.tall
                         ? "Note 0: " + String(repeating: "A long line that fills the screen. ", count: 80)
