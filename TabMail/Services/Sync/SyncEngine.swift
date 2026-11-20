@@ -140,6 +140,7 @@ actor SyncEngine {
     /// (BackfillBodyQueue reads it too, #1064).
     nonisolated static func currentBackfillPowerState() async -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
         #if DEBUG
+        if let hook = Self.backfillPowerReadHookForTesting.withLock({ $0 }) { await hook() }
         if let state = Self.backfillPowerStateForTesting.withLock({ $0 }) { return state }
         #endif
         return await MainActor.run {
@@ -157,6 +158,9 @@ actor SyncEngine {
     /// no test can wait out the worker's pauses.
     nonisolated static let backfillPowerStateForTesting =
         Mutex<(fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float)?>(nil)
+    /// Awaited at the start of every power read, so a test can park an admission
+    /// decision across the read the way the production MainActor hop suspends.
+    nonisolated static let backfillPowerReadHookForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
     nonisolated static let backfillSleepForTesting = Mutex<(@Sendable (TimeInterval) async -> Void)?>(nil)
     #endif
 
@@ -194,15 +198,16 @@ actor SyncEngine {
     nonisolated static let backgroundProcessingJobActive = Mutex<Bool>(false)
 
     /// One older-mail body download decision (BackfillBodyQueue, #1064). Each call
-    /// is its own operation: the Wi-Fi-only preference and the job context are
-    /// captured first, before any suspension. In the BGProcessing job the job's
+    /// is its own operation: the Wi-Fi-only preference is snapshotted first, before
+    /// any suspension. The job context is a live fact, read after the power await at
+    /// the admission decision, because the actor can interleave a job entry across
+    /// that await (which also sets the job's synthetic Fast Sync). In the job the job's
     /// walk decision applies; otherwise the foreground walk's rule. ActiveBodyQueue
     /// is not gated.
     nonisolated static func backfillDownloadsAllowedNow() async -> Bool {
         let wifiOnly = backfillWifiOnlySetting()
-        let inBackgroundJob = backgroundProcessingJobActive.withLock { $0 }
         let power = await currentBackfillPowerState()
-        if inBackgroundJob {
+        if backgroundProcessingJobActive.withLock({ $0 }) {
             // Wi-Fi proxy as in the walk gate: on iOS, expensive == cellular/hotspot.
             return SyncScheduler.backgroundBackfillPlan(
                 isLowPowerMode: power.lowPowerMode, wifiOnly: wifiOnly, onWiFi: !NetworkMonitor.checkExpensive())

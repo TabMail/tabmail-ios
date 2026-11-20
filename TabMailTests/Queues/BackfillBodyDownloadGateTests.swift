@@ -127,11 +127,24 @@ struct BackfillBodyDownloadGateTests {
             #expect(await fetchCount(provider) == 0, "precondition: nothing downloaded while held")
 
             // The gate opens (as when a background job starts later) before the
-            // queue's own re-check runs; the held flag is now stale.
+            // queue's own re-check runs; the held flag is now stale. The resumed
+            // fetch is parked, so the waiter must stay pending until it ends.
+            let release = TestLatch()
+            await provider.setFetchMessageHook { await release.wait() }
             openGate()
-            let returned = await drains(queue)
-            #expect(await fetchCount(provider) > 0,
-                    "awaitDrain returned on a stale held flag before the body was fetched (returned=\(returned))")
+            let drained = TestBox(false)
+            let drain = Task { () -> Bool in
+                let returned = await drains(queue)
+                drained.value.withLock { $0 = true }
+                return returned
+            }
+            #expect(await eventually { await fetchCount(provider) > 0 },
+                    "the body was not fetched once the gate opened under a stale held flag")
+            try await Task.sleep(for: Self.settle)
+            #expect(!drained.value.withLock { $0 }, "awaitDrain returned on a stale held flag while the body was still fetching")
+
+            await release.open()
+            #expect(await drain.value, "awaitDrain did not return after the resumed fetch ended")
         }
         await queue.cancelAllInFlight()
     }
@@ -290,6 +303,61 @@ struct BackfillBodyDownloadGateTests {
         }
         await queue.cancelAllInFlight()
         #expect(fetchesDuringJob.value.withLock { $0 } == 0, "an older-mail body downloaded in the job under Low Power Mode")
+    }
+
+    @Test("an admission parked across the power read while the background job starts under Low Power Mode starts no batch")
+    @MainActor
+    func admissionSpanningJobEntryUnderLowPowerModeStartsNoBatch() async throws {
+        let accountId = "gate1064-job-entry"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        let item = backfillItem(accountId)
+        let parked = TestBox(false)
+        let admit = TestLatch()
+        let fetchesDuringJob = TestBox<Int?>(nil)
+        let pendingDuringJob = TestBox<[String]?>(nil)
+        let settle = Self.settle
+        // Before the job: no Fast Sync, Low Power Mode, on battery (refused).
+        let foregroundPower = (fastSync: false, lowPowerMode: true, onPower: false, batteryLevel: Float(0.8))
+        // In the job: the job's synthetic Fast Sync, still Low Power Mode on battery.
+        let jobPower = (fastSync: true, lowPowerMode: true, onPower: false, batteryLevel: Float(0.8))
+        SyncEngine.backfillPowerReadHookForTesting.withLock {
+            $0 = {
+                parked.value.withLock { $0 = true }
+                await admit.wait()
+            }
+        }
+        defer { SyncEngine.backfillPowerReadHookForTesting.withLock { $0 = nil } }
+        try await withAccount(accountId, provider: provider, power: foregroundPower, expensive: false) {
+            // The admission decision starts outside the job and parks in its power read.
+            await queue.enqueue([item])
+            #expect(await eventually { parked.value.withLock { $0 } }, "the admission never reached the power read")
+
+            let context = BGTaskContext(label: "gate1064-job-entry", completion: { _ in })
+            let scheduler = SyncScheduler(
+                backgroundReadiness: { true },
+                backgroundWork: { _ in
+                    // Inside the real job: the power read now sees the job's Fast Sync.
+                    SyncEngine.backfillPowerStateForTesting.withLock { $0 = jobPower }
+                    await admit.open()
+                    try? await Task.sleep(for: settle)
+                    let count = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count
+                    fetchesDuringJob.value.withLock { $0 = count }
+                    let pending = await queue.queuedItemsForTesting.map(\.messageId)
+                    pendingDuringJob.value.withLock { $0 = pending }
+                },
+                processingHasWork: { false },
+                backgroundSchedule: { _ in },
+                refreshNetworkAvailable: true
+            )
+            scheduler.handleBackgroundAIProcessing(context: context) { _ in }
+            await context.waitForTaskForTesting()
+        }
+        await admit.open()
+        await queue.cancelAllInFlight()
+        #expect(fetchesDuringJob.value.withLock { $0 } == 0,
+                "an admission that spanned job entry downloaded an older-mail body under Low Power Mode")
+        #expect(pendingDuringJob.value.withLock { $0 } == ["7"], "the refused item must stay pending")
     }
 
     @Test("in the background job, Wi-Fi-only on an expensive network holds older-mail bodies until the network is unmetered")
