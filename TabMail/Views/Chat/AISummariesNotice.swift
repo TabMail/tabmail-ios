@@ -81,12 +81,18 @@ struct AISummariesNoticeButton: View {
     var send: ReportConcernSend = ReportConcernService.sendReport
 
     @State private var showsNotice = false
+    /// The popover was asked for by the landing, not by a tap.
+    @State private var autoRequested = false
     @State private var reportRequested = false
     @State private var showsReport = false
     @ScaledMetric(relativeTo: .footnote) private var glyphSize = ChatViewLayout.aiNoticeGlyphSize
 
     var body: some View {
-        Button { showsNotice = true } label: {
+        Button {
+            // A tap always shows it, whatever the landing asked for.
+            autoRequested = false
+            showsNotice = true
+        } label: {
             Image(systemName: AISummariesNotice.glyph)
                 .font(.system(size: glyphSize))
                 .foregroundStyle(Theme.textSecondary)
@@ -98,7 +104,17 @@ struct AISummariesNoticeButton: View {
         .accessibilityHint(AISummariesNotice.accessibilityHint)
         .popover(isPresented: $showsNotice, arrowEdge: .top) {
             popover
-                .onAppear { firstOpen.markShown() }
+                .onAppear {
+                    // Another chat may have shown it since this one asked: then this one closes
+                    // unseen, so it opens by itself at most once across every mounted chat.
+                    if autoRequested, !firstOpen.isDue(landed: true, tipsAllowed: true) {
+                        autoRequested = false
+                        showsNotice = false
+                        return
+                    }
+                    autoRequested = false
+                    firstOpen.markShown()
+                }
         }
         .onChange(of: showsNotice) { _, shows in
             // The sheet waits for the popover to close: one presentation at a time.
@@ -110,9 +126,14 @@ struct AISummariesNoticeButton: View {
         .reportConcernSheet(isPresented: $showsReport, contentType: .summary,
                             content: reportContent, contentNotice: AISummariesNotice.reportNotice, send: send)
         .task(id: landed) {
-            // One decision per open, read once from the flag and the tip gate.
+            // One decision per open, read once from the flag and the tip gate, just before asking.
             if firstOpen.isDue(landed: landed, tipsAllowed: tipsAllowed()) {
+                autoRequested = true
                 showsNotice = true
+            } else if autoRequested {
+                // A request still waiting to present is dropped once it is no longer due.
+                autoRequested = false
+                showsNotice = false
             }
         }
     }

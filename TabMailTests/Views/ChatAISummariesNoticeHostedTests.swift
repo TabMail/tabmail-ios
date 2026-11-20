@@ -50,6 +50,38 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
+    /// Drives whether tips are allowed, as onboarding does.
+    @MainActor @Observable
+    final class Gate {
+        var allowed = true
+    }
+
+    private struct GatedHost: View {
+        let landing: Landing
+        let gate: Gate
+        let firstOpen: AISummariesNotice.FirstOpen
+
+        var body: some View {
+            AISummariesNoticeButton(landed: landing.landed, reportContent: { "" }, firstOpen: firstOpen,
+                                    tipsAllowed: { [gate] in gate.allowed })
+        }
+    }
+
+    /// Two chats mounted at once, sharing the install's flag.
+    private struct TwoChatsHost: View {
+        let first: Landing
+        let second: Landing
+        let firstOpen: AISummariesNotice.FirstOpen
+
+        var body: some View {
+            VStack {
+                LandingHost(landing: first, firstOpen: firstOpen)
+                LandingHost(landing: second, firstOpen: firstOpen)
+                Spacer()
+            }
+        }
+    }
+
     private static func freshFirstOpen() -> AISummariesNotice.FirstOpen {
         let name = "ChatAISummariesNoticeHostedTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: name)!
@@ -377,6 +409,91 @@ struct ChatAISummariesNoticeHostedTests {
             try await Self.hosting(Self.button(landed: true, firstOpen: firstOpen, tipsAllowed: true)) { controller in
                 try await Task.sleep(for: .seconds(1))
                 #expect(controller.presentedViewController == nil, "shown once: never again")
+            }
+        }
+    }
+
+    // MARK: - At most once, across every mounted chat
+
+    @Test("A notice the user already opened by hand does not open by itself when the chat lands")
+    func aManualOpenUsesItUp() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let landing = Landing()
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(LandingHost(landing: landing, firstOpen: Self.freshFirstOpen())) { controller in
+                let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))
+                #expect(glyph.accessibilityActivate())
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "control: a tap opens it")
+                controller.presentedViewController?.dismiss(animated: false)
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                landing.landed = true
+                try await Task.sleep(for: .seconds(1))
+                #expect(controller.presentedViewController == nil, "already seen: the landing opens nothing")
+            }
+        }
+    }
+
+    @Test("Two mounted chats landing, in either order or together, open the notice exactly once")
+    func twoChatsOpenItOnce() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted view")
+        for order in [[0, 1], [1, 0], [nil]] as [[Int?]] {
+            let chats = [Landing(), Landing()]
+            try await HostedAccessibility.withAutomation {
+                try await Self.hosting(TwoChatsHost(first: chats[0], second: chats[1], firstOpen: Self.freshFirstOpen())) { controller in
+                    var opens = 0
+                    for step in order {
+                        if let step { chats[step].landed = true } else { chats.forEach { $0.landed = true } }
+                        try await Self.waitUntil { controller.presentedViewController != nil }
+                        try await Task.sleep(for: .milliseconds(500))
+                        if Self.presentedLabels(controller).contains(AISummariesNotice.title) {
+                            opens += 1
+                            controller.presentedViewController?.dismiss(animated: false)
+                            try await Self.waitUntil { controller.presentedViewController == nil }
+                        }
+                    }
+                    try await Task.sleep(for: .seconds(1))
+                    #expect(controller.presentedViewController == nil, "order \(order): nothing more opens")
+                    #expect(opens == 1, "order \(order): exactly one open, got \(opens)")
+                }
+            }
+        }
+    }
+
+    @Test("A pending landing whose chat is no longer eligible does not open later")
+    func aWithdrawnLandingDoesNotOpen() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted view")
+        let landing = Landing()
+        let gate = Gate()
+        let firstOpen = Self.freshFirstOpen()
+        try await HostedAccessibility.withAutomation {
+            let blocker = UIViewController()
+            try await Self.hosting(Color.clear) { controller in
+                controller.present(blocker, animated: false)
+                try await Self.waitUntil { controller.presentedViewController === blocker }
+                let notice = UIHostingController(rootView: GatedHost(landing: landing, gate: gate, firstOpen: firstOpen))
+                controller.addChild(notice)
+                controller.view.addSubview(notice.view)
+                notice.view.frame = controller.view.bounds
+                notice.didMove(toParent: controller)
+                // Lands while it cannot present: the request is pending.
+                landing.landed = true
+                try await Task.sleep(for: .seconds(1))
+                // Re-entered while held back.
+                gate.allowed = false
+                landing.landed = false
+                try await Task.sleep(for: .milliseconds(300))
+                landing.landed = true
+                try await Task.sleep(for: .milliseconds(300))
+                blocker.dismiss(animated: false)
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                try await Task.sleep(for: .seconds(1))
+                #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.title),
+                        "held back on re-entry: the old request is gone")
+                #expect(firstOpen.isDue(landed: true, tipsAllowed: true), "and it was never used up")
+                notice.willMove(toParent: nil)
+                notice.view.removeFromSuperview()
+                notice.removeFromParent()
             }
         }
     }
