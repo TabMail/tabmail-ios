@@ -174,6 +174,44 @@ struct PostSendServerDraftCleanupTests {
         }
     }
 
+    /// Upper bound on waiting for another test's outbox drain to release
+    /// `isDrainingOutbox`. A drain that sent anything holds the latch through
+    /// `SyncConfig.outboxMinSendGapSeconds` after its last send, so the bound
+    /// is that gap with generous headroom.
+    private static let outboxLatchWaitSeconds: TimeInterval = SyncConfig.outboxMinSendGapSeconds * 5
+    private static let outboxLatchPollNanoseconds: UInt64 = 10_000_000
+
+    /// Wait, with a time limit, until no outbox drain owns the outbox. This waits
+    /// on the real condition (IOS-TEST-010's sanctioned harness lever); it is not
+    /// a sleep standing in for one.
+    @MainActor
+    private static func waitForOutboxLatchClear() async -> Bool {
+        let deadline = Date().addingTimeInterval(outboxLatchWaitSeconds)
+        while Date() < deadline {
+            if await !AccountManager.shared.isDrainingOutbox { return true }
+            try? await Task.sleep(nanoseconds: outboxLatchPollNanoseconds)
+        }
+        return await !AccountManager.shared.isDrainingOutbox
+    }
+
+    /// `reconcileOutbox()` returns WITHOUT reconciling while a drain owns the
+    /// outbox (by design, see its doc). A drain another test left in its
+    /// post-send gap therefore made these cases skip the cleanup and fail for a
+    /// reason unrelated to what they measure (#1106). So: wait for the latch to
+    /// clear, reconcile, and then PROVE the reconcile ran — the completed-send
+    /// row it finalizes is gone — so a skipped reconcile can never pass silently.
+    @MainActor
+    private static func reconcileOutboxAndRequireItRan(_ pool: DatabasePool, accountId: String) async throws {
+        let clear = await waitForOutboxLatchClear()
+        try #require(clear, "an outbox drain still owned the outbox after \(outboxLatchWaitSeconds)s; reconcileOutbox would skip")
+        await AccountManager.shared.reconcileOutbox()
+        let left = try await pool.read { db in
+            try OutboxMessage.filter(Column("accountId") == accountId).fetchCount(db)
+        }
+        #expect(left == 0,
+                "reconcileOutbox did not finalize the completed send (\(left) outbox row(s) left): it was skipped, so the cleanup delete was never queued")
+    }
+
     // MARK: - 1. The invariant
 
     @Test("After a completed send, the draft it left on the server is gone")
@@ -208,8 +246,8 @@ struct PostSendServerDraftCleanupTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
-            await AccountManager.shared.reconcileOutbox()
+        try await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
+            try await Self.reconcileOutboxAndRequireItRan(pool, accountId: accountId)
             await Self.drainUntilSettled(pool)
         }
 
@@ -291,8 +329,8 @@ struct PostSendServerDraftCleanupTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
-            await AccountManager.shared.reconcileOutbox()
+        try await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
+            try await Self.reconcileOutboxAndRequireItRan(pool, accountId: accountId)
             await Self.drainUntilSettled(pool)
         }
 
@@ -361,8 +399,8 @@ struct PostSendServerDraftCleanupTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
-            await AccountManager.shared.reconcileOutbox()
+        try await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
+            try await Self.reconcileOutboxAndRequireItRan(pool, accountId: accountId)
             await Self.drainUntilSettled(pool)
         }
 
@@ -396,6 +434,98 @@ struct PostSendServerDraftCleanupTests {
         let remaining = try await pool.read { db in try PendingOperation.fetchAll(db) }
         #expect(remaining.isEmpty,
                 "the cleanup neither completed nor terminated — it is parked, which wedges this lane")
+    }
+
+    // MARK: - 3. A drain left running by an earlier send
+
+    @Test("A cleanup reconcile that follows a demo send still queues the server draft delete")
+    @MainActor
+    func reconcileAfterADemoSendStillRemovesTheServerDraft() async throws {
+        // 🚨 THE INVARIANT: the post-send cleanup runs even when an earlier send's
+        // drain is still holding the outbox in its rate-limit gap. Red-first: on the
+        // pre-fix sequence (reconcile straight away) `reconcileOutbox` sees
+        // `isDrainingOutbox`, returns without reconciling, and the draft stays.
+        let accountId = "post-send-after-demo"
+        let draftRfc822 = "post-send-after-demo-draft@example.com"
+        let draftUID = 4713
+        let demoId = DemoSeed.demoAccountId
+        let (pool, dir, previous) = try Self.makeFixture(accountId: accountId)
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        try await pool.writeWithoutTransaction { db in
+            var demo = Account(emailAddress: "demo@example.com", displayName: "Demo", provider: .imap)
+            demo.id = demoId
+            try demo.insert(db)
+            for (path, role) in [("INBOX", FolderRole.inbox), ("SENT", .sent), ("DRAFT", .drafts), ("TRASH", .trash)] {
+                try Folder(name: path, path: path, role: role, accountId: demoId).insert(db)
+            }
+            var draft = Draft(
+                id: "post-send-demo-draft", accountId: demoId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Demo send", body: "hello", replyToId: nil, isForward: false,
+                editHistoryJSON: nil, createdAt: 1, updatedAt: 1)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: demoId, provider: DemoProvider(accountId: demoId))
+
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [],
+            "Drafts": [Self.message(uid: draftUID, id: draftRfc822)],
+        ])
+        server.setUidValidity(Self.draftsEpoch, for: "Drafts")
+        server.expectMutation(rfc822MessageId: draftRfc822)
+        try server.start()
+        defer { server.stop() }
+
+        // The demo send: no undo hold, so the drain sends it at once and then
+        // sits in its post-send gap holding `isDrainingOutbox`.
+        let demoAccount = try #require(try await pool.read { db in try Account.fetchOne(db, key: demoId) })
+        _ = try await AccountManager.shared.queueSend(
+            draft: DraftMessage(to: ["someone@example.com"], subject: "Demo send", body: "hello"),
+            from: demoAccount, draftId: "post-send-demo-draft", instanceEpoch: "E1", holdsForUndo: false)
+        var sentCopy: MessageHeader?
+        for _ in 0..<200 {
+            sentCopy = try await pool.read { db in
+                try MessageHeader
+                    .filter(Column("accountId") == demoId && Column("folderPath") == "SENT")
+                    .fetchOne(db)
+            }
+            if sentCopy != nil { break }
+            await AccountManager.shared.drainOutbox()
+            try await Task.sleep(nanoseconds: Self.outboxLatchPollNanoseconds)
+        }
+        try #require(sentCopy != nil, "the demo send left no Sent copy")
+        // Non-vacuity: the case exists only while that drain holds the latch.
+        #expect(await AccountManager.shared.isDrainingOutbox,
+                "precondition: the demo send's drain should still be in its post-send gap")
+
+        try Self.insertCompletedSend(
+            accountId: accountId, serverDraftId: "\(draftUID)",
+            draftUidValidity: Self.draftsEpoch,
+            draftServerFolderPath: "Drafts",
+            pool: pool)
+
+        let provider = Self.provider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        try await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
+            try await Self.reconcileOutboxAndRequireItRan(pool, accountId: accountId)
+            await Self.drainUntilSettled(pool)
+        }
+
+        #expect(server.messageIDs(in: "Drafts").isEmpty,
+                "the sent draft is still on the server (\(server.messageIDs(in: "Drafts"))): the reconcile was skipped behind the demo send's drain")
+        #expect(server.wrongMessageViolations().isEmpty,
+                "the cleanup mutated a message the send never named: \(server.wrongMessageViolations())")
+        let remaining = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(remaining.isEmpty, "the cleanup op neither completed nor terminated")
+
+        // Leave no drain running for the next test.
+        let clear = await Self.waitForOutboxLatchClear()
+        #expect(clear, "an outbox drain was still running at the end of the test")
+        await AccountManager.shared.unregisterProviderForTesting(accountId: demoId)
     }
 
 }
