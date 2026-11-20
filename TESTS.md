@@ -1384,10 +1384,12 @@ with no content; the report sheet's extra line appears only for this report; and
 window and reads them through their accessibility elements (`HostedAccessibility`): the popover is
 presented by itself on the first landed open, also when the same mounted view goes from not landed to
 landed, and not on a later open; the default tip gate holds it back while onboarding is incomplete;
-"Report a concern" hands over to the sheet, whose Report submits a `.summary` report with the chat's
+"Report a concern" opens the sheet over the popover, whose Report submits a `.summary` report with the chat's
 content, including replies still sending or not sent (captured through the sheet's `send`
-parameter); a cancelled report never reopens the sheet, and an accepted one closes it and shows
-"Report Submitted"; the glyph has its label, hint and a full 44-point target at the trailing edge,
+parameter); once a report is done no popover remains and the notice never opens by itself again; a
+cancelled report never reopens the sheet, and an accepted one closes it and shows "Report
+Submitted"; two chats landing in one frame open it at most once, and if neither showed it a later
+open does; the glyph has its label, hint and a full 44-point target at the trailing edge,
 and the subject stays centred. A control pins that the long-press sheet still sends its own type and
 content with no extra line. TipKit is not used for the flag, because its store cannot be reset inside
 the test process (ADR-IOS-085), so a tip's show-once rule could not be tested.

@@ -115,6 +115,9 @@ struct ReportConcernSheetModifier: ViewModifier {
     /// An extra line saying what the report sends, when that is more than the pressed content.
     let contentNotice: String?
     let send: ReportConcernSend
+    /// Called once the report is done: the sheet closed with nothing more to show, or the
+    /// Submitted alert was dismissed.
+    var onFinish: (() -> Void)?
 
     @State private var showSubmitted = false
     @State private var selectedCategory: ReportCategory = .offensive
@@ -126,8 +129,12 @@ struct ReportConcernSheetModifier: ViewModifier {
             .sheet(isPresented: $isPresented) {
                 reportSheet
             }
+            .onChange(of: isPresented) { _, shows in
+                // Cancel, a swipe down, or a report the backend did not take.
+                if !shows, !showSubmitted { onFinish?() }
+            }
             .alert("Report Submitted", isPresented: $showSubmitted) {
-                Button("OK", role: .cancel) {}
+                Button("OK", role: .cancel) { onFinish?() }
             } message: {
                 Text("Thank you. We'll review this content.")
             }
@@ -210,9 +217,11 @@ extension View {
         contentType: ReportContentType,
         content: @escaping () -> String,
         contentNotice: String? = nil,
-        send: @escaping ReportConcernSend = ReportConcernService.sendReport
+        send: @escaping ReportConcernSend = ReportConcernService.sendReport,
+        onFinish: (() -> Void)? = nil
     ) -> some View {
         modifier(ReportConcernSheetModifier(isPresented: isPresented, contentType: contentType,
-                                            content: content, contentNotice: contentNotice, send: send))
+                                            content: content, contentNotice: contentNotice, send: send,
+                                            onFinish: onFinish))
     }
 }

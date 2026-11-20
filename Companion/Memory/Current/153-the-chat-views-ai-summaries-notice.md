@@ -14,6 +14,13 @@ and "Report a concern". The chat pill keeps its own "AI responses may contain er
 - **Why not a TipKit tip:** TipKit's datastore is configured by the test host and cannot be reset
   in-process (ADR-IOS-085), so a tip's show-once behaviour cannot be tested. A plain flag with an
   injectable `UserDefaults` can.
+- **Presentation:** the shown flag is set only when UIKit puts the popover in a window (a small
+  `WindowProbe`), because SwiftUI runs a popover's `onAppear` and `onDisappear` even when UIKit
+  refuses or has not finished the presentation. The popover itself presents the report sheet, so
+  the two never compete for one presenter; when the report is done (Cancel, a swipe down, a report
+  not taken, or OK on "Report Submitted", via the sheet's `onFinish`) the popover closes. Two
+  popovers asked for in the same frame may both be refused: then nothing shows and the notice stays
+  due. Debug builds trace all of this with `[AINotice` lines.
 - **Report:** "Report a concern" opens the shared report sheet (`reportConcernSheet`, extracted from
   the long-press `ReportConcernModifier`) with type `.summary` and every summary in the chat, the
   emails and the replies still sending or not sent, newest first

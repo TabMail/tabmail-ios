@@ -13,8 +13,9 @@ import UIKit
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. Once the chat lands on the install's first open, the popover is on screen by itself; while
 ///     tips are held back, or on a later open, nothing is presented.
-///  2. "Report a concern" closes the popover and opens the report sheet with the line saying the
-///     chat's summaries are sent; Report sends exactly the content the chat hands it.
+///  2. "Report a concern" opens the report sheet over the popover, with the line saying the chat's
+///     summaries are sent; Report sends exactly the content the chat hands it; once the report is
+///     done no popover remains, and the notice never opens by itself again.
 ///  3. The glyph reads "AI summaries, may contain errors" with its hint, keeps a full-size tap
 ///     target, and leaves the subject centred.
 @Suite("Chat AI summaries notice, hosted", .serialized, .processGlobalState)
@@ -116,8 +117,24 @@ struct ChatAISummariesNoticeHostedTests {
         HostedAccessibility.elements(under: view).first { $0.accessibilityLabel == label }
     }
 
+    /// The presentation on top: the report sheet sits on the popover that presents it.
+    private static func topPresented(_ controller: UIViewController) -> UIViewController? {
+        var top = controller.presentedViewController
+        while let next = top?.presentedViewController { top = next }
+        return top
+    }
+
     private static func presentedLabels(_ controller: UIViewController) -> [String] {
-        controller.presentedViewController.map { HostedAccessibility.labels(in: $0.view) } ?? []
+        topPresented(controller).map { HostedAccessibility.labels(in: $0.view) } ?? []
+    }
+
+    /// Hosts a landed button on `firstOpen` and checks that it does not open by itself.
+    private static func expectNeverOpensAgain(_ firstOpen: AISummariesNotice.FirstOpen) async throws {
+        #expect(!firstOpen.isDue(landed: true, tipsAllowed: true), "the notice is used up")
+        try await hosting(button(landed: true, firstOpen: firstOpen, tipsAllowed: true)) { controller in
+            try await Task.sleep(for: .seconds(1))
+            #expect(controller.presentedViewController == nil, "a later open presents nothing")
+        }
     }
 
     private static func button(landed: Bool, firstOpen: AISummariesNotice.FirstOpen, tipsAllowed: Bool,
@@ -175,8 +192,9 @@ struct ChatAISummariesNoticeHostedTests {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
         let sent = Sent()
         let content = "Newest summary\n\nOldest summary"
+        let firstOpen = Self.freshFirstOpen()
         try await HostedAccessibility.withAutomation {
-            try await Self.hosting(Self.button(landed: false, firstOpen: Self.freshFirstOpen(), tipsAllowed: true,
+            try await Self.hosting(Self.button(landed: false, firstOpen: firstOpen, tipsAllowed: true,
                                                sent: sent, content: content)) { controller in
                 let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))
                 #expect(glyph.accessibilityActivate(), "the glyph takes a press")
@@ -188,8 +206,8 @@ struct ChatAISummariesNoticeHostedTests {
                 let sheet = Self.presentedLabels(controller)
                 #expect(sheet.contains(AISummariesNotice.reportNotice), "the sheet says the summaries are sent: \(sheet)")
                 #expect(sheet.contains(ReportConcernSheetText.storedForReview), "and keeps the consent line: \(sheet)")
-                #expect(!sheet.contains(AISummariesNotice.title), "the popover has closed: \(sheet)")
-                let sheetView = try #require(controller.presentedViewController?.view)
+                #expect(!sheet.contains(AISummariesNotice.title), "the sheet is on top: \(sheet)")
+                let sheetView = try #require(Self.topPresented(controller)?.view)
                 let submit = try #require(Self.element("Report", in: sheetView), "\(sheet)")
                 #expect(submit.accessibilityActivate(), "Report takes a press")
                 try await Self.waitUntil { !sent.contents.isEmpty }
@@ -198,7 +216,11 @@ struct ChatAISummariesNoticeHostedTests {
                 #expect(sent.reports.count == 1)
                 #expect(sent.reports.first?.0 == .summary, "a summary report")
                 #expect(sent.reports.first?.1 == content, "with the newest-first content")
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                #expect(controller.presentedViewController == nil,
+                        "the sheet closed and no popover remains: \(String(describing: Self.topPresented(controller)))")
             }
+            try await Self.expectNeverOpensAgain(firstOpen)
         }
     }
 
@@ -321,7 +343,7 @@ struct ChatAISummariesNoticeHostedTests {
         let glyph = try #require(element(AISummariesNotice.accessibilityLabel, in: controller.view))
         #expect(glyph.accessibilityActivate())
         try await waitUntil { presentedLabels(controller).contains(AISummariesNotice.reportTitle) }
-        let popover = try #require(controller.presentedViewController?.view)
+        let popover = try #require(topPresented(controller)?.view)
         let report = try #require(element(AISummariesNotice.reportTitle, in: popover))
         #expect(report.accessibilityActivate())
         try await waitUntil { presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
@@ -330,15 +352,16 @@ struct ChatAISummariesNoticeHostedTests {
     @Test("After one report, closing the popover again opens no sheet")
     func aClosedPopoverDoesNotReopenTheSheet() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let firstOpen = Self.freshFirstOpen()
         try await HostedAccessibility.withAutomation {
-            try await Self.hosting(Self.button(landed: false, firstOpen: Self.freshFirstOpen(), tipsAllowed: true,
+            try await Self.hosting(Self.button(landed: false, firstOpen: firstOpen, tipsAllowed: true,
                                                sent: Sent())) { controller in
                 try await Self.openReport(in: controller)
-                let sheetView = try #require(controller.presentedViewController?.view)
+                let sheetView = try #require(Self.topPresented(controller)?.view)
                 let cancel = try #require(Self.element("Cancel", in: sheetView))
                 #expect(cancel.accessibilityActivate())
                 try await Self.waitUntil { controller.presentedViewController == nil }
-                #expect(controller.presentedViewController == nil, "control: the sheet closed")
+                #expect(controller.presentedViewController == nil, "Cancel closes the sheet and the popover")
                 // Open the popover and close it without reporting.
                 let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))
                 #expect(glyph.accessibilityActivate())
@@ -350,6 +373,7 @@ struct ChatAISummariesNoticeHostedTests {
                 #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
                         "no sheet after a plain close: \(Self.presentedLabels(controller))")
             }
+            try await Self.expectNeverOpensAgain(firstOpen)
         }
     }
 
@@ -358,18 +382,26 @@ struct ChatAISummariesNoticeHostedTests {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
         let sent = Sent()
         sent.accepted = true
+        let firstOpen = Self.freshFirstOpen()
         try await HostedAccessibility.withAutomation {
-            try await Self.hosting(Self.button(landed: false, firstOpen: Self.freshFirstOpen(), tipsAllowed: true,
+            try await Self.hosting(Self.button(landed: false, firstOpen: firstOpen, tipsAllowed: true,
                                                sent: sent, content: "Summary")) { controller in
                 try await Self.openReport(in: controller)
-                let sheetView = try #require(controller.presentedViewController?.view)
+                let sheetView = try #require(Self.topPresented(controller)?.view)
                 let submit = try #require(Self.element("Report", in: sheetView))
                 #expect(submit.accessibilityActivate())
-                try await Self.waitUntil { (controller.presentedViewController as? UIAlertController)?.title == "Report Submitted" }
-                #expect((controller.presentedViewController as? UIAlertController)?.title == "Report Submitted",
-                        "the sheet closed and the alert shows: \(String(describing: controller.presentedViewController))")
+                try await Self.waitUntil { (Self.topPresented(controller) as? UIAlertController)?.title == "Report Submitted" }
+                let alert = try #require(Self.topPresented(controller) as? UIAlertController,
+                                         "the sheet closed and the alert shows: \(String(describing: Self.topPresented(controller)))")
+                #expect(alert.title == "Report Submitted")
                 #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "the sheet is gone")
+                let ok = try #require(Self.element("OK", in: alert.view), "\(HostedAccessibility.labels(in: alert.view))")
+                #expect(ok.accessibilityActivate())
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                #expect(controller.presentedViewController == nil,
+                        "after OK no popover remains: \(String(describing: Self.topPresented(controller)))")
             }
+            try await Self.expectNeverOpensAgain(firstOpen)
         }
     }
 
@@ -435,17 +467,23 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
-    @Test("Two mounted chats landing, in either order or together, open the notice exactly once")
+    @Test("Two mounted chats landing open the notice at most once: one after the other exactly once; in one frame at most once, and a notice nobody saw opens on a later open")
     func twoChatsOpenItOnce() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted view")
         for order in [[0, 1], [1, 0], [nil]] as [[Int?]] {
             let chats = [Landing(), Landing()]
+            let firstOpen = Self.freshFirstOpen()
+            let sameFrame = order == [nil]
             try await HostedAccessibility.withAutomation {
-                try await Self.hosting(TwoChatsHost(first: chats[0], second: chats[1], firstOpen: Self.freshFirstOpen())) { controller in
+                try await Self.hosting(TwoChatsHost(first: chats[0], second: chats[1], firstOpen: firstOpen)) { controller in
                     var opens = 0
                     for step in order {
                         if let step { chats[step].landed = true } else { chats.forEach { $0.landed = true } }
-                        try await Self.waitUntil { controller.presentedViewController != nil }
+                        if sameFrame {
+                            try await Task.sleep(for: .seconds(1))
+                        } else {
+                            try await Self.waitUntil { controller.presentedViewController != nil }
+                        }
                         try await Task.sleep(for: .milliseconds(500))
                         if Self.presentedLabels(controller).contains(AISummariesNotice.title) {
                             opens += 1
@@ -455,8 +493,24 @@ struct ChatAISummariesNoticeHostedTests {
                     }
                     try await Task.sleep(for: .seconds(1))
                     #expect(controller.presentedViewController == nil, "order \(order): nothing more opens")
-                    #expect(opens == 1, "order \(order): exactly one open, got \(opens)")
+                    if sameFrame {
+                        // Two popovers asked for in one update: UIKit may show neither. At most one,
+                        // and a notice nobody saw is still due.
+                        #expect(opens <= 1, "same frame: at most one open, got \(opens)")
+                        if opens == 0 {
+                            #expect(firstOpen.isDue(landed: true, tipsAllowed: true), "same frame: nothing shown, still due")
+                        }
+                    } else {
+                        #expect(opens == 1, "order \(order): exactly one open, got \(opens)")
+                    }
                 }
+                guard sameFrame, firstOpen.isDue(landed: true, tipsAllowed: true) else { return }
+                // A later single open shows it, exactly once.
+                try await Self.hosting(Self.button(landed: true, firstOpen: firstOpen, tipsAllowed: true)) { controller in
+                    try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "a later open shows it")
+                }
+                try await Self.expectNeverOpensAgain(firstOpen)
             }
         }
     }

@@ -84,7 +84,6 @@ struct AISummariesNoticeButton: View {
     @State private var showsNotice = false
     /// The popover was asked for by the landing, not by a tap.
     @State private var autoRequested = false
-    @State private var reportRequested = false
     @State private var showsReport = false
     /// UIKit has put the popover in a window. SwiftUI runs the popover's `onAppear` even when UIKit
     /// refuses the presentation (something else is presented), so only this counts as shown.
@@ -135,23 +134,19 @@ struct AISummariesNoticeButton: View {
                     noticeDebugLog(tag, "marked shown")
                 } onDetach: {
                     noticeDebugLog(tag, "probe detached")
-                })
-                .onDisappear {
-                    noticeDebugLog(tag, "popover onDisappear; reportRequested=\(reportRequested)")
                     onScreen = false
-                    // The sheet waits until the popover has gone: UIKit refuses a second
-                    // presentation while the popover is still closing.
-                    if reportRequested {
-                        reportRequested = false
-                        showsReport = true
-                        noticeDebugLog(tag, "sheet requested")
-                    }
-                }
+                })
+                // The popover, which is on screen, presents the report sheet itself, so the two
+                // never compete for one presenter. When the report is done, the popover closes.
+                .reportConcernSheet(isPresented: $showsReport, contentType: .summary,
+                                    content: reportContent, contentNotice: AISummariesNotice.reportNotice,
+                                    send: send, onFinish: {
+                                        noticeDebugLog(tag, "report finished, closing the popover")
+                                        showsNotice = false
+                                    })
         }
         .onChange(of: showsNotice) { _, shows in noticeDebugLog(tag, "showsNotice -> \(shows)") }
         .onChange(of: showsReport) { _, shows in noticeDebugLog(tag, "showsReport -> \(shows)") }
-        .reportConcernSheet(isPresented: $showsReport, contentType: .summary,
-                            content: reportContent, contentNotice: AISummariesNotice.reportNotice, send: send)
         .task(id: landed) {
             // One decision per open, read once from the flag and the tip gate, just before asking.
             if firstOpen.isDue(landed: landed, tipsAllowed: tipsAllowed()) {
@@ -182,8 +177,7 @@ struct AISummariesNoticeButton: View {
                 .foregroundStyle(Theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             Button {
-                reportRequested = true
-                showsNotice = false
+                showsReport = true
             } label: {
                 Label(AISummariesNotice.reportTitle, systemImage: "exclamationmark.bubble")
             }
