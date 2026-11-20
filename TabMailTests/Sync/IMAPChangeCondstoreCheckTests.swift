@@ -285,35 +285,43 @@ struct IMAPChangeCondstoreCheckTests {
     static func trackedThreeWithASpentUID(_ w: IMAPChangeEngineTests.World) async throws {
         w.server.honorSearchUIDSetCriterion()
         w.server.setExpungeKeepsHighestModSeq(true, for: IMAPChangeEngineTests.path)
-        _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
-        _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+        // A baseline pass (its listing and commit track the folder), then a tracked read.
+        try await C.foregroundPass(w)
+        try await C.foregroundPass(w)
+        #expect(try C.tracked(w), "setup: tracked")
         #expect(try cursor(w.folder().changeCursor).messageCount == 3, "setup: an established bookmark")
         C.add([4], to: w.server, IMAPChangeEngineTests.path)
         C.remove([4], from: w.server, IMAPChangeEngineTests.path)
     }
 
-    @Test("An established bookmark is not poisoned by a SELECT that says EXISTS 0 while SEARCH lists the live UIDs; the next read applies a flag change")
+    @Test("A SELECT that says EXISTS 0 while SEARCH lists the live UIDs over a tracked folder: the rows and the bookmark stay, coverage is cleared, and the next listing tracks the folder again and applies a flag change")
     func existsZeroOverAnEstablishedBookmarkKeepsIt() async throws {
         let path = IMAPChangeEngineTests.path
         try await IMAPChangeEngineTests.withWorld(
             "cs-exists0", capabilities: C.condstore, serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3]
         ) { w in
             try await Self.trackedThreeWithASpentUID(w)
+            let before = try Self.cursor(w.folder().changeCursor)
             w.server.setSelectExists(0, forNext: 1, of: path)
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
-            #expect(try Self.cursor(w.folder().changeCursor).messageCount == 3, "the count is not poisoned")
+            try await C.foregroundPass(w)
+            let contradicted = try w.folder()
+            #expect(!FolderChangeState(raw: contradicted.changeState).tracking, "the contradictory read clears the folder's coverage")
+            let kept = try Self.cursor(contradicted.changeCursor)
+            #expect(kept.messageCount == 3, "the count is not poisoned")
+            #expect(kept.uidNext == before.uidNext && kept.highestModSeq == before.highestModSeq, "the prior bookmark is kept")
             #expect(try w.uids() == ["1", "2", "3"], "the live rows survive")
 
             w.server.setFlags(["\\Seen"], in: path, uid: 2)
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            try await C.foregroundPass(w, listing: true)
             let folderId = w.folderId
             let read = try await w.pool.read { db in
                 try Bool.fetchOne(db, sql: "SELECT isRead FROM messageHeader WHERE folderId = ? AND messageId = '2'",
                                   arguments: [folderId])
             }
-            #expect(read == true, "the next read applies the flag change")
+            #expect(read == true, "the next pass applies the flag change")
+            #expect(try w.uids() == ["1", "2", "3"], "the live rows survive the listing")
             let folder = try w.folder()
-            #expect(FolderChangeState(raw: folder.changeState).tracking, "still tracked")
+            #expect(FolderChangeState(raw: folder.changeState).tracking, "the next listing tracks the folder again")
             #expect(try Self.cursor(folder.changeCursor).failingSince == nil, "no failure waits for the lapse")
         }
     }

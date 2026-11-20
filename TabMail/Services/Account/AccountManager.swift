@@ -420,6 +420,15 @@ actor AccountManager {
         await syncEngine.register(accountId: account.id, provider: provider, workQueue: queue)
     }
 
+    /// Test seam: the post-drain phase (`AccountOperationExecutor.finishDrain`)
+    /// of a drain that recorded `folderKeys` (`"accountId|path"`) as folders to
+    /// sync, without executing any operation.
+    func finishDrainForTesting(foldersToSync folderKeys: [String]) async {
+        operationExecutor.beginDrain(using: self)
+        operationExecutor.recordFoldersToSyncForTesting(folderKeys, using: self)
+        await operationExecutor.finishDrain(using: self)
+    }
+
     /// Test seam: undo `connectProviderForTesting`.
     func disconnectProviderForTesting(accountId: String) async {
         providers.removeValue(forKey: accountId)

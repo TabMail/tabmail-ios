@@ -216,6 +216,93 @@ struct IMAPChangeTurnAndGuardTests {
         if passDone.flag.withLock({ $0 }) { await pass.value }
     }
 
+    /// The post-commit listings (the post-send Sent listing and the post-drain
+    /// folder listing) wait for the account's sync turn holding a captured
+    /// provider and folder. An account removed while they wait is never listed
+    /// again and its server is never logged in to again: the captured IMAP
+    /// provider still holds its password. The live-account control is
+    /// `postSendBurstDuringAHeldPassNeverWedgesTheAccount`, where the same
+    /// waiting listings do reach the server.
+    @Test("Post-send and post-drain listings waiting for the turn when the account is removed start no login and no listing once the turn is released")
+    func listingsWaitingForTheTurnStopAtAccountRemoval() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "removed-while-waiting-" + UUID().uuidString
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "Sent", role: .sent, pool: pool)
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [1, 2, 3].map(IMAPChangeReaderTests.message), "Sent": []])
+        try server.start()
+        defer { server.stop() }
+        let imap = IMAPProvider(
+            host: "127.0.0.1", port: server.port, username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        await AccountManager.shared.connectProviderForTesting(account: account, provider: imap)
+        let engine = await AccountManager.shared.syncEngine
+
+        var sent = OutboxMessage(
+            accountId: accountId,
+            draft: DraftMessage(to: ["recipient@example.com"], subject: "sent before removal", body: "sent already"))
+        sent.status = OutboxStatus.sending.rawValue
+        sent.sentAt = Date()
+        sent.appendedToSent = true
+        let row = sent
+        try await pool.write { db in try row.insert(db) }
+
+        // Hold the account's turn until the removal has committed.
+        let release = Done()
+        let holderDone = Done()
+        Task {
+            await engine.oneSyncAtATime(accountId: accountId) {
+                while !release.flag.withLock({ $0 }) {
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+            }
+            holderDone.flag.withLock { $0 = true }
+        }
+        let held = Date().addingTimeInterval(Self.raceBoundSeconds)
+        while !(await engine.syncPassRunning.contains(accountId)), Date() < held {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(await engine.syncPassRunning.contains(accountId), "setup: the turn is held")
+        func waiters() async -> Int { await engine.syncPassWaiters[accountId]?.count ?? 0 }
+
+        // Both producers start and wait for the turn.
+        await AccountManager.shared.reconcileOutbox()
+        let drainDone = Done()
+        Task {
+            await AccountManager.shared.finishDrainForTesting(foldersToSync: ["\(accountId)|INBOX"])
+            drainDone.flag.withLock { $0 = true }
+        }
+        let deadline = Date().addingTimeInterval(Self.raceBoundSeconds)
+        while await waiters() < 2, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(await waiters() == 2, "setup: the post-send and post-drain listings wait for the turn")
+
+        // The account is removed (committed removal), then the turn is released.
+        await AccountManager.shared.disconnectAccount(account, deletingCredentials: [])
+        #expect(AccountManager.shared.isRuntimeRemoved(accountId), "setup: the removal committed")
+        let start = server.recordedCommands().count
+        release.flag.withLock { $0 = true }
+
+        try await Self.waitUntil { holderDone.flag.withLock { $0 } && drainDone.flag.withLock { $0 } }
+        let settle = Date().addingTimeInterval(Self.raceBoundSeconds)
+        while await waiters() > 0 || (await engine.syncPassRunning.contains(accountId)), Date() < settle {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        // A listing would log in and SELECT within this watch.
+        try await Task.sleep(nanoseconds: UInt64(Self.quietWatchSeconds * 1_000_000_000))
+        let after = server.recordedCommands().dropFirst(start).filter {
+            let u = $0.uppercased()
+            return u.hasPrefix("LOGIN") || u.hasPrefix("AUTHENTICATE") || u.hasPrefix("SELECT")
+                || u.hasPrefix("EXAMINE") || u.contains("FETCH") || u.hasPrefix("STATUS")
+        }
+        #expect(after.isEmpty, "a removed account was logged in to or listed: \(Array(after))")
+    }
+
     /// How long a full sync over one quarantined folder may take before it
     /// counts as stuck (a bound, never a sleep).
     static let quarantinedFullSyncBoundSeconds: TimeInterval = 20

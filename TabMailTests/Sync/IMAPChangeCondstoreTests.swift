@@ -283,23 +283,47 @@ struct IMAPChangeCondstoreTests {
         return FolderChangeState(raw: folder.changeState).tracking && folder.changeCursor != nil
     }
 
+    /// One real foreground pass (`SyncEngine.sync`): the change read, the
+    /// listings it needs, and the baseline commit that alone turns tracking on
+    /// (`commitChangeBaseline`). The recent-sync throttle is cleared so the pass
+    /// runs; `listing` also makes the scheduled full sync due.
+    static func foregroundPass(_ w: E.World, listing: Bool = false) async throws {
+        let id = w.account.id
+        try await w.pool.write { db in
+            try db.execute(sql: "UPDATE account SET lastSyncedAt = NULL WHERE id = ?", arguments: [id])
+            if listing {
+                try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [id])
+            }
+        }
+        let account = try #require(try w.pool.read { db in try Account.fetchOne(db, key: id) })
+        _ = try await w.engine.sync(account: account)
+    }
+
+    static func bookmarkDropped(_ w: E.World) throws -> Bool {
+        let folder = try w.folder()
+        return !FolderChangeState(raw: folder.changeState).tracking && folder.changeCursor == nil
+    }
+
     @Test("A staged notification for a message a tracked read removed comes back with the merge, and the next sync removes it for good")
     func stagedMessageARemovalProvedGoneIsSettledByTheNextSync() async throws {
         try await E.withWorld("cs-nse-gone", capabilities: Self.condstore, serverUIDs: [1, 2, 3, 4], localUIDs: [1, 2, 3, 4]) { w in
             w.server.honorSearchUIDSetCriterion()
             w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
-            #expect(try Self.tracked(w), "setup: tracked")
+            try await Self.foregroundPass(w)
+            #expect(try Self.tracked(w), "setup: the baseline pass's listing and commit track the folder")
             Self.remove([2], from: w.server, E.path)
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            try await Self.foregroundPass(w)
             #expect(try !w.uids().contains("2"), "setup: the tracked read removed 2")
+            #expect(try Self.tracked(w), "before the merge: tracked")
 
             let kept = try await Self.stageAndMerge(2, w)
             #expect(kept, "the staged row is kept")
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            #expect(try w.uids().contains("2"), "the merge brought 2 back")
+            #expect(try Self.bookmarkDropped(w), "after the merge: the bookmark is dropped and the folder untracked")
+            try await Self.foregroundPass(w)
             #expect(try w.uids() == ["1", "3", "4"], "the next sync removes the merged-back message")
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            #expect(try Self.tracked(w), "and tracks the folder again")
+            try await Self.foregroundPass(w)
             #expect(try w.uids() == ["1", "3", "4"], "and it stays gone")
         }
     }
@@ -312,18 +336,19 @@ struct IMAPChangeCondstoreTests {
         try await E.withWorld("cs-nse", capabilities: Self.condstore, serverUIDs: world.server, localUIDs: world.local) { w in
             w.server.honorSearchUIDSetCriterion()
             w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            try await Self.foregroundPass(w)
+            #expect(try Self.tracked(w), "setup: the baseline pass's listing and commit track the folder")
             Self.add([arrival], to: w.server, E.path)
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            try await Self.foregroundPass(w)
             #expect(try w.uids().contains(String(arrival)), "setup: the tracked read applied the arrival")
-            #expect(try Self.tracked(w), "setup: tracked")
+            #expect(try Self.tracked(w), "before the merge: tracked")
             #expect(try !w.uids().contains(String(live)), "setup: the live older message is not held")
 
             let kept = try await Self.stageAndMerge(live, w)
             #expect(try w.uids().contains(String(live)), "the live staged message materialises")
             #expect(kept, "its header-only staged copy stays for the rest of its stages")
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
-            _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+            #expect(try Self.bookmarkDropped(w), "after the merge: the bookmark is dropped and the folder untracked")
+            try await Self.foregroundPass(w)
             #expect(try w.uids().contains(String(live)), "the live message survives the listing")
             #expect(try Self.tracked(w), "the folder is tracked again")
         }

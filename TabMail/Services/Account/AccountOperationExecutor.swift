@@ -125,6 +125,14 @@ final class AccountOperationExecutor {
     func beginDrain(using manager: isolated AccountManager) { drainContext = DrainContext() }
     func prepareDrain(using manager: isolated AccountManager) { manager.pruneRecentlyCompleted() }
 
+    #if DEBUG
+    /// Test seam: record folders to sync in the current drain, as a retired
+    /// operation does (`AccountManager.finishDrainForTesting`).
+    func recordFoldersToSyncForTesting(_ folderKeys: [String], using manager: isolated AccountManager) {
+        drainContext.foldersToSync.formUnion(folderKeys)
+    }
+    #endif
+
     /// A provider outcome whose LOCAL write could not commit. Full/partial
     /// cases retain settlement proof; providerFailure retains one eligible failure
     /// event, whose accounting is evaluated against the live row on replay.

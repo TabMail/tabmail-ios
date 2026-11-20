@@ -597,7 +597,9 @@ extension SyncEngine {
     /// move, step 6 of an epoch rebuild. Publishes `.checking` for the account.
     /// Lists through the one classifier (`listFolder`): the outcome says what
     /// the server proved, and no listing error escapes it (#755). Returns nil
-    /// when the folder's armed turnover reaction ran instead. Throws only
+    /// when the folder's armed turnover reaction ran instead, or when the
+    /// account was removed or the folder deleted before the sync turn was
+    /// acquired (nothing is listed). Throws only
     /// `CancellationError`.
     @discardableResult
     func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws -> ListingOutcome? {
@@ -633,8 +635,25 @@ extension SyncEngine {
         Task { @MainActor in AccountManagerState.shared.setSyncPhase(.checking, forAccount: folder.accountId) }
         // Inside the account's sync turn: no listing commits between a change
         // read and its apply (#755).
-        let outcome = await oneSyncAtATime(accountId: folder.accountId) {
-            await listFolder(folder, provider: provider, limit: SyncConfig.syncMessageLimit)
+        //
+        // The post-send and post-drain listings wait for this turn without a
+        // work-queue slot, holding a captured provider and folder. An account
+        // removed or a folder deleted while they wait must not be listed: the
+        // captured IMAP provider would log in again with its retained password.
+        // So the turn's holder re-checks the terminal removal fence and the
+        // folder's current row, and lists nothing when either is gone.
+        let outcome: ListingOutcome? = await oneSyncAtATime(accountId: folder.accountId) {
+            guard !AccountManager.shared.isRuntimeRemoved(folder.accountId) else {
+                BackgroundSyncLogger.logDebug("[Sync] \(folder.name): account removed while waiting for the sync turn; listing skipped")
+                return nil
+            }
+            guard let current = try? await dbPool.read({ [folderId = folder.id] db in
+                try Folder.fetchOne(db, key: folderId)
+            }) else {
+                BackgroundSyncLogger.logDebug("[Sync] \(folder.name): folder gone while waiting for the sync turn; listing skipped")
+                return nil
+            }
+            return await listFolder(current, provider: provider, limit: SyncConfig.syncMessageLimit)
         }
         try Task.checkCancellation()
         // Unread recount is handled when the listing's result is published.
