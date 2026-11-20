@@ -66,11 +66,6 @@ struct RootView: View {
     // UndoReopenCompose so it binds to that retained Draft without accepting a
     // replacement owner or generation.
     private var pendingSendService: PendingSendService { PendingSendService.shared }
-    /// The compose to reopen after a confirmed Undo (`PendingSendService.reopenSnapshot`).
-    private var reopenSnapshot: Binding<PendingSendService.ReopenSnapshot?> {
-        Binding(get: { pendingSendService.reopenSnapshot },
-                set: { if $0 == nil { pendingSendService.finishReopen() } })
-    }
 
     /// Sync status values — observed once here and published to descendants via
     /// Environment. Centralising here keeps the observer alive across sidebar
@@ -449,12 +444,10 @@ struct RootView: View {
         // Undo-Send reopen: the Outbox cancellation was confirmed and the Draft
         // row remains durable. UndoReopenCompose resolves the snapshot's exact
         // owner/generation authority and binds the fresh ComposeView to that row;
-        // `PendingSendService.undo()` already returned that row to Drafts in the
+        // `PendingSendService.undoAndReopen()` already returned that row to Drafts in the
         // cancellation's own write, or reports that it did not (the compose then
         // opens as unsaved).
-        .fullScreenCover(item: reopenSnapshot) { snapshot in
-            UndoReopenCompose(snapshot: snapshot)
-        }
+        .modifier(UndoReopenPresenter())
         // loadInitialData() is called eagerly in TabMailApp.init() (after DB creation)
         // so isInitialLoadComplete is already true before the first render.
         .task {

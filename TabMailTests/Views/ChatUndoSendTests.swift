@@ -383,10 +383,12 @@ struct ChatUndoSendTests {
         let text = try Self.source("TabMail/Views/RootView.swift")
         #expect(text.contains("if let pending = pendingSendService.visibleToast {"))
         #expect(text.contains("onUndo: { pendingSendService.undoAndReopen() }"))
-        #expect(text.contains("Binding(get: { pendingSendService.reopenSnapshot },") && text.contains(".fullScreenCover(item: reopenSnapshot) {"))
+        #expect(text.contains(".modifier(UndoReopenPresenter())"), "RootView is the one presenter of the reopen")
         let compose = try Self.source("TabMail/Views/Compose/ComposeView.swift")
         #expect(compose.contains("owner: snapshot.sendHasBubbleUndo ? .bubble : .toast"))
-        #expect(text.contains("set: { if $0 == nil { pendingSendService.finishReopen() } })"))
+        let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
+        #expect(inbox.contains(".chatModalSheet(isPresented: $showSearch) {"),
+                "the Search sheet, which can hold a chat, closes for an Undo's outcome")
     }
 
     // MARK: - 6. Owner kept, retry, hand-back
@@ -476,6 +478,48 @@ struct ChatUndoSendTests {
         #expect(try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) } == nil, "control: the Undo was confirmed")
         #expect(!service.isSending, "a cancelled send is no longer sending, at once")
         #expect(service.undoOwner(for: row.id) == nil, "and has no Undo owner left")
+    }
+
+    @Test("A bubble-owned send stops counting as sending once its window and acknowledgement end")
+    func bubbleOwnerExpires() async throws {
+        let service = PendingSendService.shared
+        defer { service.dismiss() }
+        service.dismiss()
+        #expect(!service.isSending, "control: nothing is sending")
+        let id = "o-expiry-\(UUID().uuidString)"
+        let hold = Date().addingTimeInterval(0.5)
+        service.present(outboxId: id, draftId: "d", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
+        #expect(service.isSending, "control: sending during its window")
+        // The owner lives for the rest of the hold plus the queued acknowledgement.
+        let ends = hold.addingTimeInterval(SyncConfig.outboxQueuedAcknowledgementSeconds)
+        let limit = ends.addingTimeInterval(3)
+        while Date() < limit && service.isSending { try await Task.sleep(for: .milliseconds(100)) }
+        #expect(!service.isSending, "the tutorial coach card (it reads isSending) no longer shows a send in progress")
+        #expect(service.undoOwner(for: id) == nil, "and the send has no Undo owner left")
+        #expect(Date() >= ends.addingTimeInterval(-0.2), "control: it ended with its lifetime, not early")
+    }
+
+    @Test("A toast closed after its send's Undo deadline hands nothing to the bubble: no Undo anywhere, and nothing counts as sending")
+    func lateCloseHandsNothingOver() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        service.dismiss()
+        let fixture = try await Self.makeFixture(pool)
+        let chat: Set<String> = [EmailFilter.normalizeMessageId(try #require(fixture.parent.rfc822MessageId))]
+        let row = try await Self.queueReply(fixture, draftId: "draft-late-close")
+        // Past its Undo deadline, still in its queued acknowledgement.
+        let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds - 0.5)
+        try await Self.setHold(pool, row.id, hold)
+        service.present(outboxId: row.id, draftId: "draft-late-close", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .toast)
+        service.dismiss()
+        #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 0, "no Undo on the toast or the bubble")
+        #expect(!service.isSending, "and nothing counts as sending once the toast is closed")
     }
 
     @Test("The bubble's Undo does nothing for a send whose Undo is on the toast")
@@ -846,6 +890,79 @@ struct ChatUndoSendTests {
         try await Task.sleep(for: .milliseconds(300))
         #expect(undo().count == 1 && fromOriginalDeadline(), "still one Undo on the bubble, the reply's own deadline")
         #expect(service.undoOwner(for: reply.id) == .bubble && service.visibleToast?.id == third.id)
+    }
+
+    /// The app's wiring in small: a chat in a sheet that closes for an Undo's outcome (Search's
+    /// `chatModalSheet`), under the one presenter of the reopen (RootView's `UndoReopenPresenter`).
+    private struct ChatInSheetHost: View {
+        let messageId: String
+        @State private var showsSheet = true
+
+        var body: some View {
+            Color.clear
+                .chatModalSheet(isPresented: $showsSheet) {
+                    NavigationStack { ChatThreadView(messageId: messageId) }
+                }
+                .modifier(UndoReopenPresenter())
+        }
+    }
+
+    @Test("Undo from a chat inside a sheet closes the sheet and opens the email's compose at the top level, and a later reopen still opens")
+    func undoInsideASheetReopensAtTheTop() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the bubble in the sheet")
+        try await HostedAccessibility.withAutomation { @MainActor in try await undoInSheetBody() }
+    }
+
+    private func undoInSheetBody() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        service.dismiss()
+        while service.reopenSnapshot != nil { service.finishReopen() }
+        saved.setChatView(on: true)
+        let fixture = try await Self.makeFixture(pool)
+        let reply = try await Self.queueReply(fixture, draftId: "draft-in-sheet", body: "Words of the reply undone in Search")
+        let later = try await Self.queueReply(fixture, draftId: "draft-later", newEmail: true, body: "Words of a later email")
+        let hold = Date().addingTimeInterval(3600)
+        try await Self.setHold(pool, reply.id, hold)
+        try await Self.setHold(pool, later.id, hold)
+        service.present(outboxId: reply.id, draftId: "draft-in-sheet", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        window.rootViewController = UIHostingController(rootView: ChatInSheetHost(messageId: fixture.parent.id))
+        window.makeKeyAndVisible()
+        defer {
+            window.rootViewController?.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func hasUndo() -> Bool { HostedAccessibility.identifiers(in: window).contains(ChatUndoSendStatus.undoId) }
+        func shows(_ words: String) -> Bool { Self.textViews(window).contains { $0.text.contains(words) } }
+
+        try await Self.waitFor { hasUndo() }
+        #expect(service.openChatModals == 1, "control: the chat is inside the open sheet")
+        #expect(HostedAccessibility.activate(ChatUndoSendStatus.undoId, in: window), "the bubble's Undo, inside the sheet")
+        try await Self.waitFor { shows("Words of the reply undone in Search") }
+        #expect(shows("Words of the reply undone in Search"), "the compose opens with the email's words")
+        #expect(service.openChatModals == 0, "the sheet closed first; the compose is at the top level")
+
+        // Close that compose; a later Undo's reopen opens too: nothing waits behind a stuck head.
+        window.rootViewController?.presentedViewController?.dismiss(animated: false)
+        try await Self.waitFor { service.reopenSnapshot == nil }
+        service.present(outboxId: later.id, draftId: "draft-later", instanceEpoch: "E1",
+                        toSummary: "To: someone@example.com", holdUntil: hold, owner: .toast)
+        service.undoAndReopen()
+        try await Self.waitFor { shows("Words of a later email") }
+        #expect(shows("Words of a later email"), "the later reopen opens")
     }
 
     /// The frame of the bubble's text element, in `view`'s coordinates.

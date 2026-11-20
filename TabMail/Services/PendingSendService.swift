@@ -236,6 +236,28 @@ final class PendingSendService {
 
     var reopenSnapshot: ReopenSnapshot? { reopenQueue.first }
 
+    /// Modals open over RootView that can hold a chat, and so a bubble's Undo (the Search sheet,
+    /// `chatModalSheet`). RootView is the one presenter of an Undo's outcome, the reopened compose
+    /// and the "Couldn't undo" notice, and UIKit cannot present it over another modal. So once an
+    /// outcome waits (`outcomeWaits`), those modals close themselves, and RootView presents only
+    /// while none is open (`topLevelReopen`, `topLevelUndoFailureMessage`). The head of the queue
+    /// is never tried under a modal, so it never stalls there and nothing waits behind it.
+    private(set) var openChatModals = 0
+
+    func chatModalOpened() { openChatModals += 1 }
+
+    func chatModalClosed() { openChatModals = max(0, openChatModals - 1) }
+
+    /// An Undo's outcome waits for RootView: a compose to reopen, or the notice that it did not take.
+    /// Set only once the outcome is known, never by the tap itself.
+    var outcomeWaits: Bool { reopenSnapshot != nil || undoFailureMessage != nil }
+
+    /// The reopen RootView presents now: the queue's head, once no chat modal is open.
+    var topLevelReopen: ReopenSnapshot? { openChatModals == 0 ? reopenSnapshot : nil }
+
+    /// The send's undo notice RootView presents now, once no chat modal is open.
+    var topLevelUndoFailureMessage: String? { openChatModals == 0 ? undoFailureMessage : nil }
+
     /// RootView closed the compose of the first reopen; the next one, if any, opens.
     func finishReopen() {
         guard !reopenQueue.isEmpty else { return }
