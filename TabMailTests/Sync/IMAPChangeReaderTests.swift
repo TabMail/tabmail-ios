@@ -2240,7 +2240,7 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("A new arrival already marked \\Deleted is neither fetched nor reported")
+    @Test("A new arrival the server reports as \\Deleted is a removal and is neither fetched nor recorded")
     func deletedArrivalIsExcluded() async throws {
         try await Self.withWorld(inbox: [1, 2]) { w in
             let cursor = try await Self.baseline(w)
@@ -2250,12 +2250,12 @@ struct IMAPChangeReaderTests {
             let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
             #expect(Self.isTracked(changes.status))
             #expect(!changes.records.contains { $0.messageId == "3" })
-            #expect(!changes.removals.contains("3"))
+            #expect(changes.removals.contains("3"), "every server-reported \\Deleted UID is a removal: \(changes.removals)")
             #expect(Self.uidFetches(w, since: start).isEmpty, "the deleted arrival is not fetched: \(Self.uidFetches(w, since: start))")
         }
     }
 
-    @Test("A held message at or above the bookmark's UIDNEXT (a moved-in row) marked \\Deleted is a removal; an unheld one beside it is not")
+    @Test("A held message at or above the bookmark's UIDNEXT (a moved-in row) marked \\Deleted is a removal, and so is an unheld one beside it")
     func deletedHeldArrivalIsRemoved() async throws {
         try await Self.withWorld(inbox: [1, 2]) { w in
             let cursor = try await Self.baseline(w)
@@ -2270,7 +2270,7 @@ struct IMAPChangeReaderTests {
             #expect(Self.isTracked(changes.status))
             #expect(changes.removals.contains("3"), "the held message the server holds as \\Deleted is removed: \(changes.removals)")
             #expect(changes.removals.contains("5"), "above UIDNEXT too: \(changes.removals)")
-            #expect(!changes.removals.contains("4"), "a message the folder does not hold is not reported")
+            #expect(changes.removals.contains("4"), "an unheld \\Deleted UID is a removal too: \(changes.removals)")
             #expect(!changes.records.contains { ["3", "4", "5"].contains($0.messageId) })
             #expect(Self.uidFetches(w, since: start).isEmpty, "none is fetched: \(Self.uidFetches(w, since: start))")
         }

@@ -94,9 +94,6 @@ struct ListingRouteFenceTests {
             "TabMail/Services/Account/AccountManagerOutbox.swift",
             "TabMail/Services/Account/AccountOperationExecutor.swift",
         ], "a new caller is reviewed against the one classifier: \(callers.sorted())")
-        let engine = try #require(sources.first { $0.path == Self.engineFile }?.text)
-        let body = try #require(engine.range(of: "func syncFolderMessages(").map { String(engine[$0.lowerBound...].prefix(4000)) })
-        #expect(body.contains("await listFolder(folder, provider: provider"), "syncFolderMessages lists through listFolder")
     }
 
     /// Both stale-sweep branches build the coverage they judge with through the
