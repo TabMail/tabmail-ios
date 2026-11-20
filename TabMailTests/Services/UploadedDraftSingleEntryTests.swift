@@ -183,6 +183,11 @@ struct UploadedDraftSingleEntryTests {
         #expect(entries.count == 1, "Drafts shows \(entries.count) entries: \(entries.map(\.0.id))")
         guard entries.count == 1 else { return }
         #expect(entries[0].0.id == serverHeaderId)
+        if fixture.kind == .imap {
+            // The server copy's entry keeps the epoch its UID was observed under.
+            #expect(entries[0].0.observedUidValidity == Self.imapEpoch,
+                    "the entry's epoch became \(String(describing: entries[0].0.observedUidValidity))")
+        }
         #expect(entries[0].0.snippet.contains(words))
         #expect(entries[0].1?.htmlContent?.contains(words) == true)
         #expect(try await row(fixture, draftId).serverDraftId == fixture.kind.serverId)
