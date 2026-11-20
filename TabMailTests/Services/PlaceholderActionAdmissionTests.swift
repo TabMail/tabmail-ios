@@ -803,17 +803,6 @@ struct PlaceholderActionAdmissionTests {
         #expect(copy.messageId == "sent-\(queued.outboxId)")
         #expect(isSyntheticPlaceholderId(copy.messageId), "precondition: the Sent copy is a placeholder id")
 
-        // The drain that sent this holds `isDrainingOutbox` through its
-        // post-send gap. A test must not leave it running: a later suite's
-        // `reconcileOutbox()` would see the latch and skip (#1106). Wait,
-        // with a time limit, for the real condition.
-        let latchDeadline = Date().addingTimeInterval(SyncConfig.outboxMinSendGapSeconds * 5)
-        while await AccountManager.shared.isDrainingOutbox, Date() < latchDeadline {
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        #expect(await !AccountManager.shared.isDrainingOutbox,
-                "the demo send's outbox drain was still running after its post-send gap")
-
         await AccountManager.shared.markUnread([copy])
         await AccountManager.shared.markFlagged([copy], flagged: true)
         await AccountManager.shared.awaitWriteQueueDrain()

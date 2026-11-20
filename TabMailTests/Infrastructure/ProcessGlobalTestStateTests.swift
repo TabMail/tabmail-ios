@@ -498,4 +498,67 @@ struct ProcessGlobalTestStateTests {
         thirdEntered.finish()
         #expect(secondRan.withLock { !$0 })
     }
+
+    @Test("a scope that leaves an outbox drain in its post-send gap does not hand it to the next scope")
+    func nextScopeEntersWithNoOutboxDrainRunning() async throws {
+        // #1106: `queueSend` with no undo hold spawns an unawaited drain that
+        // holds `isDrainingOutbox` through `SyncConfig.outboxMinSendGapSeconds`
+        // after it sends. The boundary must settle it, or the next test's
+        // `reconcileOutbox()` skips. Red if `OutboxDrainLatch.settleOrRecord()`
+        // is removed from `ProcessGlobalTestState.withLock`.
+        let demoId = DemoSeed.demoAccountId
+        let heldWhenInnerReturned = Mutex(false)
+
+        try await ProcessGlobalTestState.withLock {
+            let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+            defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+            try await pool.writeWithoutTransaction { db in
+                var demo = Account(emailAddress: "demo@example.com", displayName: "Demo", provider: .imap)
+                demo.id = demoId
+                try demo.insert(db)
+                for (path, role) in [("INBOX", FolderRole.inbox), ("SENT", .sent), ("DRAFT", .drafts), ("TRASH", .trash)] {
+                    try Folder(name: path, path: path, role: role, accountId: demoId).insert(db)
+                }
+                var draft = Draft(
+                    id: "boundary-demo-draft", accountId: demoId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                    subject: "Demo send", body: "hello", replyToId: nil, isForward: false,
+                    editHistoryJSON: nil, createdAt: 1, updatedAt: 1)
+                draft.instanceEpoch = "E1"
+                try draft.insert(db)
+            }
+            try await TestProviderRegistry.withRegisteredProvider(
+                accountId: demoId, provider: DemoProvider(accountId: demoId)
+            ) {
+                let account = try #require(try await pool.read { db in try Account.fetchOne(db, key: demoId) })
+                _ = try await AccountManager.shared.queueSend(
+                    draft: DraftMessage(to: ["someone@example.com"], subject: "Demo send", body: "hello"),
+                    from: account, draftId: "boundary-demo-draft", instanceEpoch: "E1", holdsForUndo: false)
+                // Wait only until the send has landed (the drain is then in its
+                // gap), then return WITHOUT waiting for the latch.
+                var sent = false
+                let deadline = Date().addingTimeInterval(OutboxDrainLatch.Config.waitSeconds)
+                while Date() < deadline {
+                    sent = try await pool.read { db in
+                        try MessageHeader
+                            .filter(Column("accountId") == demoId && Column("folderPath") == "SENT")
+                            .fetchCount(db) > 0
+                    }
+                    if sent { break }
+                    try await Task.sleep(for: .milliseconds(OutboxDrainLatch.Config.pollIntervalMs))
+                }
+                try #require(sent, "the demo send left no Sent copy")
+            }
+            let held = await AccountManager.shared.isDrainingOutbox
+            heldWhenInnerReturned.withLock { $0 = held }
+        }
+
+        // Non-vacuity: the inner scope really did return with the drain running.
+        #expect(heldWhenInnerReturned.withLock { $0 },
+                "precondition: the demo send's drain should still be in its post-send gap when the scope returned")
+
+        try await ProcessGlobalTestState.withLock {
+            #expect(await !AccountManager.shared.isDrainingOutbox,
+                    "the next scope entered while the previous scope's outbox drain still held the latch")
+        }
+    }
 }
