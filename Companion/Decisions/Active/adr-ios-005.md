@@ -41,6 +41,22 @@
 > decide with that one value (2026-11-20). Outside the job, a network NetworkMonitor has not reported yet
 > (`NetworkMonitor.checkExpensiveIfKnown() == nil`) counts as expensive, so Wi-Fi-only holds both the
 > walk and the bodies until the first path update, as `isOnWiFi()` holds on its timeout.
+> *Corrected again 2026-11-20 (#1064 review):* two rules replace parts of the correction above, which is
+> kept as written. (1) For Wi-Fi-only, "on Wi-Fi" means unmetered Wi-Fi everywhere: one predicate,
+> `SyncEngine.onUnmeteredWiFi(NetworkPathFacts)` (path satisfied, uses Wi-Fi, not expensive), is read by
+> the foreground gate (`backfillDownloadsAllowed`, from `NetworkMonitor.checkPathFactsIfKnown()`) and by
+> the job's measurement (`measureJobOnWiFi` over `measureJobPathFacts`, which replaces `isOnWiFi()`; its
+> only caller), whose one value the job's body gate and walk share. A Personal Hotspot (satisfied Wi-Fi
+> marked expensive) is therefore not Wi-Fi: the old `isOnWiFi()` returned true for it, so the job walked and
+> downloaded on a metered hotspot. The job walk is deliberately tightened on hotspots too. The timeout
+> and the hold while unknown are unchanged. (2) While the reading is unknown, each account's scan-only
+> pre-pass is cancelled the moment the reading lands (at most `wifiCheckTimeoutSeconds`, seen within the
+> re-check interval); then the account runs exactly what it would have run with the reading known at
+> the start, the same pipeline (walk if allowed, then the catch-up) with the same budget
+> (`runBackgroundBackfill(budget:)`, each run's deadline taken when it starts). Before, the pre-pass used
+> the shared deadline and a productive catch-up could spend all of it, leaving the walk none. Tests:
+> `BackfillBodyDownloadGateTests.pathFactsDecideEveryWiFiOnlyDownload`,
+> `GmailCatchUpTests.jobWalkBudgetIsTheSameWhetherTheReadingIsEarlyOrLate`.
 
 > **Current note (2026-11-11).** A completed walk can be re-armed by the full sync's catch-up when
 > old mail moves into the folder (ADR-IOS-107 decision 8), but never while a storage limit is in

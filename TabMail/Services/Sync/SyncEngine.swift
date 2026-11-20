@@ -212,6 +212,16 @@ actor SyncEngine {
         return !powerHeld && !(wifiOnly && expensive)
     }
 
+    /// The one meaning of "on Wi-Fi" for the Wi-Fi-only setting (#1064): a
+    /// satisfied path over Wi-Fi that iOS does not mark expensive. A Personal
+    /// Hotspot is satisfied Wi-Fi but expensive, so it is not. Read by all three
+    /// older-mail download decisions: the foreground gate
+    /// (`backfillDownloadsAllowed`, from NetworkMonitor's path), and the job's body
+    /// gate and walk (both from the job's one measurement, `SyncScheduler.measureJobOnWiFi`).
+    nonisolated static func onUnmeteredWiFi(_ facts: NetworkPathFacts) -> Bool {
+        facts.satisfied && facts.usesWiFi && !facts.isExpensive
+    }
+
     /// The Wi-Fi-only preference (Settings toggle, unset = on). Read once at the
     /// start of each gate decision and passed through (snapshot rule).
     nonisolated static func backfillWifiOnlySetting() -> Bool {
@@ -224,8 +234,8 @@ actor SyncEngine {
     /// job's own walk decision (`SyncScheduler.backgroundBackfillPlan`, #1064).
     nonisolated static let backgroundProcessingJobActive = Mutex<Bool>(false)
 
-    /// The running job's Wi-Fi state, measured once with `SyncScheduler.isOnWiFi()`
-    /// (`SyncScheduler.measureJobOnWiFi`), started at job start concurrently with
+    /// The running job's Wi-Fi state (unmetered Wi-Fi, `onUnmeteredWiFi`), measured
+    /// once with `SyncScheduler.measureJobOnWiFi`, started at job start concurrently with
     /// the job's work so no scan waits for it. nil (unknown) from job start until
     /// the reading lands, then true/false; written on the MainActor, reset to nil
     /// in the same MainActor step that clears `backgroundProcessingJobActive`.
@@ -271,7 +281,7 @@ actor SyncEngine {
         #endif
         if jobActive {
             // The job's walk decision with the job's walk input: its Wi-Fi state
-            // measured once from job start (`isOnWiFi`), never NetworkMonitor, which
+            // measured once from job start (`measureJobOnWiFi`), never NetworkMonitor, which
             // a job that launched the app from terminated never starts (#1064).
             // Until the reading lands the bodies hold; the gate watcher's re-check
             // (`backfillBodyGateRecheckSeconds`) picks up the lift.
@@ -284,16 +294,19 @@ actor SyncEngine {
 
     /// The foreground walk gate for a power snapshot and the Wi-Fi-only value the
     /// caller captured, with the network read now. Shared by the walk and
-    /// BackfillBodyQueue. Uses NetworkMonitor's expensive flag (Mutex-backed) as the
-    /// Wi-Fi proxy: on iOS, expensive == cellular/hotspot. A network no path update
-    /// has reported yet counts as expensive, so Wi-Fi-only holds until the monitor
-    /// knows (as `SyncScheduler.isOnWiFi()` holds on its timeout, #1064).
+    /// BackfillBodyQueue. "On Wi-Fi" is `onUnmeteredWiFi` of NetworkMonitor's
+    /// latest path (Mutex-backed), the same rule the job applies to its own
+    /// measurement; anything else (cellular, a Personal Hotspot) counts as
+    /// metered. A network no path update has reported yet counts as metered, so
+    /// Wi-Fi-only holds until the monitor knows (as the job's measurement holds on
+    /// its timeout, #1064).
     nonisolated static func backfillDownloadsAllowed(
         power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), wifiOnly: Bool
     ) -> Bool {
-        backfillWalkAllowed(
+        let onWiFi = NetworkMonitor.checkPathFactsIfKnown().map(onUnmeteredWiFi) ?? false
+        return backfillWalkAllowed(
             fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
-            batteryLevel: power.batteryLevel, wifiOnly: wifiOnly, expensive: NetworkMonitor.checkExpensiveIfKnown() ?? true)
+            batteryLevel: power.batteryLevel, wifiOnly: wifiOnly, expensive: !onWiFi)
     }
 
     func register(accountId: String, provider: any EmailProvider, workQueue: ProviderWorkQueue) {

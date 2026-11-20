@@ -23,24 +23,38 @@ enum BackfillRunner: String, CaseIterable, Sendable, CustomTestStringConvertible
 }
 
 enum DownloadGateHarness {
-    /// Runs `body` with NetworkMonitor's cached expensive flag, the background
-    /// job's Wi-Fi measurement (on Wi-Fi exactly when the network is not
-    /// expensive) and the Wi-Fi-only setting set, restoring all three, so a test
-    /// never depends on the network of the machine it runs on.
+    /// A satisfied path of each kind the Wi-Fi-only rule tells apart: unmetered
+    /// Wi-Fi, cellular, and a Personal Hotspot (Wi-Fi that iOS marks expensive).
+    static let unmeteredWiFi = NetworkPathFacts(satisfied: true, usesWiFi: true, isExpensive: false)
+    static let cellular = NetworkPathFacts(satisfied: true, usesWiFi: false, isExpensive: true)
+    static let personalHotspot = NetworkPathFacts(satisfied: true, usesWiFi: true, isExpensive: true)
+
+    /// `withPath` on cellular when `expensive`, else unmetered Wi-Fi.
     static func withNetwork(
         expensive: Bool, wifiOnly: Bool = true, _ body: () async throws -> Void
     ) async rethrows {
+        try await withPath(expensive ? cellular : unmeteredWiFi, wifiOnly: wifiOnly, body)
+    }
+
+    /// Runs `body` with one network path seen by both readers, NetworkMonitor's
+    /// cached path (the foreground gate) and the background job's measurement
+    /// (classified by the production rule, `SyncEngine.onUnmeteredWiFi`), and the
+    /// Wi-Fi-only setting set, restoring all of them, so a test never depends on
+    /// the network of the machine it runs on.
+    static func withPath(
+        _ facts: NetworkPathFacts, wifiOnly: Bool = true, _ body: () async throws -> Void
+    ) async rethrows {
         let key = SyncScheduler.wifiOnlyKey
         let savedSetting = UserDefaults.standard.object(forKey: key)
-        let savedExpensive = NetworkMonitor.checkExpensiveIfKnown()
-        let savedJobOnWiFi = SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 }
+        let savedFacts = NetworkMonitor.checkPathFactsIfKnown()
+        let savedJobFacts = SyncScheduler.jobPathFactsForTesting.withLock { $0 }
         UserDefaults.standard.set(wifiOnly, forKey: key)
-        NetworkMonitor.setExpensiveForTesting(expensive)
-        SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = !expensive }
+        NetworkMonitor.setPathFactsForTesting(facts)
+        SyncScheduler.jobPathFactsForTesting.withLock { $0 = facts }
         defer {
             UserDefaults.standard.set(savedSetting, forKey: key)
-            NetworkMonitor.setExpensiveForTesting(savedExpensive)
-            SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = savedJobOnWiFi }
+            NetworkMonitor.setPathFactsForTesting(savedFacts)
+            SyncScheduler.jobPathFactsForTesting.withLock { $0 = savedJobFacts }
         }
         try await body()
     }
@@ -65,11 +79,13 @@ enum DownloadGateHarness {
                     #expect(await sleeps.waitFor(count: 1), "the worker's first cycle never ended")
                 }
             case .job:
-                let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
+                // The job's reading, from the production measurement of the path.
+                let onWiFi = await SyncScheduler.measureJobOnWiFi()
                 await SyncScheduler.runBackgroundBackfill(
-                    accounts: [account], isLowPowerMode: gate == .lowPowerMode, wifiOnly: true, onWiFi: !expensive,
-                    awaitOnWiFi: { !expensive }
-                ) { account, walkAllowed in
+                    accounts: [account], isLowPowerMode: gate == .lowPowerMode, wifiOnly: true, onWiFi: onWiFi,
+                    budget: SyncConfig.backgroundBackfillDeadlineSeconds,
+                    awaitOnWiFi: { onWiFi }
+                ) { account, walkAllowed, deadline in
                     _ = await engine.performBackfill(account: account, deadline: deadline, walkAllowed: walkAllowed)
                 }
             }

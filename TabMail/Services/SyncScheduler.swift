@@ -130,8 +130,10 @@ final class SyncScheduler {
     static let shared = SyncScheduler()
 
     /// Key for WiFi-only background backfill setting (default: true).
-    /// Only gates the backward crawl (history backfill). Sync, body fetch,
-    /// AI processing, and embeddings always run regardless of network type.
+    /// Gates the backward crawl (history backfill) and older-mail body downloads
+    /// (`BackfillBodyQueue`, #1064): both need unmetered Wi-Fi when it is on. Sync,
+    /// new-mail and opened-message bodies (`ActiveBodyQueue`, on-demand fetches),
+    /// AI processing, and embeddings run regardless of network type.
     nonisolated static let wifiOnlyKey = "backgroundSyncWiFiOnly"
 
     private var timer: Timer?
@@ -550,12 +552,12 @@ final class SyncScheduler {
                 let accounts = (try? await dbPool.read { db in
                     try Account.filter(Column("isActive") == true).fetchAll(db)
                 }) ?? []
-                let backfillDeadline = Date(timeIntervalSinceNow: SyncConfig.backgroundBackfillDeadlineSeconds)
                 await Self.runBackgroundBackfill(
                     accounts: accounts, isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly,
                     onWiFi: SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 },
+                    budget: SyncConfig.backgroundBackfillDeadlineSeconds,
                     awaitOnWiFi: { await SyncEngine.awaitBackgroundProcessingJobOnWiFi() }
-                ) { account, walkAllowed in
+                ) { account, walkAllowed, backfillDeadline in
                     _ = await self.manager.runBackfill(account: account, deadline: backfillDeadline, walkAllowed: walkAllowed)
                 }
             }
@@ -1485,28 +1487,50 @@ final class SyncScheduler {
 
     /// The job's backfill stage: every account's backfill runs, so its folder
     /// scans run, under any gate; the decision passed to `run` holds the walk only.
+    /// Each account's run gets `budget` seconds from the moment it starts with the
+    /// reading known (the `Date` passed to `run`).
     /// `onWiFi` nil (the job's Wi-Fi reading has not landed) never delays a scan:
-    /// each account's backfill runs at once with the walk held, then, once
-    /// `awaitOnWiFi` returns the reading, a second call runs the walk if the plan
-    /// allows it. `awaitOnWiFi` returning nil (the job ended or was cancelled)
-    /// leaves the walk held.
+    /// a scan-only pre-pass runs at once and is cancelled the moment `awaitOnWiFi`
+    /// returns the reading (at most `SyncConfig.wifiCheckTimeoutSeconds` after job
+    /// start, picked up within `backfillBodyGateRecheckSeconds`). Then the account
+    /// runs exactly what it would have run had the reading been known at the
+    /// start: the same pipeline (walk if the plan allows it, then the catch-up)
+    /// with the same `budget`, so the pre-pass never shifts budget between the
+    /// scans and the walk (#1064). A pre-pass that finishes first just waits for
+    /// the reading. `awaitOnWiFi` returning nil (the job ended or was cancelled)
+    /// runs nothing more.
     nonisolated static func runBackgroundBackfill(
-        accounts: [Account], isLowPowerMode: Bool, wifiOnly: Bool, onWiFi: Bool?,
+        accounts: [Account], isLowPowerMode: Bool, wifiOnly: Bool, onWiFi: Bool?, budget: TimeInterval,
         awaitOnWiFi: @escaping @Sendable () async -> Bool?,
-        run: @escaping @Sendable (Account, Bool) async -> Void
+        run: @escaping @Sendable (Account, Bool, Date) async -> Void
     ) async {
         await withTaskGroup(of: Void.self) { group in
             for account in accounts {
                 group.addTask {
+                    let reading: Bool?
                     if let onWiFi {
-                        await run(account, backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: onWiFi))
-                        return
+                        reading = onWiFi
+                    } else {
+                        // nil: the pre-pass ended; .some: the reading (nil = job over).
+                        reading = await withTaskGroup(of: Bool??.self, returning: Bool?.self) { prePass in
+                            prePass.addTask {
+                                await run(account, false, Date(timeIntervalSinceNow: budget))
+                                return nil
+                            }
+                            prePass.addTask { .some(await awaitOnWiFi()) }
+                            var landed: Bool?
+                            for await result in prePass {
+                                guard case .some(let value) = result else { continue }
+                                landed = value
+                                prePass.cancelAll()
+                            }
+                            return landed
+                        }
                     }
-                    await run(account, false)
-                    guard !Task.isCancelled, let landed = await awaitOnWiFi(),
-                          backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: landed)
-                    else { return }
-                    await run(account, true)
+                    guard !Task.isCancelled, let reading else { return }
+                    await run(
+                        account, backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: reading),
+                        Date(timeIntervalSinceNow: budget))
                 }
             }
         }
@@ -1514,54 +1538,61 @@ final class SyncScheduler {
 
     #if DEBUG
     /// Test seam for the job's Wi-Fi measurement, nil (the default) in normal use.
-    /// `isOnWiFi` uses a live NWPathMonitor, so a test cannot choose its answer.
+    /// `measureJobPathFacts` uses a live NWPathMonitor, so a test cannot choose its answer.
     nonisolated static let jobOnWiFiMeasurementForTesting = Mutex<Bool?>(nil)
+    /// Path-facts variant: the measurement classifies these facts with the
+    /// production rule (`SyncEngine.onUnmeteredWiFi`) instead of a live path.
+    nonisolated static let jobPathFactsForTesting = Mutex<NetworkPathFacts?>(nil)
     /// Held variant: when set, the measurement awaits it and returns its answer,
     /// so a test can keep the reading unknown while the job's work runs.
     nonisolated static let jobOnWiFiMeasurementHoldForTesting = Mutex<(@Sendable () async -> Bool)?>(nil)
     #endif
 
     /// The background processing job's one Wi-Fi measurement, started at job start
-    /// concurrently with the job's work (`handleBackgroundAIProcessing`, #1064).
-    /// Bounded by `isOnWiFi`'s `SyncConfig.wifiCheckTimeoutSeconds`.
+    /// concurrently with the job's work (`handleBackgroundAIProcessing`, #1064):
+    /// true only on unmetered Wi-Fi (`SyncEngine.onUnmeteredWiFi`, the rule the
+    /// foreground gate applies too), so a Personal Hotspot is not Wi-Fi. A path
+    /// not reported within `SyncConfig.wifiCheckTimeoutSeconds` is not Wi-Fi.
     nonisolated static func measureJobOnWiFi() async -> Bool {
         #if DEBUG
         if let hold = jobOnWiFiMeasurementHoldForTesting.withLock({ $0 }) { return await hold() }
         if let onWiFi = jobOnWiFiMeasurementForTesting.withLock({ $0 }) { return onWiFi }
+        if let facts = jobPathFactsForTesting.withLock({ $0 }) { return SyncEngine.onUnmeteredWiFi(facts) }
         #endif
-        return await isOnWiFi()
+        guard let facts = await measureJobPathFacts() else { return false }
+        return SyncEngine.onUnmeteredWiFi(facts)
     }
 
-    /// Check if the device is currently on WiFi.
+    /// The current network path's facts from one NWPathMonitor update, or nil when
+    /// none arrives within `SyncConfig.wifiCheckTimeoutSeconds`.
     /// NWPathMonitor.pathUpdateHandler can fire multiple times (races with cancel()),
     /// so guard the continuation with a Mutex to prevent double-resume (EXC_BREAKPOINT).
-    nonisolated static func isOnWiFi() async -> Bool {
-        BackgroundSyncLogger.logDebug("[SyncScheduler] isOnWiFi() enter")
-        let result: Bool
+    nonisolated static func measureJobPathFacts() async -> NetworkPathFacts? {
+        BackgroundSyncLogger.logDebug("[SyncScheduler] measureJobPathFacts() enter")
+        let result: NetworkPathFacts
         do {
             result = try await withTimeout(seconds: SyncConfig.wifiCheckTimeoutSeconds) {
                 await withCheckedContinuation { continuation in
                     let resumed = Mutex(false)
-                    let monitor = NWPathMonitor(requiredInterfaceType: .wifi)
+                    let monitor = NWPathMonitor()
                     monitor.pathUpdateHandler = { path in
-                        let status = path.status
-                        BackgroundSyncLogger.logDebug("[SyncScheduler] WiFi pathUpdate: status=\(status), thread=\(Thread.current)")
+                        let facts = NetworkPathFacts(path: path)
+                        BackgroundSyncLogger.logDebug("[SyncScheduler] path update: \(facts), thread=\(Thread.current)")
                         monitor.cancel()
                         if !resumed.withLock({ let was = $0; $0 = true; return was }) {
-                            BackgroundSyncLogger.logDebug("[SyncScheduler] WiFi resuming continuation: satisfied=\(status == .satisfied)")
-                            continuation.resume(returning: status == .satisfied)
+                            continuation.resume(returning: facts)
                         } else {
-                            BackgroundSyncLogger.logDebug("[SyncScheduler] WiFi DUPLICATE callback suppressed")
+                            BackgroundSyncLogger.logDebug("[SyncScheduler] path DUPLICATE callback suppressed")
                         }
                     }
                     monitor.start(queue: DispatchQueue(label: "wifi-check"))
                 }
             }
         } catch {
-            BackgroundSyncLogger.logDebug("[SyncScheduler] WiFi check timed out after \(SyncConfig.wifiCheckTimeoutSeconds)s — assuming not on WiFi")
-            return false
+            BackgroundSyncLogger.logDebug("[SyncScheduler] path check timed out after \(SyncConfig.wifiCheckTimeoutSeconds)s — assuming not on Wi-Fi")
+            return nil
         }
-        BackgroundSyncLogger.logDebug("[SyncScheduler] isOnWiFi() = \(result)")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] measureJobPathFacts() = \(result)")
         return result
     }
 

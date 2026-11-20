@@ -39,7 +39,7 @@ struct BackfillBodyDownloadGateTests {
     private func withAccount(
         _ accountId: String, provider: MockEmailProvider,
         power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), expensive: Bool,
-        wifiOnly: Bool = true, _ body: () async throws -> Void
+        wifiOnly: Bool = true, path: NetworkPathFacts? = nil, _ body: () async throws -> Void
     ) async throws {
         await AccountManager.shared.installBodyGateTestProvider(
             accountId: accountId, provider: provider, queue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
@@ -47,7 +47,8 @@ struct BackfillBodyDownloadGateTests {
         defer { SyncEngine.backfillPowerStateForTesting.withLock { $0 = nil } }
         NetworkMonitor.setConnectedForTesting(true)
         do {
-            try await DownloadGateHarness.withNetwork(expensive: expensive, wifiOnly: wifiOnly) { try await body() }
+            let facts = path ?? (expensive ? DownloadGateHarness.cellular : DownloadGateHarness.unmeteredWiFi)
+            try await DownloadGateHarness.withPath(facts, wifiOnly: wifiOnly) { try await body() }
         } catch {
             await AccountManager.shared.removeBodyGateTestProvider(accountId: accountId)
             throw error
@@ -674,8 +675,9 @@ struct BackfillBodyDownloadGateTests {
                     group.addTask {
                         await SyncScheduler.runBackgroundBackfill(
                             accounts: [account], isLowPowerMode: false, wifiOnly: true, onWiFi: onWiFi,
+                            budget: SyncConfig.backgroundBackfillDeadlineSeconds,
                             awaitOnWiFi: { await SyncEngine.awaitBackgroundProcessingJobOnWiFi() }
-                        ) { _, walkAllowed in
+                        ) { _, walkAllowed, _ in
                             calls.value.withLock { $0.append(walkAllowed) }
                         }
                     }
@@ -695,8 +697,97 @@ struct BackfillBodyDownloadGateTests {
         await context.waitForTaskForTesting()
         #expect(callsWhileUnknown.value.withLock { $0 } == [false],
                 "while the reading is unknown the backfill (its scans) must run at once with the walk held")
-        #expect(calls.value.withLock { $0 } == (landsOnWiFi ? [false, true] : [false]),
-                "once the reading lands the walk must follow it with Wi-Fi-only on")
+        #expect(calls.value.withLock { $0 } == [false, landsOnWiFi],
+                "once the reading lands the account runs as with a known reading: the walk follows it with Wi-Fi-only on")
+    }
+
+    /// The facts of a network path, classified by the production rule
+    /// (`SyncEngine.onUnmeteredWiFi`), with what every Wi-Fi-only download
+    /// decision must do on it.
+    struct PathCase: Sendable, CustomTestStringConvertible {
+        let name: String
+        let facts: NetworkPathFacts
+        let downloads: Bool
+        var testDescription: String { name }
+
+        static let all: [PathCase] = [
+            PathCase(name: "personal-hotspot", facts: DownloadGateHarness.personalHotspot, downloads: false),
+            PathCase(name: "unmetered-wifi", facts: DownloadGateHarness.unmeteredWiFi, downloads: true),
+            PathCase(name: "cellular", facts: DownloadGateHarness.cellular, downloads: false),
+            PathCase(name: "unsatisfied-wifi",
+                     facts: NetworkPathFacts(satisfied: false, usesWiFi: true, isExpensive: false), downloads: false),
+        ]
+    }
+
+    @Test("with Wi-Fi-only on, \"on Wi-Fi\" means unmetered Wi-Fi for all three decisions: the foreground gate, the job's bodies and the job's walk",
+          arguments: PathCase.all)
+    @MainActor
+    func pathFactsDecideEveryWiFiOnlyDownload(_ input: PathCase) async throws {
+        let accountId = "gate1064-path-\(input.name)"
+        let provider = MockEmailProvider()
+        let foregroundQueue = BackfillBodyQueue()
+        let jobQueue = BackfillBodyQueue()
+        let account = Account(emailAddress: "user@example.com", displayName: "Path", provider: .imap)
+        let foregroundWalk = TestBox<Bool?>(nil)
+        let foregroundFetched = TestBox<Int?>(nil)
+        let jobFetched = TestBox<Int?>(nil)
+        let jobWalk = TestBox<[Bool]>([])
+        let settle = Self.settle
+        try await withAccount(accountId, provider: provider, power: Self.openPower, expensive: false, path: input.facts) {
+            // Foreground: the walk's decision and a real body dispatch.
+            foregroundWalk.value.withLock { $0 = SyncEngine.backfillDownloadsAllowed(power: Self.openPower, wifiOnly: true) }
+            await foregroundQueue.enqueue([backfillItem(accountId, messageId: "7")])
+            if input.downloads {
+                _ = await eventually { await fetchCount(provider) > 0 }
+            } else {
+                _ = await eventually { await foregroundQueue.heldByDownloadGate }
+                try await Task.sleep(for: settle)
+            }
+            let afterForeground = await fetchCount(provider)
+            foregroundFetched.value.withLock { $0 = afterForeground }
+            await foregroundQueue.cancelAllInFlight()
+
+            // The job: its own measurement of the same path decides its bodies and its walk.
+            let context = BGTaskContext(label: "gate1064-path", completion: { _ in })
+            let scheduler = SyncScheduler(
+                backgroundReadiness: { true },
+                backgroundWork: { _ in
+                    _ = await SyncEngine.awaitBackgroundProcessingJobOnWiFi()
+                    let before = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count
+                    await jobQueue.enqueue([BackfillBodyQueue.Item(
+                        headerId: "\(accountId):Archive:8", accountId: accountId,
+                        folderPath: "Archive", messageId: "8", isInInbox: false)])
+                    if input.downloads {
+                        _ = await Self.pollUntil { await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count > before }
+                    } else {
+                        _ = await Self.pollUntil { await jobQueue.heldByDownloadGate }
+                        try? await Task.sleep(for: settle)
+                    }
+                    let after = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count
+                    jobFetched.value.withLock { $0 = after - before }
+                    await SyncScheduler.runBackgroundBackfill(
+                        accounts: [account], isLowPowerMode: false, wifiOnly: true,
+                        onWiFi: SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 },
+                        budget: SyncConfig.backgroundBackfillDeadlineSeconds,
+                        awaitOnWiFi: { await SyncEngine.awaitBackgroundProcessingJobOnWiFi() }
+                    ) { _, walkAllowed, _ in
+                        jobWalk.value.withLock { $0.append(walkAllowed) }
+                    }
+                },
+                processingHasWork: { false },
+                backgroundSchedule: { _ in },
+                refreshNetworkAvailable: true
+            )
+            scheduler.handleBackgroundAIProcessing(context: context) { _ in }
+            await context.waitForTaskForTesting()
+        }
+        await jobQueue.cancelAllInFlight()
+        #expect(foregroundWalk.value.withLock { $0 } == input.downloads, "foreground walk on \(input.name)")
+        let foreground = try #require(foregroundFetched.value.withLock { $0 })
+        #expect((foreground > 0) == input.downloads, "foreground older-mail body on \(input.name): \(foreground) fetches")
+        let job = try #require(jobFetched.value.withLock { $0 }, "the job's work never ran")
+        #expect((job > 0) == input.downloads, "job older-mail body on \(input.name): \(job) fetches")
+        #expect(jobWalk.value.withLock { $0 } == [input.downloads], "job walk on \(input.name)")
     }
 
     /// One background-job input set for the body gate (#1064): Low Power Mode,

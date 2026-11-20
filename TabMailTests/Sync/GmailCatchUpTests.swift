@@ -3184,6 +3184,73 @@ struct GmailCatchUpTests {
         }
     }
 
+    /// What the job's backfill stage did around its Wi-Fi reading.
+    private final class JobReadingRecord: Sendable {
+        /// Catch-up lists sent before the reading landed (nil: never awaited).
+        let listsAtReading = Mutex<Int?>(nil)
+        /// The budget left (seconds) when each walk-allowed run started.
+        let walkBudgets = Mutex<[TimeInterval]>([])
+    }
+
+    /// #1064, through the production pipeline (`SyncScheduler.runBackgroundBackfill`
+    /// over `performBackfill`): a lapsed Inbox whose listing stays productive far
+    /// longer than the job's short budget, and an unfinished walk with `old` to
+    /// load. Whether the Wi-Fi reading is known at once or lands after the scans
+    /// have run a slice, the walk-allowed run starts with the whole budget and the
+    /// walk downloads `old`: the scan-only pre-pass ends when the reading lands and
+    /// takes nothing from the walk.
+    @Test("In the job, scans start before a late Wi-Fi reading, and the walk then gets the same budget as with a reading known at once",
+          .enabled(if: !NetworkMonitor.checkExpensive()), arguments: [false, true])
+    func jobWalkBudgetIsTheSameWhetherTheReadingIsEarlyOrLate(readingLate: Bool) async throws {
+        let clock = Clock()
+        let slice = SyncConfig.catchUpSliceSeconds
+        var (seeds, local) = Self.rangesWorld(clock, count: 12)
+        seeds.append(Self.seed("old", clock.daysAgo(300), [inboxPath]))
+        try await Self.withWorld("gcu-job-reading-\(readingLate)", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let folderId = world.folderId(inboxPath)
+            let lapsed = GmailCatchUpState(
+                lastCompletedAt: Date().addingTimeInterval(-3_600), lapseCount: 1, listedLapseCount: 0).encoded()
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ?, backfillComplete = 0 WHERE id = ?", arguments: [lapsed, folderId])
+            }
+            // 36 lists at slice / 8 each outlast the budget below.
+            world.server.holdEveryList(forSeconds: slice / 8)
+            let account = try await Self.account(world)
+            let engine = world.engine
+            let server = world.server
+            let record = JobReadingRecord()
+            // A short job budget: a few slices, while the listing keeps progressing.
+            let budget = slice * 4
+            await SyncScheduler.runBackgroundBackfill(
+                accounts: [account], isLowPowerMode: false, wifiOnly: true,
+                onWiFi: readingLate ? nil : true, budget: budget,
+                awaitOnWiFi: {
+                    // Lands only after the scans have started and run a slice.
+                    _ = await Self.eventually(seconds: 30) { !server.listRequests().isEmpty }
+                    try? await Task.sleep(for: .seconds(slice))
+                    record.listsAtReading.withLock { $0 = server.listRequests().count }
+                    return true
+                }
+            ) { account, walkAllowed, deadline in
+                if walkAllowed { record.walkBudgets.withLock { $0.append(deadline.timeIntervalSinceNow) } }
+                _ = await engine.performBackfill(account: account, deadline: deadline, walkAllowed: walkAllowed)
+            }
+
+            if readingLate {
+                let lists = record.listsAtReading.withLock { $0 } ?? 0
+                #expect(lists > 0, "the scans waited for the Wi-Fi reading")
+            }
+            let budgets = record.walkBudgets.withLock { $0 }
+            #expect(budgets.count == 1, "one walk-allowed run after the reading: \(budgets)")
+            if let left = budgets.first {
+                #expect(left >= budget - slice / 4,
+                        "the walk started with \(left) s of a \(budget) s budget; the pre-pass took budget from it")
+            }
+            #expect(try Self.rows(world, inboxPath)["old"] != nil, "the walk did not download the older message")
+            #expect(try Self.state(world, inboxPath)?.listing != nil, "precondition: the listing stays productive past the budget")
+        }
+    }
+
     /// A lapse that came while a listing ran: the completing pass starts the new
     /// listing at once on an expensive network too, so a change in a range the
     /// first listing had already passed arrives in the same run.
