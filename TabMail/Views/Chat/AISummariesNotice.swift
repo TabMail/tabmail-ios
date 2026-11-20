@@ -214,7 +214,7 @@ struct AISummariesNoticeButton: View {
 /// that is actually shown.
 private struct WindowProbe: UIViewRepresentable {
     let onWindow: () -> Void
-    /// Debug trace only.
+    /// Runs when the probe leaves its window.
     var onDetach: () -> Void = {}
 
     final class Probe: UIView {
