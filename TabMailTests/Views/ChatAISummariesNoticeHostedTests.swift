@@ -339,4 +339,45 @@ struct ChatAISummariesNoticeHostedTests {
             }
         }
     }
+
+    // MARK: - A landing that cannot present
+
+    @Test("A landing that could not present the notice leaves it for the next open; once shown it never opens again")
+    func anUnpresentedNoticeIsNotUsedUp() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted view")
+        let firstOpen = Self.freshFirstOpen()
+        try await HostedAccessibility.withAutomation {
+            // The chat lands while something else is presented (a push still running): the
+            // popover cannot be presented.
+            let blocker = UIViewController()
+            try await Self.hosting(Color.clear) { controller in
+                controller.present(blocker, animated: false)
+                try await Self.waitUntil { controller.presentedViewController === blocker }
+                let notice = UIHostingController(rootView: Self.button(landed: true, firstOpen: firstOpen, tipsAllowed: true))
+                controller.addChild(notice)
+                controller.view.addSubview(notice.view)
+                notice.view.frame = controller.view.bounds
+                notice.didMove(toParent: controller)
+                try await Task.sleep(for: .seconds(1))
+                #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.title)
+                        && !Self.presentedLabels(blocker).contains(AISummariesNotice.title),
+                        "control: the notice was not on screen")
+                notice.willMove(toParent: nil)
+                notice.view.removeFromSuperview()
+                notice.removeFromParent()
+                blocker.dismiss(animated: false)
+            }
+            // The next open shows it.
+            try await Self.hosting(Self.button(landed: true, firstOpen: firstOpen, tipsAllowed: true)) { controller in
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title),
+                        "a notice that never showed is still due")
+            }
+            // Once shown, never by itself again.
+            try await Self.hosting(Self.button(landed: true, firstOpen: firstOpen, tipsAllowed: true)) { controller in
+                try await Task.sleep(for: .seconds(1))
+                #expect(controller.presentedViewController == nil, "shown once: never again")
+            }
+        }
+    }
 }

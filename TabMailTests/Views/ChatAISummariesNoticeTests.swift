@@ -10,8 +10,8 @@ import Testing
 /// opens a popover saying the chat's messages are AI summaries, with "Report a concern".
 ///
 /// THE SYSTEM PROPERTIES pinned here:
-///  1. The popover opens by itself on the first chat-view open of the install, once the chat has
-///     landed, and never again once it has been shown (dismissed or not).
+///  1. The popover is due on every landed open until it has actually been on screen, and never
+///     after (dismissed or not).
 ///  2. It never opens by itself while tips are held back (sample mail, the tutorial), and such an
 ///     open does not use it up.
 ///  3. "Report a concern" sends every AI summary in the chat, newest first, so a cut at the
@@ -30,31 +30,25 @@ struct ChatAISummariesNoticeTests {
 
     // MARK: - 1 and 2. When it opens by itself
 
-    @Test("The first landed open shows the notice; every later open does not")
-    func showsOnceOnTheFirstOpen() {
+    @Test("The notice is due until it has been on screen, and never after")
+    func dueUntilShown() {
         let defaults = Self.freshDefaults()
         let first = AISummariesNotice.FirstOpen(defaults: defaults)
-        #expect(first.claim(landed: true, tipsAllowed: true))
-        #expect(!first.claim(landed: true, tipsAllowed: true))
+        #expect(first.isDue(landed: true, tipsAllowed: true))
+        // Asked for but never on screen (a landing during the push): still due on the next open.
+        #expect(first.isDue(landed: true, tipsAllowed: true))
+        first.markShown()
+        #expect(!first.isDue(landed: true, tipsAllowed: true))
         // A new chat, another screen instance: the flag is the install's, not the view's.
-        #expect(!AISummariesNotice.FirstOpen(defaults: defaults).claim(landed: true, tipsAllowed: true))
+        #expect(!AISummariesNotice.FirstOpen(defaults: defaults).isDue(landed: true, tipsAllowed: true))
     }
 
-    @Test("Before the chat has landed nothing opens and nothing is used up")
-    func waitsForTheLanding() {
-        let defaults = Self.freshDefaults()
-        let first = AISummariesNotice.FirstOpen(defaults: defaults)
-        #expect(!first.claim(landed: false, tipsAllowed: true))
-        #expect(first.claim(landed: true, tipsAllowed: true))
-    }
-
-    @Test("Sample mail and the tutorial never show it and never use it up")
-    func neverOnSampleMailOrTheTutorial() {
-        let defaults = Self.freshDefaults()
-        let first = AISummariesNotice.FirstOpen(defaults: defaults)
-        #expect(!first.claim(landed: true, tipsAllowed: false))
-        #expect(!first.claim(landed: true, tipsAllowed: false))
-        #expect(first.claim(landed: true, tipsAllowed: true))
+    @Test("Before the landing, and while tips are held back, it is not due")
+    func notDueBeforeLandingOrWhileHeldBack() {
+        let first = AISummariesNotice.FirstOpen(defaults: Self.freshDefaults())
+        #expect(!first.isDue(landed: false, tipsAllowed: true))
+        #expect(!first.isDue(landed: true, tipsAllowed: false))
+        #expect(first.isDue(landed: true, tipsAllowed: true))
     }
 
     @Test("Tips are held back exactly while onboarding is not complete")

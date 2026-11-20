@@ -29,7 +29,7 @@ enum AISummariesNotice {
         onboardingComplete
     }
 
-    /// The first open of the install. `claim` decides once per open, from what it is handed.
+    /// The first open of the install. The notice is due until it has actually been on screen.
     struct FirstOpen {
         let defaults: UserDefaults
 
@@ -37,12 +37,17 @@ enum AISummariesNotice {
             self.defaults = defaults
         }
 
-        /// True exactly once per install: the first open that has landed while tips may show.
-        /// Claiming records it, so the notice never opens by itself again, dismissed or not.
-        func claim(landed: Bool, tipsAllowed: Bool) -> Bool {
-            guard landed, tipsAllowed, !defaults.bool(forKey: AISummariesNotice.shownKey) else { return false }
+        /// The notice should open by itself now: the chat has landed, tips may show, and the
+        /// notice has never been on screen. Reading this records nothing.
+        func isDue(landed: Bool, tipsAllowed: Bool) -> Bool {
+            landed && tipsAllowed && !defaults.bool(forKey: AISummariesNotice.shownKey)
+        }
+
+        /// The popover is on screen: it never opens by itself again, dismissed or not. Recorded
+        /// when it appears, not when it is asked for, since a chat can land while its push is
+        /// still running and the popover cannot be presented then.
+        func markShown() {
             defaults.set(true, forKey: AISummariesNotice.shownKey)
-            return true
         }
     }
 
@@ -93,6 +98,7 @@ struct AISummariesNoticeButton: View {
         .accessibilityHint(AISummariesNotice.accessibilityHint)
         .popover(isPresented: $showsNotice, arrowEdge: .top) {
             popover
+                .onAppear { firstOpen.markShown() }
         }
         .onChange(of: showsNotice) { _, shows in
             // The sheet waits for the popover to close: one presentation at a time.
@@ -105,7 +111,7 @@ struct AISummariesNoticeButton: View {
                             content: reportContent, contentNotice: AISummariesNotice.reportNotice, send: send)
         .task(id: landed) {
             // One decision per open, read once from the flag and the tip gate.
-            if firstOpen.claim(landed: landed, tipsAllowed: tipsAllowed()) {
+            if firstOpen.isDue(landed: landed, tipsAllowed: tipsAllowed()) {
                 showsNotice = true
             }
         }
