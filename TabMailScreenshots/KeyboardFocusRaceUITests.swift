@@ -22,9 +22,8 @@ final class KeyboardFocusRaceUITests: XCTestCase {
     private let caretTapOffset: CGFloat = 0.2
     /// Where a word-selecting double tap lands horizontally: on the one typed word, near the start.
     private let wordTapOffset: CGFloat = 0.1
-    /// Where the Paste press lands horizontally: past the end of the text, so the caret goes to the end.
+    /// Where the Paste taps land horizontally: past the end of the text, so the caret goes to the end.
     private let endTapOffset: CGFloat = 0.9
-    private let pressSeconds: TimeInterval = 1.0
     /// The word typed for select, Copy and Paste; spelled correctly so a double tap offers Copy.
     private let selectWord = "Keyboard"
     /// A single-line field's text sits at its vertical middle.
@@ -452,7 +451,7 @@ final class KeyboardFocusRaceUITests: XCTestCase {
     }
 
     /// Focuses `field` and types one word; double taps the word to select it, chooses Copy from the edit
-    /// menu, presses at the end of the text and chooses Paste. The selection (Copy offered) and the
+    /// menu, taps at the end of the text, taps the caret and chooses Paste. The selection (Copy offered) and the
     /// pasted word (now there twice) are the controls; the field must keep the keyboard after each step.
     /// `lineOffset` is the vertical fraction of the field's frame where its first line sits.
     /// XCUITest has no API for a selection handle, so a handle drag is not exercised here.
@@ -478,9 +477,16 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         XCTAssertTrue(waitForFocus(field, timeout: focusSeconds), "the field kept focus after Copy")
         XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up after Copy")
 
-        field.coordinate(withNormalizedOffset: CGVector(dx: endTapOffset, dy: lineOffset)).press(forDuration: pressSeconds)
+        // On iOS 26 a long press only moves the caret (no edit menu). A tap places the caret at the
+        // end; a second, separate tap on the caret opens the edit menu with Paste.
+        let end = field.coordinate(withNormalizedOffset: CGVector(dx: endTapOffset, dy: lineOffset))
+        end.tap()
+        RunLoop.current.run(until: Date().addingTimeInterval(holdSeconds))
+        XCTAssertTrue(waitForFocus(field, timeout: focusSeconds), "the field kept focus after the caret tap")
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up after the caret tap")
+        end.tap()
         let paste = editMenuItem("Paste", in: app)
-        XCTAssertTrue(paste.waitForExistence(timeout: focusSeconds), "control: the press offered Paste")
+        XCTAssertTrue(paste.waitForExistence(timeout: focusSeconds), "control: the tap on the caret offered Paste")
         paste.tap()
         RunLoop.current.run(until: Date().addingTimeInterval(holdSeconds))
         let value = field.value as? String ?? ""
