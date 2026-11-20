@@ -15,7 +15,6 @@ struct ChatBubbleView: View {
     var actions: [ChatSwipeButton] = []
     let onOpen: () -> Void
 
-    @State private var showsOnlyList = false
 
     var body: some View {
         VStack(alignment: item.isOwn ? .trailing : .leading, spacing: 4) {
@@ -54,33 +53,8 @@ struct ChatBubbleView: View {
 
     private var showsSender: Bool { isGroup && !item.isOwn }
 
-    /// The sender's name (group chats), or "You" on the user's own email, with a gray
-    /// "(replied only to …)" when the email did not go to everyone. One line; tap the
-    /// label for the full list.
-    private var nameLine: some View {
-        HStack(spacing: 4) {
-            Text(item.isOwn ? "You" : item.sender.name)
-                .font(.caption)
-                .fontWeight(.medium)
-                .foregroundStyle(item.isOwn ? Theme.textSecondary : ChatAvatar.color(for: item.sender))
-                .fixedSize()
-            if let only = item.repliedOnlyTo {
-                Button { showsOnlyList = true } label: {
-                    Text("(replied only to \(only.label()))")
-                        .font(.caption)
-                        .foregroundStyle(Theme.textSecondary)
-                }
-                .buttonStyle(.plain)
-                .popover(isPresented: $showsOnlyList) {
-                    ChatPeopleList(
-                        title: "\(item.isOwn ? "You" : item.sender.name) replied only to",
-                        names: Self.listNames(only))
-                }
-            }
-        }
-        .lineLimit(1)
-        .accessibilityHidden(true)
-    }
+    /// The sender's name line above the bubble.
+    private var nameLine: some View { ChatSenderLine(item: item) }
 
     /// The full list: "You" for the user.
     static func listNames(_ only: ChatThread.OnlyTo) -> [String] {
@@ -373,5 +347,65 @@ struct ChatUnreadLine: View {
         .padding(.horizontal)
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// The sender's name above a bubble (`ChatBubbleView`).
+struct ChatSenderLine: View {
+    let item: ChatThread.Item
+
+    @State private var showsOnlyList = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    /// The sender's name (group chats), or "You" on the user's own email, with a gray
+    /// "(replied only to …)" when the email did not go to everyone. One line; tap the
+    /// label for the full list. At accessibility text sizes the name is one line of its own,
+    /// truncating, and the label wraps below it, so neither runs off the screen.
+    var body: some View {
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: item.isOwn ? .trailing : .leading, spacing: 4) {
+                    senderName
+                        .lineLimit(1)
+                    if let only = item.repliedOnlyTo {
+                        onlyToLabel(only)
+                            .lineLimit(nil)
+                            .multilineTextAlignment(item.isOwn ? .trailing : .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            } else {
+                HStack(spacing: 4) {
+                    senderName
+                        .fixedSize()
+                    if let only = item.repliedOnlyTo {
+                        onlyToLabel(only)
+                    }
+                }
+                .lineLimit(1)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private var senderName: some View {
+        Text(item.isOwn ? "You" : item.sender.name)
+            .font(.caption)
+            .fontWeight(.medium)
+            .foregroundStyle(item.isOwn ? Theme.textSecondary : ChatAvatar.color(for: item.sender))
+    }
+
+    private func onlyToLabel(_ only: ChatThread.OnlyTo) -> some View {
+        Button { showsOnlyList = true } label: {
+            Text("(replied only to \(only.label()))")
+                .font(.caption)
+                .foregroundStyle(Theme.textSecondary)
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $showsOnlyList) {
+            ChatPeopleList(
+                title: "\(item.isOwn ? "You" : item.sender.name) replied only to",
+                names: ChatBubbleView.listNames(only))
+        }
     }
 }
