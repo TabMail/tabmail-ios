@@ -27,9 +27,11 @@ struct ChatAISummariesNoticeHostedTests {
     final class Sent {
         var contents: [String] = []
         var reports: [(ReportContentType, String)] = []
+        /// What the backend answers.
+        var accepted = false
 
         var send: ReportConcernSend {
-            { [self] type, content, _, _ in reports.append((type, content)); return false }
+            { [self] type, content, _, _ in reports.append((type, content)); return accepted }
         }
     }
 
@@ -276,6 +278,64 @@ struct ChatAISummariesNoticeHostedTests {
                 #expect(sent.reports.count == 1)
                 #expect(sent.reports.first?.0 == .suggestedReply)
                 #expect(sent.reports.first?.1 == "pressed reply")
+            }
+        }
+    }
+
+    // MARK: - After a report
+
+    /// Opens the popover with the glyph and presses "Report a concern"; returns once the sheet shows.
+    private static func openReport(in controller: UIViewController) async throws {
+        let glyph = try #require(element(AISummariesNotice.accessibilityLabel, in: controller.view))
+        #expect(glyph.accessibilityActivate())
+        try await waitUntil { presentedLabels(controller).contains(AISummariesNotice.reportTitle) }
+        let popover = try #require(controller.presentedViewController?.view)
+        let report = try #require(element(AISummariesNotice.reportTitle, in: popover))
+        #expect(report.accessibilityActivate())
+        try await waitUntil { presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
+    }
+
+    @Test("After one report, closing the popover again opens no sheet")
+    func aClosedPopoverDoesNotReopenTheSheet() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(Self.button(landed: false, firstOpen: Self.freshFirstOpen(), tipsAllowed: true,
+                                               sent: Sent())) { controller in
+                try await Self.openReport(in: controller)
+                let sheetView = try #require(controller.presentedViewController?.view)
+                let cancel = try #require(Self.element("Cancel", in: sheetView))
+                #expect(cancel.accessibilityActivate())
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                #expect(controller.presentedViewController == nil, "control: the sheet closed")
+                // Open the popover and close it without reporting.
+                let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))
+                #expect(glyph.accessibilityActivate())
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                controller.presentedViewController?.dismiss(animated: false)
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                try await Task.sleep(for: .seconds(1))
+                #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
+                        "no sheet after a plain close: \(Self.presentedLabels(controller))")
+            }
+        }
+    }
+
+    @Test("A report the backend takes closes the sheet and says it was submitted")
+    func submittedReportClosesTheSheet() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let sent = Sent()
+        sent.accepted = true
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(Self.button(landed: false, firstOpen: Self.freshFirstOpen(), tipsAllowed: true,
+                                               sent: sent, content: "Summary")) { controller in
+                try await Self.openReport(in: controller)
+                let sheetView = try #require(controller.presentedViewController?.view)
+                let submit = try #require(Self.element("Report", in: sheetView))
+                #expect(submit.accessibilityActivate())
+                try await Self.waitUntil { (controller.presentedViewController as? UIAlertController)?.title == "Report Submitted" }
+                #expect((controller.presentedViewController as? UIAlertController)?.title == "Report Submitted",
+                        "the sheet closed and the alert shows: \(String(describing: controller.presentedViewController))")
+                #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "the sheet is gone")
             }
         }
     }
