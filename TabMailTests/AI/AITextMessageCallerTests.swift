@@ -718,6 +718,64 @@ struct AITextMessageCallerTests {
         }
     }
 
+    /// THE SYSTEM PROPERTY: closing a card ends its Recompute still waiting for its reply: the reply
+    /// that comes back afterwards is stored nowhere and shown nowhere. Control: with the card open,
+    /// the same held reply is stored. The task is shaped as `ComposeView.recomputeReply` builds it,
+    /// and closed through the card's own close step (`ComposeView.cardClosed`, what its disappear runs).
+    @Test("Closing the card while its Recompute waits stores nothing; left open, the reply is stored",
+          arguments: [true, false])
+    func cardCloseEndsTheRecompute(closed: Bool) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(replyTextMessage: "Earlier text")
+            defer { fixture.close() }
+            let release = DispatchSemaphore(value: 0)
+            let calls = Mutex(0)
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/completions/chat", method: "POST") { _ in
+                calls.withLock { $0 += 1 }
+                let object: [String: Any] = ["subject": "Re: Plans", "body": "Recomputed", "text_message": "Recomputed text"]
+                let assistant = String(decoding: (try? JSONSerialization.data(withJSONObject: object)) ?? Data(), as: UTF8.self)
+                let final = (try? JSONSerialization.data(withJSONObject: ["assistant": assistant])) ?? Data()
+                let answer = FakeHTTP.CannedResponse.bytes(
+                    Data(("event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n").utf8),
+                    contentType: "text/event-stream")
+                return .parked {
+                    _ = release.wait(timeout: .now() + 10)
+                    return answer
+                }
+            }
+            let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+            let header = fixture.header
+            let account = fixture.account
+            let shown = Mutex<ReplyResult?>(nil)
+            // As the card's Recompute: the result is shown only while the card is still open.
+            let recompute = Task {
+                if let result = await ComposeView.recomputedReply(
+                    for: header, account: account, kbText: "", compositionPrompt: "",
+                    aiService: service, dbPool: AppDatabase.dbPool) {
+                    guard !Task.isCancelled else { return }
+                    shown.withLock { $0 = result }
+                }
+            }
+            for _ in 0..<400 where calls.withLock({ $0 }) < 1 { try await Task.sleep(for: .milliseconds(5)) }
+            #expect(calls.withLock { $0 } == 1, "control: the Recompute is waiting on its reply")
+
+            if closed { ComposeView.cardClosed(recompute: recompute) }
+            release.signal()
+            _ = await recompute.value
+
+            let row = try #require(try fixture.row())
+            if closed {
+                #expect(row.cachedReply == nil && row.replyTextMessage == "Earlier text", "a closed card's Recompute stores nothing")
+                #expect(shown.withLock { $0 } == nil, "and shows nothing")
+            } else {
+                #expect(row.cachedReply == "Recomputed" && row.replyTextMessage == "Recomputed text", "control: stored")
+                #expect(shown.withLock { $0 }?.body == "Recomputed", "control: shown in the card")
+            }
+        }
+    }
+
     @Test("Recomputing for a sender that gets no reply suggests nothing and keeps the stored reply")
     func composeRecomputeFiltered() async throws {
         try await withAIEnabled {

@@ -680,6 +680,65 @@ struct SuggestionRewriteRouteTests {
         #expect(ghost.compose == envelope)
         #expect(ghost.suggestion == Self.shownReply)
     }
+
+    /// What a card's edit of its shown suggestion does to the stored AI Suggestion.
+    enum CardEdit: String, CaseIterable, Sendable {
+        /// Control: the ghost's own Reply All, unchanged: the edit replaces the suggestion.
+        case sameEnvelope
+        case narrowedAudience, otherSubject, otherSender, forward, suggestionNotShown
+        /// The envelope holds, but another email now sits at the row: nothing is stored.
+        case replacedRow
+    }
+
+    /// THE SYSTEM PROPERTY: a card's edit replaces the stored AI Suggestion only when the card is
+    /// still the suggestion's own Reply All (same sender, subject and audience) for the same email;
+    /// any other card keeps its edit to itself. Through the card's own decision
+    /// (`ComposeView.suggestionEditTarget`, what `applyInlineEdit` asks) and the one writer it then
+    /// calls, with the card's real inputs.
+    @Test("A card's edit replaces the AI Suggestion only from the suggestion's own Reply All, for the same email",
+          arguments: CardEdit.allCases)
+    func cardEditReachesTheGhostOnlyFromItsEnvelope(_ edit: CardEdit) async throws {
+        let fixture = try await fixture(imap: true)
+        let header = fixture.header
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: header, accounts: [])
+        var recipients = envelope.recipients
+        var subject = envelope.subject
+        var accountId: String? = nil
+        if edit == .narrowedAudience {
+            recipients = recipients.applying(
+                to: AIService.parseInlineEditResponse(ComposeEditJSON.make(removeTo: ["recipient@example.com"]))?.toDelta,
+                cc: nil, bcc: nil)
+            #expect(recipients != envelope.recipients, "control: the audience narrowed")
+        }
+        if edit == .otherSubject { subject = "Fwd: Offsite" }
+        if edit == .otherSender { accountId = "acc2" }
+        if edit == .replacedRow {
+            try await fixture.db.write { db in
+                try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 222 WHERE id = ?", arguments: [header.folderId])
+                try db.execute(sql: "UPDATE messageHeader SET rfc822MessageId = '<other@example.com>', observedUidValidity = 222 WHERE id = ?",
+                               arguments: [header.id])
+            }
+        }
+        let target = ComposeView.suggestionEditTarget(
+            showingSuggestion: edit != .suggestionNotShown, isForward: edit == .forward, replyTo: header,
+            recipients: recipients, subject: subject, accountId: accountId, accounts: [])
+        let edited = ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand)
+        if let target {
+            await ComposeView.writeCachedReplyToDB(edited, replacing: Self.shownReply, replyTo: target, db: fixture.db)
+        }
+        let stored = try await row(fixture.db, header.id).suggestion
+        switch edit {
+        case .sameEnvelope:
+            #expect(target?.id == header.id, "control: the suggestion's own card targets its email")
+            #expect(stored == edited, "the edit replaces the AI Suggestion whole")
+        case .replacedRow:
+            #expect(target?.id == header.id, "the card itself still holds the envelope")
+            #expect(stored == Self.shownReply, "another email's row is never written")
+        default:
+            #expect(target == nil, "\(edit.rawValue): the edit stays in its card")
+            #expect(stored == Self.shownReply, "\(edit.rawValue): the AI Suggestion is unchanged")
+        }
+    }
 }
 
 /// The AI Suggestion has one value, one writer and one envelope builder (ADR-IOS-114 decision 18).

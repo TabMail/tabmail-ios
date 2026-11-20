@@ -13,9 +13,13 @@ import GRDB
 struct EmailComposeTool: AgentTool, Sendable {
     let name = "email_compose"
     private let ctx: ToolContext
+    /// The compose edit a request runs (`EmailReplyTool.ComposeEdit`); tests answer it as the
+    /// backend would.
+    private let composeEdit: EmailReplyTool.ComposeEdit
 
-    init(context: ToolContext? = nil) {
+    init(context: ToolContext? = nil, composeEdit: EmailReplyTool.ComposeEdit? = nil) {
         self.ctx = context ?? ToolContext()
+        self.composeEdit = composeEdit ?? EmailReplyTool.chatComposeEdit
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
@@ -66,7 +70,8 @@ struct EmailComposeTool: AgentTool, Sendable {
                     body: body,
                     request: composeRequest,
                     mode: "edit_new",
-                    db: ctx.db
+                    db: ctx.db,
+                    composeEdit: composeEdit
                 )
                 generatedSubject = result.subject ?? generatedSubject
                 generatedBody = result.body ?? generatedBody
@@ -107,7 +112,8 @@ struct EmailComposeTool: AgentTool, Sendable {
         mode: String,
         relatedHeader: MessageHeader? = nil,
         relatedBodyText: String? = nil,
-        db: (any DatabaseReader & Sendable)? = nil
+        db: (any DatabaseReader & Sendable)? = nil,
+        composeEdit: EmailReplyTool.ComposeEdit
     ) async throws -> InlineEditResult {
         let dbReader = db ?? AppDatabase.rawPool
         // Get sender info from primary account (matching TB's user identity
@@ -187,13 +193,7 @@ struct EmailComposeTool: AgentTool, Sendable {
 
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] runComposeEdit: mode=\(mode) recipients=\(recipients.count) request=\(request.prefix(80))") }
 
-        return try await AIService.shared.performInlineEdit(
-            currentSubject: subject ?? "",
-            currentBody: body ?? "",
-            context: context,
-            instruction: request,
-            chatHistory: []
-        )
+        return try await composeEdit(context, subject ?? "", body ?? "", request)
     }
 
     // MARK: - Helpers

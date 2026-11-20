@@ -2081,7 +2081,7 @@ struct ComposeView: View {
     }
 
     private func performDisappear() {
-        recomputeTask?.cancel()
+        Self.cardClosed(recompute: recomputeTask)
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ComposeView] onDisappear instance=\(instanceToken) draftId=\(draftId)")
         }
@@ -2099,6 +2099,13 @@ struct ComposeView: View {
         // `.sent` or `.failed(...)` already fired inside `send()` —
         // `ComposeOutcomeState.tryResolve` guards against re-entry.
         onAgentOutcome?(.cancelled)
+    }
+
+    /// What closing the card does to its Recompute still waiting: it is cancelled, so it stores
+    /// nothing (`recomputedReply` checks before its write) and the closed card shows nothing.
+    /// Internal for testability.
+    static func cardClosed(recompute: Task<Void, Never>?) {
+        recompute?.cancel()
     }
 
     /// COMPILE REPAIR (build gate): this is the FIRST `.onAppear` closure body,
@@ -2362,8 +2369,10 @@ struct ComposeView: View {
         let previous = shownSuggestion
         let edited = newBody.map { ReplyResult(body: $0, textMessage: textMessage, changeCommand: changeCommand) }
         let stored: (ReplyResult, MessageHeader)? = {
-            guard showingSuggestion, let edited, let reply = replyTo, !isForward,
-                  holdsSuggestionEnvelope(of: reply, subject: newSubject ?? subject) else { return nil }
+            guard let edited, let reply = Self.suggestionEditTarget(
+                showingSuggestion: showingSuggestion, isForward: isForward, replyTo: replyTo,
+                recipients: recipients.pendingCommitted, subject: newSubject ?? subject,
+                accountId: selectedAccount?.id, accounts: navigationStore.accounts) else { return nil }
             return (edited, reply)
         }()
         if let s = newSubject {
@@ -2392,13 +2401,19 @@ struct ComposeView: View {
         BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: done, isApplyingEdit=false")
     }
 
-    /// Whether this card's draft is still the AI Suggestion's envelope for `reply`
-    /// (`ChatReplyCompose.suggestionEnvelope`, the one builder): same sender, subject and audience.
-    private func holdsSuggestionEnvelope(of reply: MessageHeader, subject: String) -> Bool {
-        let envelope = ChatReplyCompose.suggestionEnvelope(for: reply, accounts: navigationStore.accounts)
-        return envelope.holds(
-            recipients: recipients.pendingCommitted, subject: subject,
-            accountId: selectedAccount?.id ?? reply.accountId, of: reply)
+    /// The email whose AI Suggestion a card's edit replaces, or nil when the edit stays in the card:
+    /// only an edit of the shown suggestion in a reply (not a forward) whose draft is still the AI
+    /// Suggestion's envelope for that email (`ChatReplyCompose.suggestionEnvelope`, the one builder):
+    /// same sender (`accountId`, nil: the email's own), subject and audience. Internal for testability.
+    static func suggestionEditTarget(
+        showingSuggestion: Bool, isForward: Bool, replyTo: MessageHeader?,
+        recipients: ComposeDraftGuards.Recipients, subject: String, accountId: String?, accounts: [Account]
+    ) -> MessageHeader? {
+        guard showingSuggestion, let reply = replyTo, !isForward else { return nil }
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: reply, accounts: accounts)
+        let holds = envelope.holds(
+            recipients: recipients, subject: subject, accountId: accountId ?? reply.accountId, of: reply)
+        return holds ? reply : nil
     }
 
     /// Stores `value` as the AI Suggestion of `reply`, the email compose opened for, only over

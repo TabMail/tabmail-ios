@@ -12,9 +12,13 @@ import GRDB
 struct EmailForwardTool: AgentTool, Sendable {
     let name = "email_forward"
     private let ctx: ToolContext
+    /// The compose edit a request runs (`EmailReplyTool.ComposeEdit`); tests answer it as the
+    /// backend would.
+    private let composeEdit: EmailReplyTool.ComposeEdit
 
-    init(context: ToolContext? = nil) {
+    init(context: ToolContext? = nil, composeEdit: EmailReplyTool.ComposeEdit? = nil) {
         self.ctx = context ?? ToolContext()
+        self.composeEdit = composeEdit ?? EmailReplyTool.chatComposeEdit
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
@@ -97,7 +101,8 @@ struct EmailForwardTool: AgentTool, Sendable {
                     request: wrappedRequest,
                     mode: "edit_forward",
                     relatedHeader: header,
-                    relatedBodyText: relatedBodyText
+                    relatedBodyText: relatedBodyText,
+                    composeEdit: composeEdit
                 )
                 generatedSubject = result.subject
                 generatedBody = result.body ?? generatedBody

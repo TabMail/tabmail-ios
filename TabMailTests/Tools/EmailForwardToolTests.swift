@@ -135,28 +135,24 @@ struct EmailForwardToolTests {
 /// THE SYSTEM PROPERTY pinned here: a forward whose email is no longer provably the row at its
 /// address (a UIDVALIDITY reset is pending, so a resync can seat another email there) never sends
 /// that row's body to the model and never opens a forward card; it reports that the email changed.
-/// The same request on an email that still holds opens the forward card for it.
-///
-/// The model's call is short-circuited by the AI opt-out (no network): the property is whether the
-/// request gets past the body read at all, seen as the forward card the request then opens.
-@Suite("A forward's body read refuses an email that is no longer itself", .serialized, .processGlobalState)
+/// The same request on an email that still holds sends the email's own primary body as a forward
+/// edit and opens the forward card with the model's draft.
+@Suite("A forward's body read refuses an email that is no longer itself")
 @MainActor
 struct EmailForwardToolBodyReadTests {
 
-    @Test("A pending reset refuses the forward with no card; an unchanged email opens its forward card",
+    final class Calls: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [ComposeEditContext] = []
+        func add(_ context: ComposeEditContext) { lock.withLock { items.append(context) } }
+        var all: [ComposeEditContext] { lock.withLock { items } }
+    }
+
+    static let draftBody = "Hi Pat,\n\nSam asks whether we are in for the offsite.\n\nAlex"
+
+    @Test("A pending reset refuses the forward with no model call and no card; an unchanged email sends its own body",
           arguments: [true, false])
     func resetRefusesTheForward(resetPending: Bool) async throws {
-        let store = AIService.optOutStore
-        let previous = store.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous {
-                store.set(previous, forKey: AIService.optOutAllAIKey)
-            } else {
-                store.removeObject(forKey: AIService.optOutAllAIKey)
-            }
-        }
-        AIService.writeOptOutFlag(true)
-
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db, provider: .imap)
         try TestDatabase.insertFolder(db)
@@ -177,7 +173,15 @@ struct EmailForwardToolBodyReadTests {
         let translator = MockChatIdTranslator()
         await translator.seed(header.id, as: 1)
         let router = AgentToolRouter()
-        let tool = EmailForwardTool(context: ToolContext(db: db, translator: translator, router: router))
+        let calls = Calls()
+        let answer = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            response: "Done.", subject: "Fwd: Offsite", body: Self.draftBody,
+            textMessage: "Sam asks about the offsite.", changeCommand: "")))
+        let tool = EmailForwardTool(context: ToolContext(db: db, translator: translator, router: router),
+                                    composeEdit: { context, _, _, _ in
+            calls.add(context)
+            return answer
+        })
         let arguments: [String: JSONValue] = [
             "unique_id": .int(1),
             "to": .array([.string("pat@example.com")]),
@@ -196,15 +200,21 @@ struct EmailForwardToolBodyReadTests {
         let output = try await task.value
 
         if resetPending {
+            #expect(calls.all.isEmpty, "the row's body never goes to the model")
             #expect(card == nil, "no forward card opens for an email that may no longer be itself")
             #expect(router.composeQueueDepth == 0, "nothing is queued either")
             #expect(output.hasPrefix("Failed: ") && output.contains("email changed"), "the agent is told: \(output)")
         } else {
-            // Control: the same request on an unchanged email gets past the read and opens its card.
+            // Control: the same request on an unchanged email is edited and opens its card.
+            #expect(calls.all.count == 1)
+            let sent = try #require(calls.all.first)
+            #expect(sent.mode == "edit_forward")
+            #expect(sent.bodyText == "Are you in for the offsite?", "the email's own primary body, not its snippet")
             let opened = try #require(card, "control: the forward card opens")
             #expect(opened.mode == .forward)
             #expect(opened.replyTo?.id == header.id && opened.replyTo?.rfc822MessageId == "<offsite@example.com>")
             #expect(opened.to == ["pat@example.com"])
+            #expect(opened.subject == "Fwd: Offsite" && opened.body == Self.draftBody, "the card holds the model's draft")
             #expect(!output.contains("email changed"))
         }
     }

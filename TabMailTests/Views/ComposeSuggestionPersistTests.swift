@@ -769,8 +769,8 @@ struct ComposeSuggestionPersistTests {
     @Test("An inline edit of the visible reply suggestion is saved, awaited, with the message compose opened for")
     func inlineEditReachesTheWriterWithTheOpenedMessage() throws {
         let source = try composeSource()
-        let edit = try functionBody("private func applyInlineEdit(", before: "private func holdsSuggestionEnvelope(", in: source)
-        let gate = try #require(edit.range(of: "guard showingSuggestion, let edited, let reply = replyTo, !isForward,"))
+        let edit = try functionBody("private func applyInlineEdit(", before: "static func suggestionEditTarget(", in: source)
+        let gate = try #require(edit.range(of: "guard let edited, let reply = Self.suggestionEditTarget("))
         let save = try #require(edit.range(of: "await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: dbPool)"))
         let fade = try #require(edit.range(of: "withAnimation(.easeOut(duration: 0.4)) {"))
         #expect(gate.lowerBound < save.lowerBound && save.lowerBound < fade.lowerBound)

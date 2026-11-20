@@ -32,12 +32,15 @@ struct EmailReplyTool: AgentTool, Sendable {
         self.storeSuggestionEdit = storeSuggestionEdit ?? { edit, shown, email in
             await ComposeView.writeCachedReplyToDB(edit, replacing: shown, replyTo: email, db: AppDatabase.dbPool)
         }
-        self.composeEdit = composeEdit ?? { context, subject, body, request in
-            // The chat's one AI service, the one the card's edits and Recompute use.
-            let aiService = await MainActor.run { ChatPillState.shared.aiService }
-            return try await aiService.performInlineEdit(
-                currentSubject: subject, currentBody: body, context: context, instruction: request, chatHistory: [])
-        }
+        self.composeEdit = composeEdit ?? Self.chatComposeEdit
+    }
+
+    /// The production compose edit of every agent compose tool (reply, new email, forward): the
+    /// chat's one AI service, the one the card's edits and Recompute use.
+    static let chatComposeEdit: ComposeEdit = { context, subject, body, request in
+        let aiService = await MainActor.run { ChatPillState.shared.aiService }
+        return try await aiService.performInlineEdit(
+            currentSubject: subject, currentBody: body, context: context, instruction: request, chatHistory: [])
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
