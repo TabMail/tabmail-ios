@@ -320,7 +320,7 @@ extension AgentToolRouter.ComposeRequest {
             // The reply tool's envelope exactly (`EmailReplyTool`): its fields, an empty one
             // included, its subject and its kind.
             ComposeView(
-                replyTo: replyTo, suggestedBody: body, isReplyAll: isReplyAll,
+                replyTo: replyTo, suggestedBody: body, suggestion: suggestion, isReplyAll: isReplyAll,
                 prefillTo: to, prefillCc: cc, prefillBcc: bcc, prefillSubject: subject,
                 prefillDraftId: draftId, onAgentOutcome: onOutcome)
         case .forward:

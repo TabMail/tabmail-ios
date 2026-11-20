@@ -739,6 +739,88 @@ struct SuggestionRewriteRouteTests {
             #expect(stored == Self.shownReply, "\(edit.rawValue): the AI Suggestion is unchanged")
         }
     }
+
+    /// THE SYSTEM PROPERTY: a reply card the agent opens on the stored AI Suggestion (the reply
+    /// tool with no request and no body) keeps the user's in-card edit as the suggestion, as the
+    /// ghost's own card does; and a suggestion stored meanwhile still wins over that edit.
+    @Test("An agent-opened card on the stored suggestion stores the card's edit; a newer suggestion stored meanwhile wins",
+          arguments: [false, true])
+    func agentOpenedCardEditReplacesTheSuggestion(_ newerStoredMeanwhile: Bool) async throws {
+        let fixture = try await fixture()
+        let header = fixture.header
+        let stored = ReplyResult(body: Self.shown, textMessage: Self.shownText, changeCommand: "decline politely")
+        try await fixture.db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET replyChangeCommand = ? WHERE id = ?",
+                           arguments: [stored.changeCommand, header.id])
+        }
+        let calls = Calls()
+        let tool = tool(fixture, calls: calls, answer: nil)
+        let task = Task { @MainActor in
+            try await tool.run(arguments: ["unique_id": .int(1)], invocation: ToolInvocation(), rewritesInPlace: true)
+        }
+        let card = try #require(await waitForCard(fixture.router))
+        #expect(calls.all.isEmpty, "no request: no model edit runs")
+        // The card as every host presents it, and the suggestion it shows and compares against.
+        let view = card.composeView(account: nil, onOutcome: { _ in })
+        let shown = try #require(ComposeView.givenSuggestion(view.suggestion, suggestedBody: view.suggestedBody))
+        #expect(shown.body == Self.shown)
+
+        if newerStoredMeanwhile {
+            try await fixture.db.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET replyChangeCommand = 'newer' WHERE id = ?", arguments: [header.id])
+            }
+        }
+        // The user's in-card edit, within the suggestion's own envelope.
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: header, accounts: [])
+        let target = try #require(ComposeView.suggestionEditTarget(
+            showingSuggestion: true, isForward: false, replyTo: header,
+            recipients: envelope.recipients, subject: envelope.subject, accountId: nil, accounts: []))
+        let edited = ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand)
+        let outcome = await ComposeView.writeCachedReplyToDB(edited, replacing: shown, replyTo: target, db: fixture.db)
+
+        let row = try await row(fixture.db, header.id)
+        if newerStoredMeanwhile {
+            #expect(outcome == .dropped)
+            #expect(row.suggestion == ReplyResult(body: Self.shown, textMessage: Self.shownText, changeCommand: "newer"),
+                    "the newer suggestion stays")
+        } else {
+            #expect(outcome == .written, "the card compared against the stored value whole")
+            #expect(row.suggestion == edited, "the header holds the edit")
+            var cleared = header
+            cleared.cachedReply = nil
+            cleared.replyTextMessage = nil
+            cleared.replyChangeCommand = nil
+            let base = cleared
+            let rebuilt = try await fixture.db.write { db in
+                var fresh = base
+                try MessageAICache.restoreIfCached(into: &fresh, accountId: base.accountId, folderPath: base.folderPath, db: db)
+                return fresh
+            }
+            #expect(rebuilt.suggestion == edited, "the on-device AI cache holds the edit")
+        }
+        card.onOutcome(.cancelled)
+        _ = try await task.value
+    }
+
+    /// A card whose recipient field holds an entry that is not an address (rejected) is not the
+    /// suggestion's envelope: its edit stays in the card.
+    @Test("A card holding a rejected recipient entry keeps its edit; the same card without it is the suggestion's")
+    func rejectedEntryIsNotTheEnvelope() async throws {
+        let fixture = try await fixture()
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: fixture.header, accounts: [])
+        #expect(envelope.holds(recipients: envelope.recipients, subject: envelope.subject, accountId: "acc1", of: fixture.header),
+                "control: the unchanged card is the suggestion's")
+        for role in ComposeDraftGuards.RecipientRole.allCases {
+            var recipients = envelope.recipients
+            recipients[role: role].rejected = ["not an address"]
+            #expect(!envelope.holds(recipients: recipients, subject: envelope.subject, accountId: "acc1", of: fixture.header),
+                    "\(role): a rejected entry")
+            #expect(ComposeView.suggestionEditTarget(
+                showingSuggestion: true, isForward: false, replyTo: fixture.header,
+                recipients: recipients, subject: envelope.subject, accountId: nil, accounts: []) == nil,
+                    "\(role): the edit stays in its card")
+        }
+    }
 }
 
 /// The AI Suggestion has one value, one writer and one envelope builder (ADR-IOS-114 decision 18).

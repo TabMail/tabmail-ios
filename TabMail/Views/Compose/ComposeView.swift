@@ -2401,6 +2401,15 @@ struct ComposeView: View {
         BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: done, isApplyingEdit=false")
     }
 
+    /// The suggestion a caller hands the card, as the card shows it and later compares its edit
+    /// against (`shownSuggestion`): the stored value when given whole, else a bare body (the
+    /// agent's own draft, never stored). Nil when neither is given.
+    static func givenSuggestion(_ suggestion: ReplyResult?, suggestedBody: String?) -> ReplyResult? {
+        if let suggestion, !suggestion.body.isEmpty { return suggestion }
+        if let suggestedBody, !suggestedBody.isEmpty { return ReplyResult(body: suggestedBody, textMessage: nil) }
+        return nil
+    }
+
     /// The email whose AI Suggestion a card's edit replaces, or nil when the edit stays in the card:
     /// only an edit of the shown suggestion in a reply (not a forward) whose draft is still the AI
     /// Suggestion's envelope for that email (`ChatReplyCompose.suggestionEnvelope`, the one builder):
@@ -3329,10 +3338,8 @@ struct ComposeView: View {
         // P2P sync, or a prior in-place edit updated cachedReply after the
         // caller's snapshot was captured.
         let suggestionToShow: ReplyResult?
-        if let suggestion, !suggestion.body.isEmpty {
-            suggestionToShow = suggestion
-        } else if let suggestedBody, !suggestedBody.isEmpty {
-            suggestionToShow = ReplyResult(body: suggestedBody, textMessage: nil)
+        if let given = Self.givenSuggestion(suggestion, suggestedBody: suggestedBody) {
+            suggestionToShow = given
         } else if let reply = replyTo, !isForward {
             // Only while the row is still the email replied to: another email seated at its
             // address (a UIDVALIDITY reset) never lends this card its suggestion.

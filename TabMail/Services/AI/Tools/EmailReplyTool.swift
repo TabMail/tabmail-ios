@@ -210,12 +210,14 @@ struct EmailReplyTool: AgentTool, Sendable {
             }
         }
 
-        // With no request and no explicit body, the card opens with the AI Suggestion's body.
-        if generatedBody == nil {
-            generatedBody = header.suggestion?.body
-        }
+        // With no request and no explicit body, the card opens on the stored AI Suggestion: the
+        // whole value (body, text message, change command), so the card's own edit replaces
+        // exactly the value stored (`MessageHeader.replaceSuggestion(with:ifStill:)`).
+        let storedSuggestion = generatedBody == nil ? header.suggestion : nil
 
-        return await openReplyCard(header: header, envelope: envelope, body: generatedBody, fieldReply: fieldReply, draftId: nil)
+        return await openReplyCard(
+            header: header, envelope: envelope, body: generatedBody, suggestion: storedSuggestion,
+            fieldReply: fieldReply, draftId: nil)
     }
 
     /// The email's body for a compose edit's context (`ComposeEditContext.relatedBodyText`, the one
@@ -250,7 +252,8 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// Opens the reply's compose card and waits until the user sends, dismisses, or Stop cancels
     /// the task.
     private func openReplyCard(
-        header: MessageHeader, envelope: ChatReplyCompose, body: String?, fieldReply: ChatFieldReply?, draftId: String?
+        header: MessageHeader, envelope: ChatReplyCompose, body: String?, suggestion: ReplyResult? = nil,
+        fieldReply: ChatFieldReply?, draftId: String?
     ) async -> String {
         // Short-circuit duplicate retries: if we just sent a reply to this
         // same email within the TTL, don't re-prompt the user. Round 2 HTTP
@@ -280,6 +283,7 @@ struct EmailReplyTool: AgentTool, Sendable {
                 bcc: envelope.bcc,
                 subject: envelope.subject,
                 body: body,
+                suggestion: suggestion,
                 // A Reply All when the recipients hold the whole Reply All audience, so the send
                 // records reply-all on the original (#915).
                 isReplyAll: envelope.isReplyAll,

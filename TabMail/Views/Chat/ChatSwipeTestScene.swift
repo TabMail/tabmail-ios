@@ -186,8 +186,9 @@ struct ChatSwipeTestScene: View {
         let id = headerId(count - 1)
         _ = try? await AppDatabase.dbPool.write { db in
             guard var header = try MessageHeader.fetchOne(db, key: id) else { return }
-            header.cachedReply = fullReply
-            header.replyTextMessage = lateSuggestion
+            // Through the one writer, as a whole value over the one stored.
+            let late = ReplyResult(body: fullReply, textMessage: lateSuggestion)
+            guard header.replaceSuggestion(with: late, ifStill: header.suggestion) else { return }
             try header.save(db)
         }
         NSLog("[cv9diag] late suggestion written")

@@ -255,6 +255,9 @@ final class AgentToolRouter {
         let bcc: [String]
         let subject: String?
         let body: String?
+        /// A `.reply` opened on the stored AI Suggestion: the whole stored value, so an edit in the
+        /// card compares against exactly what is stored. Nil when the card opens on `body`.
+        let suggestion: ReplyResult?
         /// A `.reply` built from the reply-all recipient set (the AI reply
         /// tool). Carried into ComposeView so the send records reply-all on
         /// the original, like the Reply All button (#915).
@@ -286,6 +289,7 @@ final class AgentToolRouter {
             bcc: [String],
             subject: String?,
             body: String?,
+            suggestion: ReplyResult? = nil,
             isReplyAll: Bool = false,
             fieldReply: ChatFieldReply? = nil,
             draftId: String? = nil,
@@ -299,6 +303,7 @@ final class AgentToolRouter {
             self.bcc = bcc
             self.subject = subject
             self.body = body
+            self.suggestion = suggestion
             self.isReplyAll = isReplyAll
             self.fieldReply = fieldReply
             self.draftId = draftId
