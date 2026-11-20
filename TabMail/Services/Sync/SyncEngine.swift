@@ -129,17 +129,35 @@ actor SyncEngine {
         }
     }
 
-    /// The device's power state for the backfill worker's gates, read once at the
-    /// top of each cycle (MainActor hop): fast sync, Low Power Mode, external power
-    /// and the battery level (-1 when unknown).
-    func backfillPowerState() async -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
+    /// The power state together with the background-job flag and the job's Wi-Fi
+    /// measurement, all read in ONE MainActor step. The job sets and clears its
+    /// synthetic Fast Sync, the job flag and its (still unknown) Wi-Fi measurement
+    /// together in one MainActor step (`SyncScheduler.handleBackgroundAIProcessing`),
+    /// and publishes the reading on the MainActor only while the job runs, so a
+    /// reader never pairs the job's Fast Sync with "no job", nor the job with
+    /// another job's network (#1064). `jobOnWiFi` nil: the reading has not landed.
+    nonisolated static func currentBackfillPowerAndJobState() async
+        -> (power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), jobActive: Bool, jobOnWiFi: Bool?)
+    {
         #if DEBUG
-        if let state = Self.backfillPowerStateForTesting.withLock({ $0 }) { return state }
+        if let hook = Self.backfillPowerReadHookForTesting.withLock({ $0 }) { await hook() }
+        if let state = Self.backfillPowerStateForTesting.withLock({ $0 }) {
+            // The seam replaces the device readings; the app's Fast Sync flag and the
+            // job flag are still read live, so a test drives the real job entry/exit.
+            return await MainActor.run {
+                ((state.fastSync || AccountManagerState.shared.fastSyncModeActive, state.lowPowerMode,
+                  state.onPower, state.batteryLevel),
+                 backgroundProcessingJobActive.withLock { $0 },
+                 backgroundProcessingJobOnWiFi.withLock { $0 })
+            }
+        }
         #endif
         return await MainActor.run {
             let battery = UIDevice.current.batteryState
-            return (AccountManagerState.shared.fastSyncModeActive, ProcessInfo.processInfo.isLowPowerModeEnabled,
-                    battery == .charging || battery == .full, UIDevice.current.batteryLevel)
+            return ((AccountManagerState.shared.fastSyncModeActive, ProcessInfo.processInfo.isLowPowerModeEnabled,
+                     battery == .charging || battery == .full, UIDevice.current.batteryLevel),
+                    backgroundProcessingJobActive.withLock { $0 },
+                    backgroundProcessingJobOnWiFi.withLock { $0 })
         }
     }
 
@@ -151,6 +169,12 @@ actor SyncEngine {
     /// no test can wait out the worker's pauses.
     nonisolated static let backfillPowerStateForTesting =
         Mutex<(fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float)?>(nil)
+    /// Awaited at the start of every power read, so a test can park an admission
+    /// decision across the read the way the production MainActor hop suspends.
+    nonisolated static let backfillPowerReadHookForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
+    /// Awaited in `backfillDownloadsAllowedNow` after the power/job read and before
+    /// the decision uses it, so a test can let the job end across that gap.
+    nonisolated static let backfillAdmissionDecisionHookForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
     nonisolated static let backfillSleepForTesting = Mutex<(@Sendable (TimeInterval) async -> Void)?>(nil)
     #endif
 
@@ -173,6 +197,124 @@ actor SyncEngine {
         // batteryLevel is -1 when monitoring is off (it is set in TabMailApp.init).
         let powerHeld = !fastSync && !onPower && (lowPowerMode || (batteryLevel >= 0 && batteryLevel < 0.20))
         return !powerHeld && !(wifiOnly && expensive)
+    }
+
+    /// The one meaning of "on Wi-Fi" for the Wi-Fi-only setting (#1064): an
+    /// unmetered network, a satisfied path that iOS does not mark expensive,
+    /// whatever the interface. The setting saves metered data, so wired Ethernet
+    /// counts and a Personal Hotspot (Wi-Fi marked expensive) does not. Read by all three
+    /// older-mail download decisions: the foreground gate
+    /// (`backfillDownloadsAllowed`, from NetworkMonitor's path), and the job's body
+    /// gate and walk (both from the job's one measurement, `SyncScheduler.measureJobOnWiFi`).
+    nonisolated static func onUnmeteredNetwork(_ facts: NetworkPathFacts) -> Bool {
+        facts.satisfied && !facts.isExpensive
+    }
+
+    /// The Wi-Fi-only preference (Settings toggle, unset = on). Read once at the
+    /// start of each gate decision and passed through (snapshot rule).
+    nonisolated static func backfillWifiOnlySetting() -> Bool {
+        UserDefaults.standard.object(forKey: SyncScheduler.wifiOnlyKey) as? Bool ?? true
+    }
+
+    /// True while the BGProcessing job runs (`SyncScheduler.handleBackgroundAIProcessing`).
+    /// The job sets fast sync for throughput, so the body gate must not read that
+    /// flag as a user's Fast Sync: during the job, older-mail bodies follow the
+    /// job's own walk decision (`SyncScheduler.backgroundBackfillPlan`, #1064).
+    nonisolated static let backgroundProcessingJobActive = Mutex<Bool>(false)
+
+    /// The running job's network state (an unmetered network, `onUnmeteredNetwork`), measured
+    /// once with `SyncScheduler.measureJobOnWiFi`, started at job start concurrently with
+    /// the job's work so no scan waits for it. nil (unknown) from job start until
+    /// the reading lands, then true/false; written on the MainActor, reset to nil
+    /// in the same MainActor step that clears `backgroundProcessingJobActive`.
+    /// Both the job's walk and the body gate's job branch decide with this one
+    /// value and hold while it is unknown, so one decision has one network input
+    /// (#1064). The job may launch the app from terminated, where NetworkMonitor
+    /// never starts; this does not read it. nil outside a job (never read then).
+    nonisolated static let backgroundProcessingJobOnWiFi = Mutex<Bool?>(nil)
+
+    /// Waits for the running job's Wi-Fi reading, re-checking every
+    /// `SyncConfig.backfillBodyGateRecheckSeconds` (through `backfillSleep`, so a
+    /// test controls the wait). Returns nil if the job ends or the task is
+    /// cancelled first. The reading itself is bounded by
+    /// `SyncConfig.wifiCheckTimeoutSeconds`. Used only by the job's walk, after its
+    /// scans have run (`SyncScheduler.runBackgroundBackfill`).
+    nonisolated static func awaitBackgroundProcessingJobOnWiFi() async -> Bool? {
+        while !Task.isCancelled {
+            let (active, onWiFi) = await MainActor.run {
+                (backgroundProcessingJobActive.withLock { $0 }, backgroundProcessingJobOnWiFi.withLock { $0 })
+            }
+            guard active else { return nil }
+            if let onWiFi { return onWiFi }
+            await backfillSleep(seconds: SyncConfig.backfillBodyGateRecheckSeconds)
+        }
+        return nil
+    }
+
+    /// One older-mail body download decision (BackfillBodyQueue, #1064). Each call
+    /// is its own operation: the Wi-Fi-only preference is snapshotted first, before
+    /// any suspension. The job context is a live fact, read after the suspension in the
+    /// same MainActor step as the power state (`currentBackfillPowerAndJobState`): the
+    /// job's synthetic Fast Sync and its flag change together, so a job entering or
+    /// ending around the read can never make the job's Fast Sync count as a user's.
+    /// In the job the job's
+    /// walk decision applies, with the job's own Wi-Fi measurement; otherwise the
+    /// foreground walk's rule, where a network NetworkMonitor has not reported yet
+    /// holds. ActiveBodyQueue is not gated.
+    nonisolated static func backfillDownloadsAllowedNow() async -> Bool {
+        await backfillDownloadDecisionNow().allowed
+    }
+
+    /// `backfillDownloadsAllowedNow` together with the power snapshot it decided
+    /// from. The backfill worker's walk reads this too, so a worker that outlives
+    /// the foreground into the background processing job decides its walk with the
+    /// job's rule and the job's one network measurement, exactly as the bodies do;
+    /// its scans still run every cycle (#1064). `power` is for the worker's log and
+    /// pause length only.
+    nonisolated static func backfillDownloadDecisionNow() async
+        -> (allowed: Bool, power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float))
+    {
+        let wifiOnly = backfillWifiOnlySetting()
+        let (power, jobActive, jobOnWiFi) = await currentBackfillPowerAndJobState()
+        #if DEBUG
+        if let hook = backfillAdmissionDecisionHookForTesting.withLock({ $0 }) { await hook() }
+        #endif
+        return (backfillDownloadsAllowed(power: power, jobActive: jobActive, jobOnWiFi: jobOnWiFi, wifiOnly: wifiOnly), power)
+    }
+
+    /// The decision of `backfillDownloadDecisionNow` for one read.
+    private nonisolated static func backfillDownloadsAllowed(
+        power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float),
+        jobActive: Bool, jobOnWiFi: Bool?, wifiOnly: Bool
+    ) -> Bool {
+        if jobActive {
+            // The job's walk decision with the job's walk input: its Wi-Fi state
+            // measured once from job start (`measureJobOnWiFi`), never NetworkMonitor, which
+            // a job that launched the app from terminated never starts (#1064).
+            // Until the reading lands the bodies hold; the gate watcher's re-check
+            // (`backfillBodyGateRecheckSeconds`) picks up the lift.
+            guard let jobOnWiFi else { return false }
+            return SyncScheduler.backgroundBackfillPlan(
+                isLowPowerMode: power.lowPowerMode, wifiOnly: wifiOnly, onWiFi: jobOnWiFi)
+        }
+        return backfillDownloadsAllowed(power: power, wifiOnly: wifiOnly)
+    }
+
+    /// The foreground walk gate for a power snapshot and the Wi-Fi-only value the
+    /// caller captured, with the network read now. Shared by the walk and
+    /// BackfillBodyQueue. "On Wi-Fi" is `onUnmeteredNetwork` of NetworkMonitor's
+    /// latest path (Mutex-backed), the same rule the job applies to its own
+    /// measurement; an expensive or unsatisfied path (cellular, a Personal
+    /// Hotspot) counts as metered. A network no path update has reported yet counts as metered, so
+    /// Wi-Fi-only holds until the monitor knows (as the job's measurement holds on
+    /// its timeout, #1064).
+    nonisolated static func backfillDownloadsAllowed(
+        power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), wifiOnly: Bool
+    ) -> Bool {
+        let onWiFi = NetworkMonitor.checkPathFactsIfKnown().map(onUnmeteredNetwork) ?? false
+        return backfillWalkAllowed(
+            fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
+            batteryLevel: power.batteryLevel, wifiOnly: wifiOnly, expensive: !onWiFi)
     }
 
     func register(accountId: String, provider: any EmailProvider, workQueue: ProviderWorkQueue) {

@@ -379,6 +379,10 @@ enum SyncConfig {
     /// BackfillBodyQueue dispatch batch — items collected per dispatch cycle.
     /// Grouped by folder after collection, so actual per-folder batches may be smaller.
     static let backfillBodyDispatchBatch = 50
+    /// How often a BackfillBodyQueue held by the backfill walk's download gate
+    /// (Wi-Fi-only on an expensive network, low battery, Low Power Mode; #1064)
+    /// checks whether the gate has lifted (seconds).
+    static let backfillBodyGateRecheckSeconds: TimeInterval = 5
     /// Max consecutive IMAP batch-fetch misses (UID not returned at all, as opposed
     /// to an empty body) before treating the message as confirmed gone from the
     /// server and deleting the local header. Per-fetch retries cross cycles because

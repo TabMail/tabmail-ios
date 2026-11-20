@@ -3184,6 +3184,73 @@ struct GmailCatchUpTests {
         }
     }
 
+    /// What the job's backfill stage did around its Wi-Fi reading.
+    private final class JobReadingRecord: Sendable {
+        /// Catch-up lists sent before the reading landed (nil: never awaited).
+        let listsAtReading = Mutex<Int?>(nil)
+        /// The budget left (seconds) when each walk-allowed run started.
+        let walkBudgets = Mutex<[TimeInterval]>([])
+    }
+
+    /// #1064, through the production pipeline (`SyncScheduler.runBackgroundBackfill`
+    /// over `performBackfill`): a lapsed Inbox whose listing stays productive far
+    /// longer than the job's short budget, and an unfinished walk with `old` to
+    /// load. Whether the Wi-Fi reading is known at once or lands after the scans
+    /// have run a slice, the walk-allowed run starts with the whole budget and the
+    /// walk downloads `old`: the scan-only pre-pass ends when the reading lands and
+    /// takes nothing from the walk.
+    @Test("In the job, scans start before a late Wi-Fi reading, and the walk then gets the same budget as with a reading known at once",
+          .enabled(if: !NetworkMonitor.checkExpensive()), arguments: [false, true])
+    func jobWalkBudgetIsTheSameWhetherTheReadingIsEarlyOrLate(readingLate: Bool) async throws {
+        let clock = Clock()
+        let slice = SyncConfig.catchUpSliceSeconds
+        var (seeds, local) = Self.rangesWorld(clock, count: 12)
+        seeds.append(Self.seed("old", clock.daysAgo(300), [inboxPath]))
+        try await Self.withWorld("gcu-job-reading-\(readingLate)", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let folderId = world.folderId(inboxPath)
+            let lapsed = GmailCatchUpState(
+                lastCompletedAt: Date().addingTimeInterval(-3_600), lapseCount: 1, listedLapseCount: 0).encoded()
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ?, backfillComplete = 0 WHERE id = ?", arguments: [lapsed, folderId])
+            }
+            // 36 lists at slice / 8 each outlast the budget below.
+            world.server.holdEveryList(forSeconds: slice / 8)
+            let account = try await Self.account(world)
+            let engine = world.engine
+            let server = world.server
+            let record = JobReadingRecord()
+            // A short job budget: a few slices, while the listing keeps progressing.
+            let budget = slice * 4
+            await SyncScheduler.runBackgroundBackfill(
+                accounts: [account], isLowPowerMode: false, wifiOnly: true,
+                onWiFi: readingLate ? nil : true, budget: budget,
+                awaitOnWiFi: {
+                    // Lands only after the scans have started and run a slice.
+                    _ = await Self.eventually(seconds: 30) { !server.listRequests().isEmpty }
+                    try? await Task.sleep(for: .seconds(slice))
+                    record.listsAtReading.withLock { $0 = server.listRequests().count }
+                    return true
+                }
+            ) { account, walkAllowed, deadline in
+                if walkAllowed { record.walkBudgets.withLock { $0.append(deadline.timeIntervalSinceNow) } }
+                _ = await engine.performBackfill(account: account, deadline: deadline, walkAllowed: walkAllowed)
+            }
+
+            if readingLate {
+                let lists = record.listsAtReading.withLock { $0 } ?? 0
+                #expect(lists > 0, "the scans waited for the Wi-Fi reading")
+            }
+            let budgets = record.walkBudgets.withLock { $0 }
+            #expect(budgets.count == 1, "one walk-allowed run after the reading: \(budgets)")
+            if let left = budgets.first {
+                #expect(left >= budget - slice / 4,
+                        "the walk started with \(left) s of a \(budget) s budget; the pre-pass took budget from it")
+            }
+            #expect(try Self.rows(world, inboxPath)["old"] != nil, "the walk did not download the older message")
+            #expect(try Self.state(world, inboxPath)?.listing != nil, "precondition: the listing stays productive past the budget")
+        }
+    }
+
     /// A lapse that came while a listing ran: the completing pass starts the new
     /// listing at once on an expensive network too, so a change in a range the
     /// first listing had already passed arrives in the same run.
@@ -3294,6 +3361,102 @@ struct GmailCatchUpTests {
                             "the worker waited again with its walk complete: \(sleeps.recorded)")
                 }
             }
+        }
+    }
+
+    // MARK: - A worker alive during the background job (#1064)
+
+    /// What the background job in `workerDuringJob` exposes to the test.
+    private final class JobWindow: Sendable {
+        let entered = Mutex(false)
+        let done = Mutex(false)
+    }
+
+    /// The worker's inputs during the job: the job's Wi-Fi reading (nil: never
+    /// lands while the worker runs), the device power, and whether the walk may run.
+    struct WorkerJobCase: Sendable, CustomTestStringConvertible {
+        let name: String
+        let reading: Bool?
+        let power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float)
+        let walks: Bool
+        var testDescription: String { name }
+
+        static let all: [WorkerJobCase] = [
+            WorkerJobCase(name: "reading-unknown", reading: nil,
+                          power: (fastSync: false, lowPowerMode: false, onPower: false, batteryLevel: 0.8), walks: false),
+            WorkerJobCase(name: "job-measured-metered", reading: false,
+                          power: (fastSync: false, lowPowerMode: false, onPower: false, batteryLevel: 0.8), walks: false),
+            WorkerJobCase(name: "low-power-mode-on-power", reading: true,
+                          power: (fastSync: false, lowPowerMode: true, onPower: true, batteryLevel: 1), walks: false),
+            WorkerJobCase(name: "job-measured-unmetered", reading: true,
+                          power: (fastSync: false, lowPowerMode: false, onPower: false, batteryLevel: 0.8), walks: true),
+        ]
+    }
+
+    /// A backfill worker that is still alive when the background processing job
+    /// starts decides its walk by the job's rule and the job's one network
+    /// measurement, never by NetworkMonitor's cached path or the job's synthetic
+    /// Fast Sync. NetworkMonitor reports unmetered Wi-Fi throughout, so a worker
+    /// on the foreground rule would walk in every case. The scan runs in every case.
+    @Test("A backfill worker running during the background job walks only when the job's reading and rule allow it; its scan always runs",
+          arguments: WorkerJobCase.all)
+    func workerDuringJobFollowsTheJobDecision(_ input: WorkerJobCase) async throws {
+        try await Self.heldWalkWorld("gcu-worker-job-\(input.name)", walkComplete: false) { world, account in
+            try await DownloadGateHarness.withNetwork(expensive: false) { () async throws in
+                let window = JobWindow()
+                let reading = input.reading
+                SyncScheduler.jobOnWiFiMeasurementHoldForTesting.withLock {
+                    $0 = {
+                        guard let reading else {
+                            while !window.done.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(20)) }
+                            return true
+                        }
+                        return reading
+                    }
+                }
+                defer { SyncScheduler.jobOnWiFiMeasurementHoldForTesting.withLock { $0 = nil } }
+                let (scheduler, context) = await MainActor.run {
+                    let context = BGTaskContext(label: "gcu-worker-job-\(input.name)", completion: { _ in })
+                    let scheduler = SyncScheduler(
+                        backgroundReadiness: { true },
+                        backgroundWork: { _ in
+                            window.entered.withLock { $0 = true }
+                            while !window.done.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(20)) }
+                        },
+                        processingHasWork: { false },
+                        backgroundSchedule: { _ in },
+                        refreshNetworkAvailable: true
+                    )
+                    scheduler.handleBackgroundAIProcessing(context: context) { _ in }
+                    return (scheduler, context)
+                }
+                let entered = await Self.eventually(seconds: 30, poll: .milliseconds(20)) {
+                    window.entered.withLock { $0 }
+                }
+                #expect(entered, "the job never started")
+                if input.reading != nil {
+                    let known = await Self.eventually(seconds: 30, poll: .milliseconds(20)) {
+                        SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 } != nil
+                    }
+                    #expect(known, "the job's reading never landed")
+                }
+                do {
+                    try await DownloadGateHarness.withWorker(world.engine, account: account, power: input.power) { sleeps async throws in
+                        #expect(await sleeps.waitFor(count: 1), "the worker's first cycle never ended")
+                    }
+                } catch {
+                    window.done.withLock { $0 = true }
+                    await context.waitForTaskForTesting()
+                    throw error
+                }
+                window.done.withLock { $0 = true }
+                await context.waitForTaskForTesting()
+                withExtendedLifetime(scheduler) {}
+            }
+            #expect(try Self.state(world, inboxPath)?.listedLapseCount == 1, "the worker's scan ran during the job (\(input.name))")
+            #expect(try Self.rows(world, inboxPath)["g0"]?.isRead == false, "the lapsed change arrived during the job (\(input.name))")
+            let pages = world.server.http.recordedCalls().map(\.url).filter { $0.contains("/messages?") && !$0.contains("after") }
+            #expect(pages.isEmpty != input.walks, "the worker's walk during the job (\(input.name)): pages \(pages)")
         }
     }
 
