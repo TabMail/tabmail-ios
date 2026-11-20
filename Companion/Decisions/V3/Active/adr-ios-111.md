@@ -489,7 +489,9 @@ list keeps its first ids and arms the catch-up" for ids already stored, and its 
 release boundary.
 Tests: `ReleaseBoundaryRecheckTests` (`manyRetiredLabelIdsDrainInACheckedFolder`,
 `applyCutsOnlyThisPassesAdditions`, `overflowKeepsEveryRetiredId`,
-`favouriteCustomFolderKeepsEveryRetiredId`), `OutlookCatchUpTests.recheckOverflowHealsAFlag`,
+`favouriteCustomFolderKeepsEveryRetiredId`), `OutlookCatchUpTests.recheckOverflowRebaselinesAndHealsAFlag` (renamed 2026-11-20, #1107, from
+`recheckOverflowHealsAFlag`: it now asserts the dropped bookmark of the 2026-11-17 amendment and
+re-baselines before the listing),
 `ChangeApplyTests.recheckOverflowArmsCatchUp`.
 Keywords: changeRecheckLimit, overflow, stored ids never cut, this pass's additions, retired ids
 drain, #903.

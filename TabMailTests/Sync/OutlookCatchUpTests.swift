@@ -435,9 +435,12 @@ struct OutlookCatchUpTests {
     }
 
     /// More messages to read again than the folder may keep (`changeRecheckLimit`)
-    /// arms a listing; it heals a read state the delta never delivered.
-    @Test("A re-read list that overflows arms a listing that heals a stale read state")
-    func recheckOverflowHealsAFlag() async throws {
+    /// in a folder holding its own bookmark: this pass's additions are cut (#903),
+    /// the bookmark is dropped and a listing armed (ADR-IOS-111 amendment
+    /// 2026-11-17, #751). The folder re-reads from a fresh baseline, so no cut
+    /// arrival is skipped, and the listing heals a state the delta never delivered.
+    @Test("A hidden flag change in a folder whose re-read list overflowed is corrected, and the folder re-reads from a fresh baseline")
+    func recheckOverflowRebaselinesAndHealsAFlag() async throws {
         let c = Clock()
         try await Self.withWorld(seeds: [Self.seed("f-1", in: Self.archive, at: c.daysAgo(5), isRead: true, isFlagged: true)]) { w, engine in
             try w.insertRow("f-1", in: w.archive, date: c.daysAgo(5), isRead: true, isFlagged: true)
@@ -445,9 +448,10 @@ struct OutlookCatchUpTests {
             let first = try #require(try await Self.untilListed(w, engine, w.archive).flatMap { _ in try Self.state(w, w.archive)?.lastCompletedAt })
             // A change the delta never delivered: the phone holds a stale state.
             try Self.setLocal(w, "f-1", in: w.archive, isRead: false, isFlagged: false)
+            #expect(try w.cursor(w.archive) != nil, "precondition: the Archive holds its own bookmark")
 
             // A full stored list, then a pass whose own additions take it over
-            // the limit: only those additions are cut (#903), and that arms the listing.
+            // the limit: only those additions are cut (#903).
             let unreadable = (0..<SyncConfig.changeRecheckLimit).map { String(format: "rr-%04d", $0) }
             for id in unreadable { w.server.answerBatchItem(providerMessageId: id, status: 500, body: nil) }
             let full = FolderChangeState(tracking: true, recheck: unreadable).encoded
@@ -457,9 +461,14 @@ struct OutlookCatchUpTests {
                 _ = try SyncEngine.applyFolderChanges(
                     FolderChanges(folderId: archiveId, status: .tracked, rereadLater: ["rr-new"]), db: db)
             }
-            #expect(try Self.state(w, w.archive)?.lapsedSinceLastListing == true, "precondition: the overflow armed a listing")
+            #expect(try w.cursor(w.archive) == nil, "the overflow dropped the Archive's bookmark, so it re-baselines")
+            #expect(try Self.state(w, w.archive)?.lapsedSinceLastListing == true, "the overflow armed a listing")
+            let recheck = FolderChangeState(raw: try await w.pool.read { db in try Folder.fetchOne(db, key: archiveId)?.changeState }).recheck
+            #expect(!recheck.contains("rr-new"), "this pass's own addition was cut")
+            #expect(Set(unreadable).isSubset(of: Set(recheck)), "every stored id remains")
 
-            #expect(try await Self.untilListed(w, engine, w.archive, after: first) != nil)
+            try await w.baselineAll()
+            #expect(try await Self.untilListed(w, engine, w.archive, after: first) != nil, "no new listing after the overflow")
 
             let row = try #require(try w.row("f-1", in: w.archive))
             #expect(row.isRead && row.isFlagged, "the stale read state and flag were not healed")
