@@ -469,7 +469,19 @@ actor BackfillBodyQueue {
     func awaitDrain() async {
         while !storage.isEmpty || activeBatchCount > 0 {
             if Task.isCancelled { break }
-            if heldByDownloadGate && activeBatchCount == 0 { break }
+            // The held flag may be stale (set in an earlier foreground run and
+            // the app since resumed in a background job with the gate open), so
+            // the live gate decides: still shut, return without hanging; open,
+            // clear the flag, dispatch, and keep waiting for the bodies.
+            if heldByDownloadGate && activeBatchCount == 0 {
+                guard await SyncEngine.backfillDownloadsAllowedNow() else { break }
+                if heldByDownloadGate {
+                    BackgroundSyncLogger.logDebug("[BackfillBody] awaitDrain: held flag stale, gate open; dispatching")
+                    gateWatchTask?.cancel()
+                    gateLifted()
+                }
+                continue
+            }
             try? await Task.sleep(for: .milliseconds(200))
         }
     }
@@ -568,7 +580,9 @@ actor BackfillBodyQueue {
 
         // #1064: older-mail bodies follow the backfill walk's download gate
         // (Wi-Fi-only on an expensive network, low battery or Low Power Mode off
-        // power; in the background job, the job's walk decision). Decided after
+        // power). In the background job this gate tests for a not-expensive
+        // network while the job's own walk tests isOnWiFi; both refuse
+        // cellular. Decided after
         // the waits above, immediately before any batch launches (no await
         // follows). A refusal releases the candidates to pending without
         // spending a retry and arms a watch that re-dispatches once the gate

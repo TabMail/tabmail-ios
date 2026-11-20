@@ -10,8 +10,9 @@ import Testing
 
 /// #1064: older-mail body downloads (BackfillBodyQueue) follow the backfill walk's
 /// download gates (Wi-Fi-only on an expensive network, battery below 20% off
-/// power, Low Power Mode off power; in the background job, the job's own walk
-/// decision). ActiveBodyQueue (new mail) and a message the user opens are not
+/// power, Low Power Mode off power; in the background job, the body gate tests
+/// for a not-expensive network while the job's walk tests isOnWiFi, both
+/// refusing cellular). ActiveBodyQueue (new mail) and a message the user opens are not
 /// gated. The observables are the provider (a held download never reaches it)
 /// and the queue's pending items.
 @Suite("Older-mail body downloads follow the walk gate", .serialized, .processGlobalState)
@@ -110,6 +111,27 @@ struct BackfillBodyDownloadGateTests {
             openGate()
             #expect(await eventually { await fetchCount(provider) > 0 },
                     "the held body was not downloaded after \(gate) lifted")
+        }
+        await queue.cancelAllInFlight()
+    }
+
+    @Test("awaitDrain on a queue held earlier waits for the body once the gate is open (stale held flag)")
+    func staleHeldFlagWithGateOpenWaitsForBody() async throws {
+        let accountId = "gate1064-stale-held"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        try await withAccount(accountId, provider: provider, gate: .lowPowerMode) {
+            await queue.enqueue([backfillItem(accountId)])
+            try await Task.sleep(for: Self.settle)
+            #expect(await queue.heldByDownloadGate, "precondition: the queue is held")
+            #expect(await fetchCount(provider) == 0, "precondition: nothing downloaded while held")
+
+            // The gate opens (as when a background job starts later) before the
+            // queue's own re-check runs; the held flag is now stale.
+            openGate()
+            let returned = await drains(queue)
+            #expect(await fetchCount(provider) > 0,
+                    "awaitDrain returned on a stale held flag before the body was fetched (returned=\(returned))")
         }
         await queue.cancelAllInFlight()
     }
