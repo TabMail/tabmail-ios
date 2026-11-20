@@ -1985,7 +1985,10 @@ struct FastSyncKeepAwakeTests {
         #expect(FastSyncView.keepScreenAwakeWhileWorking(
             accountHeadersDone: [progress.headersDone],
             activeBodyIdle: activeIdle,
-            backfillBodyIdle: backfillIdle
+            backfillBodyIdle: backfillIdle,
+            downloadsHeld: false,
+            backfillBodyHeld: false,
+            walkRunning: false
         ) == false, "an oversized-only remainder must not pin the screen awake")
 
         // Durable writes escape the actor — settle them inside this test's scope.
@@ -2003,7 +2006,10 @@ struct FastSyncKeepAwakeTests {
         #expect(FastSyncView.keepScreenAwakeWhileWorking(
             accountHeadersDone: [true],
             activeBodyIdle: activeIdle,
-            backfillBodyIdle: true
+            backfillBodyIdle: true,
+            downloadsHeld: false,
+            backfillBodyHeld: false,
+            walkRunning: false
         ) == true, "the screen stays awake while bodies are actually being fetched")
     }
 
@@ -2017,7 +2023,10 @@ struct FastSyncKeepAwakeTests {
         #expect(FastSyncView.keepScreenAwakeWhileWorking(
             accountHeadersDone: [true],
             activeBodyIdle: true,
-            backfillBodyIdle: backfillIdle
+            backfillBodyIdle: backfillIdle,
+            downloadsHeld: false,
+            backfillBodyHeld: false,
+            walkRunning: false
         ) == true)
     }
 
@@ -2030,7 +2039,10 @@ struct FastSyncKeepAwakeTests {
         #expect(FastSyncView.keepScreenAwakeWhileWorking(
             accountHeadersDone: [true, false],
             activeBodyIdle: true,
-            backfillBodyIdle: true
+            backfillBodyIdle: true,
+            downloadsHeld: false,
+            backfillBodyHeld: false,
+            walkRunning: false
         ) == true)
     }
 

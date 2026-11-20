@@ -468,6 +468,13 @@ actor BackfillBodyQueue {
         storage.isEmpty && activeBatchCount == 0
     }
 
+    /// Items are pending, the last dispatch found the download gate shut and no
+    /// batch runs: nothing here moves until the gate lifts. The flag may be
+    /// stale, so a reader pairs it with the live gate (Fast Sync's lock, #1098).
+    var pendingHeldByDownloadGate: Bool {
+        !storage.isEmpty && heldByDownloadGate && activeBatchCount == 0
+    }
+
     func awaitDrain() async {
         while !storage.isEmpty || activeBatchCount > 0 {
             if Task.isCancelled { break }
