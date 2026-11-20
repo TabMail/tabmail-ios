@@ -433,8 +433,8 @@ struct IMAPChangeCondstoreTests {
         #expect(outcome.finalUidNext == 3, "the bookmark moves on past 2: \(String(describing: outcome.finalUidNext))")
     }
 
-    @Test("A staged UID at the old UIDNEXT flagged \\Deleted (not expunged) that the merge inserts after the apply already covered it: the bookmark stops vouching for it and ordinary passes leave no ghost")
-    func stagedSoftDeletedArrivalMergedAfterApplyIsNotAGhost() async throws {
+    @Test("A soft-deleted arrival never outlives the next pass: a staged UID at the old UIDNEXT flagged \\Deleted (not expunged), merged after the apply already covered it, is gone after the next ordinary pass")
+    func softDeletedArrivalNeverOutlivesTheNextPass() async throws {
         let outcome = try await Self.stagedArrivalMergedBetweenReadAndApply(
             "cs-nse-arrival-soft-deleted-late", fate: .softDeleted, mergeAfterApply: true)
         #expect(!outcome.racedApplyRejected, "the apply reached the proof")
