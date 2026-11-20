@@ -257,10 +257,25 @@ struct UploadedDraftSingleEntryTests {
         try await write(fixture, draftId: uploaded.draftId, body: edited, cursor: uploaded.cursor)
         #expect(await AccountManager.shared.queueDraftSave(
             draftId: uploaded.draftId, accountId: fixture.accountId))
+        let oldKey = ContentKey(rawValue: uploaded.serverHeaderId)
+        let newKey = ContentKey(rawValue: MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: Self.draftsPath, messageId: kind.replacementServerId))
+        defer { Task { try? await SearchIndex.shared.removeMessages(contentKeys: [oldKey, newKey]) } }
+        try #require(try await SearchIndex.shared.isIndexed(contentKey: oldKey),
+                     "precondition: the server copy's entry is searchable before the replacement")
+        try #require(try await SearchIndex.shared.bodyText(contentKey: oldKey)?.contains(edited) == true,
+                     "precondition: its search entry holds the latest words")
+
         await mock.setSaveDraftResult(.created(kind.replacement))
         #expect(try await push(fixture, draftId: uploaded.draftId, mock: mock) == .completed)
 
         try await expectOneEntryAfterReplacement(fixture, draftId: uploaded.draftId, words: edited)
+        #expect(try await !SearchIndex.shared.isIndexed(contentKey: oldKey),
+                "the replaced address is still in search")
+        #expect(try await SearchIndex.shared.isIndexed(contentKey: newKey),
+                "the new address is not in search")
+        let newBody = try await SearchIndex.shared.bodyText(contentKey: newKey)
+        #expect(newBody?.contains(edited) == true, "the new search entry holds \(newBody ?? "nothing")")
     }
 
     @Test("After a UIDVALIDITY reset, saving an uploaded draft leaves the message now at its UID unchanged")
