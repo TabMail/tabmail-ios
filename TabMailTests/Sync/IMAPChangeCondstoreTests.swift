@@ -330,8 +330,12 @@ struct IMAPChangeCondstoreTests {
 
     // MARK: - A staged UID at the old UIDNEXT merged between the read and the apply
 
-    /// A tracked inbox holding 1 (bookmark UIDNEXT 2). UID 2 arrives; with
-    /// `expunged` it is expunged again before the next read. The raced pass:
+    /// What happens to UID 2 on the server before the raced read.
+    enum ArrivalFate { case live, expunged, softDeleted }
+
+    /// A tracked inbox holding 1 (bookmark UIDNEXT 2, catch-up completed). UID 2
+    /// arrives; `.expunged` expunges it again before the next read,
+    /// `.softDeleted` flags it `\Deleted` without expunging it. The raced pass:
     /// the real reader reads the inbox (the database's rows), then the real
     /// staging merge inserts a notification row for 2 (the stored bookmark does
     /// not claim 2 yet, so the merge keeps it), then the read is applied. Then
@@ -346,7 +350,8 @@ struct IMAPChangeCondstoreTests {
         var finalUidNext: UInt32?
     }
 
-    static func stagedArrivalMergedBetweenReadAndApply(_ name: String, expunged: Bool) async throws -> ArrivalRaceOutcome {
+    static func stagedArrivalMergedBetweenReadAndApply(_ name: String, fate: ArrivalFate, mergeAfterApply: Bool = false) async throws -> ArrivalRaceOutcome {
+        let gone = fate != .live
         var outcome = ArrivalRaceOutcome()
         try await E.withWorld(name, capabilities: Self.condstore, serverUIDs: [1], localUIDs: [1]) { w in
             w.server.honorSearchUIDSetCriterion()
@@ -354,10 +359,16 @@ struct IMAPChangeCondstoreTests {
             try await Self.foregroundPass(w)
             try #require(try Self.tracked(w), "setup: the baseline pass's listing and commit track the folder")
             try #require(IMAPChangeCursor.decode(try w.folder().changeCursor)?.uidNext == 2, "setup: the bookmark's UIDNEXT is 2")
+            try #require(IMAPCatchUpState.decode(try w.folder().catchUpState)?.lastCompletedAt != nil,
+                         "setup: the catch-up has completed, so no periodic listing repairs a ghost")
 
             Self.add([2], to: w.server, E.path)
             _ = w.server.qresyncHighestModSeq(for: E.path)  // the server has assigned UID 2
-            if expunged { Self.remove([2], from: w.server, E.path) }
+            switch fate {
+            case .live: break
+            case .expunged: Self.remove([2], from: w.server, E.path)
+            case .softDeleted: w.server.setFlags(["\\Deleted"], in: E.path, uid: 2)
+            }
 
             let folder = try w.folder()
             let issuedWith = folder.changeCursor
@@ -373,17 +384,20 @@ struct IMAPChangeCondstoreTests {
             try #require(R.isTracked(raced.status), "setup: the raced read is tracked, got \(raced.status)")
             raced.readFrom = FolderChanges.ReadFrom(cursor: issuedWith)
 
-            outcome.staged = try await Self.stageAndMerge(2, w)
-            try #require(try w.uids().contains("2"), "setup: the merge inserted 2 between the read and the apply")
+            if !mergeAfterApply {
+                outcome.staged = try await Self.stageAndMerge(2, w)
+                try #require(try w.uids().contains("2"), "setup: the merge inserted 2 between the read and the apply")
+            }
             let racedChanges = raced
             let applied = try await w.pool.write { db in try SyncEngine.applyFolderChanges(racedChanges, db: db) }
             outcome.racedApplyRejected = applied.rejected
             outcome.afterRace = IMAPChangeCursor.decode(try w.folder().changeCursor)
             outcome.rowsAfterRace = try w.uids()
+            if mergeAfterApply { outcome.staged = try await Self.stageAndMerge(2, w) }
 
             for _ in 0..<IMAPChangeCondstoreCheckTests.raceSettlePassCap {
                 try await Self.foregroundPass(w)
-                if try (expunged ? !w.uids().contains("2") : true) && Self.tracked(w) { break }
+                if try (gone ? !w.uids().contains("2") : true) && Self.tracked(w) { break }
             }
             try await Self.foregroundPass(w)  // and it stays settled
             outcome.rows = try w.uids()
@@ -395,7 +409,7 @@ struct IMAPChangeCondstoreTests {
 
     @Test("A staged UID at the old UIDNEXT that the merge inserts between the read and the apply is never covered unchecked: the bookmark stays, ordinary passes remove the expunged message and track the folder")
     func stagedArrivalAtOldUidNextMergedBeforeApplyIsNotAGhost() async throws {
-        let outcome = try await Self.stagedArrivalMergedBetweenReadAndApply("cs-nse-arrival-gone", expunged: true)
+        let outcome = try await Self.stagedArrivalMergedBetweenReadAndApply("cs-nse-arrival-gone", fate: .expunged)
         #expect(!outcome.racedApplyRejected, "the raced apply reached the proof")
         #expect(outcome.afterRace?.uidNext == 2, "the bookmark covered UID 2 without checking it: \(String(describing: outcome.afterRace))")
         #expect(outcome.staged, "the staged payload is kept")
@@ -404,9 +418,36 @@ struct IMAPChangeCondstoreTests {
         #expect(outcome.finalUidNext == 3, "the bookmark moves on past 2: \(String(describing: outcome.finalUidNext))")
     }
 
+    @Test("A staged UID at the old UIDNEXT flagged \\Deleted (not expunged) that the merge inserts between the read and the apply is removed, never stranded behind the bookmark: ordinary passes leave no ghost and keep the folder tracked")
+    func stagedSoftDeletedArrivalMergedBeforeApplyIsNotAGhost() async throws {
+        let outcome = try await Self.stagedArrivalMergedBetweenReadAndApply("cs-nse-arrival-soft-deleted", fate: .softDeleted)
+        #expect(!outcome.racedApplyRejected, "the raced apply reached the proof")
+        // Either the raced apply removed the row it covered, or it kept the
+        // bookmark behind it; never a covered row that stays.
+        #expect(outcome.rowsAfterRace == ["1"], "the apply removes the positively observed \\Deleted arrival the merge inserted: \(outcome.rowsAfterRace)")
+        let coveredAndKept = outcome.afterRace?.uidNext == 3 && outcome.rowsAfterRace.contains("2")
+        #expect(!coveredAndKept, "the bookmark covered the soft-deleted UID 2 while its row stayed: \(String(describing: outcome.afterRace)) rows \(outcome.rowsAfterRace)")
+        #expect(outcome.staged, "the staged payload is kept")
+        #expect(outcome.rows == ["1"], "the soft-deleted staged message stays as a ghost: \(outcome.rows)")
+        #expect(outcome.trackedAfter, "the folder is tracked again")
+        #expect(outcome.finalUidNext == 3, "the bookmark moves on past 2: \(String(describing: outcome.finalUidNext))")
+    }
+
+    @Test("A staged UID at the old UIDNEXT flagged \\Deleted (not expunged) that the merge inserts after the apply already covered it: the bookmark stops vouching for it and ordinary passes leave no ghost")
+    func stagedSoftDeletedArrivalMergedAfterApplyIsNotAGhost() async throws {
+        let outcome = try await Self.stagedArrivalMergedBetweenReadAndApply(
+            "cs-nse-arrival-soft-deleted-late", fate: .softDeleted, mergeAfterApply: true)
+        #expect(!outcome.racedApplyRejected, "the apply reached the proof")
+        #expect(outcome.rowsAfterRace == ["1"], "the apply leaves no row for the soft-deleted UID 2: \(outcome.rowsAfterRace)")
+        #expect(outcome.staged, "the staged payload is kept")
+        #expect(outcome.rows == ["1"], "the soft-deleted staged message stays as a ghost: \(outcome.rows)")
+        #expect(outcome.trackedAfter, "the folder is tracked again")
+        #expect(outcome.finalUidNext == 3, "the bookmark moves on past 2: \(String(describing: outcome.finalUidNext))")
+    }
+
     @Test("Control: a staged live arrival at the old UIDNEXT merged between the read and the apply stays, and the bookmark moves on in the same apply")
     func stagedLiveArrivalAtOldUidNextMergedBeforeApplyStays() async throws {
-        let outcome = try await Self.stagedArrivalMergedBetweenReadAndApply("cs-nse-arrival-live", expunged: false)
+        let outcome = try await Self.stagedArrivalMergedBetweenReadAndApply("cs-nse-arrival-live", fate: .live)
         #expect(!outcome.racedApplyRejected, "the raced apply reached the proof")
         #expect(outcome.afterRace?.uidNext == 3, "a read that fetched the arrival covers it: \(String(describing: outcome.afterRace))")
         #expect(outcome.rowsAfterRace == ["1", "2"], "the live arrival is held after the race: \(outcome.rowsAfterRace)")

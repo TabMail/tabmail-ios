@@ -1114,6 +1114,14 @@ unchanged (RFC 7162).
    bookmark it writes): the arrivals the server listed plus the moved-in rows its own lookup found. The apply
    checks it as it checks `heldRowsProof`; any other held row there keeps the stored bookmark, so the next
    read finds the row moved-in and checks it. The staged row is kept; no new persisted state.
+   A UID admitted to that proof must have an applicable result. A listed arrival the read sees flagged
+   `\Deleted` (not expunged) is therefore emitted as a removal whether or not the folder held it at the
+   lookup (IOS-IMAP-001 D3: a `\Deleted` message is not present for display); the shared changed-flags
+   classifier (`readChangedAndArrivals`) no longer restricts that removal to held rows, for QRESYNC too, and
+   the apply's shields (pending operations, recent/outbox protections) decide as for every removal. A row
+   the merge inserts before the apply is removed by it; one it inserts after the apply contradicts the new
+   bookmark and ends tracking (`endTrackingIfBookmarkClaimsHeld`), so the next listing settles it. The
+   proof was not narrowed to omit such UIDs: one rule, no second path.
 7. **The turn.** A standalone `syncFolderMessages` lists inside `oneSyncAtATime`, which is re-entrant for the
    task holding it (`@TaskLocal heldSyncTurn`).
 8. The catch-up's MODSEQ freshness for a folder with a same-epoch bookmark is the bookmark's MODSEQ alone.

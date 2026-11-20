@@ -511,8 +511,8 @@ extension IMAPProvider {
     }
 
     /// Changed flags and arrivals on the current selection, one classification
-    /// for every change mode: a held `\Deleted` message is a removal wherever
-    /// its UID sits (IOS-IMAP-001 D3); a changed message at or above the
+    /// for every change mode: a `\Deleted` message is a removal wherever its
+    /// UID sits, held at lookup or not (IOS-IMAP-001 D3); a changed message at or above the
     /// bookmark's UIDNEXT is an arrival, fetched in full; a held one gets a
     /// partial record (its whole flag and keyword set); a changed message the
     /// folder does not hold, inside the range the older-mail walk has downloaded
@@ -525,20 +525,22 @@ extension IMAPProvider {
     ) async throws -> SelectionReadOutcome {
         let context = request.context
         let sorted = changed.sorted { $0.uid < $1.uid }
-        // Held rows are looked up below the bookmark's UIDNEXT and, for a
-        // `\Deleted` message, at or above it too: a moved-in row is re-keyed to
-        // its destination UID there before the folder's next read.
-        let heldCandidates = sorted.filter { $0.uid < cursorUidNext || $0.flags.contains(.deleted) }.map(\.uid)
+        // Held rows are looked up below the bookmark's UIDNEXT; a `\Deleted`
+        // message needs no lookup, its removal is emitted whether held or not.
+        let heldCandidates = sorted.filter { $0.uid < cursorUidNext && !$0.flags.contains(.deleted) }.map(\.uid)
         let held = try await heldIdSet(heldCandidates, folderId: folder.id, request: request)
         let heldFrom = Self.heldRangeStart(folder)
         var toFetch: [UInt32] = []
         for message in sorted {
             let value = message.uid
             if message.flags.contains(.deleted) {
-                // A message the server holds as `\Deleted` is never shown: the
-                // folder's row for it goes, wherever its UID sits. One it does not
-                // hold is neither fetched nor inserted.
-                if held.contains(value) { changes.removals.append(String(value)) }
+                // A message the server holds as `\Deleted` is never shown: its
+                // removal is emitted wherever its UID sits and whether or not the
+                // folder held it at this lookup, and it is never fetched. A row the
+                // notification merge inserts after the lookup is then removed by
+                // the apply (its shields decide), so an arrival proof that counts
+                // the UID as accounted for never strands it (#755).
+                changes.removals.append(String(value))
             } else if value >= cursorUidNext {
                 toFetch.append(value)
             } else if held.contains(value) {
