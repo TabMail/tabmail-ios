@@ -513,6 +513,46 @@ struct SuggestionRewriteRouteTests {
         }
     }
 
+    /// The no-request row of `swappedRowRefuses`: a field reply with only `unique_id` reads no
+    /// body, so the early identity check is the only refusal. Without it the card would open on
+    /// the other email, holding its stored suggestion.
+    @Test("On IMAP, another email seated at the shown row refuses a field reply with no request and no body: no card, no AI call",
+          arguments: [true, false])
+    func swappedRowRefusesWithoutRequest(swapped: Bool) async throws {
+        let fixture = try await fixture(imap: true)
+        let db = fixture.db
+        let id = fixture.header.id, folderId = fixture.header.folderId
+        if swapped {
+            await fixture.translator.setOnResolve {
+                try? await db.write { db in
+                    try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 222 WHERE id = ?", arguments: [folderId])
+                    try db.execute(sql: "UPDATE messageHeader SET rfc822MessageId = '<other@example.com>', observedUidValidity = 222 WHERE id = ?",
+                                   arguments: [id])
+                }
+            }
+        }
+        let calls = Calls()
+        let tool = tool(fixture, calls: calls, answer: Self.edit())
+        let invocation = invocation(fixture.header)
+        let arguments: [String: JSONValue] = ["unique_id": .int(1)]
+        // Bounded: a request that wrongly opens a card is cancelled, never awaited forever.
+        let task = Task { @MainActor in try await tool.run(arguments: arguments, invocation: invocation, rewritesInPlace: true) }
+        let card = await waitForCard(fixture.router)
+        card?.onOutcome(.cancelled)
+        let output = try await task.value
+        #expect(calls.all.isEmpty, "a reply with no request never asks the AI")
+        let stored = try await row(db, id).suggestion
+        #expect(stored == Self.shownReply, "nothing is stored")
+        if swapped {
+            #expect(card == nil, "no card opens for another email")
+            #expect(output.contains("email changed"))
+        } else {
+            // Control: the same email under the same numbering opens its card on the stored suggestion.
+            #expect(card != nil, "the reply's card opens")
+            #expect(card?.suggestion == Self.shownReply, "the card holds the stored suggestion")
+        }
+    }
+
     @Test("A compose edit's body read refuses a row that is no longer the email; the email's own body is read")
     func bodyReadChecksTheEmail() async throws {
         let fixture = try await fixture(imap: true)

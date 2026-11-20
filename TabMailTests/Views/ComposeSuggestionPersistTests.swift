@@ -771,6 +771,63 @@ struct ComposeSuggestionPersistTests {
         #expect(gate.lowerBound < assign.lowerBound && assign.lowerBound < save.lowerBound,
                 "the card's shown suggestion becomes the edited value before its save")
         #expect(!source.contains("persistCachedReply"), "the retired second writer")
+        // The suggestion replaced is the one shown when the edit started: read before the decision
+        // and before the card shows the edited value, else the edit compares against itself.
+        let previous = try #require(edit.range(of: "let previous = shownSuggestion\n"))
+        #expect(previous.lowerBound < gate.lowerBound && previous.lowerBound < assign.lowerBound,
+                "the replaced suggestion is read before the card shows the edit")
+        #expect(edit.components(separatedBy: "shownSuggestion").count - 1 == 2,
+                "the edit reads the shown suggestion once (as previous) and assigns it once")
+    }
+
+    /// Backstop for the hosted card's pill, which no active test can drive: each compose edit's
+    /// context is read when the edit is sent, through the identity-checked read, and a nil read
+    /// refuses the edit before the model call.
+    @Test("A card's compose edit sends the context read at request time, and refuses a nil read")
+    func cardEditReadsItsContextAtRequestTime() throws {
+        let compose = try composeSource()
+        let chat = try #require(compose.range(of: "DynamicIslandChat(\n"))
+        let wiring = compose[chat.upperBound...].prefix(1200)
+        #expect(wiring.contains("composeEditContext: { await composeEditContextForRequest() },"),
+                "the card hands the chat its request-time context read")
+        let reader = try functionBody("private func composeEditContextForRequest()", before: "\n    }\n", in: compose)
+        #expect(reader.contains("ComposeEditContext.relatedBodyText(of: reply, db: db)"), "the identity-checked body read")
+        let source = try #require(Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift"))
+        let send = try functionBody("private func sendComposeEdit(", before: "private func finishAutoSave(", in: source)
+        let capture = try #require(send.range(of: "let contextSource = composeEditContext\n"))
+        let task = try #require(send.range(of: "let editTask = Task {"))
+        let read = try #require(send.range(of: "guard let read = await contextSource() else {\n"))
+        let refuse = try #require(send[read.upperBound...].range(of: "throw InlineEditFailure("))
+        let adopt = try #require(send.range(of: "requestContext = read\n"))
+        let call = try #require(send.range(of: "aiService.performInlineEdit("))
+        #expect(capture.lowerBound < task.lowerBound && task.lowerBound < read.lowerBound
+                && read.lowerBound < refuse.lowerBound && refuse.lowerBound < adopt.lowerBound
+                && adopt.lowerBound < call.lowerBound,
+                "the context is read inside the request's task, refused on nil, then used")
+        #expect(send[read.upperBound..<adopt.lowerBound].count < 300, "the refusal is the nil read's own branch")
+        #expect(send[call.upperBound...].prefix(300).contains("context: requestContext,"),
+                "the model gets the request-time context, never the render-time one")
+    }
+
+    /// Backstop for `prepopulate`'s view-private read: a reply card opened without a given
+    /// suggestion shows the stored one only while the row is still the email replied to.
+    @Test("A reply card's stored-suggestion prefill is read only while the row is the email replied to")
+    func prefillReadsTheStoredSuggestionThroughTheIdentityCheck() throws {
+        let source = try composeSource()
+        let prepopulate = try functionBody("private func prepopulate() {", before: "private func clearAttachmentPreparationFailures() {", in: source)
+        let branch = try #require(prepopulate.range(of: "} else if let reply = replyTo, !isForward {"))
+        let rest = prepopulate[branch.upperBound...]
+        let read = try #require(rest.range(of: "suggestionToShow = try? dbPool.read { db in\n"))
+        let guardLine = try #require(rest.range(of: "guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }\n"))
+        let fetch = try #require(rest.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
+        let otherwise = try #require(rest.range(of: "} else {\n"))
+        #expect(read.lowerBound < guardLine.lowerBound && guardLine.lowerBound < fetch.lowerBound
+                && fetch.lowerBound < otherwise.lowerBound,
+                "the identity check guards the stored-suggestion read, inside it, before the value")
+        let shown = try #require(rest.range(of: "shownSuggestion = suggested"))
+        #expect(fetch.lowerBound < shown.lowerBound, "the guarded value is the one shown")
+        #expect(rest[..<otherwise.lowerBound].components(separatedBy: "MessageHeader.fetchOne").count == 2,
+                "the branch has one read of the stored suggestion, the guarded one")
     }
 
     /// Backstop for what no active test can drive (the hosted card's pill and Recompute take no
