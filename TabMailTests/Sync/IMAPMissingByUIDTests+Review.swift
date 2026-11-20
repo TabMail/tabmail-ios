@@ -283,7 +283,8 @@ extension IMAPMissingByUIDTests {
             let gmail = MockEmailProvider(staleWindowMode: .date)
             await w.engine.register(accountId: gmailId, provider: gmail,
                                     workQueue: ProviderWorkQueue(provider: gmail, maxConcurrency: 1))
-            // An account whose provider is not registered: the prune has no order for it.
+            // An account whose provider is not registered: the prune has no order
+            // for it and prunes it oldest date first, as before #1062.
             let unregisteredId = "missing-by-uid-r2-prune-unregistered"
             _ = try FolderEpochTestFixture.makeAccount(id: unregisteredId, provider: .imap, pool: w.pool)
             try FolderEpochTestFixture.insertFolder(accountId: unregisteredId, path: Self.path, role: .archive, pool: w.pool)
@@ -354,8 +355,8 @@ extension IMAPMissingByUIDTests {
             let unregisteredHeld = try await w.pool.read { db in
                 try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader WHERE folderId = ?", arguments: [unregisteredFolderId]) ?? 0
             }
-            #expect(order[unregisteredId] == nil && unregisteredHeld == count,
-                    "#1062: an account with no registered provider is not pruned in that pass")
+            #expect(order[unregisteredId] == nil && unregisteredHeld < count,
+                    "#1062: an account with no registered provider is still pruned: \(unregisteredHeld) of \(count) kept")
 
             // One catch-up under the limit, owed a full listing.
             try await w.markOwed()

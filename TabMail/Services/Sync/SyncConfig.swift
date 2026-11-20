@@ -852,6 +852,12 @@ enum SyncConfig {
     /// sparse one is reached by a bounded range (a range that still times out
     /// is halved).
     static let catchUpListingMaxRangeSpan = 10_000_000
+    /// A catch-up listing range that times out caps the next ranges at its
+    /// width divided by this (#1062).
+    static let catchUpWidthCapShrinkFactor = 2
+    /// Each catch-up listing range that answers multiplies the cap by this;
+    /// at `catchUpListingMaxRangeSpan` the cap is dropped (#1062).
+    static let catchUpWidthCapGrowthFactor = 2
     /// Most missing UIDs one catch-up load request fetches by header (#1062): one
     /// `UID FETCH` of ENVELOPE, INTERNALDATE, FLAGS, BODYSTRUCTURE and the header,
     /// charged one request of the slice's budget, so it stays well inside

@@ -80,17 +80,22 @@ account's pass does not wait).
 
 **Amended 2026-11-20 (tabmail-ios #1062): the Settings resets are turn-takers.** "Reset message data" (one
 account) and "Delete All Email Index Data" (every account) run their authoritative write transaction
-inside the sync turn of every account they write, through `SyncEngine.withSyncTurns(accountIds:)`, which
+only through the engine entry points `SyncEngine.resetMessageData(accountId:)` and
+`SyncEngine.wipeLocalIndex()`, inside the sync turn of every account they write, through
+`SyncEngine.withSyncTurns(accountIds:)`, which
 takes the turns one after another through `oneSyncAtATime` in sorted, de-duplicated account-id order, so
 two callers needing overlapping accounts never wait on each other in a cycle. The turns are taken before
 the database writer opens, never while holding it, and every turn is released on every exit, a throw
-included. The derived cleanup and the resync after the reset run outside the turn, so no pass is called
+included. The wipe reads the account ids again inside its write; if they changed while it waited, it
+releases the turns and takes them again for the new set, so no account is wiped without its turn. The
+derived cleanup and the resync after the reset run outside the turn, so no pass is called
 from inside a pass. Why: a catch-up slice, change pass or full sync read before a reset and written after
 it put pre-reset picks and progress back over the reset. The turn PREVENTS that collision; nothing
 detects it (no reset generation, no compare-and-set on `Folder.catchUpState`). **The wait:** a reset
 waits for the account's running pass and every pass already queued ahead of it (FIFO, no time cap, item
 4); a running full sync can take minutes, a catch-up slice at most one slice. Settings shows its existing
 progress state (`isResetting`, `isNuking`) for the whole wait; the reset does not cancel a running pass.
-Tests: `SyncTurnsForResetTests` (sorted order: a reset blocked on the lower id holds no turn of the higher;
-every turn released on a throw), `IMAPMissingByUIDTests.resetDuringASliceIsNeverUndone` (a reset issued
-while a slice is in flight leaves no pre-reset pick inserted and no pre-reset progress kept).
+Tests: `SyncTurnsForResetTests` (sorted order: a reset queued on the lower id holds no turn of the
+higher; every turn released on a throw), `IMAPMissingByUIDTests.resetDuringASliceIsNeverUndone` (both
+entry points: a reset issued while a slice is in flight leaves no pre-reset pick inserted and no
+pre-reset progress kept). Cancelling the running pass is not done (tabmail-ios#1118).

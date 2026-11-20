@@ -7,9 +7,10 @@
 > Exchange folder its oldest DATES first, as before. Bodies and headers are pruned in the same order.
 > The order comes from each account's `EmailProvider.staleWindowMode`, resolved by the caller
 > (`SyncEngine.pruneOrderByAccount`) and passed to `SyncEngine.runPruneIfOverBudget`; an account with
-> no registered provider is not pruned in that pass. So an IMAP folder under a limit holds one
+> no registered provider (it failed to register) is still pruned, oldest date first as before #1062. So an IMAP folder under a limit holds one
 > contiguous top range of UIDs, its lowest held UID is a clean floor, and the IMAP catch-up loads
-> only above it (ADR-IOS-107, #1062); the catch-up insert's date skip is gone.
+> only above the higher of it and the walk's start (ADR-IOS-107, #1062), so rows infinite scroll
+> cached below the walk's cursor never pull the floor down; the catch-up insert's date skip is gone.
 > **Trade-off (Archive):** an IMAP Archive keeps its most recently ARCHIVED mail (highest UIDs), not
 > its newest-DATED mail: an old message archived today is kept, a recent one archived long ago may be
 > pruned. **No migration and no cleanup:** a store already pruned by date keeps its date-holes; the

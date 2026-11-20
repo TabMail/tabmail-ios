@@ -38,11 +38,18 @@ extension IMAPMissingByUIDTests {
 
     // MARK: - a Settings reset during the slice
 
-    @Test("A Settings reset issued while a slice is in flight waits for the slice's sync turn: after it no pre-reset pick is inserted, no pre-reset progress is kept, and the next slice loads nothing from the old carry before it lists")
+    /// The two Settings resets, through the engine entry points the views call.
+    enum SettingsReset: String, CaseIterable, Sendable {
+        case accountMessageData
+        case wipeLocalIndex
+    }
+
+    @Test("A Settings reset issued while a slice is in flight waits for the slice's sync turn: after it no pre-reset pick is inserted, no pre-reset progress is kept, and the next slice loads nothing from the old carry before it lists",
+          arguments: SettingsReset.allCases)
     @MainActor
-    func resetDuringASliceIsNeverUndone() async throws {
+    func resetDuringASliceIsNeverUndone(_ reset: SettingsReset) async throws {
         let server = Self.carryServer
-        try await Self.withWorld("carry-reset", server: server, local: server,
+        try await Self.withWorld("carry-reset-\(reset.rawValue)", server: server, local: server,
                                  rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
             let folderId = w.folderId, accountId = w.accountId, pool = w.pool
             try await w.dropLocal(Self.carryMissing)
@@ -65,13 +72,15 @@ extension IMAPMissingByUIDTests {
             #expect(polls < Self.carryPolls, "setup: the slice sent its listing")
             // The Settings reset, then a window listing records a floor again, as
             // the next full sync does, so a kept carry would load.
-            try await w.engine.withSyncTurns(accountIds: [accountId]) {
-                try await pool.write { db in
-                    try AccountDetailView.resetMessageDataTxn(db, accountId: accountId)
-                    try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, db: db)
-                }
+            // The production entry point the Settings view calls.
+            switch reset {
+            case .accountMessageData: try await w.engine.resetMessageData(accountId: accountId)
+            case .wipeLocalIndex: try await w.engine.wipeLocalIndex()
             }
             await sliced
+            try await pool.write { db in
+                try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, db: db)
+            }
             w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil)
             #expect(try w.held().isEmpty, "#1062: no pre-reset pick is inserted after the reset: \(try w.held())")
             let state = try w.catchUpState()

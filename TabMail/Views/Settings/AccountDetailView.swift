@@ -568,15 +568,8 @@ struct AccountDetailView: View {
             do {
                 // This is the authoritative boundary. A failure rolls the whole
                 // account-scoped reset back and stops every derived cleanup.
-                // It runs in the account's sync turn (ADR-IOS-104), taken
-                // before the writer opens: no pass of the account writes
-                // what it read before the reset after it (#1062).
-                let pool = dbPool
-                try await manager.syncEngine.withSyncTurns(accountIds: [acctId]) {
-                    try await pool.write { db in
-                        try Self.resetMessageDataTxn(db, accountId: acctId)
-                    }
-                }
+                // It runs in the account's sync turn (ADR-IOS-104, #1062).
+                try await manager.syncEngine.resetMessageData(accountId: acctId)
             } catch {
                 BackgroundSyncLogger.logDebug("[Reset] Account-scoped database reset failed: \(error)")
                 resetError = "TabMail couldn’t delete the local message data. Nothing was removed. Please try again."

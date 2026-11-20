@@ -43,24 +43,38 @@ struct SyncTurnsForResetTests {
         return await flag.isSet
     }
 
+    /// Polls until `account` has `count` waiters; false at the bound.
+    static func waitForWaiters(_ engine: SyncEngine, _ account: String, count: Int) async throws -> Bool {
+        for _ in 0..<polls {
+            if await engine.syncPassWaiterCount(accountId: account) == count { return true }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+
     @Test("Turns are taken in sorted account-id order: while the lower id is busy, a reset of both holds no turn of the higher id")
     func turnsAreTakenInSortedOrder() async throws {
         let engine = SyncEngine()
         let low = "account-a", high = "account-b"
         let gate = Gate()
-        let busy = Task { await engine.oneSyncAtATime(accountId: low) { await gate.wait() } }
-        try await Task.sleep(for: .milliseconds(20))
+        let lowHeld = Flag()
+        let busy = Task { await engine.oneSyncAtATime(accountId: low) { await lowHeld.set(); await gate.wait() } }
+        #expect(try await Self.waitFor(lowHeld), "setup: the lower id's turn is held")
         let resetRan = Flag()
         let reset = Task { try await engine.withSyncTurns(accountIds: [high, low]) { await resetRan.set() } }
-        try await Task.sleep(for: .milliseconds(20))
+        // Sorted, the reset waits on the lower id first; caller order would hold
+        // the higher id and then wait on the lower. Either way it queues on low.
+        #expect(try await Self.waitForWaiters(engine, low, count: 1), "setup: the reset waits for the lower id")
         let highRan = Flag()
         let highPass = Task { await engine.oneSyncAtATime(accountId: high) { await highRan.set() } }
-        #expect(try await Self.waitFor(highRan), "#1062: the reset waits for the lower id first and holds no other turn meanwhile")
-        #expect(await !resetRan.isSet, "#1062: the reset waits for the busy account's turn")
+        let highFree = try await Self.waitFor(highRan)
+        let resetWaited = await !resetRan.isSet
         await gate.release()
         await busy.value
         await highPass.value
         try await reset.value
+        #expect(highFree, "#1062: the reset holds no turn of the higher id while it waits for the lower")
+        #expect(resetWaited, "#1062: the reset waits for the busy account's turn")
         #expect(await resetRan.isSet)
     }
 

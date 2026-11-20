@@ -49,6 +49,10 @@ and that capture was a lapse, so a new account listed every folder twice for the
    refusal turns it off. With no bookmark every folder is listed whatever its flag says: a reset runs
    outside the sync turn, so a pass already past its read can set the flag again after the reset, and
    skipping those folders would leave the account with no bookmark and nothing listed for good.
+   *Superseded 2026-11-20 (tabmail-ios #1062):* both Settings resets now take the sync turn (ADR-IOS-104
+   amendment), so the reason above no longer holds for them. The no-bookmark rule stays: the UIDVALIDITY
+   purge (ADR-IOS-061) still runs outside the turn under its own single flight and clears a folder's
+   change state, so a pass already past its read can still set the flag again after it.
    The folder list is written column by column (`updateChanges`), so applying it on every `.all` read
    bumps no backfill version (ADR-IOS-107).
 5. **The bookmark is read before the listings.** With no bookmark the reader returns a candidate (Gmail:

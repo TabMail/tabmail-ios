@@ -588,13 +588,17 @@ extension SyncEngine {
         // `commitChangeBaseline` tracks it again from that pass's own read.
         var changeState = FolderChangeState(raw: folder.changeState)
         let markedDuringRead = selfHealOwedAtRead.map { changeState.selfHealOwed > $0 } ?? false
+        // Clean or not: a listing that passed a UID over settles the mark too, so
+        // a message that never loads cannot keep the folder relisted forever. The
+        // passed-over UIDs are not settled with it: they go on the folder's
+        // re-read list below, where the change reader keeps asking for them.
         let settles = result.completedListing.map {
-            $0.clean && $0.lapseCountAtStart >= (changeState.selfHealLapse ?? 0)
+            $0.lapseCountAtStart >= (changeState.selfHealLapse ?? 0)
         } ?? false
-        // An owed listing that completed without settling the mark (not clean: a
-        // missing UID was passed over) consumed the lapse that made it due; with
-        // a bookmark, nothing else lists the folder again. The obligation is
-        // re-armed, so a later listing still repairs the missing UID (#1062).
+        // An owed listing that completed without settling the mark (it started
+        // before the mark) consumed the lapse that made it due; with a bookmark,
+        // nothing else lists the folder again. The obligation is re-armed once,
+        // and the next listing starts after the mark and settles it (#1062).
         let completedUnsettled = changeState.selfHealDue && result.completedListing != nil && !settles
         if markedDuringRead || completedUnsettled {
             // A mark landed while this read ran, or the owed listing completed
@@ -613,6 +617,12 @@ extension SyncEngine {
             changeState.selfHealOwed = 0
             changeState.selfHealLapse = nil
             changeState.markListingDue()
+            let passedOver = result.completedListing?.passedOverIds ?? []
+            let listed = Set(changeState.recheck)
+            changeState.recheck += passedOver.filter { !listed.contains($0) }
+            if !passedOver.isEmpty && DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[CatchUp] \(folder.id): owed check settled by a listing that passed over \(passedOver.count) UID(s); they stay on the re-read list")
+            }
             try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [changeState.encoded, folder.id])
         }
         return .applied(updatedFlags: updatedFlags, removedIds: removedIds)

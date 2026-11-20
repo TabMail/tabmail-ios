@@ -1101,7 +1101,9 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
 
 - **Ranges are cut on UIDs, not on local rows.** The lower bound is where the held range starts
   (`heldRangeStart`: 1 once the older-mail walk is complete, else its cursor + 1); under a storage limit
-  it is the first local UID, so pruned mail is neither listed nor loaded. Below the load start a listing
+  loads start at the higher of that and the first local UID (amended d1 2026-11-20: was the first local
+  UID alone, which let rows infinite scroll cached below the cursor pull the floor down and load MORE
+  under a limit), so pruned mail is neither listed for load nor loaded. Below the load start a listing
   only checks local rows. The upper bound is the larger of the last local UID and, with a change
   bookmark of the same epoch, the bookmark's UIDNEXT - 1 (by the bookmark, not by tracking), else the
   listing's own SELECT UIDNEXT - 1.
@@ -1122,10 +1124,15 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
   under the same hold, so a slow link that spends every slice on the FETCH cannot stall repair.
   *Replaces:* "When the budget is spent before request 2 [...] the cursor stays, so the range is listed again."
 - **Clean and unclean completion; retry.** A folder owed a check (`FolderChangeState.selfHealOwed`, set
-  by `dropChangeBookmark(selfHealDue:)` after an unproven move) is settled only by a CLEAN completed
-  listing that started at or after the mark (`lapseCountAtStart >= selfHealLapse`); the apply then calls
+  by `dropChangeBookmark(selfHealDue:)` after an unproven move) is settled by a completed listing that
+  started at or after the mark (`lapseCountAtStart >= selfHealLapse`), clean or not (amended d1
+  2026-11-20: was CLEAN only, so a message that never decodes kept the folder untracked and relisted
+  hourly forever). The UIDs a listing passed over are not settled with the mark: they go on the folder's
+  re-read list (`FolderChangeState.recheck`, via `CatchUpCompletedListing.passedOverIds`), where the
+  change reader keeps asking for them. A listing's start count comes from the raw state's `lapseCount`
+  (`CatchUpLapse.read`) when the typed state is absent (floor-only, another epoch). The apply then calls
   `markListingDue`, so the next scheduled full sync lists the folder and `commitChangeBaseline` tracks it
-  again. A completion that does not settle the mark (unclean, or started before it), and a mark landing
+  again. A completion that does not settle the mark (started before it), and a mark landing
   during the read, re-mark the lapse on the state just written (also when it was NULL) and record it in
   `selfHealLapse`: the obligation survives, so a later listing still repairs the missing UID even when a
   bookmark keeps the daily and MODSEQ checks off (the bookmark-based planning rule is unchanged).
@@ -1158,7 +1165,13 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     where the listing stands first ..., the other next", a retry of both halves inside the same call,
     which could not work while the timed-out request still held the folder's connection. *Replaces:* the width recomputed from each SELECT's EXISTS and UIDNEXT, and a
     listing failure that ended the folder's pass with no split.
-  - *Width cap after a timeout, current (third review round).* A range that times out also stores a
+  - *Width cap, current (d1 2026-11-20).* A range that times out sets the cap
+    (`IMAPCatchUpState.Listing.widthCap`) to its width divided by `SyncConfig.catchUpWidthCapShrinkFactor`;
+    each range that answers multiplies it by `SyncConfig.catchUpWidthCapGrowthFactor`, and at
+    `catchUpListingMaxRangeSpan` it is dropped. No range-scoped end (`widthCapThrough` removed). Why: the
+    cap below only ever shrank, so about 20 timeouts unrelated to range size left a sparse folder at
+    one-UID ranges over millions of UIDs. A cap-only change is still no progress.
+  - *Width cap after a timeout, superseded by the d1 entry above.* A range that times out also stores a
     width cap (`IMAPCatchUpState.Listing.widthCap`, the stored half width) together with the upper end
     of the range that timed out (`widthCapThrough`); repeated timeouts before the listing moves past
     keep the smallest cap and the highest end. While the listing stands at or below that end, no range
@@ -1191,7 +1204,8 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     dropped, the held one with its hold. A budget stop before the SEARCH for UIDs a load batch did
     not answer carries that SEARCH (`unanswered`). A failed SEARCH or load keeps the carry within the
     hold bound, so the retry pays only for what failed. The header load compares the SELECT's
-    UIDVALIDITY before its FETCH and sends nothing under another numbering. The slice reads the load
+    UIDVALIDITY before its FETCH and sends nothing under another numbering; a UID SEARCH is read-only
+    and is compared after its answer, which is discarded on a mismatch. The slice reads the load
     floor at the start of its turn and drops carried UIDs outside it. A Settings reset takes the
     account's sync turn (ADR-IOS-104 amendment 2026-11-20), so no slice runs between its read and its
     write and nothing read before a reset is written after it; there is no compare-and-set on the
@@ -1209,7 +1223,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     folder's `catchUpState` JSON by the window merge, `SyncEngine.recordCatchUpWindowFloor`, as the
     lowest any window listing in the epoch reached; the catch-up apply carries it across its own state
     writes; a turnover clears it with the state). Under a storage limit, the higher of that and the
-    lowest held UID. No floor recorded yet: nothing is loaded until a window listing records one. Rows
+    lowest held UID (after the walk starts, the higher of the walk's start and the lowest held UID). No floor recorded yet: nothing is loaded until a window listing records one. Rows
     infinite scroll writes far below the window never pull it down, so older mail stays the walk's,
     which waits for Wi-Fi under Wi-Fi-only. After the walk starts, the walk-cursor rule stands. No
     migration (the state column is opaque JSON). *Replaces:* the lowest held UID as the floor, which
@@ -1226,4 +1240,4 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
 passedOver, unclean completion, re-arm lapse, selfHealOwed, selfHealLapse, markListingDue, slow link,
 budget stop, SEARCH failure, date self-heal removed, range sized by EXISTS and UIDNEXT, sparse folder,
 unsolicited FETCH, walk not started, UID-ordered prune, header batch size, width cap, widthCap,
-widthCapThrough, timed-out width)
+widthCapThrough, timed-out width, cap growth, passed-over re-read, storage-limit floor after the walk)

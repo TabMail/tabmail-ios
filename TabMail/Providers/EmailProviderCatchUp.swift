@@ -165,6 +165,9 @@ struct CatchUpCompletedListing: Sendable, Equatable {
     /// Every missing message in the listed range was loaded or proven gone:
     /// none was passed over by the hold bound.
     let clean: Bool
+    /// The ids the listing passed over (#1062): the apply puts them on the
+    /// folder's re-read list, so settling an owed check never settles them.
+    var passedOverIds: [String] = []
 }
 
 /// The delta-cursor lapse marker every provider's catch-up state may carry
@@ -178,6 +181,15 @@ struct CatchUpCompletedListing: Sendable, Equatable {
 enum CatchUpLapse {
     /// The key of the lapse count in a state's JSON object.
     static let countKey = "lapseCount"
+
+    /// The lapse count recorded in `state`, read from the raw JSON, so a state
+    /// a provider cannot decode (a floor-only state, another epoch) still gives
+    /// a listing its start count (#1062). Nil when none is recorded.
+    static func read(_ state: String?) -> Int? {
+        guard let data = state?.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        return (object[countKey] as? NSNumber)?.intValue
+    }
 }
 
 /// The lowest id a window listing of the folder has reached, for a provider that

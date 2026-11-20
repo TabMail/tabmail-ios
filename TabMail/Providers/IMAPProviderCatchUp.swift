@@ -54,24 +54,25 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
         /// A missing UID was counted done by that bound in this listing, so its
         /// completion is not clean.
         var passedOver: Bool?
+        /// The UIDs this listing passed over (#1062), at most
+        /// `SyncConfig.catchUpCarriedUidCap`: reported with its completion so the
+        /// apply puts them on the folder's re-read list, where they stay
+        /// retryable after the owed mark settles.
+        var passedOverUids: [UInt32]?
         /// The width in UIDs of this listing's next range (#1062): set after
         /// every range from that range's own count, and halved when a range
         /// times out, so the next call goes on from the same place with the
         /// smaller width. Absent (a listing written before it existed, or a new
         /// one): sized from the folder's EXISTS and UIDNEXT.
         var rangeWidth: Int?
-        /// The widest range this listing may ask while it stands at or below
-        /// `widthCapThrough` (#1062): the half width stored when a range timed
-        /// out. A range starting there is never wider, whatever a later range's
-        /// count (or the configured minimum width) would size it to, so the
-        /// listing never asks a width that timed out again from a place it
-        /// returns to. Lifted once the listing moves past `widthCapThrough`, so
-        /// one slow stretch never narrows the rest of the folder. Absent: no
-        /// range timed out below the listing's place.
+        /// The widest range this listing may ask (#1062): a range that times
+        /// out sets it to its width divided by
+        /// `SyncConfig.catchUpWidthCapShrinkFactor`; each range that answers
+        /// multiplies it by `SyncConfig.catchUpWidthCapGrowthFactor`, and at
+        /// `SyncConfig.catchUpListingMaxRangeSpan` it is dropped. So once the
+        /// server recovers, the width is back within a few ranges, wherever the
+        /// timeouts happened. Absent: no cap.
         var widthCap: Int?
-        /// The upper end of the range whose timeout set `widthCap` (the highest
-        /// such end while timeouts repeat before the listing moves past it).
-        var widthCapThrough: Int?
         /// A range this listing asked and could not finish in the call that
         /// asked it (#1062): the budget ran out before its membership proof or
         /// before its loads. The next call goes on with it before it asks
@@ -81,12 +82,19 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
         /// (whose state starts empty).
         var carried: CarriedRange?
 
+        /// Record `uids` as passed over, keeping the lowest
+        /// `SyncConfig.catchUpCarriedUidCap`.
+        mutating func passOver(_ uids: [UInt32]) {
+            guard !uids.isEmpty else { return }
+            let all = Set((passedOverUids ?? []) + uids).sorted()
+            passedOverUids = Array(all.prefix(SyncConfig.catchUpCarriedUidCap))
+        }
+
         /// This listing with the width cap left out: what counts as the listing
         /// moving (`madeProgress`).
         var withoutWidthCap: Listing {
             var copy = self
             copy.widthCap = nil
-            copy.widthCapThrough = nil
             return copy
         }
     }
@@ -151,8 +159,13 @@ extension IMAPProvider {
     ///   changes arrive through the change read, so neither the MODSEQ check nor
     ///   the daily full check lists it; its first listing, a listing in progress
     ///   and a lapse of its bookmark still do (the Gmail rule, ADR-IOS-107).
+    /// - `rawLapseCount`: the lapse count in the folder's raw state
+    ///   (`CatchUpLapse.read`), the new listing's start count when `state` is
+    ///   absent (a floor-only state, another epoch), so a mark made on such a
+    ///   state is settled by the first listing that starts after it (#1062).
     nonisolated static func catchUpPlan(
-        state: IMAPCatchUpState?, freshModSeq: Int?, now: Date, isTracked: Bool = false
+        state: IMAPCatchUpState?, freshModSeq: Int?, now: Date, isTracked: Bool = false,
+        rawLapseCount: Int? = nil
     ) -> CatchUpPlan {
         let modSeqChanged: Bool = {
             guard !isTracked, let stamp = state?.completionStamp, let freshModSeq else { return false }
@@ -166,7 +179,7 @@ extension IMAPProvider {
         if let listing = state?.listing { return .list(listing) }
         if modSeqChanged || fullCheckDue {
             return .list(IMAPCatchUpState.Listing(
-                firstStamp: freshModSeq, nextUid: 1, lapseCountAtStart: state?.lapseCount))
+                firstStamp: freshModSeq, nextUid: 1, lapseCountAtStart: state?.lapseCount ?? rawLapseCount))
         }
         return .none
     }
@@ -214,7 +227,7 @@ extension IMAPProvider {
         let bookmark = IMAPChangeCursor.decode(folder.changeCursor)
         let plan = Self.catchUpPlan(
             state: state, freshModSeq: folder.lastKnownHighestModSeq,
-            now: context.clock(),
+            now: context.clock(), rawLapseCount: CatchUpLapse.read(folder.catchUpState),
             isTracked: bookmark != nil)
         guard case .list(var listing) = plan else { return nil }
 
@@ -263,8 +276,11 @@ extension IMAPProvider {
             return attempted(folder, state: state, listing: listing, epoch: epoch, context: context)
         }
         let loadsFrom: Int?
-        if heldFrom != nil {
-            loadsFrom = context.storageLimitInForce ? firstLocal : heldFrom
+        if let heldFrom {
+            // Under a storage limit the higher of the walk's start and the first
+            // local UID: rows infinite scroll cached below the cursor never pull
+            // the floor down, and nothing the prune removed loads again (#1062).
+            loadsFrom = context.storageLimitInForce ? max(heldFrom, firstLocal ?? heldFrom) : heldFrom
         } else if let windowFloor = CatchUpWindowFloor.read(folder.catchUpState) {
             loadsFrom = context.storageLimitInForce ? max(windowFloor, firstLocal ?? windowFloor) : windowFloor
         } else {
@@ -360,12 +376,6 @@ extension IMAPProvider {
                     completed = true
                     break rangeLoop
                 }
-                // A cap set by a timeout below `widthCapThrough` holds until the
-                // listing has moved past that UID (`Listing.widthCap`).
-                if let through = listing.widthCapThrough, lo > through {
-                    listing.widthCap = nil
-                    listing.widthCapThrough = nil
-                }
                 let width = min(span, listing.widthCap ?? Int.max)
                 hi = min(lo + width - 1, upper ?? Int(UInt32.max), Int(UInt32.max))
                 guard lo <= Int(UInt32.max) else {
@@ -399,8 +409,7 @@ extension IMAPProvider {
                         let halves = UIDWalkCursor.halves(from: lo, to: hi)
                         let halved = halves.map { $0.lower.to - $0.lower.from + 1 } ?? 1
                         listing.rangeWidth = halved
-                        listing.widthCap = min(listing.widthCap ?? halved, halved)
-                        listing.widthCapThrough = max(listing.widthCapThrough ?? hi, hi)
+                        listing.widthCap = max(1, (hi - lo + 1) / SyncConfig.catchUpWidthCapShrinkFactor)
                         if DebugModeManager.isLoggingEnabled() {
                             BackgroundSyncLogger.logDebug("[CatchUp] \(path) \(lo):\(hi): listing failed (\(error)) — next call asks \(listing.rangeWidth ?? 1) UID(s) from here")
                         }
@@ -432,6 +441,11 @@ extension IMAPProvider {
                 span = Self.nextListingRangeSpan(
                     messages: context.listingRangeMessages, width: hi - lo + 1, held: flags.count)
                 listing.rangeWidth = span
+                // A range that answers raises the cap again (`Listing.widthCap`).
+                if let cap = listing.widthCap {
+                    let raised = cap * SyncConfig.catchUpWidthCapGrowthFactor
+                    listing.widthCap = raised >= SyncConfig.catchUpListingMaxRangeSpan ? nil : raised
+                }
 
                 for row in local {
                     guard let uid = UInt32(row.messageId) else { continue }
@@ -558,6 +572,7 @@ extension IMAPProvider {
                         listing.nextUid = Int(uid)
                     } else {
                         listing.passedOver = true
+                        listing.passOver([uid])
                         listing.loadHeldSince = nil
                         listing.nextUid = Int(stop)
                         heldUid = nil
@@ -607,6 +622,7 @@ extension IMAPProvider {
                     break rangeLoop
                 }
                 listing.passedOver = true
+                listing.passOver((held.map { [$0] } ?? []) + (left?.missing ?? []) + (left?.unanswered ?? []))
             }
             listing.loadHeldSince = nil
             listing.nextUid = hi + 1
@@ -625,7 +641,8 @@ extension IMAPProvider {
         result.newState = newState.encoded()
         if completed {
             result.completedListing = CatchUpCompletedListing(
-                lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true)
+                lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true,
+                passedOverIds: (listing.passedOverUids ?? []).map(String.init))
         }
         // Progress: the listing moved or completed, or something applies. A range
         // whose request failed before anything moved is no progress, so the

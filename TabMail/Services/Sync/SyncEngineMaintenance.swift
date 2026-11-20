@@ -62,8 +62,10 @@ extension SyncEngine {
 
         var bodiesRemoved = 0
         for account in accounts {
-            guard let mode = pruneOrder[account.id] else { continue }
-            let orderSQL = pruneOrderSQL(mode)
+            // An account with no registered provider (it failed to register,
+            // e.g. missing credentials) is still pruned, oldest date first as
+            // before #1062: no catch-up of it runs to reload what is pruned.
+            let orderSQL = pruneOrderSQL(pruneOrder[account.id] ?? .date)
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
                 guard StorageEstimator.isOverBudget() else { break }
@@ -99,8 +101,10 @@ extension SyncEngine {
 
         var headersRemoved = 0
         for account in accounts {
-            guard let mode = pruneOrder[account.id] else { continue }
-            let orderSQL = pruneOrderSQL(mode)
+            // An account with no registered provider (it failed to register,
+            // e.g. missing credentials) is still pruned, oldest date first as
+            // before #1062: no catch-up of it runs to reload what is pruned.
+            let orderSQL = pruneOrderSQL(pruneOrder[account.id] ?? .date)
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
                 guard StorageEstimator.isOverBudget() else { break }
