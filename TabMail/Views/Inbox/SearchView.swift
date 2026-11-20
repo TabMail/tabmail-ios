@@ -153,12 +153,14 @@ struct SearchView: View {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
                 }
+                .accessibilityLabel("Clear search")
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(Color(.systemGray6))
         .clipShape(RoundedRectangle(cornerRadius: 10))
+        .textInputBox()
         .padding(.horizontal)
         .padding(.vertical, 8)
     }

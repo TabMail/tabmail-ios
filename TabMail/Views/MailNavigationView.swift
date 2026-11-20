@@ -1297,7 +1297,7 @@ private struct MessageDetailResolvedContent: View {
 /// root view. A genuine navigation-stack push — the inbox `List(selection:)`
 /// has no way to revoke it. See `pushedMessageId` doc comment on
 /// `MailNavigationView` for the full rationale.
-private struct PushedMessageDestination: View {
+struct PushedMessageDestination: View {
     let messageId: String
 
     var body: some View {

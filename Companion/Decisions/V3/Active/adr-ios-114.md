@@ -569,6 +569,47 @@ same AI result, kept as long as the email itself is shown.
    (`ChatBubbleView.actions`), not of its whole row: actions on a row of several elements made
    VoiceOver read the bubble between its own attachment chips. Tests: `chipsStopAtTheCap`,
    `chatSwipeWiring`.
+   *Amended 2026-11-18 (the back swipe, as Mail does it):* iOS 26 goes back on a rightward drag
+   anywhere on the screen, so a bubble's swipe popped the chat. One owner, `ChatSwipeOpen`, holds
+   what is open (one reveal and its frame). With nothing open, a reveal's pan takes a drag toward
+   its buttons, except that a rightward drag from the screen's left edge
+   (`ChatViewLayout.backSwipeEdgeWidth`) is the back swipe's (`ChatSwipe.takesDrag`); both back
+   swipes wait for the pans. While a reveal is open only it takes sideways drags on itself, either
+   way (further open, a full swipe, or shut), and its buttons stay tappable. Any sideways drag or
+   tap anywhere else (another bubble, empty space, the reply field, the header, the navigation bar,
+   the screen's edge) only closes it, through one closer, `ChatSwipeCloser`, which owns a pan and a
+   tap on the navigation controller's own view (not a view over the chat, so VoiceOver and every
+   control see the chat as before). A vertical drag while a swipe is open, anywhere (on the open
+   reveal too), both scrolls the chat and closes the open swipe, as in Mail. The closer takes a
+   touch only while something is open; a sideways drag is the open reveal's only inside its frame,
+   a tap only on its buttons (a tap on a bubble while anything is open only closes), and only
+   between the header and the reply field, so the header, the reply field and the navigation bar
+   are never the open reveal's, though the chat's scroll view runs under them. Every frame and the
+   touch are measured in one space by construction: the chat's named coordinate space
+   (`ChatSwipeOpen.space`), which the closer's anchor fills and reads the touch in. The screen's
+   recognizers on that touch wait for the closer (the bubbles' taps and swipes, the reply field,
+   the bar's buttons, both back swipes); the scroll views' pans run alongside its drag, which is
+   how a vertical drag also scrolls; and the window's own recognizers run alongside it too, so the
+   window-level keyboard-dismiss tap (`dismissKeyboardOnTap`) drops the keyboard on the same tap
+   that closes a swipe: the keyboard rule holds with no exception, through its one dismiss path
+   (review, 2026-11-18). *Amended 2026-11-19:* the dismiss tap's own delegate also runs it alongside
+   every recognizer (`KeyboardDismissView`), because a SwiftUI gesture on the tapped bubble shut it out
+   at touch down before the closer could; test: `testOpenActionsTapOnAnotherBubbleClosesAndDropsTheKeyboard`.
+   The screen-edge back swipe is off while something is open. The next drag
+   goes back. A closing drag or tap holds the interaction freeze like any swipe, and lets go when
+   the system cancels or fails it or the closer is torn down. A swipe runs alone (no
+   simultaneous recognizer), so a swipe never also opens the bubble's card. An open reveal whose
+   view leaves the chat (its email moved away by a sync) is no longer open, so the next swipe works
+   (ios#1004). Tests: `ChatSwipeUITests` (real drags: the four open states, the edge, close then
+   back, the reply field, the header and the navigation bar with a bubble or the chat open, a tap
+   on the reply field, on Forward and on a bubble, the open bubble's own Move, the chat inside a
+   presented sheet and opened from a mailbox through a collapsed split view's
+   `PushedMessageDestination`, left drags, a vertical drag that scrolls and closes, a closing tap
+   that drops the keyboard, the email leaving), `nothingOpen`, `onlyTheOpenRevealTakesDrags`,
+   `openState`, `openRevealOnlyWhereATouchReachesIt`,
+   `closerTakesOnlyTouchesOutsideTheOpenReveal`, `closerTakesEveryDragButTheOpenRevealsOwn`,
+   `closerBeatsOnlyTheScreensRecognizers`, `closerCoversTheWholeScreen`,
+   `backSwipesWaitForTheRule`, `closingHoldsTheFreeze`.
    Archive, Trash and Move act on every email the
    chat shows, wherever it is filed ("always the whole thread", 2026-11-04), except the user's sent
    copies and drafts, which stay in their folders, and emails already at the destination

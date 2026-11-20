@@ -4065,6 +4065,10 @@ struct TokenField: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // The chips, the input and the suggestion list are the field's own box: a chip's remove or a
+        // picked suggestion keeps the keyboard. Marked after the frame, whose height is the content's,
+        // so with the list hidden the box ends at the input line and claims no space below it.
+        .textInputBox()
     }
 
     /// The field's addresses in debug builds; in release the empty label the field had.
@@ -4093,6 +4097,7 @@ struct TokenField: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            .accessibilityLabel("Remove \(displayText)")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
