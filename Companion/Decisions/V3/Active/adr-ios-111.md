@@ -522,6 +522,9 @@ holds), and the bookmark would otherwise move past a cut arrival. A folder with 
    The listing the dropped bookmark makes due expands the last verb, so cut ids inside the listing
    window get their arrows back. The #903 limitation remains for mail older than the listing window.
 This PR adds no new limitation.
+Tests (added 2026-11-20, #1107): `OutlookCatchUpTests.recheckOverflowRebaselinesAndHealsAFlag` (a real
+read whose cut arrival answers 500 drops the bookmark and stores none of the read's later one, makes the
+full sync due, and the re-baseline loads the cut arrival), `IMAPMoveIntoTrackedFolderTests.cutArrivalLandsAfterTheListing`.
 Keywords: cutDropsBookmark, overflow, own bookmark, re-baseline, listed again, delta pages, cellular
 Inbox, last verb, listing window, #751, #903.
 

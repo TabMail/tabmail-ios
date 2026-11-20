@@ -437,10 +437,11 @@ struct OutlookCatchUpTests {
     /// More messages to read again than the folder may keep (`changeRecheckLimit`)
     /// in a folder holding its own bookmark: this pass's additions are cut (#903),
     /// the bookmark is dropped and a listing armed (ADR-IOS-111 amendment
-    /// 2026-11-17, #751), and a later bookmark the same pass carries is not
-    /// stored. The folder re-reads from a fresh baseline, which heals the read
-    /// state and flag the delta never delivered (`mergeChangeRecord`, as
-    /// `baselineCorrectsStoredFlags` pins). The armed listing then makes the
+    /// 2026-11-17, #751), and the later bookmark the same read returns is not
+    /// stored. The folder re-reads from a fresh baseline, which loads the cut
+    /// arrival and heals the read state and flag the delta never delivered
+    /// (`mergeChangeRecord`, as `baselineCorrectsStoredFlags` pins). The armed
+    /// listing then makes the
     /// repair only it can: it removes a stored row deleted on the server, which
     /// a baseline never removes (and it loads mail below the held range).
     @Test("An overflowed re-read list drops the bookmark: the re-baseline heals a hidden flag change, and the armed listing removes a message deleted on the server")
@@ -456,31 +457,41 @@ struct OutlookCatchUpTests {
             let first = try #require(try await Self.untilListed(w, engine, w.archive).flatMap { _ in try Self.state(w, w.archive)?.lastCompletedAt })
             // A change the delta never delivered: the phone holds a stale state.
             try Self.setLocal(w, "f-1", in: w.archive, isRead: false, isFlagged: false)
-            #expect(try w.cursor(w.archive) != nil, "precondition: the Archive holds its own bookmark")
+            let stale = try #require(try w.row("f-1", in: w.archive))
+            #expect(!stale.isRead && !stale.isFlagged, "precondition: the phone holds the stale state")
+            let storedBookmark = try #require(try w.folder(w.archive).changeCursor, "precondition: the Archive holds its own bookmark")
 
-            // A full stored list, then a pass whose own additions take it over
-            // the limit: only those additions are cut (#903).
+            // A full stored list, then a real read whose own addition takes it
+            // over the limit: a new Archive message whose record needs a read by
+            // id, which answers 500, so the reader returns it to read again
+            // later, together with a later bookmark. Only that addition is cut
+            // (#903), and the later bookmark must not be stored over the drop.
             let unreadable = (0..<SyncConfig.changeRecheckLimit).map { String(format: "rr-%04d", $0) }
             for id in unreadable { w.server.answerBatchItem(providerMessageId: id, status: 500, body: nil) }
             let full = FolderChangeState(tracking: true, recheck: unreadable).encoded
             let archiveId = w.folderId(w.archive)
-            // The pass carries a later bookmark, as a real read always does; it
-            // must not be stored over the drop.
-            let laterBookmark = try #require(try w.folder(w.archive).changeCursor)
             try await w.pool.write { db in
                 try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [full, archiveId])
-                _ = try SyncEngine.applyFolderChanges(
-                    FolderChanges(folderId: archiveId, status: .tracked, rereadLater: ["rr-new"], cursor: laterBookmark), db: db)
+                try db.execute(sql: "UPDATE account SET lastFullSyncAt = ? WHERE id = ?", arguments: [Date(), w.accountId])
             }
-            #expect(try w.cursor(w.archive) == nil, "the overflow dropped the Archive's bookmark, so it re-baselines")
+            w.server.omitDeltaFields(["isRead"], providerMessageId: "rr-new")
+            w.server.answerBatchItem(providerMessageId: "rr-new", status: 500, body: nil)
+            w.server.deliver(Self.seed("rr-new", in: Self.archive, at: c.daysAgo(1)))
+            try await w.read()
+            #expect(try w.folder(w.archive).changeCursor == nil, "the overflow dropped the Archive's bookmark (was \(storedBookmark)), and the read's later one was not stored")
+            #expect(try w.account().lastFullSyncAt == nil, "the overflow made the account's full sync due")
             #expect(try Self.state(w, w.archive)?.lapsedSinceLastListing == true, "the overflow armed a listing")
-            let recheck = FolderChangeState(raw: try await w.pool.read { db in try Folder.fetchOne(db, key: archiveId)?.changeState }).recheck
+            let recheck = try w.recheck(w.archive)
             #expect(!recheck.contains("rr-new"), "this pass's own addition was cut")
             #expect(Set(unreadable).isSubset(of: Set(recheck)), "every stored id remains")
+            #expect(try w.row("rr-new", in: w.archive) == nil, "precondition: the cut arrival is not stored")
 
             // Deleted on the server after the overflow; kept off the forced-500 list.
             w.server.deleteFromOtherClient(providerMessageId: "d-1")
+            w.server.answerBatchItem(
+                providerMessageId: "rr-new", status: 200, body: Self.detailBody("rr-new", in: Self.archive, at: c.daysAgo(1)))
             try await w.baselineAll()
+            #expect(try w.row("rr-new", in: w.archive) != nil, "the re-baseline loaded the cut arrival")
             let healed = try #require(try w.row("f-1", in: w.archive))
             #expect(healed.isRead && healed.isFlagged, "the re-baseline healed the stale read state and flag")
             #expect(try w.row("d-1", in: w.archive) != nil, "precondition: the re-baseline did not remove the server-side deletion")
