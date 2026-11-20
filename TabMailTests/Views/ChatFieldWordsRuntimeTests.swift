@@ -27,6 +27,9 @@ import UIKit
 ///     moving to another email of another chat keeps each chat's words on its own.
 ///  7. The email screen's pill (no reply field) keeps its chat's words too; the inbox's chat keeps
 ///     none. A demo's words stay in the demo and go with it.
+///  8. Words typed in a chat opened from the Search sheet survive the sheet's dismissal, by its
+///     own dismiss and by the UIKit path a swipe-down ends in, and are in the field when the chat
+///     opens again, in this run and the next.
 @Suite("Chat field words kept on Back", .serialized, .processGlobalState)
 @MainActor
 struct ChatFieldWordsRuntimeTests {
@@ -532,6 +535,95 @@ struct ChatFieldWordsRuntimeTests {
             await DemoModeService.shared.exit()
             try await Self.open(email) { view in
                 #expect(Self.fieldTexts(view).contains("Real words"), "the real chat keeps its words: \(Self.fieldTexts(view))")
+            }
+        }
+    }
+
+    // MARK: - A chat opened from the Search sheet
+
+    /// How the Search sheet goes away.
+    enum SheetDismissal: String, CaseIterable, CustomTestStringConvertible {
+        /// The sheet's own `dismiss` (Search's Done and title buttons call it).
+        case programmatic
+        /// The UIKit path a swipe-down ends in: the presented controller is dismissed under its
+        /// presentation controller's delegate, which is how SwiftUI learns the sheet closed.
+        case swipeDown
+        var testDescription: String { rawValue }
+    }
+
+    /// The Search sheet as the inbox presents it (`InboxView`'s `.sheet` over `SearchView`, whose
+    /// `NavigationStack` pushes the chat), with the chat already pushed.
+    @Observable final class SearchSheetHost {
+        var presented = false
+        @ObservationIgnored var dismiss: DismissAction?
+    }
+
+    struct SearchSheetView: View {
+        @Bindable var host: SearchSheetHost
+        let message: MessageHeader
+        var body: some View {
+            Color.clear
+                .sheet(isPresented: $host.presented) {
+                    NavigationStack {
+                        SheetChat(host: host, message: message)
+                    }
+                }
+        }
+    }
+
+    struct SheetChat: View {
+        let host: SearchSheetHost
+        let message: MessageHeader
+        @Environment(\.dismiss) private var dismiss
+        var body: some View {
+            HostView(message: message)
+                .onAppear { host.dismiss = dismiss }
+        }
+    }
+
+    @Test("Words typed in a chat opened from Search survive the Search sheet's dismissal and are there when the chat opens again",
+          arguments: SheetDismissal.allCases)
+    func wordsSurviveTheSearchSheetsDismissal(_ dismissal: SheetDismissal) async throws {
+        try await Self.withDatabase { pool in
+            let email = Self.header("search-1", thread: "search-thread")
+            let words = "Typed in a chat opened from Search"
+            let host = SearchSheetHost()
+            let mounted = try await Self.mount(SearchSheetView(host: host, message: email))
+            defer { mounted.close() }
+            let presenter = try #require(mounted.view.window?.rootViewController)
+            host.presented = true
+            try await Task.sleep(for: .milliseconds(800))
+            let sheet = try #require(presenter.presentedViewController, "control: the Search sheet is up")
+            #expect(Self.type(words, in: sheet.view), "the chat in the sheet has a native editable field")
+            try await Self.settle()
+            #expect(Self.fieldTexts(sheet.view).contains(words), "control: the edit reached the field")
+
+            switch dismissal {
+            case .programmatic:
+                let dismiss = try #require(host.dismiss, "control: the sheet's chat has its dismiss action")
+                dismiss()
+            case .swipeDown:
+                let presentation = try #require(sheet.presentationController)
+                presentation.delegate?.presentationControllerWillDismiss?(presentation)
+                await withCheckedContinuation { continuation in
+                    sheet.dismiss(animated: true) { continuation.resume() }
+                }
+                presentation.delegate?.presentationControllerDidDismiss?(presentation)
+            }
+            try await Task.sleep(for: .milliseconds(800))
+            #expect(presenter.presentedViewController == nil, "control: the Search sheet is gone")
+            #expect(!host.presented, "control: SwiftUI saw the sheet close")
+
+            await ChatFieldWords.shared.written()
+            let stored = try Self.stored(pool)
+            #expect(stored == [ChatFieldWords.key(for: email): words], "the words are kept on the device: \(stored)")
+            try await Self.open(email) { view in
+                #expect(Self.fieldTexts(view).contains(words), "the words are in the field when the chat opens again: \(Self.fieldTexts(view))")
+            }
+            // And in the next app run.
+            await Self.newRun { PrioritizedDatabase(pool: pool) }
+            try await Self.open(email) { view in
+                #expect(Self.fieldTexts(view).contains(words), "and after the app was closed: \(Self.fieldTexts(view))")
             }
         }
     }

@@ -49,6 +49,8 @@ struct ChatFieldWordsTests {
             var failsWrites = false
             var reads: [String] = []
             var writes = 0
+            /// The keys of every batch handed to the storage, in order.
+            var batches: [Set<String>] = []
         }
 
         struct Refused: Error {}
@@ -89,6 +91,7 @@ struct ChatFieldWordsTests {
                     await withCheckedContinuation { continuation in
                         let held = state.withLock { state in
                             state.writes += 1
+                            state.batches.append(Set(batch.keys))
                             guard state.holdsWrites else { return false }
                             state.waitingWrites.append(continuation)
                             return true
@@ -180,6 +183,14 @@ struct ChatFieldWordsTests {
                 return state.waitingWrites
             }
             waiting.forEach { $0.resume() }
+        }
+
+        /// How many batches were handed to the storage so far.
+        var batchCount: Int { state.withLock { $0.batches.count } }
+
+        /// The keys of every batch handed to the storage from the `from`th on.
+        func batchKeys(from: Int) -> [Set<String>] {
+            state.withLock { Array($0.batches.dropFirst(from)) }
         }
 
         func failReads(_ fails: Bool) { state.withLock { $0.failsReads = fails } }
@@ -732,6 +743,7 @@ struct ChatFieldWordsTests {
             #expect(await storage.waitForWrites(1), "control: the write is running")
 
             try await Self.remove(Self.account, store: store, pool: pool)
+            let afterRemoval = storage.batchCount
             storage.releaseWrites()
             await store.written()
             storage.failWrites(false)
@@ -740,6 +752,11 @@ struct ChatFieldWordsTests {
 
             let stored = try Self.storedWords(pool)
             #expect(stored == [live: "Live account's newer words"], "\(stored)")
+            // The store never offers a removed account's words to a write again, a failed write's
+            // retry included: the transaction's own refusal is the second fence, not the only one.
+            let later = storage.batchKeys(from: afterRemoval)
+            #expect(later.contains { $0.contains(live) }, "control: the live chat's words were written after the removal")
+            #expect(!later.contains { $0.contains(removed) }, "the removed account's words reached a write again: \(later)")
             #expect(store.fill(for: removed).words == "")
             #expect(await Self.nextRun(storage, removed) == "")
         }
@@ -894,12 +911,16 @@ struct ChatFieldWordsTests {
             #expect(await storage.waitForWrites(1), "control: the write is running")
 
             try await Self.endDemoAndStartTheNext(store, pool: pool)
+            let afterEnd = storage.batchCount
             storage.releaseWrites()
             await store.written()
             storage.failWrites(false)
             // A field edit in the next demo starts the writer again.
             store.apply(.put("Next words"), to: next)
             await store.written()
+            let later = storage.batchKeys(from: afterEnd)
+            #expect(later.contains { $0.contains(next) }, "control: the next words were written after the demo ended")
+            #expect(!later.contains { $0.contains(demo) }, "the ended demo's words reached a write again: \(later)")
 
             let stored = Dictionary(uniqueKeysWithValues: try Self.rows(pool).map { ($0.sessionId, $0.words) })
             #expect(stored == [real: "Real words", next: "Next words"],

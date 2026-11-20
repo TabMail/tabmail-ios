@@ -67,8 +67,8 @@ chat history the same key already keeps, and goes with that thread's AI data and
 **Tests:** `ChatFieldWordsRuntimeTests` (Back and reopen, the newer email of the thread, another thread
 and another account never show them, a new store after a restart, two pills on one chat, a failed or left
 read, an emptying before the read lands, a pill moving between chats while reads are held, the email
-screen's pill and the inbox control, a demo's words through `DemoModeService.exit`), `ChatFieldWordsTests`
+screen's pill and the inbox control, a demo's words through `DemoModeService.exit`, a chat opened from the Search sheet over the sheet's dismissal), `ChatFieldWordsTests`
 (store restart, keying, clearing on send and on an emptied field, every newer intention against a held
 read, a late read, a failed read, reads landing only on their own chat, writes during a write and a failed
-write, no words in failure logs, purge with the thread's AI data per account and for a threadless email,
+write, a removed account's or ended demo's words never handed to a write again, no words in failure logs, purge with the thread's AI data per account and for a threadless email,
 account removal, demo wipe).
