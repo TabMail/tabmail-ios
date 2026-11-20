@@ -1845,7 +1845,7 @@ struct ComposeView: View {
             .onAppear { performLifecycleAppear() }
             .onDisappear { performDisappear() }
             .onChange(of: showingSuggestion) { old, new in logShowingSuggestionChange(old, new) }
-            .onChange(of: bodyBranchKey, initial: true) { _, key in logBodyBranch(key) }
+            .onChange(of: DebugModeManager.isLoggingEnabled() ? bodyBranchKey : "", initial: true) { _, key in logBodyBranch(key) }
             .onChange(of: selectedAccount) {
                 currentSignature = selectedAccount?.signature ?? ""
             }
@@ -2004,9 +2004,9 @@ struct ComposeView: View {
 
     /// The card has finished coming on screen: a suggestion already waiting animates in now; one
     /// dismissed meanwhile never appears (the branch reads `showingSuggestion` as it is now).
-    private func markPresentationSettled(ancestorBeingPresented: Bool) {
+    private func markPresentationSettled(_ state: ComposePresentationProbe.AppearState) {
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[ComposeView] presentationSettled instance=\(instanceToken) wasSettled=\(presentationSettled) ancestorBeingPresented=\(ancestorBeingPresented) showing=\(showingSuggestion)")
+            BackgroundSyncLogger.logDebug("[ComposeView] presentationSettled instance=\(instanceToken) wasSettled=\(presentationSettled) ancestorBeingPresented=\(state.ancestorBeingPresented) transitionCoordinator=\(state.hasTransitionCoordinator) showing=\(showingSuggestion)")
         }
         guard !presentationSettled else { return }
         withAnimation(.easeInOut(duration: ComposeSuggestionRevealConfig.insertionDuration)) {

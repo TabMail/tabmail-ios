@@ -18,3 +18,4 @@
 - `prepopulate()` re-reads `cachedReply` fresh from DB so prior edits survive in-memory staleness of caller's `MessageHeader` snapshot.
 - Recompute (`ComposeView.swift:825`) still overwrites `cachedReply` — by design, "give me a fresh AI draft" discards edits.
 - Subject / recipient deltas always go to compose state, regardless of whether bubble is up.
+- **The bubble waits for the card to be on screen (owner ruling 2026-11-20, ADR-IOS-114 decision 16).** Only the bubble's insertion is held until `ComposePresentationProbe` reports `viewDidAppear` (`presentationSettled`); `showingSuggestion`, `currentSuggestion`, the editor and the draft load update as before. While held the body shows the editor. Never hold card content behind a cosmetic wait (reverted 68ded8e). Pinned by `ChatSuggestionBubbleTests.bubbleHeldUntilAppearanceEnds`, which drives `beginAppearanceTransition` / `endAppearanceTransition` by hand.

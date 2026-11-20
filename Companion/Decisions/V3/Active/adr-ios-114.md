@@ -900,8 +900,20 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      and never sends it. Every Send from the field goes to the agent. When the compose prompt
      returns its own suggested change with each draft, the line will show that one while a
      suggestion shows; until then it always shows the config example.
+   - **The card's bubble waits for the card (owner ruling 2026-11-20).** The suggestion bubble never
+     animates in while the compose card is still sliding in. ComposeView holds only the bubble's
+     insertion until the card has finished coming on screen; `showingSuggestion`, the editor, the
+     fields and the draft load are never held (holding content behind a cosmetic wait slowed every
+     open and broke scroll anchors, the reverted 68ded8e). The signal is UIKit's `viewDidAppear` on
+     a zero-size child controller (`ComposePresentationProbe`), which in UIKit's usual appearance
+     sequence arrives once the presentation transition has finished, never a guessed delay;
+     `presentationSettled` then brings the bubble in with `ComposeSuggestionRevealConfig.insertionDuration`.
+     A suggestion dismissed while held never appears. The shape follows the chat pill's
+     `statusQueue` (a view-local hold drained on one trigger), not the interaction freeze, which
+     defers data behind a timed cooldown.
    Tests: `ChatSuggestionBubbleTests` (the ghost, its tap opening the card, the in-place rewrite,
-   no "AI Reply" string), `ChatThreadViewLifecycleTests.suggestionSitsAtTheSentPosition` and
+   no "AI Reply" string, the saved reply draft left as it is, the bubble held until the card's
+   appearance ends: `bubbleHeldUntilAppearanceEnds`), `ChatThreadViewLifecycleTests.suggestionSitsAtTheSentPosition` and
    `sentReplyTakesTheTurn`, `ChatReplyFieldRuntimeTests.exampleLinePutsTheChange` and
    `suggestionNeverEntersTheField`, `ChatReplyFieldTests.suggestionText` and `exampleFromConfig`,
    `TutorialChatViewTests.fieldText`.
