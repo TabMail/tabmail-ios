@@ -90,7 +90,8 @@ struct UploadedDraftSingleEntryTests {
             account.id = accountId
             try account.insert(db)
             var drafts = Folder(name: Self.draftsPath, path: Self.draftsPath, role: .drafts, accountId: accountId)
-            drafts.lastKnownUidValidity = Self.imapEpoch
+            // Only an IMAP mailbox has a UIDVALIDITY; a demo folder never does.
+            if kind == .imap { drafts.lastKnownUidValidity = Self.imapEpoch }
             try drafts.insert(db)
         }
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in

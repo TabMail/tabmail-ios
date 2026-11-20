@@ -1832,11 +1832,14 @@ extension AccountManager {
         authority: PendingSendService.RetainedDraftAuthority
     ) -> (cancelled: Bool, returnedToDrafts: Bool) {
         do {
+            // A failed return is reported after the write commits: a log line
+            // written inside the write would outlive a rollback.
             let outcome = try AppDatabase.dbPool.write {
-                db -> (cancel: (deleted: Bool, dir: String?), admission: DraftsAdmission?) in
+                db -> (cancel: (deleted: Bool, dir: String?), admission: DraftsAdmission?, returnError: Error?) in
                 let cancel = try Self.cancelHeldOutboxRow(db: db, messageId: messageId)
-                guard cancel.deleted else { return (cancel, nil) }
+                guard cancel.deleted else { return (cancel, nil, nil) }
                 var admission: DraftsAdmission?
+                var returnError: Error?
                 do {
                     try db.inSavepoint {
                         admission = try Self.returnKeptDraftToDrafts(db: db, authority: authority)
@@ -1844,11 +1847,12 @@ extension AccountManager {
                     }
                 } catch {
                     admission = nil
-                    if DebugModeManager.isLoggingEnabled() {
-                        BackgroundSyncLogger.logDebug("[UndoSend] kept draft not returned to Drafts: \(authority.draftId) \(error)")
-                    }
+                    returnError = error
                 }
-                return (cancel, admission)
+                return (cancel, admission, returnError)
+            }
+            if let returnError = outcome.returnError {
+                BackgroundSyncLogger.logDebug("[UndoSend] kept draft not returned to Drafts: \(authority.draftId) \(returnError)")
             }
             guard outcome.cancel.deleted else { return (false, false) }
             finishOutboxCancellation(attachmentsDirName: outcome.cancel.dir)

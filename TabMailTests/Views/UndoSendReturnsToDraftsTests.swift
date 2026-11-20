@@ -6,6 +6,8 @@ import Foundation
 import GRDB
 import Synchronization
 import Testing
+import SwiftUI
+import UIKit
 @testable import TabMail
 
 /// After Undo Send, Close without typing never drops the words (ADR-IOS-065, as
@@ -374,5 +376,123 @@ struct UndoSendReturnsToDraftsTests {
             "snapshotInitialState reads: \(body)")
         #expect(source.contains("ComposeDraftGuards.hasChanges(current: currentBaseline(), baseline: initialBaseline)"),
                 "hasChanges must compare against the recorded baseline")
+        // Both load outcomes record the baseline through that function: the
+        // loaded-row branch, and the prefill branch when no row is found.
+        let loadedBranch = try #require(source.range(of: "[ComposeView] Loaded draft: id="))
+        let afterLoaded = source[loadedBranch.upperBound...]
+        let loadedReturn = try #require(afterLoaded.range(of: "return"))
+        #expect(afterLoaded[..<loadedReturn.lowerBound].contains("snapshotInitialState()"),
+                "the loaded-row branch must record its baseline with snapshotInitialState()")
+        let prefillBranch = try #require(source.range(of: "// No draft found — normal prepopulate"))
+        let afterPrefill = source[prefillBranch.upperBound...]
+        let prefillEnd = try #require(afterPrefill.range(of: "\n    }\n"))
+        #expect(afterPrefill[..<prefillEnd.lowerBound].contains("snapshotInitialState()"),
+                "the prefill branch must record its baseline with snapshotInitialState()")
+        let assignments = source.split(separator: "\n")
+            .filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("initialBaseline = ") }.count
+        #expect(assignments == 1, "only snapshotInitialState may set the baseline, found \(assignments)")
+    }
+
+    // MARK: - The real compose: load, then Close
+
+    private nonisolated static let hostedDeadlineSeconds: TimeInterval = 30
+    private nonisolated static let hostedSettleMilliseconds = 1_000
+
+    private func textViews(_ view: UIView) -> [UITextView] {
+        (view as? UITextView).map { [$0] } ?? view.subviews.flatMap { textViews($0) }
+    }
+
+    /// The accessibility element a VoiceOver user would activate for `label`.
+    private func accessibilityButton(_ label: String, in element: NSObject) -> NSObject? {
+        if element.accessibilityLabel == label, element.accessibilityTraits.contains(.button) { return element }
+        var children: [NSObject] = (element.accessibilityElements as? [NSObject]) ?? []
+        if let view = element as? UIView { children += view.subviews }
+        for child in children {
+            if let found = accessibilityButton(label, in: child) { return found }
+        }
+        return nil
+    }
+
+    private func presentedAlertTitle(_ window: UIWindow) -> String? {
+        var controller = window.rootViewController?.presentedViewController
+        while let current = controller {
+            if let alert = current as? UIAlertController { return alert.title }
+            controller = current.presentedViewController
+        }
+        return nil
+    }
+
+    private func wait(until condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(Self.hostedDeadlineSeconds)
+        while Date() < deadline && !condition() {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    /// Hosts the compose the Undo reopens, waits until it shows `words`, presses
+    /// Close, and returns the title of the alert Close raised, if any.
+    private func closeHostedCompose(
+        _ fixture: Fixture, snapshot: PendingSendService.ReopenSnapshot, words: String
+    ) async throws -> String? {
+        let account = try #require(try await fixture.pool.read { try Account.fetchOne($0, key: fixture.accountId) })
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let navigationStore = NavigationStore()
+        navigationStore.accounts = [account]
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = UIHostingController(
+            rootView: UndoReopenCompose.composeView(for: snapshot).environment(navigationStore))
+        window.isHidden = false
+        window.makeKeyAndVisible()
+        window.layoutIfNeeded()
+        defer {
+            window.rootViewController?.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        try await wait { textViews(window).contains { $0.text.contains(words) } }
+        try #require(textViews(window).contains { $0.text.contains(words) }, "precondition: the compose loaded the row")
+        // Let the load finish recording its baseline before Close reads it.
+        try await Task.sleep(for: .milliseconds(Self.hostedSettleMilliseconds))
+        var close: NSObject?
+        try await wait {
+            close = accessibilityButton("Close", in: window)
+            return close != nil
+        }
+        let button = try #require(close, "the compose shows no Close button")
+        #expect(button.accessibilityActivate())
+        try await wait { presentedAlertTitle(window) != nil }
+        if presentedAlertTitle(window) == nil {
+            try await Task.sleep(for: .milliseconds(Self.hostedSettleMilliseconds))
+        }
+        return presentedAlertTitle(window)
+    }
+
+    @Test("The reopened compose, loaded and closed without typing, asks to save exactly when the return failed",
+          arguments: [true, false])
+    func hostedComposeCloseFollowsTheReturn(returned: Bool) async throws {
+        let fixture = try makeFixture()
+        defer { finish(fixture) }
+        let draftId = "draft-\(UUID().uuidString)"
+        let words = "Words the reopened compose shows."
+        let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
+        _ = try await send(fixture, draft(draftId, fixture, body: words), cursor: cursor)
+        if !returned {
+            try await fixture.pool.write { db in
+                try db.execute(sql: """
+                    CREATE TRIGGER refuse_draft_save BEFORE INSERT ON pendingOperation
+                    BEGIN SELECT RAISE(ABORT, 'refused for the test'); END
+                    """)
+            }
+        }
+        let snapshot = try #require(PendingSendService.shared.undo(), "the Undo was not confirmed")
+        try #require(snapshot.returnedToDrafts == returned, "precondition: the return \(returned ? "landed" : "failed")")
+
+        let alert = try await closeHostedCompose(fixture, snapshot: snapshot, words: words)
+        if returned {
+            #expect(alert == nil, "Close of a draft already in Drafts raised \(alert ?? "")")
+        } else {
+            #expect(alert == "Save Draft?", "Close without typing would drop the words; it raised \(alert ?? "nothing")")
+        }
     }
 }
