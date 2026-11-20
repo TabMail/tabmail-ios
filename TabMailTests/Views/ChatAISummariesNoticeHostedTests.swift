@@ -373,6 +373,8 @@ struct ChatAISummariesNoticeHostedTests {
         var started = 0
         var categories: [ReportCategory] = []
         var reasons: [String?] = []
+        /// Answers that have reached their sender, in order of arrival.
+        var answered = 0
         private var answers: [Int: CheckedContinuation<Bool, Never>] = [:]
 
         var send: ReportConcernSend {
@@ -381,7 +383,9 @@ struct ChatAISummariesNoticeHostedTests {
                 let call = started
                 categories.append(category)
                 reasons.append(reason)
-                return await withCheckedContinuation { answers[call] = $0 }
+                let accepted = await withCheckedContinuation { answers[call] = $0 }
+                answered += 1
+                return accepted
             }
         }
 
@@ -567,7 +571,6 @@ struct ChatAISummariesNoticeHostedTests {
 
     // MARK: - After a report
 
-    /// Opens the popover with the glyph and presses "Report a concern"; returns once the sheet shows.
     /// The popover and its report sheet are both up, and neither is still being presented.
     private static func presentationSettled(_ controller: UIViewController) -> Bool {
         var chain: [UIViewController] = []
@@ -579,6 +582,7 @@ struct ChatAISummariesNoticeHostedTests {
         return chain.count == 2 && chain.allSatisfy { !$0.isBeingPresented && !$0.isBeingDismissed }
     }
 
+    /// Opens the popover with the glyph and presses "Report a concern"; returns once the sheet shows.
     private static func openReport(in controller: UIViewController) async throws {
         let glyph = try #require(element(AISummariesNotice.accessibilityLabel, in: controller.view))
         #expect(glyph.accessibilityActivate())
@@ -1126,6 +1130,13 @@ struct ChatAISummariesNoticeHostedTests {
                         held.release(1, true)
                     }
                     #expect(report.accessibilityActivate())
+                    if answerAt == "betweenPressAndOpen" {
+                        #expect(held.answered == 0, "control: the old answer has not landed before the press")
+                        #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
+                                "control: the sheet is not up yet")
+                        try await Self.waitUntil { held.answered == 1 }
+                        #expect(held.answered == 1, "control: the old answer landed after the press")
+                    }
                     try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
                     #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
                             "\(answerAt): the press opens the next report's sheet")
