@@ -413,8 +413,8 @@ struct ComposeSuggestionPersistTests {
 
     /// Resend and rewind put an earlier suggestion back in the card. The suggestion stored for the
     /// chat view must keep its text version, or the ghost disappears with nothing to show.
-    @Test("A resend or rewind restore keeps the restored suggestion's text version", arguments: ["resend", "rewind"])
-    func restoreKeepsTheTextVersion(_ restore: String) async throws {
+    @Test("A resend or rewind restore keeps the restored suggestion's text version")
+    func restoreKeepsTheTextVersion() async throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
@@ -434,11 +434,6 @@ struct ComposeSuggestionPersistTests {
         let draft = Self.draft(history: Draft.encodeEditHistory([turn]))
         let restored = try #require(draft.editHistory.first)
 
-        // The production restore passes the turn's recorded text version with its body.
-        let call = try #require(Self.restoreCall(restore))
-        #expect(call.contains("bodyAtRequest, nil, nil, nil,") && call.contains(".textMessageAtRequest,")
-                && call.contains(".changeCommandAtRequest)"),
-                "the \(restore) restore must carry the turn's text version and change command")
         await ComposeView.writeOverCurrent(ReplyResult(body: restored.bodyAtRequest, textMessage: restored.textMessageAtRequest, changeCommand: restored.changeCommandAtRequest), replyTo: header, db: db)
 
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
@@ -471,6 +466,16 @@ struct ComposeSuggestionPersistTests {
         let result = try #require(rest.range(of: "await onDraftUpdate?(result.subject, result.body,"))
         #expect(task.lowerBound < restore.lowerBound && restore.lowerBound < result.lowerBound)
         #expect(rest[restore.upperBound...].prefix(400).contains("await Self.restoreDraft(anchor, through: onDraftUpdate)"))
+        // The accepted edit records its turn with the text version and command it was requested on
+        // (the base's, read once), so a later resend or rewind restores the whole suggestion.
+        let base = try #require(rest.range(of: "let atRequest = base.atRequest\n"))
+        let record = try #require(rest.range(of: """
+            editHistory.append(Self.editTurn(
+                                instruction: instruction, subject: currentSubject, body: currentBody,
+                                atRequest: atRequest, assistantResponse: result.raw))
+            """))
+        #expect(base.lowerBound < record.lowerBound && result.lowerBound < record.lowerBound,
+                "the accepted edit records its turn with the request's text version")
     }
 
     /// The choice itself, without the view: a restored turn wins over the card's draft, which a
@@ -517,21 +522,6 @@ struct ComposeSuggestionPersistTests {
             createdAt: 0, updatedAt: 0,
             serverDraftId: nil, serverPushStatus: nil,
             rfc822MessageId: nil, attachmentsDirName: nil)
-    }
-
-    private static func restoreCall(_ restore: String) -> String? {
-        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        guard let source = try? String(contentsOf: root.appendingPathComponent("TabMail/Views/Inbox/DynamicIslandChatButton.swift"), encoding: .utf8) else { return nil }
-        let signature = restore == "resend"
-            ? "private func resendLastUserComposeEdit(" : "private func rewindComposeEditToMessage("
-        // The restore hands its turn to the request, which puts that turn's draft back first.
-        guard let start = source.range(of: signature),
-              source[start.upperBound...].prefix(1200).contains("sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)"),
-              let send = source.range(of: "private func sendComposeEdit("),
-              let restore = source[send.upperBound...].range(of: "if let anchor {\n") else { return nil }
-        let tail = source[restore.upperBound...]
-        guard let call = tail.range(of: "await onDraftUpdate?("), let end = tail.range(of: "\n            }\n") else { return nil }
-        return String(tail[call.lowerBound..<end.lowerBound])
     }
 
     @Test("Updates cachedReply on messageHeader for the given id")
@@ -775,6 +765,11 @@ struct ComposeSuggestionPersistTests {
         let fade = try #require(edit.range(of: "withAnimation(.easeOut(duration: 0.4)) {"))
         #expect(gate.lowerBound < save.lowerBound && save.lowerBound < fade.lowerBound)
         #expect(!edit.contains("Task {"), "the save is awaited by the edit, never detached")
+        // The card shows the stored whole value, so a second edit starts from (and replaces) this one.
+        let shown = try #require(edit.range(of: "if showingSuggestion {"))
+        let assign = try #require(edit[shown.upperBound...].range(of: "shownSuggestion = edit.edited\n"))
+        #expect(gate.lowerBound < assign.lowerBound && assign.lowerBound < save.lowerBound,
+                "the card's shown suggestion becomes the edited value before its save")
         #expect(!source.contains("persistCachedReply"), "the retired second writer")
     }
 
