@@ -1388,6 +1388,11 @@ final class SyncScheduler {
             // maximize throughput by skipping delta sync pauses and using aggressive backfill.
             AccountManagerState.shared.fastSyncModeActive = true
             defer { Task { @MainActor in AccountManagerState.shared.fastSyncModeActive = false } }
+            // The fast-sync flag above is the job's throughput switch, not a
+            // user's Fast Sync: older-mail body downloads during the job follow
+            // the job's walk decision instead (#1064).
+            SyncEngine.backgroundProcessingJobActive.withLock { $0 = true }
+            defer { SyncEngine.backgroundProcessingJobActive.withLock { $0 = false } }
 
             #if DEBUG
             if let backgroundWorkHook = self.backgroundWorkHook {

@@ -181,22 +181,43 @@ actor SyncEngine {
         return !powerHeld && !(wifiOnly && expensive)
     }
 
-    /// The walk gate from a fresh snapshot of the device's power, the Wi-Fi-only
-    /// setting and the network. Older-mail body downloads (BackfillBodyQueue) are
-    /// held by the same rules as the walk (#1064); ActiveBodyQueue is not gated.
-    nonisolated static func backfillDownloadsAllowedNow() async -> Bool {
-        backfillDownloadsAllowed(power: await currentBackfillPowerState())
+    /// The Wi-Fi-only preference (Settings toggle, unset = on). Read once at the
+    /// start of each gate decision and passed through (snapshot rule).
+    nonisolated static func backfillWifiOnlySetting() -> Bool {
+        UserDefaults.standard.object(forKey: SyncScheduler.wifiOnlyKey) as? Bool ?? true
     }
 
-    /// The walk gate for a given power snapshot, with the Wi-Fi-only setting and
-    /// the network read now. The one rule shared by the walk and BackfillBodyQueue.
-    /// Uses checkExpensive() (Mutex-backed) as the Wi-Fi proxy: on iOS,
-    /// expensive == cellular/hotspot.
+    /// True while the BGProcessing job runs (`SyncScheduler.handleBackgroundAIProcessing`).
+    /// The job sets fast sync for throughput, so the body gate must not read that
+    /// flag as a user's Fast Sync: during the job, older-mail bodies follow the
+    /// job's own walk decision (`SyncScheduler.backgroundBackfillPlan`, #1064).
+    nonisolated static let backgroundProcessingJobActive = Mutex<Bool>(false)
+
+    /// One older-mail body download decision (BackfillBodyQueue, #1064). Each call
+    /// is its own operation: the Wi-Fi-only preference and the job context are
+    /// captured first, before any suspension. In the BGProcessing job the job's
+    /// walk decision applies; otherwise the foreground walk's rule. ActiveBodyQueue
+    /// is not gated.
+    nonisolated static func backfillDownloadsAllowedNow() async -> Bool {
+        let wifiOnly = backfillWifiOnlySetting()
+        let inBackgroundJob = backgroundProcessingJobActive.withLock { $0 }
+        let power = await currentBackfillPowerState()
+        if inBackgroundJob {
+            // Wi-Fi proxy as in the walk gate: on iOS, expensive == cellular/hotspot.
+            return SyncScheduler.backgroundBackfillPlan(
+                isLowPowerMode: power.lowPowerMode, wifiOnly: wifiOnly, onWiFi: !NetworkMonitor.checkExpensive())
+        }
+        return backfillDownloadsAllowed(power: power, wifiOnly: wifiOnly)
+    }
+
+    /// The foreground walk gate for a power snapshot and the Wi-Fi-only value the
+    /// caller captured, with the network read now. Shared by the walk and
+    /// BackfillBodyQueue. Uses checkExpensive() (Mutex-backed) as the Wi-Fi proxy:
+    /// on iOS, expensive == cellular/hotspot.
     nonisolated static func backfillDownloadsAllowed(
-        power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float)
+        power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), wifiOnly: Bool
     ) -> Bool {
-        let wifiOnly = UserDefaults.standard.object(forKey: SyncScheduler.wifiOnlyKey) as? Bool ?? true
-        return backfillWalkAllowed(
+        backfillWalkAllowed(
             fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
             batteryLevel: power.batteryLevel, wifiOnly: wifiOnly, expensive: NetworkMonitor.checkExpensive())
     }

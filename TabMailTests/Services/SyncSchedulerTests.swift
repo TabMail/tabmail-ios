@@ -76,11 +76,11 @@ struct SyncSchedulerConstantsTests {
         #expect(toggle.contains("@AppStorage(SyncScheduler.wifiOnlyKey)"), "the toggle writes the key")
         let read = "UserDefaults.standard.object(forKey: SyncScheduler.wifiOnlyKey) as? Bool ?? true"
         let jobRead = "UserDefaults.standard.object(forKey: Self.wifiOnlyKey) as? Bool ?? true"
-        #expect(try source("TabMail/Services/Sync/SyncEngineBackfill.swift").contains(read),
-                "the worker reads the toggle's key, unset = on")
+        #expect(try source("TabMail/Services/Sync/SyncEngine.swift").contains(read),
+                "the worker and the older-mail body gate read the toggle's key, unset = on")
         #expect(try source("TabMail/Services/SyncScheduler.swift").contains(jobRead),
                 "the job reads the toggle's key, unset = on")
-        for path in ["TabMail/Services/Sync/SyncEngineBackfill.swift", "TabMail/Services/SyncScheduler.swift"] {
+        for path in ["TabMail/Services/Sync/SyncEngine.swift", "TabMail/Services/Sync/SyncEngineBackfill.swift", "TabMail/Services/SyncScheduler.swift"] {
             let literals = try source(path).components(separatedBy: "\"backgroundSyncWiFiOnly\"").count - 1
             #expect(literals <= (path.hasSuffix("SyncScheduler.swift") ? 1 : 0), "\(path) spells the key as a literal")
         }

@@ -291,8 +291,9 @@ extension SyncEngine {
                     // The gates hold only the walk (downloads); the cycle, and so
                     // the folder scans, always runs (#1063). BackfillBodyQueue
                     // shares the same rule (#1064).
+                    let wifiOnly = Self.backfillWifiOnlySetting()
                     guard let power = await self?.backfillPowerState() else { break }
-                    let walkAllowed = Self.backfillDownloadsAllowed(power: power)
+                    let walkAllowed = Self.backfillDownloadsAllowed(power: power, wifiOnly: wifiOnly)
                     let powerHeld = !Self.backfillWalkAllowed(
                         fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
                         batteryLevel: power.batteryLevel, wifiOnly: false, expensive: false)

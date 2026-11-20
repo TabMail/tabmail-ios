@@ -534,22 +534,6 @@ actor BackfillBodyQueue {
         connectivityWatchTask?.cancel()
         connectivityWatchTask = nil
 
-        // #1064: older-mail bodies follow the walk's download gate (Wi-Fi-only on
-        // an expensive network, low battery or Low Power Mode off power). Items
-        // stay pending; a watch re-dispatches once the gate lifts. Batches
-        // already running finish. ActiveBodyQueue is not gated, by design.
-        guard await SyncEngine.backfillDownloadsAllowedNow() else {
-            if !heldByDownloadGate {
-                BackgroundSyncLogger.logBackfill("[BackfillBody] downloads HELD by the walk gate (pending=\(storage.pendingCount))")
-            }
-            heldByDownloadGate = true
-            if !storage.isEmpty { scheduleDispatchOnGateLift() }
-            return
-        }
-        heldByDownloadGate = false
-        gateWatchTask?.cancel()
-        gateWatchTask = nil
-
         // ADR-IOS-046: if the GRDB pool is suspended (app backgrounded past its
         // grace window), ABANDON — don't fetch bodies we can't persist. Every
         // write would abort (SQLITE_ABORT); the work is idempotent and
@@ -581,6 +565,26 @@ actor BackfillBodyQueue {
                 providerByAccount[accountId] = provider
             }
         }
+
+        // #1064: older-mail bodies follow the backfill walk's download gate
+        // (Wi-Fi-only on an expensive network, low battery or Low Power Mode off
+        // power; in the background job, the job's walk decision). Decided after
+        // the waits above, immediately before any batch launches (no await
+        // follows). A refusal releases the candidates to pending without
+        // spending a retry and arms a watch that re-dispatches once the gate
+        // lifts. Batches already running finish. ActiveBodyQueue is not gated.
+        guard await SyncEngine.backfillDownloadsAllowedNow() else {
+            for item in batch { storage.releaseInFlightOnly(item) }
+            if !heldByDownloadGate {
+                BackgroundSyncLogger.logBackfill("[BackfillBody] downloads HELD by the walk gate (pending=\(storage.pendingCount))")
+            }
+            heldByDownloadGate = true
+            scheduleDispatchOnGateLift()
+            return
+        }
+        heldByDownloadGate = false
+        gateWatchTask?.cancel()
+        gateWatchTask = nil
 
         // Filter to dispatchable candidates (provider present, folder under its
         // batch cap), then group. Isolation-pending items each form their OWN
