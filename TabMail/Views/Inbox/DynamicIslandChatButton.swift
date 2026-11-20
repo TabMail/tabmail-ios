@@ -2948,7 +2948,8 @@ private struct ExpandablePillPressStyle: ButtonStyle {
 
 /// The reply field's focus as an accessibility-only marker, for the chat swipe UI tests: XCUITest
 /// reads a text field's own focus as lost once a swipe re-renders the chat, while editing goes on.
-/// Active only in debug builds launched with the swipe UI test's argument; it draws nothing (clear
+/// Active only in debug builds launched with the swipe UI test's argument (`--chat-swipe-ui-test`)
+/// or the keyboard focus UI test's (`--keyboard-focus-ui-test`); it draws nothing (clear
 /// text in the background, so no layout change) and is set only when the field's focus changes.
 private struct ReplyFieldFocusMarker: ViewModifier {
     let focused: Bool

@@ -8,8 +8,8 @@ import SwiftUI
 ///
 /// Uses a UIKit `UITapGestureRecognizer` with `cancelsTouchesInView = false`
 /// so child views still receive their touches. A delegate filter prevents
-/// the gesture from firing on `UITextField` / `UITextView` (which handle
-/// their own focus).
+/// the gesture from firing on a touch inside a `UITextField` / `UITextView`
+/// (which handle their own focus), including their internal subviews.
 ///
 /// Apply once near the root of a screen (e.g. on NavigationStack).
 private struct KeyboardDismissOnTapModifier: ViewModifier {
@@ -58,8 +58,10 @@ private final class KeyboardDismissView: UIView {
 extension KeyboardDismissView: UIGestureRecognizerDelegate {
     func gestureRecognizer(_: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
         guard let view = touch.view else { return true }
-        // Don't dismiss when tapping text inputs — they handle focus themselves
-        return !(view is UITextField || view is UITextView)
+        // Don't dismiss when tapping inside a text input — it handles focus itself. A tap in a field
+        // being edited lands on an internal subview (the field editor, the text view inside a
+        // multi-line SwiftUI TextField or TextEditor, selection handles), so walk the superviews.
+        return !sequence(first: view, next: \.superview).contains { $0 is UITextField || $0 is UITextView }
     }
 
     /// The dismiss tap only watches (`cancelsTouchesInView = false`), so it runs alongside every other

@@ -14,16 +14,20 @@ import SwiftUI
 /// - `--keyboard-focus-chip`: a rejected recipient chip in a recipient field (`RecipientTokenField`);
 /// - `--keyboard-focus-bullet`: a bullet list's Add (`BulletListEditor`);
 /// - `--keyboard-focus-search`: a button presenting search in a sheet, as the inbox does (`SearchView`);
-/// - `--keyboard-focus-fork`: the inbox chat with one past session, for "Fork and re-send".
+/// - `--keyboard-focus-fork`: the inbox chat with one past session, for "Fork and re-send";
+/// - `--keyboard-focus-caret`: a single-line and a multi-line field, for a tap inside a field that
+///   already has the keyboard (the tap lands on the field's internal subviews).
 /// Each screen also has an "Other field" that can hold the keyboard first.
 struct KeyboardFocusTestScene: View {
     static let templateId = "keyboard-focus-fixture-template"
     static let rejectedRecipient = "notanaddress"
     static let forkSessionId = "keyboard-focus-fixture-session"
     static let forkUserText = "Keyboard focus fixture question"
+    /// The multi-line field's height in lines, so it is backed by a text view with room to tap in.
+    static let multiLineLines = 3...6
 
     private enum Mode {
-        case template, chip, bullet, search, fork
+        case template, chip, bullet, search, fork, caret
     }
 
     private let mode: Mode = {
@@ -32,11 +36,13 @@ struct KeyboardFocusTestScene: View {
         if arguments.contains("--keyboard-focus-bullet") { return .bullet }
         if arguments.contains("--keyboard-focus-search") { return .search }
         if arguments.contains("--keyboard-focus-fork") { return .fork }
+        if arguments.contains("--keyboard-focus-caret") { return .caret }
         return .template
     }()
 
     @State private var ready = false
     @State private var other = ""
+    @State private var multiLine = ""
     @State private var recipients = ComposeDraftGuards.Recipients()
         .filling(to: RecipientEntry([KeyboardFocusTestScene.rejectedRecipient]))
     @State private var showCc = false
@@ -88,6 +94,15 @@ struct KeyboardFocusTestScene: View {
                     .padding()
                     .environment(\.hasTabMailSession, true)
                     .dismissKeyboardOnTap()
+                case .caret:
+                    VStack(alignment: .leading, spacing: 16) {
+                        TextField("Other field", text: $other)
+                        TextField("Multi-line field", text: $multiLine, axis: .vertical)
+                            .lineLimit(Self.multiLineLines)
+                        Spacer()
+                    }
+                    .padding()
+                    .dismissKeyboardOnTap()
                 }
             }
         }
@@ -101,7 +116,7 @@ struct KeyboardFocusTestScene: View {
             case .fork:
                 try? await Self.seedPastSession()
                 AISubscriptionGate.shared.openGate()
-            case .chip, .bullet, .search:
+            case .chip, .bullet, .search, .caret:
                 break
             }
             ready = true

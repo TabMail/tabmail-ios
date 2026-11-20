@@ -8,13 +8,16 @@ import XCTest
 /// tap on a control whose action focuses a text field must still end with that field focused and the
 /// keyboard up: the dismiss tap's `endEditing` must never land after the control's focus change.
 /// The controls: a reply template's plus button, a rejected recipient chip, a bullet list's Add,
-/// search opened from its button, and chat's "Fork and re-send" (`KeyboardFocusTestScene`).
+/// search opened from its button, and chat's "Fork and re-send" (`KeyboardFocusTestScene`). A tap
+/// inside a field that already has the keyboard (to move the caret) must also leave the keyboard up.
 @MainActor
 final class KeyboardFocusRaceUITests: XCTestCase {
     private let waitSeconds: TimeInterval = 15
     private let focusSeconds: TimeInterval = 5
     /// Long enough for a late `endEditing` to have landed.
     private let holdSeconds: TimeInterval = 1
+    /// Where inside a field a caret-moving tap lands, as a fraction of its frame (near the top left).
+    private let caretTapOffset: CGFloat = 0.2
 
     func testPlusOnATemplateKeepsTheInstructionFieldFocused() {
         continueAfterFailure = false
@@ -141,6 +144,43 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         XCTAssertTrue(marker.waitForExistence(timeout: focusSeconds), "control: the focus marker shows")
         let focused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'focused'"), object: marker)
         XCTAssertEqual(XCTWaiter.wait(for: [focused], timeout: focusSeconds), .completed, "the input kept the keyboard after the menu closed")
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up")
+    }
+
+    func testTapInsideAFocusedSingleLineFieldKeepsTheKeyboard() {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-caret")
+        defer { app.terminate() }
+
+        let field = app.textFields["Other field"].firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
+        tapInsideKeepsTheKeyboard(field, in: app)
+    }
+
+    func testTapInsideAFocusedMultiLineFieldKeepsTheKeyboard() {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-caret")
+        defer { app.terminate() }
+
+        let field = app.descendants(matching: .any).matching(NSPredicate(
+            format: "(elementType == %d OR elementType == %d) AND placeholderValue == %@",
+            XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue,
+            "Multi-line field")).firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
+        tapInsideKeepsTheKeyboard(field, in: app)
+    }
+
+    /// Focuses `field`, types into it, then taps inside it away from the caret, as a user moving the
+    /// caret does; the field must keep the keyboard.
+    private func tapInsideKeepsTheKeyboard(_ field: XCUIElement, in app: XCUIApplication) {
+        field.tap()
+        field.typeText("Caret text \(UUID().uuidString.prefix(6))")
+        XCTAssertTrue(waitForFocus(field, timeout: focusSeconds), "control: the field has the keyboard")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: focusSeconds), "control: the keyboard is up")
+        // Near the start of the text, away from the caret at its end.
+        field.coordinate(withNormalizedOffset: CGVector(dx: caretTapOffset, dy: caretTapOffset)).tap()
+        RunLoop.current.run(until: Date().addingTimeInterval(holdSeconds))
+        XCTAssertTrue(waitForFocus(field, timeout: focusSeconds), "the field kept focus after a tap inside it")
         XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up")
     }
 
