@@ -45,7 +45,7 @@ enum AISummariesNotice {
         }
 
         /// The popover is on screen: it never opens by itself again, dismissed or not. Recorded
-        /// when it appears, not when it is asked for, since a chat can land while its push is
+        /// when UIKit puts it in a window, not when it is asked for, since a chat can land while its push is
         /// still running and the popover cannot be presented then.
         func markShown() {
             defaults.set(true, forKey: AISummariesNotice.shownKey)
