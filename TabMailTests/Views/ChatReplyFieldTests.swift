@@ -681,13 +681,17 @@ struct ChatReplyFieldTests {
         // open panel or the tutorial.
         #expect(Self.count(".popoverTip(", in: chat) == 0)
         #expect(Self.count(".overlay(alignment: .top) { if !chatExpanded && !TutorialCoordinator.shared.isRunning { TipView(ChatFieldDragTip(), arrowEdge: .bottom)", in: chat) == 1)
+        // On the whole stack, the one the side inset pads, so it sits above "Replying only to" and
+        // the no-reply notice rather than over them.
+        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) .alignmentGuide(.top) { $0[.bottom] } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
         // A tap on the field focuses it, a drag starts, or the panel opens: each ends the tip for good.
         #expect(Self.count(".onChange(of: chatInputFocused) { _, focused in if focused { ChatFieldDragTip.close() } }", in: chat) == 1)
         #expect(Self.count(".onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close() } }", in: chat) == 1)
         let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
-        let start = try #require(changed.range(of: "if dragging {"))
-        let end = try #require(changed.range(of: "return }"))
-        #expect(Self.count("ChatFieldDragTip.close()", in: String(changed[start.upperBound..<end.lowerBound])) == 1,
+        let dragStart = try #require(changed.range(of: "if dragging {"))
+        let dragEnd = try #require(changed[dragStart.upperBound...].range(of: "return }"))
+        guard dragStart.upperBound <= dragEnd.lowerBound else { return }
+        #expect(Self.count("ChatFieldDragTip.close()", in: String(changed[dragStart.upperBound..<dragEnd.lowerBound])) == 1,
                 "once per drag, at its start, not on every frame")
         #expect(Self.count("ChatFieldDragTip.close()", in: chat) == 3)
         let tips = try Self.source("TabMail/Views/Components/AppTips.swift")
@@ -702,7 +706,7 @@ struct ChatReplyFieldTests {
     @Test("The drag's swell is gesture state, reset with the pill's spring however the drag ends; it holds the freeze once per drag")
     func fieldDragWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        // R1: a cancelled drag resets too, so the field never stays swollen.
+        // A cancelled drag resets too, so the field never stays swollen.
         #expect(Self.count("@GestureState(resetTransaction: Transaction(animation: ChatThreadView.pillSpring)) private var fieldDragProgress = ChatFieldDrag.Progress()", in: chat) == 1)
         #expect(Self.count(".updating($fieldDragProgress) { value, progress, _ in progress = ChatFieldDrag.progress(translation: value.translation) }", in: chat) == 1)
         #expect(Self.count("@State private var fieldSwell", in: chat) == 0)
@@ -710,20 +714,55 @@ struct ChatReplyFieldTests {
         let ended = try #require(gesture.range(of: ".onEnded {"))
         #expect(Self.count("fieldDragProgress", in: String(gesture[ended.upperBound...])) == 0, "the let-go only decides the open")
         #expect(Self.count("withAnimation(Self.pillSpring) { chatExpanded = true }", in: String(gesture[ended.upperBound...])) == 1)
-        // R2: the freeze, under its own id, from the gesture state, so a cancelled drag releases.
+        // The freeze, under its own id, from the gesture state, so a cancelled drag releases.
         #expect(Self.count(".onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }", in: chat) == 1)
         let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
         #expect(Self.count("ChatSwipeHold.shared.begin(Self.fieldDragHoldId)", in: changed) == 1)
         #expect(Self.count("ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: ChatViewLayout.swipeSettleHold)", in: changed) == 1)
         #expect(Self.count("ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)", in: chat) == 1, "released if the chat goes away")
-        // C1: the bar keeps its resting height through the swell and its settle.
-        #expect(Self.count("if !chatExpanded && fieldSettleToken == nil { pillHeight = height }", in: chat) == 1)
-        #expect(Self.count("try? await Task.sleep(for: ChatViewLayout.fieldDragSettle)", in: changed) == 1)
-        // T5: never in the tutorial, whose steps open the chat themselves, nor over the open panel.
+        // The bar keeps its resting height through the swell and its settle.
+        #expect(Self.count("if !chatExpanded && fieldSettleToken == nil && !fieldDragProgress.isDragging { pillHeight = height }", in: chat) == 1)
+        #expect(Self.count("try? await Task.sleep(for: Self.fieldDragSettle)", in: changed) == 1)
+        // Never in the tutorial, whose steps open the chat themselves, nor over the open panel.
         #expect(Self.count(".simultaneousGesture(fieldDragGesture, isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning)", in: chat) == 1)
-        // C5: VoiceOver opens the panel with a named action on the field.
+        // VoiceOver opens the panel with a named action on the field.
         #expect(ChatThreadView.showChatActionName == "Show TabMail chat")
         #expect(Self.count("Button(Self.showChatActionName) { withAnimation(Self.pillSpring) { chatExpanded = true } }", in: chat) == 1)
+    }
+
+    @Test("A drag on the field holds the bar from its start, the bar ignores the field while it drags, and every let-go releases the freeze")
+    func fieldDragSettleFences() throws {
+        let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
+        let dragStart = try #require(changed.range(of: "if dragging {"))
+        let dragEnd = try #require(changed[dragStart.upperBound...].range(of: "return }"))
+        guard dragStart.upperBound <= dragEnd.lowerBound else { return }
+        let started = String(changed[dragStart.upperBound..<dragEnd.lowerBound])
+        let letGo = String(changed[dragEnd.upperBound...])
+        // The token is taken as the drag starts, not only on its let-go.
+        #expect(Self.count("fieldSettleToken = UUID()", in: started) == 1)
+        // The bar's gate reads the drag itself: its geometry action and the token's onChange run in
+        // an unspecified order.
+        #expect(Self.count("if !chatExpanded && fieldSettleToken == nil && !fieldDragProgress.isDragging { pillHeight = height }", in: chat) == 1)
+        // Every let-go releases the freeze, a let-go that opens the panel included.
+        let release = "ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: ChatViewLayout.swipeSettleHold)"
+        #expect(Self.count(release, in: letGo) == 1)
+        let beforeRelease = try #require(letGo.range(of: release))
+        #expect(!letGo[..<beforeRelease.lowerBound].contains("if "), "the release sits under no condition")
+        #expect(!letGo[..<beforeRelease.lowerBound].contains("guard "), "nor after a guard")
+    }
+
+    @Test("The settle lasts the pill spring's own settling duration, which drives the panel and the swell too")
+    func fieldDragSettleIsThePillSpring() throws {
+        let spring = ChatThreadView.pillSpringModel
+        #expect(spring.settlingDuration > 0, "control: the spring settles")
+        #expect(ChatThreadView.fieldDragSettle == .seconds(spring.settlingDuration))
+        #expect(ChatThreadView.fieldDragSettle > .zero)
+        // The settle outlasts the freeze's hold's spring part: the field is at rest when the bar follows.
+        #expect(ChatThreadView.fieldDragSettle >= .seconds(ChatViewLayout.swipeSpringResponse))
+        let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        #expect(Self.count("private static let pillSpring = Animation.spring(pillSpringModel)", in: chat) == 1)
+        #expect(Self.count("static let fieldDragSettle: Duration = .seconds(pillSpringModel.settlingDuration)", in: chat) == 1)
     }
 
     @Test("A new email's arrival re-pins the landing in the rise, only after the landing and not for the user's own email")

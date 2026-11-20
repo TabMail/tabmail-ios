@@ -198,6 +198,32 @@ struct ChatThreadLayoutTests {
         }
     }
 
+    @Test("VoiceOver's \"Show TabMail chat\" opens the panel, is gone once it is open, and sits on an element VoiceOver can focus")
+    func showChatActionOpensThePanel() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosted { _, controller, _ in
+                let id = ChatThreadView.replyPillId
+                let name = ChatThreadView.showChatActionName
+                try await Self.waitFor { Self.frame(of: id, in: controller.view) != nil }
+                let carrier = try #require(HostedAccessibility.elements(under: controller.view)
+                    .first { $0.accessibilityCustomActions?.contains { $0.name == name } ?? false },
+                    "ids: \(HostedAccessibility.identifiers(in: controller.view))")
+                // VoiceOver offers an element's actions only while that element has its focus.
+                #expect(carrier.isAccessibilityElement,
+                        "the action's element can take VoiceOver focus: \(HostedAccessibility.identifier(of: carrier) ?? "no id")")
+                #expect(Self.frame(of: "chatClose", in: controller.view) == nil, "control: the panel starts closed")
+                let carrierId = try #require(HostedAccessibility.identifier(of: carrier))
+                #expect(HostedAccessibility.perform(name, on: carrierId, in: controller.view), "the action runs")
+                try await Self.waitFor { Self.frame(of: "chatClose", in: controller.view) != nil }
+                #expect(Self.frame(of: "chatClose", in: controller.view) != nil, "the panel opened")
+                let stillOffered = HostedAccessibility.elements(under: controller.view)
+                    .contains { $0.accessibilityCustomActions?.contains { $0.name == name } ?? false }
+                #expect(!stillOffered, "the action is gone while the panel is open")
+            }
+        }
+    }
+
     @Test("The chat scrolls behind the reply field: the field is the scroll view's bottom bar")
     func chatScrollsBehindTheField() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")

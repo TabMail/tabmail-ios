@@ -148,20 +148,52 @@ final class ChatSwipeUITests: XCTestCase {
     }
 
     /// The swell is not the field's room: across a short drag and its settle the chat does not move.
+    /// XCUITest reads frames only once the app is idle, after the spring, so the app's marker
+    /// records the newest row's largest move from the drag's start until well after its settle.
     func testShortDragOnTheReplyFieldKeepsTheChat() {
         let app = launchIntoChat()
         let field = replyField(in: app)
         let newest = bubble(3, in: app)
-        let before = newest.frame
+        let before = restingMinY(of: newest)
         let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
         start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -40)),
                     withVelocity: .slow, thenHoldForDuration: 0.3)
-        // Read at once: inside the settle (ChatViewLayout.fieldDragSettle), then after it.
-        let settling = newest.frame
-        XCTAssertEqual(settling.minY, before.minY, accuracy: 1, "the chat stayed while the field settled")
-        Thread.sleep(forTimeInterval: 1.5)
-        XCTAssertEqual(newest.frame.minY, before.minY, accuracy: 1, "the chat is where it was once settled")
+        let marker = dragMarker(afterDrags: 1, in: app)
+        XCTAssertNotNil(marker, "control: the marker recorded one finished drag")
+        guard let marker else { return }
+        XCTAssertLessThan(marker.move, 1, "the chat stayed through the swell and the settle: moved \(marker.move)")
+        XCTAssertFalse(marker.frozen, "the freeze is released once the drag has settled")
+        XCTAssertEqual(newest.frame.minY, before, accuracy: 1, "the chat is where it was once settled")
         XCTAssertFalse(app.buttons["chatClose"].exists, "control: the short drag did not open the panel")
+    }
+
+    /// A drag that opens the panel lets go of the user-interaction freeze too.
+    func testDragThatOpensThePanelReleasesTheFreeze() {
+        let app = launchIntoChat()
+        dragFieldOpen(in: app)
+        let marker = dragMarker(afterDrags: 1, in: app)
+        XCTAssertNotNil(marker, "control: the marker recorded one finished drag")
+        guard let marker else { return }
+        XCTAssertFalse(marker.frozen, "the freeze is released after a drag that opened the panel")
+        XCTAssertTrue(app.buttons["chatClose"].exists, "control: the panel is still open")
+    }
+
+    /// With the first-time tip showing, as a new user sees it: the tip is on screen, and it takes
+    /// no touch from the field. The first drag opens the panel; in a fresh launch, the first tap
+    /// focuses the field.
+    func testFieldDragTipShowsAndLeavesTheFieldItsTouches() {
+        let app = launchIntoChat(fieldDragTip: true)
+        let tip = app.staticTexts[Self.fieldDragTipText].firstMatch
+        XCTAssertTrue(tip.waitForExistence(timeout: 5), "the tip shows above the field")
+        XCTAssertLessThanOrEqual(tip.frame.maxY, replyField(in: app).frame.minY + 1, "control: the tip is above the field")
+        dragFieldOpen(in: app)
+        app.terminate()
+
+        let fresh = launchIntoChat(fieldDragTip: true)
+        XCTAssertTrue(fresh.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: 5),
+                      "control: the tip shows again in the fresh launch")
+        replyField(in: fresh).tap()
+        XCTAssertTrue(markerReads(focused: true, in: fresh), "the first tap focused the field")
     }
 
     func testShortDragUpOnTheReplyFieldSettlesBack() {
@@ -593,7 +625,7 @@ final class ChatSwipeUITests: XCTestCase {
 
     private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false,
                                 lateSuggestion: Bool = false, unread: Bool = false,
-                                suggestionOnJump: Bool = false) -> XCUIApplication {
+                                suggestionOnJump: Bool = false, fieldDragTip: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
@@ -604,6 +636,7 @@ final class ChatSwipeUITests: XCTestCase {
             + (lateSuggestion ? ["--chat-swipe-late-suggestion"] : [])
             + (suggestionOnJump ? ["--chat-swipe-suggestion-on-jump"] : [])
             + (host == .tutorialCard ? ["--chat-swipe-tutorial-card"] : [])
+            + (fieldDragTip ? ["--chat-field-drag-tip"] : [])
         app.launch()
         switch host {
         case .stack, .tutorialCard:
@@ -657,6 +690,39 @@ final class ChatSwipeUITests: XCTestCase {
             Self.replyPlaceholder)).firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5), "control: the reply field, found by its placeholder")
         return field
+    }
+
+    /// `ChatFieldDragTip.text`, the tip's words.
+    private static let fieldDragTipText = "Drag up to see what you asked TabMail about this conversation."
+    /// How long the app's drag marker may take to finish watching a drag (its watch outlasts the
+    /// settle by design).
+    private static let dragMarkerPollLimit: TimeInterval = 5
+
+    /// What the app's `chatFieldDragMarker` recorded: the newest row's largest move during and
+    /// after the last field drag, and whether the interaction freeze is held.
+    private struct DragMarker { let drags: Int; let watching: Bool; let move: CGFloat; let frozen: Bool }
+
+    private func readDragMarker(in app: XCUIApplication) -> DragMarker? {
+        let marker = app.descendants(matching: .any)["chatFieldDragMarker"].firstMatch
+        guard marker.exists else { return nil }
+        var fields: [String: String] = [:]
+        for part in marker.label.split(separator: " ") {
+            let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
+            if pair.count == 2 { fields[pair[0]] = pair[1] }
+        }
+        guard let drags = fields["drags"].flatMap(Int.init), let watching = fields["watching"],
+              let move = fields["move"].flatMap(Double.init), let frozen = fields["frozen"] else { return nil }
+        return DragMarker(drags: drags, watching: watching == "1", move: CGFloat(move), frozen: frozen == "1")
+    }
+
+    /// The marker once it has seen `drags` drags and stopped watching the last one.
+    private func dragMarker(afterDrags drags: Int, in app: XCUIApplication) -> DragMarker? {
+        let deadline = Date().addingTimeInterval(Self.dragMarkerPollLimit)
+        repeat {
+            if let marker = readDragMarker(in: app), marker.drags >= drags, !marker.watching { return marker }
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.focusMarkerPollStep))
+        } while Date() < deadline
+        return nil
     }
 
     /// Drags the collapsed reply field up past the open distance and waits for the panel.
