@@ -82,6 +82,7 @@ struct ChatThreadLayoutTests {
     private static func hosted(
         textSize: DynamicTypeSize = .large,
         earlier: Int = 0,
+        signedIn: Bool = false,
         _ body: (UIWindow, UIHostingController<AnyView>, MessageHeader) async throws -> Void
     ) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -95,7 +96,9 @@ struct ChatThreadLayoutTests {
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         let controller = UIHostingController(rootView: AnyView(
-            NavigationStack { ChatThreadView(messageId: parent.id) }.environment(\.dynamicTypeSize, textSize)))
+            NavigationStack { ChatThreadView(messageId: parent.id) }
+                .environment(\.dynamicTypeSize, textSize)
+                .environment(\.hasTabMailSession, signedIn)))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -168,6 +171,29 @@ struct ChatThreadLayoutTests {
                 #expect(abs(mic.midX - (field.minX + ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2)) < 1,
                         "mic 12 in from the edge: \(mic), field \(field)")
                 #expect(send.height >= 44 && mic.height >= 44, "tap areas stay 44 tall")
+            }
+        }
+    }
+
+    @Test("Signed in, the empty field shows its \"e.g.\" line: 60 tall, the mic and Send on its last line")
+    func signedInEmptyField() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosted(signedIn: true) { _, controller, _ in
+                let id = ChatThreadView.replyPillId
+                try await Self.waitFor { Self.frame(of: "chatSend", in: controller.view) != nil }
+                try await Task.sleep(for: .milliseconds(300))
+                let labels = HostedAccessibility.labels(in: controller.view)
+                #expect(labels.contains { $0.hasPrefix("e.g.") }, "control: the \"e.g.\" line shows: \(labels.prefix(30))")
+                let field = try #require(Self.frame(of: id, in: controller.view))
+                let send = try #require(Self.frame(of: "chatSend", in: controller.view))
+                let mic = try #require(HostedAccessibility.elements(under: controller.view)
+                    .first { $0.accessibilityLabel == "Dictate" }?.accessibilityFrame)
+                // Option B: the hint line, the "e.g." line under it, 10 above and below.
+                #expect(abs(field.height - 60) < 1, "empty signed-in field \(field.height)")
+                let lineMid = field.maxY - ChatViewLayout.fieldVerticalPadding - ChatViewLayout.fieldLineHeight / 2
+                #expect(abs(send.midY - lineMid) < 1, "Send \(send) on the last line at \(lineMid)")
+                #expect(abs(mic.midY - lineMid) < 1, "mic \(mic) on the last line at \(lineMid)")
             }
         }
     }

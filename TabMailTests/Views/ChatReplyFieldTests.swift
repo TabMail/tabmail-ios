@@ -677,11 +677,19 @@ struct ChatReplyFieldTests {
     func fieldDragTip() throws {
         #expect(ChatFieldDragTip.text == "Drag up to see what you asked TabMail about this conversation.")
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        // Above the field (its arrow points down at it), never over the open panel or the tutorial.
-        #expect(Self.count(".popoverTip(chatExpanded || TutorialCoordinator.shared.isRunning ? nil : ChatFieldDragTip(), arrowEdge: .bottom)", in: chat) == 1)
-        // A tap on the field focuses it; the first drag swells it: each ends the tip for good.
+        // Inline above the field (its arrow points down at it), never a popover, never over the
+        // open panel or the tutorial.
+        #expect(Self.count(".popoverTip(", in: chat) == 0)
+        #expect(Self.count(".overlay(alignment: .top) { if !chatExpanded && !TutorialCoordinator.shared.isRunning { TipView(ChatFieldDragTip(), arrowEdge: .bottom)", in: chat) == 1)
+        // A tap on the field focuses it, a drag starts, or the panel opens: each ends the tip for good.
         #expect(Self.count(".onChange(of: chatInputFocused) { _, focused in if focused { ChatFieldDragTip.close() } }", in: chat) == 1)
-        #expect(Self.count("if fieldSwell > 0 { ChatFieldDragTip.close() }", in: chat) == 1)
+        #expect(Self.count(".onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close() } }", in: chat) == 1)
+        let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
+        let start = try #require(changed.range(of: "if dragging {"))
+        let end = try #require(changed.range(of: "return }"))
+        #expect(Self.count("ChatFieldDragTip.close()", in: String(changed[start.upperBound..<end.lowerBound])) == 1,
+                "once per drag, at its start, not on every frame")
+        #expect(Self.count("ChatFieldDragTip.close()", in: chat) == 3)
         let tips = try Self.source("TabMail/Views/Components/AppTips.swift")
         let start = try #require(tips.range(of: "struct ChatFieldDragTip: Tip {"))
         let end = try #require(tips[start.upperBound...].range(of: "struct ComposeChatPillTip: Tip {"))
@@ -689,6 +697,55 @@ struct ChatReplyFieldTests {
         #expect(Self.count("MaxDisplayCount(1)", in: tip) == 1, "shown once")
         #expect(Self.count("invalidate(reason: .actionPerformed)", in: tip) == 1)
         #expect(Self.count("OnboardingTipGate.$onboardingComplete", in: tip) == 1, "today's tip gate")
+    }
+
+    @Test("The drag's swell is gesture state, reset with the pill's spring however the drag ends; it holds the freeze once per drag")
+    func fieldDragWiring() throws {
+        let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        // R1: a cancelled drag resets too, so the field never stays swollen.
+        #expect(Self.count("@GestureState(resetTransaction: Transaction(animation: ChatThreadView.pillSpring)) private var fieldDragProgress = ChatFieldDrag.Progress()", in: chat) == 1)
+        #expect(Self.count(".updating($fieldDragProgress) { value, progress, _ in progress = ChatFieldDrag.progress(translation: value.translation) }", in: chat) == 1)
+        #expect(Self.count("@State private var fieldSwell", in: chat) == 0)
+        let gesture = try Self.body(of: "private var fieldDragGesture: some Gesture {", in: chat)
+        let ended = try #require(gesture.range(of: ".onEnded {"))
+        #expect(Self.count("fieldDragProgress", in: String(gesture[ended.upperBound...])) == 0, "the let-go only decides the open")
+        #expect(Self.count("withAnimation(Self.pillSpring) { chatExpanded = true }", in: String(gesture[ended.upperBound...])) == 1)
+        // R2: the freeze, under its own id, from the gesture state, so a cancelled drag releases.
+        #expect(Self.count(".onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }", in: chat) == 1)
+        let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
+        #expect(Self.count("ChatSwipeHold.shared.begin(Self.fieldDragHoldId)", in: changed) == 1)
+        #expect(Self.count("ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: ChatViewLayout.swipeSettleHold)", in: changed) == 1)
+        #expect(Self.count("ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)", in: chat) == 1, "released if the chat goes away")
+        // C1: the bar keeps its resting height through the swell and its settle.
+        #expect(Self.count("if !chatExpanded && fieldSettleToken == nil { pillHeight = height }", in: chat) == 1)
+        #expect(Self.count("try? await Task.sleep(for: ChatViewLayout.fieldDragSettle)", in: changed) == 1)
+        // T5: never in the tutorial, whose steps open the chat themselves, nor over the open panel.
+        #expect(Self.count(".simultaneousGesture(fieldDragGesture, isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning)", in: chat) == 1)
+        // C5: VoiceOver opens the panel with a named action on the field.
+        #expect(ChatThreadView.showChatActionName == "Show TabMail chat")
+        #expect(Self.count("Button(Self.showChatActionName) { withAnimation(Self.pillSpring) { chatExpanded = true } }", in: chat) == 1)
+    }
+
+    @Test("A new email's arrival re-pins the landing in the rise, only after the landing and not for the user's own email")
+    func arrivalWiring() throws {
+        let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        #expect(Self.count("@Environment(\\.accessibilityReduceMotion) private var reduceMotion", in: chat) == 1)
+        #expect(Self.count(".onChange(of: thread.items.last?.id) { old, new in guard ChatArrival.isArrival(landed: didInitialScroll, oldNewest: old, newNewest: new, newestIsOwn: thread.items.last?.isOwn ?? false), let target = scrollTarget else { return } withAnimation(ChatArrival.animation(ChatArrival.style(reduceMotion: reduceMotion))) { proxy.scrollTo(target.id, anchor: target.anchor) } }", in: chat) == 1)
+        #expect(Self.count(".animation(ChatArrival.animates(landed: didInitialScroll, newestIsOwn: thread.items.last?.isOwn ?? false) ? ChatArrival.animation(ChatArrival.style(reduceMotion: reduceMotion)) : nil, value: thread.items.last?.id)", in: chat) == 1)
+        #expect(Self.count("ChatArrival.style(reduceMotion: reduceMotion), isArrivalRow: item.id == thread.items.last?.id && ChatArrival.animates(landed: didInitialScroll, newestIsOwn: item.isOwn)", in: chat) == 1)
+        #expect(Self.count("reduceMotion: false", in: chat) == 0 && Self.count("reduceMotion: true", in: chat) == 0)
+    }
+
+    @Test("The working status line keeps the field's padding above it")
+    func statusLinePadding() throws {
+        let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
+        #expect(Self.count(".frame(maxWidth: .infinity) // The row pads only itself: the status line keeps the field's padding above it. .padding(.top, ChatViewLayout.fieldVerticalPadding)", in: field) == 1)
+    }
+
+    @Test("The tutorial tooltip's arrow points at the mic glyph's centre")
+    func tutorialArrowOnTheMic() {
+        let micCentre = ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2
+        #expect(TutorialChatInputBar.tooltipArrowCenterX + TutorialChatInputBar.tooltipInset == micCentre)
     }
 
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")

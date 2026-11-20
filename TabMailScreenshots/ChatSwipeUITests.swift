@@ -127,6 +127,43 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(isInChat(app), "the chat stays")
     }
 
+    /// Memory 129: a control at the bottom safe-area bar can exist yet swallow nothing, or take
+    /// nothing, so the opened panel is tapped, not only found: Close closes it, and so does the dim
+    /// above it.
+    func testDraggedOpenPanelClosesOnCloseAndOnTheDim() {
+        let app = launchIntoChat()
+        dragFieldOpen(in: app)
+        app.buttons["chatClose"].tap()
+        XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "Close closed the panel")
+        XCTAssertTrue(replyField(in: app).isHittable, "the collapsed field is back")
+
+        dragFieldOpen(in: app)
+        let close = app.buttons["chatClose"]
+        // The dim between the navigation bar and the panel's top.
+        let dimY = (navigationBarY(in: app) + close.frame.minY) / 2
+        XCTAssertLessThan(navigationBarY(in: app) + 20, close.frame.minY - 20, "control: there is dim above the panel to tap")
+        tap(atY: dimY, dx: 0.5, in: app)
+        XCTAssertTrue(close.waitForNonExistence(timeout: 3), "a tap on the dim closed the panel")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    /// The swell is not the field's room: across a short drag and its settle the chat does not move.
+    func testShortDragOnTheReplyFieldKeepsTheChat() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        let newest = bubble(3, in: app)
+        let before = newest.frame
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -40)),
+                    withVelocity: .slow, thenHoldForDuration: 0.3)
+        // Read at once: inside the settle (ChatViewLayout.fieldDragSettle), then after it.
+        let settling = newest.frame
+        XCTAssertEqual(settling.minY, before.minY, accuracy: 1, "the chat stayed while the field settled")
+        Thread.sleep(forTimeInterval: 1.5)
+        XCTAssertEqual(newest.frame.minY, before.minY, accuracy: 1, "the chat is where it was once settled")
+        XCTAssertFalse(app.buttons["chatClose"].exists, "control: the short drag did not open the panel")
+    }
+
     func testShortDragUpOnTheReplyFieldSettlesBack() {
         let app = launchIntoChat()
         let field = replyField(in: app)
@@ -620,6 +657,14 @@ final class ChatSwipeUITests: XCTestCase {
             Self.replyPlaceholder)).firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5), "control: the reply field, found by its placeholder")
         return field
+    }
+
+    /// Drags the collapsed reply field up past the open distance and waits for the panel.
+    private func dragFieldOpen(in app: XCUIApplication) {
+        let field = replyField(in: app)
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -200)))
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "control: the drag opened the panel")
     }
 
     private func navigationBarY(in app: XCUIApplication) -> CGFloat {
