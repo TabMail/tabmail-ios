@@ -57,7 +57,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Ever-Rolling FIFO Queues (ADR-IOS-027) | [read in full](Companion/Memory/Current/031-ever-rolling-fifo-queues-adr-ios-027.md) |
 | Bounded Memory (CRITICAL) | [read in full](Companion/Memory/Current/032-bounded-memory-critical.md) |
 | Optimistic UI Rollback | [read in full](Companion/Memory/Current/033-optimistic-ui-rollback.md) |
-| Gmail Label System; user-label rules in the providers (`userLabel(named:connected:)`, `userLabelCatalog` nil not `[]`, `storedUserLabelIds`, `emailProviderType`, #500) | [read in full](Companion/Memory/Current/034-gmail-label-system.md) |
+| Gmail Label System; user-label rules in the providers (`userLabel(named:connected:)`, `userLabelCatalog` nil not `[]`, `storedUserLabelIds`, `emailProviderType`, #500); Trash/Spam exclusive membership (TRASH or SPAM = no other folder, #1066) | [read in full](Companion/Memory/Current/034-gmail-label-system.md) |
 | SwiftUI Observable Array Mutation Safety | [read in full](Companion/Memory/Current/035-swiftui-observable-array-mutation-safety.md) |
 | SwiftUI Layout Gotchas | [read in full](Companion/Memory/Current/036-swiftui-layout-gotchas.md) |
 | HTML Email Render Pipeline (AutoSizingHTMLView) — MUST stay idempotent (ADR-IOS-039) | [read in full](Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md) |
