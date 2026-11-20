@@ -369,7 +369,12 @@ struct FastSyncHeldWorkTests {
                         #expect(during.waitingForWiFi, "the cycle's catch-up runs: the caption stays")
 
                         await free()
-                        #expect(await sleeps.waitFor(count: 1), "the worker's cycle never ended")
+                        // The cycle ends at the worker's wait (walk unfinished) or at
+                        // its exit (walk done, the cycle did no work).
+                        #expect(await Self.pollUntil {
+                            let exited = await engine.headerBackfillTasks[account.id] == nil
+                            return !sleeps.recorded.isEmpty || exited
+                        }, "the worker's cycle never ended")
                         let after = await Self.decide([account], engine: engine)
                         #expect(!after.holdAwake, "the cycle ended: the lock stays released")
                         #expect(after.waitingForWiFi, "the cycle ended: the caption stays")
