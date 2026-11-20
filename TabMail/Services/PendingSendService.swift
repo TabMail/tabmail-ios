@@ -217,6 +217,16 @@ final class PendingSendService {
         undoOwners[outboxId]
     }
 
+    #if DEBUG
+    /// Test-only: end every send's Undo owner and cancel its expiry, so no owner outlives the
+    /// test that made it. Does NOT touch the toast (`dismiss()`).
+    func resetUndoOwnersForTesting() {
+        ownerExpiry.values.forEach { $0.cancel() }
+        ownerExpiry.removeAll()
+        undoOwners.removeAll()
+    }
+    #endif
+
     /// The toast RootView shows: the current send, only when its Undo belongs to the toast.
     var visibleToast: Pending? {
         guard let current, undoOwners[current.id] == .toast else { return nil }

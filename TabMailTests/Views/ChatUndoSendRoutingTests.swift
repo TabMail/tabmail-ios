@@ -25,6 +25,12 @@ import UIKit
 struct ChatUndoSendRoutingTests {
     nonisolated private static let account = "acc-undo-routing"
 
+    /// Every test starts with no Undo owner left by another (the suite's shared teardown point:
+    /// Swift Testing makes a new suite value per test), so test order does not matter.
+    init() {
+        PendingSendService.shared.resetUndoOwnersForTesting()
+    }
+
     // MARK: - 1. The real Send
 
     private struct Fixture {
@@ -107,6 +113,7 @@ struct ChatUndoSendRoutingTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }

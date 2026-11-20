@@ -26,6 +26,12 @@ import UIKit
 struct ChatUndoSendTests {
     nonisolated private static let account = "acc-undo-bubble"
 
+    /// Every test starts with no Undo owner left by another (the suite's shared teardown point:
+    /// Swift Testing makes a new suite value per test), so test order does not matter.
+    init() {
+        PendingSendService.shared.resetUndoOwnersForTesting()
+    }
+
     private static func reply(
         status: OutboxStatus = .queued, sentAt: Date? = nil, holdUntil: Date?,
         draftId: String? = "d", id: String = "o"
@@ -216,6 +222,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             while service.reopenSnapshot != nil { service.finishReopen() }
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
@@ -277,6 +284,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -326,6 +334,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
         let fixture = try await Self.makeFixture(pool)
@@ -346,6 +355,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             while service.reopenSnapshot != nil { service.finishReopen() }
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -399,6 +409,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
         let fixture = try await Self.makeFixture(pool)
@@ -423,6 +434,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             while service.reopenSnapshot != nil { service.finishReopen() }
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -456,6 +468,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             while service.reopenSnapshot != nil { service.finishReopen() }
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -483,7 +496,10 @@ struct ChatUndoSendTests {
     @Test("A bubble-owned send stops counting as sending once its window and acknowledgement end")
     func bubbleOwnerExpires() async throws {
         let service = PendingSendService.shared
-        defer { service.dismiss() }
+        defer {
+            service.dismiss()
+            service.resetUndoOwnersForTesting()
+        }
         service.dismiss()
         #expect(!service.isSending, "control: nothing is sending")
         let id = "o-expiry-\(UUID().uuidString)"
@@ -506,6 +522,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
         service.dismiss()
@@ -528,6 +545,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             while service.reopenSnapshot != nil { service.finishReopen() }
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -556,6 +574,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -610,6 +629,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             while service.reopenSnapshot != nil { service.finishReopen() }
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -721,7 +741,10 @@ struct ChatUndoSendTests {
     private func deliveryBody() async throws {
         #expect(UIAccessibility.isReduceMotionEnabled, "control: Reduce Motion is on")
         let service = PendingSendService.shared
-        defer { service.dismiss() }
+        defer {
+            service.dismiss()
+            service.resetUndoOwnersForTesting()
+        }
         // Undo ends 1.5 s from now.
         let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + 1.5)
         func reply(_ id: String, _ status: OutboxStatus, sentAt: Date? = nil) -> ChatUnsentReply {
@@ -844,6 +867,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -904,7 +928,64 @@ struct ChatUndoSendTests {
                     NavigationStack { ChatThreadView(messageId: messageId) }
                 }
                 .modifier(UndoReopenPresenter())
+                // RootView's own "Couldn't undo" host for a send.
+                .background(UndoFailureAlertHost(source: .send))
         }
+    }
+
+    @Test("A refused Undo inside a sheet keeps the send, closes the sheet, and shows the Couldn't undo notice at the top level")
+    func refusedUndoInsideASheetShowsTheNotice() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the bubble in the sheet")
+        try await HostedAccessibility.withAutomation { @MainActor in try await refusedInSheetBody() }
+    }
+
+    private func refusedInSheetBody() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismissUndoFailure()
+            service.dismiss()
+            service.resetUndoOwnersForTesting()
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        service.dismiss()
+        service.dismissUndoFailure()
+        saved.setChatView(on: true)
+        let fixture = try await Self.makeFixture(pool)
+        let reply = try await Self.queueReply(fixture, draftId: "draft-refused-sheet")
+        let hold = Date().addingTimeInterval(3600)
+        try await Self.setHold(pool, reply.id, hold)
+        service.present(outboxId: reply.id, draftId: "draft-refused-sheet", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        window.rootViewController = UIHostingController(rootView: ChatInSheetHost(messageId: fixture.parent.id))
+        window.makeKeyAndVisible()
+        defer {
+            window.rootViewController?.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func hasUndo() -> Bool { HostedAccessibility.identifiers(in: window).contains(ChatUndoSendStatus.undoId) }
+        func notice() -> UIAlertController? { window.rootViewController?.presentedViewController as? UIAlertController }
+
+        try await Self.waitFor { hasUndo() }
+        #expect(service.openChatModals == 1, "control: the chat is inside the open sheet")
+        let refuser = UndoProviderIdentitySafetyTests.OutboxDeleteCommitRefuser()
+        pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+        #expect(HostedAccessibility.activate(ChatUndoSendStatus.undoId, in: window), "the bubble's Undo, inside the sheet")
+        pool.remove(transactionObserver: refuser)
+        #expect(refuser.refusals.withLock { $0 } == 1, "control: the cancellation commit was refused")
+        #expect(try await pool.read { try OutboxMessage.fetchOne($0, key: reply.id) } != nil, "the send stays durable")
+
+        try await Self.waitFor { notice() != nil }
+        #expect(service.openChatModals == 0, "the sheet closed after the refusal")
+        #expect(notice()?.title == "Couldn't undo", "RootView shows the notice at the top level")
+        #expect(service.reopenQueue.isEmpty, "control: nothing reopens")
     }
 
     @Test("Undo from a chat inside a sheet closes the sheet and opens the email's compose at the top level, and a later reopen still opens")
@@ -919,6 +1000,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
+            service.resetUndoOwnersForTesting()
             while service.reopenSnapshot != nil { service.finishReopen() }
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
