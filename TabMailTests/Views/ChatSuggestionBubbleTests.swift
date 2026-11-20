@@ -163,6 +163,8 @@ struct ChatSuggestionBubbleTests {
 
     @Test("A tap on the AI Suggestion opens the compose card with it written out, and sends nothing")
     func tapOpensTheComposeCard() async throws {
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
+        defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
         try await withChat { chat in
             let ghost = try #require(Self.ghost(in: chat.view))
             #expect(chat.controller.presentedViewController == nil, "control: nothing open yet")
@@ -194,6 +196,8 @@ struct ChatSuggestionBubbleTests {
 
     @Test("A saved reply draft stays as it is: the ghost's card shows the suggestion, and the draft keeps its words")
     func savedDraftStaysInDrafts() async throws {
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
+        defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
         try await withChat { chat in
             let now = Date().timeIntervalSince1970
             let key = Draft.draftKey(replyTo: "\(chat.email.accountId):\(chat.email.stableId)", isForward: false, newId: nil)
