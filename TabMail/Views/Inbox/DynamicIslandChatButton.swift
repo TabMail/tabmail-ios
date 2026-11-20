@@ -1618,6 +1618,50 @@ struct DynamicIslandChat: View {
                 (draftSuggestion?.textMessage, draftSuggestion?.changeCommand))
     }
 
+    /// The history turn an accepted compose edit records: the request and the draft it edited
+    /// (`editBase`), with the suggestion's text version and change command when that draft was the
+    /// suggestion, so a resend or rewind puts the whole value back. Internal for testability.
+    nonisolated static func editTurn(
+        instruction: String, subject: String, body: String,
+        atRequest: (textMessage: String?, changeCommand: String?), assistantResponse: String
+    ) -> InlineEditTurn {
+        InlineEditTurn(
+            userRequest: instruction,
+            bodyAtRequest: body,
+            subjectAtRequest: subject,
+            assistantResponse: assistantResponse,
+            textMessageAtRequest: atRequest.textMessage,
+            changeCommandAtRequest: atRequest.changeCommand
+        )
+    }
+
+    /// Resend: the last turn is restored and leaves the history. Internal for testability.
+    nonisolated static func resendAnchor(_ history: [InlineEditTurn]) -> (anchor: InlineEditTurn?, history: [InlineEditTurn]) {
+        guard let last = history.last else { return (nil, history) }
+        return (last, Array(history.dropLast()))
+    }
+
+    /// Rewind to the user message after `userMessagesBefore` user messages: the turn at that index
+    /// (the draft as it was when that request was made) is restored, and it and every later turn
+    /// leave the history. Internal for testability.
+    nonisolated static func rewindAnchor(
+        _ history: [InlineEditTurn], userMessagesBefore: Int
+    ) -> (anchor: InlineEditTurn?, history: [InlineEditTurn]) {
+        let cutoff = min(userMessagesBefore, history.count)
+        guard cutoff < history.count else { return (nil, history) }
+        return (history[cutoff], Array(history.prefix(cutoff)))
+    }
+
+    /// Puts a resend's or rewind's turn's draft back, awaited, through the card's draft update.
+    /// Recipients are not tracked in editHistory: nil keeps the current values. Internal for testability.
+    static func restoreDraft(
+        _ anchor: InlineEditTurn,
+        through apply: (String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?, String?, String?) async -> Void
+    ) async {
+        await apply(anchor.subjectAtRequest, anchor.bodyAtRequest, nil, nil, nil,
+                    anchor.textMessageAtRequest, anchor.changeCommandAtRequest)
+    }
+
     private func sendComposeEdit(_ instruction: String, agentAdmissionAcquired: Bool = false, from anchor: InlineEditTurn? = nil) {
         guard composeMutationAllowed else {
             if agentAdmissionAcquired { composeAgentSendFence?.finishAgent() }
@@ -1724,10 +1768,8 @@ struct DynamicIslandChat: View {
             defer { composeAgentSendFence?.finishAgent() }
             // A resend or rewind first puts its turn's draft back, awaited under this request's
             // admission, so this request's result lands over the restored draft, never before it.
-            if let anchor {
-                // Recipients are not tracked in editHistory — pass nil to keep current values.
-                await onDraftUpdate?(anchor.subjectAtRequest, anchor.bodyAtRequest, nil, nil, nil,
-                                     anchor.textMessageAtRequest, anchor.changeCommandAtRequest)
+            if let anchor, let onDraftUpdate {
+                await Self.restoreDraft(anchor, through: onDraftUpdate)
             }
             _ = await userTurnPersistence.value
             do {
@@ -1772,14 +1814,9 @@ struct DynamicIslandChat: View {
                 }
 
                 // Record in edit history for continuous editing (with draft state)
-                editHistory.append(InlineEditTurn(
-                    userRequest: instruction,
-                    bodyAtRequest: currentBody,
-                    subjectAtRequest: currentSubject,
-                    assistantResponse: result.raw,
-                    textMessageAtRequest: atRequest.textMessage,
-                    changeCommandAtRequest: atRequest.changeCommand
-                ))
+                editHistory.append(Self.editTurn(
+                    instruction: instruction, subject: currentSubject, body: currentBody,
+                    atRequest: atRequest, assistantResponse: result.raw))
 
                 // Persist assistant turn to GRDB
                 let assistantTurn = ChatTurn(
@@ -2844,8 +2881,9 @@ struct DynamicIslandChat: View {
     private func resendLastUserComposeEdit(text: String, afterIndex index: Int) {
         guard acquireComposeEditAdmission() else { return }
         trimForResendLast(atIndex: index)
-        let anchor = editHistory.last
-        if anchor != nil { editHistory.removeLast() }
+        let replay = Self.resendAnchor(editHistory)
+        let anchor = replay.anchor
+        editHistory = replay.history
         // The request restores the anchor's draft first (`sendComposeEdit(from:)`).
         sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)
     }
@@ -2857,9 +2895,9 @@ struct DynamicIslandChat: View {
         guard acquireComposeEditAdmission() else { return }
         let userMessagesBefore = trimForRewind(atIndex: index)
         // Snapshot on the earliest popped editHistory entry is the pre-edit draft for that turn.
-        let editCutoff = min(userMessagesBefore, editHistory.count)
-        let anchor = editCutoff < editHistory.count ? editHistory[editCutoff] : nil
-        if anchor != nil { editHistory = Array(editHistory.prefix(editCutoff)) }
+        let replay = Self.rewindAnchor(editHistory, userMessagesBefore: userMessagesBefore)
+        let anchor = replay.anchor
+        editHistory = replay.history
         // The request restores the anchor's draft first (`sendComposeEdit(from:)`).
         sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)
     }

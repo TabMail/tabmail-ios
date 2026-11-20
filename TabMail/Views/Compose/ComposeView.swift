@@ -2367,14 +2367,11 @@ struct ComposeView: View {
         // subject stays in this card and its draft. Compose has no source message, and forward
         // would write to the email being forwarded.
         let previous = shownSuggestion
-        let edited = newBody.map { ReplyResult(body: $0, textMessage: textMessage, changeCommand: changeCommand) }
-        let stored: (ReplyResult, MessageHeader)? = {
-            guard let edited, let reply = Self.suggestionEditTarget(
-                showingSuggestion: showingSuggestion, isForward: isForward, replyTo: replyTo,
-                recipients: recipients.pendingCommitted, subject: newSubject ?? subject,
-                accountId: selectedAccount?.id, accounts: navigationStore.accounts) else { return nil }
-            return (edited, reply)
-        }()
+        let edit = Self.suggestionEdit(
+            body: newBody, textMessage: textMessage, changeCommand: changeCommand,
+            showingSuggestion: showingSuggestion, isForward: isForward, replyTo: replyTo,
+            recipients: recipients.pendingCommitted, subject: newSubject ?? subject,
+            accountId: selectedAccount?.id, accounts: navigationStore.accounts)
         if let s = newSubject {
             BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating subject to '\(s.prefix(40))'")
             subject = s
@@ -2382,13 +2379,13 @@ struct ComposeView: View {
         if let b = newBody {
             if showingSuggestion {
                 BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating suggestion (len=\(b.count))")
-                shownSuggestion = edited
+                shownSuggestion = edit.edited
             } else {
                 BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating body (len=\(b.count))")
                 messageBody = b
             }
         }
-        if let (value, reply) = stored {
+        if let value = edit.edited, let reply = edit.target {
             await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: dbPool)
         }
         if DebugModeManager.isLoggingEnabled() {
@@ -2399,6 +2396,29 @@ struct ComposeView: View {
             isApplyingEdit = false
         }
         BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: done, isApplyingEdit=false")
+    }
+
+    /// What a card's inline edit makes of its result: the edited suggestion, whole (body, text
+    /// message and change command, as the edit returned them), and the email whose stored AI
+    /// Suggestion it replaces (`suggestionEditTarget`), nil when the edit stays in the card.
+    /// `applyInlineEdit` shows `edited` and stores it over the suggestion shown before; internal
+    /// for testability.
+    struct SuggestionEdit {
+        let edited: ReplyResult?
+        let target: MessageHeader?
+    }
+
+    static func suggestionEdit(
+        body newBody: String?, textMessage: String?, changeCommand: String?,
+        showingSuggestion: Bool, isForward: Bool, replyTo: MessageHeader?,
+        recipients: ComposeDraftGuards.Recipients, subject: String, accountId: String?, accounts: [Account]
+    ) -> SuggestionEdit {
+        let edited = newBody.map { ReplyResult(body: $0, textMessage: textMessage, changeCommand: changeCommand) }
+        guard edited != nil else { return SuggestionEdit(edited: nil, target: nil) }
+        let target = suggestionEditTarget(
+            showingSuggestion: showingSuggestion, isForward: isForward, replyTo: replyTo,
+            recipients: recipients, subject: subject, accountId: accountId, accounts: accounts)
+        return SuggestionEdit(edited: edited, target: target)
     }
 
     /// The suggestion a caller hands the card, as the card shows it and later compares its edit

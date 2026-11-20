@@ -467,10 +467,10 @@ struct ComposeSuggestionPersistTests {
         // holds the compose fence admission until it ends: the restore lands before the result.
         let rest = source[send.upperBound...]
         let task = try #require(rest.range(of: "activeChatTask = Task {\n            defer { composeAgentSendFence?.finishAgent() }"))
-        let restore = try #require(rest.range(of: "if let anchor {\n"))
+        let restore = try #require(rest.range(of: "if let anchor, let onDraftUpdate {\n"))
         let result = try #require(rest.range(of: "await onDraftUpdate?(result.subject, result.body,"))
         #expect(task.lowerBound < restore.lowerBound && restore.lowerBound < result.lowerBound)
-        #expect(rest[restore.upperBound...].prefix(400).contains("await onDraftUpdate?(anchor.subjectAtRequest, anchor.bodyAtRequest,"))
+        #expect(rest[restore.upperBound...].prefix(400).contains("await Self.restoreDraft(anchor, through: onDraftUpdate)"))
     }
 
     /// The choice itself, without the view: a restored turn wins over the card's draft, which a
@@ -769,8 +769,8 @@ struct ComposeSuggestionPersistTests {
     @Test("An inline edit of the visible reply suggestion is saved, awaited, with the message compose opened for")
     func inlineEditReachesTheWriterWithTheOpenedMessage() throws {
         let source = try composeSource()
-        let edit = try functionBody("private func applyInlineEdit(", before: "static func suggestionEditTarget(", in: source)
-        let gate = try #require(edit.range(of: "guard let edited, let reply = Self.suggestionEditTarget("))
+        let edit = try functionBody("private func applyInlineEdit(", before: "struct SuggestionEdit {", in: source)
+        let gate = try #require(edit.range(of: "let edit = Self.suggestionEdit("))
         let save = try #require(edit.range(of: "await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: dbPool)"))
         let fade = try #require(edit.range(of: "withAnimation(.easeOut(duration: 0.4)) {"))
         #expect(gate.lowerBound < save.lowerBound && save.lowerBound < fade.lowerBound)
@@ -786,9 +786,9 @@ struct ComposeSuggestionPersistTests {
     @Test("A card's edit decides with the card's own From, recipients after the edit and subject; its disappearance closes its Recompute")
     func cardEditUsesTheCardsOwnInputs() throws {
         let source = try composeSource()
-        let edit = try functionBody("private func applyInlineEdit(", before: "static func suggestionEditTarget(", in: source)
+        let edit = try functionBody("private func applyInlineEdit(", before: "struct SuggestionEdit {", in: source)
         let deltas = try #require(edit.range(of: "setRecipients(recipients.applying(to: toDelta, cc: ccDelta, bcc: bccDelta))"))
-        let gate = try #require(edit.range(of: "guard let edited, let reply = Self.suggestionEditTarget("))
+        let gate = try #require(edit.range(of: "let edit = Self.suggestionEdit("))
         #expect(deltas.lowerBound < gate.lowerBound, "the decision reads the recipients after this edit's deltas")
         let call = String(edit[gate.lowerBound...].prefix(400))
         #expect(call.contains("recipients: recipients.pendingCommitted"), "the card's recipients: \(call)")

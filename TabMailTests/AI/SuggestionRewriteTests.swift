@@ -802,6 +802,180 @@ struct SuggestionRewriteRouteTests {
         _ = try await task.value
     }
 
+    /// The on-device AI cache's copy of `header`'s suggestion: the row's columns cleared, then
+    /// restored from the cache.
+    func cachedSuggestion(_ db: DatabaseQueue, _ header: MessageHeader) async throws -> ReplyResult? {
+        var cleared = header
+        cleared.cachedReply = nil
+        cleared.replyTextMessage = nil
+        cleared.replyChangeCommand = nil
+        let base = cleared
+        return try await db.write { db in
+            var fresh = base
+            try MessageAICache.restoreIfCached(into: &fresh, accountId: base.accountId, folderPath: base.folderPath, db: db)
+            return fresh
+        }.suggestion
+    }
+
+    /// THE SYSTEM PROPERTY: an accepted card edit of the shown suggestion becomes the AI Suggestion
+    /// WHOLE (body, text message and change command as the edit returned them), in the header and
+    /// the cache, and the chat's ghost and its "e.g." line show it. Through the card's own
+    /// transition (`ComposeView.suggestionEdit`, what `applyInlineEdit` builds and stores), twice:
+    /// the second edit compares against the first, so the card's shown value must advance.
+    @Test("A card's edits become the whole AI Suggestion in header and cache, and the ghost shows each")
+    func cardEditStoresTheWholeEditedValue() async throws {
+        let fixture = try await fixture()
+        let header = fixture.header
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: header, accounts: [])
+        let edits = [
+            (body: Self.editedBody, text: Self.editedText, command: Self.editedCommand),
+            (body: "Dear Sam,\n\nI will attend and bring the slides.\n\nAlex",
+             text: "I will bring the slides.", command: "offer to present"),
+        ]
+        var shown: ReplyResult? = Self.shownReply
+        for (index, step) in edits.enumerated() {
+            let edit = ComposeView.suggestionEdit(
+                body: step.body, textMessage: step.text, changeCommand: step.command,
+                showingSuggestion: true, isForward: false, replyTo: header,
+                recipients: envelope.recipients, subject: envelope.subject, accountId: nil, accounts: [])
+            let expected = ReplyResult(body: step.body, textMessage: step.text, changeCommand: step.command)
+            #expect(edit.edited == expected, "edit \(index): the card shows the whole edited value")
+            let value = try #require(edit.edited)
+            let target = try #require(edit.target, "control: the suggestion's own card targets its email")
+            let outcome = await ComposeView.writeCachedReplyToDB(value, replacing: shown, replyTo: target, db: fixture.db)
+            #expect(outcome == .written, "edit \(index): stored over the value the card showed")
+            shown = edit.edited
+
+            let row = try await row(fixture.db, header.id)
+            #expect(row.suggestion == expected, "edit \(index): the header holds the whole edit")
+            #expect(try await cachedSuggestion(fixture.db, header) == expected, "edit \(index): the cache holds the whole edit")
+            let ghost = ChatReplyField.shown(newest: row, usersTurn: false, onlyTo: nil)
+            #expect(ghost == expected, "edit \(index): the ghost shows the edit")
+            #expect(ChatReplyField.example(shown: ghost, configured: nil) == step.command,
+                    "edit \(index): the example is the edit's change command")
+        }
+    }
+
+    /// The card's draft as `applyInlineEdit` keeps it: the shown suggestion, replaced by each
+    /// update through the card's own transition and stored over the value shown before.
+    @MainActor
+    final class CardDraft {
+        var shown: ReplyResult?
+        var subject: String
+        var applied: [ReplyResult] = []
+        let header: MessageHeader
+        let envelope: ChatReplyCompose
+        let db: DatabaseQueue
+        init(shown: ReplyResult?, header: MessageHeader, db: DatabaseQueue) {
+            self.shown = shown
+            self.header = header
+            self.db = db
+            envelope = ChatReplyCompose.suggestionEnvelope(for: header, accounts: [])
+            subject = envelope.subject
+        }
+        func apply(_ newSubject: String?, _ body: String?, _ to: RecipientDelta?, _ cc: RecipientDelta?,
+                   _ bcc: RecipientDelta?, _ text: String?, _ command: String?) async {
+            let previous = shown
+            let edit = ComposeView.suggestionEdit(
+                body: body, textMessage: text, changeCommand: command,
+                showingSuggestion: true, isForward: false, replyTo: header,
+                recipients: envelope.recipients.applying(to: to, cc: cc, bcc: bcc), subject: newSubject ?? subject,
+                accountId: nil, accounts: [])
+            if let newSubject { subject = newSubject }
+            shown = edit.edited
+            if let value = edit.edited {
+                applied.append(value)
+                if let target = edit.target {
+                    await ComposeView.writeCachedReplyToDB(value, replacing: previous, replyTo: target, db: db)
+                }
+            }
+        }
+    }
+
+    /// One accepted compose edit as `sendComposeEdit` runs it: the draft it edits (`editBase`),
+    /// the result applied through the card's update, then the turn it records (`editTurn`).
+    @MainActor
+    func acceptedEdit(_ request: String, result: InlineEditResult, anchor: InlineEditTurn? = nil,
+                      card: CardDraft) async -> InlineEditTurn {
+        let base = DynamicIslandChat.editBase(anchor: anchor, draftSubject: card.subject,
+                                              draftBody: card.shown?.body, draftSuggestion: card.shown)
+        await card.apply(result.subject, result.body, result.toDelta, result.ccDelta, result.bccDelta,
+                         result.textMessage, result.changeCommand)
+        return DynamicIslandChat.editTurn(instruction: request, subject: base.subject, body: base.body,
+                                          atRequest: base.atRequest, assistantResponse: result.raw)
+    }
+
+    nonisolated static func result(body: String, text: String, command: String) -> InlineEditResult {
+        AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            response: "Done.", subject: "Re: Offsite", body: body, textMessage: text, changeCommand: command))!
+    }
+
+    /// Which history replay puts an earlier draft back.
+    enum Replay: String, CaseIterable, Sendable { case resend, rewind }
+
+    /// THE SYSTEM PROPERTY: a resend or rewind puts back the WHOLE suggestion its turn edited (body,
+    /// text message and change command) in the header and the cache, before its own result lands;
+    /// the result then replaces it whole. Starts from real accepted edits, whose recorded turns
+    /// carry the suggestion's text and command (`editTurn`, what `sendComposeEdit` appends).
+    @MainActor
+    @Test("A resend or rewind restores the edited turn's whole suggestion before its held result lands",
+          arguments: Replay.allCases)
+    func replayRestoresTheWholeSuggestion(_ replay: Replay) async throws {
+        let fixture = try await fixture()
+        let header = fixture.header
+        let original = ReplyResult(body: Self.shown, textMessage: Self.shownText, changeCommand: "decline politely")
+        try await fixture.db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET replyChangeCommand = ? WHERE id = ?",
+                           arguments: [original.changeCommand, header.id])
+        }
+        let card = CardDraft(shown: original, header: header, db: fixture.db)
+        let first = Self.result(body: Self.editedBody, text: Self.editedText, command: Self.editedCommand)
+        let second = Self.result(body: "Dear Sam,\n\nI will attend.\n\nAlex", text: "I will attend.", command: "ask about parking")
+        var history = [await acceptedEdit("more formal", result: first, card: card)]
+        history.append(await acceptedEdit("shorter", result: second, card: card))
+        let firstValue = ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand)
+
+        // The recorded turns carry the whole suggestion each request edited.
+        guard history.count == 2 else { return }
+        #expect(history[0].bodyAtRequest == original.body)
+        #expect(history[0].textMessageAtRequest == original.textMessage)
+        #expect(history[0].changeCommandAtRequest == original.changeCommand)
+        #expect(history[1].bodyAtRequest == firstValue.body)
+        #expect(history[1].textMessageAtRequest == firstValue.textMessage)
+        #expect(history[1].changeCommandAtRequest == firstValue.changeCommand)
+
+        let picked = replay == .resend
+            ? DynamicIslandChat.resendAnchor(history)
+            : DynamicIslandChat.rewindAnchor(history, userMessagesBefore: 0)
+        let anchor = try #require(picked.anchor)
+        let restored = replay == .resend ? firstValue : original
+        #expect(picked.history.count == (replay == .resend ? 1 : 0), "the restored turn and later ones leave the history")
+
+        // The replay's result is held until the restore has been checked.
+        let replayed = Self.result(body: "Dear Sam,\n\nYes, I will attend.\n\nAlex", text: "Yes, I will attend.", command: "suggest a date")
+        let (release, held) = AsyncStream<Void>.makeStream()
+        let request = Task { @MainActor in
+            await DynamicIslandChat.restoreDraft(anchor, through: card.apply)
+            for await _ in release { break }
+            return await acceptedEdit("again", result: replayed, anchor: anchor, card: card)
+        }
+        let deadline = Date().addingTimeInterval(2)
+        while card.shown != restored, Date() < deadline { await Task.yield() }
+        #expect(card.shown == restored, "the card shows the restored suggestion whole")
+        #expect(try await row(fixture.db, header.id).suggestion == restored, "the header holds the restored value whole")
+        #expect(try await cachedSuggestion(fixture.db, header) == restored, "the cache holds the restored value whole")
+
+        held.yield()
+        held.finish()
+        let turn = await request.value
+        let finalValue = ReplyResult(body: replayed.body ?? "", textMessage: replayed.textMessage, changeCommand: replayed.changeCommand)
+        #expect(try await row(fixture.db, header.id).suggestion == finalValue, "the result replaces the restored value")
+        #expect(try await cachedSuggestion(fixture.db, header) == finalValue)
+        #expect(turn.textMessageAtRequest == restored.textMessage && turn.changeCommandAtRequest == restored.changeCommand,
+                "the replayed request edited the restored suggestion")
+        #expect(Array(card.applied.suffix(2)) == [restored, finalValue], "the restore lands before the result")
+    }
+
     /// A card whose recipient field holds an entry that is not an address (rejected) is not the
     /// suggestion's envelope: its edit stays in the card.
     @Test("A card holding a rejected recipient entry keeps its edit; the same card without it is the suggestion's")
@@ -924,6 +1098,46 @@ struct SuggestionSinglePathFenceTests {
         #expect(census.outside == ["TabMail/Planted.swift:1", "TabMail/Planted.swift:2"])
         #expect(census.unscheduled == ["TabMail/Planted.swift:3", "TabMail/Planted.swift:4"])
         #expect(census.sql.contains("TabMail/Planted.swift:5"), "the scheduling line names the column and passes")
+    }
+
+    /// The one file allowed to REPLACE a stored suggestion (a non-nil expected value): the central
+    /// writer `AccountManager.storeSuggestion`, which writes the header and the cache together.
+    static let replacer = "TabMail/Services/Account/AccountManagerAI.swift"
+
+    /// `replaceSuggestion(with:ifStill:)` calls whose expected value is not `nil`, by `path:offset`.
+    /// A call may span lines, so the whole file is matched; a signature mention in a comment
+    /// (`replaceSuggestion(with:ifStill:)`, no space after `with:`) is not a call.
+    static func replacements(_ files: [(path: String, text: String)]) throws -> [String] {
+        let regex = try NSRegularExpression(pattern: #"\.replaceSuggestion\(with:\s[\s\S]*?ifStill:\s*([A-Za-z_][\w.]*)"#)
+        return files.flatMap { file -> [String] in
+            let range = NSRange(file.text.startIndex..., in: file.text)
+            return regex.matches(in: file.text, range: range).compactMap { match in
+                guard let token = Range(match.range(at: 1), in: file.text).map({ String(file.text[$0]) }),
+                      token != "nil" else { return nil }
+                return "\(file.path):\(match.range.location)"
+            }
+        }
+    }
+
+    @Test("Only the central writer replaces a stored suggestion; every other caller only fills an empty one")
+    func onlyTheCentralWriterReplaces() throws {
+        let files = try Self.sources()
+        let found = try Self.replacements(files)
+        #expect(found.contains { Self.file(of: $0) == Self.replacer }, "control: the central writer replaces")
+        let elsewhere = found.filter { Self.file(of: $0) != Self.replacer }
+        #expect(elsewhere.isEmpty, "a suggestion replaced outside AccountManager.storeSuggestion: \(elsewhere)")
+    }
+
+    @Test("Control: the replacement census flags a planted multi-line replacement and passes a fill")
+    func replacementCensusFlagsPlantedForms() throws {
+        let planted = [
+            "_ = header.replaceSuggestion(with: ReplyResult(body: \"x\", textMessage: nil), ifStill: nil)",
+            "guard header.replaceSuggestion(with: ReplyResult(",
+            "    body: \"y\", textMessage: nil),",
+            "    ifStill: header.suggestion) else { return }",
+        ].joined(separator: "\n")
+        let found = try Self.replacements([("TabMail/Planted.swift", planted)])
+        #expect(found.count == 1, "only the replacement is flagged: \(found)")
     }
 
     @Test("One envelope builder: no Reply All re-derivation or re-sorting of a reply card")

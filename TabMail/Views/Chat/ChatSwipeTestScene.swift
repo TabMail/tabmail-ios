@@ -184,12 +184,12 @@ struct ChatSwipeTestScene: View {
     /// a late row height.
     private static func writeSuggestion() async {
         let id = headerId(count - 1)
-        _ = try? await AppDatabase.dbPool.write { db in
-            guard var header = try MessageHeader.fetchOne(db, key: id) else { return }
-            // Through the one writer, as a whole value over the one stored.
+        _ = try? await AppDatabase.dbPool.write { db -> AIWriteOutcome in
+            guard let header = try MessageHeader.fetchOne(db, key: id),
+                  let target = try AIWriteTarget.capture(message: header, db: db) else { return .dropped }
+            // Through the one central writer (header and cache together), over the value stored.
             let late = ReplyResult(body: fullReply, textMessage: lateSuggestion)
-            guard header.replaceSuggestion(with: late, ifStill: header.suggestion) else { return }
-            try header.save(db)
+            return try AccountManager.storeSuggestion(late, replacing: header.suggestion, target: target, db: db)
         }
         NSLog("[cv9diag] late suggestion written")
         NotificationCenter.default.post(name: .messageDataDidChange, object: id)
