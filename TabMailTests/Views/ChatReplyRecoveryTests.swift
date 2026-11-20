@@ -708,17 +708,16 @@ struct ChatReplyRecoveryTests {
         return ((view as? UITextView).map { [$0] } ?? []) + view.subviews.flatMap { textViews($0) }
     }
 
-    @Test("A resumed field request's answer empties the unchanged sent words, keeps words written since (even the same text), and leaves another chat's words",
-          arguments: [false, true])
-    func resumedFieldRequestCompletesTheFieldWords(retyped: Bool) async throws {
+    @Test("A resumed field request's answer empties the unchanged sent words and leaves another chat's words")
+    func resumedFieldRequestCompletesTheFieldWords() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
         let backend = Backend(failure: .connectionLost, asksForReply: false)
         try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: "resume-words-\(retyped)") { chat in
+            try await withChat(backend, tag: "resume-words") { chat in
                 let key = ChatFieldWords.key(for: chat.email)
                 let sent = "Tell them Friday works"
                 // Another chat's words, which the resumed request must not touch.
-                let other = Self.groupEmail("resume-other-\(retyped)")
+                let other = Self.groupEmail("resume-other")
                 let otherKey = ChatFieldWords.key(for: other)
                 #expect(otherKey != key, "control: two chats")
                 let otherWords = "Words on another chat"
@@ -732,39 +731,61 @@ struct ChatReplyRecoveryTests {
                 #expect(backend.bodies.count == 1, "control: the request went out once and was cut off")
                 #expect(ChatFieldWords.shared.fill(for: key).words == sent, "control: the sent words wait in the field")
                 #expect(ChatFieldWords.shared.fill(for: key).unsent == "", "control: sent words are not kept")
-                if retyped {
-                    // Cleared and written again, the same text: new words.
-                    #expect(Self.type("", in: chat.view))
-                    try await Task.sleep(for: .milliseconds(200))
-                    #expect(Self.type(sent, in: chat.view))
-                    try await Task.sleep(for: .milliseconds(300))
-                }
 
-                // The chat's "Connection lost" affordance resumes the cut-off request.
-                var resume: NSObject?
-                try await Self.waitUntil {
-                    resume = HostedAccessibility.elements(under: chat.view).first {
-                        ($0.accessibilityLabel ?? "").contains("Connection lost")
-                    }
-                    return resume != nil
-                }
-                let button = try #require(resume, "control: the chat offers the resume: \(HostedAccessibility.labels(in: chat.view).suffix(12))")
-                #expect(button.accessibilityActivate(), "control: the resume takes a tap")
+                // The field still holds the sent words, unchanged: its Retry resumes the cut-off request.
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
+                #expect(!HostedAccessibility.identifiers(in: chat.view).contains("chatSend"),
+                        "the field offers Retry, not Send: \(HostedAccessibility.identifiers(in: chat.view))")
+                #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
+                        "control: the field's Retry takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
                 #expect(backend.bodies.count == 2 && backend.bodies.last?.contains("conversation_state") == true,
-                        "control: the request was resumed from its saved state")
+                        "the request was resumed from its saved state, not sent again")
                 try await Task.sleep(for: .milliseconds(300))
 
-                let expected = retyped ? sent : ""
-                #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                #expect(ChatFieldWords.shared.fill(for: key).words == "",
                         "after the resumed answer: \(ChatFieldWords.shared.fill(for: key).words)")
                 #expect(ChatFieldWords.shared.fill(for: otherKey).words == otherWords, "another chat's words stay")
                 await ChatFieldWords.shared.written()
                 let stored = try await chat.pool.read { try ChatFieldWordsRecord.fetchAll($0) }
                 let byKey = Dictionary(uniqueKeysWithValues: stored.map { ($0.sessionId, $0.words) })
-                var want = [otherKey: otherWords]
-                if retyped { want[key] = sent }
-                #expect(byKey == want, "kept words: \(byKey)")
+                #expect(byKey == [otherKey: otherWords], "kept words: \(byKey)")
+            }
+        }
+    }
+
+    @Test("Edited words in a cut-off request's field turn Retry back into Send, which sends the new words",
+          arguments: [false, true])
+    func editedFieldWordsSendAnew(sameText: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let backend = Backend(failure: .connectionLost, asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await withChat(backend, tag: "edit-words-\(sameText)") { chat in
+                let sent = "Tell them Friday works"
+                let edited = sameText ? sent : "Tell them Monday works"
+                #expect(Self.type(sent, in: chat.view), "control: the field takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
+                #expect(HostedAccessibility.identifiers(in: chat.view).contains("chatRetry"),
+                        "control: the unchanged sent words offer Retry")
+
+                // An edit (cleared and written again, even to the same text, is new words).
+                #expect(Self.type("", in: chat.view))
+                try await Task.sleep(for: .milliseconds(200))
+                #expect(Self.type(edited, in: chat.view))
+                try await Task.sleep(for: .milliseconds(300))
+                let ids = HostedAccessibility.identifiers(in: chat.view)
+                #expect(ids.contains("chatSend") && !ids.contains("chatRetry"), "edited words offer Send: \(ids)")
+
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 2, "one new request")
+                #expect(backend.bodies.last?.contains("conversation_state") == false && backend.bodies.last?.contains(edited) == true,
+                        "Send sends the edited words as a new request, not a resume")
             }
         }
     }

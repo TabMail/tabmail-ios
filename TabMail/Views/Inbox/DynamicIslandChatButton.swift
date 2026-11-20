@@ -937,9 +937,11 @@ struct DynamicIslandChat: View {
             DictationSpinner(isRetrying: dictation.isRetrying)
                 .frame(width: 44, height: 44)
                 .accessibilityLabel("Transcribing")
-        } else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil) && isOnLiveSession && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
-            // Retry button. Reverts to the send button as soon as the user types
-            // (the `inputText.isEmpty` gate above). Routes to the right path:
+        } else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil) && isOnLiveSession
+                    && (inputText.trimmingCharacters(in: .whitespaces).isEmpty || (pendingResume != nil && fieldFill.holdsSentWords)) {
+            // Retry button. Shown on an empty field, or on a field still holding the unchanged sent
+            // words of the cut-off request (resuming it adds no user turn). Reverts to the send
+            // button as soon as the user types or edits. Routes to the right path:
             // a connection-lost RESUMES from saved state; a plain failure re-sends.
             Button {
                 if pendingResume != nil {

@@ -274,6 +274,12 @@ final class ChatFieldWords {
             return ChatFieldWords.shared.fill(for: key).words
         }
 
+        /// The words are still those of the open send, unedited (`ChatFieldFill.holdsSentWords`).
+        var holdsSentWords: Bool {
+            guard let key else { return own.wrappedValue.holdsSentWords }
+            return ChatFieldWords.shared.fill(for: key).holdsSentWords
+        }
+
         func apply(_ change: ChatFieldFill.Change) {
             guard let key else { own.wrappedValue.apply(change); return }
             ChatFieldWords.shared.apply(change, to: key)
