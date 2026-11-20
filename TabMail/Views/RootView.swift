@@ -376,8 +376,10 @@ struct RootView: View {
                 PendingSendToast(
                     pending: pending,
                     onUndo: {
-                        if let snapshot = pendingSendService.undo() {
-                            reopenSnapshot = snapshot
+                        Task {
+                            if let snapshot = await pendingSendService.undoAndReturnToDrafts() {
+                                reopenSnapshot = snapshot
+                            }
                         }
                     },
                     onDismiss: { pendingSendService.dismiss() }
@@ -448,7 +450,8 @@ struct RootView: View {
         // Undo-Send reopen: the Outbox cancellation was confirmed and the Draft
         // row remains durable. UndoReopenCompose resolves the snapshot's exact
         // owner/generation authority and binds the fresh ComposeView to that row;
-        // ADR-IOS-065 owns its retained-draft close/save semantics.
+        // `undoAndReturnToDrafts` has already saved that row to Drafts, so the
+        // compose edits an ordinary draft.
         .fullScreenCover(item: $reopenSnapshot) { snapshot in
             UndoReopenCompose(snapshot: snapshot)
         }

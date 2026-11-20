@@ -3,6 +3,17 @@
 
 **Date:** 2026-07-26. **Spec:** the close-state design.
 
+**Status:** **Superseded on v3 by saving the draft when Undo Send is confirmed (#1086).** Why: the
+email returns to Drafts at once, as most mail clients do, so no close prompt is needed. Once Undo's
+cancellation is confirmed (the Outbox row is gone), `PendingSendService.undoAndReturnToDrafts` saves
+the kept Draft row through the normal draft save (the row write at the row's own generation, then
+`AccountManager.queueDraftSave`) BEFORE the compose reopens. The Drafts entry exists and the server
+copy is queued, carrying the words that were sent, even over an older server copy. Closing without
+typing just closes; the app ending while the reopened compose is open loses nothing; editing
+afterwards is editing an ordinary draft. The save runs at the row's own epoch, so it neither rotates
+nor re-mints it (ADR-IOS-070 item 1). The close prompt and its wording are unchanged. Pinned by
+`UndoSendReturnsToDraftsTests`. The text below is the original 2026-07-26 decision, kept as written.
+
 **Context.** After Undo Send, closing compose without typing **silently discarded the user's draft**. Send initiation removes the Drafts header and admits a `.deleteDraft` for the server copy; nothing restored either. `UndoReopenCompose` passes `prefillTreatAsUnsavedChanges: true` AND `prefillDraftId`, but with the retained row present the row-load branch snapshotted the loaded content as baseline and returned before reaching the guard honouring that flag — so `hasChanges` was false and the close resolved to `.dismiss`.
 
 At `v1.6.38` this was impossible: `undo()` **deleted** the Draft row, making the reopen prefill-based with no baseline, so close prompted and the save recreated both copies. Retaining the row is a deliberate later improvement (it preserves `serverDraftId`/`rfc822`/`serverPushStatus` and survives the crash window) — but it removed that mechanism without replacing it.
