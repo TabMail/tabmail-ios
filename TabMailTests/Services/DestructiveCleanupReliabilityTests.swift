@@ -195,6 +195,7 @@ struct DestructiveCleanupReliabilityTests {
     /// refused removal keeps them (shown, stored, and new words still written); a committed one
     /// forgets them and writes none again.
     @Test("account removal keeps the chat words when refused and forgets them, never writing again, when it commits")
+    @MainActor
     func accountRemovalOwnsTheChatWords() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -214,7 +215,9 @@ struct DestructiveCleanupReliabilityTests {
         let previousNSEIMAPAccounts = nseDefaults.string(forKey: "nse.imapAccounts")
         await PushNotificationService.shared._setRemovedAccountCleanupDependenciesForTesting(
             client: nil, defaults: SendableRemovedAccountCleanupDefaults(value: defaults))
-        await MainActor.run { ChatFieldWords.shared = ChatFieldWords(database: { PrioritizedDatabase(pool: pool) }) }
+        ChatFieldWords.shared = ChatFieldWords(database: { PrioritizedDatabase(pool: pool) })
+        // The shared store is reset however the test ends, so no later test reads this one's.
+        defer { ChatFieldWords.shared = ChatFieldWords() }
         defer {
             defaults.removePersistentDomain(forName: suiteName)
             if let previousNSEAccountMap { nseDefaults.set(previousNSEAccountMap, forKey: "nse.accountMap") } else { nseDefaults.removeObject(forKey: "nse.accountMap") }
@@ -268,7 +271,6 @@ struct DestructiveCleanupReliabilityTests {
         await ChatFieldWords.shared.written()
         #expect(await MainActor.run { ChatFieldWords.shared.fill(for: after).words } == "")
         #expect(try await words().isEmpty, "nothing of the removed account is written")
-        await MainActor.run { ChatFieldWords.shared = ChatFieldWords() }
     }
 
     @Test("a stale Account value cannot resurrect runtime state after committed removal")

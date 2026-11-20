@@ -282,24 +282,37 @@ final class ChatFieldWords {
 
     // MARK: - Lifetime
 
-    /// Delete the words of every thread with no email left on the device: a row untouched for
-    /// `SyncConfig.aiCacheOrphanGraceDays` whose key names no email of its account and thread
-    /// (`ChatThreadKey.memberSQL`), or no thread at all. The rule the thread's AI results live by
-    /// (`SyncEngine.runPurgeOrphanedAICache`), run in the same pass. Returns how many went.
+    /// Delete the words of every thread with no email left on the device: a row not seen with an
+    /// email of its account and thread (`ChatThreadKey.memberSQL`) for `SyncConfig.aiCacheOrphanGraceDays`,
+    /// or with no thread at all. Every row whose thread still has an email is re-stamped to `now` in
+    /// one UPDATE, so the grace counts from the last pass that saw the thread: emails briefly gone
+    /// (an index wipe or UIDVALIDITY resync re-walking, a move between folders) never cost the words.
+    /// The rule the thread's AI results live by (`SyncEngine.runPurgeOrphanedAICache`), run in the
+    /// same pass. Returns how many went.
     @discardableResult
     nonisolated static func purgeOrphans(db: Database, now: Date) throws -> Int {
         let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheOrphanGraceDays, to: now) ?? .distantPast
-        let keys = try String.fetchAll(
-            db, sql: "SELECT sessionId FROM \(ChatFieldWordsRecord.databaseTableName) WHERE updatedAt < ?",
-            arguments: [cutoff])
+        let rows = try Row.fetchAll(db, sql: "SELECT sessionId, updatedAt FROM \(ChatFieldWordsRecord.databaseTableName)")
+        var kept: [String] = []
         var purged = 0
-        for key in keys {
+        for row in rows {
+            let key: String = row["sessionId"]
+            let updatedAt: Date = row["updatedAt"]
             if let (accountId, threadId) = ChatThreadKey.parse(key),
                try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM messageHeader WHERE \(ChatThreadKey.memberSQL))",
                                  arguments: [accountId, threadId, threadId]) == true {
+                kept.append(key)
                 continue
             }
-            purged += try ChatFieldWordsRecord.filter(key: key).deleteAll(db)
+            if updatedAt < cutoff {
+                purged += try ChatFieldWordsRecord.filter(key: key).deleteAll(db)
+            }
+        }
+        if !kept.isEmpty {
+            let marks = Array(repeating: "?", count: kept.count).joined(separator: ",")
+            try db.execute(
+                sql: "UPDATE \(ChatFieldWordsRecord.databaseTableName) SET updatedAt = ? WHERE sessionId IN (\(marks))",
+                arguments: StatementArguments([now]) + StatementArguments(kept))
         }
         return purged
     }
@@ -320,6 +333,7 @@ struct ChatFieldWordsRecord: Codable, FetchableRecord, PersistableRecord, Equata
     /// The thread's chat key (`ChatFieldWords.key(for:)`).
     var sessionId: String
     var words: String
-    /// When the words last changed.
+    /// When the words last changed, or the last maintenance pass that saw an email of the thread
+    /// (`ChatFieldWords.purgeOrphans`), whichever is later: the orphan grace counts from it.
     var updatedAt: Date
 }

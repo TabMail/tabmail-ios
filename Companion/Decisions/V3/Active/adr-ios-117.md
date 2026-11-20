@@ -41,8 +41,11 @@ chat's field, also after the app is closed.
    Within the app run the store's memory is the source the field reads; writes go behind it in order, the
    newest words of a key winning, so Back and an immediate reopen never race the disk.
 5. **Lifetime: the thread's AI data rule.** A thread's words stay while any email of that thread (its
-   account, its thread id: `ChatThreadKey.memberSQL`) is on the device. A row untouched for
-   `SyncConfig.aiCacheOrphanGraceDays` whose thread has no email left is deleted by the same maintenance
+   account, its thread id: `ChatThreadKey.memberSQL`) is on the device. A row whose thread no
+   maintenance pass has seen with an email for `SyncConfig.aiCacheOrphanGraceDays` is deleted; every pass
+   re-stamps the rows whose thread still has an email (one UPDATE, as the AI cache re-stamps its kept
+   entries), so emails briefly gone (an index wipe or UIDVALIDITY resync re-walking, a move between
+   folders) never cost the words. The purge runs in the same maintenance
    pass that purges orphaned AI results (`SyncEngine.runPurgeOrphanedChatFieldWords`, next to
    `runPurgeOrphanedAICache`). Removing an account deletes its rows in the account's row-delete transaction
    (`AccountManager.removeAccountRowsTxn`), with its AI cache. A demo's rows go with the demo's chat

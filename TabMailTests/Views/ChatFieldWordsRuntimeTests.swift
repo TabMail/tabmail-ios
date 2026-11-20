@@ -160,6 +160,9 @@ struct ChatFieldWordsRuntimeTests {
     static func withDatabase(_ body: @MainActor (DatabasePool) async throws -> Void) async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        // A chat's words are written only while its account row exists (`Storage.admits`): the
+        // account every test types in (`header`) is set up once here, as its setup does.
+        _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
         ChatPillState.shared.removeAllSessions()
         // A new app run's store: nothing in memory from an earlier test.
         ChatFieldWords.shared = ChatFieldWords()
@@ -290,7 +293,6 @@ struct ChatFieldWordsRuntimeTests {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
         try await HostedAccessibility.withAutomation {
             try await Self.withDatabase { pool in
-                _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
                 try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
                 let email = Self.header("two-1", thread: "two-thread")
                 try await pool.write { try email.insert($0) }
@@ -568,7 +570,6 @@ struct ChatFieldWordsRuntimeTests {
 
     private func completionLandsOnTheSendsChatBody(_ end: SendEnd) async throws {
         try await Self.withDatabase { pool in
-            _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
             try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
             let email = Self.header("done-\(end.rawValue)", thread: "done-thread-\(end.rawValue)")
             try await pool.write { try email.insert($0) }
@@ -645,7 +646,6 @@ struct ChatFieldWordsRuntimeTests {
 
     private func retypedSentWordsBody(_ end: RetypeEnd, _ retyped: Bool) async throws {
         try await Self.withDatabase { pool in
-            _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
             try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
             let tag = "\(end.rawValue)-\(retyped)"
             let email = Self.header("retype-\(tag)", thread: "retype-thread-\(tag)")
@@ -770,7 +770,6 @@ struct ChatFieldWordsRuntimeTests {
 
     private func composeSendThenAnswerBody(_ producer: ComposeProducer, _ origin: ComposeOrigin) async throws {
         try await Self.withDatabase { pool in
-            _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
             try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
             let tag = "\(producer.rawValue)-\(origin.rawValue)"
             let email = Self.header("compose-\(tag)", thread: "compose-thread-\(tag)")
@@ -851,7 +850,6 @@ struct ChatFieldWordsRuntimeTests {
 
     private func sameRequestFollowUpBody(_ followUp: SameRequestFollowUp, _ origin: ComposeOrigin) async throws {
         try await Self.withDatabase { pool in
-            _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
             try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
             let tag = "\(followUp.rawValue)-\(origin.rawValue)"
             let email = Self.header("follow-\(tag)", thread: "follow-thread-\(tag)")
@@ -940,7 +938,6 @@ struct ChatFieldWordsRuntimeTests {
         #expect(HostedAccessibility.isAvailable, "control: the test can drive the hosted field")
         try await HostedAccessibility.withAutomation {
             try await Self.withDatabase { pool in
-                _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
                 try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
                 let email = Self.header("closed-\(closed.rawValue)", thread: "closed-thread-\(closed.rawValue)")
                 try await pool.write { try email.insert($0) }
@@ -993,7 +990,6 @@ struct ChatFieldWordsRuntimeTests {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
         try await HostedAccessibility.withAutomation {
             try await Self.withDatabase { pool in
-                _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
                 try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
                 let email = Self.header("two-sided", thread: "two-sided-thread")
                 try await pool.write { try email.insert($0) }
@@ -1067,6 +1063,14 @@ struct ChatFieldWordsRuntimeTests {
     @Test("A demo's words stay in the demo and go with it; the real chat keeps its own")
     func demoWordsStayInTheDemo() async throws {
         try await Self.withDatabase { pool in
+            let savedAutoSync = UserDefaults.standard.object(forKey: "device_sync_auto_enabled")
+            defer {
+                if let savedAutoSync {
+                    UserDefaults.standard.set(savedAutoSync, forKey: "device_sync_auto_enabled")
+                } else {
+                    UserDefaults.standard.removeObject(forKey: "device_sync_auto_enabled")
+                }
+            }
             UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
             DeviceSyncService.shared.disconnect()
             DemoModeStore.shared._resetForTests()

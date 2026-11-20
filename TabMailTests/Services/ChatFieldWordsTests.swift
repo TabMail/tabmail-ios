@@ -751,7 +751,12 @@ struct ChatFieldWordsTests {
         try pool.write { try $0.execute(sql: "UPDATE chatFieldWords SET updatedAt = ? WHERE sessionId = ?", arguments: [old, key]) }
     }
 
-    @Test("Kept words stay while an email of the thread is on the device, and go with the thread's AI data")
+    /// `days` days after `base`.
+    private static func later(_ days: Int, from base: Date) throws -> Date {
+        try #require(Calendar.current.date(byAdding: .day, value: days, to: base))
+    }
+
+    @Test("Words past the grace survive a pass in which their thread's email is briefly gone, after a pass that saw it; words of a thread gone for the whole grace go")
     func wordsGoWithTheThreadsAIData() async throws {
         try await Self.withStore { pool, _, store in
             try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
@@ -763,17 +768,52 @@ struct ChatFieldWordsTests {
             store.apply(.put("Typed today"), to: fresh)
             await store.written()
             try Self.age(key, pool: pool)
+            let database = PrioritizedDatabase(pool: pool)
+            let seen = Date()
 
-            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: PrioritizedDatabase(pool: pool))
-            let kept = try Self.rows(pool)
-            #expect(kept.map(\.sessionId).sorted() == [fresh, key].sorted(),
+            // A pass that sees the thread's email.
+            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: seen)
+            #expect(try Self.rows(pool).map(\.sessionId).sorted() == [fresh, key].sorted(),
                     "the thread's email is here, and a fresh row waits out the grace as AI results do")
 
+            // The email is briefly gone (a resync re-walking, a move between folders): the next pass
+            // keeps the words, the grace counting from the pass that saw the thread.
             try await pool.write { _ = try MessageHeader.deleteOne($0, key: email.id) }
-            SyncEngine.runPurgeOrphanedAICache(dbPool: PrioritizedDatabase(pool: pool))
-            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: PrioritizedDatabase(pool: pool))
-            let purged = try Self.rows(pool)
-            #expect(purged.map(\.sessionId) == [fresh], "no email of the thread is left: its words went")
+            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: try Self.later(1, from: seen))
+            #expect(try Self.rows(pool).map(\.sessionId).sorted() == [fresh, key].sorted(),
+                    "words past the grace survive their thread's email being briefly gone")
+
+            // Gone for the whole grace since the last pass that saw it: the words go, and so does
+            // the fresh row no pass ever saw with an email.
+            SyncEngine.runPurgeOrphanedChatFieldWords(
+                dbPool: database, now: try Self.later(SyncConfig.aiCacheOrphanGraceDays + 1, from: seen))
+            #expect(try Self.rows(pool).isEmpty, "no email of the thread for the whole grace: its words went")
+        }
+    }
+
+    @Test("Delete All Email Index Data keeps a thread's old unsent words: after a maintenance pass and the resync, they show again")
+    func indexWipeKeepsTheWordsThroughTheResync() async throws {
+        try await Self.withStore { pool, storage, store in
+            try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
+            let email = Self.header("w-1", thread: "wiped")
+            try await pool.write { try email.insert($0) }
+            let key = ChatFieldWords.key(for: email)
+            let words = "Typed long before the wipe"
+            store.apply(.put(words), to: key)
+            await store.written()
+            try Self.age(key, pool: pool)
+            let database = PrioritizedDatabase(pool: pool)
+            let seen = Date()
+            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: seen)
+
+            try await pool.write { try SettingsView.localIndexWipeTxn($0) }
+            #expect(try await pool.read { try MessageHeader.fetchCount($0) } == 0, "control: the wipe deleted the headers")
+            // The first poll after the wipe runs maintenance before the thread is back.
+            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: try Self.later(1, from: seen))
+
+            // The resync restores the thread.
+            try await pool.write { try email.insert($0) }
+            #expect(await Self.nextRun(storage, key) == words, "the thread's unsent words show again")
         }
     }
 
@@ -842,12 +882,17 @@ struct ChatFieldWordsTests {
 
     @Test("A demo's kept words go with the demo; real ones stay")
     func demoWipeRemovesDemoWords() async throws {
+        DemoModeStore.shared._resetForTests()
+        defer { DemoModeStore.shared._resetForTests() }
         try await Self.withStore { pool, _, store in
+            // A demo runs, so the store admits its words and they reach the disk.
+            DemoModeStore.shared.isActive = true
             let real = ChatFieldWords.key(for: Self.header("d-1", thread: "real"))
             let demo = "demo:" + ChatThreadKey.key(accountId: DemoSeed.demoAccountId, threadId: "demo-thread")
             store.apply(.put("Real words"), to: real)
             store.apply(.put("Demo words"), to: demo)
             await store.written()
+            #expect(Set(try Self.rows(pool).map(\.sessionId)) == [real, demo], "control: the demo's words were stored")
             try await pool.write { try DemoSeed.wipe($0) }
             let stored = try Self.rows(pool)
             #expect(stored.map(\.sessionId) == [real])
