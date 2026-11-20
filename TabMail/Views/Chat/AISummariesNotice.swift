@@ -89,6 +89,10 @@ struct AISummariesNoticeButton: View {
     /// UIKit has put the popover in a window. SwiftUI runs the popover's `onAppear` even when UIKit
     /// refuses the presentation (something else is presented), so only this counts as shown.
     @State private var onScreen = false
+    #if DEBUG
+    /// Tells mounted buttons apart in the debug log.
+    @State private var debugTag = String(UUID().uuidString.prefix(4))
+    #endif
     @ScaledMetric(relativeTo: .footnote) private var glyphSize = ChatViewLayout.aiNoticeGlyphSize
 
     var body: some View {
@@ -116,27 +120,36 @@ struct AISummariesNoticeButton: View {
         .popover(isPresented: $showsNotice, arrowEdge: .top) {
             popover
                 .background(WindowProbe {
+                    noticeDebugLog(tag, "probe attached; auto=\(autoRequested) due=\(firstOpen.isDue(landed: true, tipsAllowed: true)) shows=\(showsNotice)")
                     onScreen = true
                     // Another chat may have shown it since this one asked: then this one closes
                     // unseen, so it opens by itself at most once across every mounted chat.
                     if autoRequested, !firstOpen.isDue(landed: true, tipsAllowed: true) {
+                        noticeDebugLog(tag, "at-most-once: already shown, closing")
                         autoRequested = false
                         showsNotice = false
                         return
                     }
                     autoRequested = false
                     firstOpen.markShown()
+                    noticeDebugLog(tag, "marked shown")
+                } onDetach: {
+                    noticeDebugLog(tag, "probe detached")
                 })
                 .onDisappear {
+                    noticeDebugLog(tag, "popover onDisappear; reportRequested=\(reportRequested)")
                     onScreen = false
                     // The sheet waits until the popover has gone: UIKit refuses a second
                     // presentation while the popover is still closing.
                     if reportRequested {
                         reportRequested = false
                         showsReport = true
+                        noticeDebugLog(tag, "sheet requested")
                     }
                 }
         }
+        .onChange(of: showsNotice) { _, shows in noticeDebugLog(tag, "showsNotice -> \(shows)") }
+        .onChange(of: showsReport) { _, shows in noticeDebugLog(tag, "showsReport -> \(shows)") }
         .reportConcernSheet(isPresented: $showsReport, contentType: .summary,
                             content: reportContent, contentNotice: AISummariesNotice.reportNotice, send: send)
         .task(id: landed) {
@@ -150,6 +163,14 @@ struct AISummariesNoticeButton: View {
                 showsNotice = false
             }
         }
+    }
+
+    private var tag: String {
+        #if DEBUG
+        debugTag
+        #else
+        ""
+        #endif
     }
 
     private var popover: some View {
@@ -175,17 +196,37 @@ struct AISummariesNoticeButton: View {
     }
 }
 
+/// Debug-only trace of the notice's presentations, with what each key window has presented.
+private func noticeDebugLog(_ tag: String, _ message: String) {
+    #if DEBUG
+    let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows)
+    let presented = windows.compactMap { window -> String? in
+        var chain: [String] = []
+        var controller = window.rootViewController?.presentedViewController
+        while let current = controller {
+            chain.append("\(type(of: current))\(current.isBeingDismissed ? "(dismissing)" : "")\(current.isBeingPresented ? "(presenting)" : "")")
+            controller = current.presentedViewController
+        }
+        return chain.isEmpty ? nil : chain.joined(separator: ">")
+    }
+    print("[AINotice \(Date().formatted(.iso8601.time(includingFractionalSeconds: true)))] \(tag) \(message) | presented: \(presented)")
+    #endif
+}
+
 /// Calls `onWindow` when UIKit puts this view in a window, which happens only for a presentation
 /// that is actually shown.
 private struct WindowProbe: UIViewRepresentable {
     let onWindow: () -> Void
+    /// Debug trace only.
+    var onDetach: () -> Void = {}
 
     final class Probe: UIView {
         var onWindow: () -> Void = {}
+        var onDetach: () -> Void = {}
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
-            if window != nil { onWindow() }
+            if window != nil { onWindow() } else { onDetach() }
         }
     }
 
@@ -193,10 +234,12 @@ private struct WindowProbe: UIViewRepresentable {
         let probe = Probe()
         probe.isUserInteractionEnabled = false
         probe.onWindow = onWindow
+        probe.onDetach = onDetach
         return probe
     }
 
     func updateUIView(_ probe: Probe, context: Context) {
         probe.onWindow = onWindow
+        probe.onDetach = onDetach
     }
 }
