@@ -3430,12 +3430,12 @@ struct GmailCatchUpTests {
                     scheduler.handleBackgroundAIProcessing(context: context) { _ in }
                     return (scheduler, context)
                 }
-                let entered = try await Self.eventually(seconds: 30, poll: .milliseconds(20)) {
+                let entered = await Self.eventually(seconds: 30, poll: .milliseconds(20)) {
                     window.entered.withLock { $0 }
                 }
                 #expect(entered, "the job never started")
                 if input.reading != nil {
-                    let known = try await Self.eventually(seconds: 30, poll: .milliseconds(20)) {
+                    let known = await Self.eventually(seconds: 30, poll: .milliseconds(20)) {
                         SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 } != nil
                     }
                     #expect(known, "the job's reading never landed")
