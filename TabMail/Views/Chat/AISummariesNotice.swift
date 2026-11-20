@@ -82,12 +82,7 @@ struct AISummariesNoticeButton: View {
     var send: ReportConcernSend = ReportConcernService.sendReport
 
     @State private var showsNotice = false
-    /// The popover was asked for by the landing, not by a tap.
-    @State private var autoRequested = false
     @State private var showsReport = false
-    /// UIKit has put the popover in a window. SwiftUI runs the popover's `onAppear` even when UIKit
-    /// refuses the presentation (something else is presented), so only this counts as shown.
-    @State private var onScreen = false
     #if DEBUG
     /// Tells mounted buttons apart in the debug log.
     @State private var debugTag = String(UUID().uuidString.prefix(4))
@@ -96,11 +91,10 @@ struct AISummariesNoticeButton: View {
 
     var body: some View {
         Button {
-            // A tap always shows it, whatever the landing asked for.
-            autoRequested = false
-            if showsNotice, !onScreen {
-                // A refused presentation left the request set with nothing on screen, and SwiftUI
-                // never retries it: clear it, then ask again on the next turn.
+            // A tap always shows it. The glyph cannot be tapped while its popover is on screen, so a
+            // request still set here is one UIKit refused (the chat landed under another screen),
+            // and SwiftUI never retries it: clear it, then ask again on the next turn.
+            if showsNotice {
                 showsNotice = false
                 Task { @MainActor in showsNotice = true }
             } else {
@@ -119,22 +113,13 @@ struct AISummariesNoticeButton: View {
         .popover(isPresented: $showsNotice, arrowEdge: .top) {
             popover
                 .background(WindowProbe {
-                    noticeDebugLog(tag, "probe attached; auto=\(autoRequested) due=\(firstOpen.isDue(landed: true, tipsAllowed: true)) shows=\(showsNotice)")
-                    onScreen = true
-                    // Another chat may have shown it since this one asked: then this one closes
-                    // unseen, so it opens by itself at most once across every mounted chat.
-                    if autoRequested, !firstOpen.isDue(landed: true, tipsAllowed: true) {
-                        noticeDebugLog(tag, "at-most-once: already shown, closing")
-                        autoRequested = false
-                        showsNotice = false
-                        return
-                    }
-                    autoRequested = false
+                    // Shown only once UIKit has put it in a window: SwiftUI runs a popover's
+                    // onAppear even when UIKit refuses the presentation.
+                    noticeDebugLog(tag, "probe attached; due=\(firstOpen.isDue(landed: true, tipsAllowed: true)) shows=\(showsNotice)")
                     firstOpen.markShown()
                     noticeDebugLog(tag, "marked shown")
                 } onDetach: {
                     noticeDebugLog(tag, "probe detached")
-                    onScreen = false
                 })
                 // The popover, which is on screen, presents the report sheet itself, so the two
                 // never compete for one presenter. When the report is done, the popover closes.
@@ -152,12 +137,7 @@ struct AISummariesNoticeButton: View {
         .task(id: landed) {
             // One decision per open, read once from the flag and the tip gate, just before asking.
             if firstOpen.isDue(landed: landed, tipsAllowed: tipsAllowed()) {
-                autoRequested = true
                 showsNotice = true
-            } else if autoRequested {
-                // A request still waiting to present is dropped once it is no longer due.
-                autoRequested = false
-                showsNotice = false
             }
         }
     }
