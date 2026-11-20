@@ -336,6 +336,37 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
+    /// The long-press report's sheet as its caller attaches it: no `onFinish`, closed by its own state.
+    private struct LongPressHost: View {
+        let send: ReportConcernSend
+        @State private var shows = true
+
+        var body: some View {
+            Color.clear.reportConcernSheet(isPresented: $shows, contentType: .suggestedReply,
+                                           content: { "pressed reply" }, send: send)
+        }
+    }
+
+    @Test("A long-press report the backend takes closes the sheet and says it was submitted")
+    func longPressSubmittedReportShowsTheAlert() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        let sent = Sent()
+        sent.accepted = true
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosting(LongPressHost(send: sent.send)) { controller in
+                try await Self.waitUntil { Self.presentedLabels(controller).contains(ReportConcernSheetText.storedForReview) }
+                let sheetView = try #require(Self.topPresented(controller)?.view)
+                let submit = try #require(Self.element("Report", in: sheetView), "\(Self.presentedLabels(controller))")
+                #expect(submit.accessibilityActivate())
+                try await Self.waitUntil { (Self.topPresented(controller) as? UIAlertController)?.title == "Report Submitted" }
+                #expect((Self.topPresented(controller) as? UIAlertController)?.title == "Report Submitted",
+                        "the sheet closed and the alert shows: \(String(describing: Self.topPresented(controller)))")
+                #expect(sent.reports.count == 1)
+                #expect(sent.reports.first?.0 == .suggestedReply)
+            }
+        }
+    }
+
     // MARK: - After a report
 
     /// Opens the popover with the glyph and presses "Report a concern"; returns once the sheet shows.
