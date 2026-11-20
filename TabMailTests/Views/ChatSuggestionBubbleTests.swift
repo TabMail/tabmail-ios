@@ -115,6 +115,16 @@ struct ChatSuggestionBubbleTests {
         }
     }
 
+    /// What the open compose card shows, read fresh from the top of the chat's presentation
+    /// chain on every call: the card's suggestion lands after it opens, so a view kept from the
+    /// first read can miss it. Never the chat behind it, whose ghost holds the same words.
+    private static func cardTexts(_ chat: Chat) -> [String] {
+        var top = chat.controller.presentedViewController
+        while let next = top?.presentedViewController { top = next }
+        guard let card = top?.view else { return [] }
+        return HostedAccessibility.labels(in: card) + fieldTexts(card)
+    }
+
     private static func ghost(in view: UIView) -> NSObject? {
         HostedAccessibility.elements(under: view).first {
             HostedAccessibility.identifier(of: $0) == ChatSuggestionBubble.bubbleId
@@ -196,10 +206,10 @@ struct ChatSuggestionBubbleTests {
                     "the ghost still reads as one element: \(String(describing: ghost.accessibilityLabel))")
             #expect(ghost.accessibilityActivate(), "the ghost takes a tap")
             try await Self.waitUntil { chat.controller.presentedViewController != nil }
-            let card = try #require(chat.controller.presentedViewController?.view, "the compose card opened")
+            #expect(chat.controller.presentedViewController?.view != nil, "the compose card opened")
             var found: [String] = []
             try await Self.waitUntil {
-                found = HostedAccessibility.labels(in: card) + Self.fieldTexts(card)
+                found = Self.cardTexts(chat)
                 return found.contains { $0.contains("Yes, Tuesday works for me.") }
             }
             #expect(found.contains { $0.contains("Yes, Tuesday works for me.") }, "the card holds the suggestion: \(found)")
