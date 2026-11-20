@@ -1320,7 +1320,7 @@ struct UndoProviderIdentitySafetyTests {
         PendingSendService.shared.present(
             outboxId: outbox.id, draftId: draft.id,
             instanceEpoch: try #require(draft.instanceEpoch),
-            toSummary: "To: recipient@example.com", holdUntil: outbox.holdUntil, showsToast: true)
+            toSummary: "To: recipient@example.com", holdUntil: outbox.holdUntil)
         let refuser = OutboxDeleteCommitRefuser()
         fixture.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
         let snapshot = PendingSendService.shared.undo()

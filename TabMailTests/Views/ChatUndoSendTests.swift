@@ -208,7 +208,7 @@ struct ChatUndoSendTests {
         let service = PendingSendService.shared
         defer {
             service.dismiss()
-            service.reopenSnapshot = nil
+            while service.reopenSnapshot != nil { service.finishReopen() }
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -221,8 +221,8 @@ struct ChatUndoSendTests {
         try await Self.setHold(pool, other.id, hold)
         // Another send's toast is up.
         service.present(outboxId: other.id, draftId: "draft-toast", instanceEpoch: "E1",
-                        toSummary: "To: someone@example.com", holdUntil: hold, showsToast: true)
-        service.reopenSnapshot = nil
+                        toSummary: "To: someone@example.com", holdUntil: hold, owner: .toast)
+        while service.reopenSnapshot != nil { service.finishReopen() }
 
         let chat = try Self.host(fixture)
         defer { chat.close() }
@@ -250,38 +250,135 @@ struct ChatUndoSendTests {
         #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: false, inReplyTo: nil))
     }
 
-    @Test("Every send has exactly one visible Undo, a reply and a new email, with the chat view on or off")
-    func exactlyOneUndoPerSend() async throws {
+    /// The presenters that offer a send's Undo right now, read as the app reads them: the toast
+    /// RootView shows (`visibleToast`), and the bubble of a chat showing the row.
+    private static func presenters(of row: OutboxMessage, chat: Set<String>, pool: DatabasePool) async throws -> Int {
+        let service = PendingSendService.shared
+        let toast = service.visibleToast?.id == row.id
+        let bubbles = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
+        let bubble = bubbles.contains {
+            $0.id == row.id && $0.bubbleUndoSecondsLeft(at: Date(), owner: service.undoOwner(for: row.id)) != nil
+        }
+        return (toast ? 1 : 0) + (bubble ? 1 : 0)
+    }
+
+    @Test("Every send has exactly one Undo presenter through its window, a reply and a new email, whatever the chat view does after Send")
+    func exactlyOnePresenterAcrossChatViewFlips() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        let fixture = try await Self.makeFixture(pool)
+        let chat: Set<String> = [EmailFilter.normalizeMessageId(try #require(fixture.parent.rfc822MessageId))]
+        var n = 0
+        for atSend in [true, false] {
+            for isReply in [true, false] {
+                n += 1
+                let row = try await Self.queueReply(fixture, draftId: "draft-flip-\(n)", newEmail: !isReply)
+                let hold = Date().addingTimeInterval(3600)
+                try await Self.setHold(pool, row.id, hold)
+                // Send as ComposeView does: the owner from the setting read at the Send tap.
+                saved.setChatView(on: atSend)
+                let owner: PendingSendService.UndoOwner = PendingSendService.sendHasBubbleUndo(
+                    chatViewActive: ChatViewConfig.isActive, inReplyTo: row.inReplyTo) ? .bubble : .toast
+                service.present(outboxId: row.id, draftId: "draft-flip-\(n)", instanceEpoch: "E1",
+                                toSummary: "To: sender@example.com", holdUntil: hold, owner: owner)
+                let what = "chat view \(atSend) at Send, \(isReply ? "reply" : "new email")"
+                #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "\(what), no flip")
+                // The chat view flips during the window, then flips back.
+                saved.setChatView(on: !atSend)
+                #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "\(what), flipped")
+                saved.setChatView(on: atSend)
+                #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "\(what), flipped back")
+                service.dismiss()
+            }
+        }
+    }
+
+    @Test("A chat reply still in its window after a relaunch (no owner known) has its Undo on the bubble only")
+    func relaunchedReplyHasBubbleOnly() async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
         let fixture = try await Self.makeFixture(pool)
-        let reply = try await Self.queueReply(fixture, draftId: "draft-one-reply")
-        let newEmail = try await Self.queueReply(fixture, draftId: "draft-one-new", newEmail: true)
-        let hold = Date().addingTimeInterval(3600)
-        try await Self.setHold(pool, reply.id, hold)
-        try await Self.setHold(pool, newEmail.id, hold)
+        let row = try await Self.queueReply(fixture, draftId: "draft-relaunch")
+        try await Self.setHold(pool, row.id, Date().addingTimeInterval(3600))
         let chat: Set<String> = [EmailFilter.normalizeMessageId(try #require(fixture.parent.rfc822MessageId))]
-        let bubbles = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
-        let now = Date()
-        for chatViewActive in [true, false] {
-            for row in [reply, newEmail] {
-                let toast = !PendingSendService.sendHasBubbleUndo(chatViewActive: chatViewActive, inReplyTo: row.inReplyTo)
-                let bubble = chatViewActive
-                    && bubbles.contains { $0.id == row.id && $0.undoSecondsLeft(at: now) != nil }
-                #expect((toast ? 1 : 0) + (bubble ? 1 : 0) == 1,
-                        "chat view \(chatViewActive), \(row.id == reply.id ? "reply" : "new email"): toast \(toast), bubble \(bubble)")
-            }
+        #expect(PendingSendService.shared.undoOwner(for: row.id) == nil, "control: this run never presented it")
+        #expect(PendingSendService.shared.visibleToast?.id != row.id, "no toast")
+        #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "the bubble is its one presenter")
+    }
+
+    @Test("A send whose Undo is on its bubble leaves another send's toast showing")
+    func bubbleSendKeepsAnotherToast() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
+        let fixture = try await Self.makeFixture(pool)
+        let email = try await Self.queueReply(fixture, draftId: "draft-keep-email", newEmail: true)
+        let reply = try await Self.queueReply(fixture, draftId: "draft-keep-reply")
+        let hold = Date().addingTimeInterval(3600)
+        service.present(outboxId: email.id, draftId: "draft-keep-email", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .toast)
+        service.present(outboxId: reply.id, draftId: "draft-keep-reply", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
+        #expect(service.visibleToast?.id == email.id, "the new email keeps its toast, its only Undo")
+        #expect(service.undoOwner(for: reply.id) == .bubble && service.undoOwner(for: email.id) == .toast)
+    }
+
+    @Test("Two Undos before either compose opens reopen both, in order; a repeated Undo does nothing and says nothing")
+    func overlappingUndosKeepEveryReopen() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        while service.reopenSnapshot != nil { service.finishReopen() }
+        let fixture = try await Self.makeFixture(pool)
+        let email = try await Self.queueReply(fixture, draftId: "draft-two-email", newEmail: true)
+        let reply = try await Self.queueReply(fixture, draftId: "draft-two-reply")
+        let hold = Date().addingTimeInterval(3600)
+        try await Self.setHold(pool, email.id, hold)
+        try await Self.setHold(pool, reply.id, hold)
+        service.present(outboxId: email.id, draftId: "draft-two-email", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .toast)
+        service.present(outboxId: reply.id, draftId: "draft-two-reply", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
+        let replyPending = PendingSendService.Pending(
+            id: reply.id, draftId: "draft-two-reply", instanceEpoch: "E1", toSummary: "",
+            presentedAt: Date(), holdUntil: hold)
+
+        service.undoAndReopen()               // the toast's Undo
+        service.undoAndReopen(replyPending)   // the bubble's Undo, before the first compose opens
+        #expect(service.reopenQueue.map(\.id) == [email.id, reply.id], "both composes wait to reopen, the first first")
+        let left = try await pool.read { try OutboxMessage.fetchAll($0).map(\.id) }
+        #expect(!left.contains(email.id) && !left.contains(reply.id), "both sends are cancelled")
+
+        service.undoAndReopen(replyPending)   // a second tap on the same bubble
+        #expect(service.reopenQueue.count == 2, "a repeated Undo adds nothing")
+        #expect(service.undoFailureMessage == nil, "and raises no failure notice")
+
+        service.finishReopen()
+        #expect(service.reopenSnapshot?.id == reply.id, "the second compose opens when the first closes")
     }
 
     @Test("RootView shows the toast only for a send whose Undo is not on a bubble, and both Undos share one reopen")
     func rootViewWiring() throws {
         let text = try Self.source("TabMail/Views/RootView.swift")
-        #expect(text.contains("if let pending = pendingSendService.current, pending.showsToast {"))
+        #expect(text.contains("if let pending = pendingSendService.visibleToast {"))
         #expect(text.contains("onUndo: { pendingSendService.undoAndReopen() }"))
         #expect(text.contains("Binding(get: { pendingSendService.reopenSnapshot },") && text.contains(".fullScreenCover(item: reopenSnapshot) {"))
         let compose = try Self.source("TabMail/Views/Compose/ComposeView.swift")
-        #expect(compose.contains("showsToast: !snapshot.sendHasBubbleUndo"))
+        #expect(compose.contains("owner: snapshot.sendHasBubbleUndo ? .bubble : .toast"))
+        #expect(text.contains("set: { if $0 == nil { pendingSendService.finishReopen() } })"))
     }
 
     // MARK: - Fixture

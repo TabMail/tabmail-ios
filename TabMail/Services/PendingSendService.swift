@@ -164,9 +164,12 @@ final class PendingSendService {
         var undoDeadline: Date {
             OutboxCancellationPolicy.undoDeadline(for: holdUntil)
         }
-        /// Whether the toast shows for this send. False for a reply sent with the chat view on:
-        /// its Undo is on the chat's "Sending" bubble (`ChatUndoSendStatus`). Decided at Send.
-        var showsToast = true
+    }
+
+    /// Which presenter offers a send's Undo: the toast, or the chat's "Sending" bubble.
+    enum UndoOwner: Sendable, Equatable {
+        case toast
+        case bubble
     }
 
     /// Whether the send gets a chat bubble with its own Undo, so its toast is not shown. Every send
@@ -191,7 +194,7 @@ final class PendingSendService {
 
     /// Process-local handoff authority. The retained Draft is the only content
     /// source; no absent-row payload or Outbox attachment fallback is carried.
-    struct ReopenSnapshot: Identifiable, Sendable {
+    struct ReopenSnapshot: Identifiable, Sendable, Equatable {
         let id: String  // outboxId — unique identifier for fullScreenCover(item:)
         let authority: RetainedDraftAuthority
         /// Whether the confirmed Undo also saved the kept row back to Drafts.
@@ -201,9 +204,46 @@ final class PendingSendService {
 
     private(set) var current: Pending?
 
-    /// The compose to reopen after a confirmed Undo, from the toast or a chat bubble alike.
-    /// RootView presents it with `UndoReopenCompose` (ADR-IOS-065 owns its close semantics).
-    var reopenSnapshot: ReopenSnapshot?
+    /// The one presenter of each send's Undo, by outbox row id, decided ONCE at Send from the
+    /// send's own settings snapshot (`present(owner:)`). Both presenters honour it, so a chat view
+    /// switched on or off during the window applies to the next send only: never two Undos for
+    /// one send, never none. In memory only; an entry ends with its send's toast lifetime. A row
+    /// with no entry was not sent in this run of the app (see `ChatUnsentReply.bubbleOffersUndo`).
+    private(set) var undoOwners: [String: UndoOwner] = [:]
+    private var ownerExpiry: [String: Task<Void, Never>] = [:]
+
+    func undoOwner(for outboxId: String) -> UndoOwner? {
+        undoOwners[outboxId]
+    }
+
+    /// The toast RootView shows: the current send, only when its Undo belongs to the toast.
+    var visibleToast: Pending? {
+        guard let current, undoOwners[current.id] == .toast else { return nil }
+        return current
+    }
+
+    /// A send is waiting out its undo window, on the toast or on a chat bubble.
+    var isSending: Bool {
+        current != nil || undoOwners.values.contains(.bubble)
+    }
+
+    /// The composes to reopen after confirmed Undos, from the toast or a chat bubble alike, oldest
+    /// first. RootView presents the first with `UndoReopenCompose` (ADR-IOS-065 owns its close
+    /// semantics) and the next once it closes. A queue, so a second Undo before the first compose
+    /// opens never replaces the first: every cancelled send keeps its reopen (never drop).
+    private(set) var reopenQueue: [ReopenSnapshot] = []
+
+    var reopenSnapshot: ReopenSnapshot? { reopenQueue.first }
+
+    /// RootView closed the compose of the first reopen; the next one, if any, opens.
+    func finishReopen() {
+        guard !reopenQueue.isEmpty else { return }
+        reopenQueue.removeFirst()
+    }
+
+    /// Sends this run of the app has cancelled through Undo. A repeated Undo for one of them (a
+    /// second tap before its bubble goes) is a no-op: no second discard and no false notice.
+    private var undoneSendIds: Set<String> = []
 
     /// Non-nil ⇒ the last Undo tap could not be decided, so nothing was cancelled
     /// and the toast was deliberately left up. The view renders this and clears it.
@@ -235,19 +275,34 @@ final class PendingSendService {
         instanceEpoch: String,
         toSummary: String,
         holdUntil: Date?,
-        showsToast: Bool = true
+        owner: UndoOwner = .toast
     ) {
+        let now = Date()
+        // The owner is the send's own, decided once. A dedup onto a send already presented
+        // (`persistQueuedSend` returns the in-flight row) keeps that send's owner.
+        let owner = undoOwners[outboxId] ?? owner
+        undoOwners[outboxId] = owner
+        let ownerLifetime = max(0, (holdUntil ?? now).timeIntervalSince(now))
+                          + SyncConfig.outboxQueuedAcknowledgementSeconds
+        ownerExpiry[outboxId]?.cancel()
+        ownerExpiry[outboxId] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: OutboxDeadlineScheduler.nanoseconds(for: ownerLifetime))
+            guard !Task.isCancelled else { return }
+            self?.undoOwners[outboxId] = nil
+            self?.ownerExpiry[outboxId] = nil
+        }
+        // A send whose Undo is on its bubble leaves any toast showing untouched: that toast is
+        // another send's only Undo.
+        guard owner == .toast else { return }
         dismissTask?.cancel()
         undoFailureMessage = nil
-        let now = Date()
         current = Pending(
             id: outboxId,
             draftId: draftId,
             instanceEpoch: instanceEpoch,
             toSummary: toSummary,
             presentedAt: now,
-            holdUntil: holdUntil,
-            showsToast: showsToast)
+            holdUntil: holdUntil)
 
         // One auto-dismiss Task whose remaining visible window is anchored on the
         // DURABLE hold rather than on this instant:
@@ -286,19 +341,41 @@ final class PendingSendService {
     /// `RetainedAuthorityOutcome` for why collapsing them was the defect.
     func undo() -> ReopenSnapshot? {
         guard let p = current else { return nil }
-        return undo(p)
+        let outcome = undo(p)
+        if outcome != .refused { undoneSendIds.insert(p.id) }
+        if case .reopen(let snapshot) = outcome { return snapshot }
+        return nil
     }
 
     /// Undo, then reopen the compose: the one path for the toast's Undo and a chat bubble's.
-    /// `pending` is the send to cancel; nil means the toast's `current`.
+    /// `pending` is the send to cancel; nil means the toast's `current`. The reopen is admitted to
+    /// `reopenQueue` in the same main-actor turn as the cancellation, and the queue takes every
+    /// reopen, so no cancelled send can lose its compose to another Undo.
     func undoAndReopen(_ pending: Pending? = nil) {
-        guard let p = pending ?? current, let snapshot = undo(p) else { return }
-        reopenSnapshot = snapshot
+        guard let p = pending ?? current, !undoneSendIds.contains(p.id) else { return }
+        switch undo(p) {
+        case .reopen(let snapshot):
+            undoneSendIds.insert(p.id)
+            reopenQueue.append(snapshot)
+        case .cancelled:
+            undoneSendIds.insert(p.id)
+        case .refused:
+            break
+        }
+    }
+
+    /// What one Undo did: cancelled the send and has its compose to reopen; cancelled it with
+    /// nothing to reopen (the retained draft is provably another generation or gone); or refused,
+    /// with nothing cancelled and `undoFailureMessage` set.
+    private enum UndoOutcome: Equatable {
+        case reopen(ReopenSnapshot)
+        case cancelled
+        case refused
     }
 
     /// `undo()` for any send still in its window, not only the toast's (a chat bubble's send).
     /// Clears the toast only when it is this send's.
-    private func undo(_ p: Pending) -> ReopenSnapshot? {
+    private func undo(_ p: Pending) -> UndoOutcome {
         switch retainedAuthorityOutcome(for: p) {
         case .readFailed:
             // We could not determine anything, so we decide nothing: the Outbox row
@@ -306,7 +383,7 @@ final class PendingSendService {
             // Do NOT reach for `discardOutboxMessageConfirmed` here — cancelling on
             // an unknown is the direction that loses the content (see the enum).
             undoFailureMessage = Self.undoNotConfirmedMessage
-            return nil
+            return .refused
         case .mismatchOrAbsent:
             // PROVEN not to be the generation this toast is holding. Cancel the send
             // — the user asked for that and we know it is safe — but reopen nothing.
@@ -323,10 +400,10 @@ final class PendingSendService {
                 // experience. Under a suspended GRDB one root cause routed two ways:
                 // one spoke, one was silent, and the message went out.
                 undoFailureMessage = Self.undoNotConfirmedMessage
-                return nil
+                return .refused
             }
             clearToast(ifShowing: p.id)
-            return nil
+            return .cancelled
         case .verified(let authority):
             // The cancellation and the kept draft's return to Drafts commit in one
             // write, in this same synchronous turn (ADR-IOS-065, as superseded on v3).
@@ -337,11 +414,11 @@ final class PendingSendService {
                 // the arm where the user had a reopenable draft in hand, so a silent
                 // `nil` here reads as "Undo did nothing at all".
                 undoFailureMessage = Self.undoNotConfirmedMessage
-                return nil
+                return .refused
             }
             clearToast(ifShowing: p.id)
-            return ReopenSnapshot(
-                id: p.id, authority: authority, returnedToDrafts: outcome.returnedToDrafts)
+            return .reopen(ReopenSnapshot(
+                id: p.id, authority: authority, returnedToDrafts: outcome.returnedToDrafts))
         }
     }
 

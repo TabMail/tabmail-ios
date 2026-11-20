@@ -1070,6 +1070,7 @@ enum ComposeDraftGuards {
 }
 
 struct ComposeView: View {
+    static let sendButtonId = "composeSend"
     /// Immutable authored values captured in one MainActor turn immediately
     /// before the agent-vs-Send claim. No live compose field is read afterward.
     private struct AuthoredSendSnapshot {
@@ -1108,7 +1109,7 @@ struct ComposeView: View {
         /// The guided tutorial's practice reply: sent with no undo hold.
         let isTutorialPracticeReply: Bool
         /// Undo shows on the chat's "Sending" bubble, not the toast
-        /// (`PendingSendService.sendHasBubbleUndo`), read once here.
+        /// (`PendingSendService.sendHasBubbleUndo`), from the setting read at the Send tap.
         let sendHasBubbleUndo: Bool
         let outbound: DraftMessage
     }
@@ -1687,6 +1688,7 @@ struct ComposeView: View {
                         ProgressView()
                     } else {
                         Button("Send") { trySend() }
+                            .accessibilityIdentifier(Self.sendButtonId)
                             .font(.subheadline)
                             .fontWeight(.semibold)
                             // B1: block Send while attachments failed to load —
@@ -1921,7 +1923,10 @@ struct ComposeView: View {
                 onDiscard: { dismiss() }))
             .overlay { if isCheckingServerCopy { ServerCopyCheckCover() } }
             .alert("Empty Body", isPresented: $showEmptyBodyPrompt) {
-                Button("Send Anyway") { Task { await send() } }
+                Button("Send Anyway") {
+                    let chatViewActive = ChatViewConfig.isActive
+                    Task { await send(chatViewActive: chatViewActive) }
+                }
                 Button("Cancel", role: .cancel) { }
             } message: {
                 Text("The message body is empty. Send anyway?")
@@ -3572,13 +3577,17 @@ struct ComposeView: View {
             guard TutorialCoordinator.shared.admits(
                 .useSuggestion, accountId: replyTo?.accountId, messageId: replyTo?.messageId) else { return }
             acceptVisibleSuggestionIfOffered()
-            Task { await send() }
+            let chatViewActive = ChatViewConfig.isActive
+            Task { await send(chatViewActive: chatViewActive) }
         case .sendAsTyped:
-            Task { await send() }
+            let chatViewActive = ChatViewConfig.isActive
+            Task { await send(chatViewActive: chatViewActive) }
         }
     }
 
-    private func send() async {
+    /// `chatViewActive` is the chat view setting read at the Send tap, before anything suspends
+    /// (snapshot settings at operation start); it decides who offers this send's Undo.
+    private func send(chatViewActive: Bool) async {
         // An explicit Save may be suspended while settling forwarded attachments.
         // Sending concurrently would race two durable dispositions of one compose.
         guard !isSavingDraft else { return }
@@ -3702,7 +3711,7 @@ struct ComposeView: View {
             isReplyAll: isReplyAll,
             isTutorialPracticeReply: isPracticeReply,
             sendHasBubbleUndo: PendingSendService.sendHasBubbleUndo(
-                chatViewActive: ChatViewConfig.isActive, inReplyTo: outbound.inReplyTo),
+                chatViewActive: chatViewActive, inReplyTo: outbound.inReplyTo),
             outbound: outbound)
 
         // Capture existing draft (server-side metadata preserved through save-before-send).
@@ -3903,7 +3912,7 @@ struct ComposeView: View {
             instanceEpoch: snapshot.instanceEpoch,
             toSummary: toSummary,
             holdUntil: queued.holdUntil,
-            showsToast: !snapshot.sendHasBubbleUndo
+            owner: snapshot.sendHasBubbleUndo ? .bubble : .toast
         )
         sendWasAdmitted = true
 

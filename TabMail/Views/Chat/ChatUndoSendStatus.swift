@@ -37,12 +37,34 @@ extension ChatUnsentReply {
         return .pending(fill: max(0, min(1, passed / window)))
     }
 
+    /// Whether the bubble is its send's Undo presenter, by the owner decided at Send
+    /// (`PendingSendService.undoOwner`): yes unless the toast owns it.
+    ///
+    /// No entry means the send was not made in this run of the app (a relaunch, or an owner that
+    /// ended with its toast's lifetime after the window). The toast cannot exist then, so for a
+    /// chat reply still in its window the bubble is the ONLY possible presenter, not a fallback.
+    static func bubbleOffersUndo(owner: PendingSendService.UndoOwner?) -> Bool {
+        owner != .toast
+    }
+
+    /// `undoSecondsLeft(at:)` on the bubble: nil when the toast owns this send's Undo.
+    func bubbleUndoSecondsLeft(at instant: Date, owner: PendingSendService.UndoOwner?) -> Int? {
+        Self.bubbleOffersUndo(owner: owner) ? undoSecondsLeft(at: instant) : nil
+    }
+
+    /// `undoLook(at:reduceMotion:)` on the bubble: solid when the toast owns this send's Undo.
+    func bubbleUndoLook(at instant: Date, reduceMotion: Bool, owner: PendingSendService.UndoOwner?) -> ChatUndoSendLook {
+        Self.bubbleOffersUndo(owner: owner) ? undoLook(at: instant, reduceMotion: reduceMotion) : .solid
+    }
+
     /// Undo on the bubble: the toast's own undo-and-reopen path for this row.
     @MainActor func undo() {
-        guard let draftId, let instanceEpoch else { return }
-        PendingSendService.shared.undoAndReopen(PendingSendService.Pending(
+        let service = PendingSendService.shared
+        guard let draftId, let instanceEpoch,
+              Self.bubbleOffersUndo(owner: service.undoOwner(for: outboxId)) else { return }
+        service.undoAndReopen(PendingSendService.Pending(
             id: outboxId, draftId: draftId, instanceEpoch: instanceEpoch, toSummary: "",
-            presentedAt: Date(), holdUntil: holdUntil, showsToast: false))
+            presentedAt: Date(), holdUntil: holdUntil))
     }
 }
 
@@ -85,7 +107,8 @@ struct ChatUndoSendSchedule: TimelineSchedule {
     }
 }
 
-/// Redraws a reply's bubble and status line over its undo window, on `ChatUndoSendSchedule`.
+/// Redraws a reply's bubble and status line over its undo window, on `ChatUndoSendSchedule`, with
+/// the system's Reduce Motion setting.
 struct ChatUndoSendTimeline<Content: View>: View {
     let reply: ChatUnsentReply
     @ViewBuilder let content: (_ look: ChatUndoSendLook, _ secondsLeft: Int?) -> Content
@@ -93,9 +116,21 @@ struct ChatUndoSendTimeline<Content: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        ChatUndoSendTimelineBody(reply: reply, reduceMotion: reduceMotion, content: content)
+    }
+}
+
+/// `ChatUndoSendTimeline` for a given Reduce Motion setting.
+struct ChatUndoSendTimelineBody<Content: View>: View {
+    let reply: ChatUnsentReply
+    let reduceMotion: Bool
+    @ViewBuilder let content: (_ look: ChatUndoSendLook, _ secondsLeft: Int?) -> Content
+
+    var body: some View {
+        let owner = PendingSendService.shared.undoOwner(for: reply.outboxId)
         TimelineView(ChatUndoSendSchedule(deadline: reply.undoDeadline, animatesFill: !reduceMotion)) { context in
-            content(reply.undoLook(at: context.date, reduceMotion: reduceMotion),
-                    reply.undoSecondsLeft(at: context.date))
+            content(reply.bubbleUndoLook(at: context.date, reduceMotion: reduceMotion, owner: owner),
+                    reply.bubbleUndoSecondsLeft(at: context.date, owner: owner))
         }
     }
 }

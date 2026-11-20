@@ -69,7 +69,7 @@ struct RootView: View {
     /// The compose to reopen after a confirmed Undo (`PendingSendService.reopenSnapshot`).
     private var reopenSnapshot: Binding<PendingSendService.ReopenSnapshot?> {
         Binding(get: { pendingSendService.reopenSnapshot },
-                set: { pendingSendService.reopenSnapshot = $0 })
+                set: { if $0 == nil { pendingSendService.finishReopen() } })
     }
 
     /// Sync status values — observed once here and published to descendants via
@@ -377,7 +377,7 @@ struct RootView: View {
         // undo chip (InboxView.swift:283-284): ignore the bottom safe area
         // and use negative padding to sit where other app toasts sit.
         .overlay(alignment: .bottom) {
-            if let pending = pendingSendService.current, pending.showsToast {
+            if let pending = pendingSendService.visibleToast {
                 PendingSendToast(
                     pending: pending,
                     onUndo: { pendingSendService.undoAndReopen() },
@@ -408,7 +408,7 @@ struct RootView: View {
                 .ignoresSafeArea(.container, edges: .bottom)
                 .padding(.bottom, -12)
         }
-        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: pendingSendService.current?.id)
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: pendingSendService.visibleToast?.id)
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: demoStore.isActive)
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: tutorial.lockedNotice)
         .alert("Could not start demo", isPresented: Binding(
