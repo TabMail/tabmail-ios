@@ -749,6 +749,11 @@ struct IMAPCatchUpTests {
                     .filter { $0.uppercased().hasPrefix("UID SEARCH") }
                 #expect(searches.isEmpty, "the held walk sent no range SEARCH: \(searches)")
                 #expect(try Self.rows(world)["1"] == nil, "the held walk loaded nothing below the local rows")
+            } else {
+                let searches = world.server.recordedCommands().dropFirst(commandsBefore)
+                    .filter { $0.uppercased().hasPrefix("UID SEARCH") }
+                #expect(!searches.isEmpty, "the allowed walk sent its range SEARCH")
+                #expect(try Self.rows(world)["1"] != nil, "the allowed walk loaded the message below the local rows")
             }
         }
     }

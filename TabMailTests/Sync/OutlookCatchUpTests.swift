@@ -397,6 +397,9 @@ struct OutlookCatchUpTests {
             if walkHeld {
                 #expect(w.server.requestCounts().listings == listingsBefore, "the held walk listed no page")
                 #expect(try w.row("a-old", in: w.archive) == nil, "the held walk loaded nothing older than every local row")
+            } else {
+                #expect(w.server.requestCounts().listings > listingsBefore, "the allowed walk listed a page")
+                #expect(try w.row("a-old", in: w.archive) != nil, "the allowed walk loaded the message older than every local row")
             }
         }
     }

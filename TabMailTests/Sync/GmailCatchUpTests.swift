@@ -3142,6 +3142,10 @@ struct GmailCatchUpTests {
                 let pages = world.server.http.recordedCalls().map(\.url).filter { $0.contains("/messages?") && !$0.contains("after") }
                 #expect(pages.isEmpty, "the held walk listed no page: \(pages)")
                 #expect(rows["old"] == nil, "the held walk loaded nothing older than every local row")
+            } else {
+                let pages = world.server.http.recordedCalls().map(\.url).filter { $0.contains("/messages?") && !$0.contains("after") }
+                #expect(!pages.isEmpty, "the allowed walk listed a page")
+                #expect(rows["old"] != nil, "the allowed walk loaded the message older than every local row")
             }
         }
     }
