@@ -199,7 +199,20 @@ final class ChatFieldWords {
         changed.insert(key)
         guard after.unsent != before.unsent else { return }
         unwritten[key] = Write(words: after.unsent, admission: admission, lifetimes: lifetimes)
-        guard writer == nil else { return }
+        startWriter()
+    }
+
+    /// A save point: writes what a failed write left unsaved in memory. The next change is one
+    /// (`apply`); so are the app going to the background (`RootView`) and a pill showing a chat
+    /// (`load`). No timer and no retry count: words stay unsaved until a save point succeeds.
+    func saveUnwritten() {
+        startWriter()
+    }
+
+    /// Starts the one writer, unless it runs or nothing waits. The writer takes each key's
+    /// newest words at the moment it builds its batch.
+    private func startWriter() {
+        guard writer == nil, !unwritten.isEmpty else { return }
         writer = Task { await writeUnwritten() }
     }
 
@@ -208,6 +221,13 @@ final class ChatFieldWords {
     /// to show the chat reads them again. The read runs on its own, so a pill that goes away while
     /// it runs does not end it for another pill on the chat.
     func load(_ key: String) async {
+        // Showing a chat is a save point for what a failed write left unsaved.
+        saveUnwritten()
+        // A read for a removed account's chat, or an ended demo's, never starts, and one whose
+        // account or demo run ended while it ran never lands (S1: a read started after a demo's
+        // exit forgot it, while its wipe runs, would bring the old words back into the next run).
+        let admission = DemoModeStore.shared.chatAdmission
+        guard !lifetimes.isGone(key, admission: admission) else { return }
         guard !changed.contains(key), !read.contains(key) else { return }
         let current: (id: UUID, task: Task<String?, Error>)
         if let inFlight = reading[key] {
@@ -231,6 +251,7 @@ final class ChatFieldWords {
         // on a chat nothing changed.
         guard reading[key]?.id == current.id else { return }
         reading[key] = nil
+        guard !lifetimes.isGone(key, admission: admission) else { return }
         guard !changed.contains(key) else { return }
         read.insert(key)
         guard let stored, !stored.isEmpty else { return }
@@ -270,8 +291,7 @@ final class ChatFieldWords {
     /// removal of the account still runs.
     func rollBackRemoval(_ removal: Removal) {
         lifetimes.release(removal, committed: false)
-        guard writer == nil, !unwritten.isEmpty else { return }
-        writer = Task { await writeUnwritten() }
+        startWriter()
     }
 
     /// The account `accountId` exists again: the demo's fixed account, seeded anew once its seed
@@ -309,7 +329,7 @@ final class ChatFieldWords {
                     unwritten[key] = write
                 }
             } catch {
-                // Kept in memory for this run; the next change writes them again. A removed
+                // Kept unsaved in memory; the next save point (`saveUnwritten`, a change) writes them. A removed
                 // account's, or an ended demo's, are not: they were forgotten while this wrote.
                 for (key, write) in batch where unwritten[key] == nil && write.isKept(key) { unwritten[key] = write }
                 if DebugModeManager.isLoggingEnabled() {

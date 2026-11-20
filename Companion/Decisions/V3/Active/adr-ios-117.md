@@ -48,6 +48,11 @@ chat's field, also after the app is closed.
    (`AccountManager.removeAccountRowsTxn`), with its AI cache. A demo's rows go with the demo's chat
    (`DemoSeed.wipe`).
 
+**Review r1 (2026-11-20):** words a failed write left unsaved are written by the one writer at the
+next save point: a change, the app going to the background, a pill showing a chat (no timer, no retry
+count). A read checks the chat's demo admission and account removal as it starts and again before it
+lands, so a read started during a demo's exit never fills the next demo's field.
+
 **Why not a mail draft:** the field's words are an instruction to the agent ("tell her Tuesday works",
 "decline politely"), not an email body. Saved as a draft they would sit in the user's Drafts folder on the
 mail server, synced to every client, as a message nobody wrote, and Q22 (the chat ignores drafts) would

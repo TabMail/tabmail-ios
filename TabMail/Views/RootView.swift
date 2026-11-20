@@ -847,6 +847,8 @@ struct RootView: View {
                 Task { await Self.revalidateAISubscriptionGate() }
             case .background:
                 syncScheduler.stopPolling()
+                // A save point for unsent chat words a failed write left unsaved (ADR-IOS-117).
+                ChatFieldWords.shared.saveUnwritten()
                 // Give in-flight backfill ~30s to finish its current chunk
                 syncScheduler.requestBackgroundGracePeriod()
                 syncScheduler.scheduleBackgroundSync()

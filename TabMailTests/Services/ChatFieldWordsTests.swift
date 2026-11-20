@@ -540,6 +540,47 @@ struct ChatFieldWordsTests {
         }
     }
 
+    /// A save point other than a change: the app going to the background, a pill showing a chat.
+    enum SavePoint: String, CaseIterable, Sendable { case background, open }
+
+    @Test("Words a failed write left unsaved are kept for the next run once a later save point succeeds, typed or emptied, with no further change",
+          arguments: [false, true], SavePoint.allCases)
+    func failedWriteIsSavedAtTheNextSavePoint(emptied: Bool, savePoint: SavePoint) async throws {
+        try await Self.withStore { _, storage, store in
+            let key = ChatFieldWords.key(for: Self.header("sp-1", thread: "save-point"))
+            let earlier = "Saved earlier"
+            let newest = emptied ? "" : "Typed before the failure"
+            // Control: a write that succeeds is kept for the next run at once.
+            store.apply(.put(earlier), to: key)
+            await store.written()
+            #expect(await Self.nextRun(storage, key) == earlier, "control: a successful write is kept")
+
+            storage.failWrites(true)
+            store.apply(.put(newest), to: key)
+            await store.written()
+            storage.failWrites(false)
+            #expect(await Self.nextRun(storage, key) == earlier, "control: the failed write kept nothing, and nothing but a save point writes")
+            #expect(store.fill(for: key).words == newest, "the run still shows the newest")
+
+            switch savePoint {
+            case .background: store.saveUnwritten()
+            case .open: await store.load(key)
+            }
+            await store.written()
+            #expect(await Self.nextRun(storage, key) == newest, "the save point wrote the newest words")
+        }
+    }
+
+    @Test("The app going to the background is a save point for unsaved chat words")
+    func backgroundIsASavePoint() throws {
+        let text = try Self.source("TabMail/Views/RootView.swift")
+        let background = try #require(text.range(of: "case .background:"), "control: RootView handles the background phase")
+        let rest = text[background.upperBound...]
+        let save = try #require(rest.range(of: "ChatFieldWords.shared.saveUnwritten()"), "the background phase saves the unsaved words")
+        let nextCase = rest.range(of: "case .")?.lowerBound ?? rest.endIndex
+        #expect(save.lowerBound < nextCase, "in the background branch itself")
+    }
+
     @Test("A read or write failure logs the error's type, never the words")
     func failuresNeverLogTheWords() throws {
         let text = try Self.source("TabMail/Services/AI/ChatFieldWords.swift")
@@ -985,6 +1026,60 @@ struct ChatFieldWordsTests {
             await run.written()
             let onDisk935 = try Self.rows(pool)
             #expect(onDisk935.map(\.sessionId) == [Self.demoKey("other")], "nor does its disk")
+        }
+    }
+
+    @Test("A read of a demo chat started after the demo's exit forgot it, while the wipe waits, never brings the old words into the next demo; a live demo's and a real chat's reads land")
+    func readStartedDuringTheDemosExitNeverLands() async throws {
+        DemoModeStore.shared._resetForTests()
+        defer { DemoModeStore.shared._resetForTests() }
+        try await Self.withStore { pool, storage, run in
+            DemoModeStore.shared.isActive = true
+            let demo = Self.demoKey("exit-read")
+            let real = ChatThreadKey.key(accountId: Self.account, threadId: "real-during-exit")
+            try await pool.write { db in
+                try ChatFieldWordsRecord(sessionId: demo, words: "Old demo words", updatedAt: Date()).insert(db)
+                try ChatFieldWordsRecord(sessionId: real, words: "Real words", updatedAt: Date()).insert(db)
+            }
+
+            // Control: in a live demo, a held read of the same key lands.
+            let live = ChatFieldWords(storage: storage.storage)
+            storage.hold(resultsOf: demo)
+            let liveLoad = Task { await live.load(demo) }
+            #expect(await storage.waitForHeldResult(of: demo), "control: the live demo's read has its words")
+            storage.release(resultsOf: demo)
+            await liveLoad.value
+            #expect(live.fill(for: demo).words == "Old demo words", "control: a live demo's read lands")
+
+            // The exit revokes the run and forgets its words; the wipe has not run yet.
+            DemoModeStore.shared.revokeAdmission()
+            run.forgetDemo()
+            storage.hold(resultsOf: demo)
+            let finished = Finished()
+            let lateLoad = Task { await run.load(demo); finished.value = true }
+            let deadline = ContinuousClock.now + ControlledStorage.waitLimit
+            while !finished.value, storage.heldResultCount(of: demo) == 0, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            // Control: a real chat's read during the exit lands.
+            await run.load(real)
+            #expect(run.fill(for: real).words == "Real words", "control: a real chat's read lands during the exit")
+
+            // The wipe finishes, the demo ends and the next one is seeded; then the read is released.
+            try await pool.write { try DemoSeed.wipe($0) }
+            DemoModeStore.shared.isActive = false
+            DemoModeStore.shared.isActive = true
+            run.reopenAccount(DemoSeed.demoAccountId)
+            storage.release(resultsOf: demo)
+            await lateLoad.value
+
+            #expect(run.fill(for: demo).words == "", "the old words are not in the next demo's field")
+            await run.load(demo)
+            #expect(run.fill(for: demo).words == "", "and the next demo's own read finds none")
+            run.apply(.put("Next demo's words"), to: demo)
+            await run.written()
+            let stored = try Self.storedWords(pool)
+            #expect(stored == [real: "Real words", demo: "Next demo's words"], "\(stored)")
         }
     }
 }

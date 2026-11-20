@@ -27,9 +27,9 @@ import UIKit
 ///     moving to another email of another chat keeps each chat's words on its own.
 ///  7. The email screen's pill (no reply field) keeps its chat's words too; the inbox's chat keeps
 ///     none. A demo's words stay in the demo and go with it.
-///  8. Words typed in a chat opened from the Search sheet survive the sheet's dismissal, by its
-///     own dismiss and by the UIKit path a swipe-down ends in, and are in the field when the chat
-///     opens again, in this run and the next.
+///  8. Words typed in a chat pushed inside a sheet, as Search opens chats, survive the sheet's
+///     dismissal, by its own dismiss and by a UIKit programmatic teardown, and are in the field
+///     when the chat opens again, in this run and the next.
 @Suite("Chat field words kept on Back", .serialized, .processGlobalState)
 @MainActor
 struct ChatFieldWordsRuntimeTests {
@@ -545,9 +545,10 @@ struct ChatFieldWordsRuntimeTests {
     enum SheetDismissal: String, CaseIterable, CustomTestStringConvertible {
         /// The sheet's own `dismiss` (Search's Done and title buttons call it).
         case programmatic
-        /// The UIKit path a swipe-down ends in: the presented controller is dismissed under its
-        /// presentation controller's delegate, which is how SwiftUI learns the sheet closed.
-        case swipeDown
+        /// A UIKit programmatic teardown of the sheet: the presented controller is dismissed under
+        /// its presentation controller's delegate, which is how SwiftUI learns the sheet closed. Not
+        /// a swipe: the real Search sheet disables interactive dismissal.
+        case uikitTeardown
         var testDescription: String { rawValue }
     }
 
@@ -581,7 +582,7 @@ struct ChatFieldWordsRuntimeTests {
         }
     }
 
-    @Test("Words typed in a chat opened from Search survive the Search sheet's dismissal and are there when the chat opens again",
+    @Test("Words typed in a chat pushed inside a sheet, as Search opens chats, survive the sheet's dismissal and are there when the chat opens again",
           arguments: SheetDismissal.allCases)
     func wordsSurviveTheSearchSheetsDismissal(_ dismissal: SheetDismissal) async throws {
         try await Self.withDatabase { pool in
@@ -602,7 +603,7 @@ struct ChatFieldWordsRuntimeTests {
             case .programmatic:
                 let dismiss = try #require(host.dismiss, "control: the sheet's chat has its dismiss action")
                 dismiss()
-            case .swipeDown:
+            case .uikitTeardown:
                 let presentation = try #require(sheet.presentationController)
                 presentation.delegate?.presentationControllerWillDismiss?(presentation)
                 await withCheckedContinuation { continuation in
