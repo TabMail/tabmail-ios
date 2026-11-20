@@ -145,8 +145,10 @@ struct AISummariesNoticeButton: View {
                                         showsNotice = false
                                     })
         }
+        #if DEBUG
         .onChange(of: showsNotice) { _, shows in noticeDebugLog(tag, "showsNotice -> \(shows)") }
         .onChange(of: showsReport) { _, shows in noticeDebugLog(tag, "showsReport -> \(shows)") }
+        #endif
         .task(id: landed) {
             // One decision per open, read once from the flag and the tip gate, just before asking.
             if firstOpen.isDue(landed: landed, tipsAllowed: tipsAllowed()) {
@@ -191,7 +193,8 @@ struct AISummariesNoticeButton: View {
 }
 
 /// Debug-only trace of the notice's presentations, with what each key window has presented.
-@MainActor private func noticeDebugLog(_ tag: String, _ message: String) {
+/// `@autoclosure`: a release build never builds the tag or the message, nor reads what they read.
+@MainActor private func noticeDebugLog(_ tag: @autoclosure () -> String, _ message: @autoclosure () -> String) {
     #if DEBUG
     let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
     let presented = windows.compactMap { window -> String? in
@@ -203,7 +206,7 @@ struct AISummariesNoticeButton: View {
         }
         return chain.isEmpty ? nil : chain.joined(separator: ">")
     }
-    print("[AINotice \(Date().formatted(.iso8601.time(includingFractionalSeconds: true)))] \(tag) \(message) | presented: \(presented)")
+    print("[AINotice \(Date().formatted(.iso8601.time(includingFractionalSeconds: true)))] \(tag()) \(message()) | presented: \(presented)")
     #endif
 }
 
