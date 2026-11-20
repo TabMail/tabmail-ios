@@ -25,6 +25,8 @@ final class KeyboardFocusRaceUITests: XCTestCase {
     /// Where the Paste press lands horizontally: past the end of the text, so the caret goes to the end.
     private let endTapOffset: CGFloat = 0.9
     private let pressSeconds: TimeInterval = 1.0
+    /// The word typed for select, Copy and Paste; spelled correctly so a double tap offers Copy.
+    private let selectWord = "Keyboard"
     /// A single-line field's text sits at its vertical middle.
     private let singleLineOffset: CGFloat = 0.5
 
@@ -334,7 +336,8 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         defer { app.terminate() }
 
         _ = openChatInputWithText("Mic fixture \(UUID().uuidString.prefix(6))", in: app)
-        let mic = app.buttons["Dictate"].firstMatch
+        // The keyboard's own dictation key is also labelled Dictate (identifier "dictation"); the chat's mic is the other one.
+        let mic = app.buttons.matching(NSPredicate(format: "label == %@ AND identifier != %@", "Dictate", "dictation")).firstMatch
         XCTAssertTrue(mic.waitForExistence(timeout: focusSeconds), "control: the mic shows")
         let micEnabled = mic.isEnabled
         mic.tap()
@@ -392,10 +395,7 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         let app = launch("--keyboard-focus-caret")
         defer { app.terminate() }
 
-        let field = app.descendants(matching: .any).matching(NSPredicate(
-            format: "(elementType == %d OR elementType == %d) AND placeholderValue == %@",
-            XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue,
-            "Multi-line field")).firstMatch
+        let field = multiLineField(in: app)
         XCTAssertTrue(field.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
         tapInsideKeepsTheKeyboard(field, in: app)
     }
@@ -436,10 +436,7 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         let app = launch("--keyboard-focus-caret")
         defer { app.terminate() }
 
-        let field = app.descendants(matching: .any).matching(NSPredicate(
-            format: "(elementType == %d OR elementType == %d) AND placeholderValue == %@",
-            XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue,
-            "Multi-line field")).firstMatch
+        let field = multiLineField(in: app)
         XCTAssertTrue(field.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
         selectCopyPasteKeepsTheKeyboard(field, lineOffset: caretTapOffset, in: app)
     }
@@ -460,7 +457,10 @@ final class KeyboardFocusRaceUITests: XCTestCase {
     /// `lineOffset` is the vertical fraction of the field's frame where its first line sits.
     /// XCUITest has no API for a selection handle, so a handle drag is not exercised here.
     private func selectCopyPasteKeepsTheKeyboard(_ field: XCUIElement, lineOffset: CGFloat, in app: XCUIApplication) {
-        let word = "Selectword\(String(UUID().uuidString.filter(\.isLetter).prefix(6)).lowercased())"
+        // A dictionary word: a double tap on a misspelled word opens the spelling-replacements
+        // menu (no Copy) instead of the edit menu. The field starts empty, so the word is the only
+        // text and the Paste count below stays exact.
+        let word = selectWord
         field.tap()
         field.typeText(word)
         XCTAssertTrue(waitForFocus(field, timeout: focusSeconds), "control: the field has the keyboard")
@@ -487,6 +487,15 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         XCTAssertEqual(value.components(separatedBy: word).count - 1, 2, "control: Paste put the copied word in again")
         XCTAssertTrue(waitForFocus(field, timeout: focusSeconds), "the field kept focus after Paste")
         XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up after Paste")
+    }
+
+    /// The fixture's multi-line field, by identifier: once it holds text its placeholder is no
+    /// longer exposed, so a placeholder query stops resolving after typing.
+    private func multiLineField(in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any).matching(NSPredicate(
+            format: "(elementType == %d OR elementType == %d) AND identifier == %@",
+            XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue,
+            "keyboardFocusMultiLineField")).firstMatch
     }
 
     /// An edit-menu command by its visible title; the menu shows it as a menu item or a button.

@@ -48,6 +48,8 @@ struct KeyboardFocusTestScene: View {
     nonisolated static let forkUserText = "Keyboard focus fixture question"
     /// The multi-line field's height in lines, so it is backed by a text view with room to tap in.
     static let multiLineLines = 3...6
+    /// The multi-line field's identifier: its placeholder is no longer exposed once it holds text.
+    static let multiLineIdentifier = "keyboardFocusMultiLineField"
     static let textEditorIdentifier = "keyboardFocusTextEditor"
     /// The text editor's height, so it has room to tap and select in.
     static let textEditorHeight: CGFloat = 120
@@ -181,6 +183,7 @@ struct KeyboardFocusTestScene: View {
                         TextField("Other field", text: $other)
                         TextField("Multi-line field", text: $multiLine, axis: .vertical)
                             .lineLimit(Self.multiLineLines)
+                            .accessibilityIdentifier(Self.multiLineIdentifier)
                         TextEditor(text: $editorText)
                             .frame(height: Self.textEditorHeight)
                             .accessibilityIdentifier(Self.textEditorIdentifier)
