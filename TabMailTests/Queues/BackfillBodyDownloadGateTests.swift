@@ -15,6 +15,10 @@ import Testing
 /// network NetworkMonitor has not reported yet holds). ActiveBodyQueue (new mail) and a message the user opens are not
 /// gated. The observables are the provider (a held download never reaches it)
 /// and the queue's pending items.
+///
+/// The helpers that take a closure (`withAccount`, `eventually`, `pollUntil`) are
+/// `nonisolated(nonsending)`: they run on the caller's actor, so the `@MainActor`
+/// job tests can pass them non-Sendable closures without sending them off the actor.
 @Suite("Older-mail body downloads follow the walk gate", .serialized, .processGlobalState)
 struct BackfillBodyDownloadGateTests {
     private static let settle: Duration = .milliseconds(600)
@@ -27,7 +31,7 @@ struct BackfillBodyDownloadGateTests {
 
     /// Installs `provider` as the account's provider in AccountManager (where the
     /// body queues resolve it), runs `body` under `gate`, then removes it.
-    private func withAccount(
+    private nonisolated(nonsending) func withAccount(
         _ accountId: String, provider: MockEmailProvider, gate: DownloadGate?,
         _ body: () async throws -> Void
     ) async throws {
@@ -36,7 +40,7 @@ struct BackfillBodyDownloadGateTests {
                               expensive: gate == .expensiveNetwork, body)
     }
 
-    private func withAccount(
+    private nonisolated(nonsending) func withAccount(
         _ accountId: String, provider: MockEmailProvider,
         power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), expensive: Bool,
         wifiOnly: Bool = true, path: NetworkPathFacts? = nil, _ body: () async throws -> Void
@@ -72,7 +76,7 @@ struct BackfillBodyDownloadGateTests {
     }
 
     /// Polls `condition` until it holds or `Self.deadline` passes.
-    private func eventually(_ condition: () async -> Bool) async -> Bool {
+    private nonisolated(nonsending) func eventually(_ condition: () async -> Bool) async -> Bool {
         let clock = ContinuousClock()
         let end = clock.now.advanced(by: Self.deadline)
         while clock.now < end {
@@ -83,7 +87,7 @@ struct BackfillBodyDownloadGateTests {
     }
 
     /// `eventually` for closures that cannot capture the suite (the job's work hook).
-    private static func pollUntil(_ condition: () async -> Bool) async -> Bool {
+    private nonisolated(nonsending) static func pollUntil(_ condition: () async -> Bool) async -> Bool {
         let clock = ContinuousClock()
         let end = clock.now.advanced(by: deadline)
         while clock.now < end {

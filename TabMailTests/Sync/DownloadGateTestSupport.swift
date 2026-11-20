@@ -33,7 +33,7 @@ enum DownloadGateHarness {
     static let personalHotspot = NetworkPathFacts(satisfied: true, isExpensive: true)
 
     /// `withPath` on cellular when `expensive`, else unmetered Wi-Fi.
-    static func withNetwork(
+    nonisolated(nonsending) static func withNetwork(
         expensive: Bool, wifiOnly: Bool = true, _ body: () async throws -> Void
     ) async rethrows {
         try await withPath(expensive ? cellular : unmeteredWiFi, wifiOnly: wifiOnly, body)
@@ -44,7 +44,7 @@ enum DownloadGateHarness {
     /// (classified by the production rule, `SyncEngine.onUnmeteredNetwork`), and the
     /// Wi-Fi-only setting set, restoring all of them, so a test never depends on
     /// the network of the machine it runs on.
-    static func withPath(
+    nonisolated(nonsending) static func withPath(
         _ facts: NetworkPathFacts, wifiOnly: Bool = true, _ body: () async throws -> Void
     ) async rethrows {
         let key = SyncScheduler.wifiOnlyKey
