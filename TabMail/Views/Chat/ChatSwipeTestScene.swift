@@ -22,7 +22,6 @@ struct ChatSwipeTestScene: View {
     @State private var ready = false
     @State private var status = "Preparing fixture"
     @State private var armed = false
-    @State private var suggestionArmed = false
     @State private var showsSheet = false
     @State private var mailbox: String?
     @State private var pushedId: String?
@@ -46,9 +45,10 @@ struct ChatSwipeTestScene: View {
     /// How long after "Remove a bubble" the email leaves: long enough for a test to open the chat
     /// and that bubble's actions first.
     private static let removalDelay: Duration = .seconds(8)
-    /// How long after "Arm a late suggestion" the newest email's AI Suggestion lands: long enough
-    /// for a test to open the chat and scroll away first.
-    private static let suggestionDelay: Duration = .seconds(10)
+    /// `--chat-swipe-late-suggestion`: a strip under the whole navigation stack holds "Release the
+    /// AI Suggestion", which writes the newest email's AI Suggestion when the test taps it, so the
+    /// test decides that it lands only after its drag or jump has come to rest.
+    private let lateSuggestionRelease = ProcessInfo.processInfo.arguments.contains("--chat-swipe-late-suggestion")
     /// The late AI Suggestion's text message.
     nonisolated static let lateSuggestion = "Sounds good, see you Tuesday."
 
@@ -85,6 +85,13 @@ struct ChatSwipeTestScene: View {
                         }
                         .padding()
                     }
+                } else if lateSuggestionRelease {
+                    // Below the whole stack, like the tutorial strip, so the reply bar ends above it.
+                    VStack(spacing: 0) {
+                        NavigationStack { list }
+                        Button("Release the AI Suggestion") { Task { await Self.writeSuggestion() } }
+                            .padding()
+                    }
                 } else {
                     NavigationStack { list }
                 }
@@ -111,7 +118,6 @@ struct ChatSwipeTestScene: View {
             }
             if !tutorialCard {
                 Button(armed ? "Removal armed" : "Remove a bubble") { arm() }
-                Button(suggestionArmed ? "Late suggestion armed" : "Arm a late suggestion") { armSuggestion() }
             }
         }
         .navigationTitle("Fixture list")
@@ -132,16 +138,8 @@ struct ChatSwipeTestScene: View {
         }
     }
 
-    /// Writes the newest email's AI Suggestion after `suggestionDelay`, as the AI's reply write does,
-    /// so the open chat gets a late row height.
-    private func armSuggestion() {
-        suggestionArmed = true
-        Task {
-            try? await Task.sleep(for: Self.suggestionDelay)
-            await Self.writeSuggestion()
-        }
-    }
-
+    /// Writes the newest email's AI Suggestion as the AI's reply write does, so the open chat gets
+    /// a late row height.
     private static func writeSuggestion() async {
         let id = headerId(count - 1)
         _ = try? await AppDatabase.dbPool.write { db in

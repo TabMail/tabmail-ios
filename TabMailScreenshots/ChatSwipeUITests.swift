@@ -300,9 +300,11 @@ final class ChatSwipeUITests: XCTestCase {
         }
         XCTAssertTrue(jump.waitForExistence(timeout: 3), "control: the user scrolled away from the bottom")
         let oldest = bubble(0, in: app)
-        let place = oldest.frame.minY
+        let place = restingMinY(of: oldest)
         let ghost = app.descendants(matching: .any)["chat.aiSuggestion"].firstMatch
-        XCTAssertTrue(ghost.waitForExistence(timeout: 20), "control: the AI Suggestion lands late")
+        XCTAssertFalse(ghost.exists, "control: no AI Suggestion before the test releases it")
+        app.buttons["Release the AI Suggestion"].tap()
+        XCTAssertTrue(ghost.waitForExistence(timeout: 5), "control: the AI Suggestion lands after the user's scroll rests")
         // Let any layout the new row causes run.
         XCTAssertFalse(app.buttons["Jump to the newest email"].waitForNonExistence(timeout: 2),
                        "the chat stays away from the bottom: the jump button is still there")
@@ -318,10 +320,14 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(jump.waitForExistence(timeout: 5), "control: the chat lands at the Unread line, away from the bottom")
         let newest = bubble(3, in: app)
         let fieldTop = replyField(in: app).frame.minY
+        let ghost = app.descendants(matching: .any)["chat.aiSuggestion"].firstMatch
+        XCTAssertFalse(ghost.exists, "control: no AI Suggestion before the jump")
         jump.tap()
         XCTAssertTrue(newestInView(newest, above: fieldTop, in: app, timeout: 5), "control: the jump reaches the newest bubble")
-        let ghost = app.descendants(matching: .any)["chat.aiSuggestion"].firstMatch
-        XCTAssertTrue(ghost.waitForExistence(timeout: 20), "control: the AI Suggestion lands late")
+        _ = restingMinY(of: newest)
+        XCTAssertFalse(ghost.exists, "control: no AI Suggestion until the test releases it, after the jump rests")
+        app.buttons["Release the AI Suggestion"].tap()
+        XCTAssertTrue(ghost.waitForExistence(timeout: 5), "control: the AI Suggestion lands after the jump")
         XCTAssertTrue(newestInView(newest, above: replyField(in: app).frame.minY, in: app, timeout: 3),
                       "after the late row the newest bubble is still in view: \(newest.frame)")
         XCTAssertFalse(jump.waitForExistence(timeout: 2), "and the chat was never pulled back up to the Unread line")
@@ -361,6 +367,19 @@ final class ChatSwipeUITests: XCTestCase {
     }
 
     /// Whether the newest bubble's bottom is on screen, above `fieldTop`, within `timeout`.
+    /// `element`'s top once two reads half a second apart agree: where a scroll came to rest.
+    private func restingMinY(of element: XCUIElement) -> CGFloat {
+        var last = element.frame.minY
+        for _ in 0..<Self.restReads {
+            Thread.sleep(forTimeInterval: Self.restReadInterval)
+            let now = element.frame.minY
+            if abs(now - last) < 1 { return now }
+            last = now
+        }
+        XCTFail("control: the scroll came to rest: \(element.frame)")
+        return last
+    }
+
     private func newestInView(_ newest: XCUIElement, above fieldTop: CGFloat, in app: XCUIApplication, timeout: TimeInterval) -> Bool {
         let shown = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             newest.exists && newest.frame.maxY <= fieldTop + 1 && newest.frame.maxY > fieldTop - app.frame.height / 2
@@ -502,6 +521,9 @@ final class ChatSwipeUITests: XCTestCase {
     private static let scrolledAtLeast: CGFloat = 60
     /// Drags up the tall chat until the jump button shows.
     private static let jumpScrollDrags = 8
+    /// How many half-second reads `restingMinY` makes before calling the scroll still moving.
+    private static let restReads = 10
+    private static let restReadInterval: TimeInterval = 0.5
 
     /// What the fixture's list sits in: a navigation stack, a presented sheet (as search), or a
     /// collapsed split view's content column (as a mailbox).
@@ -519,6 +541,7 @@ final class ChatSwipeUITests: XCTestCase {
             + (host == .split ? ["--chat-swipe-in-split"] : [])
             + (tall ? ["--chat-swipe-tall"] : [])
             + (unread ? ["--chat-swipe-unread"] : [])
+            + (lateSuggestion ? ["--chat-swipe-late-suggestion"] : [])
             + (suggestionOnJump ? ["--chat-swipe-suggestion-on-jump"] : [])
             + (host == .tutorialCard ? ["--chat-swipe-tutorial-card"] : [])
         app.launch()
@@ -535,7 +558,6 @@ final class ChatSwipeUITests: XCTestCase {
         }
         XCTAssertTrue(app.staticTexts["Chat swipe fixture"].waitForExistence(timeout: 20))
         if armRemoval { app.buttons["Remove a bubble"].tap() }
-        if lateSuggestion { app.buttons["Arm a late suggestion"].tap() }
         app.buttons["Open chat"].tap()
         XCTAssertTrue(subject(in: app).waitForExistence(timeout: 10))
         XCTAssertTrue(bubble(host == .tutorialCard ? nil : 3, in: app).waitForExistence(timeout: 10))
