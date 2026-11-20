@@ -482,8 +482,11 @@ struct ChatReplyFieldTests {
 
     @Test("A completion empties only the words that were sent, or none; newer words stay")
     func completionClearsOnlyTheSentWords() {
-        // Nothing sent yet (a reply sent from a bubble's compose card): the words empty.
-        #expect(Self.fill(Self.typed("Anything"), .completed).words == "")
+        // No send open (a reply sent from a bubble's compose card, or nothing sent): no
+        // completion, card or answer touches the user's words.
+        #expect(Self.fill(Self.typed("Anything"), .completed).words == "Anything")
+        #expect(Self.fill(Self.typed("Anything"), .confirmationCard).words == "Anything")
+        #expect(Self.fill(Self.typed("Anything"), .answered).words == "Anything")
 
         // Sent from the collapsed field, then a newer draft typed in the open sheet.
         var fill = Self.fill(Self.typed("First request"), .sentFromField)
@@ -492,9 +495,19 @@ struct ChatReplyFieldTests {
         fill.apply(.completed)
         #expect(fill.words == "My newer draft", "words written after the send are newer")
         #expect(fill.atSend == nil)
-        // Once completed, the next completion has no send to protect.
+        // Once completed, the same request's later transitions have no send left to complete:
+        // a second compose's Send, a later confirmation card and the closing answer keep the
+        // newer draft.
         fill.apply(.completed)
-        #expect(fill.words == "")
+        #expect(fill.words == "My newer draft", "a second compose's Send keeps the newer draft")
+        fill.apply(.confirmationCard)
+        #expect(fill.words == "My newer draft", "a later confirmation card keeps the newer draft")
+        fill.apply(.answered)
+        #expect(fill.words == "My newer draft", "the closing answer keeps the newer draft")
+        #expect(fill.unsent == "My newer draft", "the newer draft is what is kept")
+        // Control: the same sequences with the sent words unchanged empty them once.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed, .completed).words == "")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed, .confirmationCard).words == "")
         // The words sent, still there: the completion empties them.
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed).words == "")
         // A compose card's Send completed the field's send; the request's closing answer after it
@@ -503,6 +516,10 @@ struct ChatReplyFieldTests {
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer"), .completed, .answered).words == "Newer")
         // An answer to a send still open empties the words sent.
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, .answered).words == "")
+        // A compose card that opened and closed without sending: the closing answer completes
+        // nothing; the sent words wait in the field, still the send's (none kept).
+        let closed = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, .answered)
+        #expect(closed.words == "Ask" && closed.atSend == "Ask" && closed.unsent == "")
 
         // From the open sheet the words go at once; a draft typed next stays through the completion.
         let sheet = Self.fill(Self.typed("Ask"), .sentFromSheet)
@@ -530,8 +547,14 @@ struct ChatReplyFieldTests {
         #expect(fill.words == "My own words")
         fill.apply(.heard("there friend, later"))
         #expect(fill.words == "My own words")
-        // So does any other change: a completion, a send, an Edit, a dictation's text.
-        for change in [ChatFieldFill.Change.completed, .sentFromSheet, .put("Edited"), .said("said")] {
+        // So does any other change: a send, an Edit, a dictation's text.
+        // A completion that empties the sent words is a change too.
+        var completed = Self.fill(Self.typed("Hi"), .sentFromField, .startHearing)
+        completed.apply(.completed)
+        #expect(completed.words == "", "control: the completion emptied the sent words")
+        completed.apply(.heard("one"))
+        #expect(completed.words == "", "a transcript after the completion is dropped")
+        for change in [ChatFieldFill.Change.sentFromSheet, .put("Edited"), .said("said")] {
             var other = Self.fill(Self.typed("Hi"), .startHearing, .heard("one"))
             other.apply(change)
             let after = other.words

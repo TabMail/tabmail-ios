@@ -672,9 +672,10 @@ struct ChatFieldWordsRuntimeTests {
     }
 
     /// Runs `producer`'s tool with `invocation` on a router of its own (no view presents the compose)
-    /// and presses its Send: the compose's `.sent` outcome. Returns the tool's result.
+    /// and presses its Send: the compose's `.sent` outcome, or closes it with `outcome`. Returns the
+    /// tool's result.
     static func sendCompose(_ producer: ComposeProducer, _ invocation: ToolInvocation, email: MessageHeader,
-                            pool: DatabasePool) async throws -> String {
+                            pool: DatabasePool, outcome: ComposeOutcome = .sent) async throws -> String {
         let translator = MockChatIdTranslator()
         await translator.seed(email.id, as: 1)
         let router = AgentToolRouter()
@@ -682,7 +683,7 @@ struct ChatFieldWordsRuntimeTests {
         let task = Task { @MainActor in try await producer.run(invocation, context: context) }
         try await ThreadChatTests.wait { router.pendingCompose != nil }
         let request = try #require(router.pendingCompose, "control: \(producer) opened its compose")
-        request.onOutcome(.sent)
+        request.onOutcome(outcome)
         return try await task.value
     }
 
@@ -755,6 +756,142 @@ struct ChatFieldWordsRuntimeTests {
             await ChatFieldWords.shared.load(key)
             #expect(ChatFieldWords.shared.fill(for: key).words == (origin == .fieldUnchanged ? "" : newerWords),
                     "a fresh store: \(ChatFieldWords.shared.fill(for: key).words)")
+        }
+    }
+
+    /// What follows a field request's first compose Send, in the same request (same invocation).
+    enum SameRequestFollowUp: String, CaseIterable, CustomTestStringConvertible {
+        /// The request's second compose (another email), sent.
+        case secondComposeSent
+        /// A later confirmation card (an archive, a template) of the same request.
+        case confirmationCard
+        var testDescription: String { rawValue }
+    }
+
+    @Test("A field request's later compose Send or confirmation card, after its first compose went out, keeps newer words; unchanged sent words still go",
+          arguments: SameRequestFollowUp.allCases, [ComposeOrigin.fieldWithNewerWords, .fieldUnchanged])
+    func sameRequestFollowUpKeepsNewerWords(_ followUp: SameRequestFollowUp, _ origin: ComposeOrigin) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can type into the hosted field")
+        try await HostedAccessibility.withAutomation { try await sameRequestFollowUpBody(followUp, origin) }
+    }
+
+    private func sameRequestFollowUpBody(_ followUp: SameRequestFollowUp, _ origin: ComposeOrigin) async throws {
+        try await Self.withDatabase { pool in
+            _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
+            try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
+            let tag = "\(followUp.rawValue)-\(origin.rawValue)"
+            let email = Self.header("follow-\(tag)", thread: "follow-thread-\(tag)")
+            try await pool.write { try email.insert($0) }
+            let key = ChatFieldWords.key(for: email)
+            let sent = "Reply that Friday works and archive the rest"
+            let newerWords = "Also ask about lunch"
+            let expected = origin == .fieldUnchanged ? "" : newerWords
+            // One invocation for the whole request: every tool round carries the same field key.
+            let invocation = Self.invocation(origin, email: email)
+            let backend = ThreadChatTests.Backend(holdAnswers: true)
+            try await ThreadChatTests.withBackend(backend, chatView: true) {
+                let host = Host(email)
+                let pill = try await Self.mount(PillView(host: host, replyField: true))
+                defer { pill.close() }
+                try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
+                let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
+                #expect(asked, "control: the request reached the backend")
+                if origin == .fieldWithNewerWords {
+                    host.expanded = true
+                    try await Task.sleep(for: .milliseconds(600))
+                    #expect(Self.type(newerWords, in: pill.view), "the open sheet has a native editable field")
+                    try await Self.settle()
+                    host.expanded = false
+                    try await Task.sleep(for: .milliseconds(600))
+                }
+
+                // The request's first compose goes out.
+                let first = try await Self.sendCompose(.reply, invocation, email: email, pool: pool)
+                #expect(first.contains("sent successfully"), "control: the first compose went out: \(first)")
+                #expect(ChatFieldWords.shared.fill(for: key).words == expected, "after the first Send")
+
+                // The same request goes on.
+                switch followUp {
+                case .secondComposeSent:
+                    let second = try await Self.sendCompose(.compose, invocation, email: email, pool: pool)
+                    #expect(second.contains("sent successfully"), "control: the second compose went out: \(second)")
+                case .confirmationCard:
+                    let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: email))
+                    let card = AgentToolRouter.ActionConfirmation(
+                        action: .archive, emails: [], contacts: [], calendarEvents: [], templates: [], onRespond: { _ in })
+                    SessionUISink(session: session, fieldWordsKey: invocation.fieldWordsKey).deliverConfirmation(card)
+                }
+                try await Self.settle()
+                #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                        "after the follow-up: \(ChatFieldWords.shared.fill(for: key).words)")
+
+                backend.proceed.signal()
+                try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
+                try await Self.settle()
+                #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                        "after the closing answer: \(ChatFieldWords.shared.fill(for: key).words)")
+                let texts = Self.fieldTexts(pill.view)
+                #expect(!texts.contains(sent), "the sent words left the field: \(texts)")
+                #expect(expected.isEmpty || texts.contains(expected), "newer words stay in the mounted field: \(texts)")
+            }
+            try await Self.open(email) { view in
+                let texts = Self.fieldTexts(view)
+                #expect(!texts.contains(sent), "the sent words never come back on reopen: \(texts)")
+                #expect(expected.isEmpty || texts.contains(expected), "newer words are there on reopen: \(texts)")
+            }
+            await ChatFieldWords.shared.written()
+            let stored = try Self.stored(pool)
+            #expect(stored == (expected.isEmpty ? [:] : [key: expected]), "\(stored)")
+            await Self.newRun { PrioritizedDatabase(pool: pool) }
+            await ChatFieldWords.shared.load(key)
+            #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                    "a fresh store: \(ChatFieldWords.shared.fill(for: key).words)")
+        }
+    }
+
+    @Test("A field request's compose closed without sending, then its answer: the sent words wait in the field; with no compose the answer empties them",
+          arguments: [true, false])
+    func closedComposeThenAnswerKeepsTheSend(_ composeClosed: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can drive the hosted field")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withDatabase { pool in
+                _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
+                try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
+                let email = Self.header("closed-\(composeClosed)", thread: "closed-thread-\(composeClosed)")
+                try await pool.write { try email.insert($0) }
+                let key = ChatFieldWords.key(for: email)
+                let sent = "Reply that Friday works"
+                let backend = ThreadChatTests.Backend(holdAnswers: true)
+                try await ThreadChatTests.withBackend(backend, chatView: true) {
+                    let host = Host(email)
+                    let pill = try await Self.mount(PillView(host: host, replyField: true))
+                    defer { pill.close() }
+                    try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
+                    let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
+                    #expect(asked, "control: the request reached the backend")
+                    if composeClosed {
+                        let result = try await Self.sendCompose(.reply, Self.invocation(.fieldUnchanged, email: email),
+                                                                email: email, pool: pool, outcome: .cancelled)
+                        #expect(!result.contains("sent successfully"), "control: the compose closed unsent: \(result)")
+                        #expect(ChatFieldWords.shared.fill(for: key).composing, "control: the compose opened for the field")
+                    }
+                    backend.proceed.signal()
+                    try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
+                    try await Self.settle()
+                    let fill = ChatFieldWords.shared.fill(for: key)
+                    let texts = Self.fieldTexts(pill.view)
+                    if composeClosed {
+                        // The compose card owned the completion: the answer completes nothing.
+                        #expect(fill.words == sent && fill.atSend == sent, "the sent words wait: \(fill.words)")
+                        #expect(texts.contains(sent), "the sent words stay in the field: \(texts)")
+                    } else {
+                        #expect(fill.words == "" && fill.atSend == nil, "the answer emptied the sent words: \(fill.words)")
+                        #expect(!texts.contains(sent), "the field is empty: \(texts)")
+                    }
+                }
+                await ChatFieldWords.shared.written()
+                #expect(try Self.stored(pool) == [:], "sent words are never kept")
+            }
         }
     }
 

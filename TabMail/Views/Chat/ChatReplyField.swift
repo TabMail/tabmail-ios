@@ -151,8 +151,8 @@ struct ChatFieldFill: Equatable {
         case sentFromSheet
         /// Send from the collapsed field: the words stay, pulsing, until the send completes.
         case sentFromField
-        /// The last send completed (its compose card's reply went out): it empties the words only
-        /// if they are still the words sent, or none.
+        /// The open send completed (its compose card's reply went out): it empties the words only
+        /// if a send is open and they are still the words sent, or none.
         case completed
         /// The agent answered the field's send: `completed`, unless a compose card opened for it.
         case answered
@@ -194,10 +194,9 @@ struct ChatFieldFill: Equatable {
             atSend = nil
             composing = false
         case .answered:
-            // A compose card's Send already completed the field's send (`atSend` nil): the
-            // request's later closing answer has nothing left to complete, and words written
-            // since are newer.
-            guard !composing, atSend != nil else { return }
+            // A compose card that opened for the send owns its completion: a closed card's
+            // closing answer leaves the words.
+            guard !composing else { return }
             if clears { words = "" }
             atSend = nil
         case .composeOpened:
@@ -208,10 +207,12 @@ struct ChatFieldFill: Equatable {
         if words != before { changes += 1 }
     }
 
-    /// Whether the last send's completion may empty the words: they are still the words sent, or
-    /// none. Anything else the user wrote after the send.
+    /// Whether a send's completion may empty the words: only while a send is open, and only if
+    /// they are still the words sent, or none. With no send open (a compose card's Send already
+    /// completed it, or nothing was sent), a later card, compose or answer of the same request
+    /// leaves the words: they are newer than the send.
     private var clears: Bool {
-        guard let atSend else { return true }
+        guard let atSend else { return false }
         return words == atSend || words.isEmpty
     }
 }

@@ -179,8 +179,15 @@ struct ChatReplyFieldRuntimeTests {
             #expect(Self.type("My question", in: controller.view), "the mounted pill has a native editable field")
             try await Self.settle()
             #expect(Self.fieldTexts(controller.view).contains("My question"), "control: the edit reached the field")
-            // A send's completion lands on the chat key the send was made under (ADR-IOS-117).
-            ChatFieldWords.shared.apply(.completed, to: ChatFieldWords.key(for: host.message))
+            let key = ChatFieldWords.key(for: host.message)
+            // Control: with no field send open, a completion leaves the user's words.
+            ChatFieldWords.shared.apply(.completed, to: key)
+            try await Self.settle()
+            #expect(Self.fieldTexts(controller.view).contains("My question"), "no send open: the words stay: \(Self.fieldTexts(controller.view))")
+            // The words sent from the field: the send's completion lands on the chat key the send
+            // was made under (ADR-IOS-117) and empties them.
+            ChatFieldWords.shared.apply(.sentFromField, to: key)
+            ChatFieldWords.shared.apply(.completed, to: key)
             try await Self.settle()
             let texts = Self.fieldTexts(controller.view)
             #expect(!texts.contains("My question"), "the completion emptied the field: \(texts)")
