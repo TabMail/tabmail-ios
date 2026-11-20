@@ -15,7 +15,6 @@ struct ChatBubbleView: View {
     var actions: [ChatSwipeButton] = []
     let onOpen: () -> Void
 
-
     var body: some View {
         VStack(alignment: item.isOwn ? .trailing : .leading, spacing: 4) {
             HStack(alignment: .bottom, spacing: 8) {
