@@ -482,6 +482,13 @@ struct ChatAISummariesNoticeHostedTests {
         #expect(field.text == reason, "control: the reason was typed")
     }
 
+    /// The alert's button itself, not a label that shares its title: only the button presses.
+    private static func alertButton(_ title: String, in alert: UIAlertController) -> NSObject? {
+        HostedAccessibility.elements(under: alert.view).first {
+            $0.accessibilityLabel == title && $0.accessibilityTraits.contains(.button)
+        }
+    }
+
     private static func sheetIsUp(_ controller: UIViewController) -> Bool {
         presentedLabels(controller).contains(ReportConcernSheetText.storedForReview)
     }
@@ -535,7 +542,7 @@ struct ChatAISummariesNoticeHostedTests {
                 try await Self.waitUntil { (Self.topPresented(controller) as? UIAlertController)?.title == "Report Submitted" }
                 let alert = try #require(Self.topPresented(controller) as? UIAlertController, "the alert shows")
                 #expect(controller.presentedViewController === alert, "only the alert is presented: \(String(describing: controller.presentedViewController))")
-                let ok = try #require(Self.element("OK", in: alert.view))
+                let ok = try #require(Self.alertButton("OK", in: alert))
                 #expect(ok.accessibilityActivate())
                 try await Self.waitUntil { controller.presentedViewController == nil }
                 #expect(controller.presentedViewController == nil, "control: the alert closed")
@@ -613,7 +620,7 @@ struct ChatAISummariesNoticeHostedTests {
                                          "the sheet closed and the alert shows: \(String(describing: Self.topPresented(controller)))")
                 #expect(alert.title == "Report Submitted")
                 #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "the sheet is gone")
-                let ok = try #require(Self.element("OK", in: alert.view), "\(HostedAccessibility.labels(in: alert.view))")
+                let ok = try #require(Self.alertButton("OK", in: alert), "\(HostedAccessibility.labels(in: alert.view))")
                 #expect(ok.accessibilityActivate())
                 try await Self.waitUntil { controller.presentedViewController == nil }
                 #expect(controller.presentedViewController == nil,
@@ -1055,6 +1062,8 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
+    /// The report's binding lives on the button, which outlives the popover: only the shared
+    /// sheet's tie between an answer and its own presentation keeps the old answer off the new one.
     @Test("The notice stays mounted: an answer from a closed popover's report never reaches the reopened one")
     func aClosedPopoversAnswerNeverReachesTheNext() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")

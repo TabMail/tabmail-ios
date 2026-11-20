@@ -82,6 +82,9 @@ struct AISummariesNoticeButton: View {
     var send: ReportConcernSend = ReportConcernService.sendReport
 
     @State private var showsNotice = false
+    /// The report sheet over the popover. Kept here, not in the popover's content: SwiftUI did not
+    /// reliably observe that state, so Cancel and the answer could not close the sheet.
+    @State private var showsReport = false
     #if DEBUG
     /// Tells mounted buttons apart in the debug log.
     @State private var debugTag = String(UUID().uuidString.prefix(4))
@@ -110,7 +113,7 @@ struct AISummariesNoticeButton: View {
         .accessibilityLabel(AISummariesNotice.accessibilityLabel)
         .accessibilityHint(AISummariesNotice.accessibilityHint)
         .popover(isPresented: $showsNotice, arrowEdge: .top) {
-            AISummariesNoticePopover(reportContent: reportContent, send: send, tag: tag) {
+            AISummariesNoticePopover(reportContent: reportContent, send: send, tag: tag, showsReport: $showsReport) {
                 noticeDebugLog(tag, "report finished, closing the popover")
                 showsNotice = false
             }
@@ -144,16 +147,16 @@ struct AISummariesNoticeButton: View {
     }
 }
 
-/// The popover's content. It owns the report sheet's state, so the sheet, its binding and any
-/// report still sending all end with this popover: a late answer cannot reach a later one.
+/// The popover's content: the note, "Report a concern", and the report sheet it presents. An
+/// answer from a report whose popover has gone cannot reach a later one: the shared sheet ties
+/// each answer to its own presentation.
 private struct AISummariesNoticePopover: View {
     let reportContent: () -> String
     let send: ReportConcernSend
     let tag: String
     /// The report is done: the popover closes.
+    @Binding var showsReport: Bool
     let onFinish: () -> Void
-
-    @State private var showsReport = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: ChatViewLayout.aiNoticeSpacing) {

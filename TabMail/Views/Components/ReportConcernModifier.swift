@@ -148,6 +148,15 @@ struct ReportConcernSheetModifier: ViewModifier {
                 selectedCategory = .offensive
                 reason = ""
             }
+            // The view presenting the sheet has gone, so the sheet has too, even when nothing
+            // ran its onDismiss (a parent removed it with the sheet still up): retire this
+            // presentation so an answer still on its way acts on nothing, and record that no
+            // sheet is up, so the caller's binding does not reopen it with a later view.
+            .onDisappear {
+                presentation.next()
+                isSubmitting = false
+                isPresented = false
+            }
             .sheet(isPresented: $isPresented, onDismiss: {
                 // This presentation has ended: an answer still on its way acts on nothing.
                 presentation.next()
