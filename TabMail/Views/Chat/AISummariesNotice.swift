@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import SwiftUI
+import UIKit
 
 /// The chat view's notice that its messages are AI summaries: a gray sparkles glyph at the top
 /// right of the chat header. A tap opens a popover with the note and "Report a concern". The same
@@ -85,13 +86,23 @@ struct AISummariesNoticeButton: View {
     @State private var autoRequested = false
     @State private var reportRequested = false
     @State private var showsReport = false
+    /// UIKit has put the popover in a window. SwiftUI runs the popover's `onAppear` even when UIKit
+    /// refuses the presentation (something else is presented), so only this counts as shown.
+    @State private var onScreen = false
     @ScaledMetric(relativeTo: .footnote) private var glyphSize = ChatViewLayout.aiNoticeGlyphSize
 
     var body: some View {
         Button {
             // A tap always shows it, whatever the landing asked for.
             autoRequested = false
-            showsNotice = true
+            if showsNotice, !onScreen {
+                // A refused presentation left the request set with nothing on screen, and SwiftUI
+                // never retries it: clear it, then ask again on the next turn.
+                showsNotice = false
+                Task { @MainActor in showsNotice = true }
+            } else {
+                showsNotice = true
+            }
         } label: {
             Image(systemName: AISummariesNotice.glyph)
                 .font(.system(size: glyphSize))
@@ -104,7 +115,8 @@ struct AISummariesNoticeButton: View {
         .accessibilityHint(AISummariesNotice.accessibilityHint)
         .popover(isPresented: $showsNotice, arrowEdge: .top) {
             popover
-                .onAppear {
+                .background(WindowProbe {
+                    onScreen = true
                     // Another chat may have shown it since this one asked: then this one closes
                     // unseen, so it opens by itself at most once across every mounted chat.
                     if autoRequested, !firstOpen.isDue(landed: true, tipsAllowed: true) {
@@ -114,14 +126,16 @@ struct AISummariesNoticeButton: View {
                     }
                     autoRequested = false
                     firstOpen.markShown()
+                })
+                .onDisappear {
+                    onScreen = false
+                    // The sheet waits until the popover has gone: UIKit refuses a second
+                    // presentation while the popover is still closing.
+                    if reportRequested {
+                        reportRequested = false
+                        showsReport = true
+                    }
                 }
-        }
-        .onChange(of: showsNotice) { _, shows in
-            // The sheet waits for the popover to close: one presentation at a time.
-            if !shows, reportRequested {
-                reportRequested = false
-                showsReport = true
-            }
         }
         .reportConcernSheet(isPresented: $showsReport, contentType: .summary,
                             content: reportContent, contentNotice: AISummariesNotice.reportNotice, send: send)
@@ -158,5 +172,31 @@ struct AISummariesNoticeButton: View {
         .padding()
         .frame(idealWidth: ChatViewLayout.aiNoticeWidth)
         .presentationCompactAdaptation(.popover)
+    }
+}
+
+/// Calls `onWindow` when UIKit puts this view in a window, which happens only for a presentation
+/// that is actually shown.
+private struct WindowProbe: UIViewRepresentable {
+    let onWindow: () -> Void
+
+    final class Probe: UIView {
+        var onWindow: () -> Void = {}
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window != nil { onWindow() }
+        }
+    }
+
+    func makeUIView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.isUserInteractionEnabled = false
+        probe.onWindow = onWindow
+        return probe
+    }
+
+    func updateUIView(_ probe: Probe, context: Context) {
+        probe.onWindow = onWindow
     }
 }

@@ -520,8 +520,8 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
-    @Test("A tap on a waiting automatic request stays open even when another chat shows the notice first")
-    func aTapOverAWaitingRequestStaysOpen() async throws {
+    @Test("A chat that landed under another screen: once it closes, a tap opens the notice and it stays open, even though another chat showed it")
+    func aTapAfterARefusedLandingStaysOpen() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
         let firstOpen = Self.freshFirstOpen()
         try await HostedAccessibility.withAutomation {
@@ -529,19 +529,23 @@ struct ChatAISummariesNoticeHostedTests {
             try await Self.hosting(Color.clear) { controller in
                 controller.present(blocker, animated: false)
                 try await Self.waitUntil { controller.presentedViewController === blocker }
-                // Lands while it cannot present: the automatic request waits.
+                // The chat lands while another screen is up: UIKit refuses the popover, and the
+                // automatic request stays set.
                 let notice = UIHostingController(rootView: Self.button(landed: true, firstOpen: firstOpen, tipsAllowed: true))
                 controller.addChild(notice)
                 controller.view.addSubview(notice.view)
                 notice.view.frame = controller.view.bounds
                 notice.didMove(toParent: controller)
                 try await Task.sleep(for: .seconds(1))
+                #expect(firstOpen.isDue(landed: true, tipsAllowed: true), "control: the refused popover did not use it up")
+                blocker.dismiss(animated: false)
+                try await Self.waitUntil { controller.presentedViewController == nil }
+                firstOpen.markShown()  // another chat shows it
+                // The user taps the glyph, now on screen.
                 let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: notice.view))
                 #expect(glyph.accessibilityActivate(), "the user taps")
-                firstOpen.markShown()  // another chat shows it first
-                blocker.dismiss(animated: false)
                 try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
-                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "the tapped notice opens")
+                #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "the tap opens it")
                 try await Task.sleep(for: .seconds(1))
                 #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title), "and it stays open")
                 controller.presentedViewController?.dismiss(animated: false)
