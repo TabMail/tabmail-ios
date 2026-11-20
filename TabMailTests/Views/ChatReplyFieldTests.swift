@@ -673,6 +673,24 @@ struct ChatReplyFieldTests {
         #expect(ChatViewLayout.fieldCornerRadius * 2 == 42)
     }
 
+    @Test("A one-time tip above the field says what the drag up shows, and a tap or the first drag ends it")
+    func fieldDragTip() throws {
+        #expect(ChatFieldDragTip.text == "Drag up to see what you asked TabMail about this conversation.")
+        let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        // Above the field (its arrow points down at it), never over the open panel or the tutorial.
+        #expect(Self.count(".popoverTip(chatExpanded || TutorialCoordinator.shared.isRunning ? nil : ChatFieldDragTip(), arrowEdge: .bottom)", in: chat) == 1)
+        // A tap on the field focuses it; the first drag swells it: each ends the tip for good.
+        #expect(Self.count(".onChange(of: chatInputFocused) { _, focused in if focused { ChatFieldDragTip.close() } }", in: chat) == 1)
+        #expect(Self.count("if fieldSwell > 0 { ChatFieldDragTip.close() }", in: chat) == 1)
+        let tips = try Self.source("TabMail/Views/Components/AppTips.swift")
+        let start = try #require(tips.range(of: "struct ChatFieldDragTip: Tip {"))
+        let end = try #require(tips[start.upperBound...].range(of: "struct ComposeChatPillTip: Tip {"))
+        let tip = String(tips[start.upperBound..<end.lowerBound])
+        #expect(Self.count("MaxDisplayCount(1)", in: tip) == 1, "shown once")
+        #expect(Self.count("invalidate(reason: .actionPerformed)", in: tip) == 1)
+        #expect(Self.count("OnboardingTipGate.$onboardingComplete", in: tip) == 1, "today's tip gate")
+    }
+
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")

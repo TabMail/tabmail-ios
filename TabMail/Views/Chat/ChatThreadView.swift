@@ -4,6 +4,7 @@
 
 import GRDB
 import SwiftUI
+import TipKit
 
 #if DEBUG
 extension Notification.Name {
@@ -811,6 +812,10 @@ struct ChatThreadView: View {
             // Drag the field up: it swells under the finger and opens the TabMail chat panel. Not
             // in the tutorial, whose steps open the chat themselves.
             .simultaneousGesture(fieldDrag, isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning)
+            // Once, above the field: what the drag up shows. Not over the tutorial or the panel.
+            .popoverTip(chatExpanded || TutorialCoordinator.shared.isRunning ? nil : ChatFieldDragTip(), arrowEdge: .bottom)
+            // A tap on the field (it takes focus) ends the tip.
+            .onChange(of: chatInputFocused) { _, focused in if focused { ChatFieldDragTip.close() } }
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.replyPillId)
@@ -825,6 +830,8 @@ struct ChatThreadView: View {
         DragGesture(minimumDistance: ChatViewLayout.fieldDragMinimumDistance)
             .onChanged { value in
                 fieldSwell = ChatFieldDrag.swell(translation: value.translation)
+                // The first drag ends the tip.
+                if fieldSwell > 0 { ChatFieldDragTip.close() }
             }
             .onEnded { value in
                 let opens = ChatFieldDrag.opens(

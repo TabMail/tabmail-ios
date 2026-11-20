@@ -943,6 +943,13 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel` and
    `testShortDragUpOnTheReplyFieldSettlesBack`.
 
+20. **The first-time drag tip (amendment 2026-11-20).** Once, above the collapsed reply field, a
+   tip in today's TipKit style (`ChatFieldDragTip`, behind the onboarding gate, shown at most once)
+   says "Drag up to see what you asked TabMail about this conversation." It goes away for good on a
+   tap (the field takes focus, or the popover's own dismissal) or on the first drag up
+   (`invalidate(reason: .actionPerformed)`), and is not shown over the open panel or in the
+   tutorial; there is no tutorial step for it. Test: `ChatReplyFieldTests.fieldDragTip`.
+
 ## The longer index line (routed 2026-11-09)
 
 The DECISIONS.md row grew with each decision of the chat view; it moved here when the index went
