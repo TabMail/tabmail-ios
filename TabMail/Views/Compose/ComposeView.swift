@@ -1112,6 +1112,8 @@ struct ComposeView: View {
     /// nothing: a save now would carry the not-yet-loaded attachments as none and
     /// delete the saved files.
     @State private var isHydratingPreparedDraft = false
+    /// Debug logging only: when this card's onAppear ran, for the bodyBranch log's timing.
+    @State private var debugAppearedAt: ContinuousClock.Instant?
     /// PORT — sticky initial-read state from v2final ComposeDraftGuards.
     /// `.error` is never reinterpreted as genuine absence later in this view.
     @State private var draftReadState: ComposeDraftGuards.ReadState = .notFound
@@ -1837,6 +1839,7 @@ struct ComposeView: View {
             .onAppear { performLifecycleAppear() }
             .onDisappear { performDisappear() }
             .onChange(of: showingSuggestion) { old, new in logShowingSuggestionChange(old, new) }
+            .onChange(of: bodyBranchKey, initial: true) { _, key in logBodyBranch(key) }
             .onChange(of: selectedAccount) {
                 currentSignature = selectedAccount?.signature ?? ""
             }
@@ -1979,6 +1982,20 @@ struct ComposeView: View {
     }
 
     /// Debug-gated: the suggestion bubble entering or leaving the card.
+    /// Debug-gated diagnostics: every input of the body's bubble-or-editor branch, in one value.
+    private var bodyBranchKey: String {
+        "showing=\(showingSuggestion) suggestionLen=\(currentSuggestion?.count ?? -1) read=\(draftReadState) "
+            + "hydrating=\(isHydratingPreparedDraft) checkingServer=\(isCheckingServerCopy) quoted=\(quotedHTML != nil)"
+    }
+
+    private func logBodyBranch(_ key: String) {
+        if DebugModeManager.isLoggingEnabled() {
+            let bubble = showingSuggestion && !(currentSuggestion ?? "").isEmpty
+            let sinceAppear = debugAppearedAt.map { "\(($0.duration(to: .now) / .milliseconds(1)).rounded())" } ?? "beforeAppear"
+            BackgroundSyncLogger.logDebug("[ComposeView] bodyBranch instance=\(instanceToken) branch=\(bubble ? "bubble" : "editor") msSinceAppear=\(sinceAppear) key=\(key)")
+        }
+    }
+
     private func logShowingSuggestionChange(_ old: Bool, _ new: Bool) {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ComposeView] showingSuggestion \(old)->\(new) instance=\(instanceToken) suggestionLen=\(currentSuggestion?.count ?? -1)")
@@ -2038,6 +2055,7 @@ struct ComposeView: View {
         // block, so the two calls always name the same id.
         DraftSessionRegistry.shared.register(draftId)
         if DebugModeManager.isLoggingEnabled() {
+            debugAppearedAt = ContinuousClock.now
             BackgroundSyncLogger.logDebug("[ComposeView] onAppear instance=\(instanceToken) draftId=\(draftId)")
         }
         contactSearch.requestAccess()
