@@ -51,7 +51,50 @@ struct ChatFieldWordsTests {
             var writes = 0
             /// The keys of every batch handed to the storage, in order.
             var batches: [Set<String>] = []
+            /// The fuzzer's seeded faults and latency (`enableChaos`); nil: none.
+            var chaos: Chaos?
         }
+
+        /// Seeded faults and latency for the fuzzer: a write fails before its transaction one
+        /// time in `faultOneIn`, and every read and write parks for up to `maxLatency` before and
+        /// after the database, stretching the await windows where the store's races live.
+        struct Chaos {
+            var rng: SplitMix64
+            let faultOneIn: Int
+            let maxLatencyMicroseconds: Int
+        }
+
+        /// Where a read or write parks.
+        private func chaosPoint() async {
+            let micros = state.withLock { state -> Int? in
+                guard var chaos = state.chaos else { return nil }
+                defer { state.chaos = chaos }
+                return chaos.rng.pick(chaos.maxLatencyMicroseconds + 1)
+            }
+            guard let micros else { return }
+            if micros % 2 == 0 {
+                for _ in 0..<(micros % 7) { await Task.yield() }
+            } else {
+                try? await Task.sleep(for: .microseconds(micros))
+            }
+        }
+
+        /// Whether the fuzzer fails this write.
+        private func chaosFault() -> Bool {
+            state.withLock { state in
+                guard var chaos = state.chaos else { return false }
+                defer { state.chaos = chaos }
+                return chaos.rng.pick(chaos.faultOneIn) == 0
+            }
+        }
+
+        func enableChaos(seed: UInt64, faultOneIn: Int, maxLatencyMicroseconds: Int) {
+            state.withLock {
+                $0.chaos = Chaos(rng: SplitMix64(seed: seed), faultOneIn: faultOneIn, maxLatencyMicroseconds: maxLatencyMicroseconds)
+            }
+        }
+
+        func disableChaos() { state.withLock { $0.chaos = nil } }
 
         struct Refused: Error {}
 
@@ -75,7 +118,9 @@ struct ChatFieldWordsTests {
                         if !held { continuation.resume() }
                     }
                     if state.withLock({ $0.failsReads }) { throw Refused() }
+                    await chaosPoint()
                     let result = try await base.read(key)
+                    await chaosPoint()
                     // A held result: the read has its words and waits to hand them over.
                     await withCheckedContinuation { continuation in
                         let held = state.withLock { state in
@@ -98,8 +143,10 @@ struct ChatFieldWordsTests {
                         }
                         if !held { continuation.resume() }
                     }
-                    if state.withLock({ $0.failsWrites }) { throw Refused() }
+                    await chaosPoint()
+                    if state.withLock({ $0.failsWrites }) || chaosFault() { throw Refused() }
                     let refused = try await base.write(batch)
+                    await chaosPoint()
                     // A held return: the transaction is done and its answer waits.
                     await withCheckedContinuation { continuation in
                         let held = state.withLock { state in
@@ -324,6 +371,45 @@ struct ChatFieldWordsTests {
             await store.written()
             let newer = try Self.rows(pool)
             #expect(newer.map(\.words) == ["And bring the slides"])
+        }
+    }
+
+    @Test("A live transcript after a field Send makes the words newly written: kept in full, read by the next run, and left by the answer; unedited sent words go",
+          arguments: [false, true])
+    func liveTranscriptAfterAFieldSendIsKept(edited: Bool) async throws {
+        try await Self.withStore { pool, storage, store in
+            let key = ChatFieldWords.key(for: Self.header("lt-1", thread: "live-transcript-\(edited)"))
+            let sent = "Ask her about Tuesday"
+            let said = "and whether Friday works too"
+            let full = DictationController.appending(said, to: sent)
+            store.apply(.put(sent), to: key)
+            store.apply(.sentFromField, to: key)
+            await store.written()
+            let atSend = try Self.rows(pool)
+            #expect(atSend.isEmpty, "control: the sent words are not kept while the send is open")
+            if edited {
+                store.apply(.startHearing, to: key)
+                store.apply(.heard(said), to: key)
+                #expect(store.fill(for: key).words == full, "control: the transcript adds to the sent words")
+                await store.written()
+                let afterHeard = try Self.storedWords(pool)
+                #expect(afterHeard == [key: full], "the edited words are kept in full: \(afterHeard)")
+                #expect(await Self.nextRun(storage, key) == full, "and a new run on the same database reads them")
+            }
+            // The send's answer, then its card's completion.
+            store.apply(.answered, to: key)
+            store.apply(.completed, to: key)
+            await store.written()
+            let stored = try Self.storedWords(pool)
+            if edited {
+                #expect(store.fill(for: key).words == full, "the answer leaves the newly written words")
+                #expect(stored == [key: full], "\(stored)")
+                #expect(await Self.nextRun(storage, key) == full)
+            } else {
+                #expect(store.fill(for: key).words == "", "control: the unedited sent words go with the answer")
+                #expect(stored.isEmpty, "\(stored)")
+                #expect(await Self.nextRun(storage, key) == "")
+            }
         }
     }
 
@@ -1088,6 +1174,143 @@ struct ChatFieldWordsTests {
             await run.written()
             let stored = try Self.storedWords(pool)
             #expect(stored == [real: "Real words", demo: "Next demo's words"], "\(stored)")
+        }
+    }
+
+    // MARK: - 9. Seeded concurrency fuzz
+
+    /// The fuzzer's bounds: a fixed seed list, a small iteration count, and the faults and
+    /// latency injected into storage.
+    enum FuzzConfig {
+        static let seeds: [UInt64] = [1, 7, 42, 1009, 65_537]
+        static let iterationsPerSeed = 4
+        static let operationsPerIteration = 60
+        static let writeFaultOneIn = 4
+        static let maxLatencyMicroseconds = 400
+    }
+
+    /// Seeded random sequences of field changes (put, send, answer, transcript), reads, save points,
+    /// writes, account removals that commit or roll back (overlapping holds included) and demo
+    /// reopens, against storage with seeded write faults and latency before and after the database.
+    /// Checked against a model, never a schedule: the newest unsent words of a live chat are in its
+    /// field and on disk once a save point succeeds (a failed write's words included), a load never
+    /// changes a fill, and a removed account's or an ended demo's words never come back.
+    @Test("Seeded fuzz: the newest unsent words win, failed writes are retried, retired chats never get words back",
+          arguments: FuzzConfig.seeds)
+    func seededConcurrencyFuzz(seed: UInt64) async throws {
+        for iteration in 0..<FuzzConfig.iterationsPerSeed {
+            try await Self.fuzzOnce(seed: seed &+ UInt64(iteration) &* 0x1_0000_0001, label: "seed \(seed) iteration \(iteration)")
+        }
+    }
+
+    private static func fuzzOnce(seed: UInt64, label: String) async throws {
+        DemoModeStore.shared._resetForTests()
+        defer { DemoModeStore.shared._resetForTests() }
+        try await withStore { pool, storage, store in
+            DemoModeStore.shared.isActive = true
+            var rng = SplitMix64(seed: seed)
+            storage.enableChaos(seed: seed ^ 0xC4A0_5EED, faultOneIn: FuzzConfig.writeFaultOneIn,
+                                maxLatencyMicroseconds: FuzzConfig.maxLatencyMicroseconds)
+            let accounts = ["fz-a", "fz-b", DemoSeed.demoAccountId]
+            let keysOf: [String: [String]] = [
+                "fz-a": ["fz-a-1", "fz-a-2"].map { ChatThreadKey.key(accountId: "fz-a", threadId: $0) },
+                "fz-b": ["fz-b-1", "fz-b-2"].map { ChatThreadKey.key(accountId: "fz-b", threadId: $0) },
+                DemoSeed.demoAccountId: [demoKey("fz-d-1"), demoKey("fz-d-2")],
+            ]
+            let keys = accounts.flatMap { keysOf[$0]! }
+            let accountOf = Dictionary(uniqueKeysWithValues: accounts.flatMap { a in keysOf[a]!.map { ($0, a) } })
+            // The model: each live chat's fill, and the accounts whose words are retired.
+            var model: [String: ChatFieldFill] = [:]
+            var retired: Set<String> = []
+            var open: [ChatFieldWords.Removal] = []
+            var loads: [Task<Void, Never>] = []
+            var log: [String] = []
+            let texts = ["", "Sounds good", "Tuesday works", "See you then", "Sounds good"]
+
+            for _ in 0..<FuzzConfig.operationsPerIteration {
+                let roll = rng.pick(100)
+                if roll < 50 {
+                    let key = keys[rng.pick(keys.count)]
+                    let change: ChatFieldFill.Change
+                    switch rng.pick(10) {
+                    case 0...3: change = .put(texts[rng.pick(texts.count)] + (rng.pick(2) == 0 ? "" : " \(rng.pick(9))"))
+                    case 4: change = .sentFromField
+                    case 5: change = .answered
+                    case 6: change = .completed
+                    case 7: change = .startHearing
+                    case 8: change = .heard("and Friday \(rng.pick(9))")
+                    default:
+                        let rare: [ChatFieldFill.Change] = [.sentFromSheet, .composeOpened, .confirmationCard]
+                        change = rare[rng.pick(rare.count)]
+                    }
+                    log.append("apply \(change) \(key)")
+                    store.apply(change, to: key)
+                    if !retired.contains(accountOf[key]!) { model[key, default: ChatFieldFill()].apply(change) }
+                } else if roll < 58 {
+                    let key = keys[rng.pick(keys.count)]
+                    log.append("load \(key)")
+                    loads.append(Task { await store.load(key) })
+                } else if roll < 64 {
+                    let account = accounts[rng.pick(accounts.count)]
+                    log.append("beginRemoval \(account)")
+                    open.append(store.beginRemoval(account))
+                } else if roll < 70, !open.isEmpty {
+                    let removal = open.remove(at: rng.pick(open.count))
+                    if rng.pick(3) == 0 {
+                        log.append("commitRemoval \(removal.accountId)")
+                        let account = removal.accountId
+                        try await pool.write { try AccountManager.removeAccountRowsTxn($0, accountId: account, wasPrimary: false) }
+                        store.commitRemoval(removal)
+                        retired.insert(account)
+                        for key in keysOf[account]! { model[key] = nil }
+                    } else {
+                        log.append("rollBackRemoval \(removal.accountId)")
+                        store.rollBackRemoval(removal)
+                    }
+                } else if roll < 73 {
+                    // The demo ends with its account removed, and the next one is seeded.
+                    log.append("demoReopen")
+                    try await remove(DemoSeed.demoAccountId, store: store, pool: pool)
+                    try await endDemoAndStartTheNext(store, pool: pool)
+                    store.reopenAccount(DemoSeed.demoAccountId)
+                    retired.remove(DemoSeed.demoAccountId)
+                    for key in keysOf[DemoSeed.demoAccountId]! { model[key] = nil }
+                } else if roll < 80 {
+                    log.append("written")
+                    await store.written()
+                } else if roll < 85 {
+                    log.append("saveUnwritten")
+                    store.saveUnwritten()
+                } else {
+                    for _ in 0..<rng.pick(6) { await Task.yield() }
+                }
+                for key in keys {
+                    let expected = retired.contains(accountOf[key]!) ? "" : (model[key]?.words ?? "")
+                    #expect(store.fill(for: key).words == expected,
+                            "\(label): the field of \(key) is not the newest words; ops: \(log)")
+                }
+            }
+
+            // Quiesce: loads land, every hold ends, faults stop, and one save point succeeds.
+            for load in loads { await load.value }
+            for removal in open { store.rollBackRemoval(removal) }
+            await store.written()
+            storage.disableChaos()
+            store.saveUnwritten()
+            await store.written()
+
+            let stored = try storedWords(pool)
+            for key in keys {
+                let gone = retired.contains(accountOf[key]!)
+                let words = gone ? "" : (model[key]?.words ?? "")
+                let unsent = gone ? "" : (model[key]?.unsent ?? "")
+                #expect(store.fill(for: key).words == words,
+                        "\(label): a load or late write changed the field of \(key); ops: \(log)")
+                #expect(stored[key] == (unsent.isEmpty ? nil : unsent),
+                        "\(label): \(key) stored \(stored[key] ?? "nothing"), the newest unsent words are \"\(unsent)\" (retired: \(gone)); ops: \(log)")
+                #expect(await nextRun(storage, key) == unsent,
+                        "\(label): a new run reads the wrong words for \(key); ops: \(log)")
+            }
         }
     }
 }
