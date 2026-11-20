@@ -142,10 +142,11 @@ struct AISummariesNoticeButton: View {
         }
     }
 
-    /// Opens the notice afresh, with no sheet up: the system may have closed the last popover with
-    /// its sheet still up, so nothing cleared the flag.
+    /// Opens the notice afresh. A report from an earlier popover is over: the system may have
+    /// closed that popover with its sheet still up, so nothing cleared the flag or ended the
+    /// presentation. Retire it, so a late answer acts on nothing, and start with no sheet up.
     private func openNotice() {
-        // The sheet's open handler retires the earlier report's presentation when the next opens.
+        reportPresentation.next()
         showsReport = false
         showsNotice = true
     }

@@ -1074,8 +1074,9 @@ struct ChatAISummariesNoticeHostedTests {
     func aSystemClosedPopoversAnswerNeverReachesTheNext() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
         // When the old answer arrives: after the notice reopens but before its report opens,
-        // after the next report opens but before it sends, or after it sends.
-        for answerAt in ["beforeReportOpens", "beforeNextSend", "afterNextSend"] {
+        // between the press on "Report a concern" and the sheet's open handler, after the next
+        // report opens but before it sends, or after it sends.
+        for answerAt in ["beforeReportOpens", "betweenPressAndOpen", "beforeNextSend", "afterNextSend"] {
             let held = HeldSend()
             try await HostedAccessibility.withAutomation {
                 let button = AISummariesNoticeButton(landed: false, reportContent: { "Summary" }, firstOpen: Self.freshFirstOpen(),
@@ -1104,8 +1105,15 @@ struct ChatAISummariesNoticeHostedTests {
                     }
                     let popover = try #require(Self.topPresented(controller)?.view)
                     let report = try #require(Self.element(AISummariesNotice.reportTitle, in: popover))
+                    if answerAt == "betweenPressAndOpen" {
+                        // The answer resumes on the main actor before SwiftUI's next update runs the
+                        // sheet's open handler for the press below: nothing yields between the two.
+                        held.release(1, true)
+                    }
                     #expect(report.accessibilityActivate())
                     try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
+                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
+                            "\(answerAt): the press opens the next report's sheet")
                     let sheetView = try #require(Self.topPresented(controller)?.view, "control: the next report's sheet")
                     if answerAt == "beforeNextSend" {
                         held.release(1, true)
