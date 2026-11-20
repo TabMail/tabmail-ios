@@ -1275,7 +1275,7 @@ struct UndoProviderIdentitySafetyTests {
 
     /// Refuses the commit that would delete an Outbox row, so the Send's Undo
     /// cannot confirm its cancellation.
-    private final class OutboxDeleteCommitRefuser: TransactionObserver, Sendable {
+    final class OutboxDeleteCommitRefuser: TransactionObserver, Sendable {
         struct Refused: Error {}
         private let deleting = Mutex(false)
         let refusals = Mutex(0)

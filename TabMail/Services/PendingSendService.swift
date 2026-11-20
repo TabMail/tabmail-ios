@@ -207,7 +207,8 @@ final class PendingSendService {
     /// The one presenter of each send's Undo, by outbox row id, decided ONCE at Send from the
     /// send's own settings snapshot (`present(owner:)`). Both presenters honour it, so a chat view
     /// switched on or off during the window applies to the next send only: never two Undos for
-    /// one send, never none. In memory only; an entry ends with its send's toast lifetime. A row
+    /// one send, never none. The one change: a toast that stops showing a send still in its window
+    /// hands that send to its bubble (`releaseToast`). In memory only; an entry ends with its send's toast lifetime. A row
     /// with no entry was not sent in this run of the app (see `ChatUnsentReply.bubbleOffersUndo`).
     private(set) var undoOwners: [String: UndoOwner] = [:]
     private var ownerExpiry: [String: Task<Void, Never>] = [:]
@@ -262,7 +263,7 @@ final class PendingSendService {
 
     /// Show the undo-send toast for the given outboxId. Replaces any
     /// previously-displayed pending (the prior message continues draining on
-    /// its own schedule).
+    /// its own schedule; its Undo passes to its bubble, `releaseToast`).
     ///
     /// `holdUntil` is the durable `OutboxMessage.holdUntil` of the row this toast
     /// represents, as returned by `AccountManager.queueSend`. It is REQUIRED, with
@@ -294,6 +295,7 @@ final class PendingSendService {
         // A send whose Undo is on its bubble leaves any toast showing untouched: that toast is
         // another send's only Undo.
         guard owner == .toast else { return }
+        if current?.id != outboxId { releaseToast(at: now) }
         dismissTask?.cancel()
         undoFailureMessage = nil
         current = Pending(
@@ -523,8 +525,20 @@ final class PendingSendService {
     /// User tapped the × on the toast. Hides the toast but doesn't cancel the
     /// send — the message continues through its normal drain flow.
     func dismiss() {
+        releaseToast(at: Date())
         dismissTask?.cancel()
         undoFailureMessage = nil
         current = nil
+    }
+
+    /// The toast stops showing `current` (another send's toast replaces it, or the user closed
+    /// it). If that send can still be undone, its Undo passes to its chat bubble: a toast-owned
+    /// reply (sent with the chat view off) still shows a bubble in its chat, and must keep exactly
+    /// one Undo. A send with no bubble (a new email) has none left, as before this change; it
+    /// still goes as asked.
+    private func releaseToast(at instant: Date) {
+        guard let p = current, undoOwners[p.id] == .toast,
+              instant < OutboxCancellationPolicy.undoDeadline(for: p.holdUntil) else { return }
+        undoOwners[p.id] = .bubble
     }
 }

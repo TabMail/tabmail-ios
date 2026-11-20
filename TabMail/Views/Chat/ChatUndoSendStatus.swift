@@ -24,14 +24,21 @@ extension ChatUnsentReply {
         return Int(undoDeadline.timeIntervalSince(instant).rounded(.up))
     }
 
+    /// The row's delivery has settled: the provider took the email, or the send failed (its own
+    /// "Not sent" look). A row still queued or sending has not, however long it waits (offline).
+    var deliverySettled: Bool {
+        sentAt != nil || failed
+    }
+
     /// How the bubble looks at `instant`: pending while Undo is offered, with the solid blue risen
     /// by the part of the undo window that has passed, then solid. The window is the toast's: the
     /// nominal hold up to the same deadline, so a slow persist starts the fill part-way up and
-    /// never moves its end. Under Reduce Motion the fill does not rise; the bubble stays pending
-    /// until the deadline and the text countdown carries the time.
+    /// never moves its end. Under Reduce Motion the fill does not rise, and the look follows
+    /// delivery, not Undo: pending (no fill) until the email is sent, then solid. The text
+    /// countdown carries the Undo time, so a queued or offline reply never looks sent.
     func undoLook(at instant: Date, reduceMotion: Bool) -> ChatUndoSendLook {
+        guard !reduceMotion else { return deliverySettled ? .solid : .pending(fill: 0) }
         guard undoSecondsLeft(at: instant) != nil else { return .solid }
-        guard !reduceMotion else { return .pending(fill: 0) }
         let window = SyncConfig.outboxUndoHoldSeconds
         let passed = window - undoDeadline.timeIntervalSince(instant)
         return .pending(fill: max(0, min(1, passed / window)))

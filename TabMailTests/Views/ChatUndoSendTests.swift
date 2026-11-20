@@ -5,6 +5,7 @@
 import Foundation
 import GRDB
 import SwiftUI
+import Synchronization
 import Testing
 import UIKit
 @testable import TabMail
@@ -112,16 +113,23 @@ struct ChatUndoSendTests {
         #expect(Self.reply(sentAt: now, holdUntil: hold).undoLook(at: now, reduceMotion: false) == .solid)
     }
 
-    @Test("Under Reduce Motion the fill does not rise: pending and empty until the deadline, redrawn only when the seconds change")
+    @Test("Under Reduce Motion the fill does not rise, and the bubble turns solid when the email is sent, not when Undo ends")
     func reduceMotionHasNoRisingFill() {
         let hold = Date().addingTimeInterval(4.5)
         let row = Self.reply(holdUntil: hold)
         let deadline = row.undoDeadline
-        for offset in stride(from: -4.0, to: 0.0, by: 0.25) {
+        // Queued, before and after the Undo window ends (a claim buffer, or offline for long).
+        for offset in [-4.0, -2.0, -0.25, 0.0, 0.5, 1.0, 30.0, 600.0] {
             #expect(row.undoLook(at: deadline.addingTimeInterval(offset), reduceMotion: true) == .pending(fill: 0),
-                    "at \(offset)")
+                    "queued at \(offset): pending, never solid before it is sent")
         }
-        #expect(row.undoLook(at: deadline, reduceMotion: true) == .solid, "solid when the window ends")
+        #expect(Self.reply(status: .sending, holdUntil: hold).undoLook(at: deadline.addingTimeInterval(1), reduceMotion: true)
+                == .pending(fill: 0), "sending is not sent")
+        #expect(Self.reply(sentAt: Date(), holdUntil: hold).undoLook(at: deadline.addingTimeInterval(1), reduceMotion: true)
+                == .solid, "solid once the email is sent")
+        #expect(Self.reply(status: .failed, holdUntil: hold).undoLook(at: deadline, reduceMotion: true) == .solid,
+                "a failed send has its own Not sent look on the ordinary bubble")
+        #expect(row.undoSecondsLeft(at: deadline) == nil, "control: Undo itself still ends at the deadline")
         let start = deadline.addingTimeInterval(-4)
         let still = ChatUndoSendSchedule(deadline: deadline, animatesFill: false)
         #expect(still.entries(from: start, mode: .normal) == ChatUndoSendSchedule.ticks(from: start, deadline: deadline),
@@ -381,6 +389,244 @@ struct ChatUndoSendTests {
         #expect(text.contains("set: { if $0 == nil { pendingSendService.finishReopen() } })"))
     }
 
+    // MARK: - 6. Owner kept, retry, hand-back
+
+    @Test("Presenting the same send again keeps its first owner; the next send uses the setting at its own Send")
+    func representKeepsTheOwner() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        let fixture = try await Self.makeFixture(pool)
+        let row = try await Self.queueReply(fixture, draftId: "draft-again")
+        let next = try await Self.queueReply(fixture, draftId: "draft-next")
+        let hold = Date().addingTimeInterval(3600)
+        service.present(outboxId: row.id, draftId: "draft-again", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .toast)
+        // The dedup path presents the in-flight row again, after the chat view came on.
+        service.present(outboxId: row.id, draftId: "draft-again", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
+        #expect(service.undoOwner(for: row.id) == .toast, "the send keeps the owner decided at its Send")
+        #expect(service.visibleToast?.id == row.id, "and its toast")
+        service.present(outboxId: next.id, draftId: "draft-next", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
+        #expect(service.undoOwner(for: next.id) == .bubble, "a new send uses the changed setting")
+    }
+
+    @Test("An Undo refused by the database can be tapped again once the fault is gone, and then cancels and reopens")
+    func refusedUndoCanBeRetried() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        while service.reopenSnapshot != nil { service.finishReopen() }
+        let fixture = try await Self.makeFixture(pool)
+        let row = try await Self.queueReply(fixture, draftId: "draft-retry")
+        let hold = Date().addingTimeInterval(3600)
+        try await Self.setHold(pool, row.id, hold)
+        service.present(outboxId: row.id, draftId: "draft-retry", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .toast)
+
+        let refuser = UndoProviderIdentitySafetyTests.OutboxDeleteCommitRefuser()
+        pool.add(transactionObserver: refuser, extent: .databaseLifetime)
+        service.undoAndReopen()
+        pool.remove(transactionObserver: refuser)
+        #expect(refuser.refusals.withLock { $0 } == 1, "control: the cancellation commit was refused")
+        #expect(service.undoFailureMessage != nil, "the user is told the Undo did not take")
+        #expect(try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) } != nil, "nothing was cancelled")
+        #expect(service.reopenQueue.isEmpty && service.visibleToast?.id == row.id, "no reopen; the toast stays")
+
+        service.dismissUndoFailure()          // the user acknowledges the notice
+        service.undoAndReopen()               // and taps Undo again
+        #expect(try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) } == nil, "the retry cancels the send")
+        #expect(service.reopenQueue.map(\.id) == [row.id], "and reopens its compose")
+        #expect(service.undoFailureMessage == nil)
+    }
+
+    @Test("A toast-owned reply whose toast another send replaces, or the user closes, keeps exactly one Undo: its bubble's")
+    func replacedToastHandsUndoToTheBubble() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        service.dismiss()
+        let fixture = try await Self.makeFixture(pool)
+        let chat: Set<String> = [EmailFilter.normalizeMessageId(try #require(fixture.parent.rfc822MessageId))]
+        // Two replies sent 3 s apart with the chat view off: both toast-owned, both in their window.
+        saved.setChatView(on: false)
+        let first = try await Self.queueReply(fixture, draftId: "draft-hand-1")
+        let second = try await Self.queueReply(fixture, draftId: "draft-hand-2")
+        let firstHold = Date().addingTimeInterval(3600)
+        let secondHold = firstHold.addingTimeInterval(3)
+        try await Self.setHold(pool, first.id, firstHold)
+        try await Self.setHold(pool, second.id, secondHold)
+        service.present(outboxId: first.id, draftId: "draft-hand-1", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: firstHold, owner: .toast)
+        #expect(try await Self.presenters(of: first, chat: chat, pool: pool) == 1, "the first: its toast")
+        service.present(outboxId: second.id, draftId: "draft-hand-2", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: secondHold, owner: .toast)
+        saved.setChatView(on: true)           // the chat that shows both bubbles is open now
+        #expect(try await Self.presenters(of: first, chat: chat, pool: pool) == 1, "the first: now its bubble")
+        #expect(service.undoOwner(for: first.id) == .bubble, "control: the bubble took it")
+        #expect(try await Self.presenters(of: second, chat: chat, pool: pool) == 1, "the second: its toast")
+        // The user closes the second toast: its bubble takes the Undo.
+        service.dismiss()
+        #expect(try await Self.presenters(of: second, chat: chat, pool: pool) == 1, "the second: now its bubble")
+
+        // A send whose window has ended hands nothing over.
+        let late = try await Self.queueReply(fixture, draftId: "draft-hand-late")
+        let past = Date().addingTimeInterval(-60)
+        try await Self.setHold(pool, late.id, past)
+        service.present(outboxId: late.id, draftId: "draft-hand-late", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: past, owner: .toast)
+        service.dismiss()
+        #expect(service.undoOwner(for: late.id) == .toast, "past its deadline the toast keeps it (no Undo left anywhere)")
+    }
+
+    // MARK: - 7. Hosted: reopen through RootView, the bubble under Reduce Motion
+
+    private static func textViews(_ view: UIView) -> [UITextView] {
+        (view as? UITextView).map { [$0] } ?? view.subviews.flatMap { textViews($0) }
+    }
+
+    @Test("Two Undos before either compose opens: RootView reopens both composes, one after the other, each with its own draft")
+    func rootViewReopensBothComposes() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can close the hosted compose")
+        try await HostedAccessibility.withAutomation { @MainActor in try await reopenBody() }
+    }
+
+    private func reopenBody() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        while service.reopenSnapshot != nil { service.finishReopen() }
+        let fixture = try await Self.makeFixture(pool)
+        let email = try await Self.queueReply(fixture, draftId: "draft-root-1", newEmail: true, body: "First reopened words")
+        let reply = try await Self.queueReply(fixture, draftId: "draft-root-2", body: "Second reopened words")
+        let hold = Date().addingTimeInterval(3600)
+        try await Self.setHold(pool, email.id, hold)
+        try await Self.setHold(pool, reply.id, hold)
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        window.rootViewController = UIHostingController(rootView: RootView().environment(NavigationStore()))
+        window.makeKeyAndVisible()
+        defer {
+            window.rootViewController?.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func texts() -> [String] { Self.textViews(window).map(\.text) }
+        func shows(_ words: String) -> Bool { texts().contains { $0.contains(words) } }
+
+        service.present(outboxId: email.id, draftId: "draft-root-1", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .toast)
+        service.present(outboxId: reply.id, draftId: "draft-root-2", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
+        service.undoAndReopen()
+        service.undoAndReopen(PendingSendService.Pending(
+            id: reply.id, draftId: "draft-root-2", instanceEpoch: "E1", toSummary: "", presentedAt: Date(), holdUntil: hold))
+
+        try await Self.waitFor { shows("First reopened words") }
+        #expect(shows("First reopened words"), "the first compose opens with its own draft")
+        #expect(!shows("Second reopened words"), "one compose at a time")
+        #expect(HostedAccessibility.activate(ComposeView.closeButtonId, in: window), "the compose's own Close")
+        try await Self.waitFor { shows("Second reopened words") }
+        #expect(shows("Second reopened words") && !shows("First reopened words"),
+                "closing the first opens the second, with its own draft")
+        #expect(HostedAccessibility.activate(ComposeView.closeButtonId, in: window))
+        try await Self.waitFor { service.reopenSnapshot == nil && !shows("Second reopened words") }
+        #expect(service.reopenSnapshot == nil && !shows("Second reopened words"), "both closed, nothing left to reopen")
+        #expect(try await pool.read { try Draft.fetchOne($0, key: "draft-root-1") }?.body == "First reopened words",
+                "the unchanged reopened draft is kept on Close (ADR-IOS-065)")
+    }
+
+    @Test("Under Reduce Motion the real bubble has one Undo button whose value counts down, and its fill does not rise")
+    func bubbleUnderReduceMotion() async throws {
+        #expect(HostedAccessibility.isAvailable && HostedAccessibility.canSetReduceMotion,
+                "control: the test can read the bubble and set Reduce Motion")
+        try await HostedAccessibility.withAutomation { @MainActor in
+            try await HostedAccessibility.withReduceMotion(true) { @MainActor in try await reduceMotionBody() }
+        }
+    }
+
+    private func reduceMotionBody() async throws {
+        #expect(UIAccessibility.isReduceMotionEnabled, "control: Reduce Motion is on")
+        // 4 s of Undo left, 1 s of the window passed.
+        let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + 4)
+        let reply = ChatUnsentReply(outboxId: "o-reduce", status: .queued, sentAt: nil, holdUntil: hold,
+                                    draftId: "d", instanceEpoch: "E1", filed: false, textMessage: "ok, Tuesday works.")
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 300)
+        let controller = UIHostingController(rootView: ChatUnsentReplyBubble(reply: reply, retry: {}, delete: {}, undo: {}))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        let undo: @MainActor () -> [(label: String?, value: String?)] = {
+            HostedAccessibility.labelsAndValues(of: ChatUndoSendStatus.undoId, in: controller.view)
+        }
+        try await Self.waitFor { !undo().isEmpty }
+        let first = undo()
+        #expect(first.count == 1, "one Undo button")
+        #expect(first.first?.label == "Undo send", "its label names the action, not the time")
+        let firstValue = try #require(first.first?.value)
+        #expect(firstValue.hasSuffix("seconds left"), "its value carries the time")
+        // A tick later: the same one button, the label unchanged, only the value counts down.
+        try await Self.waitFor { undo().first?.value != firstValue }
+        let later = undo()
+        #expect(later.count == 1 && later.first?.label == "Undo send", "still one button, same label")
+        let seconds = { (value: String?) in value.flatMap { Int($0.split(separator: " ").first ?? "") } }
+        #expect(seconds(later.first?.value).map { $0 < (seconds(firstValue) ?? 0) } == true, "the value counted down")
+
+        // The real bubble read Reduce Motion: drawn 3 s into the window, the middle is still the tint.
+        try await Task.sleep(for: .seconds(1.5))
+        let image = UIGraphicsImageRenderer(bounds: controller.view.bounds).image { _ in
+            controller.view.drawHierarchy(in: controller.view.bounds, afterScreenUpdates: true)
+        }
+        let bubbleFrame = try #require(Self.bubbleFrame(in: controller.view), "the bubble's text is on screen")
+        // The text's bottom-left corner, below the round "o": background, low in the bubble, where
+        // a rising fill (60% up by now) would be solid blue.
+        let probe = CGPoint(x: bubbleFrame.minX + 1, y: bubbleFrame.maxY - 1)
+        #expect(Self.color(of: image, at: probe).isClose(to: Palette.chatUndoSendPendingTint, in: controller.traitCollection),
+                "the bubble still shows the pending tint: no rising fill under Reduce Motion")
+    }
+
+    /// The frame of the bubble's text element, in `view`'s coordinates.
+    private static func bubbleFrame(in view: UIView) -> CGRect? {
+        HostedAccessibility.elements(under: view)
+            .first { ($0.accessibilityLabel ?? "").contains("Tuesday works") }
+            .map { view.convert($0.accessibilityFrame, from: nil) }
+    }
+
+    private static func color(of image: UIImage, at point: CGPoint) -> UIColor {
+        let scale = image.scale
+        guard let cg = image.cgImage,
+              let crop = cg.cropping(to: CGRect(x: point.x * scale, y: point.y * scale, width: 1, height: 1)) else { return .clear }
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let context = CGContext(data: &pixel, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        context?.draw(crop, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        return UIColor(red: CGFloat(pixel[0]) / 255, green: CGFloat(pixel[1]) / 255, blue: CGFloat(pixel[2]) / 255, alpha: CGFloat(pixel[3]) / 255)
+    }
+
     // MARK: - Fixture
 
     private struct Fixture {
@@ -438,11 +684,13 @@ struct ChatUndoSendTests {
     }
 
     /// Queues a reply as the compose card does, with an undo hold, and returns its outbox row.
-    private static func queueReply(_ fixture: Fixture, draftId: String, inReplyTo: String? = nil, newEmail: Bool = false) async throws -> OutboxMessage {
+    private static func queueReply(
+        _ fixture: Fixture, draftId: String, inReplyTo: String? = nil, newEmail: Bool = false, body: String = "Tuesday works"
+    ) async throws -> OutboxMessage {
         try await fixture.pool.write { db in
             var draft = Draft(
                 id: draftId, accountId: Self.account, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
-                subject: "Re: Lunch plans", body: "Tuesday works", replyToId: nil, isForward: false,
+                subject: "Re: Lunch plans", body: body, replyToId: nil, isForward: false,
                 editHistoryJSON: nil, createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970)
             draft.instanceEpoch = "E1"
             try draft.insert(db)
@@ -460,5 +708,18 @@ struct ChatUndoSendTests {
         try await pool.write { db in
             try db.execute(sql: "UPDATE outboxMessage SET holdUntil = ? WHERE id = ?", arguments: [hold, id])
         }
+    }
+}
+
+private extension UIColor {
+    /// Whether this colour is `color` as resolved for `traits`, within rendering tolerance.
+    func isClose(to color: Color, in traits: UITraitCollection) -> Bool {
+        let expected = UIColor(color).resolvedColor(with: traits)
+        var a = (r: CGFloat(0), g: CGFloat(0), b: CGFloat(0), al: CGFloat(0))
+        var b = a
+        getRed(&a.r, green: &a.g, blue: &a.b, alpha: &a.al)
+        expected.getRed(&b.r, green: &b.g, blue: &b.b, alpha: &b.al)
+        let tolerance: CGFloat = 0.06
+        return abs(a.r - b.r) < tolerance && abs(a.g - b.g) < tolerance && abs(a.b - b.b) < tolerance
     }
 }
