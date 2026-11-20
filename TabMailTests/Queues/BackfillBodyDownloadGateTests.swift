@@ -45,6 +45,10 @@ struct BackfillBodyDownloadGateTests {
             accountId: accountId, provider: provider, queue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
         SyncEngine.backfillPowerStateForTesting.withLock { $0 = power }
         defer { SyncEngine.backfillPowerStateForTesting.withLock { $0 = nil } }
+        // A body may set the job's measured answer; it never outlives the test,
+        // or it would override the next test's path facts.
+        let savedJobMeasurement = SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 }
+        defer { SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = savedJobMeasurement } }
         NetworkMonitor.setConnectedForTesting(true)
         do {
             let facts = path ?? (expensive ? DownloadGateHarness.cellular : DownloadGateHarness.unmeteredWiFi)
