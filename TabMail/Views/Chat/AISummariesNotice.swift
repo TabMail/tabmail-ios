@@ -82,7 +82,6 @@ struct AISummariesNoticeButton: View {
     var send: ReportConcernSend = ReportConcernService.sendReport
 
     @State private var showsNotice = false
-    @State private var showsReport = false
     #if DEBUG
     /// Tells mounted buttons apart in the debug log.
     @State private var debugTag = String(UUID().uuidString.prefix(4))
@@ -111,28 +110,22 @@ struct AISummariesNoticeButton: View {
         .accessibilityLabel(AISummariesNotice.accessibilityLabel)
         .accessibilityHint(AISummariesNotice.accessibilityHint)
         .popover(isPresented: $showsNotice, arrowEdge: .top) {
-            popover
-                .background(WindowProbe {
-                    // Shown only once UIKit has put it in a window: SwiftUI runs a popover's
-                    // onAppear even when UIKit refuses the presentation.
-                    noticeDebugLog(tag, "probe attached; due=\(firstOpen.isDue(landed: true, tipsAllowed: true)) shows=\(showsNotice)")
-                    firstOpen.markShown()
-                    noticeDebugLog(tag, "marked shown")
-                } onDetach: {
-                    noticeDebugLog(tag, "probe detached")
-                })
-                // The popover, which is on screen, presents the report sheet itself, so the two
-                // never compete for one presenter. When the report is done, the popover closes.
-                .reportConcernSheet(isPresented: $showsReport, contentType: .summary,
-                                    content: reportContent, contentNotice: AISummariesNotice.reportNotice,
-                                    send: send, onFinish: {
-                                        noticeDebugLog(tag, "report finished, closing the popover")
-                                        showsNotice = false
-                                    })
+            AISummariesNoticePopover(reportContent: reportContent, send: send, tag: tag) {
+                noticeDebugLog(tag, "report finished, closing the popover")
+                showsNotice = false
+            }
+            .background(WindowProbe {
+                // Shown only once UIKit has put it in a window: SwiftUI runs a popover's
+                // onAppear even when UIKit refuses the presentation.
+                noticeDebugLog(tag, "probe attached; due=\(firstOpen.isDue(landed: true, tipsAllowed: true)) shows=\(showsNotice)")
+                firstOpen.markShown()
+                noticeDebugLog(tag, "marked shown")
+            } onDetach: {
+                noticeDebugLog(tag, "probe detached")
+            })
         }
         #if DEBUG
         .onChange(of: showsNotice) { _, shows in noticeDebugLog(tag, "showsNotice -> \(shows)") }
-        .onChange(of: showsReport) { _, shows in noticeDebugLog(tag, "showsReport -> \(shows)") }
         #endif
         .task(id: landed) {
             // One decision per open, read once from the flag and the tip gate, just before asking.
@@ -149,8 +142,20 @@ struct AISummariesNoticeButton: View {
         ""
         #endif
     }
+}
 
-    private var popover: some View {
+/// The popover's content. It owns the report sheet's state, so the sheet, its binding and any
+/// report still sending all end with this popover: a late answer cannot reach a later one.
+private struct AISummariesNoticePopover: View {
+    let reportContent: () -> String
+    let send: ReportConcernSend
+    let tag: String
+    /// The report is done: the popover closes.
+    let onFinish: () -> Void
+
+    @State private var showsReport = false
+
+    var body: some View {
         VStack(alignment: .leading, spacing: ChatViewLayout.aiNoticeSpacing) {
             Text(AISummariesNotice.title)
                 .font(.headline)
@@ -169,6 +174,14 @@ struct AISummariesNoticeButton: View {
         .padding()
         .frame(idealWidth: ChatViewLayout.aiNoticeWidth)
         .presentationCompactAdaptation(.popover)
+        // The popover, which is on screen, presents the report sheet itself, so the two never
+        // compete for one presenter. When the report is done, the popover closes.
+        .reportConcernSheet(isPresented: $showsReport, contentType: .summary,
+                            content: reportContent, contentNotice: AISummariesNotice.reportNotice,
+                            send: send, onFinish: onFinish)
+        #if DEBUG
+        .onChange(of: showsReport) { _, shows in noticeDebugLog(tag, "showsReport -> \(shows)") }
+        #endif
     }
 }
 

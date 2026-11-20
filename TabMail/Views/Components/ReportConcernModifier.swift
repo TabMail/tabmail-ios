@@ -105,6 +105,16 @@ enum ReportConcernSheetText {
 /// Sends one report: its type, content, category and optional reason; true once the backend took it.
 typealias ReportConcernSend = @MainActor (ReportContentType, String, ReportCategory, String?) async -> Bool
 
+/// Which presentation of a report sheet is current. A send's answer acts only for the
+/// presentation that sent it: one that ended (dismissed, or its owner removed) is retired, and a
+/// new one starts afresh, so a late answer never closes, finishes or confirms a later report.
+@MainActor
+final class ReportPresentation {
+    private(set) var current = 0
+
+    func next() { current += 1 }
+}
+
 /// The report sheet, presented by `isPresented`: category, optional reason, Report. Shared by the
 /// long-press flow and any other entry point that reports AI content.
 struct ReportConcernSheetModifier: ViewModifier {
@@ -125,10 +135,22 @@ struct ReportConcernSheetModifier: ViewModifier {
     @State private var selectedCategory: ReportCategory = .offensive
     @State private var reason = ""
     @State private var isSubmitting = false
+    @State private var presentation = ReportPresentation()
 
     func body(content view: Content) -> some View {
         view
+            .onChange(of: isPresented) { _, shows in
+                // A new presentation starts with its own state.
+                guard shows else { return }
+                presentation.next()
+                submitted = false
+                isSubmitting = false
+                selectedCategory = .offensive
+                reason = ""
+            }
             .sheet(isPresented: $isPresented, onDismiss: {
+                // This presentation has ended: an answer still on its way acts on nothing.
+                presentation.next()
                 // The alert waits until the sheet has gone: UIKit refuses to present it while the
                 // sheet is still closing.
                 if submitted {
@@ -201,13 +223,16 @@ struct ReportConcernSheetModifier: ViewModifier {
 
     private func submit() {
         isSubmitting = true
+        let sending = presentation
+        let sentFor = sending.current
         Task {
             let success = await send(contentType, content(), selectedCategory, reason.isEmpty ? nil : reason)
+            // The presentation that sent this has ended: its answer touches nothing, not even
+            // the caller's binding, which may now show a later report.
+            guard sending.current == sentFor else { return }
             isSubmitting = false
             submitted = success
             isPresented = false
-            selectedCategory = .offensive
-            reason = ""
         }
     }
 }
