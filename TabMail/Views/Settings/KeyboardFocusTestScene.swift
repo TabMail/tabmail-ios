@@ -14,6 +14,8 @@ import SwiftUI
 /// - `--keyboard-focus-chip`: a rejected recipient chip in a recipient field (`RecipientTokenField`);
 ///   also an address chip, whose remove sits inside the field's own box and keeps the keyboard, and
 ///   an attachment row below the field, whose remove sits outside every box and closes the keyboard;
+///   and one contact suggestion while the To field is focused, which counts as the field, with an
+///   empty area right below the field (where the list was) for a tap outside it;
 /// - `--keyboard-focus-bullet`: a bullet list's Add (`BulletListEditor`);
 /// - `--keyboard-focus-search`: a button presenting search in a sheet, as the inbox does (`SearchView`);
 /// - `--keyboard-focus-fork`: the inbox chat with one past session, for "Fork and re-send";
@@ -27,6 +29,8 @@ struct KeyboardFocusTestScene: View {
     static let rejectedRecipient = "notanaddress"
     static let tokenRecipient = "person@example.com"
     static let attachmentName = "fixture-attachment.pdf"
+    static let suggestion = ContactResult(name: "Suggested Person", email: "suggested@example.com")
+    static let chipEmptyAreaIdentifier = "keyboardFocusChipEmptyArea"
     static let forkSessionId = "keyboard-focus-fixture-session"
     static let forkUserText = "Keyboard focus fixture question"
     /// The multi-line field's height in lines, so it is backed by a text view with room to tap in.
@@ -76,8 +80,13 @@ struct KeyboardFocusTestScene: View {
                     VStack(alignment: .leading, spacing: 16) {
                         TextField("Other field", text: $other)
                         RecipientTokenField(
-                            role: .to, recipients: $recipients, showCc: $showCc, searchResults: [],
+                            role: .to, recipients: $recipients, showCc: $showCc,
+                            searchResults: recipients[.to].tokens.contains(Self.suggestion.email) ? [] : [Self.suggestion],
                             onFocus: {}, revealedChipKey: $revealedChipKey)
+                        Color.clear
+                            .frame(height: Self.emptyAreaHeight)
+                            .accessibilityElement()
+                            .accessibilityIdentifier(Self.chipEmptyAreaIdentifier)
                         // Drawn like compose's attachment rows: a remove outside the field's box.
                         if hasAttachment {
                             HStack(spacing: 6) {

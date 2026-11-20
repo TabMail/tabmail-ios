@@ -105,6 +105,37 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up")
     }
 
+    /// The suggestion list belongs to the recipient field's box: picking a suggestion adds its chip
+    /// and keeps the keyboard. Once the list hides, the box ends at the input line, so a tap on the
+    /// empty space where the list was closes the keyboard.
+    func testPickingASuggestionKeepsTheKeyboardAndTheSpaceBelowStillCloses() {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-chip")
+        defer { app.terminate() }
+
+        let input = app.textFields["recipientInput-to"].firstMatch
+        XCTAssertTrue(input.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
+        input.tap()
+        XCTAssertTrue(waitForFocus(input, timeout: focusSeconds), "control: the To input has the keyboard")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: focusSeconds), "control: the keyboard is up")
+        let suggestion = app.buttons.containing(NSPredicate(format: "label CONTAINS %@", "suggested@example.com")).firstMatch
+        XCTAssertTrue(suggestion.waitForExistence(timeout: focusSeconds), "control: the suggestion shows")
+        suggestion.tap()
+        let chipRemove = app.buttons["Remove suggested@example.com"].firstMatch
+        XCTAssertTrue(chipRemove.waitForExistence(timeout: focusSeconds), "the pick added the chip")
+        let hidden = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: suggestion)
+        XCTAssertEqual(XCTWaiter.wait(for: [hidden], timeout: focusSeconds), .completed, "control: the list hid")
+        RunLoop.current.run(until: Date().addingTimeInterval(holdSeconds))
+        XCTAssertTrue(waitForFocus(input, timeout: focusSeconds), "the input kept the keyboard after the pick")
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up")
+
+        let empty = app.descendants(matching: .any)["keyboardFocusChipEmptyArea"].firstMatch
+        XCTAssertTrue(empty.exists, "control: the empty area below the field shows")
+        empty.tap()
+        let closed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.keyboards.firstMatch)
+        XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: focusSeconds), .completed, "a tap below the field closed the keyboard")
+    }
+
     /// An attachment's remove sits outside every field's box, so its tap closes the keyboard.
     func testAttachmentRemoveOutsideTheFieldClosesTheKeyboard() {
         continueAfterFailure = false
