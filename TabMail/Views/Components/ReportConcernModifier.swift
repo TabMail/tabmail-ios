@@ -135,7 +135,15 @@ struct ReportConcernSheetModifier: ViewModifier {
     @State private var selectedCategory: ReportCategory = .offensive
     @State private var reason = ""
     @State private var isSubmitting = false
-    @State private var presentation = ReportPresentation()
+    /// Set by a caller whose `isPresented` flag outlives the view this sheet is attached to (the
+    /// notice's flag lives on its button, the sheet on the popover's content): the caller then
+    /// owns the presentation too and retires it when the sheet's view goes. Otherwise the sheet
+    /// owns it, with the same lifetime as its flag.
+    var ownerPresentation: ReportPresentation?
+
+    @State private var ownPresentation = ReportPresentation()
+
+    private var presentation: ReportPresentation { ownerPresentation ?? ownPresentation }
 
     func body(content view: Content) -> some View {
         view
@@ -223,15 +231,13 @@ struct ReportConcernSheetModifier: ViewModifier {
 
     private func submit() {
         isSubmitting = true
-        let sentFor = presentation.current
-        // Held weakly: the view that owns this sheet's state (the notice's popover content, or a
-        // long-press caller's row) may be destroyed while the report sends, and its answer then
-        // acts on nothing. A view that only scrolls out of sight keeps its state and its answer.
-        Task { [weak sending = presentation] in
+        let sending = presentation
+        let sentFor = sending.current
+        Task {
             let success = await send(contentType, content(), selectedCategory, reason.isEmpty ? nil : reason)
-            // The presentation that sent this has ended or its owner is gone: its answer touches
-            // nothing, not even the caller's binding, which may now show a later report.
-            guard let sending, sending.current == sentFor else { return }
+            // The presentation that sent this has ended: its answer touches nothing, not even
+            // the caller's binding, which may now show a later report.
+            guard sending.current == sentFor else { return }
             isSubmitting = false
             submitted = success
             isPresented = false
@@ -254,10 +260,11 @@ extension View {
         content: @escaping () -> String,
         contentNotice: String? = nil,
         send: @escaping ReportConcernSend = ReportConcernService.sendReport,
-        onFinish: (() -> Void)? = nil
+        onFinish: (() -> Void)? = nil,
+        presentation: ReportPresentation? = nil
     ) -> some View {
         modifier(ReportConcernSheetModifier(isPresented: isPresented, contentType: contentType,
                                             content: content, contentNotice: contentNotice, send: send,
-                                            onFinish: onFinish))
+                                            onFinish: onFinish, ownerPresentation: presentation))
     }
 }

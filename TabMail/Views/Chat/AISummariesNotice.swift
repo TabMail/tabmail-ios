@@ -85,6 +85,9 @@ struct AISummariesNoticeButton: View {
     /// The report sheet over the popover. Kept here, not in the popover's content: SwiftUI did not
     /// reliably observe that state, so Cancel and the answer could not close the sheet.
     @State private var showsReport = false
+    /// The report's presentation, owned with its flag: the popover, and the sheet on it, can be
+    /// closed by the system while a report sends, and nothing on them runs then.
+    @State private var reportPresentation = ReportPresentation()
     #if DEBUG
     /// Tells mounted buttons apart in the debug log.
     @State private var debugTag = String(UUID().uuidString.prefix(4))
@@ -98,9 +101,9 @@ struct AISummariesNoticeButton: View {
             // and SwiftUI never retries it: clear it, then ask again on the next turn.
             if showsNotice {
                 showsNotice = false
-                Task { @MainActor in showsNotice = true }
+                Task { @MainActor in openNotice() }
             } else {
-                showsNotice = true
+                openNotice()
             }
         } label: {
             Image(systemName: AISummariesNotice.glyph)
@@ -113,7 +116,8 @@ struct AISummariesNoticeButton: View {
         .accessibilityLabel(AISummariesNotice.accessibilityLabel)
         .accessibilityHint(AISummariesNotice.accessibilityHint)
         .popover(isPresented: $showsNotice, arrowEdge: .top) {
-            AISummariesNoticePopover(reportContent: reportContent, send: send, tag: tag, showsReport: $showsReport) {
+            AISummariesNoticePopover(reportContent: reportContent, send: send, tag: tag,
+                                     showsReport: $showsReport, reportPresentation: reportPresentation) {
                 noticeDebugLog(tag, "report finished, closing the popover")
                 showsNotice = false
             }
@@ -133,9 +137,18 @@ struct AISummariesNoticeButton: View {
         .task(id: landed) {
             // One decision per open, read once from the flag and the tip gate, just before asking.
             if firstOpen.isDue(landed: landed, tipsAllowed: tipsAllowed()) {
-                showsNotice = true
+                openNotice()
             }
         }
+    }
+
+    /// Opens the notice afresh. A report from an earlier popover is over: the system may have
+    /// closed that popover with its sheet still up, so nothing cleared the flag or ended the
+    /// presentation. Retire it, so a late answer acts on nothing, and start with no sheet up.
+    private func openNotice() {
+        reportPresentation.next()
+        showsReport = false
+        showsNotice = true
     }
 
     private var tag: String {
@@ -156,6 +169,7 @@ private struct AISummariesNoticePopover: View {
     let tag: String
     /// The report is done: the popover closes.
     @Binding var showsReport: Bool
+    let reportPresentation: ReportPresentation
     let onFinish: () -> Void
 
     var body: some View {
@@ -181,7 +195,7 @@ private struct AISummariesNoticePopover: View {
         // compete for one presenter. When the report is done, the popover closes.
         .reportConcernSheet(isPresented: $showsReport, contentType: .summary,
                             content: reportContent, contentNotice: AISummariesNotice.reportNotice,
-                            send: send, onFinish: onFinish)
+                            send: send, onFinish: onFinish, presentation: reportPresentation)
         #if DEBUG
         .onChange(of: showsReport) { _, shows in noticeDebugLog(tag, "showsReport -> \(shows)") }
         #endif

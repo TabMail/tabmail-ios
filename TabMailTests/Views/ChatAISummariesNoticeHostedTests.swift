@@ -1062,13 +1062,14 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
-    /// The popover closes with its sheet still up, so the sheet's onDismiss never runs, while the
-    /// report's binding lives on the button, which outlives the popover. Only the shared sheet's
-    /// weak tie between an answer and its own presentation keeps the old answer off the new one.
-    @Test("The notice stays mounted: an answer from a closed popover's report never reaches the reopened one")
-    func aClosedPopoversAnswerNeverReachesTheNext() async throws {
+    /// The system closes the popover while its report sheet is up and sending: nothing on the
+    /// popover or the sheet runs, and the report's flag and presentation live on the button. The
+    /// button retires that presentation when the notice opens again, so the old answer, before or
+    /// after the next report starts sending, acts on nothing.
+    @Test("A popover the system closed while its report sends: the old answer never shows, closes or changes the next report")
+    func aSystemClosedPopoversAnswerNeverReachesTheNext() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
-        for answerBeforeNextReport in [true, false] {
+        for answerBeforeNextSend in [true, false] {
             let held = HeldSend()
             try await HostedAccessibility.withAutomation {
                 let button = AISummariesNoticeButton(landed: false, reportContent: { "Summary" }, firstOpen: Self.freshFirstOpen(),
@@ -1076,42 +1077,39 @@ struct ChatAISummariesNoticeHostedTests {
                 try await Self.hosting(button) { controller in
                     try await Self.openReport(in: controller)
                     try await Self.pressReport(in: controller, held: held)
-                    // Only the popover and its sheet close; the button stays mounted.
+                    // The system closes the popover and its sheet; the button stays mounted.
                     controller.presentedViewController?.dismiss(animated: false)
                     try await Self.waitUntil { controller.presentedViewController == nil }
                     #expect(controller.presentedViewController == nil, "control: the popover and its sheet closed")
-                    if answerBeforeNextReport {
-                        held.release(1, true)
-                        try await Task.sleep(for: .seconds(1))
-                        #expect(controller.presentedViewController == nil, "answer first: no stale sheet or alert")
-                    }
                     let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))
                     #expect(glyph.accessibilityActivate())
-                    try await Self.waitUntil {
-                        let labels = Self.presentedLabels(controller)
-                        return labels.contains(AISummariesNotice.title) || labels.contains(AISummariesNotice.reportNotice)
-                    }
+                    try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
                     try await Task.sleep(for: .milliseconds(500))
-                    // The popover closed with its sheet still up, so nothing cleared the button's
-                    // report binding: the reopened notice may bring up a new, empty report sheet
-                    // by itself. Either way the next report is a fresh one.
-                    if !Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) {
-                        let popover = try #require(Self.topPresented(controller)?.view)
-                        let report = try #require(Self.element(AISummariesNotice.reportTitle, in: popover))
-                        #expect(report.accessibilityActivate())
-                        try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
+                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title)
+                            && !Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
+                            "the notice opens afresh, with no report sheet: \(Self.presentedLabels(controller))")
+                    let popover = try #require(Self.topPresented(controller)?.view)
+                    let report = try #require(Self.element(AISummariesNotice.reportTitle, in: popover))
+                    #expect(report.accessibilityActivate())
+                    try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
+                    let sheetView = try #require(Self.topPresented(controller)?.view, "control: the next report's sheet")
+                    if answerBeforeNextSend {
+                        held.release(1, true)
+                        try await Task.sleep(for: .seconds(1))
+                        #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "answer first: the new sheet stays")
+                        #expect(Self.isEnabled("Report", in: sheetView) && Self.isEnabled("Cancel", in: sheetView),
+                                "answer first: its controls are unchanged")
+                        #expect(!(Self.topPresented(controller) is UIAlertController), "answer first: no alert")
                     }
-                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "control: the next report's sheet")
                     try await Self.pressReport(in: controller, held: held, sends: 2)
-                    let sheetView = try #require(Self.topPresented(controller)?.view)
-                    if !answerBeforeNextReport {
+                    if !answerBeforeNextSend {
                         held.release(1, true)
                         try await Task.sleep(for: .seconds(1))
                     }
-                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
-                            "the new report stays open")
+                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "the new report stays open")
                     #expect(!Self.isEnabled("Report", in: sheetView) && !Self.isEnabled("Cancel", in: sheetView),
-                            "and its send's controls are unchanged")
+                            "its own send's controls are unchanged")
+                    #expect(!(Self.topPresented(controller) is UIAlertController), "no alert from the old answer")
                     held.release(2, false)
                     try await Self.waitUntil { controller.presentedViewController == nil }
                     try await Task.sleep(for: .seconds(1))
