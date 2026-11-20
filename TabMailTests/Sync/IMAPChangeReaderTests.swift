@@ -1472,12 +1472,13 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("Arrivals: a server whose UID SEARCH ignores the range never refetches held messages below the bookmark")
+    @Test("Arrivals: held messages below the bookmark are never refetched in full")
     func arrivalsSearchBelowTheBookmarkIgnored() async throws {
         try await Self.withWorld(inbox: [1, 2]) { w in
             let cursor = try await Self.baseline(w)
-            // The fake's UID SEARCH answers the whole mailbox by default, as a
-            // server ignoring the UID set would.
+            // This fixture's UID SEARCH answers within the UID set, as a
+            // conforming server does; the over-broad answer is pinned by
+            // `overbroadArrivalSearchKeepsTheBookmark`.
             w.server.setMessages([1, 2, 3].map(Self.message), in: Self.inboxPath)
             let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
             #expect(Set(changes.records.compactMap { $0.header?.messageId }) == ["3"],

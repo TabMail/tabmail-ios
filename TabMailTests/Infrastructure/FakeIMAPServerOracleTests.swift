@@ -1216,22 +1216,32 @@ struct FakeIMAPServerOracleTests {
         _ = try client.command(tag: "s1", "LOGIN \(server.username) \(server.password)")
         _ = try client.command(tag: "s2", "SELECT INBOX")
 
-        func answer(_ tag: String, _ set: String) throws -> Set<Int> {
-            let reply = try client.command(tag: tag, "UID SEARCH UID \(set)")
-            let line = reply.split(separator: "\r\n").first { $0.hasPrefix("* SEARCH") } ?? ""
-            return Set(line.split(separator: " ").dropFirst(2).compactMap { Int($0) })
-        }
-        let cases: [(set: String, expected: Set<Int>)] = [
-            ("2:7", [2, 3, 7]),
-            ("4:6", []),
-            ("1,8", [1, 8]),
-            ("3:*", [3, 7, 8]),
+        // Each case asserts the exact untagged answer (UIDs in mailbox order)
+        // and the tagged OK, so an empty answer is a successful empty SEARCH,
+        // not a failed or unparsed one.
+        let cases: [(criteria: String, expected: [Int])] = [
+            ("UID 2:7", [2, 3, 7]),
+            ("UID 4:6", []),
+            ("UID 1,8", [1, 8]),
+            ("UID 3:*", [3, 7, 8]),
             // `*` is 8 here, so 20:* is 8:20 and matches the last message only.
-            ("20:*", [8]),
+            ("UID 20:*", [8]),
+            // Keys are ANDed (§6.4.4): a header match outside the UID set is no match.
+            ("UID 2:7 HEADER \"Message-ID\" \"<search-set-1@example.com>\"", []),
+            ("UID 1:2 HEADER \"Message-ID\" \"<search-set-1@example.com>\"", [1]),
+            // Two UID keys intersect: 7 is the only UID in both, unlike either one alone.
+            ("UID 2:7 UID 7:8", [7]),
+            // Disjoint UID keys match nothing.
+            ("UID 1:2 UID 7:8", []),
         ]
         for (index, item) in cases.enumerated() {
-            let got = try answer("q\(index)", item.set)
-            #expect(got == item.expected, "UID SEARCH UID \(item.set) answered \(got.sorted())")
+            let tag = "q\(index)"
+            let reply = try client.command(tag: tag, "UID SEARCH \(item.criteria)")
+            let lines = reply.split(separator: "\r\n", omittingEmptySubsequences: true).map(String.init)
+            let untagged = (["* SEARCH"] + item.expected.map(String.init)).joined(separator: " ")
+            #expect(lines.contains(untagged), "UID SEARCH \(item.criteria) answered \(lines)")
+            #expect(lines.filter { $0.hasPrefix("* SEARCH") }.count == 1, "one SEARCH answer: \(lines)")
+            #expect(lines.contains("\(tag) OK UID SEARCH completed"), "tagged OK for \(item.criteria): \(lines)")
         }
         _ = try client.command(tag: "s9", "LOGOUT")
     }
