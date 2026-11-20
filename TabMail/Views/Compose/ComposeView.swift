@@ -1457,6 +1457,8 @@ struct ComposeView: View {
                             if showingSuggestion, let suggested = currentSuggestion, !suggested.isEmpty {
                                 suggestionBubble(text: suggested)
                                     .transition(.scale(scale: 0.96).combined(with: .opacity))
+                                    .onAppear { logSuggestionBubble("appeared") }
+                                    .onDisappear { logSuggestionBubble("disappeared") }
                             } else {
                                 TextEditor(text: $messageBody)
                                     .scrollDisabled(true)
@@ -1834,6 +1836,11 @@ struct ComposeView: View {
             // (manual New, contact, reply, replyAll, forward, agent compose, agent draft).
             .onAppear { performLifecycleAppear() }
             .onDisappear { performDisappear() }
+            .onChange(of: showingSuggestion) { old, new in
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[ComposeView] showingSuggestion \(old)->\(new) instance=\(instanceToken) suggestionLen=\(currentSuggestion?.count ?? -1)")
+                }
+            }
             .onChange(of: selectedAccount) {
                 currentSignature = selectedAccount?.signature ?? ""
             }
@@ -1972,6 +1979,13 @@ struct ComposeView: View {
                 AgentToolRouter.shared.composePresentationDidEnd()
                 outcomeAtAppear?(.cancelled)
             }
+        }
+    }
+
+    /// Debug-gated: the suggestion bubble entering or leaving the card.
+    private func logSuggestionBubble(_ event: String) {
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] suggestion bubble \(event) instance=\(instanceToken) showing=\(showingSuggestion)")
         }
     }
 
@@ -2504,6 +2518,10 @@ struct ComposeView: View {
             readResult = .failure(error)
         }
         draftReadState = ComposeDraftGuards.readState(readResult)
+        if DebugModeManager.isLoggingEnabled() {
+            let row = (try? readResult.get()).flatMap { $0 }
+            BackgroundSyncLogger.logDebug("[ComposeView] draft read instance=\(instanceToken) draftId=\(draftId) found=\(row != nil) bodyLen=\(row?.body.count ?? -1) suggestedBodyLen=\(suggestedBody?.count ?? -1)")
+        }
         guard case .success(let loaded) = readResult else {
             draftReadState = .error
             sendError = "This draft did not finish loading. Close and reopen it to try again."
@@ -2876,6 +2894,9 @@ struct ComposeView: View {
     }
 
     private func saveDraftAndDismiss() async {
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] saveDraftAndDismiss instance=\(instanceToken) draftId=\(draftId) bodyLen=\(messageBody.count)")
+        }
         // B1: refuse to save-to-server while attachments failed to load. Saving
         // here would (a) queue a push of a partial set to the server draft and
         // (b) rewrite the on-disk attachments dir from the empty in-memory list
@@ -3238,6 +3259,9 @@ struct ComposeView: View {
             suggestionToShow = freshHeader?.cachedReply
         } else {
             suggestionToShow = nil
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] suggestion instance=\(instanceToken) draftId=\(draftId) suggestionLen=\(suggestionToShow?.count ?? -1)")
         }
         if let suggested = suggestionToShow, !suggested.isEmpty {
             currentSuggestion = suggested

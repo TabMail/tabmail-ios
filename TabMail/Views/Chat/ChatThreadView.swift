@@ -272,6 +272,7 @@ struct ChatThreadView: View {
             .presentationDragIndicator(.visible)
         }
         .fullScreenCover(item: $readyReply) { ready in
+            let _ = ChatThreadView.logReadyCard(ready)
             // Today's Reply All compose, with the AI Suggestion in its box: the full reply of the
             // row the ghost showed, read with it, so the card holds the reply that was tapped. It
             // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
@@ -752,10 +753,20 @@ struct ChatThreadView: View {
     /// A tap on the AI Suggestion: the Reply All compose card with it written out (the suggestion
     /// shows only while the reply goes to everyone). In the tutorial only the step that asks for it
     /// opens the card.
+    /// Debug-gated: each build of the ready card's content, with the draft it names.
+    static func logReadyCard(_ ready: ChatReadyReply) {
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) cachedReplyLen=\(ready.message.cachedReply?.count ?? -1)")
+        }
+    }
+
     private func openSuggestion(on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {
         if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion {
             _ = TutorialCoordinator.shared.admits(.other)
             return
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Chat] openSuggestion message=\(newest.id) alreadyOpen=\(readyReply != nil)")
         }
         readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
             replyAllTo: newest, accounts: context.accounts))
