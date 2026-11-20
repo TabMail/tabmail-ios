@@ -53,6 +53,18 @@ next save point: a change, the app going to the background, a pill showing a cha
 count). A read checks the chat's demo admission and account removal as it starts and again before it
 lands, so a read started during a demo's exit never fills the next demo's field.
 
+**Review r7 (2026-11-20): one fence inside the write, not a removal lifecycle.** The words' write
+transaction itself checks that the key's account row still exists (`EXISTS(SELECT 1 FROM account WHERE
+id = ?)`, `ChatFieldWords.Storage.admits`) beside the demo run's admission (`DemoModeStore.admits`), as
+`AccountFieldPersistenceStore.persist` guards account writes. The account's removal deletes its row and
+its words in ONE transaction (`removeAccountRowsTxn`; `DemoSeed.wipe` for the demo), so a write lands
+before it and is deleted by it, or runs after it and is refused and dropped; a removal that rolls back
+leaves the row, so the write lands. Overlapping removals, the gap before the store hears of the commit,
+and the demo's fixed account seeded anew need no extra state. Replaced: the per-attempt removal holds
+(`Lifetimes`, `beginRemoval`/`commitRemoval`/`rollBackRemoval`/`reopenAccount`) and the re-queue of
+refused words. After the commit the store only forgets the account's words in memory and takes no new
+ones for it (`forgetAccount`; a real account id is never reused, the demo's chats are fenced by admission).
+
 **Why not a mail draft:** the field's words are an instruction to the agent ("tell her Tuesday works",
 "decline politely"), not an email body. Saved as a draft they would sit in the user's Drafts folder on the
 mail server, synced to every client, as a message nobody wrote, and Q22 (the chat ignores drafts) would

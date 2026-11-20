@@ -617,9 +617,6 @@ extension AccountManager {
         // Await any write already admitted to GRDB, fence queued closures, and
         // purge retry/overlay state before the row-delete transaction begins.
         await AccountFieldPersistenceStore.production.discardAccount(acctId)
-        // The account's chats' unsent words are not written while the delete runs; they are
-        // forgotten once it commits, and kept and written if it fails (ADR-IOS-117).
-        let wordsRemoval = await ChatFieldWords.shared.beginRemoval(acctId)
         // The account's calendar operations, whose saved put-back files (#718) go with it. They are
         // counted again inside the delete: a drain may have saved more since the user was warned
         // (a file is saved before its record is kept, so a record kept before this transaction has
@@ -637,15 +634,14 @@ extension AccountManager {
             }
         } catch {
             await AccountFieldPersistenceStore.production.reactivateAccount(acctId)
-            await ChatFieldWords.shared.rollBackRemoval(wordsRemoval)
             await push.cancelPreparedRemovedAccountCleanup(generation: cleanupGeneration)
             // The DB row is still authoritative. Re-derive both maps rather
             // than restoring a possibly stale captured Account snapshot.
             NSEDataBridge.mirrorAccountIdentity()
             throw error
         }
-        // The delete committed: the account's chats' unsent words go from memory too (ADR-IOS-117).
-        await ChatFieldWords.shared.commitRemoval(wordsRemoval)
+        // The delete committed, the account's chat words with it: the store forgets them too (ADR-IOS-117).
+        await ChatFieldWords.shared.forgetAccount(acctId)
 
         // Converge the mirrors now that the delete has committed. This is NOT a
         // second attempt at the pre-commit clearing above — that clearing is

@@ -145,7 +145,7 @@ struct ChatFieldWordsTests {
                     }
                     await chaosPoint()
                     if state.withLock({ $0.failsWrites }) || chaosFault() { throw Refused() }
-                    let refused = try await base.write(batch)
+                    try await base.write(batch)
                     await chaosPoint()
                     // A held return: the transaction is done and its answer waits.
                     await withCheckedContinuation { continuation in
@@ -156,7 +156,6 @@ struct ChatFieldWordsTests {
                         }
                         if !held { continuation.resume() }
                     }
-                    return refused
                 })
         }
 
@@ -272,8 +271,19 @@ struct ChatFieldWordsTests {
     ) async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        // A chat's words are written only while its account row exists (`Storage.admits`).
+        for account in accounts { try insertAccount(account, pool: pool) }
         let storage = ControlledStorage(pool)
         try await body(pool, storage, ChatFieldWords(storage: storage.storage))
+    }
+
+    /// Every account the tests type words for.
+    private static let accounts = [account, account + "-2", account + "-live", account + "-other", "other",
+                                   DemoSeed.demoAccountId, "fz-a", "fz-b"]
+
+    /// Inserts the account row `id`, as its setup (or the demo's seed) does.
+    private static func insertAccount(_ id: String, pool: DatabasePool) throws {
+        _ = try FolderEpochTestFixture.makeAccount(id: id, provider: .gmail, pool: pool)
     }
 
     /// What a new app run's field shows for `key`: a new store, its words read.
@@ -699,7 +709,6 @@ struct ChatFieldWordsTests {
     @Test("Kept words stay while an email of the thread is on the device, and go with the thread's AI data")
     func wordsGoWithTheThreadsAIData() async throws {
         try await Self.withStore { pool, _, store in
-            _ = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
             try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
             let email = Self.header("l-1", thread: "lifetime")
             try await pool.write { try email.insert($0) }
@@ -728,7 +737,6 @@ struct ChatFieldWordsTests {
         try await Self.withStore { pool, _, store in
             let other = Self.account + "-other"
             for account in [Self.account, other] {
-                _ = try FolderEpochTestFixture.makeAccount(id: account, provider: .gmail, pool: pool)
                 try FolderEpochTestFixture.insertFolder(accountId: account, path: "INBOX", role: .inbox, pool: pool)
             }
             // The same thread id, in the other account only.
@@ -816,20 +824,21 @@ struct ChatFieldWordsTests {
     }
 
     /// Ends the current demo run as `DemoModeService.exit` does (admission revoked, the store's demo
-    /// words forgotten, the demo's rows wiped), then starts the next run.
+    /// words forgotten, the demo's rows wiped), then starts the next run, its account seeded anew.
     private static func endDemoAndStartTheNext(_ store: ChatFieldWords, pool: DatabasePool) async throws {
         DemoModeStore.shared.revokeAdmission()
         store.forgetDemo()
         try await pool.write { try DemoSeed.wipe($0) }
         DemoModeStore.shared.isActive = false
         DemoModeStore.shared.isActive = true
+        try insertAccount(DemoSeed.demoAccountId, pool: pool)
     }
 
-    /// Removes the account `account` as `AccountManager.removeAccount` does around its delete.
+    /// Removes the account `account` as `AccountManager.removeAccount` does: its row-delete
+    /// transaction, then the store forgets its words.
     private static func remove(_ account: String, store: ChatFieldWords, pool: DatabasePool) async throws {
-        let removal = store.beginRemoval(account)
         try await pool.write { try AccountManager.removeAccountRowsTxn($0, accountId: account, wasPrimary: false) }
-        store.commitRemoval(removal)
+        store.forgetAccount(account)
     }
 
     private static func storedWords(_ pool: DatabasePool) throws -> [String: String] {
@@ -897,12 +906,11 @@ struct ChatFieldWordsTests {
         }
     }
 
-    @Test("A removal that fails keeps every word of the account: typed before it and not yet written, typed during it, and refused by its fence")
+    @Test("A removal that fails keeps every word of the account: typed before it and not yet written, and written while it ran")
     func failedRemovalKeepsTheWords() async throws {
         try await Self.withStore { pool, storage, store in
             let earlier = ChatFieldWords.key(for: Self.header("fr-1", thread: "typed-earlier"))
             let inFlight = ChatFieldWords.key(for: Self.header("fr-2", thread: "in-flight"))
-            let during = ChatFieldWords.key(for: Self.header("fr-3", thread: "typed-during"))
             // Typed earlier, its write failed: only memory has it.
             storage.failWrites(true)
             store.apply(.put("Typed earlier"), to: earlier)
@@ -911,122 +919,28 @@ struct ChatFieldWordsTests {
             let onDisk751 = try Self.rows(pool)
             #expect(onDisk751.isEmpty, "control: not on disk")
 
-            // A write running as the removal begins: its transaction finds the fence.
+            // A write waits as the removal's delete runs and fails (as `AccountRemovalSavedFilesGrew`
+            // refuses it): the transaction rolls back, the account row stays.
             storage.holdWrites()
-            store.apply(.put("Written as it began"), to: inFlight)
+            store.apply(.put("Written as it ran"), to: inFlight)
             #expect(await storage.waitForWrites(2), "control: the write is running")
-            let removal = store.beginRemoval(Self.account)
+            struct Refused: Error {}
+            let account = Self.account
+            await #expect(throws: Refused.self) {
+                try await pool.write { db in
+                    try AccountManager.removeAccountRowsTxn(db, accountId: account, wasPrimary: false)
+                    throw Refused()
+                }
+            }
             storage.releaseWrites()
             await store.written()
-            store.apply(.put("Typed during"), to: during)
-            await store.written()
-            let onDisk762 = try Self.rows(pool)
-            #expect(onDisk762.isEmpty, "control: nothing of the account is written while its removal runs")
-            #expect(store.fill(for: earlier).words == "Typed earlier", "the field keeps its words meanwhile")
-
-            // The delete fails (as `AccountRemovalSavedFilesGrew` refuses it): rolled back.
-            store.rollBackRemoval(removal)
+            store.saveUnwritten()
             await store.written()
             let onDisk768 = try Self.storedWords(pool)
-            #expect(onDisk768 == [earlier: "Typed earlier", inFlight: "Written as it began", during: "Typed during"])
+            #expect(onDisk768 == [earlier: "Typed earlier", inFlight: "Written as it ran"])
             #expect(store.fill(for: earlier).words == "Typed earlier")
             #expect(await Self.nextRun(storage, earlier) == "Typed earlier")
         }
-    }
-
-    @Test("Words a removal's fence refused are written once it fails, even when it ended before the write returned")
-    func refusedWordsSurviveARollbackBeforeTheWriteReturns() async throws {
-        try await Self.withStore { pool, storage, store in
-            let key = ChatFieldWords.key(for: Self.header("rr-1", thread: "refused-then-rolled-back"))
-            // The writer has the words and waits before its transaction.
-            storage.holdWrites()
-            store.apply(.put("Refused by the fence"), to: key)
-            #expect(await storage.waitForWrites(1), "control: the write is running")
-            // A removal begins; the transaction runs under its fence and refuses the words.
-            let removal = store.beginRemoval(Self.account)
-            storage.holdWriteReturns()
-            storage.releaseWrites()
-            #expect(await storage.waitForHeldWriteReturn(), "control: the transaction ran")
-            let onDisk787 = try Self.rows(pool)
-            #expect(onDisk787.isEmpty, "control: the fence refused the words")
-            // The removal fails, and ends, before the write returns.
-            store.rollBackRemoval(removal)
-            storage.releaseWriteReturns()
-            await store.written()
-            #expect(await Self.nextRun(storage, key) == "Refused by the fence", "a new run loads them with no further edit")
-        }
-    }
-
-    @Test("Two removals of one account, one failed and one committed, in either order: a delayed write never brings its words back",
-          arguments: [false, true])
-    func overlappingRemovalsNeverReopen(failedFirst: Bool) async throws {
-        try await Self.withStore { pool, storage, store in
-            _ = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
-            let key = ChatFieldWords.key(for: Self.header("ov-1", thread: "overlap"))
-            let live = ChatFieldWords.key(for: Self.header("ov-2", thread: "overlap-live", account: Self.account + "-live"))
-            // A batch of the account's words, delayed before its transaction.
-            storage.holdWrites()
-            store.apply(.put("Delayed words"), to: key)
-            #expect(await storage.waitForWrites(1), "control: the write is running")
-
-            let failed = store.beginRemoval(Self.account)
-            let committed = store.beginRemoval(Self.account)
-            let account = Self.account
-            if failedFirst { store.rollBackRemoval(failed) }
-            try await pool.write { try AccountManager.removeAccountRowsTxn($0, accountId: account, wasPrimary: false) }
-            if failedFirst {
-                // The delete has committed and the committed removal has not finished yet: its own
-                // hold still fences the delayed batch, which the failed one's end did not release.
-                storage.releaseWrites()
-                await store.written()
-            }
-            store.commitRemoval(committed)
-            if !failedFirst { store.rollBackRemoval(failed) }
-            storage.releaseWrites()
-            await store.written()
-            store.apply(.put("Live words"), to: live)
-            await store.written()
-
-            let onDisk820 = try Self.storedWords(pool)
-            #expect(onDisk820 == [live: "Live words"], "the removed account's words stay gone")
-            let accountLeft = try await pool.read { try Account.fetchOne($0, key: account) }
-            #expect(accountLeft == nil, "control: the account is removed")
-            #expect(store.fill(for: key).words == "")
-        }
-    }
-
-    @Test("The demo account removed, the demo ended and seeded anew: the next demo's field keeps its words; the old run's never come back")
-    func removedDemoAccountReopensWithTheNextSeed() async throws {
-        DemoModeStore.shared._resetForTests()
-        defer { DemoModeStore.shared._resetForTests() }
-        try await Self.withStore { pool, storage, store in
-            DemoModeStore.shared.isActive = true
-            let demo = Self.demoKey("removed-demo")
-            // The old run's write, delayed past everything below.
-            storage.holdWrites()
-            store.apply(.put("Old run's words"), to: demo)
-            #expect(await storage.waitForWrites(1), "control: the write is running")
-
-            try await Self.remove(DemoSeed.demoAccountId, store: store, pool: pool)
-            try await Self.endDemoAndStartTheNext(store, pool: pool)
-            // `DemoModeService.completeSetup`, once the new seed committed.
-            store.reopenAccount(DemoSeed.demoAccountId)
-            storage.releaseWrites()
-            await store.written()
-
-            store.apply(.put("New run's words"), to: demo)
-            #expect(store.fill(for: demo).words == "New run's words", "the next demo's field takes the edit")
-            await store.written()
-            let onDisk849 = try Self.storedWords(pool)
-            #expect(onDisk849 == [demo: "New run's words"], "and keeps it; the old run's write stays refused")
-        }
-    }
-
-    @Test("The demo's seed reopens its fixed account's words with the account settings, after the seed commits")
-    func demoSeedReopensTheWords() throws {
-        let text = try Self.source("TabMail/Services/Demo/DemoModeService.swift")
-        #expect(text.contains("try DemoSeed.seed() AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)"))
-        #expect(text.contains("ChatFieldWords.shared.reopenAccount(DemoSeed.demoAccountId) } catch {"))
     }
 
     @Test("A demo's write running as the demo ends: whether it lands or fails, its words are never in the next demo; real words are",
@@ -1163,7 +1077,7 @@ struct ChatFieldWordsTests {
             try await pool.write { try DemoSeed.wipe($0) }
             DemoModeStore.shared.isActive = false
             DemoModeStore.shared.isActive = true
-            run.reopenAccount(DemoSeed.demoAccountId)
+            try Self.insertAccount(DemoSeed.demoAccountId, pool: pool)
             storage.release(resultsOf: demo)
             await lateLoad.value
 
@@ -1190,11 +1104,13 @@ struct ChatFieldWordsTests {
     }
 
     /// Seeded random sequences of field changes (put, send, answer, transcript), reads, save points,
-    /// writes, account removals that commit or roll back (overlapping holds included) and demo
-    /// reopens, against storage with seeded write faults and latency before and after the database.
-    /// Checked against a model, never a schedule: the newest unsent words of a live chat are in its
-    /// field and on disk once a save point succeeds (a failed write's words included), a load never
-    /// changes a fill, and a removed account's or an ended demo's words never come back.
+    /// writes, account removals (their delete committed, or rolled back) and demo runs ended and
+    /// seeded anew, against storage with seeded write faults and latency before and after the
+    /// database. Checked against a model, never a schedule: the newest unsent words of a live chat
+    /// are in its field and on disk once a save point succeeds (a failed write's words included), a
+    /// load never changes a fill, and a removed account's or an ended demo's words never come back.
+    /// Acceptance mutant: dropping the account-row check from `ChatFieldWords.Storage.admits` lets a
+    /// write running across a removal land on a removed account's chat, which the disk check reports.
     @Test("Seeded fuzz: the newest unsent words win, failed writes are retried, retired chats never get words back",
           arguments: FuzzConfig.seeds)
     func seededConcurrencyFuzz(seed: UInt64) async throws {
@@ -1222,7 +1138,6 @@ struct ChatFieldWordsTests {
             // The model: each live chat's fill, and the accounts whose words are retired.
             var model: [String: ChatFieldFill] = [:]
             var retired: Set<String> = []
-            var open: [ChatFieldWords.Removal] = []
             var loads: [Task<Void, Never>] = []
             var log: [String] = []
             let texts = ["", "Sounds good", "Tuesday works", "See you then", "Sounds good"]
@@ -1250,30 +1165,27 @@ struct ChatFieldWordsTests {
                     let key = keys[rng.pick(keys.count)]
                     log.append("load \(key)")
                     loads.append(Task { await store.load(key) })
-                } else if roll < 64 {
-                    let account = accounts[rng.pick(accounts.count)]
-                    log.append("beginRemoval \(account)")
-                    open.append(store.beginRemoval(account))
-                } else if roll < 70, !open.isEmpty {
-                    let removal = open.remove(at: rng.pick(open.count))
+                } else if roll < 66 {
+                    // A real account removed: its delete commits, or fails and rolls back.
+                    let account = ["fz-a", "fz-b"][rng.pick(2)]
+                    if retired.contains(account) { continue }
                     if rng.pick(3) == 0 {
-                        log.append("commitRemoval \(removal.accountId)")
-                        let account = removal.accountId
-                        try await pool.write { try AccountManager.removeAccountRowsTxn($0, accountId: account, wasPrimary: false) }
-                        store.commitRemoval(removal)
+                        log.append("remove \(account)")
+                        try await remove(account, store: store, pool: pool)
                         retired.insert(account)
                         for key in keysOf[account]! { model[key] = nil }
                     } else {
-                        log.append("rollBackRemoval \(removal.accountId)")
-                        store.rollBackRemoval(removal)
+                        log.append("failedRemoval \(account)")
+                        struct RolledBack: Error {}
+                        _ = try? await pool.write { db in
+                            try AccountManager.removeAccountRowsTxn(db, accountId: account, wasPrimary: false)
+                            throw RolledBack()
+                        }
                     }
-                } else if roll < 73 {
-                    // The demo ends with its account removed, and the next one is seeded.
+                } else if roll < 70 {
+                    // The demo ends (its account and rows wiped), and the next one is seeded.
                     log.append("demoReopen")
-                    try await remove(DemoSeed.demoAccountId, store: store, pool: pool)
                     try await endDemoAndStartTheNext(store, pool: pool)
-                    store.reopenAccount(DemoSeed.demoAccountId)
-                    retired.remove(DemoSeed.demoAccountId)
                     for key in keysOf[DemoSeed.demoAccountId]! { model[key] = nil }
                 } else if roll < 80 {
                     log.append("written")
@@ -1291,9 +1203,8 @@ struct ChatFieldWordsTests {
                 }
             }
 
-            // Quiesce: loads land, every hold ends, faults stop, and one save point succeeds.
+            // Quiesce: loads land, faults stop, and one save point succeeds.
             for load in loads { await load.value }
-            for removal in open { store.rollBackRemoval(removal) }
             await store.written()
             storage.disableChaos()
             store.saveUnwritten()
