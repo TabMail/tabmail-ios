@@ -148,6 +148,7 @@ struct EmailForwardToolBodyReadTests {
         var all: [ComposeEditContext] { lock.withLock { items } }
     }
 
+    static let attachedSentinel = "ATTACHED-EML-SENTINEL"
     static let draftBody = "Hi Pat,\n\nSam asks whether we are in for the offsite.\n\nAlex"
 
     @Test("A pending reset refuses the forward with no model call and no card; an unchanged email sends its own body",
@@ -162,7 +163,14 @@ struct EmailForwardToolBodyReadTests {
         try await db.write { db in
             try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 111 WHERE id = ?", arguments: [folderId])
             try db.execute(sql: "UPDATE messageHeader SET observedUidValidity = 111 WHERE id = ?", arguments: [id])
-            try MessageBody(contentKey: ContentKey(rawValue: id), htmlContent: "<p>Are you in for the offsite?</p>").insert(db)
+            // The primary message, then an attached email (.eml) rendered inline: another person's
+            // email, never part of this email's own body.
+            let html = "<p>Are you in for the offsite?</p>" + EmlMarker.build(
+                filename: "attached.eml", partSection: "2",
+                envelope: EmlMarker.Envelope(subject: "Attached", from: "other@example.com", date: Date(),
+                                             to: ["user@example.com"], cc: []),
+                bodyHtml: "<p>\(Self.attachedSentinel)</p>")
+            try MessageBody(contentKey: ContentKey(rawValue: id), htmlContent: html).insert(db)
             if resetPending {
                 // The reset reaction's first step: the folder is marked, the old row still sits there.
                 try db.execute(sql: "UPDATE folder SET uidValidityResetPendingAt = ? WHERE id = ?",
@@ -209,7 +217,8 @@ struct EmailForwardToolBodyReadTests {
             #expect(calls.all.count == 1)
             let sent = try #require(calls.all.first)
             #expect(sent.mode == "edit_forward")
-            #expect(sent.bodyText == "Are you in for the offsite?", "the email's own primary body, not its snippet")
+            #expect(sent.bodyText.contains("Are you in for the offsite?"), "the email's own primary body, not its snippet")
+            #expect(!sent.bodyText.contains(Self.attachedSentinel), "an attached email's text never goes as this email's body")
             let opened = try #require(card, "control: the forward card opens")
             #expect(opened.mode == .forward)
             #expect(opened.replyTo?.id == header.id && opened.replyTo?.rfc822MessageId == "<offsite@example.com>")

@@ -778,6 +778,27 @@ struct ComposeSuggestionPersistTests {
         #expect(!source.contains("persistCachedReply"), "the retired second writer")
     }
 
+    /// Backstop for what no active test can drive (the hosted card's pill and Recompute take no
+    /// accessibility activation): the card's edit decides with the card's OWN live inputs, the From
+    /// chosen in the card, its recipients after this edit's deltas and the subject after this edit,
+    /// never the email's; and the card's disappearance runs its close step. The decisions themselves
+    /// are pinned behaviourally (`cardEditReachesTheGhostOnlyFromItsEnvelope`, `cardCloseEndsTheRecompute`).
+    @Test("A card's edit decides with the card's own From, recipients after the edit and subject; its disappearance closes its Recompute")
+    func cardEditUsesTheCardsOwnInputs() throws {
+        let source = try composeSource()
+        let edit = try functionBody("private func applyInlineEdit(", before: "static func suggestionEditTarget(", in: source)
+        let deltas = try #require(edit.range(of: "setRecipients(recipients.applying(to: toDelta, cc: ccDelta, bcc: bccDelta))"))
+        let gate = try #require(edit.range(of: "guard let edited, let reply = Self.suggestionEditTarget("))
+        #expect(deltas.lowerBound < gate.lowerBound, "the decision reads the recipients after this edit's deltas")
+        let call = String(edit[gate.lowerBound...].prefix(400))
+        #expect(call.contains("recipients: recipients.pendingCommitted"), "the card's recipients: \(call)")
+        #expect(call.contains("subject: newSubject ?? subject"), "the subject after this edit: \(call)")
+        #expect(call.contains("accountId: selectedAccount?.id"), "the From chosen in the card, never the email's account: \(call)")
+        #expect(!call.contains("replyTo?.accountId") && !call.contains("reply.accountId"))
+        let disappear = try functionBody("private func performDisappear()", before: "static func cardClosed(", in: source)
+        #expect(disappear.contains("Self.cardClosed(recompute: recomputeTask)"), "the card's disappearance closes its Recompute")
+    }
+
     @Test("A user edit clears the reply's text message, which described the AI's body")
     func editClearsReplyTextMessage() async throws {
         let db = try TestDatabase.make()
