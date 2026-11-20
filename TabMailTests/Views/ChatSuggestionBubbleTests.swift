@@ -50,11 +50,13 @@ struct ChatSuggestionBubbleTests {
         var view: UIView { controller.view }
     }
 
-    private func withChat(_ body: @MainActor (Chat) async throws -> Void) async throws {
-        try await HostedAccessibility.withAutomation { try await withChatBody(body) }
+    /// `noAnimation` hosts the chat (and so the card it presents) under a transaction with every
+    /// animation off: a test-host setting only, never the app's.
+    private func withChat(noAnimation: Bool = false, _ body: @MainActor (Chat) async throws -> Void) async throws {
+        try await HostedAccessibility.withAutomation { try await withChatBody(noAnimation: noAnimation, body) }
     }
 
-    private func withChatBody(_ body: @MainActor (Chat) async throws -> Void) async throws {
+    private func withChatBody(noAnimation: Bool, _ body: @MainActor (Chat) async throws -> Void) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         let queue = ActiveAIQueue.shared
@@ -68,7 +70,7 @@ struct ChatSuggestionBubbleTests {
         }
         // Every exit, setup included, gives the queue back as it was.
         do {
-            try await runChat(pool: pool, saved: saved, body)
+            try await runChat(pool: pool, saved: saved, noAnimation: noAnimation, body)
         } catch {
             await queue.clearForTesting()
             await queue.setDispatchSuppressedForTesting(false)
@@ -79,7 +81,7 @@ struct ChatSuggestionBubbleTests {
     }
 
     private func runChat(
-        pool: DatabasePool, saved: ChatSummaryQueueTests.SavedChatViewState,
+        pool: DatabasePool, saved: ChatSummaryQueueTests.SavedChatViewState, noAnimation: Bool,
         _ body: @MainActor (Chat) async throws -> Void
     ) async throws {
         saved.setChatView(on: true)
@@ -94,9 +96,12 @@ struct ChatSuggestionBubbleTests {
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        let controller = UIHostingController(rootView: AnyView(NavigationStack {
+        let chatRoot = NavigationStack {
             ChatThreadView(messageId: email.id)
-        }.environment(navigationStore).environment(\.hasTabMailSession, true)))
+        }.environment(navigationStore).environment(\.hasTabMailSession, true)
+        let controller = UIHostingController(rootView: noAnimation
+            ? AnyView(chatRoot.transaction { $0.animation = nil; $0.disablesAnimations = true })
+            : AnyView(chatRoot))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -146,6 +151,15 @@ struct ChatSuggestionBubbleTests {
         let hasTextView = HostedAccessibility.elements(under: card).contains { $0 is UITextView }
         return "presented=\(chain) window=\(card.window != nil) useSuggestion=\(labels.contains("Use Suggestion")) "
             + "bodyTextView=\(hasTextView) labels=\(labels) fields=\(fieldTexts(card))"
+    }
+
+    /// Draws the card's window as the screen shows it and records it as a PNG on the test.
+    private static func recordSnapshot(of card: UIView, named name: String) {
+        guard let window = card.window else { return }
+        let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+            _ = window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+        }
+        if let png = image.pngData() { Attachment.record(png, named: name) }
     }
 
     /// Presses the card's button labelled `label`, as a VoiceOver double tap does.
@@ -235,11 +249,12 @@ struct ChatSuggestionBubbleTests {
         }
     }
 
-    @Test("A saved reply draft stays as it is: the ghost's card shows the suggestion, and the draft keeps its words")
-    func savedDraftStaysInDrafts() async throws {
+    @Test("A saved reply draft stays as it is: the ghost's card shows the suggestion, and the draft keeps its words",
+          arguments: [false, true])
+    func savedDraftStaysInDrafts(noAnimation: Bool) async throws {
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
-        try await withChat { chat in
+        try await withChat(noAnimation: noAnimation) { chat in
             let now = Date().timeIntervalSince1970
             let key = Draft.draftKey(replyTo: "\(chat.email.accountId):\(chat.email.stableId)", isForward: false, newId: nil)
             let saved = Draft(
@@ -255,14 +270,20 @@ struct ChatSuggestionBubbleTests {
             #expect(ghost.accessibilityLabel == "\(ChatSuggestionConfig.label): Yes, Tuesday works for me.",
                     "the ghost still reads as one element: \(String(describing: ghost.accessibilityLabel))")
             #expect(ghost.accessibilityActivate(), "the ghost takes a tap")
+            let tapped = ContinuousClock.now
             let card = try await Self.openCard(chat)
+            let presenting = chat.controller.presentedViewController?.isBeingPresented ?? false
+            BackgroundSyncLogger.logDebug("[ChatTest] card seen noAnimation=\(noAnimation) msSinceTap=\((tapped.duration(to: .now) / .milliseconds(1)).rounded()) isBeingPresented=\(presenting)")
             var found: [String] = []
             try await Self.waitUntil {
                 found = Self.cardTexts(card)
                 return found.contains { $0.contains("Yes, Tuesday works for me.") }
             }
+            if !found.contains(where: { $0.contains("Yes, Tuesday works for me.") }) {
+                Self.recordSnapshot(of: card, named: "savedDraft-card.png")
+            }
             #expect(found.contains { $0.contains("Yes, Tuesday works for me.") },
-                    "the card holds the suggestion: \(Self.cardReport(chat, card))")
+                    "the card holds the suggestion (noAnimation=\(noAnimation), isBeingPresented when first seen=\(presenting)): \(Self.cardReport(chat, card))")
             #expect(found.contains { $0.contains("Hello Sam") }, "the full email is on the card: \(found)")
             #expect(!found.contains { $0.contains("My own words") }, "never the saved draft: \(found)")
             // Both sides: the suggestion saved from the card goes to a row of its own, and the
