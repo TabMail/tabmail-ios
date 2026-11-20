@@ -133,6 +133,12 @@ actor SyncEngine {
     /// top of each cycle (MainActor hop): fast sync, Low Power Mode, external power
     /// and the battery level (-1 when unknown).
     func backfillPowerState() async -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
+        await Self.currentBackfillPowerState()
+    }
+
+    /// The device's power state for the backfill gates, readable off the engine
+    /// (BackfillBodyQueue reads it too, #1064).
+    nonisolated static func currentBackfillPowerState() async -> (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float) {
         #if DEBUG
         if let state = Self.backfillPowerStateForTesting.withLock({ $0 }) { return state }
         #endif
@@ -173,6 +179,17 @@ actor SyncEngine {
         // batteryLevel is -1 when monitoring is off (it is set in TabMailApp.init).
         let powerHeld = !fastSync && !onPower && (lowPowerMode || (batteryLevel >= 0 && batteryLevel < 0.20))
         return !powerHeld && !(wifiOnly && expensive)
+    }
+
+    /// The walk gate from a fresh snapshot of the device's power, the Wi-Fi-only
+    /// setting and the network. Older-mail body downloads (BackfillBodyQueue) are
+    /// held by the same rules as the walk (#1064); ActiveBodyQueue is not gated.
+    nonisolated static func backfillDownloadsAllowedNow() async -> Bool {
+        let power = await currentBackfillPowerState()
+        let wifiOnly = UserDefaults.standard.object(forKey: SyncScheduler.wifiOnlyKey) as? Bool ?? true
+        return backfillWalkAllowed(
+            fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
+            batteryLevel: power.batteryLevel, wifiOnly: wifiOnly, expensive: NetworkMonitor.checkExpensive())
     }
 
     func register(accountId: String, provider: any EmailProvider, workQueue: ProviderWorkQueue) {

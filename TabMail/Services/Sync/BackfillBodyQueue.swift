@@ -163,6 +163,13 @@ actor BackfillBodyQueue {
     // by the priority on-demand / active body fetch).
     private var dbPool: PrioritizedDatabase { AppDatabase.backgroundPool }
 
+    /// True while the last dispatch found the backfill walk's download gate shut
+    /// (`SyncEngine.backfillDownloadsAllowedNow`, #1064). `awaitDrain` returns
+    /// while held, since no pending item can make progress until it lifts.
+    private(set) var heldByDownloadGate = false
+    /// Polls the download gate while held and re-dispatches once it lifts.
+    private var gateWatchTask: Task<Void, Never>?
+
     /// Test-only seam: snapshot of the underlying `QueueStorage` bookkeeping so the
     /// oversized-defer tests can assert the item was removed, was NOT marked
     /// recentlyCompleted, and `activeJobs` was left untouched.
@@ -448,6 +455,8 @@ actor BackfillBodyQueue {
         debounceTask = nil
         connectivityWatchTask?.cancel()
         connectivityWatchTask = nil
+        gateWatchTask?.cancel()
+        gateWatchTask = nil
         if itemCount > 0 || taskCount > 0 {
             BackgroundSyncLogger.logDebug("[BackfillBody] Cancelled \(taskCount) batch tasks, \(itemCount) in-flight items")
         }
@@ -460,6 +469,7 @@ actor BackfillBodyQueue {
     func awaitDrain() async {
         while !storage.isEmpty || activeBatchCount > 0 {
             if Task.isCancelled { break }
+            if heldByDownloadGate && activeBatchCount == 0 { break }
             try? await Task.sleep(for: .milliseconds(200))
         }
     }
@@ -492,6 +502,26 @@ actor BackfillBodyQueue {
         }
     }
 
+    private func scheduleDispatchOnGateLift() {
+        guard gateWatchTask == nil else { return }
+        gateWatchTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(SyncConfig.backfillBodyGateRecheckSeconds))
+                guard !Task.isCancelled else { return }
+                if await SyncEngine.backfillDownloadsAllowedNow() {
+                    await self?.gateLifted()
+                    return
+                }
+            }
+        }
+    }
+
+    private func gateLifted() {
+        gateWatchTask = nil
+        heldByDownloadGate = false
+        scheduleDispatch()
+    }
+
     /// Batched dispatch: groups items by (account, folder), launches one Task per group.
     /// Each Task does: batch IMAP fetch → render → process → FTS write in one shot.
     /// No deferred FTS buffer — the IMAP batch IS the write batch.
@@ -503,6 +533,22 @@ actor BackfillBodyQueue {
         }
         connectivityWatchTask?.cancel()
         connectivityWatchTask = nil
+
+        // #1064: older-mail bodies follow the walk's download gate (Wi-Fi-only on
+        // an expensive network, low battery or Low Power Mode off power). Items
+        // stay pending; a watch re-dispatches once the gate lifts. Batches
+        // already running finish. ActiveBodyQueue is not gated, by design.
+        guard await SyncEngine.backfillDownloadsAllowedNow() else {
+            if !heldByDownloadGate {
+                BackgroundSyncLogger.logBackfill("[BackfillBody] downloads HELD by the walk gate (pending=\(storage.pendingCount))")
+            }
+            heldByDownloadGate = true
+            if !storage.isEmpty { scheduleDispatchOnGateLift() }
+            return
+        }
+        heldByDownloadGate = false
+        gateWatchTask?.cancel()
+        gateWatchTask = nil
 
         // ADR-IOS-046: if the GRDB pool is suspended (app backgrounded past its
         // grace window), ABANDON — don't fetch bodies we can't persist. Every
