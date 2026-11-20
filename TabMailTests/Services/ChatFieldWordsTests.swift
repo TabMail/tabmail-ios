@@ -887,9 +887,12 @@ struct ChatFieldWordsTests {
         DemoModeStore.shared._resetForTests()
         defer { DemoModeStore.shared._resetForTests() }
         try await Self.withStore { pool, _, store in
+            // A real chat's key, taken before the demo starts: once one runs, `key(for:)`
+            // scopes every key to the demo.
+            let real = ChatFieldWords.key(for: Self.header("d-1", thread: "real"))
+            #expect(!real.hasPrefix("demo:"), "control: the real chat's key is not demo-scoped")
             // A demo runs, so the store admits its words and they reach the disk.
             DemoModeStore.shared.isActive = true
-            let real = ChatFieldWords.key(for: Self.header("d-1", thread: "real"))
             let demo = "demo:" + ChatThreadKey.key(accountId: DemoSeed.demoAccountId, threadId: "demo-thread")
             store.apply(.put("Real words"), to: real)
             store.apply(.put("Demo words"), to: demo)
