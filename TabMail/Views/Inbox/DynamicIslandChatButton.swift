@@ -159,8 +159,11 @@ struct DynamicIslandChat: View {
         get { session.lastFailedSend }
         nonmutating set { session.lastFailedSend = newValue }
     }
-    /// Saved checkpoint for a turn cut off in transit — drives the "Connection
-    /// lost. Tap to retry." affordance. Separate from `lastFailedSend`.
+    /// Saved checkpoint for a turn cut off in transit. Drives the "Connection
+    /// lost. Tap to retry." affordance and the field's Retry (`chatRetry`): on an
+    /// empty field, or in Send's place while the field still holds the unedited
+    /// sent words of this same request (its `fieldWordsKey` is the field's
+    /// `wordsKey`). Separate from `lastFailedSend`.
     private var pendingResume: ChatPillState.Session.PendingResume? {
         get { session.pendingResume }
         nonmutating set { session.pendingResume = newValue }
@@ -938,9 +941,9 @@ struct DynamicIslandChat: View {
                 .frame(width: 44, height: 44)
                 .accessibilityLabel("Transcribing")
         } else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil) && isOnLiveSession
-                    && (inputText.trimmingCharacters(in: .whitespaces).isEmpty || (pendingResume != nil && fieldFill.holdsSentWords)) {
+                    && (inputText.trimmingCharacters(in: .whitespaces).isEmpty || (pendingResume?.fieldWordsKey == wordsKey && fieldFill.holdsSentWords)) {
             // Retry button. Shown on an empty field, or on a field still holding the unchanged sent
-            // words of the cut-off request (resuming it adds no user turn). Reverts to the send
+            // words of the field's own cut-off request (resuming it adds no user turn). Reverts to the send
             // button as soon as the user types or edits. Routes to the right path:
             // a connection-lost RESUMES from saved state; a plain failure re-sends.
             Button {
