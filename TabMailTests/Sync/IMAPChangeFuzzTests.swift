@@ -7,7 +7,10 @@ import Testing
 @testable import TabMail
 
 /// Seeded fuzzer for the IMAP change reader (Testing Rule 11): the real
-/// `IMAPProvider.fetchChanges` against `FakeIMAPServer`'s QRESYNC model, with
+/// `IMAPProvider.fetchChanges` against `FakeIMAPServer`'s QRESYNC model, and its
+/// CONDSTORE model without QRESYNC (#755: expunges that leave HIGHESTMODSEQ
+/// unchanged, injected `UID SEARCH` failures, and budgets that stop the removal
+/// check part-way, so it resumes on later reads), with
 /// another client changing the mailbox between reads (flags, `\Deleted` and
 /// un-deleting, expunges, arrivals), seeded per-command latency, injected SELECT failures and
 /// cut budgets. The device side is a mirror applied from what the reader reports.
@@ -63,13 +66,26 @@ struct IMAPChangeFuzzTests {
         return out
     }
 
-    @Test("Seeded schedules never remove a shown message, never write wrong state, and converge")
-    func fuzz() async throws {
+    /// The server's change-reading capability.
+    enum Mode: String, CaseIterable, Sendable, CustomStringConvertible {
+        case qresync, condstore
+        var description: String { rawValue }
+    }
+
+    static func withWorld(_ mode: Mode, inbox: [Int], _ body: (R.World) async throws -> Void) async throws {
+        switch mode {
+        case .qresync: try await R.withWorld(inbox: inbox, body)
+        case .condstore: try await IMAPChangeCondstoreTests.withWorld(inbox: inbox, body)
+        }
+    }
+
+    @Test("Seeded schedules never remove a shown message, never write wrong state, and converge", arguments: Mode.allCases)
+    func fuzz(_ mode: Mode) async throws {
         let base = FuzzConfig.seed
         for iteration in 0..<FuzzConfig.iterations {
             var rng = SplitMix64(seed: base &+ UInt64(iteration))
-            let label = "seed=0x\(String(base, radix: 16)) iteration=\(iteration)"
-            try await R.withWorld(inbox: Array(1...FuzzConfig.initialMessages)) { w in
+            let label = "\(mode) seed=0x\(String(base, radix: 16)) iteration=\(iteration)"
+            try await Self.withWorld(mode, inbox: Array(1...FuzzConfig.initialMessages)) { w in
                 w.server.setSeededLatencyInjection(seed: base &+ UInt64(iteration) &* 31, maxMilliseconds: FuzzConfig.latencyMaxMilliseconds)
                 var mirror = Mirror()
                 for (uid, flags) in Self.shown(w.server) { mirror.held[uid] = flags }
@@ -113,13 +129,23 @@ struct IMAPChangeFuzzTests {
                     }
                     let fault = rng.pick(100) < FuzzConfig.faultPercent
                     let cut = rng.pick(100) < FuzzConfig.budgetCutPercent
-                    if fault { w.server.failNextCommand(containing: "SELECT") }
-                    try await Self.readAndApply(w, &mirror, cut: cut, label: "\(label) round=\(round)")
+                    if fault {
+                        // CONDSTORE: half the faults hit the removal check's SEARCH.
+                        let searchFault = mode == .condstore && rng.pick(2) == 0
+                        w.server.failNextCommand(containing: searchFault ? "UID SEARCH" : "SELECT")
+                    }
+                    // CONDSTORE: a cut is a budget the removal check runs out of
+                    // part-way (one to four SEARCH steps), not a pass that never starts.
+                    let budget: ChangeContext? = cut && mode == .condstore
+                        ? IMAPChangeCondstoreCheckTests.searchBudget(
+                            w, seconds: SyncConfig.changeReadRequestTimeoutSeconds * Double(3 + rng.pick(4)))
+                        : nil
+                    try await Self.readAndApply(w, &mirror, mode: mode, cut: cut, budget: budget, label: "\(label) round=\(round)")
                 }
 
                 // Quiescence: reads with no faults until the mirror converges.
                 for quiet in 0..<3 {
-                    try await Self.readAndApply(w, &mirror, cut: false, label: "\(label) quiet=\(quiet)")
+                    try await Self.readAndApply(w, &mirror, mode: mode, cut: false, budget: nil, label: "\(label) quiet=\(quiet)")
                 }
                 let server = Self.shown(w.server)
                 #expect(Set(mirror.held.keys) == Set(server.keys), "I3 held set converges, \(label)")
@@ -127,17 +153,23 @@ struct IMAPChangeFuzzTests {
                     #expect(mirror.held[uid]?.read == flags.read && mirror.held[uid]?.flagged == flags.flagged,
                             "I3 flags converge for \(uid), \(label)")
                 }
-                #expect(w.server.enableQResyncCountByConnection.values.allSatisfy { $0 == 1 }, "ENABLE once per connection, \(label)")
+                if mode == .qresync {
+                    #expect(w.server.enableQResyncCountByConnection.values.allSatisfy { $0 == 1 }, "ENABLE once per connection, \(label)")
+                } else {
+                    #expect(w.server.enableQResyncCountByConnection.isEmpty, "no ENABLE QRESYNC on a CONDSTORE server, \(label)")
+                }
             }
         }
     }
 
     /// One read of the inbox, checked (I1, I2) and applied to the mirror.
-    static func readAndApply(_ w: R.World, _ mirror: inout Mirror, cut: Bool, label: String) async throws {
+    static func readAndApply(
+        _ w: R.World, _ mirror: inout Mirror, mode: Mode, cut: Bool, budget: ChangeContext?, label: String
+    ) async throws {
         w.local.set(w.inboxId, Array(mirror.held.keys))
-        let context = cut
+        let context = budget ?? (cut
             ? ChangeContext(deadline: Date.distantPast, onProgress: { _ in })
-            : ChangeContext(onProgress: { _ in })
+            : ChangeContext(onProgress: { _ in }))
         let set = try await R.read(w, cursors: [w.inboxId: mirror.cursor], context: context)
         let changes = try R.inbox(w, set)
         let server = shown(w.server)
@@ -173,8 +205,14 @@ struct IMAPChangeFuzzTests {
             mirror.held = server
         case .failed:
             if let cursor = changes.cursor { mirror.cursor = cursor }
-        case .untracked:
-            Issue.record("a QRESYNC server's inbox reported untracked, \(label)")
+        case .untracked(let observation):
+            // CONDSTORE: a removal check cut by the budget. The engine lists the
+            // folder the same pass and keeps the bookmark with the check's progress.
+            guard mode == .condstore, observation.mustList else {
+                Issue.record("an inbox the server tracks reported untracked (\(mode)), \(label)"); return
+            }
+            mirror.cursor = changes.cursor ?? mirror.cursor
+            mirror.held = server
         case .notRun, .baselining:
             break
         }

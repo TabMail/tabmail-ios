@@ -130,6 +130,83 @@ struct IMAPChangeCondstoreCheckTests {
         }
     }
 
+    /// A budget spent by the fake server's work, not by wall time: each
+    /// `UID SEARCH` the pass sends costs one request timeout. `seconds` is the
+    /// pass's whole budget, so the check's own step gates decide how far it gets.
+    static func searchBudget(_ w: R.World, seconds: TimeInterval) -> ChangeContext {
+        let start = Date()
+        let server = w.server
+        let before = Self.searchesSent(server)
+        return ChangeContext(
+            deadline: start.addingTimeInterval(seconds),
+            clock: { start.addingTimeInterval(Double(Self.searchesSent(server) - before) * SyncConfig.changeReadRequestTimeoutSeconds) },
+            onProgress: { _ in })
+    }
+
+    static func searchesSent(_ server: FakeIMAPServer) -> Int {
+        server.recordedCommands().filter { $0.uppercased().contains("UID SEARCH") }.count
+    }
+
+    /// A pass whose budget pays for one window chunk and its proof only.
+    static let oneChunkBudgetSeconds = SyncConfig.changeReadRequestTimeoutSeconds * 4
+    /// Most passes either test lets the check take before it counts as stuck.
+    static let passCap = 8
+
+    @Test("T1a: a check over several window chunks makes progress on every cut pass, resumes where it stopped, and finishes with every removal proven")
+    func finiteBudgetCheckResumesAcrossPasses() async throws {
+        let held = Array(1...1_500)
+        try await C.withWorld(inbox: held) { w in
+            let base = try await R.baseline(w)
+            let gone: Set<Int> = [100, 900, 1_400]
+            C.remove(gone, from: w.server)
+            var stored: String? = base
+            var removed = Set<String>()
+            var lastPosition: (nextBelow: UInt32, remaining: Int)?
+            var cuts = 0
+            var finished = false
+            for _ in 0..<Self.passCap {
+                let pass = try await R.inbox(w, R.read(w, cursors: [w.inboxId: stored], context: Self.searchBudget(w, seconds: Self.oneChunkBudgetSeconds)))
+                removed.formUnion(pass.removals)
+                if R.isTracked(pass.status) { finished = true; break }
+                guard case .untracked = pass.status else { Issue.record("expected a cut, got \(pass.status)"); return }
+                cuts += 1
+                let progress = try #require(try Self.cursor(pass.cursor).pendingCheck, "a cut carries the check's progress")
+                if let last = lastPosition {
+                    #expect(progress.nextBelow < last.nextBelow || progress.remaining < last.remaining,
+                            "cut \(cuts) made no progress: \(progress.nextBelow)/\(progress.remaining)")
+                }
+                lastPosition = (progress.nextBelow, progress.remaining)
+                stored = pass.cursor
+            }
+            #expect(finished, "the check finished within \(Self.passCap) passes")
+            #expect(cuts >= 2, "the budget cut the check more than once: \(cuts)")
+            #expect(removed == Set(gone.map(String.init)), "every removal proven, nothing else: \(removed.sorted())")
+        }
+    }
+
+    @Test("T1b: after a bulk expunge of over a thousand messages the check finishes within the production budget, the folder is tracked again, and a later flag change on an older message arrives")
+    func bulkExpungeReturnsToTracking() async throws {
+        let held = Array(1...1_500)
+        try await C.withWorld(inbox: held) { w in
+            let base = try await R.baseline(w)
+            C.remove(Set(1...1_001), from: w.server)
+            let productionBudget = SyncConfig.changeReadRequestTimeoutSeconds * 6 + 2
+            var stored: String? = base
+            var tracked = false
+            for _ in 0..<Self.passCap {
+                let pass = try await R.inbox(w, R.read(w, cursors: [w.inboxId: stored], context: Self.searchBudget(w, seconds: productionBudget)))
+                stored = pass.cursor ?? stored
+                if R.isTracked(pass.status) { tracked = true; break }
+            }
+            #expect(tracked, "the folder is tracked again after the check finishes")
+            guard tracked else { return }
+            w.server.setFlags(["\\Seen"], in: R.inboxPath, uid: 1_200)
+            let later = try await R.inbox(w, R.read(w, cursors: [w.inboxId: stored], context: Self.searchBudget(w, seconds: productionBudget)))
+            #expect(R.isTracked(later.status), "got \(later.status)")
+            #expect(later.records.contains { $0.messageId == "1200" }, "the older message's flag change arrives")
+        }
+    }
+
     @Test("T12 through the apply: three cuts mark exactly one catch-up lapse, and the armed catch-up listing completes and removes the deleted message")
     func repeatedCutsLapseOnceAndTheCatchUpCompletes() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()

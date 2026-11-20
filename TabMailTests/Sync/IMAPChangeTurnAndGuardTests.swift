@@ -137,6 +137,85 @@ struct IMAPChangeTurnAndGuardTests {
         }
     }
 
+    /// More post-send finalisations than the IMAP work queue has slots.
+    static let postSendBurst = SyncConfig.imapMaxConnectionCeiling + 1
+    /// How long the held pass and the burst may take to finish once released:
+    /// past the stuck-wait watch's bound, so a wedge is reported by the watch
+    /// (and released by it) before this test gives up.
+    static let burstBoundSeconds = SyncConfig.syncTurnWaitTestBoundSeconds * 2
+
+    /// No account-wide wedge: a foreground pass holds the account's sync turn
+    /// while a burst of completed sends is finalised (crash recovery,
+    /// `reconcileOutbox`). Each finalisation lists the Sent folder, which waits
+    /// for the turn. With a work-queue slot held around that wait, the burst
+    /// filled the queue and the pass's next request never got a slot. The
+    /// engine and the drains share one queue, as `connectAccount` sets them up.
+    @Test("A pass holding the turn while more sends are finalised than the work queue has slots: the pass and every finalisation complete")
+    func postSendBurstDuringAHeldPassNeverWedgesTheAccount() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "post-send-burst"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "Sent", role: .sent, pool: pool)
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [1, 2, 3].map(IMAPChangeReaderTests.message), "Sent": []])
+        try server.start()
+        defer { server.stop() }
+        let imap = IMAPProvider(
+            host: "127.0.0.1", port: server.port, username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        await AccountManager.shared.connectProviderForTesting(account: account, provider: imap)
+        defer { Task { await AccountManager.shared.disconnectProviderForTesting(accountId: accountId) } }
+        let engine = await AccountManager.shared.syncEngine
+
+        for index in 0..<Self.postSendBurst {
+            var sent = OutboxMessage(
+                accountId: accountId,
+                draft: DraftMessage(to: ["recipient@example.com"], subject: "burst \(index)", body: "sent already"))
+            sent.status = OutboxStatus.sending.rawValue
+            sent.sentAt = Date()
+            sent.appendedToSent = true
+            let row = sent
+            try await pool.write { db in try row.insert(db) }
+        }
+
+        // The pass holds the turn, parked inside its change read (a STATUS, in
+        // a work-queue slot); its full sync and maintenance still need slots.
+        server.holdNextCommand(containing: "STATUS")
+        let passDone = Done()
+        let pass = Task {
+            _ = try? await engine.sync(account: account)
+            passDone.flag.withLock { $0 = true }
+        }
+        try await Self.waitUntil { server.isHoldingCommand(containing: "STATUS") }
+
+        await AccountManager.shared.reconcileOutbox()
+        try await Self.waitUntil { (try? pool.read { db in try OutboxMessage.fetchCount(db) }) == 0 }
+        // Each finalisation's Sent listing is started and waiting for the turn.
+        try await Task.sleep(nanoseconds: UInt64(Self.quietWatchSeconds * 1_000_000_000))
+        server.releaseHeldCommand(containing: "STATUS")
+
+        let deadline = Date().addingTimeInterval(Self.burstBoundSeconds)
+        func settled() async -> Bool {
+            guard passDone.flag.withLock({ $0 }) else { return false }
+            let running = await engine.syncPassRunning.isEmpty
+            let waiting = await engine.syncPassWaiters.isEmpty
+            // Every finalisation's Sent listing reached the server.
+            let sentSelects = server.recordedCommands().filter {
+                let u = $0.uppercased(); return u.contains("SELECT") && u.contains("SENT")
+            }.count
+            return running && waiting && sentSelects >= Self.postSendBurst
+        }
+        while !(await settled()), Date() < deadline {
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        #expect(passDone.flag.withLock { $0 }, "the pass holding the turn never finished: the account is wedged")
+        #expect(await settled(), "not every finalisation listed the Sent folder: the account is wedged")
+        if passDone.flag.withLock({ $0 }) { await pass.value }
+    }
+
     /// How long a full sync over one quarantined folder may take before it
     /// counts as stuck (a bound, never a sleep).
     static let quarantinedFullSyncBoundSeconds: TimeInterval = 20
@@ -198,7 +277,7 @@ struct IMAPChangeTurnAndGuardTests {
                 w.server.honorSearchUIDSetCriterion()
                 w.server.setSeededLatencyInjection(seed: TurnFuzz.seed &+ UInt64(iteration) &* 31, maxMilliseconds: TurnFuzz.latencyMaxMilliseconds)
                 let folder = try w.folder()
-                let kinds = (0..<TurnFuzz.tasksPerIteration).map { _ in Int.random(in: 0..<3, using: &rng) }
+                let kinds = (0..<TurnFuzz.tasksPerIteration).map { _ in Int.random(in: 0..<4, using: &rng) }
                 let finished = Finished()
                 for kind in kinds {
                     // Never awaited: a deadlock must fail the test, not hang the suite.
@@ -209,15 +288,19 @@ struct IMAPChangeTurnAndGuardTests {
                                 try await w.engine.syncFolderMessages(folder: folder, provider: w.provider)
                             }
                         case 1: _ = try? await w.engine.syncFolderMessages(folder: folder, provider: w.provider)
-                        default: _ = try? await w.engine.performDeltaSync(account: w.account, provider: w.provider)
+                        // The production pass entry points, which take the turn.
+                        case 2: _ = try? await w.engine.backgroundDeltaSync(account: w.account)
+                        default: _ = try? await w.engine.sync(account: w.account)
                         }
                         finished.count.withLock { $0 += 1 }
                     }
                 }
                 try await Self.waitUntil { finished.count.withLock { $0 } == kinds.count }
                 #expect(finished.count.withLock { $0 } == kinds.count, "\(label): every task completed (\(kinds))")
-                _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
-                _ = try await w.engine.syncFolderMessages(folder: try w.folder(), provider: w.provider)
+                // One more change pass through the production entry, and no repair
+                // listing: a listing would re-list the folder and hide what the
+                // overlapping tasks left behind.
+                _ = try await w.engine.backgroundDeltaSync(account: w.account)
                 let rows = try w.uids()
                 #expect(Set(["4", "5", "6"]).isSubset(of: rows), "\(label): no live message lost: \(rows.sorted())")
                 #expect(rows.isSubset(of: Set((1...6).map(String.init))), "\(label): no row the server does not hold: \(rows.sorted())")
