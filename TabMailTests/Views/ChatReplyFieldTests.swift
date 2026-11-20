@@ -725,9 +725,17 @@ struct ChatReplyFieldTests {
         #expect(Self.count("try? await Task.sleep(for: Self.fieldDragSettle)", in: changed) == 1)
         // Never in the tutorial, whose steps open the chat themselves, nor over the open panel.
         #expect(Self.count(".simultaneousGesture(fieldDragGesture, isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning)", in: chat) == 1)
-        // VoiceOver opens the panel with a named action on the field.
+        // VoiceOver opens the panel with a named action on the text field it focuses, offered only
+        // while the panel is closed, never on the field's container.
         #expect(ChatThreadView.showChatActionName == "Show TabMail chat")
-        #expect(Self.count("Button(Self.showChatActionName) { withAnimation(Self.pillSpring) { chatExpanded = true } }", in: chat) == 1)
+        #expect(Self.count("showChat: chatExpanded || TutorialCoordinator.shared.isRunning ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } }", in: chat) == 1)
+        #expect(Self.count("Button(Self.showChatActionName)", in: chat) == 0, "not on the container")
+        let bar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
+        #expect(Self.count("inputField(placeholder: hasTabMailSession ? field.placeholder : \"Sign in to reply or ask\") // The drag up's VoiceOver equivalent, on the element VoiceOver // focuses; only while the panel is closed. .accessibilityActions { if let showChat = field.showChat, !isExpanded { Button(ChatThreadView.showChatActionName) { showChat() } } }", in: bar) == 1)
+        // The closure is not part of the field's equality.
+        let open = ChatReplyField(example: nil, isNoReply: false, clearCount: 0, showChat: {})
+        let closed = ChatReplyField(example: nil, isNoReply: false, clearCount: 0)
+        #expect(open == closed)
     }
 
     @Test("A drag on the field holds the bar from its start, the bar ignores the field while it drags, and every let-go releases the freeze")

@@ -209,12 +209,17 @@ struct ChatThreadLayoutTests {
                 let carrier = try #require(HostedAccessibility.elements(under: controller.view)
                     .first { $0.accessibilityCustomActions?.contains { $0.name == name } ?? false },
                     "ids: \(HostedAccessibility.identifiers(in: controller.view))")
-                // VoiceOver offers an element's actions only while that element has its focus.
+                // VoiceOver offers an element's actions only while that element has its focus: the
+                // reply field's text field, never its container.
                 #expect(carrier.isAccessibilityElement,
                         "the action's element can take VoiceOver focus: \(HostedAccessibility.identifier(of: carrier) ?? "no id")")
+                #expect(HostedAccessibility.identifier(of: carrier) != id, "not the field's container")
                 #expect(Self.frame(of: "chatClose", in: controller.view) == nil, "control: the panel starts closed")
-                let carrierId = try #require(HostedAccessibility.identifier(of: carrier))
-                #expect(HostedAccessibility.perform(name, on: carrierId, in: controller.view), "the action runs")
+                // Run it as VoiceOver's actions rotor does (the text field has no identifier to
+                // look it up by).
+                let action = try #require(carrier.accessibilityCustomActions?.first { $0.name == name })
+                let handler = try #require(action.actionHandler, "control: a SwiftUI action has a handler")
+                #expect(handler(action), "the action runs")
                 try await Self.waitFor { Self.frame(of: "chatClose", in: controller.view) != nil }
                 #expect(Self.frame(of: "chatClose", in: controller.view) != nil, "the panel opened")
                 let stillOffered = HostedAccessibility.elements(under: controller.view)
