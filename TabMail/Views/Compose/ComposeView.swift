@@ -213,18 +213,30 @@ enum ComposeDraftGuards {
         static let empty = Baseline(subject: "", body: "", to: [], cc: [], bcc: [], attachmentsFingerprint: [])
     }
 
-    /// The baseline a compose keeps after loading or prefilling `loaded`.
-    /// `treatAsUnsavedChanges` keeps the empty baseline, so whatever was loaded
-    /// counts as unsaved and Close asks to save it: the compose reopened by Undo
-    /// Send when its save back to Drafts did not land, and the prefill callers
-    /// that ask for it.
-    static func baseline(afterLoading loaded: Baseline, treatAsUnsavedChanges: Bool) -> Baseline {
-        treatAsUnsavedChanges ? .empty : loaded
+    /// What the compose holds when the user presses Close.
+    struct CloseState: Equatable {
+        var readState: ReadState
+        /// The fields as they were when the compose finished loading or
+        /// prefilling.
+        var loaded: Baseline
+        /// The fields now.
+        var current: Baseline
+        /// The loaded content counts as unsaved, so Close asks to save it even
+        /// when nothing was typed: the compose reopened by Undo Send when its
+        /// save back to Drafts did not land, and the prefill callers that ask
+        /// for it.
+        var loadedIsUnsaved: Bool
+        var hasContent: Bool
+        /// Work Close must not drop silently: an attachment still being
+        /// prepared, or a visible suggestion.
+        var hasUnsettledWork: Bool
     }
 
-    /// Whether the compose's fields differ from its baseline.
-    static func hasChanges(current: Baseline, baseline: Baseline) -> Bool {
-        current != baseline
+    /// The action Close takes for `state`.
+    static func closeDecision(_ state: CloseState) -> CloseAction {
+        let baseline = state.loadedIsUnsaved ? Baseline.empty : state.loaded
+        let hasChanges = state.current != baseline || state.hasUnsettledWork
+        return closeAction(readState: state.readState, hasContent: state.hasContent, hasChanges: hasChanges)
     }
 
     /// PORT — `v2final:ComposeDraftGuards.CloseAction`.
@@ -1157,7 +1169,7 @@ struct ComposeView: View {
     /// See `ComposeDraftGuards.sendReplyTarget`.
     @State private var persistedReplyTargetClaim: ComposeDraftGuards.PersistedReplyTargetClaim?
     /// Snapshot of draft state at load time — used to detect actual changes for "Save?" prompt
-    @State private var initialBaseline = ComposeDraftGuards.Baseline.empty
+    @State private var loadedBaseline = ComposeDraftGuards.Baseline.empty
     @FocusState private var bodyFocused: Bool
     @Environment(\.dismiss) private var dismiss
     @Environment(NavigationStore.self) private var navigationStore
@@ -2704,13 +2716,10 @@ struct ComposeView: View {
         prepopulate()
     }
 
-    /// Snapshot current field values so closeCompose can detect actual changes.
-    /// `prefillTreatAsUnsavedChanges` keeps the empty baseline instead, so the
-    /// loaded or prefilled content counts as unsaved (`ComposeDraftGuards.baseline`).
+    /// Record the fields as loaded or prefilled, for Close to compare against
+    /// (`ComposeDraftGuards.closeDecision`).
     private func snapshotInitialState() {
-        initialBaseline = ComposeDraftGuards.baseline(
-            afterLoading: currentBaseline(),
-            treatAsUnsavedChanges: prefillTreatAsUnsavedChanges)
+        loadedBaseline = currentBaseline()
     }
 
     private func currentBaseline() -> ComposeDraftGuards.Baseline {
@@ -2815,12 +2824,14 @@ struct ComposeView: View {
             bcc: recipients.bcc.tokens + recipients.bcc.rejected,
             toInput: recipients.to.input, ccInput: recipients.cc.input, bccInput: recipients.bcc.input,
             hasAttachments: !attachments.isEmpty || attachmentLoadFailed || attachmentPreparationIsUnsettled)
-        let hasChanges = ComposeDraftGuards.hasChanges(current: currentBaseline(), baseline: initialBaseline)
-            || attachmentPreparationIsUnsettled
-            || hasVisibleSuggestion
-        switch ComposeDraftGuards.closeAction(
-            readState: draftReadState, hasContent: hasContent, hasChanges: hasChanges
-        ) {
+        switch ComposeDraftGuards.closeDecision(ComposeDraftGuards.CloseState(
+            readState: draftReadState,
+            loaded: loadedBaseline,
+            current: currentBaseline(),
+            loadedIsUnsaved: prefillTreatAsUnsavedChanges,
+            hasContent: hasContent,
+            hasUnsettledWork: attachmentPreparationIsUnsettled || hasVisibleSuggestion
+        )) {
         case .promptSave:
             showDiscardPrompt = true
         case .promptDelete:

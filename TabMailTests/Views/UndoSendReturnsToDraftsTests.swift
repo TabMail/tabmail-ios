@@ -145,23 +145,22 @@ struct UndoSendReturnsToDraftsTests {
     }
 
     /// The close decision the reopened compose makes when the user closes it
-    /// without typing: its fields are exactly the kept row.
+    /// without typing: what it loaded and what it holds are the kept row.
     private func closeWithoutTyping(
         _ compose: ComposeView, loaded: Draft
     ) -> ComposeDraftGuards.CloseAction {
-        let current = ComposeDraftGuards.Baseline(
+        let fields = ComposeDraftGuards.Baseline(
             subject: loaded.subject, body: loaded.body,
             to: loaded.toArray, cc: loaded.ccArray, bcc: loaded.bccArray,
             attachmentsFingerprint: [])
-        let baseline = ComposeDraftGuards.baseline(
-            afterLoading: current, treatAsUnsavedChanges: compose.prefillTreatAsUnsavedChanges)
-        return ComposeDraftGuards.closeAction(
-            readState: .loaded,
+        return ComposeDraftGuards.closeDecision(ComposeDraftGuards.CloseState(
+            readState: .loaded, loaded: fields, current: fields,
+            loadedIsUnsaved: compose.prefillTreatAsUnsavedChanges,
             hasContent: ComposeDraftGuards.hasContent(
                 subject: loaded.subject, body: loaded.body,
                 to: loaded.toArray, cc: loaded.ccArray, bcc: loaded.bccArray,
                 toInput: "", ccInput: "", bccInput: "", hasAttachments: false),
-            hasChanges: ComposeDraftGuards.hasChanges(current: current, baseline: baseline))
+            hasUnsettledWork: false))
     }
 
     // MARK: - The confirmed Undo returns the message to Drafts
@@ -320,18 +319,34 @@ struct UndoSendReturnsToDraftsTests {
 
     // MARK: - The close decision behind a failed return
 
-    @Test("A compose opened as unsaved asks to save unchanged content; one opened as saved closes")
-    func unsavedBaselineDrivesTheClosePrompt() {
-        let loaded = ComposeDraftGuards.Baseline(
-            subject: "Quarterly plan", body: "Words.", to: ["recipient@example.com"], cc: [], bcc: [],
-            attachmentsFingerprint: [])
-        for (unsaved, expected) in [(true, ComposeDraftGuards.CloseAction.promptSave), (false, .dismiss)] {
-            let baseline = ComposeDraftGuards.baseline(afterLoading: loaded, treatAsUnsavedChanges: unsaved)
-            let action = ComposeDraftGuards.closeAction(
-                readState: .loaded, hasContent: true,
-                hasChanges: ComposeDraftGuards.hasChanges(current: loaded, baseline: baseline))
-            #expect(action == expected, "treatAsUnsavedChanges: \(unsaved)")
-        }
+    private static let loadedFields = ComposeDraftGuards.Baseline(
+        subject: "Quarterly plan", body: "Words.", to: ["recipient@example.com"], cc: [], bcc: [],
+        attachmentsFingerprint: [])
+
+    private static func close(
+        current: ComposeDraftGuards.Baseline, loadedIsUnsaved: Bool,
+        readState: ComposeDraftGuards.ReadState = .loaded, hasUnsettledWork: Bool = false
+    ) -> ComposeDraftGuards.CloseAction {
+        ComposeDraftGuards.closeDecision(ComposeDraftGuards.CloseState(
+            readState: readState, loaded: loadedFields, current: current,
+            loadedIsUnsaved: loadedIsUnsaved, hasContent: true, hasUnsettledWork: hasUnsettledWork))
+    }
+
+    @Test("Close of loaded content left unchanged asks to save only when the content is unsaved")
+    func closeOfUnchangedContentFollowsTheUnsavedFlag() {
+        #expect(Self.close(current: Self.loadedFields, loadedIsUnsaved: true) == .promptSave)
+        #expect(Self.close(current: Self.loadedFields, loadedIsUnsaved: false) == .dismiss)
+    }
+
+    @Test("Close compares against what was loaded: an edit asks to save, unchanged content closes")
+    func closeComparesAgainstTheLoadedContent() {
+        var edited = Self.loadedFields
+        edited.body = "Words, edited."
+        #expect(Self.close(current: edited, loadedIsUnsaved: false) == .promptSave)
+        #expect(Self.close(current: edited, loadedIsUnsaved: true) == .promptSave)
+        #expect(Self.close(current: Self.loadedFields, loadedIsUnsaved: false, hasUnsettledWork: true) == .promptSave)
+        #expect(Self.close(current: Self.loadedFields, loadedIsUnsaved: true, readState: .error) == .promptDiscardEdits)
+        #expect(Self.close(current: Self.loadedFields, loadedIsUnsaved: false, readState: .error) == .dismiss)
     }
 
     @Test("The reopened compose opens as unsaved exactly when the return to Drafts failed")
@@ -346,55 +361,43 @@ struct UndoSendReturnsToDraftsTests {
             #expect(compose.retainedDraftAuthority == authority)
         }
     }
-    // MARK: - The compose applies the flag where it records its baseline
+    // MARK: - Close is wired to the decision
 
-    /// Source fence on the one call that turns the reopen flag into the close
-    /// decision: `ComposeView.snapshotInitialState` must pass the compose's own
-    /// `prefillTreatAsUnsavedChanges` to `ComposeDraftGuards.baseline`, so a
-    /// failed return opens with unsaved changes and Close asks to save.
-    /// The decision that baseline feeds is tested below against the real Undo.
-    @Test("The compose records its baseline with its own unsaved-changes flag")
-    func composeBaselineUsesTheReopenFlag() throws {
+    /// Source fence on the wiring only: the compose's Close hands the decision
+    /// its recorded load, its current fields and its own unsaved-content flag,
+    /// and the load is recorded from the fields. The decision itself is tested
+    /// above by behaviour.
+    @Test("The compose's Close calls the close decision with its own state")
+    func closeCallsTheDecision() throws {
         let projectRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let source = try String(contentsOf: projectRoot
             .appendingPathComponent("TabMail/Views/Compose/ComposeView.swift"), encoding: .utf8)
-        let start = try #require(source.range(of: "private func snapshotInitialState() {"))
+        let start = try #require(source.range(of: "private func closeCompose() async {"))
         let tail = source[start.upperBound...]
-        let end = try #require(tail.range(of: "private func currentBaseline()"))
+        let end = try #require(tail.range(of: "\n    }\n"))
         let body = tail[..<end.lowerBound].split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        #expect(body.contains(
-            "initialBaseline = ComposeDraftGuards.baseline( afterLoading: currentBaseline(), treatAsUnsavedChanges: prefillTreatAsUnsavedChanges)"),
-            "snapshotInitialState reads: \(body)")
-        #expect(source.contains("ComposeDraftGuards.hasChanges(current: currentBaseline(), baseline: initialBaseline)"),
-                "hasChanges must compare against the recorded baseline")
-        // Both load outcomes record the baseline through that function: the
-        // loaded-row branch, and the prefill branch when no row is found.
-        let loadedBranch = try #require(source.range(of: "[ComposeView] Loaded draft: id="))
-        let afterLoaded = source[loadedBranch.upperBound...]
-        let loadedReturn = try #require(afterLoaded.range(of: "return"))
-        #expect(afterLoaded[..<loadedReturn.lowerBound].contains("snapshotInitialState()"),
-                "the loaded-row branch must record its baseline with snapshotInitialState()")
-        // The prefill branch calls `prepopulate()`, which records it at its end.
-        let prefill = try #require(source.range(of: "private func prepopulate() {"))
-        let afterPrefill = source[prefill.upperBound...]
-        let prefillEnd = try #require(afterPrefill.range(of: "\n    }\n"))
-        #expect(afterPrefill[..<prefillEnd.lowerBound].contains("snapshotInitialState()"),
-                "prepopulate() must record its baseline with snapshotInitialState()")
-        let assignments = source.split(separator: "\n")
-            .filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("initialBaseline = ") }.count
-        #expect(assignments == 1, "only snapshotInitialState may set the baseline, found \(assignments)")
+        for wiring in [
+            "switch ComposeDraftGuards.closeDecision(ComposeDraftGuards.CloseState(",
+            "loaded: loadedBaseline,",
+            "current: currentBaseline(),",
+            "loadedIsUnsaved: prefillTreatAsUnsavedChanges,",
+        ] {
+            #expect(body.contains(wiring), "closeCompose() lacks `\(wiring)`")
+        }
+        let record = try #require(source.range(of: "private func snapshotInitialState() {"))
+        let recordBody = source[record.upperBound...].prefix(200)
+        #expect(recordBody.contains("loadedBaseline = currentBaseline()"),
+                "snapshotInitialState() must record the loaded fields")
     }
 
     // MARK: - The decision Close reads, after the real Undo
 
-    /// Close compares the compose's fields with the baseline it recorded on
-    /// loading (`ComposeDraftGuards.hasChanges`). After the real Undo, with the
-    /// compose the Undo reopens and the row it loads: a failed return (the
-    /// savepoint refused) reports changes, so Close asks to save; a return that
-    /// landed reports none, so Close just closes.
+    /// After the real Undo, with the compose the Undo reopens and the row it
+    /// loads, closed without typing: a failed return (the savepoint refused)
+    /// asks to save; a return that landed just closes.
     @Test("After a failed return the reopened compose reports changes and Close asks to save; after a return that landed it reports none",
           arguments: [true, false])
     func closeDecisionFollowsTheReturn(returned: Bool) async throws {
@@ -417,22 +420,10 @@ struct UndoSendReturnsToDraftsTests {
                      "precondition: the return \(returned ? "landed" : "failed")")
 
         let compose = UndoReopenCompose.composeView(for: snapshot)
-        let loaded = try await row(fixture, draftId)
-        let fields = ComposeDraftGuards.Baseline(
-            subject: loaded.subject, body: loaded.body,
-            to: loaded.toArray, cc: loaded.ccArray, bcc: loaded.bccArray,
-            attachmentsFingerprint: [])
-        let baseline = ComposeDraftGuards.baseline(
-            afterLoading: fields, treatAsUnsavedChanges: compose.prefillTreatAsUnsavedChanges)
-        let changes = ComposeDraftGuards.hasChanges(current: fields, baseline: baseline)
-        let decision = closeWithoutTyping(compose, loaded: loaded)
+        let decision = closeWithoutTyping(compose, loaded: try await row(fixture, draftId))
         if returned {
-            #expect(compose.prefillTreatAsUnsavedChanges == false)
-            #expect(changes == false)
             #expect(decision == .dismiss)
         } else {
-            #expect(compose.prefillTreatAsUnsavedChanges == true)
-            #expect(changes == true)
             #expect(decision == .promptSave)
         }
     }
