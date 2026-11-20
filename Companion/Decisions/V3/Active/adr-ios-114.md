@@ -910,7 +910,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      drafts, so a reply draft already saved for the email stays as it is in Drafts, never opened,
      saved over or deleted by the card; each card has its own key, so two cards' drafts never
      overwrite each other. The ghost shows only once the thread and the email's own account have
-     loaded, and not while the agent works on a request from the field. In the tutorial only the step that asks for it
+     loaded, and not while the agent works on a request from the field.
+     A late suggestion stays hidden while "Writing your email" runs or a compose card is open, shows when the card closes without sending, and waits as the ghost while the field has words (`ChatReplyField.shown(writing:cardOpen:)`).
+     In the tutorial only the step that asks for it
      (`FieldMove.tapSuggestion`, ringed by `TutorialPulseRing`) opens the card; elsewhere the
      locked notice shows.
    - **The field** holds only the user's words (`ChatFieldFill`: `shown`, `emptiedOn` and

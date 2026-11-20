@@ -97,6 +97,48 @@ struct ChatReplyFieldTests {
         #expect(ChatReplyField.shown(newest: missingText, usersTurn: false, onlyTo: nil)?.textMessage == nil)
     }
 
+    /// A late AI Suggestion (ready while the user is busy): hidden while "Writing your email" runs
+    /// and while a compose card is open, shown once the card closes without sending, never after a
+    /// send (the reply in the outbox makes it the user's turn), and it waits as the ghost while the
+    /// field has words.
+    @Test("A late AI Suggestion is hidden while writing")
+    func lateSuggestionHiddenWhileWriting() {
+        let late = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: true, cardOpen: false) == nil)
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: false, cardOpen: false) == late.suggestion,
+                "shown once writing ends with no card open")
+    }
+
+    @Test("A late AI Suggestion is hidden while the compose card is open")
+    func lateSuggestionHiddenWhileCardOpen() {
+        let late = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: false, cardOpen: true) == nil)
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: true, cardOpen: true) == nil)
+    }
+
+    @Test("A late AI Suggestion shows after the card closes without sending")
+    func lateSuggestionShownAfterCloseWithoutSend() {
+        let late = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        // Closed without sending: no reply in the outbox, still the other side's turn.
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: false, cardOpen: false)?.textMessage == "Tuesday works")
+    }
+
+    @Test("A late AI Suggestion does not show after the card sends")
+    func lateSuggestionNotShownAfterSend() {
+        let late = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        // Sent: the reply in the outbox (or its Sent copy as the newest email) is the user's turn.
+        #expect(ChatReplyField.shown(newest: late, usersTurn: true, onlyTo: nil, writing: false, cardOpen: false) == nil)
+    }
+
+    @Test("A late AI Suggestion waits as the ghost while the field has words, and never enters it")
+    func lateSuggestionWaitsWhileFieldHasText() {
+        let late = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        let fill = Self.fill(Self.typed("Can we do"))
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: false, cardOpen: false)?.textMessage == "Tuesday works",
+                "the field's words do not hide the ghost")
+        #expect(fill.words == "Can we do", "the suggestion never lands on the user's words")
+    }
+
     @Test("The placeholder offers a reply only when the sender takes replies")
     func placeholder() {
         #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).placeholder == "Reply or ask anything")
@@ -428,9 +470,11 @@ struct ChatReplyFieldTests {
         #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
         // Who the reply goes to and whose turn it is decide whether the suggestion shows.
         #expect(Self.count("let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty", in: text) == 1)
-        #expect(Self.count("guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking, context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }", in: text) == 1,
-                "no suggestion before the thread and accounts load, or while the agent works")
-        #expect(Self.count("ChatReplyField.shown(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)", in: text) == 1)
+        #expect(Self.count("guard viewModel.hasLoadedThread, context.isLoaded, context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }", in: text) == 1,
+                "no suggestion before the thread and accounts load")
+        // Every compose card the chat opens hides it; "Writing your email" hides it.
+        #expect(Self.count("let cardOpen = readyReply != nil || agentCompose != nil || forwardMessage != nil", in: text) == 1)
+        #expect(Self.count("ChatReplyField.shown( newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only, writing: chatWorking, cardOpen: cardOpen)", in: text) == 1)
         #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1,
                 "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)

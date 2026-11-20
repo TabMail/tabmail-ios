@@ -34,8 +34,14 @@ struct ChatReplyField: Equatable {
     /// reply and its text version are stored. Nothing on the user's turn, for a no-reply sender,
     /// or while the reply goes only to people chosen in Reply to (`onlyTo`): the suggestion was
     /// written for everyone.
-    static func shown(newest: MessageHeader, usersTurn: Bool, onlyTo: [ChatThread.Person]?) -> ReplyResult? {
-        guard !usersTurn, onlyTo == nil, !EmailFilter.isNoReply(newest.fromAddress),
+    /// Nothing while "Writing your email" runs (`writing`) or a compose card is open (`cardOpen`):
+    /// a suggestion that became ready meanwhile shows once the card closes without sending (a send
+    /// makes it the user's turn). Words in the field never hide it: it waits as the ghost.
+    static func shown(
+        newest: MessageHeader, usersTurn: Bool, onlyTo: [ChatThread.Person]?,
+        writing: Bool = false, cardOpen: Bool = false
+    ) -> ReplyResult? {
+        guard !writing, !cardOpen, !usersTurn, onlyTo == nil, !EmailFilter.isNoReply(newest.fromAddress),
               let suggestion = newest.suggestion, !suggestion.body.isEmpty,
               let text = suggestion.textMessage, !text.isEmpty else { return nil }
         return suggestion

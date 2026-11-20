@@ -742,14 +742,18 @@ struct ChatThreadView: View {
     /// field has the agent write one for the people chosen. None until the thread and its accounts
     /// have loaded (the newest email and the Reply All audience, without the user's own address,
     /// are known only then), and none while the agent works on a request from the field (it may
-    /// open its own compose card).
+    /// open its own compose card), or while a compose card is open: one that became ready meanwhile
+    /// shows when the card closes without sending.
     private func shownSuggestion(on newest: MessageHeader, thread: ChatThread) -> ReplyResult? {
         // `isLoaded` is also set when the context read failed: the email's own account, read,
         // is the proof the audience can leave the user out.
-        guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking,
+        guard viewModel.hasLoadedThread, context.isLoaded,
               context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }
         let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty
-        return ChatReplyField.shown(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)
+        let cardOpen = readyReply != nil || agentCompose != nil || forwardMessage != nil
+        return ChatReplyField.shown(
+            newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only,
+            writing: chatWorking, cardOpen: cardOpen)
     }
 
     /// The tutorial's move in this chat, if it holds the practice email.
