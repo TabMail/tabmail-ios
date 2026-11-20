@@ -180,6 +180,9 @@ struct ReportConcernSheetModifier: ViewModifier {
                     Button("Cancel") {
                         isPresented = false
                     }
+                    // While the report is sending, the sheet stays, as it does for a swipe down:
+                    // a reply after the sheet had gone would have no sheet to show its result.
+                    .disabled(isSubmitting)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Report") {
