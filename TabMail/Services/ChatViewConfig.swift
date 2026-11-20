@@ -97,6 +97,9 @@ enum ChatViewLayout {
     static let swipeSettleHold: Duration = .milliseconds(550)
     /// The response of the spring a let-go swipe settles with, in seconds.
     static let swipeSpringResponse: Double = 0.35
+    /// The interaction freeze's cooldown after an animation has settled (user-interaction-freeze
+    /// rule): the part of `swipeSettleHold` past the swipe's spring.
+    static var freezeCooldown: Duration { swipeSettleHold - .seconds(swipeSpringResponse) }
     /// The back swipe's zone at the screen's left edge, in points: with nothing open, a rightward
     /// drag that starts here goes back rather than opening a bubble's actions.
     static let backSwipeEdgeWidth: CGFloat = 24
