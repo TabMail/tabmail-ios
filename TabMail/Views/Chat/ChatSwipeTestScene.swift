@@ -49,6 +49,9 @@ struct ChatSwipeTestScene: View {
     /// AI Suggestion", which writes the newest email's AI Suggestion when the test taps it, so the
     /// test decides that it lands only after its drag or jump has come to rest.
     private let lateSuggestionRelease = ProcessInfo.processInfo.arguments.contains("--chat-swipe-late-suggestion")
+    /// `--chat-swipe-writing`: the newest email is classified with no reply yet, so the chat shows
+    /// the AI Suggestion's working bubble until "Release the AI Suggestion" stores the reply.
+    nonisolated private static let writing = ProcessInfo.processInfo.arguments.contains("--chat-swipe-writing")
     /// The late AI Suggestion's text message.
     nonisolated static let lateSuggestion = "Sounds good, see you Tuesday."
 
@@ -210,6 +213,7 @@ struct ChatSwipeTestScene: View {
                     header.headerComplete = true
                     header.bodyComplete = true
                     header.isRead = !Self.unread
+                    if Self.writing && index == Self.count - 1 { header.actionTag = .reply }
                     header.summaryBlurb = "Note \(index)"
                     header.summaryTextMessage = index == 0 && Self.tall
                         ? "Note 0: " + String(repeating: "A long line that fills the screen. ", count: 80)

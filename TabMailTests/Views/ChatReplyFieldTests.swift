@@ -82,6 +82,71 @@ struct ChatReplyFieldTests {
         #expect(ChatReplyField.suggestionText(newest: missingText, usersTurn: false, onlyTo: nil) == nil)
     }
 
+    @Test("The AI Suggestion's row is the working bubble while the reply is written, then the ghost")
+    func suggestionPhaseWritingThenReady() {
+        var email = Self.header("w1")
+        email.actionTag = .reply
+        #expect(ChatReplyField.suggestionPhase(newest: email, usersTurn: false, onlyTo: nil, subscribed: true) == .writing,
+                "tagged with no reply yet: Writing")
+        email.cachedReply = "Hi Alex,\n\nTuesday works."
+        email.replyTextMessage = "Tuesday works"
+        #expect(ChatReplyField.suggestionPhase(newest: email, usersTurn: false, onlyTo: nil, subscribed: true) == .ready("Tuesday works"),
+                "the stored reply fills it in")
+
+        // Nothing where the AI writes no suggestion, or the user cannot use one.
+        var untagged = Self.header("w2")
+        untagged.actionTag = nil
+        #expect(ChatReplyField.suggestionPhase(newest: untagged, usersTurn: false, onlyTo: nil, subscribed: true) == nil, "not classified")
+        var filtered = Self.header("w3", reply: "")
+        filtered.actionTag = ActionTag.none
+        #expect(ChatReplyField.suggestionPhase(newest: filtered, usersTurn: false, onlyTo: nil, subscribed: true) == nil,
+                "the empty sentinel: no reply will come")
+        var writing = Self.header("w4")
+        writing.actionTag = .reply
+        #expect(ChatReplyField.suggestionPhase(newest: writing, usersTurn: true, onlyTo: nil, subscribed: true) == nil, "the user's turn")
+        #expect(ChatReplyField.suggestionPhase(newest: writing, usersTurn: false, onlyTo: [Self.david], subscribed: true) == nil,
+                "only some people chosen")
+        #expect(ChatReplyField.suggestionPhase(newest: writing, usersTurn: false, onlyTo: nil, subscribed: false) == nil, "no plan")
+        var noReply = Self.header("w5", fromAddress: "noreply@example.com")
+        noReply.actionTag = .reply
+        #expect(ChatReplyField.suggestionPhase(newest: noReply, usersTurn: false, onlyTo: nil, subscribed: true) == nil, "a no-reply sender")
+    }
+
+    @Test("A new email above a ready ghost puts the row back to Writing; only Writing to ready fills in")
+    func suggestionPhaseNewEmailResetsToWriting() {
+        var first = Self.header("n1", minutesAgo: 5, reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        first.actionTag = .reply
+        let shown = ChatReplyField.suggestionPhase(newest: first, usersTurn: false, onlyTo: nil, subscribed: true)
+        #expect(shown == .ready("Tuesday works"))
+
+        var second = Self.header("n2", inReplyTo: first.rfc822MessageId)
+        second.actionTag = .reply
+        let afterArrival = ChatReplyField.suggestionPhase(newest: second, usersTurn: false, onlyTo: nil, subscribed: true)
+        #expect(afterArrival == .writing, "the first email's suggestion is gone; the row writes the new one")
+        #expect(!ChatSuggestionPhase.fills(from: shown, to: afterArrival), "back to Writing at once, no fill")
+
+        second.cachedReply = "Hi Alex,\n\nSee you then."
+        second.replyTextMessage = "See you then"
+        let ready = ChatReplyField.suggestionPhase(newest: second, usersTurn: false, onlyTo: nil, subscribed: true)
+        #expect(ready == .ready("See you then"))
+        #expect(ChatSuggestionPhase.fills(from: afterArrival, to: ready), "the working bubble grows into the ghost")
+
+        #expect(!ChatSuggestionPhase.fills(from: nil, to: ready), "a ghost with no working bubble before it shows at once")
+        #expect(!ChatSuggestionPhase.fills(from: .ready("Tuesday works"), to: ready), "a rewrite in place")
+        #expect(!ChatSuggestionPhase.fills(from: .writing, to: nil), "the row going away")
+    }
+
+    @Test("The working bubble's dots pulse between the dim opacity and full")
+    func workingDots() {
+        let period = ChatSuggestionConfig.dotPulsePeriod
+        #expect(abs(ChatSuggestionWorkingBubble.dotOpacity(at: 0) - ChatSuggestionConfig.dotDimOpacity) < 0.0001)
+        #expect(abs(ChatSuggestionWorkingBubble.dotOpacity(at: period / 2) - 1) < 0.0001)
+        #expect(abs(ChatSuggestionWorkingBubble.dotOpacity(at: -period / 4) - ChatSuggestionWorkingBubble.dotOpacity(at: period * 3 / 4)) < 0.0001,
+                "a staggered dot before zero is in range")
+        #expect(ChatSuggestionConfig.writingLine == "AI Suggestion · Writing")
+        #expect(ChatSuggestionWorkingBubble.bubbleId != ChatSuggestionBubble.bubbleId, "its own identifier")
+    }
+
     @Test("The placeholder offers a reply only when the sender takes replies")
     func placeholder() {
         #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).placeholder == "Reply or ask anything")
@@ -415,7 +480,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty", in: text) == 1)
         #expect(Self.count("guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking, context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }", in: text) == 1,
                 "no suggestion before the thread and accounts load, or while the agent works")
-        #expect(Self.count("ChatReplyField.suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)", in: text) == 1)
+        #expect(Self.count("ChatReplyField.suggestionPhase(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only, subscribed: AISubscriptionGate.shared.isActive)", in: text) == 1)
         #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1,
                 "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)

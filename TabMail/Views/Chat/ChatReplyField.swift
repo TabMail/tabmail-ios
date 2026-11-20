@@ -37,6 +37,20 @@ struct ChatReplyField: Equatable {
         return text
     }
 
+    /// The AI Suggestion's row under the newest email: `.ready` with the ghost's text once the
+    /// reply is stored (`suggestionText`), `.writing` while the AI still writes it (the inbox's
+    /// shimmer rule: the email is tagged and has no reply yet, `MessageViewHelpers.showShimmer`),
+    /// else nothing. Keyed by the newest email alone, so a new email that arrives above a ready
+    /// ghost puts the row back to `.writing` until its own suggestion is stored.
+    static func suggestionPhase(
+        newest: MessageHeader, usersTurn: Bool, onlyTo: [ChatThread.Person]?, subscribed: Bool
+    ) -> ChatSuggestionPhase? {
+        if let text = suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: onlyTo) { return .ready(text) }
+        guard !usersTurn, onlyTo == nil, !EmailFilter.isNoReply(newest.fromAddress),
+              MessageViewHelpers.showShimmer(newest, subscribed: subscribed) else { return nil }
+        return .writing
+    }
+
     /// The agent's message for words typed or said in the field: today's Chat pill message on the
     /// newest email (`Regarding [Email](N): …`), with a nudge that the words came from this
     /// email's reply field, so an unclear request is a reply to it. For a no-reply
@@ -341,5 +355,22 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
     /// Delete on a "Not sent" bubble: the Outbox's own Discard for the same row.
     @MainActor func delete() {
         AccountManager.shared.discardOutboxMessageConfirmed(outboxId)
+    }
+}
+
+/// The AI Suggestion's row in the chat (`ChatReplyField.suggestionPhase`): the working bubble while
+/// the AI writes it, then the ghost with its text.
+enum ChatSuggestionPhase: Equatable {
+    case writing
+    case ready(String)
+
+    var isReady: Bool { if case .ready = self { true } else { false } }
+
+    /// Whether a change of the row is the working bubble filling in, the one change that grows the
+    /// row into the ghost with its re-pin in one animation. Anything else (the first value, a new
+    /// email putting the ghost back to writing, a ghost that lands with no working bubble before it,
+    /// a rewrite in place) shows at once.
+    static func fills(from old: Self?, to new: Self?) -> Bool {
+        old == .writing && new?.isReady == true
     }
 }
