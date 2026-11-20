@@ -178,6 +178,27 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         tapInsideKeepsTheKeyboard(field, in: app)
     }
 
+    /// The dismiss rule itself: a tap on empty space outside every input closes the keyboard.
+    func testTapOnEmptySpaceDismissesTheKeyboard() {
+        continueAfterFailure = false
+        let app = launch("--keyboard-focus-caret")
+        defer { app.terminate() }
+
+        let field = app.textFields["Other field"].firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: waitSeconds), "control: the fixture opened")
+        let empty = app.descendants(matching: .any)["keyboardFocusEmptyArea"].firstMatch
+        XCTAssertTrue(empty.waitForExistence(timeout: waitSeconds), "control: the empty area shows")
+        field.tap()
+        field.typeText("Dismiss text")
+        XCTAssertTrue(waitForFocus(field, timeout: focusSeconds), "control: the field has the keyboard")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: focusSeconds), "control: the keyboard is up")
+        empty.tap()
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.keyboards.firstMatch)
+        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: focusSeconds), .completed, "the tap outside closed the keyboard")
+        let unfocused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hasKeyboardFocus == false"), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [unfocused], timeout: focusSeconds), .completed, "and the field lost focus")
+    }
+
     func testSelectCopyPasteInAFocusedSingleLineFieldKeepsTheKeyboard() {
         continueAfterFailure = false
         let app = launch("--keyboard-focus-caret")
