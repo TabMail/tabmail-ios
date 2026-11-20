@@ -108,6 +108,7 @@ Tests: `AgeAndTermsConsentTests`, `AppStoreAgeCheckSimulationTests` (simulated A
 `SignificantUpdateStorageTests` (first-run record and repeat), `AppStoreAgeCheckRunnerGuardTests` (one age check at a time, notice only after `.allowed`, RootView source fence),
 `SignificantUpdateAcknowledgmentTests` (Apple's answers through `acknowledge`: no notice and no record
 where the rules do not apply, shown then recorded once they do, failures record nothing),
+`SignificantUpdateMarkerStorageTests`, `AppStoreAgeCheckRunnerTapTests`, `SignificantUpdateBannerWiringTests`,
 `AgeAndTermsPushGateTests`, `AgeAndTermsDeviceSyncGateTests`.
 Not covered by a test (view wiring; owner smoke list): `ConsentGateView.leave` (OK waits for the
 deletion request, resends on no answer, shows the connection message, signs out only after an answer),

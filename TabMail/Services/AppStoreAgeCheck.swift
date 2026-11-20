@@ -133,7 +133,9 @@ enum AppStoreAgeCheck {
         /// (`SignificantUpdate.hasStalledNotice`): when the age lookup could
         /// not answer (`.notChecked`) and a notice once stalled, the step still
         /// runs so the banner is offered. With the marker set the step makes no
-        /// unasked call to Apple, so the notice itself still needs `.allowed`.
+        /// unasked call to Apple, so a notice shown unasked still needs
+        /// `.allowed`; a notice opened from the banner asks the rules question
+        /// first.
         func pass(
             check: () async -> Status,
             apply: (Status) -> Void,
