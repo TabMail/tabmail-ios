@@ -114,6 +114,28 @@ struct BackfillBodyDownloadGateTests {
         await queue.cancelAllInFlight()
     }
 
+    @Test("a held older-mail body stays held across full gate re-checks, then downloads when the gate opens",
+          arguments: DownloadGate.allCases)
+    func heldAcrossRechecksThenDownloaded(_ gate: DownloadGate) async throws {
+        let accountId = "gate1064-rechecks-\(gate.rawValue)"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        // Two full re-check intervals, so a watcher that checks once and exits is caught.
+        let refusedSpan: Duration = .seconds(SyncConfig.backfillBodyGateRecheckSeconds * 2)
+        try await withAccount(accountId, provider: provider, gate: gate) {
+            await queue.enqueue([backfillItem(accountId)])
+            try await Task.sleep(for: Self.settle + refusedSpan)
+            #expect(await fetchCount(provider) == 0, "the body was downloaded under \(gate) during a re-check")
+            #expect(await queue.queuedItemsForTesting.map(\.messageId) == ["7"],
+                    "the held item must stay pending across re-checks")
+
+            openGate()
+            #expect(await eventually { await fetchCount(provider) > 0 },
+                    "the held body was not downloaded after \(gate) lifted past the first re-check")
+        }
+        await queue.cancelAllInFlight()
+    }
+
     @Test("with no gate shut, the older-mail body downloads (the harness is live)")
     func downloadsWithNoGate() async throws {
         let accountId = "gate1064-open"
@@ -246,6 +268,57 @@ struct BackfillBodyDownloadGateTests {
         }
         await queue.cancelAllInFlight()
         #expect(fetchesDuringJob.value.withLock { $0 } == 0, "an older-mail body downloaded in the job under Low Power Mode")
+    }
+
+    @Test("in the background job, Wi-Fi-only on an expensive network holds older-mail bodies until the network is unmetered")
+    @MainActor
+    func backgroundJobWifiOnlyExpensiveHoldsThenResumes() async throws {
+        let accountId = "gate1064-job-wifi"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        let item = backfillItem(accountId)
+        let fetchesWhileExpensive = TestBox<Int?>(nil)
+        let pendingWhileExpensive = TestBox<[String]?>(nil)
+        let resumedInJob = TestBox(false)
+        let deadline = Self.deadline
+        // The job sets fast sync; Low Power Mode off; the harness keeps Wi-Fi-only on.
+        let jobPower = (fastSync: true, lowPowerMode: false, onPower: true, batteryLevel: Float(1))
+        try await withAccount(accountId, provider: provider, power: jobPower, expensive: true) {
+            let context = BGTaskContext(label: "gate1064-job-wifi", completion: { _ in })
+            let scheduler = SyncScheduler(
+                backgroundReadiness: { true },
+                backgroundWork: { _ in
+                    await queue.enqueue([item])
+                    try? await Task.sleep(for: Self.settle)
+                    let count = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count
+                    fetchesWhileExpensive.value.withLock { $0 = count }
+                    let pending = await queue.queuedItemsForTesting.map(\.messageId)
+                    pendingWhileExpensive.value.withLock { $0 = pending }
+
+                    // Still inside the job: the network becomes unmetered.
+                    NetworkMonitor.setExpensiveForTesting(false)
+                    let clock = ContinuousClock()
+                    let end = clock.now.advanced(by: deadline)
+                    while clock.now < end {
+                        if await provider.callLog.contains(where: { $0.hasPrefix("fetchMessage(") }) {
+                            resumedInJob.value.withLock { $0 = true }
+                            break
+                        }
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                },
+                processingHasWork: { false },
+                backgroundSchedule: { _ in },
+                refreshNetworkAvailable: true
+            )
+            scheduler.handleBackgroundAIProcessing(context: context) { _ in }
+            await context.waitForTaskForTesting()
+        }
+        await queue.cancelAllInFlight()
+        #expect(fetchesWhileExpensive.value.withLock { $0 } == 0,
+                "an older-mail body downloaded in the job on an expensive network with Wi-Fi-only on")
+        #expect(pendingWhileExpensive.value.withLock { $0 } == ["7"], "the held item must stay pending in the job")
+        #expect(resumedInJob.value.withLock { $0 }, "the download did not resume in the job once the network was unmetered")
     }
 
     @Test("a user's Fast Sync still lifts Low Power Mode for older-mail bodies outside the job")
