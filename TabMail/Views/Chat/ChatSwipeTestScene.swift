@@ -38,6 +38,12 @@ struct ChatSwipeTestScene: View {
     /// jump button is tapped, while its scroll animates.
     nonisolated private static let suggestionOnJump = ProcessInfo.processInfo.arguments.contains("--chat-swipe-suggestion-on-jump")
     private let tutorialCard = ProcessInfo.processInfo.arguments.contains("--chat-swipe-tutorial-card")
+    /// `--chat-swipe-saved-draft`: the newest email has its AI Suggestion from the start, and a reply
+    /// draft is already saved for it under its usual reply key (`Draft.draftKey(replyTo:)`), so the
+    /// ghost's card opens next to a saved draft it must leave alone.
+    nonisolated private static let savedDraft = ProcessInfo.processInfo.arguments.contains("--chat-swipe-saved-draft")
+    /// The saved draft's words.
+    nonisolated static let savedDraftBody = "My own words, not sent yet"
     nonisolated private static let accountID = "chat-swipe-fixture"
     nonisolated private static let count = 4
     /// The email "Remove a bubble" takes out of the chat.
@@ -214,7 +220,24 @@ struct ChatSwipeTestScene: View {
                     header.summaryTextMessage = index == 0 && Self.tall
                         ? "Note 0: " + String(repeating: "A long line that fills the screen. ", count: 80)
                         : "Note \(index): a short line."
+                    if Self.savedDraft, index == Self.count - 1 {
+                        header.cachedReply = "Hello,\n\n\(Self.lateSuggestion)\n\nThanks."
+                        header.replyTextMessage = Self.lateSuggestion
+                    }
                     try header.save(db)
+                    if Self.savedDraft, index == Self.count - 1 {
+                        let key = Draft.draftKey(replyTo: "\(accountID):\(header.stableId)", isForward: false, newId: nil)
+                        let stamp = now.timeIntervalSince1970
+                        try Draft.deleteOne(db, key: key)
+                        try Draft(
+                            id: key, accountId: accountID,
+                            toJSON: "[\"sender\(index)@example.com\"]", ccJSON: "[]", bccJSON: "[]",
+                            subject: "Re: Swipe fixture lunch", body: Self.savedDraftBody,
+                            replyToId: header.id, isForward: false, editHistoryJSON: nil,
+                            createdAt: stamp, updatedAt: stamp,
+                            serverDraftId: nil, serverPushStatus: nil,
+                            rfc822MessageId: nil, attachmentsDirName: nil).insert(db)
+                    }
                 }
             }
             status = "Fixture ready"
