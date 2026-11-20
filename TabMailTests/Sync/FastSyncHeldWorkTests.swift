@@ -337,6 +337,95 @@ struct FastSyncHeldWorkTests {
         }
     }
 
+    /// Two runs of the same kind on one engine at once, as the job runs accounts concurrently.
+    enum OverlappingKind: String, CaseIterable, Sendable, CustomTestStringConvertible {
+        case headerWalk
+        case catchUp
+        var testDescription: String { rawValue }
+    }
+
+    /// Starts two overlapping `kind` runs on `engine`, each parked on its own latch;
+    /// returns one finisher per run, in start order.
+    private static func latchTwo(
+        _ kind: OverlappingKind, account: Account, provider: MockEmailProvider, engine: SyncEngine
+    ) async -> [@Sendable () async -> Void] {
+        switch kind {
+        case .headerWalk:
+            let gates = [HeldWorkLatch(), HeldWorkLatch()]
+            let entered = [HeldWorkLatch(), HeldWorkLatch()]
+            let order = HeldWorkCounter()
+            SyncEngine.backfillWalkStartedHookForTesting.withLock {
+                $0 = {
+                    let index = order.next()
+                    await entered[index].open()
+                    await gates[index].wait()
+                }
+            }
+            var finishers: [@Sendable () async -> Void] = []
+            for index in 0..<2 {
+                let walk = Task { await engine.runBackfillWalk(account: account) }
+                await entered[index].wait()
+                finishers.append {
+                    await gates[index].open()
+                    _ = await walk.value
+                }
+            }
+            return finishers
+        case .catchUp:
+            // Each run's account has its own provider slot, taken by an occupier.
+            var finishers: [@Sendable () async -> Void] = []
+            for index in 0..<2 {
+                var runAccount = account
+                runAccount.id = "\(account.id)-run\(index)"
+                let queue = ProviderWorkQueue(provider: provider, maxConcurrency: 1)
+                await engine.register(accountId: runAccount.id, provider: provider, workQueue: queue)
+                let entered = HeldWorkLatch()
+                let slot = HeldWorkLatch()
+                let occupier = Task { await queue.execute(priority: .headerFetch) { await entered.open(); await slot.wait() } }
+                await entered.wait()
+                let run = Task { await engine.runCatchUpRun(account: runAccount, run: .snapshot(deadline: nil)) }
+                #expect(await pollUntil { await engine.backfillOrCatchUpRunning }, "precondition: catch-up run \(index) started")
+                finishers.append {
+                    await slot.open()
+                    _ = await run.value
+                    await occupier.value
+                }
+            }
+            return finishers
+        }
+    }
+
+    @Test("foreground: two overlapping walks or catch-up runs on one engine keep the screen awake until the second ends; then the lock releases and the caption shows",
+          arguments: OverlappingKind.allCases, Remaining.allCases)
+    func overlappingRunsHoldUntilLastEnds(_ kind: OverlappingKind, _ remaining: Remaining) async throws {
+        try await Self.withAccount("held1098-overlap-\(kind.rawValue)-\(remaining.rawValue)", walkDone: remaining == .bodies) { account, provider in
+            try await Self.withPower(Self.openPower) {
+                try await DownloadGateHarness.withNetwork(expensive: true) {
+                    if remaining == .bodies { await Self.queueBody(account.id, expectHeld: true) }
+                    let engine = SyncEngine()
+                    let finishers = await Self.latchTwo(kind, account: account, provider: provider, engine: engine)
+                    guard finishers.count == 2 else { return }
+
+                    let both = await Self.decide([account], engine: engine)
+                    #expect(both.holdAwake, "two \(kind) runs are progressing: the screen stays awake")
+                    #expect(!both.waitingForWiFi)
+
+                    await finishers[0]()
+                    let one = await Self.decide([account], engine: engine)
+                    #expect(one.holdAwake, "the second \(kind) run is still progressing: the screen stays awake")
+                    #expect(!one.waitingForWiFi, "the second \(kind) run is still progressing: no Waiting for Wi-Fi")
+
+                    await finishers[1]()
+                    SyncEngine.backfillWalkStartedHookForTesting.withLock { $0 = nil }
+                    #expect(await Self.pollUntil {
+                        let after = await Self.decide([account], engine: engine)
+                        return !after.holdAwake && after.waitingForWiFi
+                    }, "both \(kind) runs ended, only held \(remaining) left: the lock releases and the caption shows")
+                }
+            }
+        }
+    }
+
     @Test("foreground: a header walk admitted before the gate closed keeps the screen awake until it ends")
     func admittedWalkHoldsAfterGateCloses() async throws {
         try await Self.withAccount("held1098-fg-admitted-walk", walkDone: false) { account, _ in
@@ -497,7 +586,7 @@ struct FastSyncHeldWorkTests {
 
             let held = FastSyncView.presentation(accounts: [account], progress: progress, poll: Self.poll(account.id, phase: phase, held: true))
             #expect(held.phase == phase)
-            #expect(held.statusLine == FastSyncView.waitingForWiFiText, "held: the line reads Waiting for Wi-Fi")
+            #expect(held.statusLine == "Waiting for Wi-Fi", "held: the line reads Waiting for Wi-Fi")
             #expect(held.statusLine != estimate, "held: the estimate is not shown beside it")
             #expect(!held.syncComplete, "held work never shows Sync Complete")
             #expect(!held.holdAwake)
@@ -586,6 +675,12 @@ private final class HeldWorkFlag: Sendable {
     /// Sets the flag; returns whether it was already set.
     func set() -> Bool { value.withLock { let was = $0; $0 = true; return was } }
     var isSet: Bool { value.withLock { $0 } }
+}
+
+/// Hands out 0, 1, 2, ... from any context.
+private final class HeldWorkCounter: Sendable {
+    private let value = Mutex(0)
+    func next() -> Int { value.withLock { let current = $0; $0 += 1; return current } }
 }
 
 private final class DecisionBox: Sendable {
