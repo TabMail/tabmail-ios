@@ -684,12 +684,20 @@ struct ChatFieldWordsTests {
             let removed = ChatFieldWords.key(for: Self.header("a-1", thread: "gone"))
             let removedDemo = "demo:" + removed
             let kept = ChatFieldWords.key(for: Self.header("a-1", thread: "gone", account: Self.account + "-2"))
-            for key in [removed, removedDemo, kept] { store.apply(.put("Words of \(key)"), to: key) }
+            for key in [removed, kept] { store.apply(.put("Words of \(key)"), to: key) }
             await store.written()
+            // The demo-scoped row of the same account, persisted as a demo run's write lands it
+            // (no demo runs here, so the store would refuse it): inserted directly.
+            try await pool.write {
+                try ChatFieldWordsRecord(sessionId: removedDemo, words: "Demo words of the removed account", updatedAt: Date()).insert($0)
+            }
+            let before = try Self.rows(pool)
+            #expect(Set(before.map(\.sessionId)) == [removed, removedDemo, kept], "control: all three rows are stored")
             let account = Self.account
+            // No demo wipe follows: only the account removal may delete the demo row.
             try await pool.write { try AccountManager.removeAccountRowsTxn($0, accountId: account, wasPrimary: false) }
             let stored = try Self.rows(pool)
-            #expect(stored.map(\.sessionId) == [kept])
+            #expect(stored.map(\.sessionId) == [kept], "the removed account's real and demo words are gone, the other account's stay")
         }
     }
 

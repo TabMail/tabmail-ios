@@ -194,7 +194,10 @@ struct ChatFieldFill: Equatable {
             atSend = nil
             composing = false
         case .answered:
-            guard !composing else { return }
+            // A compose card's Send already completed the field's send (`atSend` nil): the
+            // request's later closing answer has nothing left to complete, and words written
+            // since are newer.
+            guard !composing, atSend != nil else { return }
             if clears { words = "" }
             atSend = nil
         case .composeOpened:

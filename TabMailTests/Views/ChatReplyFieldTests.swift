@@ -497,6 +497,12 @@ struct ChatReplyFieldTests {
         #expect(fill.words == "")
         // The words sent, still there: the completion empties them.
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed).words == "")
+        // A compose card's Send completed the field's send; the request's closing answer after it
+        // has nothing left to complete: newer words stay.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, Self.typed("Newer"), .completed, .answered).words == "Newer")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer"), .completed, .answered).words == "Newer")
+        // An answer to a send still open empties the words sent.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .answered).words == "")
 
         // From the open sheet the words go at once; a draft typed next stays through the completion.
         let sheet = Self.fill(Self.typed("Ask"), .sentFromSheet)
@@ -573,21 +579,17 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldFill.", in: text)
                 == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text),
                 "nothing else touches the field's state")
-        // Each change, where it happens: typing (above), both dictations, both sends, the
-        // completion, a confirmation card, and an Edit.
+        // Each change, where it happens: typing (above), both dictations, both sends, and an Edit.
         #expect(Self.count("fieldFill.apply(.startHearing) speech.start(locale: speechLocale, auto: auto) { transcript in fieldFill.apply(.heard(transcript))", in: text) == 1)
         #expect(Self.count("{ text in fieldFill.apply(.said(text))", in: text) == 1)
-        #expect(Self.count("fieldSentText = nil // Words written after the send this completes are newer, and stay (`ChatFieldFill`). fieldFill.apply(.completed)", in: text) == 1)
-        // A confirmation card raises the sheet and ends the field's pulse over the earlier send
-        // (the sheet rising is also run for real: `ChatReplyFieldRuntimeTests.confirmationCardOpensTheSheet`).
-        // It watches the thread's whole chat, so a card raised for an earlier email of the thread counts.
-        #expect(Self.count(".onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in guard hasCard, replyField != nil, !isExpanded else { return } fieldFill.apply(.confirmationCard) fieldSentText = nil withAnimation(expandSpring) { isExpanded = true } }", in: text) == 1)
+        // The completion and a confirmation card land on the sent request's chat key in
+        // `ChatFieldWords`, never through this view (`ChatReplyFieldRuntimeTests.clearWiring`).
         #expect(Self.count("dictation.inputSent(inputText) // From the open sheet the input empties as it goes; a newer draft is what is typed next. fieldFill.apply(.sentFromSheet)", in: text) == 1)
         #expect(Self.count("isTextFieldFocused = false fieldFill.apply(.sentFromField) dictation.inputSent(inputText)", in: text) == 1)
         #expect(Self.count("fieldFill.apply(.put(text)) isTextFieldFocused = true", in: text) == 1)
         // The "e.g." line's change goes in as words and is never sent from here.
         #expect(Self.count("func putExample(_ example: String) { fieldFill.apply(.put(example)) inputSelection = .init(insertionPoint: inputText.endIndex) }", in: text) == 1)
-        #expect(Self.count("fieldFill.apply(", in: text) == 10)
+        #expect(Self.count("fieldFill.apply(", in: text) == 8)
     }
 
     @Test("The field's Send sends the words to the agent; nothing in the field opens compose")

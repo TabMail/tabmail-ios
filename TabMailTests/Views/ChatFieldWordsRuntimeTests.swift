@@ -35,6 +35,10 @@ import UIKit
 ///     unsent words in the field, in storage and in a new run; an answer that lands after the chat
 ///     was torn down still empties the words sent, so they never return on reopen; newer words
 ///     typed while the agent works stay.
+/// 10. A field request whose agent opens a compose (reply, compose or forward): newer words typed
+///     while it runs survive the compose's Send AND the request's closing answer after it, in the
+///     field, on reopen and in a new run; with no newer words, the compose's Send empties the words
+///     sent. A compose from a request sent elsewhere (no field key) never touches the typed words.
 @Suite("Chat field words kept on Back", .serialized, .processGlobalState)
 @MainActor
 struct ChatFieldWordsRuntimeTests {
@@ -620,6 +624,180 @@ struct ChatFieldWordsRuntimeTests {
             await Self.newRun { PrioritizedDatabase(pool: pool) }
             await ChatFieldWords.shared.load(key)
             #expect(!ChatFieldWords.shared.fill(for: key).words.contains(sent), "nor in the next run")
+        }
+    }
+
+    // MARK: - 10. A field request's compose, sent, then the request's closing answer
+
+    /// The agent tool that opens the compose for the field's request.
+    enum ComposeProducer: String, CaseIterable, CustomTestStringConvertible {
+        case reply, compose, forward
+        var testDescription: String { rawValue }
+
+        /// Runs the producer's real tool on `email` (numeric id 1), with `invocation`.
+        @MainActor
+        func run(_ invocation: ToolInvocation, context: ToolContext) async throws -> String {
+            let to = JSONValue.array([.string("someone@example.com")])
+            switch self {
+            case .reply:
+                return try await EmailReplyTool(context: context).execute(
+                    arguments: ["unique_id": .int(1), "body": .string("Friday works")], invocation: invocation)
+            case .compose:
+                return try await EmailComposeTool(context: context).execute(
+                    arguments: ["to": to, "subject": .string("Plans"), "body": .string("Friday works")], invocation: invocation)
+            case .forward:
+                return try await EmailForwardTool(context: context).execute(
+                    arguments: ["unique_id": .int(1), "to": to, "body": .string("FYI")], invocation: invocation)
+            }
+        }
+    }
+
+    /// Who sent the request whose compose goes out.
+    enum ComposeOrigin: String, CaseIterable, CustomTestStringConvertible {
+        /// Sent from the collapsed field; newer words typed in the open sheet while it runs.
+        case fieldWithNewerWords
+        /// Sent from the collapsed field; nothing typed since.
+        case fieldUnchanged
+        /// Control: a request sent from elsewhere (no field key); words typed in the sheet.
+        case sheet
+        var testDescription: String { rawValue }
+    }
+
+    /// The invocation the field's send builds for `email` (`DynamicIslandChat.sendAgentChat`), or, from
+    /// elsewhere, none of the field's.
+    static func invocation(_ origin: ComposeOrigin, email: MessageHeader) -> ToolInvocation {
+        guard origin != .sheet else { return ToolInvocation() }
+        return ToolInvocation(fieldReply: ChatFieldReply(emailKey: ChatThread.copyKey(email), onlyTo: nil),
+                              fieldWordsKey: ChatFieldWords.key(for: email))
+    }
+
+    /// Runs `producer`'s tool with `invocation` on a router of its own (no view presents the compose)
+    /// and presses its Send: the compose's `.sent` outcome. Returns the tool's result.
+    static func sendCompose(_ producer: ComposeProducer, _ invocation: ToolInvocation, email: MessageHeader,
+                            pool: DatabasePool) async throws -> String {
+        let translator = MockChatIdTranslator()
+        await translator.seed(email.id, as: 1)
+        let router = AgentToolRouter()
+        let context = ToolContext(db: pool, translator: translator, router: router)
+        let task = Task { @MainActor in try await producer.run(invocation, context: context) }
+        try await ThreadChatTests.wait { router.pendingCompose != nil }
+        let request = try #require(router.pendingCompose, "control: \(producer) opened its compose")
+        request.onOutcome(.sent)
+        return try await task.value
+    }
+
+    @Test("A field request's compose, sent, then its closing answer: newer words stay; with none, the sent words go; a request from elsewhere keeps the typed words",
+          arguments: ComposeProducer.allCases, ComposeOrigin.allCases)
+    func composeSendThenAnswerKeepsNewerWords(_ producer: ComposeProducer, _ origin: ComposeOrigin) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
+        try await HostedAccessibility.withAutomation { try await composeSendThenAnswerBody(producer, origin) }
+    }
+
+    private func composeSendThenAnswerBody(_ producer: ComposeProducer, _ origin: ComposeOrigin) async throws {
+        try await Self.withDatabase { pool in
+            _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
+            try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
+            let tag = "\(producer.rawValue)-\(origin.rawValue)"
+            let email = Self.header("compose-\(tag)", thread: "compose-thread-\(tag)")
+            try await pool.write { try email.insert($0) }
+            let key = ChatFieldWords.key(for: email)
+            let sent = "Reply that Friday works"
+            let newerWords = "Also ask about lunch"
+            let backend = ThreadChatTests.Backend(holdAnswers: true)
+            try await ThreadChatTests.withBackend(backend, chatView: true) {
+                let host = Host(email)
+                let pill = try await Self.mount(PillView(host: host, replyField: true))
+                defer { pill.close() }
+                if origin != .sheet {
+                    try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
+                    let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
+                    #expect(asked, "control: the request reached the backend")
+                    #expect(ChatFieldWords.shared.fill(for: key).words == sent, "control: the sent words stay while it works")
+                }
+                if origin != .fieldUnchanged {
+                    // The user opens the chat and writes more while the agent works.
+                    host.expanded = true
+                    try await Task.sleep(for: .milliseconds(600))
+                    #expect(Self.type(newerWords, in: pill.view), "the open sheet has a native editable field")
+                    try await Self.settle()
+                    host.expanded = false
+                    try await Task.sleep(for: .milliseconds(600))
+                }
+                let expected = origin == .fieldUnchanged ? "" : newerWords
+
+                // The agent's compose opens and the user presses its Send.
+                let result = try await Self.sendCompose(producer, Self.invocation(origin, email: email), email: email, pool: pool)
+                #expect(result.contains("sent successfully"), "control: the compose went out: \(result)")
+                #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                        "after the compose's Send: \(ChatFieldWords.shared.fill(for: key).words)")
+
+                // The request's closing answer arrives after the compose went out.
+                if origin != .sheet {
+                    backend.proceed.signal()
+                    try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
+                    try await Self.settle()
+                }
+                #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                        "after the closing answer: \(ChatFieldWords.shared.fill(for: key).words)")
+                let texts = Self.fieldTexts(pill.view)
+                #expect(!texts.contains(sent), "the sent words left the field: \(texts)")
+                #expect(expected.isEmpty || texts.contains(expected), "newer words stay in the field: \(texts)")
+            }
+            try await Self.open(email) { view in
+                let texts = Self.fieldTexts(view)
+                #expect(!texts.contains(sent), "the sent words never come back on reopen: \(texts)")
+                #expect(origin == .fieldUnchanged || texts.contains(newerWords), "newer words are there on reopen: \(texts)")
+            }
+            await ChatFieldWords.shared.written()
+            let stored = try Self.stored(pool)
+            #expect(stored == (origin == .fieldUnchanged ? [:] : [key: newerWords]), "\(stored)")
+            await Self.newRun { PrioritizedDatabase(pool: pool) }
+            await ChatFieldWords.shared.load(key)
+            #expect(ChatFieldWords.shared.fill(for: key).words == (origin == .fieldUnchanged ? "" : newerWords),
+                    "a fresh store: \(ChatFieldWords.shared.fill(for: key).words)")
+        }
+    }
+
+    @Test("A compose card from the field empties the field on its Send; a compose card from elsewhere keeps the typed words")
+    func fieldCardEmptiesElsewhereCardKeeps() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withDatabase { pool in
+                _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
+                try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
+                let email = Self.header("two-sided", thread: "two-sided-thread")
+                try await pool.write { try email.insert($0) }
+                let key = ChatFieldWords.key(for: email)
+                let backend = ThreadChatTests.Backend(holdAnswers: true)
+                try await ThreadChatTests.withBackend(backend, chatView: true) {
+                    let host = Host(email)
+                    let pill = try await Self.mount(PillView(host: host, replyField: true))
+                    defer { pill.close() }
+                    // Side 1: the field's own request; its card's Send empties the field.
+                    let sent = "Reply that Friday works"
+                    try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
+                    let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
+                    #expect(asked, "control: the request reached the backend")
+                    _ = try await Self.sendCompose(.reply, Self.invocation(.fieldUnchanged, email: email), email: email, pool: pool)
+                    try await Self.settle()
+                    #expect(ChatFieldWords.shared.fill(for: key).words == "", "the field's card emptied the field")
+                    #expect(!Self.fieldTexts(pill.view).contains(sent), "\(Self.fieldTexts(pill.view))")
+                    backend.proceed.signal()
+                    try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
+                    try await Self.settle()
+
+                    // Side 2: words typed, then a card from a request sent elsewhere goes out.
+                    let typed = "Words the user is writing"
+                    #expect(Self.type(typed, in: pill.view), "the field is a native editable field")
+                    try await Self.settle()
+                    _ = try await Self.sendCompose(.reply, Self.invocation(.sheet, email: email), email: email, pool: pool)
+                    try await Self.settle()
+                    #expect(ChatFieldWords.shared.fill(for: key).words == typed, "a card from elsewhere keeps the typed words")
+                    #expect(Self.fieldTexts(pill.view).contains(typed), "\(Self.fieldTexts(pill.view))")
+                }
+                await ChatFieldWords.shared.written()
+                #expect(try Self.stored(pool) == [key: "Words the user is writing"])
+            }
         }
     }
 
