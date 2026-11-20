@@ -61,6 +61,14 @@ extension KeyboardDismissView: UIGestureRecognizerDelegate {
         // Don't dismiss when tapping text inputs — they handle focus themselves
         return !(view is UITextField || view is UITextView)
     }
+
+    /// The dismiss tap only watches (`cancelsTouchesInView = false`), so it runs alongside every other
+    /// recognizer: a SwiftUI gesture that begins on touch down, or a closer that takes the tap, must not
+    /// shut it out, or a tap outside a text input leaves the keyboard up (the keyboard dismiss rule).
+    func gestureRecognizer(_: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith _: UIGestureRecognizer) -> Bool {
+        true
+    }
 }
 
 extension View {

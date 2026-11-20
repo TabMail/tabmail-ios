@@ -592,7 +592,10 @@ same AI result, kept as long as the email itself is shown.
    how a vertical drag also scrolls; and the window's own recognizers run alongside it too, so the
    window-level keyboard-dismiss tap (`dismissKeyboardOnTap`) drops the keyboard on the same tap
    that closes a swipe: the keyboard rule holds with no exception, through its one dismiss path
-   (review, 2026-11-18). The screen-edge back swipe is off while something is open. The next drag
+   (review, 2026-11-18). *Amended 2026-11-19:* the dismiss tap's own delegate also runs it alongside
+   every recognizer (`KeyboardDismissView`), because a SwiftUI gesture on the tapped bubble shut it out
+   at touch down before the closer could; test: `testOpenActionsTapOnAnotherBubbleClosesAndDropsTheKeyboard`.
+   The screen-edge back swipe is off while something is open. The next drag
    goes back. A closing drag or tap holds the interaction freeze like any swipe, and lets go when
    the system cancels or fails it or the closer is torn down. A swipe runs alone (no
    simultaneous recognizer), so a swipe never also opens the bubble's card. An open reveal whose

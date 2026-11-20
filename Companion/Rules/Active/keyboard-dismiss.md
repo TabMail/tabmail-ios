@@ -5,6 +5,7 @@
 - Every screen with text input MUST apply `.dismissKeyboardOnTap()` (defined in `KeyboardDismiss.swift`) on its root container.
 - ScrollViews with text input should also use `.scrollDismissesKeyboard(.interactively)`.
 - The keyboard reappears naturally when the user taps a text field — no special handling needed.
+- The dismiss tap runs alongside every other recognizer (`shouldRecognizeSimultaneouslyWith` returns true), so a tap on a button, chip or bubble also drops the keyboard; only text fields and text views are excluded (2026-11-19).
 - Do NOT add manual keyboard dismiss buttons (toolbar chevrons, floating buttons, etc.). The tap-outside gesture handles everything.
 
 ---
