@@ -59,9 +59,12 @@ extension ChatUnsentReply {
         Self.bubbleOffersUndo(owner: owner) ? undoSecondsLeft(at: instant) : nil
     }
 
-    /// `undoLook(at:reduceMotion:)` on the bubble: solid when the toast owns this send's Undo.
+    /// `undoLook(at:reduceMotion:)` on the bubble. Under Reduce Motion the look is delivery state
+    /// alone, whoever owns the Undo (ownership gates only the button), so a toast-owned reply still
+    /// queued looks pending and a hand-over never changes the look. With motion the rising fill is
+    /// the Undo countdown, so a bubble without the Undo (the toast owns it) shows no fill: solid.
     func bubbleUndoLook(at instant: Date, reduceMotion: Bool, owner: PendingSendService.UndoOwner?) -> ChatUndoSendLook {
-        Self.bubbleOffersUndo(owner: owner) ? undoLook(at: instant, reduceMotion: reduceMotion) : .solid
+        reduceMotion || Self.bubbleOffersUndo(owner: owner) ? undoLook(at: instant, reduceMotion: reduceMotion) : .solid
     }
 
     /// Undo on the bubble: the toast's own undo-and-reopen path for this row.

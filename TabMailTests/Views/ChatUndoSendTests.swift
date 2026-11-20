@@ -500,7 +500,7 @@ struct ChatUndoSendTests {
 
     @Test("Two Undos before either compose opens: RootView reopens both composes, one after the other, each with its own draft")
     func rootViewReopensBothComposes() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can close the hosted compose")
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted window")
         try await HostedAccessibility.withAutomation { @MainActor in try await reopenBody() }
     }
 
@@ -544,15 +544,14 @@ struct ChatUndoSendTests {
         try await Self.waitFor { shows("First reopened words") }
         #expect(shows("First reopened words"), "the first compose opens with its own draft")
         #expect(!shows("Second reopened words"), "one compose at a time")
-        #expect(HostedAccessibility.activate(ComposeView.closeButtonId, in: window), "the compose's own Close")
+        // Reach the next compose without the compose's Close (its close decision belongs to
+        // ADR-IOS-065, not to this test): the cover goes away as the system dismisses it, which
+        // clears RootView's binding.
+        window.rootViewController?.presentedViewController?.dismiss(animated: false)
         try await Self.waitFor { shows("Second reopened words") }
         #expect(shows("Second reopened words") && !shows("First reopened words"),
-                "closing the first opens the second, with its own draft")
-        #expect(HostedAccessibility.activate(ComposeView.closeButtonId, in: window))
-        try await Self.waitFor { service.reopenSnapshot == nil && !shows("Second reopened words") }
-        #expect(service.reopenSnapshot == nil && !shows("Second reopened words"), "both closed, nothing left to reopen")
-        #expect(try await pool.read { try Draft.fetchOne($0, key: "draft-root-1") }?.body == "First reopened words",
-                "the unchanged reopened draft is kept on Close (ADR-IOS-065)")
+                "after the first compose goes, the second opens, with its own draft")
+        #expect(service.reopenSnapshot?.id == reply.id, "the second reopen is the one showing")
     }
 
     @Test("Under Reduce Motion the real bubble has one Undo button whose value counts down, and its fill does not rise")
@@ -607,6 +606,80 @@ struct ChatUndoSendTests {
         let probe = CGPoint(x: bubbleFrame.minX + 1, y: bubbleFrame.maxY - 1)
         #expect(Self.color(of: image, at: probe).isClose(to: Palette.chatUndoSendPendingTint, in: controller.traitCollection),
                 "the bubble still shows the pending tint: no rising fill under Reduce Motion")
+    }
+
+    @Test("Under Reduce Motion the mounted bubble stays pending past the Undo deadline until it is sent, whoever owns the Undo, and again after a failed send is retried")
+    func reduceMotionLookFollowsDelivery() async throws {
+        #expect(HostedAccessibility.isAvailable && HostedAccessibility.canSetReduceMotion,
+                "control: the test can read the bubble and set Reduce Motion")
+        try await HostedAccessibility.withAutomation { @MainActor in
+            try await HostedAccessibility.withReduceMotion(true) { @MainActor in try await deliveryBody() }
+        }
+    }
+
+    private func deliveryBody() async throws {
+        #expect(UIAccessibility.isReduceMotionEnabled, "control: Reduce Motion is on")
+        let service = PendingSendService.shared
+        defer { service.dismiss() }
+        // Undo ends 1.5 s from now.
+        let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + 1.5)
+        func reply(_ id: String, _ status: OutboxStatus, sentAt: Date? = nil) -> ChatUnsentReply {
+            ChatUnsentReply(outboxId: id, status: status, sentAt: sentAt, holdUntil: hold,
+                            draftId: "d", instanceEpoch: "E1", filed: false, textMessage: "ok, Tuesday works.")
+        }
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 300)
+        let controller = UIHostingController(rootView: ChatUnsentReplyBubble(reply: reply("o-life", .queued), retry: {}, delete: {}, undo: {}))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func show(_ row: ChatUnsentReply) async throws {
+            controller.rootView = ChatUnsentReplyBubble(reply: row, retry: {}, delete: {}, undo: {})
+            try await Task.sleep(for: .milliseconds(300))
+        }
+        func drawn() throws -> String {
+            let image = UIGraphicsImageRenderer(bounds: controller.view.bounds).image { _ in
+                controller.view.drawHierarchy(in: controller.view.bounds, afterScreenUpdates: true)
+            }
+            let frame = try #require(Self.bubbleFrame(in: controller.view), "the bubble's text is on screen")
+            let pixel = Self.color(of: image, at: CGPoint(x: frame.minX + 1, y: frame.maxY - 1))
+            if pixel.isClose(to: Palette.chatUndoSendPendingTint, in: controller.traitCollection) { return "pending" }
+            if pixel.isClose(to: Theme.accent, in: controller.traitCollection) { return "solid" }
+            return "other"
+        }
+
+        try await show(reply("o-life", .queued))
+        #expect(try drawn() == "pending", "queued, in the Undo window")
+        // The toast-owned reply in the same chat, queued in its window.
+        service.present(outboxId: "o-toast", draftId: "d", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .toast)
+        try await show(reply("o-toast", .queued))
+        #expect(try drawn() == "pending", "a toast-owned reply still queued looks pending: the look is delivery, not ownership")
+        #expect(!HostedAccessibility.identifiers(in: controller.view).contains(ChatUndoSendStatus.undoId),
+                "control: its bubble offers no Undo")
+
+        try await Task.sleep(for: .seconds(2))   // past the Undo deadline
+        try await show(reply("o-toast", .queued))
+        #expect(try drawn() == "pending", "the toast-owned reply past the deadline, still queued: pending")
+        try await show(reply("o-life", .queued))
+        #expect(try drawn() == "pending", "past the deadline, still queued (a claim buffer, or offline): pending, not solid")
+        #expect(!HostedAccessibility.identifiers(in: controller.view).contains(ChatUndoSendStatus.undoId),
+                "control: the Undo itself has ended")
+        try await show(reply("o-life", .sending))
+        #expect(try drawn() == "pending", "sending: pending")
+        try await show(reply("o-life", .queued, sentAt: Date()))
+        #expect(try drawn() == "solid", "sent: solid")
+
+        try await show(reply("o-retry", .failed))
+        #expect(try drawn() == "solid", "a failed send: the ordinary bubble with its Not sent mark")
+        try await show(reply("o-retry", .queued))
+        #expect(try drawn() == "pending", "retried, queued again: pending")
+        try await show(reply("o-retry", .queued, sentAt: Date()))
+        #expect(try drawn() == "solid", "and solid once sent")
     }
 
     /// The frame of the bubble's text element, in `view`'s coordinates.

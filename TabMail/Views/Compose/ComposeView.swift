@@ -1071,7 +1071,6 @@ enum ComposeDraftGuards {
 
 struct ComposeView: View {
     static let sendButtonId = "composeSend"
-    static let closeButtonId = "composeClose"
     /// Immutable authored values captured in one MainActor turn immediately
     /// before the agent-vs-Send claim. No live compose field is read afterward.
     private struct AuthoredSendSnapshot {
@@ -1676,7 +1675,6 @@ struct ComposeView: View {
                 HStack {
                     Button("Close") { Task { await closeCompose() } }
                         .font(.subheadline)
-                        .accessibilityIdentifier(Self.closeButtonId)
                     Spacer()
                     if attachmentCarryGate.outstanding > 0 {
                         HStack(spacing: 7) {
