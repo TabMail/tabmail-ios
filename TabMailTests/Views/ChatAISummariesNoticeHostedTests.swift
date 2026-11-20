@@ -482,11 +482,16 @@ struct ChatAISummariesNoticeHostedTests {
         #expect(field.text == reason, "control: the reason was typed")
     }
 
-    /// The alert's button itself, not a label that shares its title: only the button presses.
-    private static func alertButton(_ title: String, in alert: UIAlertController) -> NSObject? {
-        HostedAccessibility.elements(under: alert.view).first {
-            $0.accessibilityLabel == title && $0.accessibilityTraits.contains(.button)
-        }
+    /// Presses the alert's OK as the user does: UIKit dismisses the alert, then runs that
+    /// button's own handler. An alert's action views do not answer `accessibilityActivate` in a
+    /// hosted test, so this follows `UndoProviderIdentitySafetyTests.tapOK`.
+    private static func pressOK(on alert: UIAlertController) throws {
+        typealias Handler = @convention(block) (UIAlertAction) -> Void
+        let ok = try #require(alert.actions.first { $0.title == "OK" }, "the alert has an OK button")
+        try #require(ok.responds(to: NSSelectorFromString("handler")), "UIAlertAction exposes its handler")
+        let block = try #require(ok.value(forKey: "handler") as AnyObject?, "the OK button has a handler")
+        let handler = unsafeBitCast(block, to: Handler.self)
+        alert.dismiss(animated: false) { handler(ok) }
     }
 
     private static func sheetIsUp(_ controller: UIViewController) -> Bool {
@@ -542,8 +547,7 @@ struct ChatAISummariesNoticeHostedTests {
                 try await Self.waitUntil { (Self.topPresented(controller) as? UIAlertController)?.title == "Report Submitted" }
                 let alert = try #require(Self.topPresented(controller) as? UIAlertController, "the alert shows")
                 #expect(controller.presentedViewController === alert, "only the alert is presented: \(String(describing: controller.presentedViewController))")
-                let ok = try #require(Self.alertButton("OK", in: alert))
-                #expect(ok.accessibilityActivate())
+                try Self.pressOK(on: alert)
                 try await Self.waitUntil { controller.presentedViewController == nil }
                 #expect(controller.presentedViewController == nil, "control: the alert closed")
                 // The same caller reports again and cancels: no alert.
@@ -620,8 +624,7 @@ struct ChatAISummariesNoticeHostedTests {
                                          "the sheet closed and the alert shows: \(String(describing: Self.topPresented(controller)))")
                 #expect(alert.title == "Report Submitted")
                 #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "the sheet is gone")
-                let ok = try #require(Self.alertButton("OK", in: alert), "\(HostedAccessibility.labels(in: alert.view))")
-                #expect(ok.accessibilityActivate())
+                try Self.pressOK(on: alert)
                 try await Self.waitUntil { controller.presentedViewController == nil }
                 #expect(controller.presentedViewController == nil,
                         "after OK no popover remains: \(String(describing: Self.topPresented(controller)))")
@@ -1225,8 +1228,7 @@ struct ChatAISummariesNoticeHostedTests {
                 try await Self.waitUntil { (Self.topPresented(controller) as? UIAlertController)?.title == "Report Submitted" }
                 let alert = try #require(Self.topPresented(controller) as? UIAlertController, "the answer lands")
                 #expect(controller.presentedViewController === alert, "one alert, nothing else presented")
-                let ok = try #require(Self.alertButton("OK", in: alert))
-                #expect(ok.accessibilityActivate())
+                try Self.pressOK(on: alert)
                 try await Self.waitUntil { controller.presentedViewController == nil }
                 #expect(controller.presentedViewController == nil, "OK closes it")
             }
