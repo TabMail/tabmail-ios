@@ -531,6 +531,26 @@ struct ChatReplyFieldTests {
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer"), .confirmationCard).words == "Newer")
     }
 
+    @Test("Words cleared and retyped to the sent text after Send are newly written: kept, never emptied by the send")
+    func retypedSentTextIsNewWords() {
+        // Unchanged sent words: not kept, and the send's answer empties them.
+        let unchanged = Self.fill(Self.typed("Ask"), .sentFromField)
+        #expect(unchanged.unsent == "")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .answered).words == "")
+        // A binding's echo of the same text is no edit.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Ask")).unsent == "")
+        // Cleared and retyped identically while the send is open: newly written words.
+        let retyped = Self.fill(Self.typed("Ask"), .sentFromField, Self.typed(""), Self.typed("Ask"))
+        #expect(retyped.words == "Ask" && retyped.unsent == "Ask", "the retyped words are kept")
+        for ending in [ChatFieldFill.Change.answered, .completed, .confirmationCard] {
+            var fill = retyped
+            fill.apply(ending)
+            #expect(fill.words == "Ask" && fill.unsent == "Ask", "the older send never empties newly written words")
+        }
+        // Said words, too, are an edit.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .said("more"), .answered).words != "")
+    }
+
     @Test("A live transcript adds to the words it started on, and is dropped once anything else changed them")
     func liveTranscriptComparesTheChangeCounter() {
         var fill = Self.fill(Self.typed("Hi"), .startHearing)

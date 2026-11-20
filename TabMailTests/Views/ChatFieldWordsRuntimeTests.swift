@@ -627,6 +627,80 @@ struct ChatFieldWordsRuntimeTests {
         }
     }
 
+    /// How the field's request ends in `retypedSentWordsAreNewWords`.
+    enum RetypeEnd: String, CaseIterable, CustomTestStringConvertible {
+        /// The agent answers the request.
+        case answer
+        /// The request's compose card goes out, then its closing answer.
+        case card
+        var testDescription: String { rawValue }
+    }
+
+    @Test("Words cleared and retyped to the sent text while the request runs are new: they survive its answer and card, Back/reopen and a fresh store; unchanged sent words go",
+          arguments: RetypeEnd.allCases, [true, false])
+    func retypedSentWordsAreNewWords(_ end: RetypeEnd, _ retyped: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
+        try await HostedAccessibility.withAutomation { try await retypedSentWordsBody(end, retyped) }
+    }
+
+    private func retypedSentWordsBody(_ end: RetypeEnd, _ retyped: Bool) async throws {
+        try await Self.withDatabase { pool in
+            _ = try FolderEpochTestFixture.makeAccount(id: "words", provider: .imap, pool: pool)
+            try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
+            let tag = "\(end.rawValue)-\(retyped)"
+            let email = Self.header("retype-\(tag)", thread: "retype-thread-\(tag)")
+            try await pool.write { try email.insert($0) }
+            let key = ChatFieldWords.key(for: email)
+            let sent = "Reply that Friday works"
+            let expected = retyped ? sent : ""
+            let backend = ThreadChatTests.Backend(holdAnswers: true)
+            try await ThreadChatTests.withBackend(backend, chatView: true) {
+                let host = Host(email)
+                let pill = try await Self.mount(PillView(host: host, replyField: true))
+                defer { pill.close() }
+                try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
+                let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
+                #expect(asked, "control: the request reached the backend")
+                #expect(ChatFieldWords.shared.fill(for: key).unsent == "", "control: sent words are not kept")
+                if retyped {
+                    // The user opens the chat, clears the field and types the same words again.
+                    host.expanded = true
+                    try await Task.sleep(for: .milliseconds(600))
+                    #expect(Self.type("", in: pill.view), "the open sheet has a native editable field")
+                    try await Self.settle()
+                    #expect(Self.type(sent, in: pill.view))
+                    try await Self.settle()
+                    host.expanded = false
+                    try await Task.sleep(for: .milliseconds(600))
+                    #expect(ChatFieldWords.shared.fill(for: key).unsent == sent, "the retyped words are kept")
+                }
+                if end == .card {
+                    let result = try await Self.sendCompose(.reply, Self.invocation(.fieldUnchanged, email: email),
+                                                            email: email, pool: pool)
+                    #expect(result.contains("sent successfully"), "control: the compose went out: \(result)")
+                    #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                            "after the card: \(ChatFieldWords.shared.fill(for: key).words)")
+                }
+                backend.proceed.signal()
+                try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
+                try await Self.settle()
+                #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                        "after the answer: \(ChatFieldWords.shared.fill(for: key).words)")
+            }
+            try await Self.open(email) { view in
+                let texts = Self.fieldTexts(view)
+                #expect(texts.contains(sent) == retyped, "reopen: \(texts)")
+            }
+            await ChatFieldWords.shared.written()
+            let stored = try Self.stored(pool)
+            #expect(stored == (retyped ? [key: sent] : [:]), "\(stored)")
+            await Self.newRun { PrioritizedDatabase(pool: pool) }
+            await ChatFieldWords.shared.load(key)
+            #expect(ChatFieldWords.shared.fill(for: key).words == expected,
+                    "a fresh store: \(ChatFieldWords.shared.fill(for: key).words)")
+        }
+    }
+
     // MARK: - 10. A field request's compose, sent, then the request's closing answer
 
     /// The agent tool that opens the compose for the field's request.

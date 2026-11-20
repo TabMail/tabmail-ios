@@ -121,6 +121,10 @@ struct ChatFieldFill: Equatable {
     /// send completed. An answer or a sent reply completes it, so it empties only those words:
     /// words the user wrote after it are newer and stay.
     private(set) var atSend: String?
+    /// The field still holds the words of its open send, unedited: true from the field's Send until
+    /// any edit of the words. Ownership follows edits, not content: words cleared and retyped to the
+    /// same text after Send are newly written, so they are kept and no completion empties them.
+    private(set) var holdsSentWords = false
     /// How many changes the words have had: the change counter a live transcript compares.
     private(set) var changes = 0
     /// A compose card opened for the field's send: the reply is the point, so the agent's closing
@@ -164,7 +168,7 @@ struct ChatFieldFill: Equatable {
 
     /// The words to keep for the chat (`ChatFieldWords`): the words, except a send's still in
     /// flight (they went to the agent).
-    var unsent: String { words == atSend ? "" : words }
+    var unsent: String { holdsSentWords ? "" : words }
 
     /// The only way the words change.
     mutating func apply(_ change: Change) {
@@ -172,26 +176,35 @@ struct ChatFieldFill: Equatable {
         switch change {
         case let .said(text):
             words = DictationController.appending(text, to: words)
+            holdsSentWords = false
         case .startHearing:
             hearing = Hearing(base: words, at: changes)
             return
         case let .heard(transcript):
             guard let hearing, hearing.at == changes else { self.hearing = nil; return }
             words = DictationController.appending(transcript, to: hearing.base)
+            holdsSentWords = false
             changes += 1
             self.hearing = Hearing(base: hearing.base, at: changes)
             return
         case let .put(text):
+            // A set that leaves the words as they are is no edit (a binding's echo); any real
+            // edit, even one that ends back on the sent text, makes the words newly written.
+            guard text != words else { return }
             words = text
+            holdsSentWords = false
         case .sentFromSheet:
             atSend = ""
             words = ""
+            holdsSentWords = false
         case .sentFromField:
             atSend = words
+            holdsSentWords = true
             composing = false
         case .completed:
             if clears { words = "" }
             atSend = nil
+            holdsSentWords = false
             composing = false
         case .answered:
             // A compose card that opened for the send owns its completion: a closed card's
@@ -199,21 +212,22 @@ struct ChatFieldFill: Equatable {
             guard !composing else { return }
             if clears { words = "" }
             atSend = nil
+            holdsSentWords = false
         case .composeOpened:
             composing = true
         case .confirmationCard:
-            if clears { words = "" }
+            if clears { words = ""; holdsSentWords = false }
         }
         if words != before { changes += 1 }
     }
 
     /// Whether a send's completion may empty the words: only while a send is open, and only if
-    /// they are still the words sent, or none. With no send open (a compose card's Send already
+    /// they are still the words sent, unedited (`holdsSentWords`), or none. With no send open (a compose card's Send already
     /// completed it, or nothing was sent), a later card, compose or answer of the same request
     /// leaves the words: they are newer than the send.
     private var clears: Bool {
         guard let atSend else { return false }
-        return words == atSend || words.isEmpty
+        return holdsSentWords || words.isEmpty
     }
 }
 
