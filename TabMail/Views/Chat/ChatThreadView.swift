@@ -91,6 +91,7 @@ struct ChatThreadView: View {
     @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private static let bottomId = "chat-bottom"
     private static let unreadLineId = "chat-unread-line"
@@ -314,6 +315,7 @@ struct ChatThreadView: View {
                     VStack(spacing: ChatViewLayout.bubbleSpacing) {
                         ForEach(thread.items) { item in
                             row(item, thread: thread, offersArchive: offersArchive)
+                                .transition(ChatArrival.transition(ChatArrival.style(reduceMotion: reduceMotion)))
                         }
                         // Replies still in the outbox.
                         ForEach(unsentReplies) { reply in
@@ -330,6 +332,10 @@ struct ChatThreadView: View {
                         Color.clear.frame(height: ChatViewLayout.pillGap).id(Self.bottomId)
                     }
                     .padding(.top, 8)
+                    // A new email rises from behind the field and the rows above move up with it,
+                    // its height growing inside the same animation. Not the open's own landing.
+                    .animation(didInitialScroll ? ChatArrival.animation(ChatArrival.style(reduceMotion: reduceMotion)) : nil,
+                               value: thread.items.last?.id)
                 }
                 // Only the user's hand ends the landing. A programmatic scroll that animates (a
                 // late height arriving inside an animated transaction) or its settling is not the
@@ -354,6 +360,16 @@ struct ChatThreadView: View {
                     geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height) > ChatViewLayout.jumpButtonThreshold
                 } action: { _, isAbove in
                     withAnimation(.easeInOut(duration: 0.2)) { showsJumpButton = isAbove }
+                }
+                // While the landing still holds the chat at the bottom, an arrival re-pins it in the
+                // same animation as the rise (the landing's re-pin path below), so the new email
+                // ends fully above the field and the chat never jumps.
+                .onChange(of: thread.items.last?.id) { old, new in
+                    guard ChatArrival.isArrival(landed: didInitialScroll, oldNewest: old, newNewest: new),
+                          let target = scrollTarget else { return }
+                    withAnimation(ChatArrival.animation(ChatArrival.style(reduceMotion: reduceMotion))) {
+                        proxy.scrollTo(target.id, anchor: target.anchor)
+                    }
                 }
                 .onChange(of: scrollTarget) { _, target in
                     #if DEBUG

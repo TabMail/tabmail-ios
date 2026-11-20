@@ -197,6 +197,47 @@ struct ChatThreadLayoutTests {
         }
     }
 
+    @Test("A new email arriving in the open chat ends below the one before and fully above the field")
+    func arrivalEndsAboveTheField() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosted(earlier: 2) { _, controller, parent in
+                let id = ChatThreadView.replyPillId
+                try await Self.waitFor { Self.frame(of: id, in: controller.view).map { $0.height > 0 } ?? false }
+                try await Task.sleep(for: .milliseconds(500))
+                @MainActor func bubble(_ words: String) -> CGRect? {
+                    HostedAccessibility.elements(under: controller.view)
+                        .last { $0.accessibilityLabel?.contains(" said: \(words)") == true }?.accessibilityFrame
+                }
+                _ = try #require(bubble("Lunch?"), "control: the newest before the arrival")
+                var arrived = MessageHeader(
+                    messageId: "layout-arrived", subject: "Lunch plans", from: "Sender 1",
+                    fromAddress: "sender1@example.com", to: "someone@example.com",
+                    date: Date(), snippet: "Noon works",
+                    folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: "INBOX"),
+                    accountId: Self.account, folderPath: "INBOX", isInInbox: true)
+                arrived.rfc822MessageId = "<layout-arrived@example.com>"
+                arrived.inReplyTo = "<\(parent.rfc822MessageId ?? "")>"
+                arrived.headerComplete = true
+                arrived.bodyComplete = true
+                arrived.isRead = true
+                arrived.summaryBlurb = "Noon works"
+                arrived.summaryTextMessage = "Noon works"
+                let row = arrived
+                try await AppDatabase.dbPool.write { db in try row.insert(db) }
+                NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+                try await Self.waitFor { bubble("Noon works") != nil }
+                // Past the rise.
+                try await Task.sleep(for: .seconds(ChatViewLayout.arrivalRiseDuration + 0.6))
+                let new = try #require(bubble("Noon works"), "labels: \(HostedAccessibility.labels(in: controller.view).prefix(30))")
+                let before = try #require(bubble("Lunch?"))
+                let field = try #require(Self.frame(of: id, in: controller.view))
+                #expect(new.minY >= before.maxY - 0.5, "the arrival \(new) is below the one before \(before)")
+                #expect(new.maxY <= field.minY + 0.5, "the arrival \(new) is fully above the field \(field)")
+            }
+        }
+    }
+
     @Test("Opening the pill does not move the chat under it")
     func openingThePillKeepsTheChat() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")

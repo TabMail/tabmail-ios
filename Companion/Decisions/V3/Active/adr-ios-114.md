@@ -950,6 +950,17 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (`invalidate(reason: .actionPerformed)`), and is not shown over the open panel or in the
    tutorial; there is no tutorial step for it. Test: `ChatReplyFieldTests.fieldDragTip`.
 
+21. **A new email rises into the open chat (amendment 2026-11-20).** When the newest email changes
+   after the chat has landed (`ChatArrival.isArrival`), the new bubble rises from behind the reply
+   field (`.move(edge: .bottom)`) over `ChatViewLayout.arrivalRiseDuration` (0.42 s) and the rows
+   above move up with it: the stack's layout animates with the same rise, so the row's height grows
+   inside the animation. While the landing still holds the chat at the bottom, the arrival re-pins
+   it through the landing's own target in the same animation, so the new email ends fully above the
+   field. Under Reduce Motion the space opens at once (no layout animation, the chat jumps up) and
+   the bubble fades in over `arrivalFadeDuration` (0.2 s). The open's own load never animates.
+   Not decided here and left for later work: the AI Suggestion's working bubble and its growth into
+   the ghost. Tests: `ChatArrivalTests`, `ChatThreadLayoutTests.arrivalEndsAboveTheField`.
+
 ## The longer index line (routed 2026-11-09)
 
 The DECISIONS.md row grew with each decision of the chat view; it moved here when the index went

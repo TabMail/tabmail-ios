@@ -132,6 +132,10 @@ enum ChatViewLayout {
     static let fieldDragMinimumDistance: CGFloat = 10
     static let fieldDragMaxSwell: CGFloat = 220
     static let fieldDragOpenDistance: CGFloat = 60
+    /// A new email's arrival in the open chat (`ChatArrival`): it rises from behind the field over
+    /// this long; under Reduce Motion the space opens at once and it fades in over the second.
+    static let arrivalRiseDuration: Double = 0.42
+    static let arrivalFadeDuration: Double = 0.2
 }
 
 /// The AI Suggestion in the chat: the ghost of the user's next message, and the field's hint.
