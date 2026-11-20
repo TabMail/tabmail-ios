@@ -980,6 +980,25 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     private nonisolated let serverCreatedTestHook =
         Mutex<(@Sendable (IMAPServer, String) -> Void)?>(nil)
 
+    #if DEBUG
+    /// Test seam: when set, `send(draft:)` uses the returned SMTP session
+    /// instead of a SwiftMail `SMTPServer` (`IMAPProviderSMTPSession.swift`).
+    private nonisolated let smtpSessionTestFactory =
+        Mutex<(@Sendable () -> any SMTPSubmissionSession)?>(nil)
+
+    nonisolated func setSMTPSessionFactoryForTesting(_ factory: (@Sendable () -> any SMTPSubmissionSession)?) {
+        smtpSessionTestFactory.withLock { $0 = factory }
+    }
+    #endif
+
+    /// The SMTP session one send uses.
+    private nonisolated func makeSMTPSession() -> any SMTPSubmissionSession {
+        #if DEBUG
+        if let factory = smtpSessionTestFactory.withLock({ $0 }) { return factory() }
+        #endif
+        return SMTPServer(host: smtpHost, port: smtpPort)
+    }
+
     /// Test seam: install `serverCreatedTestHook`.
     nonisolated func setServerCreatedTestHookForTesting(_ hook: (@Sendable (IMAPServer, String) -> Void)?) {
         serverCreatedTestHook.withLock { $0 = hook }
@@ -6320,13 +6339,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // provider sends nothing.
         if openingTornDown(nil) { throw ProviderError.notConnected }
         try await withTimeout(seconds: SyncConfig.smtpSendTimeoutSeconds) {
+            // The timeout runs this in an unstructured task: removal can land
+            // between the entry check and its start, so no connection opens then.
+            if await self.openingTornDown(nil) { throw ProviderError.notConnected }
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Sending via \(self.smtpHost):\(self.smtpPort) from=\(self.senderEmail) to=\(draft.to) attachments=\(draft.attachments.count)") }
             // Built before connecting: a recipient SwiftMail cannot read fails the
             // send without opening a connection.
             let email = try Self.buildEmail(from: draft, senderEmail: self.senderEmail)
-            let smtpServer = SMTPServer(host: self.smtpHost, port: self.smtpPort)
+            let smtpServer = self.makeSMTPSession()
             do {
-                try await smtpServer.connect()
+                try await smtpServer.openConnection()
             } catch {
                 // IOS-TLS-002, send path. Without this the row stays `.queued`
                 // FOREVER: `isTransientSendError` reads `.tlsFailed`/connection
@@ -6335,20 +6357,30 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // given the Retry/Discard agency Outbox Rules 7/9 promise.
                 throw Self.mapTransportSecurityFailure(error, host: self.smtpHost)
             }
-            try await smtpServer.login(username: self.username, password: self.password)
+            // Connect, greeting and TLS were awaited: an account removed
+            // meanwhile neither authenticates nor submits.
+            if await self.openingTornDown(nil) {
+                try? await smtpServer.close()
+                throw ProviderError.notConnected
+            }
+            try await smtpServer.authenticate(username: self.username, password: self.password)
+            if await self.openingTornDown(nil) {
+                try? await smtpServer.close()
+                throw ProviderError.notConnected
+            }
 
             do {
-                try await smtpServer.sendEmail(email)
+                try await smtpServer.submit(email)
             } catch {
                 if !(error is CancellationError) && !SyncEngine.isConnectionError(error) {
                     BackgroundSyncLogger.logError("SMTP send failed: \(error)", source: "outbox:\(self.senderEmail)")
                 }
                 // Best-effort disconnect before rethrowing
-                try? await smtpServer.disconnect()
+                try? await smtpServer.close()
                 throw error
             }
             // Email is sent — disconnect is cleanup, must not throw
-            try? await smtpServer.disconnect()
+            try? await smtpServer.close()
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Send complete") }
         }
     }
