@@ -845,6 +845,8 @@ struct ChatFieldWordsTests {
                     "the other account's email keeps nothing alive here; the threadless email keeps its own")
 
             try await pool.write { _ = try MessageHeader.deleteOne($0, key: threadless.id) }
+            // The pass above saw the email and re-stamped the row, so age it past the grace again.
+            try Self.age(threadlessKey, pool: pool)
             SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: PrioritizedDatabase(pool: pool))
             let purged = try Self.rows(pool)
             #expect(purged.isEmpty, "the threadless email gone, its words go")
