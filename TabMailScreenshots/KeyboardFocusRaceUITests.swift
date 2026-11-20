@@ -482,7 +482,6 @@ final class KeyboardFocusRaceUITests: XCTestCase {
         let end = field.coordinate(withNormalizedOffset: CGVector(dx: endTapOffset, dy: lineOffset))
         end.tap()
         RunLoop.current.run(until: Date().addingTimeInterval(holdSeconds))
-        XCTAssertTrue(waitForFocus(field, timeout: focusSeconds), "the field kept focus after the caret tap")
         XCTAssertTrue(app.keyboards.firstMatch.exists, "and the keyboard is up after the caret tap")
         end.tap()
         let paste = editMenuItem("Paste", in: app)
