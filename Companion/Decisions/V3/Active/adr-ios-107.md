@@ -1052,7 +1052,8 @@ foreground backfill worker and the background processing job.
   *Note (2026-11-20, #1064):* "The body queues have no gate" above is superseded: `BackfillBodyQueue`
   (older-mail bodies) now follows the walk's download gates (ADR-IOS-005, amendment of 2026-11-20 and its
   correction). In the background job the walk and the bodies decide with the job's one Wi-Fi
-  measurement; outside it, a network NetworkMonitor has not reported yet holds under Wi-Fi-only.
+  measurement, taken concurrently with the job's work: scans never wait for the reading, and the walk
+  and the bodies hold until it lands; outside it, a network NetworkMonitor has not reported yet holds under Wi-Fi-only.
   `ActiveBodyQueue` and opened messages are not gated; scans and the direct load are unchanged.
 - **Pacing is unchanged:** 2 s slices, `catchUpSliceMaxRequests`, the slice window, the 3 s request
   timeout. A worker cycle whose walk a power gate holds still sleeps 60 s when it did no work, and one

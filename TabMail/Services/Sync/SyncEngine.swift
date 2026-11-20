@@ -144,12 +144,13 @@ actor SyncEngine {
 
     /// The power state together with the background-job flag and the job's Wi-Fi
     /// measurement, all read in ONE MainActor step. The job sets and clears its
-    /// synthetic Fast Sync, the job flag and its Wi-Fi measurement together in one
-    /// MainActor step (`SyncScheduler.handleBackgroundAIProcessing`), so a reader
-    /// never pairs the job's Fast Sync with "no job", nor the job with another
-    /// job's network (#1064).
+    /// synthetic Fast Sync, the job flag and its (still unknown) Wi-Fi measurement
+    /// together in one MainActor step (`SyncScheduler.handleBackgroundAIProcessing`),
+    /// and publishes the reading on the MainActor only while the job runs, so a
+    /// reader never pairs the job's Fast Sync with "no job", nor the job with
+    /// another job's network (#1064). `jobOnWiFi` nil: the reading has not landed.
     nonisolated static func currentBackfillPowerAndJobState() async
-        -> (power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), jobActive: Bool, jobOnWiFi: Bool)
+        -> (power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), jobActive: Bool, jobOnWiFi: Bool?)
     {
         #if DEBUG
         if let hook = Self.backfillPowerReadHookForTesting.withLock({ $0 }) { await hook() }
@@ -223,14 +224,34 @@ actor SyncEngine {
     /// job's own walk decision (`SyncScheduler.backgroundBackfillPlan`, #1064).
     nonisolated static let backgroundProcessingJobActive = Mutex<Bool>(false)
 
-    /// The running job's Wi-Fi state, measured once at job start with
-    /// `SyncScheduler.isOnWiFi()` (`SyncScheduler.measureJobOnWiFi`) and published
-    /// with `backgroundProcessingJobActive` in the same MainActor step. Both the
-    /// job's walk and the body gate's job branch decide with this one value, so
-    /// one decision has one network input (#1064). The job may launch the app
-    /// from terminated, where NetworkMonitor never starts; this does not read it.
-    /// False outside a job (never read then).
-    nonisolated static let backgroundProcessingJobOnWiFi = Mutex<Bool>(false)
+    /// The running job's Wi-Fi state, measured once with `SyncScheduler.isOnWiFi()`
+    /// (`SyncScheduler.measureJobOnWiFi`), started at job start concurrently with
+    /// the job's work so no scan waits for it. nil (unknown) from job start until
+    /// the reading lands, then true/false; written on the MainActor, reset to nil
+    /// in the same MainActor step that clears `backgroundProcessingJobActive`.
+    /// Both the job's walk and the body gate's job branch decide with this one
+    /// value and hold while it is unknown, so one decision has one network input
+    /// (#1064). The job may launch the app from terminated, where NetworkMonitor
+    /// never starts; this does not read it. nil outside a job (never read then).
+    nonisolated static let backgroundProcessingJobOnWiFi = Mutex<Bool?>(nil)
+
+    /// Waits for the running job's Wi-Fi reading, re-checking every
+    /// `SyncConfig.backfillBodyGateRecheckSeconds` (through `backfillSleep`, so a
+    /// test controls the wait). Returns nil if the job ends or the task is
+    /// cancelled first. The reading itself is bounded by
+    /// `SyncConfig.wifiCheckTimeoutSeconds`. Used only by the job's walk, after its
+    /// scans have run (`SyncScheduler.runBackgroundBackfill`).
+    nonisolated static func awaitBackgroundProcessingJobOnWiFi() async -> Bool? {
+        while !Task.isCancelled {
+            let (active, onWiFi) = await MainActor.run {
+                (backgroundProcessingJobActive.withLock { $0 }, backgroundProcessingJobOnWiFi.withLock { $0 })
+            }
+            guard active else { return nil }
+            if let onWiFi { return onWiFi }
+            await backfillSleep(seconds: SyncConfig.backfillBodyGateRecheckSeconds)
+        }
+        return nil
+    }
 
     /// One older-mail body download decision (BackfillBodyQueue, #1064). Each call
     /// is its own operation: the Wi-Fi-only preference is snapshotted first, before
@@ -250,8 +271,11 @@ actor SyncEngine {
         #endif
         if jobActive {
             // The job's walk decision with the job's walk input: its Wi-Fi state
-            // measured once at job start (`isOnWiFi`), never NetworkMonitor, which a
-            // job that launched the app from terminated never starts (#1064).
+            // measured once from job start (`isOnWiFi`), never NetworkMonitor, which
+            // a job that launched the app from terminated never starts (#1064).
+            // Until the reading lands the bodies hold; the gate watcher's re-check
+            // (`backfillBodyGateRecheckSeconds`) picks up the lift.
+            guard let jobOnWiFi else { return false }
             return SyncScheduler.backgroundBackfillPlan(
                 isLowPowerMode: power.lowPowerMode, wifiOnly: wifiOnly, onWiFi: jobOnWiFi)
         }

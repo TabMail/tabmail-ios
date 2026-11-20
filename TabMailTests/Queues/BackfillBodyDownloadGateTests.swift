@@ -592,6 +592,113 @@ struct BackfillBodyDownloadGateTests {
         #expect(resumedInSecondJob.value.withLock { $0 }, "the download did not resume in a job that measured Wi-Fi")
     }
 
+    @Test("in the background job, the work (its scans) starts while the Wi-Fi reading is still unknown; older-mail bodies hold until it lands, then follow it")
+    @MainActor
+    func backgroundJobWorkStartsBeforeTheWiFiReadingAndBodiesWaitForIt() async throws {
+        let accountId = "gate1064-job-held-reading"
+        let provider = MockEmailProvider()
+        let queue = BackfillBodyQueue()
+        let item = backfillItem(accountId)
+        let released = TestBox(false)
+        let workStartedWhileUnknown = TestBox(false)
+        let fetchesWhileUnknown = TestBox<Int?>(nil)
+        let downloadedAfterLanding = TestBox(false)
+        let jobPower = (fastSync: true, lowPowerMode: false, onPower: true, batteryLevel: Float(1))
+        try await withAccount(accountId, provider: provider, power: jobPower, expensive: false) {
+            SyncScheduler.jobOnWiFiMeasurementHoldForTesting.withLock {
+                $0 = {
+                    while !released.value.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(50)) }
+                    return true
+                }
+            }
+            defer { SyncScheduler.jobOnWiFiMeasurementHoldForTesting.withLock { $0 = nil } }
+            let context = BGTaskContext(label: "gate1064-job-held-reading", completion: { _ in })
+            let scheduler = SyncScheduler(
+                backgroundReadiness: { true },
+                backgroundWork: { _ in
+                    // The work (syncStartup and its scans in production) runs now,
+                    // with the job active and its reading unknown.
+                    let state = await SyncEngine.currentBackfillPowerAndJobState()
+                    workStartedWhileUnknown.value.withLock { $0 = state.jobActive && state.jobOnWiFi == nil }
+                    await queue.enqueue([item])
+                    _ = await Self.pollUntil { await queue.heldByDownloadGate }
+                    try? await Task.sleep(for: Self.settle)
+                    let count = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }.count
+                    fetchesWhileUnknown.value.withLock { $0 = count }
+                    // The reading lands on Wi-Fi; the gate watcher's re-check lifts the hold.
+                    released.value.withLock { $0 = true }
+                    let resumed = await Self.pollUntil {
+                        await provider.callLog.contains { $0.hasPrefix("fetchMessage(") }
+                    }
+                    downloadedAfterLanding.value.withLock { $0 = resumed }
+                },
+                processingHasWork: { false },
+                backgroundSchedule: { _ in },
+                refreshNetworkAvailable: true
+            )
+            scheduler.handleBackgroundAIProcessing(context: context) { _ in }
+            await context.waitForTaskForTesting()
+        }
+        await queue.cancelAllInFlight()
+        #expect(workStartedWhileUnknown.value.withLock { $0 }, "the job's work waited for the Wi-Fi reading")
+        #expect(fetchesWhileUnknown.value.withLock { $0 } == 0, "an older-mail body downloaded before the job's Wi-Fi reading landed")
+        #expect(downloadedAfterLanding.value.withLock { $0 }, "the body did not download once the reading landed on Wi-Fi")
+        #expect(SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 } == nil, "the job's reading must be cleared at job end")
+    }
+
+    @Test("in the background job, the backfill's scans run while the Wi-Fi reading is unknown; the walk waits for the reading and follows it",
+          arguments: [true, false])
+    @MainActor
+    func backgroundJobWalkWaitsForTheReadingButScansDoNot(_ landsOnWiFi: Bool) async throws {
+        let released = TestBox(false)
+        let calls = TestBox<[Bool]>([])
+        let callsWhileUnknown = TestBox<[Bool]?>(nil)
+        let account = Account(emailAddress: "user@example.com", displayName: "Walk", provider: .imap)
+        SyncScheduler.jobOnWiFiMeasurementHoldForTesting.withLock {
+            $0 = {
+                while !released.value.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(50)) }
+                return landsOnWiFi
+            }
+        }
+        SyncEngine.backfillSleepForTesting.withLock { $0 = { _ in try? await Task.sleep(for: .milliseconds(50)) } }
+        defer {
+            SyncScheduler.jobOnWiFiMeasurementHoldForTesting.withLock { $0 = nil }
+            SyncEngine.backfillSleepForTesting.withLock { $0 = nil }
+        }
+        let context = BGTaskContext(label: "gate1064-job-walk", completion: { _ in })
+        let scheduler = SyncScheduler(
+            backgroundReadiness: { true },
+            backgroundWork: { _ in
+                let onWiFi = SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 }
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        await SyncScheduler.runBackgroundBackfill(
+                            accounts: [account], isLowPowerMode: false, wifiOnly: true, onWiFi: onWiFi,
+                            awaitOnWiFi: { await SyncEngine.awaitBackgroundProcessingJobOnWiFi() }
+                        ) { _, walkAllowed in
+                            calls.value.withLock { $0.append(walkAllowed) }
+                        }
+                    }
+                    group.addTask {
+                        _ = await Self.pollUntil { !calls.value.withLock { $0 }.isEmpty }
+                        try? await Task.sleep(for: Self.settle)
+                        callsWhileUnknown.value.withLock { $0 = calls.value.withLock { $0 } }
+                        released.value.withLock { $0 = true }
+                    }
+                }
+            },
+            processingHasWork: { false },
+            backgroundSchedule: { _ in },
+            refreshNetworkAvailable: true
+        )
+        scheduler.handleBackgroundAIProcessing(context: context) { _ in }
+        await context.waitForTaskForTesting()
+        #expect(callsWhileUnknown.value.withLock { $0 } == [false],
+                "while the reading is unknown the backfill (its scans) must run at once with the walk held")
+        #expect(calls.value.withLock { $0 } == (landsOnWiFi ? [false, true] : [false]),
+                "once the reading lands the walk must follow it with Wi-Fi-only on")
+    }
+
     /// One background-job input set for the body gate (#1064): Low Power Mode,
     /// the Wi-Fi-only setting, the job's own Wi-Fi measurement, and what
     /// NetworkMonitor holds (nil: never started, as in a job that launched the app

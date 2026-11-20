@@ -2,8 +2,9 @@
 > **Note (2026-11-20, #1064).** The "Power-aware backfill" entry below says the gates hold back the walk
 > only. Since #1064 the same gates also hold older-mail body downloads (`BackfillBodyQueue`); new mail
 > (`ActiveBodyQueue`), opened messages and scans are not held. In the background processing job the walk
-> and the bodies decide with the job's one Wi-Fi measurement, taken at job start
-> (`SyncEngine.backgroundProcessingJobOnWiFi`), never NetworkMonitor, which a job that launched the app
+> and the bodies decide with the job's one Wi-Fi measurement, started at job start concurrently with
+> the job's work so scans never wait for it; walk and bodies hold while it is unknown
+> (`SyncEngine.backgroundProcessingJobOnWiFi`, nil until it lands), never NetworkMonitor, which a job that launched the app
 > from terminated never starts. Outside the job, a network NetworkMonitor has not reported yet counts as
 > expensive (`checkExpensiveIfKnown() == nil`), so Wi-Fi-only holds until the first path update
 > (ADR-IOS-005 amendment of 2026-11-20 and its correction). The text below is kept as written.

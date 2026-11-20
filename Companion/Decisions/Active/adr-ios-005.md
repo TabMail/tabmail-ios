@@ -31,10 +31,14 @@
 > *Corrected 2026-11-20 (#1064 review):* "the job's walk decision applies" held only when NetworkMonitor
 > was running. A job that launches the app from terminated never starts it (only RootView's `.task`
 > does), and its unset flag read as "not metered", so bodies downloaded on cellular while the job's walk
-> was held. Now the job measures Wi-Fi once at job start (`SyncScheduler.measureJobOnWiFi`, i.e.
-> `isOnWiFi()`) and publishes it with the job flag in one MainActor step
-> (`SyncEngine.backgroundProcessingJobOnWiFi`); the job's walk and the body gate's job branch both
-> decide with that one value. Outside the job, a network NetworkMonitor has not reported yet
+> was held. Now the job measures Wi-Fi once (`SyncScheduler.measureJobOnWiFi`, i.e. `isOnWiFi()`,
+> bounded by `SyncConfig.wifiCheckTimeoutSeconds`) concurrently with its work: the job flag, its Fast
+> Sync and the work start at once, so scans (listings, change checks, the catch-up) never wait for the
+> reading. `SyncEngine.backgroundProcessingJobOnWiFi` is unknown (nil) until the reading lands, then
+> true/false; while unknown, the body gate's job branch and the job's walk hold (the walk waits for
+> the reading after its account's scans ran, `SyncScheduler.runBackgroundBackfill`; the body queue's
+> gate watcher picks up the lift). Once it lands, the job's walk and the body gate's job branch both
+> decide with that one value (2026-11-20). Outside the job, a network NetworkMonitor has not reported yet
 > (`NetworkMonitor.checkExpensiveIfKnown() == nil`) counts as expensive, so Wi-Fi-only holds both the
 > walk and the bodies until the first path update, as `isOnWiFi()` holds on its timeout.
 

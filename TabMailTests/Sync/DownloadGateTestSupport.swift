@@ -67,7 +67,8 @@ enum DownloadGateHarness {
             case .job:
                 let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
                 await SyncScheduler.runBackgroundBackfill(
-                    accounts: [account], isLowPowerMode: gate == .lowPowerMode, wifiOnly: true, onWiFi: !expensive
+                    accounts: [account], isLowPowerMode: gate == .lowPowerMode, wifiOnly: true, onWiFi: !expensive,
+                    awaitOnWiFi: { !expensive }
                 ) { account, walkAllowed in
                     _ = await engine.performBackfill(account: account, deadline: deadline, walkAllowed: walkAllowed)
                 }

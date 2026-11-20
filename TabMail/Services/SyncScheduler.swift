@@ -541,17 +541,20 @@ final class SyncScheduler {
             // and Wi-Fi-only off Wi-Fi hold back the walk only (#1063).
             let isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
             let wifiOnly = UserDefaults.standard.object(forKey: Self.wifiOnlyKey) as? Bool ?? true
-            // The job's Wi-Fi state, measured once at job start; the older-mail body
-            // gate decides with the same value, so the walk and the bodies share one
-            // network input (#1064). `.full` runs only inside the job.
-            let onWiFi = SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 }
+            // The job's Wi-Fi state, measured concurrently from job start; the
+            // older-mail body gate decides with the same value, so the walk and the
+            // bodies share one network input (#1064). `.full` runs only inside the
+            // job. While the reading is unknown the scans run anyway and the walk
+            // waits for it (`runBackgroundBackfill`).
             if !Task.isCancelled {
                 let accounts = (try? await dbPool.read { db in
                     try Account.filter(Column("isActive") == true).fetchAll(db)
                 }) ?? []
                 let backfillDeadline = Date(timeIntervalSinceNow: SyncConfig.backgroundBackfillDeadlineSeconds)
                 await Self.runBackgroundBackfill(
-                    accounts: accounts, isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: onWiFi
+                    accounts: accounts, isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly,
+                    onWiFi: SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 },
+                    awaitOnWiFi: { await SyncEngine.awaitBackgroundProcessingJobOnWiFi() }
                 ) { account, walkAllowed in
                     _ = await self.manager.runBackfill(account: account, deadline: backfillDeadline, walkAllowed: walkAllowed)
                 }
@@ -1395,19 +1398,28 @@ final class SyncScheduler {
             // both in one MainActor step, so no reader pairs the job's Fast Sync with
             // "no job". Clearing the job flag first and Fast Sync in a later task
             // opened a window that admitted downloads under Low Power Mode.
-            // The job's Wi-Fi state is measured once here, before the flags, and
-            // published with them in the same MainActor step: the job's walk and
-            // the body gate's job branch both read it, so one decision has one
-            // network input. NetworkMonitor is not used: a job that launched the
-            // app from terminated never starts it (#1064).
-            let jobOnWiFi = await Self.measureJobOnWiFi()
+            // The job's Wi-Fi state is measured once, concurrently: the flags and
+            // the work start at once, so the job's scans (listings, change checks,
+            // the catch-up) never wait for the reading. Until it lands the value is
+            // unknown (nil) and the job's downloads hold: the body gate's job branch
+            // and the job's walk. Once it lands, both decide with that one value, so
+            // one decision has one network input. NetworkMonitor is not used: a job
+            // that launched the app from terminated never starts it (#1064).
             AccountManagerState.shared.fastSyncModeActive = true
             SyncEngine.backgroundProcessingJobActive.withLock { $0 = true }
-            SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 = jobOnWiFi }
+            SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 = nil }
+            let wifiMeasurement = Task { @MainActor in
+                let onWiFi = await Self.measureJobOnWiFi()
+                // Published only while this job still runs: the defer below
+                // cancels this task in the same MainActor step that clears the job.
+                guard !Task.isCancelled else { return }
+                SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 = onWiFi }
+            }
             defer {
+                wifiMeasurement.cancel()
                 AccountManagerState.shared.fastSyncModeActive = false
                 SyncEngine.backgroundProcessingJobActive.withLock { $0 = false }
-                SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 = false }
+                SyncEngine.backgroundProcessingJobOnWiFi.withLock { $0 = nil }
             }
 
             #if DEBUG
@@ -1473,14 +1485,29 @@ final class SyncScheduler {
 
     /// The job's backfill stage: every account's backfill runs, so its folder
     /// scans run, under any gate; the decision passed to `run` holds the walk only.
+    /// `onWiFi` nil (the job's Wi-Fi reading has not landed) never delays a scan:
+    /// each account's backfill runs at once with the walk held, then, once
+    /// `awaitOnWiFi` returns the reading, a second call runs the walk if the plan
+    /// allows it. `awaitOnWiFi` returning nil (the job ended or was cancelled)
+    /// leaves the walk held.
     nonisolated static func runBackgroundBackfill(
-        accounts: [Account], isLowPowerMode: Bool, wifiOnly: Bool, onWiFi: Bool,
+        accounts: [Account], isLowPowerMode: Bool, wifiOnly: Bool, onWiFi: Bool?,
+        awaitOnWiFi: @escaping @Sendable () async -> Bool?,
         run: @escaping @Sendable (Account, Bool) async -> Void
     ) async {
-        let walkAllowed = backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: onWiFi)
         await withTaskGroup(of: Void.self) { group in
             for account in accounts {
-                group.addTask { await run(account, walkAllowed) }
+                group.addTask {
+                    if let onWiFi {
+                        await run(account, backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: onWiFi))
+                        return
+                    }
+                    await run(account, false)
+                    guard !Task.isCancelled, let landed = await awaitOnWiFi(),
+                          backgroundBackfillPlan(isLowPowerMode: isLowPowerMode, wifiOnly: wifiOnly, onWiFi: landed)
+                    else { return }
+                    await run(account, true)
+                }
             }
         }
     }
@@ -1489,12 +1516,17 @@ final class SyncScheduler {
     /// Test seam for the job's Wi-Fi measurement, nil (the default) in normal use.
     /// `isOnWiFi` uses a live NWPathMonitor, so a test cannot choose its answer.
     nonisolated static let jobOnWiFiMeasurementForTesting = Mutex<Bool?>(nil)
+    /// Held variant: when set, the measurement awaits it and returns its answer,
+    /// so a test can keep the reading unknown while the job's work runs.
+    nonisolated static let jobOnWiFiMeasurementHoldForTesting = Mutex<(@Sendable () async -> Bool)?>(nil)
     #endif
 
-    /// The background processing job's one Wi-Fi measurement, taken at job start
-    /// (`handleBackgroundAIProcessing`, #1064).
+    /// The background processing job's one Wi-Fi measurement, started at job start
+    /// concurrently with the job's work (`handleBackgroundAIProcessing`, #1064).
+    /// Bounded by `isOnWiFi`'s `SyncConfig.wifiCheckTimeoutSeconds`.
     nonisolated static func measureJobOnWiFi() async -> Bool {
         #if DEBUG
+        if let hold = jobOnWiFiMeasurementHoldForTesting.withLock({ $0 }) { return await hold() }
         if let onWiFi = jobOnWiFiMeasurementForTesting.withLock({ $0 }) { return onWiFi }
         #endif
         return await isOnWiFi()
