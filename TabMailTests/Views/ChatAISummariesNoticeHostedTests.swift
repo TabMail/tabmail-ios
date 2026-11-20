@@ -1069,7 +1069,9 @@ struct ChatAISummariesNoticeHostedTests {
     @Test("A popover the system closed while its report sends: the old answer never shows, closes or changes the next report")
     func aSystemClosedPopoversAnswerNeverReachesTheNext() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
-        for answerBeforeNextSend in [true, false] {
+        // When the old answer arrives: after the notice reopens but before its report opens,
+        // after the next report opens but before it sends, or after it sends.
+        for answerAt in ["beforeReportOpens", "beforeNextSend", "afterNextSend"] {
             let held = HeldSend()
             try await HostedAccessibility.withAutomation {
                 let button = AISummariesNoticeButton(landed: false, reportContent: { "Summary" }, firstOpen: Self.freshFirstOpen(),
@@ -1088,12 +1090,20 @@ struct ChatAISummariesNoticeHostedTests {
                     #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title)
                             && !Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
                             "the notice opens afresh, with no report sheet: \(Self.presentedLabels(controller))")
+                    if answerAt == "beforeReportOpens" {
+                        held.release(1, true)
+                        try await Task.sleep(for: .seconds(1))
+                        #expect(Self.presentedLabels(controller).contains(AISummariesNotice.title)
+                                && !Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
+                                "answer before the report opens: the notice stays, with no sheet")
+                        #expect(!(Self.topPresented(controller) is UIAlertController), "answer before the report opens: no alert")
+                    }
                     let popover = try #require(Self.topPresented(controller)?.view)
                     let report = try #require(Self.element(AISummariesNotice.reportTitle, in: popover))
                     #expect(report.accessibilityActivate())
                     try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
                     let sheetView = try #require(Self.topPresented(controller)?.view, "control: the next report's sheet")
-                    if answerBeforeNextSend {
+                    if answerAt == "beforeNextSend" {
                         held.release(1, true)
                         try await Task.sleep(for: .seconds(1))
                         #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "answer first: the new sheet stays")
@@ -1102,7 +1112,7 @@ struct ChatAISummariesNoticeHostedTests {
                         #expect(!(Self.topPresented(controller) is UIAlertController), "answer first: no alert")
                     }
                     try await Self.pressReport(in: controller, held: held, sends: 2)
-                    if !answerBeforeNextSend {
+                    if answerAt == "afterNextSend" {
                         held.release(1, true)
                         try await Task.sleep(for: .seconds(1))
                     }

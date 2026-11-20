@@ -137,7 +137,7 @@ struct ReportConcernSheetModifier: ViewModifier {
     @State private var isSubmitting = false
     /// Set by a caller whose `isPresented` flag outlives the view this sheet is attached to (the
     /// notice's flag lives on its button, the sheet on the popover's content): the caller then
-    /// owns the presentation too and retires it when the sheet's view goes. Otherwise the sheet
+    /// owns the presentation too and retires it whenever it opens that view again. Otherwise the sheet
     /// owns it, with the same lifetime as its flag.
     var ownerPresentation: ReportPresentation?
 

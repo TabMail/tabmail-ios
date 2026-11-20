@@ -167,9 +167,9 @@ private struct AISummariesNoticePopover: View {
     let reportContent: () -> String
     let send: ReportConcernSend
     let tag: String
-    /// The report is done: the popover closes.
     @Binding var showsReport: Bool
     let reportPresentation: ReportPresentation
+    /// The report is done: the popover closes.
     let onFinish: () -> Void
 
     var body: some View {
