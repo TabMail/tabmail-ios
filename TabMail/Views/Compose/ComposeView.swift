@@ -1062,9 +1062,6 @@ struct ComposeView: View {
     @State private var showFilePicker = false
     @State private var showCamera = false
     @State private var showingSuggestion = false
-    /// True once the card has finished coming on screen (`ComposePresentationProbe`). Until then
-    /// the suggestion bubble's insertion waits; `showingSuggestion` and the rest of the card do not.
-    @State private var presentationSettled = false
     @State private var currentSuggestion: String?
     @State private var isRecomputing = false
     @State private var isApplyingEdit = false
@@ -1355,9 +1352,6 @@ struct ComposeView: View {
                 // Layer 1: Fields content with header spacer
                 VStack(spacing: 0) {
                     Spacer().frame(height: Self.headerHeight)
-                    // Holds the suggestion bubble's insertion until the card is on screen.
-                    ComposePresentationProbe(onAppeared: markPresentationSettled)
-                        .frame(width: 0, height: 0)
                     Divider()
 
                     // Demo notice — mock provider keeps the message local.
@@ -1462,7 +1456,7 @@ struct ComposeView: View {
                             Divider()
 
                             // Body + suggestion bubble + signature + quoted original
-                            if showingSuggestion, presentationSettled, let suggested = currentSuggestion, !suggested.isEmpty {
+                            if showingSuggestion, let suggested = currentSuggestion, !suggested.isEmpty {
                                 suggestionBubble(text: suggested)
                                     .transition(.scale(scale: 0.96).combined(with: .opacity))
                                     .onAppear { logSuggestionBubble("appeared") }
@@ -1990,27 +1984,15 @@ struct ComposeView: View {
     /// Debug-gated: the suggestion bubble entering or leaving the card.
     /// Debug-gated diagnostics: every input of the body's bubble-or-editor branch, in one value.
     private var bodyBranchKey: String {
-        "showing=\(showingSuggestion) settled=\(presentationSettled) suggestionLen=\(currentSuggestion?.count ?? -1) read=\(draftReadState) "
+        "showing=\(showingSuggestion) suggestionLen=\(currentSuggestion?.count ?? -1) read=\(draftReadState) "
             + "hydrating=\(isHydratingPreparedDraft) checkingServer=\(isCheckingServerCopy) quoted=\(quotedHTML != nil)"
     }
 
     private func logBodyBranch(_ key: String) {
         if DebugModeManager.isLoggingEnabled() {
-            let bubble = showingSuggestion && presentationSettled && !(currentSuggestion ?? "").isEmpty
+            let bubble = showingSuggestion && !(currentSuggestion ?? "").isEmpty
             let sinceAppear = debugAppearedAt.map { "\(($0.duration(to: .now) / .milliseconds(1)).rounded())" } ?? "beforeAppear"
             BackgroundSyncLogger.logDebug("[ComposeView] bodyBranch instance=\(instanceToken) branch=\(bubble ? "bubble" : "editor") msSinceAppear=\(sinceAppear) key=\(key)")
-        }
-    }
-
-    /// The card has finished coming on screen: a suggestion already waiting animates in now; one
-    /// dismissed meanwhile never appears (the branch reads `showingSuggestion` as it is now).
-    private func markPresentationSettled(_ state: ComposePresentationProbe.AppearState) {
-        if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[ComposeView] presentationSettled instance=\(instanceToken) wasSettled=\(presentationSettled) ancestorBeingPresented=\(state.ancestorBeingPresented) transitionCoordinator=\(state.hasTransitionCoordinator) showing=\(showingSuggestion)")
-        }
-        guard !presentationSettled else { return }
-        withAnimation(.easeInOut(duration: ComposeSuggestionRevealConfig.insertionDuration)) {
-            presentationSettled = true
         }
     }
 
@@ -3303,7 +3285,7 @@ struct ComposeView: View {
         }
         if let suggested = suggestionToShow, !suggested.isEmpty {
             currentSuggestion = suggested
-            withAnimation(.easeInOut(duration: ComposeSuggestionRevealConfig.insertionDuration)) {
+            withAnimation(.easeInOut(duration: 0.3)) {
                 showingSuggestion = true
             }
         }
