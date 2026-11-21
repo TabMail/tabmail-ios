@@ -139,9 +139,14 @@ final class ChatSwipeUITests: XCTestCase {
 
         dragFieldOpen(in: app)
         let close = app.buttons["chatClose"]
-        // The dim between the navigation bar and the panel's top.
-        let dimY = (navigationBarY(in: app) + close.frame.minY) / 2
-        XCTAssertLessThan(navigationBarY(in: app) + 20, close.frame.minY - 20, "control: there is dim above the panel to tap")
+        // The dim between the navigation bar's bottom and the panel's top: a tap higher up lands on
+        // the navigation bar, which takes it.
+        let barBottom = app.navigationBars.firstMatch.frame.maxY
+        let panelTop = openPanelTop(in: app, below: barBottom, close: close.frame)
+        XCTAssertNotNil(panelTop, "control: the open panel's top is found")
+        guard let panelTop else { return }
+        XCTAssertLessThan(barBottom, panelTop, "control: there is dim between the navigation bar \(barBottom) and the panel \(panelTop) to tap")
+        let dimY = (barBottom + panelTop) / 2
         tap(atY: dimY, dx: 0.5, in: app)
         XCTAssertTrue(close.waitForNonExistence(timeout: 3), "a tap on the dim closed the panel")
         XCTAssertTrue(isInChat(app), "the chat stays")
@@ -912,6 +917,23 @@ final class ChatSwipeUITests: XCTestCase {
 
     private func navigationBarY(in app: XCUIApplication) -> CGFloat {
         app.buttons["Forward"].frame.midY
+    }
+
+    /// The open panel's top: the highest top, below the navigation bar, of an element that holds
+    /// Close (the panel's header bar), read from one snapshot of the app.
+    private func openPanelTop(in app: XCUIApplication, below barBottom: CGFloat, close: CGRect) -> CGFloat? {
+        guard let root = try? app.snapshot() else { return nil }
+        let closeCenter = CGPoint(x: close.midX, y: close.midY)
+        var top: CGFloat?
+        var pending: [any XCUIElementSnapshot] = [root]
+        while let element = pending.popLast() {
+            let frame = element.frame
+            if element.elementType == .other, frame.minY > barBottom, frame.minY <= close.minY, frame.contains(closeCenter) {
+                top = min(top ?? frame.minY, frame.minY)
+            }
+            pending += element.children
+        }
+        return top
     }
 
     private func tap(atY y: CGFloat, dx: CGFloat, in app: XCUIApplication) {
