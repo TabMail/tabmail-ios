@@ -59,20 +59,16 @@ struct ChatThreadView: View {
     @State private var chatExpanded = false
     /// The collapsed field's height, notices and chips included: the height of the bottom bar,
     /// whose inset keeps the last bubble and the jump button above the field. The field grows to six
-    /// lines, so it is measured; the open panel and a drag on the field (its swell and settle) keep
-    /// the last resting height, so the chat does not move under them.
+    /// lines, so it is measured; the open panel keeps the last resting height, and a drag's swell
+    /// never reaches it (`pill(on:)` takes the swell back out of the layout), so the chat does not
+    /// move under either.
     @State private var pillHeight = ChatViewLayout.pillStartHeight
-    /// The field's latest measured height, swell included; taken as `pillHeight` once a drag settles.
-    @State private var fieldMeasuredHeight = ChatViewLayout.pillStartHeight
     /// The chat's own height: the opened pill grows upward out of the bottom bar into it.
     @State private var chatAreaHeight: CGFloat = 0
     /// A drag up on the collapsed field (`ChatFieldDrag`): reset however the drag ends, a cancelled
     /// one included, with the pill's spring, so the swell always springs back.
     @GestureState(resetTransaction: Transaction(animation: ChatThreadView.pillSpring))
     private var fieldDragProgress = ChatFieldDrag.Progress()
-    /// From a drag's start on the field until its swell has settled (`fieldDragSettle`): the bar
-    /// keeps its resting height. The token makes an older drag's settle do nothing.
-    @State private var fieldSettleToken: UUID?
     @State private var chatInputFocused = false
     @State private var chatWorking = false
     /// The ready AI Suggestion's compose card: the email it answers, and how it opens.
@@ -110,9 +106,9 @@ struct ChatThreadView: View {
     static let pillSpringModel = Spring(
         response: ChatViewLayout.pillSpringResponse, dampingRatio: ChatViewLayout.pillSpringDamping)
     private static let pillSpring = Animation.spring(pillSpringModel)
-    /// After a drag on the field lets go, how long the bar keeps its resting height while the swell
-    /// springs back: the pill's spring's own settling duration (about 0.6 s for response 0.45 and
-    /// damping 0.82), so the chat does not follow the settling field.
+    /// After a drag on the field lets go, how long its swell takes to spring back: the pill's
+    /// spring's own settling duration (about 0.6 s for response 0.45 and damping 0.82). The drag's
+    /// freeze holds through it plus the freeze rule's cooldown.
     static let fieldDragSettle: Duration = .seconds(pillSpringModel.settlingDuration)
 
     init(messageId: String, expectedRfc822MessageId: String? = nil, highlightsOpenedMessage: Bool = false) {
@@ -486,14 +482,7 @@ struct ChatThreadView: View {
                         .overlay(alignment: .bottom) {
                             pill(on: newest)
                                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                                    fieldMeasuredHeight = height
-                                    // A drag's swell, and its settle, are not the field's room: the
-                                    // chat stays put (the resting height is taken once it settles).
-                                    // `isDragging` is read too because the drag's start queues this
-                                    // action and the `onChange` that sets the token together, and
-                                    // SwiftUI runs deferred actions in an unspecified order: the
-                                    // token alone could let the first swollen height through.
-                                    if !chatExpanded && fieldSettleToken == nil && !fieldDragProgress.isDragging { pillHeight = height }
+                                    if !chatExpanded { pillHeight = height }
                                 }
                                 // ...and above the reply field.
                                 .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
@@ -880,6 +869,10 @@ struct ChatThreadView: View {
                     showChat: chatExpanded || TutorialCoordinator.shared.isRunning
                         ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } }),
                 onFieldSend: { _ in fieldComposeOpened = false })
+            // The swell is not the field's room: its glass grows upward, and the same swell is taken
+            // back out of the layout here, springing back in the same transaction, so the field's
+            // measured height, the bar, its inset and the chat never move under a drag.
+            .padding(.top, -fieldDragProgress.swell)
             // Drag the field up: it swells under the finger and opens the TabMail chat panel. Not
             // in the tutorial, whose steps open the chat themselves.
             .simultaneousGesture(fieldDragGesture, isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning)
@@ -910,9 +903,6 @@ struct ChatThreadView: View {
         .animation(Self.pillSpring, value: chatExpanded)
     }
 
-    /// The field's VoiceOver action that opens the TabMail chat panel.
-    static let showChatActionName = "Show TabMail chat"
-
     /// The drag up on the collapsed field (`ChatFieldDrag`). The swell lives in `@GestureState`, so
     /// it springs back however the drag ends; the let-go only decides whether the panel opens.
     private var fieldDragGesture: some Gesture {
@@ -928,29 +918,17 @@ struct ChatThreadView: View {
     }
 
     /// A drag on the field began or ended (finished or cancelled). It holds the interaction freeze
-    /// under its own id from its start, ends the tip once, and keeps the bar at its resting height.
-    /// One timer chain ends both: once the swell has settled (`fieldDragSettle`) the bar takes the
-    /// field's height, and after the freeze rule's cooldown (`freezeCooldown`) the freeze is
-    /// released. A newer drag replaces the token and holds the freeze itself, so an older chain
-    /// does nothing; the chat going away releases it (`onDisappear`).
+    /// under its own id from its start and ends the tip once; after its let-go the freeze holds
+    /// while the swell settles (`fieldDragSettle`) and then the freeze rule's cooldown
+    /// (`freezeCooldown`). A newer drag's `begin` cancels an older settle; the chat going away
+    /// releases it (`onDisappear`).
     private func fieldDragChanged(_ dragging: Bool) {
         if dragging {
             ChatSwipeHold.shared.begin(Self.fieldDragHoldId)
             ChatFieldDragTip.close()
-            fieldSettleToken = UUID()
             return
         }
-        let token = UUID()
-        fieldSettleToken = token
-        Task { @MainActor in
-            try? await Task.sleep(for: Self.fieldDragSettle)
-            guard fieldSettleToken == token else { return }
-            fieldSettleToken = nil
-            if !chatExpanded { pillHeight = fieldMeasuredHeight }
-            try? await Task.sleep(for: ChatViewLayout.freezeCooldown)
-            guard fieldSettleToken == nil else { return }
-            ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)
-        }
+        ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: Self.fieldDragSettle + ChatViewLayout.freezeCooldown)
     }
 
     /// The gray line above the field when the reply is not a Reply All; tap for everyone.

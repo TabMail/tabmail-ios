@@ -111,13 +111,13 @@ extension DynamicIslandChat {
 
 extension View {
     /// The chat reply field's drag up as VoiceOver's "Show TabMail chat"
-    /// (`ChatThreadView.showChatActionName`), on the element VoiceOver focuses: the text field, the
+    /// (`ChatViewConfig.showChatActionName`), on the element VoiceOver focuses: the text field, the
     /// sent words while the agent works, the waveform while dictating. Only while the panel is
     /// closed; nil offers nothing (any other pill, the panel open, the tutorial).
     func showChatAction(_ showChat: (() -> Void)?, isExpanded: Bool) -> some View {
         accessibilityActions {
             if let showChat, !isExpanded {
-                Button(ChatThreadView.showChatActionName) { showChat() }
+                Button(ChatViewConfig.showChatActionName) { showChat() }
             }
         }
     }

@@ -982,21 +982,29 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `ChatViewLayout.fieldDragMaxSwell`); on let-go the panel opens with the pill's spring once the
    swell, or a flick's predicted swell, reaches `fieldDragOpenDistance`, and otherwise the field
    settles back. Only a drag more up than sideways counts, so the chat's sideways swipes are
-   unchanged. The swell is not the field's room: from the drag's start until its swell has
-   settled (`ChatThreadView.fieldDragSettle`, the pill spring's own `settlingDuration`, so the two
-   cannot drift apart) the bar keeps its resting height, so the chat does not move during the swell
-   or the settle. The bar also ignores the field's height while the drag is in progress
+   unchanged. The swell is not the field's room: `pill(on:)` takes it back out of the layout right
+   after the field (`.padding(.top, -fieldDragProgress.swell)`), so the field's glass grows upward
+   while its measured height, the bar, its inset and the chat stay put; the two paddings read the
+   same gesture state and spring back in the same reset transaction, so they cancel through the
+   settle too. *Superseded 2026-11-21 (the compensation below needed three fixes and was deleted
+   for the padding above):* "from the drag's start until its swell has settled
+   (`ChatThreadView.fieldDragSettle`, the pill spring's own `settlingDuration`, so the two cannot
+   drift apart) the bar keeps its resting height, so the chat does not move during the swell or the
+   settle. The bar also ignores the field's height while the drag is in progress
    (`fieldDragProgress.isDragging`): the drag's start queues the bar's geometry action and the
    `onChange` that sets the settle token together, and SwiftUI runs deferred actions in an
-   unspecified order. The drag's state is a `@GestureState`
+   unspecified order." The drag's state is a `@GestureState`
    (`ChatFieldDrag.Progress`) reset with the pill's spring, so a cancelled drag (the panel opening on
    an agent answer mid-drag, a system interruption) springs back too; the let-go only decides
    whether the panel opens. The drag holds the user-interaction freeze through `ChatSwipeHold` under
    its own id (`ChatThreadView.fieldDragHoldId`) from its start until its swell has settled
-   (`fieldDragSettle`) plus the freeze rule's cooldown (`ChatViewLayout.freezeCooldown`, the part
-   of `swipeSettleHold` past the swipe spring) after it ends, finished or cancelled. One timer
-   chain does both: at the settle the bar takes the field's height, after the cooldown the freeze
-   is released, so the hold always lasts at least the settle plus the cooldown.
+   (`ChatThreadView.fieldDragSettle`, the pill spring's own `settlingDuration`, so the two cannot
+   drift apart) plus the freeze rule's cooldown (`ChatViewLayout.freezeCooldown`, the part of
+   `swipeSettleHold` past the swipe spring) after it ends, finished or cancelled: one
+   `ChatSwipeHold.release(_:after:)` at the let-go, which a newer drag's `begin` cancels.
+   *Superseded 2026-11-21:* "One timer chain does both: at the settle the bar takes the field's
+   height, after the cooldown the freeze is released, so the hold always lasts at least the settle
+   plus the cooldown."
    VoiceOver opens the panel with the named action "Show TabMail chat" on the element it focuses:
    the text field, the sent words while the agent works, the waveform while dictating
    (`showChatAction`), only while the panel is closed. Not in the tutorial, whose steps open the chat themselves. The panel stays dimmed
@@ -1006,10 +1014,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (taps), `ChatReplyFieldTests.fieldDragWiring`. The swell and the settle are covered by
    `ChatSwipeUITests.testShortDragOnTheReplyFieldKeepsTheChat`, which reads the debug marker
    `ChatFieldDragMarker` (the newest row's largest move from the drag's start until well after the
-   settle), by `testDragThatOpensThePanelReleasesTheFreeze` (the same marker's freeze state), by
-   `ChatReplyFieldTests.fieldDragSettleFences` (the token at the drag's start, the bar's gate, the
-   release at the end of the settle's timer chain) and `fieldDragSettleIsThePillSpring` (the freeze
-   is released no sooner than the settle plus the cooldown). The VoiceOver action:
+   settle, and whether the freeze is still held halfway through the cooldown), by
+   `testDragThatOpensThePanelReleasesTheFreeze` (the same marker's freeze state) and by
+   `ChatReplyFieldTests.fieldDragSettleIsThePillSpring` (the settle is the pill spring's).
+   (`fieldDragSettleFences`, which pinned the deleted settle token, gate and timer chain, was
+   removed with them on 2026-11-21.) The VoiceOver action:
    `ChatThreadLayoutTests.showChatActionOpensThePanel`.
 
 20. **The first-time drag tip (amendment 2026-11-20).** Once, above the collapsed reply field, a

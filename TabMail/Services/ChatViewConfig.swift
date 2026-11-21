@@ -43,6 +43,10 @@ enum ChatViewConfig {
     /// summaries of its newest this many emails, and the background walk takes each thread's newest
     /// this many. An older email asks for its own when it comes on screen.
     static let summaryWindow = 10
+
+    /// The reply field's VoiceOver action that opens the TabMail chat panel, the drag up's
+    /// equivalent (`showChatAction`).
+    static let showChatActionName = "Show TabMail chat"
 }
 
 /// Sizes and timings of the chat screen.

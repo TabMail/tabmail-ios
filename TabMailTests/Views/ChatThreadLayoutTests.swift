@@ -204,7 +204,7 @@ struct ChatThreadLayoutTests {
         try await HostedAccessibility.withAutomation {
             try await Self.hosted { _, controller, _ in
                 let id = ChatThreadView.replyPillId
-                let name = ChatThreadView.showChatActionName
+                let name = ChatViewConfig.showChatActionName
                 try await Self.waitFor { Self.frame(of: id, in: controller.view) != nil }
                 let carrier = try #require(HostedAccessibility.elements(under: controller.view)
                     .first { $0.accessibilityCustomActions?.contains { $0.name == name } ?? false },

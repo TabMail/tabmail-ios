@@ -374,7 +374,7 @@ struct ChatReplyRecoveryTests {
         try await HostedAccessibility.withAutomation {
             try await withChat(backend, tag: "show-chat-working") { chat in
                 defer { release.signal() }
-                let name = ChatThreadView.showChatActionName
+                let name = ChatViewConfig.showChatActionName
                 #expect(Self.type("Tell them Friday works", in: chat.view), "control: the field takes words")
                 try await Task.sleep(for: .milliseconds(300))
                 #expect(HostedAccessibility.activate("chatSend", in: chat.view),

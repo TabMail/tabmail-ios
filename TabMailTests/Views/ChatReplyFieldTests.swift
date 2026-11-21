@@ -718,22 +718,20 @@ struct ChatReplyFieldTests {
         #expect(Self.count(".onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }", in: chat) == 1)
         let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
         #expect(Self.count("ChatSwipeHold.shared.begin(Self.fieldDragHoldId)", in: changed) == 1)
-        #expect(Self.count("ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)", in: changed) == 1, "released once settled")
-        #expect(Self.count("ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)", in: chat) == 2, "and if the chat goes away")
-        #expect(Self.count("ChatSwipeHold.shared.release(Self.fieldDragHoldId, after:", in: chat) == 0, "one timer, the settle's")
-        // The bar keeps its resting height through the swell and its settle.
-        #expect(Self.count("if !chatExpanded && fieldSettleToken == nil && !fieldDragProgress.isDragging { pillHeight = height }", in: chat) == 1)
-        #expect(Self.count("try? await Task.sleep(for: Self.fieldDragSettle)", in: changed) == 1)
+        // Every let-go holds through the settle and the freeze rule's cooldown, on the swipes' own
+        // settle (a newer begin cancels it).
+        #expect(Self.count("ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: Self.fieldDragSettle + ChatViewLayout.freezeCooldown)", in: changed) == 1)
+        #expect(Self.count("ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)", in: chat) == 1, "and if the chat goes away")
         // Never in the tutorial, whose steps open the chat themselves, nor over the open panel.
         #expect(Self.count(".simultaneousGesture(fieldDragGesture, isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning)", in: chat) == 1)
         // VoiceOver opens the panel with a named action on the text field it focuses, offered only
         // while the panel is closed, never on the field's container.
-        #expect(ChatThreadView.showChatActionName == "Show TabMail chat")
+        #expect(ChatViewConfig.showChatActionName == "Show TabMail chat")
         #expect(Self.count("showChat: chatExpanded || TutorialCoordinator.shared.isRunning ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } }", in: chat) == 1)
-        #expect(Self.count("Button(Self.showChatActionName)", in: chat) == 0, "not on the container")
+        #expect(Self.count("Button(ChatViewConfig.showChatActionName)", in: chat) == 0, "not on the container")
         let bar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
         // One helper, only while the panel is closed.
-        #expect(Self.count("func showChatAction(_ showChat: (() -> Void)?, isExpanded: Bool) -> some View { accessibilityActions { if let showChat, !isExpanded { Button(ChatThreadView.showChatActionName) { showChat() } } } }", in: bar) == 1)
+        #expect(Self.count("func showChatAction(_ showChat: (() -> Void)?, isExpanded: Bool) -> some View { accessibilityActions { if let showChat, !isExpanded { Button(ChatViewConfig.showChatActionName) { showChat() } } } }", in: bar) == 1)
         // On the text field, and on the sent words while the agent works (the drag stays on then).
         #expect(Self.count("inputField(placeholder: hasTabMailSession ? field.placeholder : \"Sign in to reply or ask\", showChat: field.showChat)", in: bar) == 1)
         #expect(Self.count(".opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1) // The drag stays on while the agent works: so does its VoiceOver action. .showChatAction(field.showChat, isExpanded: isExpanded)", in: bar) == 1)
@@ -741,32 +739,9 @@ struct ChatReplyFieldTests {
         let pill = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count(".accessibilityHidden(dictation.isActive) .showChatAction(showChat, isExpanded: isExpanded)", in: pill) == 1)
         #expect(Self.count(".onTapGesture { dictation.finish() } .showChatAction(showChat, isExpanded: isExpanded)", in: pill) == 1)
-        // The closure is not part of the field's equality.
-        let open = ChatReplyField(example: nil, isNoReply: false, clearCount: 0, showChat: {})
-        let closed = ChatReplyField(example: nil, isNoReply: false, clearCount: 0)
-        #expect(open == closed)
-    }
-
-    @Test("A drag on the field holds the bar from its start, the bar ignores the field while it drags, and every let-go releases the freeze")
-    func fieldDragSettleFences() throws {
-        let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
-        let dragStart = try #require(changed.range(of: "if dragging {"))
-        let dragEnd = try #require(changed[dragStart.upperBound...].range(of: "return }"))
-        guard dragStart.upperBound <= dragEnd.lowerBound else { return }
-        let started = String(changed[dragStart.upperBound..<dragEnd.lowerBound])
-        let letGo = String(changed[dragEnd.upperBound...])
-        // The token is taken as the drag starts, not only on its let-go.
-        #expect(Self.count("fieldSettleToken = UUID()", in: started) == 1)
-        // The bar's gate reads the drag itself: its geometry action and the token's onChange run in
-        // an unspecified order.
-        #expect(Self.count("if !chatExpanded && fieldSettleToken == nil && !fieldDragProgress.isDragging { pillHeight = height }", in: chat) == 1)
-        // Every let-go releases the freeze, a let-go that opens the panel included, from the
-        // settle's own timer chain: the settle, the bar, then the freeze's cooldown, then the release.
-        let release = "try? await Task.sleep(for: Self.fieldDragSettle) guard fieldSettleToken == token else { return } fieldSettleToken = nil if !chatExpanded { pillHeight = fieldMeasuredHeight } try? await Task.sleep(for: ChatViewLayout.freezeCooldown) guard fieldSettleToken == nil else { return } ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)"
-        #expect(Self.count(release, in: letGo) == 1)
-        let beforeRelease = try #require(letGo.range(of: release))
-        #expect(!letGo[..<beforeRelease.lowerBound].contains("if "), "the timer starts under no condition")
+        // A field built without the action offers none (the panel open, the tutorial).
+        #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).showChat == nil)
+        #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0, showChat: {}).showChat != nil)
     }
 
     @Test("The settle lasts the pill spring's own settling duration, which drives the panel and the swell too")
@@ -775,19 +750,9 @@ struct ChatReplyFieldTests {
         #expect(spring.settlingDuration > 0, "control: the spring settles")
         #expect(ChatThreadView.fieldDragSettle == .seconds(spring.settlingDuration))
         #expect(ChatThreadView.fieldDragSettle > .zero)
-        // freezeRelease >= fieldDragSettle + cooldown: the only let-go release comes after the
-        // settle's sleep and then the cooldown's, and no shorter timer releases it.
         #expect(ChatViewLayout.freezeCooldown > .zero, "control: the freeze rule's cooldown")
         #expect(ChatViewLayout.freezeCooldown + .seconds(ChatViewLayout.swipeSpringResponse) == ChatViewLayout.swipeSettleHold,
                 "the same cooldown the swipes' hold carries")
-        let chatText = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chatText)
-        let sleep = try #require(changed.range(of: "try? await Task.sleep(for: Self.fieldDragSettle)"))
-        let release = try #require(changed.range(of: "ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)"))
-        let cooldown = try #require(changed.range(of: "try? await Task.sleep(for: ChatViewLayout.freezeCooldown)"))
-        #expect(sleep.upperBound <= cooldown.lowerBound && cooldown.upperBound <= release.lowerBound,
-                "freezeRelease >= fieldDragSettle + cooldown")
-        #expect(Self.count("ChatSwipeHold.shared.release(", in: changed) == 0)
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(Self.count("private static let pillSpring = Animation.spring(pillSpringModel)", in: chat) == 1)
         #expect(Self.count("static let fieldDragSettle: Duration = .seconds(pillSpringModel.settlingDuration)", in: chat) == 1)
