@@ -228,6 +228,17 @@ same AI result, kept as long as the email itself is shown.
    each read by its own id, as the shown copy is. The dedupe is display only; a Message-ID never
    selects a row to change (ADR-IOS-068 D4), so a copy the thread did not load (Trash, Spam) is not
    touched. Tests: `ChatCopiesTests.openReadsEveryCopy`, `ThreadDetectionTests.copiesAreTheRowsLeftOut`.
+   *Amended 2026-11-21 (#1000, #1001):* the opened email is never also one of the rows, and the
+   rows are the thread of the email opened now. Both hold through the `message` setter, for every
+   writer of it: when the opened id changes, the new id leaves `threadCopies` and `threadMessages`
+   at once and the earlier/later split is recomputed against it
+   (`MessageDetailViewModel.dropOpenedFromThreadRows`), and
+   when one opened email is replaced by another the setter queues the serialized thread reload
+   (`reloadThread`, FIFO behind the writer's display turn, preview-freeze buffered), which rebuilds
+   the rows from the new opened email. So the email screen never shows the opened email twice,
+   `chatRows` never lists a row twice, and the email opened before (another Gmail label's copy,
+   which shares its provider id) is a row or a copy again after that reload whenever the thread
+   load still finds it, so a whole-chat action takes it. Tests: `MessageDetailOpenedRowTests`.
    **What the chat asks for, and where it opens (decided 2026-11-09).** In the decision's words: "Just walk back
    from the recent thing until you walk through the whole thread with some cap. We already have a
    cap somewhere; it's probably good enough. If we scroll further up, we could see more summarizing
@@ -948,6 +959,27 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `sentReplyTakesTheTurn`, `ChatReplyFieldRuntimeTests.exampleLinePutsTheChange` and
    `suggestionNeverEntersTheField`, `ChatReplyFieldTests.suggestionText` and `exampleFromConfig`,
    `TutorialChatViewTests.fieldText`.
+
+   **Amended 2026-11-20 (the working bubble):** while the suggestion is written its row is the
+   working bubble, `ChatSuggestionWorkingBubble` (the ghost's dashed bubble with three pulsing dots,
+   "AI Suggestion · Writing", identifier `chat.aiSuggestion.writing`; the ghost keeps
+   `chat.aiSuggestion`), always the last chat row above the field. "Being written" is the inbox
+   row's "AI is working" rule under the ghost's own guards (`ChatReplyField.suggestionPhase`). The phase is keyed by the newest email, so
+   a new email that arrives above a ready ghost puts the row back to Writing at once. Only Writing to
+   ready animates (`ChatSuggestionPhase.fills`): the row grows into the ghost over
+   `ChatSuggestionConfig.fillDuration` (0.3 s) with the landing's re-pin `scrollTo` in the same
+   `withAnimation` (`ChatThreadView.showSuggestion`); under Reduce Motion the height changes at once
+   and the ghost fades in (`ghostFadeDuration`, 0.2 s), as the mock's M2. A ghost with no working
+   bubble before it still shows at once: the working bubble is held only while a grow is pending, so
+   opening on a ready suggestion never shows it, and the ghost's removal always follows its
+   transaction. The dots cap at 30 fps. The arrival rise of the new email is not built here.
+
+   **Writing rule (2026-11-20):** Writing shows when the newest email meets the inbox row's one shared
+   predicate, `AIWorkingRule` (tagged with no reply processed, or untagged in the Inbox with an AI
+   source on), which `MessageRowView` calls too; a filtered email's empty-reply sentinel never writes.
+   Tests: `ChatReplyFieldTests.suggestionPhaseWritingThenReady`, `suggestionPhaseNewEmailResetsToWriting`,
+   `workingDots`, `suggestionPhaseWritingRule`, `suggestionFillWiring`;
+   `ChatSwipeUITests.testWorkingBubbleBecomesTheGhostAboveTheField`.
 
 ## The longer index line (routed 2026-11-09)
 

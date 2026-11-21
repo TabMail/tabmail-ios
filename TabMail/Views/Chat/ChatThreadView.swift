@@ -86,6 +86,16 @@ struct ChatThreadView: View {
     @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Held only while a grow is pending: set when the AI Suggestion's row becomes Writing, cleared
+    /// inside the fill's `withAnimation` (`showSuggestion`), so the working bubble filling in is one
+    /// animated transaction with its re-pin. A ready suggestion with nothing held is the ghost, so
+    /// opening on one never shows the working bubble.
+    @State private var suggestionGrowPending = false
+    /// Set by `showSuggestion` on the fill under Reduce Motion: the ghost fades in. Every other
+    /// insertion of the ghost, and every removal, follows its transaction (at once).
+    @State private var ghostFadesIn = false
+    @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
 
     private static let bottomId = "chat-bottom"
     private static let unreadLineId = "chat-unread-line"
@@ -300,6 +310,7 @@ struct ChatThreadView: View {
     @ViewBuilder
     private func chatContent(_ thread: ChatThread) -> some View {
         let offersArchive = viewModel.chatHasInboxCopy
+        let suggestion = thread.newest.flatMap { suggestionPhase(on: $0, thread: thread) }
         ZStack(alignment: .bottom) {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -315,11 +326,22 @@ struct ChatThreadView: View {
                         ForEach(unsentReplies) { reply in
                             ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })
                         }
-                        // The ready AI Suggestion, where the reply lands once sent.
-                        if let newest = thread.newest, let text = suggestionText(on: newest, thread: thread) {
-                            let move = tutorialMove(thread)
-                            ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) {
-                                openSuggestion(on: newest, tutorialMove: move)
+                        // The AI Suggestion, where the reply lands once sent: the working bubble
+                        // while it is written, then the ghost.
+                        if let newest = thread.newest, let suggestion {
+                            if !suggestionGrowPending, case .ready(let text) = suggestion {
+                                let move = tutorialMove(thread)
+                                ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) {
+                                    openSuggestion(on: newest, tutorialMove: move)
+                                }
+                                .transition(.asymmetric(
+                                    insertion: ghostFadesIn
+                                        ? .opacity.animation(.easeInOut(duration: ChatSuggestionConfig.ghostFadeDuration))
+                                        : .opacity,
+                                    removal: .opacity))
+                            } else {
+                                ChatSuggestionWorkingBubble()
+                                    .transition(.opacity)
                             }
                         }
                         Color.clear.frame(height: pillHeight + ChatViewLayout.pillGap).id(Self.bottomId)
@@ -349,6 +371,9 @@ struct ChatThreadView: View {
                     geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height) > ChatViewLayout.jumpButtonThreshold
                 } action: { _, isAbove in
                     withAnimation(.easeInOut(duration: 0.2)) { showsJumpButton = isAbove }
+                }
+                .onChange(of: suggestion, initial: true) { old, new in
+                    showSuggestion(new, from: old, proxy: proxy)
                 }
                 .onChange(of: scrollTarget) { _, target in
                     #if DEBUG
@@ -735,20 +760,48 @@ struct ChatThreadView: View {
     /// The reply field's container, as tests find it.
     static let replyPillId = "chatReplyPill"
 
-    /// The ready AI Suggestion's text on the newest email. None on the user's turn (their email is
+    /// The AI Suggestion's row, from `suggestionPhase`. The working bubble filling in grows the row
+    /// into the ghost over `ChatSuggestionConfig.fillDuration`, and while the landing holds its
+    /// target the re-pin scroll runs in the same transaction, so the growing row stays above the
+    /// field. Under Reduce Motion the ghost replaces it at once and fades in (`ghostFadesIn`).
+    /// Every other change, opening on a ready suggestion included, shows or removes at once.
+    private func showSuggestion(_ new: ChatSuggestionPhase?, from old: ChatSuggestionPhase?, proxy: ScrollViewProxy) {
+        guard ChatSuggestionPhase.fills(from: old, to: new) else {
+            suggestionGrowPending = new == .writing
+            ghostFadesIn = false
+            return
+        }
+        #if DEBUG
+        NSLog("[cvwb] working bubble fills, re-pin=%d reduceMotion=%d", scrollTarget != nil ? 1 : 0, reduceMotion ? 1 : 0)
+        #endif
+        ghostFadesIn = reduceMotion
+        // At rebase onto the reply field's arrival change (its own re-pin inside `withAnimation`
+        // for an arriving email), fold both re-pins into one helper and re-check this fill.
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: ChatSuggestionConfig.fillDuration)) {
+            suggestionGrowPending = false
+            if let target = scrollTarget { proxy.scrollTo(target.id, anchor: target.anchor) }
+        }
+    }
+
+    /// The AI Suggestion's row on the newest email (`ChatReplyField.suggestionPhase`). None on the user's turn (their email is
     /// the newest, or a reply of theirs is still in the outbox below it), and none while the reply
     /// goes only to people chosen in Reply to: the suggestion was written for everyone, and the
     /// field has the agent write one for the people chosen. None until the thread and its accounts
     /// have loaded (the newest email and the Reply All audience, without the user's own address,
     /// are known only then), and none while the agent works on a request from the field (it may
     /// open its own compose card).
-    private func suggestionText(on newest: MessageHeader, thread: ChatThread) -> String? {
+    private func suggestionPhase(on newest: MessageHeader, thread: ChatThread) -> ChatSuggestionPhase? {
         // `isLoaded` is also set when the context read failed: the email's own account, read,
         // is the proof the audience can leave the user out.
         guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking,
               context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }
         let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty
-        return ChatReplyField.suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)
+        let subscribed = AISubscriptionGate.shared.isActive
+        let aiSourceEnabled = AIWorkingRule.anyAISourceEnabled(
+            demoHidesAI: DemoModeStore.shared.hidesAIContent, optedOutAllAI: optOutAllAI,
+            deviceSyncAuto: DeviceSyncService.shared.isAutoEnabled, subscribed: subscribed)
+        return ChatReplyField.suggestionPhase(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only,
+                                              aiSourceEnabled: aiSourceEnabled, subscribed: subscribed)
     }
 
     /// The tutorial's move in this chat, if it holds the practice email.
