@@ -743,7 +743,7 @@ same AI result, kept as long as the email itself is shown.
    `archiveRecordsATagThatLandsDuringItsRead`, `trashAndMoveRecordTheStoredTagOnEveryRow`,
    `trashAndMoveRecordTheStoredTagOnFiledRows`, `archiveRecordsTheFolderTheChatHolds`,
    `archiveTakesAStagedOpener`, `archiveTakesTheStoredRowOverItsStagedCopy`,
-   `archiveTakesAStoredRowWithNoTagOverItsTaggedStagedCopy`,
+   `archiveTakesAStoredRowWithNoTagOverItsTaggedStagedCopy`, `resolverTakesStoredAndStagedRowsInTheOrderAsked`,
    `archiveLeavesOutARowNoLongerStored`, `unreadableRowsMoveNothing`,
    `archiveRecordsTheStoredTagInEveryAccount`. Related, not changed here: a manual tag write after
    a mailbox reset between its resolve and its write (tabmail-ios #1150).

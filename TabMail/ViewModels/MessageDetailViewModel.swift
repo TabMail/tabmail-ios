@@ -184,8 +184,9 @@ final class MessageDetailViewModel {
     /// with the new value already in place, so a test sees every publication.
     @ObservationIgnored var _publicationHook: (@MainActor (DisplayField) -> Void)?
     /// Test seam: called synchronously INSIDE a whole-chat action's read of its rows
-    /// (`lookupChatRows`), after both fetches, so the read's database snapshot is fixed and a
-    /// test can land a write, an overlay retire or an unstage within that read. Called on the
+    /// (`lookupChatRows`), between its folder fetch and its row fetch: the folder fetch has fixed
+    /// the read's database snapshot, so a test can land a write, an overlay retire or an unstage
+    /// within that read, before the rows are fetched. Called on the
     /// read's thread, so it must not touch MainActor state. Debug builds only; no production
     /// caller sets it.
     @ObservationIgnored var _chatRowsReadHook: (@Sendable () -> Void)?
@@ -2479,10 +2480,10 @@ final class MessageDetailViewModel {
         #endif
         guard let read = try? dbPool.read({ db -> (roles: [String: FolderRole], rows: [String: MessageHeader]) in
             let roles = Dictionary(try Folder.fetchAll(db, keys: folderIds).map { ($0.id, $0.role) }) { first, _ in first }
-            let rows = Dictionary(try MessageHeader.fetchAll(db, keys: ids).map { ($0.id, $0) }) { first, _ in first }
             #if DEBUG
             readHook?()
             #endif
+            let rows = Dictionary(try MessageHeader.fetchAll(db, keys: ids).map { ($0.id, $0) }) { first, _ in first }
             return (roles: roles, rows: rows)
         }) else { return nil }
         return (roles: read.roles, rows: read.rows.merging(staged) { stored, _ in stored })

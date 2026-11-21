@@ -1221,6 +1221,7 @@ struct MessageDetailThreadActionTests {
         // thread. Only an overlay snapshot taken before the read still holds the retag.
         let landed = ReadFlag()
         let wrote = ReadFlag()
+        let retired = ReadFlag()
         vm._chatRowsReadHook = {
             guard landed.setFirst() else { return }
             Self.landDuringTheRead {
@@ -1235,14 +1236,16 @@ struct MessageDetailThreadActionTests {
                 }
                 if committed != nil { _ = wrote.setFirst() }
                 AccountManager.shared.removeOverlayEntries(ids: ids)
+                // Checked here, before the Archive registers its own tag clear for these rows.
+                let overlay = AccountManager.shared.snapshotOverlay()
+                if ids.allSatisfy({ overlay[$0] == nil }) { _ = retired.setFirst() }
             }
         }
 
         expectArchiveRecords(vm, ids, TagPair(.reply))
         #expect(landed.on, "control: the retag landed during the Archive's read")
         #expect(wrote.on, "control: the retag's write committed")
-        #expect(ids.allSatisfy { AccountManager.shared.snapshotOverlay()[$0]?.actionTag == nil },
-                "control: the retag's overlay entry retired during the read")
+        #expect(retired.on, "control: the retag's overlay entry retired during the read")
         try await expectUndoRestores(pool, ids, TagPair(.reply))
     }
 
@@ -1494,6 +1497,41 @@ struct MessageDetailThreadActionTests {
         try await expectUndoRestores(pool, [opener.id], TagPair(nil))
     }
 
+    @Test("The move resolver returns stored rows and staged-only rows together, in the order asked, with a stored row over its staged copy, and drops an id it cannot find")
+    @MainActor
+    func resolverTakesStoredAndStagedRowsInTheOrderAsked() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        defer { NSEDataBridge.latestStagedRows.withLock { $0 = [] } }
+
+        func stagedRow(_ messageId: String, tag: ActionTag) -> StagedInboxRow {
+            StagedInboxRow(
+                accountId: "acc1", folderPath: Self.inboxPath, messageId: messageId,
+                rfc822MessageId: "<\(messageId)@example.com>", threadId: nil, inReplyTo: nil, references: [],
+                subject: "Test", senderName: "Sender", senderAddress: "sender@example.com", to: "me@example.com",
+                snippet: "body", date: Self.seededDate, isRead: false, isFlagged: false, hasAttachments: false,
+                isReplied: false, isForwarded: false, actionTag: tag.rawValue, summaryBlurb: nil)
+        }
+        // One email stored (tagged Reply) with a staged copy tagged Archive, one only staged, and
+        // one id neither stored nor staged.
+        let stored = try insertHeader(pool, messageId: "resolve-stored")
+        try await writeTags(pool, [stored.id: .reply], post: false)
+        let storedCopy = stagedRow("resolve-stored", tag: .archive)
+        let stagedOnly = stagedRow("resolve-staged-only", tag: .delete)
+        #expect(storedCopy.headerId == stored.id, "control: the staged copy is the stored email")
+        NSEDataBridge.latestStagedRows.withLock { $0 = [storedCopy, stagedOnly] }
+        let missingId = "acc1:\(Self.inboxPath):resolve-missing"
+        #expect(try await rows(pool, [stagedOnly.headerId, missingId]).isEmpty, "control: only one email is stored")
+
+        let resolved = await AccountManager.shared.resolveHeadersForAction(
+            ids: [stagedOnly.headerId, missingId, stored.id])
+        #expect(resolved.map(\.id) == [stagedOnly.headerId, stored.id],
+                "the stored and the staged-only rows, in the order asked, without the missing id")
+        guard resolved.count == 2 else { return }
+        #expect(TagPair(of: resolved[0]) == TagPair(.delete), "the staged-only row as staged")
+        #expect(TagPair(of: resolved[1]) == TagPair(.reply), "the stored row over its staged copy")
+    }
+
     @Test("When the chat's rows cannot be read, a whole-chat action moves nothing and records no Undo")
     @MainActor
     func unreadableRowsMoveNothing() async throws {
@@ -1542,7 +1580,7 @@ struct MessageDetailThreadActionTests {
     }
 
 
-    @Test("A whole-chat Archive across two accounts records each row's stored tag, and one Undo restores each")
+    @Test("A whole-chat Archive across two accounts records each row's stored tag, also for the same message id in the same mailbox, and one Undo restores each")
     @MainActor
     func archiveRecordsTheStoredTagInEveryAccount() async throws {
         let (pool, dir, previous) = try makeEnv()
@@ -1551,8 +1589,12 @@ struct MessageDetailThreadActionTests {
         UndoService.shared.dismissAll()
         try await addRenamedAccount(pool)
 
-        let opener = try insertHeader(pool, messageId: "tag-two-acc-own")
-        let other = try insertHeader(pool, messageId: "tag-two-acc-other", accountId: "acc2")
+        // The same mailbox path and the same provider message id in both accounts (two IMAP
+        // accounts can hold the same Inbox UID): only the account tells the rows apart.
+        let opener = try insertHeader(pool, messageId: "tag-two-acc-same-uid")
+        let other = try insertHeader(pool, messageId: "tag-two-acc-same-uid", accountId: "acc2")
+        #expect(opener.id != other.id && opener.messageId == other.messageId && opener.folderPath == other.folderPath,
+                "control: two rows that differ only by account")
         try await writeTags(pool, [opener.id: .archive, other.id: .archive], post: false)
         var shownOpener = opener
         shownOpener.setActionTag(.archive)
