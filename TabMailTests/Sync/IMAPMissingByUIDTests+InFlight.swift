@@ -7,6 +7,67 @@ import GRDB
 import Testing
 @testable import TabMail
 
+/// The slices of a catch-up run as they start
+/// (`SyncEngine.setCatchUpSliceStartHookForTesting`): the number of commands
+/// the server had recorded when each started, and the folders it asked. A
+/// recorded command belongs to the last slice that started at or before it.
+final class CatchUpSliceLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var starts: [(commandIndex: Int, folderIds: [String])] = []
+
+    func append(commandIndex: Int, folderIds: [String]) {
+        lock.withLock { starts.append((commandIndex, folderIds)) }
+    }
+
+    /// How many slices started.
+    var count: Int { lock.withLock { starts.count } }
+
+    /// The slice that sent the recorded command at `index`: nil for a command
+    /// recorded before the first slice started.
+    func slice(of index: Int) -> Int? {
+        lock.withLock { starts.lastIndex { $0.commandIndex <= index } }
+    }
+
+    /// The recorded-command index at which slice `slice` started; nil past the last.
+    func start(of slice: Int) -> Int? {
+        lock.withLock { slice < starts.count ? starts[slice].commandIndex : nil }
+    }
+}
+
+/// The clock of a run whose request the server holds until it times out. It
+/// stands still while the server answers (each read moves it a microsecond,
+/// so the times it hands out still order the folders' attempts), so a slow
+/// answer never spends a slice, and it moves one slice forward each time the
+/// server starts holding another request (`FakeIMAPServer.holdsStarted`), so
+/// the slice that sent the held request is spent by it, as a timeout spends its
+/// slice in production. The wall clock plays no part in admission.
+final class HoldAdmissionClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = Date()
+    private var holdsSeen: Int
+    private let server: FakeIMAPServer
+    private let step: TimeInterval
+    static let tick: TimeInterval = 0.000_001
+
+    init(server: FakeIMAPServer, step: TimeInterval) {
+        self.server = server
+        self.step = step
+        holdsSeen = server.holdsStarted()
+    }
+
+    func now() -> Date {
+        let holds = server.holdsStarted()
+        return lock.withLock {
+            if holds > holdsSeen {
+                current = current.addingTimeInterval(step * Double(holds - holdsSeen))
+                holdsSeen = holds
+            }
+            current = current.addingTimeInterval(Self.tick)
+            return current
+        }
+    }
+}
+
 /// A catch-up request that may still be in flight (#1062): the run asks its
 /// folder nothing more while the account's other folders go on, every timeout
 /// ends the folder's call, and a call that stops with no timeout leaves
@@ -65,70 +126,116 @@ extension IMAPMissingByUIDTests {
         return IMAPCatchUpState.decode(raw)
     }
 
-    /// How long an in-flight test's run may take: well within its deadline. A
-    /// run that kept taking slices once only its left-out folder had work would
-    /// run to the deadline.
-    static let leftOutRunSeconds: TimeInterval = slowLinkDeadline / 2
-
-    /// One background run, `maxRequests` per slice, with the production request
-    /// timeout and slice (`heldRequestTimeout`, `heldRunSliceSeconds`): the
-    /// request the test holds times out, every request the server answers
-    /// (the healthy folder's included) answers far within the timeout, and a
-    /// slice is shorter than a request's timeout, as in production, so a
-    /// timeout spends its slice. Returns the run's own answer (an applied
-    /// result made progress) and how long the run took.
+    /// One run, `maxRequests` per slice, with the production request timeout
+    /// and slice (`heldRequestTimeout`, `heldRunSliceSeconds`) on the hold's
+    /// admission clock (`HoldAdmissionClock`): the request the test holds times
+    /// out and spends its slice, as in production, while no request the server
+    /// answers (the healthy folder's included) can spend one, however slow the
+    /// machine. `foreground`: a foreground cycle (no deadline). Returns the
+    /// run's own answer (an applied result made progress) and its slices.
     /// *Superseded (#1062):* "on the scaled link": a 0.5 s timeout, which an
-    /// answered request of the healthy folder could reach on a busy machine.
+    /// answered request of the healthy folder could reach on a busy machine;
+    /// then the wall clock, on which a slow answer could spend the slice before
+    /// the held request was asked.
     @MainActor @discardableResult
-    static func inFlightRun(_ w: World, maxRequests: Int = inFlightSliceRequests) async throws -> (didWork: Bool, seconds: TimeInterval) {
-        let started = Date()
-        let didWork = try await w.workerRun(maxRequests: maxRequests, deadlineIn: slowLinkDeadline, requestTimeout: heldRequestTimeout,
-                                            sliceSeconds: heldRunSliceSeconds)
-        return (didWork, Date().timeIntervalSince(started))
+    static func inFlightRun(_ w: World, maxRequests: Int = inFlightSliceRequests,
+                            foreground: Bool = false) async throws -> (didWork: Bool, slices: CatchUpSliceLog) {
+        let slices = CatchUpSliceLog()
+        let server = w.server
+        await w.engine.setCatchUpSliceStartHookForTesting { folderIds in
+            slices.append(commandIndex: server.recordedCommands().count, folderIds: folderIds)
+        }
+        let clock = HoldAdmissionClock(server: server, step: heldRunSliceSeconds)
+        let didWork = try await w.workerRun(maxRequests: maxRequests, deadlineIn: foreground ? nil : slowLinkDeadline,
+                                            requestTimeout: heldRequestTimeout, sliceSeconds: heldRunSliceSeconds,
+                                            clock: { clock.now() })
+        await w.engine.setCatchUpSliceStartHookForTesting(nil)
+        return (didWork, slices)
     }
 
-    /// The run of an in-flight test, which took `runSeconds`, after the
+    /// How many slices `slices` started after slice `slice`.
+    static func slicesAfter(_ slice: Int, _ slices: CatchUpSliceLog) -> Int {
+        slices.count - 1 - slice
+    }
+
+    /// The run of an in-flight test, whose slices were `slices`, after the
     /// folder's request timed out at the command `timedOut`: the folder got no
-    /// request after it; the healthy folder was asked after it, so in a later
-    /// slice (the timeout spent its own), until its listing completed; and the
-    /// run ended once only the left-out folder had work.
+    /// request after it; the healthy folder was asked after it only in later
+    /// slices (the timeout spent its own), until its listing completed with its
+    /// completion stamped; and the run ended once only the left-out folder had
+    /// work: at most one slice, which finds nothing to do, starts after the
+    /// healthy folder's last request.
     /// *Superseded (#1062):* "the healthy folder kept being asked in later
-    /// slices", counted as at least two listing ranges after the timeout.
+    /// slices", counted as at least two listing ranges after the timeout; then
+    /// a run shorter than half its deadline, which allowed idle slices.
     @MainActor
-    static func expectFolderLeftOutOfTheRun(_ w: World, from start: Int, timedOut: Int, runSeconds: TimeInterval,
+    static func expectFolderLeftOutOfTheRun(_ w: World, from start: Int, timedOut: Int, slices: CatchUpSliceLog,
                                             sourceLocation: SourceLocation = #_sourceLocation) throws {
         let after = requests(to: path, w.server, from: start).filter { $0.index > timedOut }.map { $0.command }
         #expect(after.isEmpty, "#1062: the run never asks the folder again after its request timed out: \(after)",
                 sourceLocation: sourceLocation)
-        let healthy = listingRanges(requests(to: healthyPath, w.server, from: timedOut + 1).map { $0.command })
-        #expect(!healthy.isEmpty, "#1062: the healthy folder is asked in a later slice of the same run: \(healthy)",
+        let healthyAsked = requests(to: healthyPath, w.server, from: timedOut + 1)
+        let healthy = listingRanges(healthyAsked.map { $0.command })
+        #expect(!healthy.isEmpty, "#1062: the healthy folder is asked after the timeout in the same run: \(healthy)",
                 sourceLocation: sourceLocation)
-        #expect(try healthyState(w)?.listing == nil, "#1062: the healthy folder's listing completed in the same run",
+        let timedOutSlice = try #require(slices.slice(of: timedOut), "setup: a slice of the run sent the request that timed out",
+                                         sourceLocation: sourceLocation)
+        let healthySlices = healthyAsked.compactMap { slices.slice(of: $0.index) }
+        #expect(healthySlices.count == healthyAsked.count && healthySlices.allSatisfy { $0 > timedOutSlice },
+                "#1062: the healthy folder is asked after the timeout only in later slices: \(healthySlices), the timeout's \(timedOutSlice)",
                 sourceLocation: sourceLocation)
-        #expect(runSeconds < leftOutRunSeconds,
-                "#1062: the run ends once only the left-out folder has work: it took \(runSeconds) s of its \(slowLinkDeadline) s",
+        let state = try #require(try healthyState(w), "#1062: the healthy folder's state is stored", sourceLocation: sourceLocation)
+        #expect(state.listing == nil && state.lastCompletedAt != nil,
+                "#1062: the healthy folder's listing completed in the same run, its completion stamped",
+                sourceLocation: sourceLocation)
+        let lastHealthySlice = healthySlices.max() ?? timedOutSlice
+        #expect(slicesAfter(lastHealthySlice, slices) <= 1,
+                "#1062: the run ends once only the left-out folder has work: \(slicesAfter(lastHealthySlice, slices)) slices after the healthy folder's last request",
                 sourceLocation: sourceLocation)
     }
 
-    /// Once the run has returned, let the request it gave up answer (`release`)
-    /// and read the UIDNEXT of `mailbox` through the provider, as the folder's
-    /// next caller would: the timeout closed the held request's session, so the
-    /// read logs in again and is answered, and the folder is not left blocked.
-    /// Then no request of the run went to `mailbox` after the one that timed
-    /// out (`timedOut`); the read's own selection is left out (`asking`).
-    /// Nothing is timed.
+    /// Wait until fewer than `count` held requests are still in progress at the
+    /// server (`FakeIMAPServer.heldRequestsInProgress`): a released request's
+    /// handler has passed its hold. Bounded; the bound matters only on failure.
+    static func joinHeldHandlers(_ server: FakeIMAPServer, below count: Int) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(heldHandlerJoinBound)
+        while server.heldRequestsInProgress() >= count {
+            guard Date() < deadline else { return false }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        return true
+    }
+    static let heldHandlerJoinBound: TimeInterval = 30
+
+    /// Once the run has returned, let the request it gave up answer (`release`),
+    /// join the server's handler of it (`joinHeldHandlers`), and read the
+    /// UIDNEXT of `mailbox` through the provider, as the folder's next caller
+    /// would: the read takes the folder's connection only once the cancelled
+    /// request's checkout has let it go, the timeout closed the held request's
+    /// session, so the read logs in again and is answered, and the folder is
+    /// not left blocked. Then no request of the run went to `mailbox` after the
+    /// one that timed out (`timedOut`): before the read, any command, a
+    /// selection included; from the read on, any command but the read's own
+    /// selection and liveness check (`asking`). Nothing is timed.
     /// *Superseded (#1062):* "wait for that late answer: a UIDNEXT read of the
     /// test's own needs the connection of `mailbox`, so it returns only once
     /// the connection is free again. The release, not a sleep, frees it": the
-    /// timeout freed the connection, and the late answer is never read.
+    /// timeout freed the connection, and the late answer is never read; then
+    /// the release alone, with every selection after the timeout left out.
     @MainActor
     static func answerAfterTheRun(_ w: World, mailbox: String = path, timedOut: Int, release: () -> Void,
                                   sourceLocation: SourceLocation = #_sourceLocation) async throws {
+        let inProgress = w.server.heldRequestsInProgress()
         release()
+        #expect(try await joinHeldHandlers(w.server, below: inProgress),
+                "setup: the released request's handler went on", sourceLocation: sourceLocation)
+        let readStart = w.server.recordedCommands().count
         _ = try await w.provider.getUidNextWithEpoch(folder: mailbox)
-        let afterAnswer = asking(requests(to: mailbox, w.server, from: timedOut + 1))
-        #expect(afterAnswer.isEmpty,
-                "#1062: no request of the run went to \(mailbox) after the one that timed out: \(afterAnswer)",
+        let all = requests(to: mailbox, w.server, from: timedOut + 1)
+        let beforeRead = all.filter { $0.index < readStart }.map { $0.command }
+        let fromRead = asking(all.filter { $0.index >= readStart })
+        #expect(beforeRead.isEmpty && fromRead.isEmpty,
+                "#1062: no request of the run went to \(mailbox) after the one that timed out: \(beforeRead + fromRead)",
                 sourceLocation: sourceLocation)
     }
 
@@ -159,7 +266,7 @@ extension IMAPMissingByUIDTests {
             let timedOut = try #require(asked.first { !Self.listingRanges([$0.command]).isEmpty }, "setup: the folder's first range was asked")
             let range = try #require(Self.listingRanges([timedOut.command]).first)
             #expect(range.lowerBound == 1, "setup: the new listing's first range starts at the folder's first UID: \(range)")
-            try Self.expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index, runSeconds: run.seconds)
+            try Self.expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index, slices: run.slices)
             try await Self.answerAfterTheRun(w, timedOut: timedOut.index) { w.server.releaseFetchAfterSnapshot(in: Self.path) }
             #expect(held, "setup: the folder's first range was held past its timeout")
             let listing = try #require(try w.catchUpState()?.listing, "#1062: the listing the call started is saved")
@@ -195,7 +302,9 @@ extension IMAPMissingByUIDTests {
             #expect(Self.listingRanges(listed.prefix(2).map { $0.command }) == [1...cap, (cap + 1)...(cap + grown)],
                     "setup: one call answered a range at the cap and asked the next at the doubled cap")
             let timedOut = try #require(listed.dropFirst().first, "setup: the second range was asked")
-            try Self.expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index, runSeconds: run.seconds)
+            #expect(run.slices.slice(of: listed[0].index) == run.slices.slice(of: timedOut.index),
+                    "setup: one call, in one slice, answered the first range and asked the second")
+            try Self.expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index, slices: run.slices)
             try await Self.answerAfterTheRun(w, timedOut: timedOut.index) { w.server.releaseHeldCommand(containing: secondRange) }
             #expect(held, "setup: the second range was held past its timeout")
             let listing = try #require(try w.catchUpState()?.listing, "setup: the listing is in progress")
@@ -231,12 +340,15 @@ extension IMAPMissingByUIDTests {
             #expect(Self.listingRanges(listed.prefix(2).map { $0.command }) == [1...cap, (cap + 1)...(cap + grown)],
                     "setup: one call answered a range at the cap and asked the next at the doubled cap")
             let timedOut = try #require(listed.dropFirst().first, "setup: the second range was asked")
+            #expect(run.slices.slice(of: listed[0].index) == run.slices.slice(of: timedOut.index),
+                    "setup: one call, in one slice, answered the first range and asked the second")
             let after = asked.filter { $0.index > timedOut.index }.map { $0.command }
             #expect(after.isEmpty, "#1062: the run never asks the folder again after its request timed out: \(after)")
             #expect(try w.catchUpState()?.listing?.nextUid == cap + 1, "setup: the call's progress was applied")
             #expect(run.didWork, "#1062: the run reports the left-out folder's applied progress as work")
-            #expect(run.seconds < Self.leftOutRunSeconds,
-                    "#1062: the run ends once only the left-out folder has work: it took \(run.seconds) s of its \(Self.slowLinkDeadline) s")
+            let timedOutSlice = try #require(run.slices.slice(of: timedOut.index), "setup: a slice sent the request that timed out")
+            #expect(Self.slicesAfter(timedOutSlice, run.slices) <= 1,
+                    "#1062: the run ends once only the left-out folder has work: \(Self.slicesAfter(timedOutSlice, run.slices)) slices after the timeout's")
             try await Self.answerAfterTheRun(w, timedOut: timedOut.index) { w.server.releaseHeldCommand(containing: secondRange) }
             #expect(held, "setup: the second range was held past its timeout")
         }
@@ -313,11 +425,11 @@ extension IMAPMissingByUIDTests {
                 let after = Self.requests(to: mailbox, w.server, from: start).filter { $0.index > timedOut.index }.map { $0.command }
                 #expect(after.isEmpty, "#1062: the run never asks \(mailbox) again after its request timed out: \(after)")
             }
-            let healthy = Self.listingRanges(Self.requests(to: Self.healthyPath, w.server, from: second.index + 1).map { $0.command })
-            #expect(!healthy.isEmpty, "#1062: the healthy folder is asked after the second timeout, in a later slice of the same run: \(healthy)")
-            #expect(try Self.healthyState(w)?.listing == nil, "#1062: the healthy folder's listing completed in the same run")
-            #expect(run.seconds < Self.leftOutRunSeconds,
-                    "#1062: the run ends once only the left-out folders have work: it took \(run.seconds) s of its \(Self.slowLinkDeadline) s")
+            #expect(run.slices.slice(of: second.index).map { $0 > (run.slices.slice(of: first.index) ?? .max) } == true,
+                    "#1062: the second folder timed out in a later slice than the first")
+            // The healthy folder after the second timeout: only in later slices,
+            // to completion, and the run ends once only the left-out folders have work.
+            try Self.expectFolderLeftOutOfTheRun(w, from: second.index, timedOut: second.index, slices: run.slices)
             for (mailbox, timedOut) in [(Self.path, first), (Self.secondPath, second)] {
                 try await Self.answerAfterTheRun(w, mailbox: mailbox, timedOut: timedOut.index) {
                     w.server.releaseFetchAfterSnapshot(in: mailbox)
@@ -356,7 +468,7 @@ extension IMAPMissingByUIDTests {
         let timedOut = try #require(requests(to: path, w.server, from: start).first { request in
             held.contains { request.command.uppercased().contains($0) }
         }, "setup: the folder's request held past the timeout was asked", sourceLocation: sourceLocation)
-        try expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index, runSeconds: run.seconds,
+        try expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index, slices: run.slices,
                                         sourceLocation: sourceLocation)
         try await answerAfterTheRun(w, timedOut: timedOut.index, release: {
             for fragment in fragments { w.server.releaseHeldCommand(containing: fragment) }
@@ -783,13 +895,28 @@ extension IMAPMissingByUIDTests {
 
     // MARK: - A call that stops with no timeout leaves nothing in flight (#1062)
 
-    /// NO answers to a request: one that names a response too large to read
-    /// and one that names a response the client cannot decode (the answered
+    /// The answers a request fails on with no timeout: a reply longer than the
+    /// client's response buffer and a reply the client cannot decode, both
+    /// genuine, so the client's own parser fails on them (the answered
     /// failures that cap the width as a timeout does,
-    /// `UIDWalkCursor.failureCallsForSmallerRange`), and an ordinary refusal.
-    static let oversizedAnswer = "PayloadTooLargeError from the fixture"
-    static let undecodableAnswer = "IMAPDecoderError from the fixture"
+    /// `UIDWalkCursor.failureCallsForSmallerRange`); and, as their control, an
+    /// ordinary tagged refusal.
+    /// *Superseded (#1062):* the too-large and undecodable answers were tagged
+    /// NOs whose text named the error, which never reached the decoder or the
+    /// receive limit.
+    enum FailingReply: Sendable {
+        case overLimit, undecodable, refused
+    }
     static let refusedAnswer = "refused by the fixture"
+
+    /// Arm `reply` for the next command containing `fragment`.
+    static func arm(_ reply: FailingReply, _ server: FakeIMAPServer, containing fragment: String) {
+        switch reply {
+        case .overLimit: server.answerNextCommandOverLimit(containing: fragment)
+        case .undecodable: server.answerNextCommandUndecodable(containing: fragment)
+        case .refused: server.failNextCommand(containing: fragment, message: refusedAnswer)
+        }
+    }
 
     /// The fragment of the site range's listing FETCH.
     static var siteRangeFetch: String { "FETCH \(siteRange.lowerBound):\(siteRange.upperBound)" }
@@ -880,23 +1007,36 @@ extension IMAPMissingByUIDTests {
             }
         }
 
-        /// The NO answer this stop's failure gives; nil for a budget stop.
-        var failingAnswer: String? {
+        /// The answer this stop's failure gives; nil for a budget stop.
+        var failingReply: Suite.FailingReply? {
             switch self {
             case .oversizedListing, .oversizedUidNext, .oversizedProof, .oversizedOwedSearch, .oversizedUnreadableSearch,
                  .oversizedHeaderLoad:
-                return Suite.oversizedAnswer
-            case .undecodableListing: return Suite.undecodableAnswer
+                return .overLimit
+            case .undecodableListing: return .undecodable
             case .refusedListing, .refusedUidNext, .refusedProof, .refusedOwedSearch, .refusedUnreadableSearch, .refusedHeaderLoad:
-                return Suite.refusedAnswer
+                return .refused
+            case .budgetBeforeHeaderLoad, .budgetBeforeOwedSearch, .budgetBeforeUnreadableSearch: return nil
+            }
+        }
+
+        /// The verb of the request this stop's failure answers; nil for a budget stop.
+        var failingVerb: String? {
+            switch self {
+            case .oversizedListing, .undecodableListing, .refusedListing, .refusedHeaderLoad, .oversizedHeaderLoad:
+                return "UID FETCH"
+            case .refusedUidNext, .oversizedUidNext: return "SELECT"
+            case .refusedProof, .oversizedProof, .refusedOwedSearch, .oversizedOwedSearch,
+                 .refusedUnreadableSearch, .oversizedUnreadableSearch:
+                return "UID SEARCH"
             case .budgetBeforeHeaderLoad, .budgetBeforeOwedSearch, .budgetBeforeUnreadableSearch: return nil
             }
         }
 
         /// Arm this stop's answered failure for one call.
         func arm(_ w: Suite.World) {
-            guard let answer = failingAnswer else { return }
-            for fragment in failingFragments { w.server.failNextCommand(containing: fragment, message: answer) }
+            guard let reply = failingReply else { return }
+            for fragment in failingFragments { Suite.arm(reply, w.server, containing: fragment) }
         }
 
         /// The requests this stop's call may send: for a budget stop, every
@@ -978,9 +1118,13 @@ extension IMAPMissingByUIDTests {
                                listingRangeMessages: w.rangeMessages)
             }
             // The provider's own result, read without an apply.
+            let malformedBefore = w.server.malformedAnswersSent()
             stop.arm(w)
             let reading = context()
             let read = try await w.read(reading)
+            let malformed = stop.failingReply == .overLimit || stop.failingReply == .undecodable
+            #expect(w.server.malformedAnswersSent() == malformedBefore + (malformed ? 1 : 0),
+                    "setup: \(stop): the call's request got the malformed reply, which the client's parser fails on")
             #expect(budget - reading.requestsLeft == stop.leaves.charged, "setup: \(stop): the call stopped where this stop stops it")
             #expect(read.results.count == 1, "setup: \(stop): the folder's call returned a result")
             guard read.results.count == 1 else { return }
@@ -1007,7 +1151,7 @@ extension IMAPMissingByUIDTests {
         try await Self.withWorld("in-run-oversized", server: Self.siteServer, local: Self.siteServer) { w in
             try await Self.startHealthyListing(w)
             try await Self.startSiteListing(w)
-            w.server.failNextCommand(containing: Self.siteRangeFetch, message: Self.oversizedAnswer)
+            w.server.answerNextCommandOverLimit(containing: Self.siteRangeFetch)
             let start = w.server.recordedCommands().count
             let run = try await Self.inFlightRun(w)
             let ranges = Self.listingRanges(Self.requests(to: Self.path, w.server, from: start).map { $0.command })
@@ -1027,23 +1171,61 @@ extension IMAPMissingByUIDTests {
         try await Self.withWorld("in-run-\(stop.rawValue)", server: Self.siteServer, local: Self.siteServer) { w in
             try await Self.startHealthyListing(w)
             try await stop.setUp(w)
+            let consumedBefore = w.server.consumedInjectedFailureCount()
             stop.arm(w)
             let start = w.server.recordedCommands().count
             // A slice has room for every request of the folder's call up to the failed one.
             let run = try await Self.inFlightRun(w, maxRequests: max(Self.inFlightSliceRequests, stop.leaves.charged))
             let asked = Self.requests(to: Self.path, w.server, from: start)
             let fragments = stop.failingFragments.map { $0.uppercased() }
-            let failed = try #require(asked.first { request in fragments.contains { request.command.uppercased().contains($0) } },
+            func isTheFailingRequest(_ command: String) -> Bool { fragments.contains { command.uppercased().contains($0) } }
+            let failed = try #require(asked.first { isTheFailingRequest($0.command) },
                                       "setup: \(stop): the folder's request that failed was asked")
-            // The failure ended the folder's call, so a later request is a later
-            // slice's. Only a UID FETCH or SEARCH counts: a selection, a liveness
-            // check or the LOGOUT of a connection dropped after the answer asks
-            // the folder nothing.
-            let after = asked.filter { $0.index > failed.index && $0.command.uppercased().hasPrefix("UID ") }.map { $0.command }
-            #expect(!after.isEmpty,
-                    "#1062: \(stop): nothing is in flight after an answered request, so the same run asks the folder again in a later slice: \(asked.map { $0.command })")
-            #expect(try Self.healthyState(w)?.listing == nil, "#1062: \(stop): the healthy folder's listing completed in the same run")
+            // The injected failure answered the folder's own request, of the
+            // intended verb, once.
+            let verb = try #require(stop.failingVerb)
+            #expect(failed.command.uppercased().hasPrefix(verb),
+                    "setup: \(stop): the failure answered the folder's \(verb): \(failed.command)")
+            #expect(w.server.consumedInjectedFailureCount() == consumedBefore + 1,
+                    "setup: \(stop): the injected failure answered one request")
+            // The failure ended the folder's call: the folder gets nothing more in
+            // that slice. A LOGOUT of a connection dropped after the answer, or a
+            // liveness check, asks the folder nothing; a selection does.
+            let failedSlice = try #require(run.slices.slice(of: failed.index), "setup: \(stop): a slice sent the failed request")
+            let nextSliceStart = try #require(run.slices.start(of: failedSlice + 1),
+                                              "#1062: \(stop): nothing is in flight after an answered request, so the run takes another slice")
+            let sameCall = asked.filter { request in
+                let verb = request.command.split(separator: " ").first.map { $0.uppercased() } ?? ""
+                return request.index > failed.index && request.index < nextSliceStart && !["LOGOUT", "NOOP"].contains(verb)
+            }.map { $0.command }
+            #expect(sameCall.isEmpty, "#1062: \(stop): the failure ended the folder's call: \(sameCall)")
+            // A later slice asks the same request again.
+            let retried = asked.filter { $0.index >= nextSliceStart && isTheFailingRequest($0.command) }
+            #expect(!retried.isEmpty,
+                    "#1062: \(stop): nothing is in flight after an answered request, so a later slice of the same run asks it again: \(asked.map { $0.command })")
+            let healthy = try #require(try Self.healthyState(w), "#1062: \(stop): the healthy folder's state is stored")
+            #expect(healthy.listing == nil && healthy.lastCompletedAt != nil,
+                    "#1062: \(stop): the healthy folder's listing completed in the same run, its completion stamped")
             #expect(run.didWork, "setup: \(stop): the run made progress")
+        }
+    }
+
+    @Test("A foreground cycle (no deadline) whose folder's request times out takes one slice: leaving the folder out does not buy the cycle another slice")
+    @MainActor
+    func foregroundCycleTakesOneSliceAfterATimeout() async throws {
+        try await Self.withWorld("in-flight-foreground", server: Self.siteServer, local: Self.siteServer) { w in
+            try await Self.startSiteListing(w)
+            let fragment = Self.siteRangeFetch
+            w.server.holdNextCommand(containing: fragment)
+            let start = w.server.recordedCommands().count
+            let run = try await Self.inFlightRun(w, foreground: true)
+            let held = w.server.isHoldingCommand(containing: fragment)
+            let timedOut = try #require(Self.requests(to: Self.path, w.server, from: start).first {
+                $0.command.uppercased().contains(fragment)
+            }, "setup: the folder's range was asked")
+            try await Self.answerAfterTheRun(w, timedOut: timedOut.index) { w.server.releaseHeldCommand(containing: fragment) }
+            #expect(held, "setup: the folder's range was held past its timeout")
+            #expect(run.slices.count == 1, "#1062: a foreground cycle takes one slice, a timeout in it included: \(run.slices.count)")
         }
     }
 }

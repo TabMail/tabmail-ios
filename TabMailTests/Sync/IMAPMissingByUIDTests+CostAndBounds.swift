@@ -385,4 +385,141 @@ extension IMAPMissingByUIDTests {
             #expect(!(try w.changeState()).selfHealDue, "#1062: the listing completed and settled")
         }
     }
+
+    // MARK: - a later scroll page does not reopen what the prune removed
+
+    /// Rows of `uids` cached by another path (an infinite scroll page by date):
+    /// the server's messages, under the folder's epoch.
+    @MainActor
+    static func cacheScrolledRows(_ w: World, _ uids: [Int]) async throws {
+        try FolderEpochTestFixture.insertHeaders(accountId: w.accountId, path: path, uids: uids, pool: w.pool)
+        let folderId = w.folderId
+        try await w.pool.write { db in
+            for uid in uids {
+                try db.execute(sql: "UPDATE messageHeader SET rfc822MessageId = ?, observedUidValidity = ? WHERE folderId = ? AND messageId = ?",
+                               arguments: ["<missing-by-uid-\(uid)@example.com>", epoch, folderId, "\(uid)"])
+            }
+        }
+    }
+
+    /// One catch-up run under a storage limit; the header FETCHes it sent.
+    @MainActor
+    static func runUnderTheLimit(_ w: World) async throws -> [String] {
+        let start = w.server.recordedCommands().count
+        var run = SyncEngine.CatchUpRun(
+            storageLimitInForce: true, deadline: Date().addingTimeInterval(60),
+            sliceSeconds: SyncConfig.catchUpSliceSeconds, intervalSeconds: SyncConfig.catchUpSliceIntervalSeconds,
+            clock: { Date() })
+        run.listingRangeMessages = w.rangeMessages
+        await AccountManager.shared.clearRecentlyCompletedForTesting()
+        _ = await w.engine.runCatchUpRun(account: try w.account(), run: run)
+        return w.server.recordedCommands().dropFirst(start).filter {
+            $0.uppercased().contains("FETCH") && $0.uppercased().contains("ENVELOPE")
+        }
+    }
+
+    @Test("Under a storage limit, after the prune with the older-mail walk complete, a sparse scroll page caches two low pruned UIDs: a catch-up loads none of the UIDs pruned between them and the kept rows, and still applies a flag change and an expunge on the cached rows")
+    @MainActor
+    func scrollPageAfterThePruneDoesNotReopenThePrunedRange() async throws {
+        let count = 120
+        let server = Array(1...count)
+        try await Self.withWorld("prune-scroll", server: server, local: server) { w in
+            #expect(try w.folder().backfillComplete, "setup: the older-mail walk is complete")
+            // Over the limit whatever this store's size: a padding file larger
+            // than the limit, so the prune runs to its floor.
+            let savedBudget = UserDefaults.standard.object(forKey: StorageEstimator.storageBudgetKey)
+            defer { UserDefaults.standard.set(savedBudget, forKey: StorageEstimator.storageBudgetKey) }
+            StorageEstimator.budgetMB = 1
+            let appSupport = try #require(FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
+            try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+            let padding = appSupport.appendingPathComponent("prune-test-padding-\(UUID().uuidString)")
+            try Data(count: 2 * 1024 * 1024).write(to: padding)
+            defer { try? FileManager.default.removeItem(at: padding) }
+            try #require(StorageEstimator.isOverBudget(), "setup: the store is over the limit, so the prune runs")
+            SyncEngine.runPruneIfOverBudget(dbPool: AppDatabase.backgroundPool, pruneOrder: await w.engine.pruneOrderByAccount())
+
+            let kept = try w.held()
+            try #require(!kept.isEmpty && kept.count < count && kept == Array(kept[0]...count),
+                         "setup: the prune kept a top run of UIDs: \(kept)")
+            let pruned = Array(1..<kept[0])
+            try #require(pruned.count > 4, "setup: the prune removed enough to leave a pruned range above the scroll page")
+            #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == pruned.last,
+                    "#1062: the prune recorded where it reached, with the folder's epoch")
+
+            // A sparse scroll page caches two low pruned UIDs; another client
+            // reads one and expunges the other.
+            let flagged = pruned[0], expunged = pruned[2]
+            try await Self.cacheScrolledRows(w, [flagged, expunged])
+            w.server.setMessages(server.filter { $0 != expunged }.map(Self.message), in: Self.path)
+            w.server.setFlags(["\\Seen"], in: Self.path, uid: flagged)
+            try await w.markOwed()
+            let headerFetches = try await Self.runUnderTheLimit(w)
+
+            let reopened = pruned.filter { uid in headerFetches.contains { Self.uidSet($0).contains(uid) } }
+            #expect(reopened.isEmpty, "#1062: no pruned UID is downloaded again: \(reopened.prefix(20))")
+            try w.expectHeldExactly([flagged] + kept, "#1062: the expunged cached row is gone, and nothing pruned is loaded")
+            let folderId = w.folderId
+            let isRead = try await w.pool.read { db in
+                try Bool.fetchOne(db, sql: "SELECT isRead FROM messageHeader WHERE folderId = ? AND messageId = ?",
+                                  arguments: [folderId, "\(flagged)"])
+            }
+            #expect(isRead == true, "#1062: the flag change on the cached row below the cutoff is applied")
+            #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == pruned.last,
+                    "#1062: the catch-up's state write carries the cutoff")
+        }
+    }
+
+    @Test("Under a storage limit with a cached row below the prune cutoff, a catch-up loads nothing at or below a cutoff recorded in the folder's epoch, and ignores one recorded in another epoch",
+          arguments: [true, false])
+    @MainActor
+    func pruneCutoffCountsOnlyInItsEpoch(sameEpoch: Bool) async throws {
+        let scrolled = 5, cutoff = 20
+        let server = Array(1...40)
+        let kept = Array((cutoff + 1)...40)
+        try await Self.withWorld("prune-epoch-\(sameEpoch)", server: server, local: server) { w in
+            // The prune took everything below the cutoff; a scroll page cached one row back.
+            try await w.dropLocal(server.filter { $0 != scrolled && $0 <= cutoff })
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try SyncEngine.recordCatchUpPruneCutoff(
+                    folderId: folderId, highest: cutoff, epoch: sameEpoch ? Self.epoch : Self.epoch + 1, db: db)
+            }
+            try await w.markOwed()
+            _ = try await Self.runUnderTheLimit(w)
+            let between = Array((scrolled + 1)...cutoff)
+            try w.expectHeldExactly([scrolled] + (sameEpoch ? [] : between) + kept,
+                                    sameEpoch ? "#1062: nothing at or below the cutoff loads, the cached row is kept"
+                                              : "#1062: a cutoff of another epoch is not read: the missing mail above the first local UID loads")
+        }
+    }
+
+    @Test("The prune cutoff's bookkeeping: the highest value recorded in an epoch, never lowered; one of another epoch replaced; a NULL or non-object state becomes an object holding it")
+    @MainActor
+    func pruneCutoffIsKeptPerEpoch() async throws {
+        try await Self.withWorld("prune-books", server: Array(1...10), local: Array(1...10)) { w in
+            let folderId = w.folderId
+            func record(_ highest: Int, _ epoch: Int) async throws {
+                try await w.pool.write { db in
+                    try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: highest, epoch: epoch, db: db)
+                }
+            }
+            func cutoff(_ epoch: Int) throws -> Int? { CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: epoch) }
+            try await record(7, Self.epoch)
+            try await record(4, Self.epoch)
+            #expect(try cutoff(Self.epoch) == 7, "#1062: a lower value in the same epoch never lowers the cutoff")
+            try await record(9, Self.epoch)
+            #expect(try cutoff(Self.epoch) == 9, "#1062: a higher value in the same epoch raises it")
+            try await record(3, Self.epoch + 1)
+            #expect(try cutoff(Self.epoch + 1) == 3 && cutoff(Self.epoch) == nil,
+                    "#1062: a value of another epoch replaces the old one, which is no longer read")
+            #expect(IMAPCatchUpState.decode(try w.folder().catchUpState) != nil, "#1062: the provider still reads its own state")
+            for raw in [nil, "not json", "[1, 2]"] as [String?] {
+                try await w.pool.write { db in
+                    try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [raw, folderId])
+                }
+                try await record(6, Self.epoch)
+                #expect(try cutoff(Self.epoch) == 6, "#1062: a state \(raw ?? "NULL") becomes an object holding the cutoff")
+            }
+        }
+    }
 }

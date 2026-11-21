@@ -12,8 +12,13 @@ import Testing
 @Suite("Settings reset sync turns")
 struct SyncTurnsForResetTests {
 
-    /// Polls before a waiting step counts as blocked.
-    static let polls = 50
+    /// How long a step may take to happen before the test fails. Every wait
+    /// below ends as soon as its step happens, so the bound matters only on
+    /// failure, and no scheduling delay of a busy machine can fail a test.
+    /// *Superseded (#1062):* 50 polls 10 ms apart, about half a second, which a
+    /// busy machine could exceed before a step that was going to happen.
+    static let stepBound: TimeInterval = 30
+    static let pollInterval: Duration = .milliseconds(10)
 
     /// Gate a test opens to end a pass it holds.
     actor Gate {
@@ -36,20 +41,22 @@ struct SyncTurnsForResetTests {
     }
 
     static func waitFor(_ flag: Flag) async throws -> Bool {
-        for _ in 0..<polls {
+        let deadline = Date().addingTimeInterval(stepBound)
+        while Date() < deadline {
             if await flag.isSet { return true }
-            try await Task.sleep(for: .milliseconds(10))
+            try await Task.sleep(for: pollInterval)
         }
         return await flag.isSet
     }
 
     /// Polls until `account` has `count` waiters; false at the bound.
     static func waitForWaiters(_ engine: SyncEngine, _ account: String, count: Int) async throws -> Bool {
-        for _ in 0..<polls {
+        let deadline = Date().addingTimeInterval(stepBound)
+        while Date() < deadline {
             if await engine.syncPassWaiterCountForTesting(accountId: account) == count { return true }
-            try await Task.sleep(for: .milliseconds(10))
+            try await Task.sleep(for: pollInterval)
         }
-        return false
+        return await engine.syncPassWaiterCountForTesting(accountId: account) == count
     }
 
     @Test("Turns are taken in sorted account-id order: while the lower id is busy, a reset of both holds no turn of the higher id")

@@ -133,15 +133,18 @@ struct IMAPMissingByUIDTests {
         /// the run's own answer (`SyncEngine.runCatchUpRun`: an applied result made
         /// progress).
         @discardableResult
-        func workerRun(maxRequests: Int = SyncConfig.catchUpSliceMaxRequests, deadlineIn: TimeInterval = 60,
+        /// `clock`: the run's clock (`CatchUpRun.clock`), the wall clock by default.
+        /// `deadlineIn` nil: a foreground cycle (`CatchUpRun.deadline` nil).
+        func workerRun(maxRequests: Int = SyncConfig.catchUpSliceMaxRequests, deadlineIn: TimeInterval? = 60,
                        requestTimeout: TimeInterval = SyncConfig.catchUpRequestTimeoutSeconds,
                        sliceSeconds: TimeInterval = SyncConfig.catchUpSliceSeconds,
-                       intervalSeconds: TimeInterval = SyncConfig.catchUpSliceIntervalSeconds) async throws -> Bool {
+                       intervalSeconds: TimeInterval = SyncConfig.catchUpSliceIntervalSeconds,
+                       clock: @escaping @Sendable () -> Date = { Date() }) async throws -> Bool {
             await AccountManager.shared.clearRecentlyCompletedForTesting()
             var run = SyncEngine.CatchUpRun(
-                storageLimitInForce: false, deadline: Date().addingTimeInterval(deadlineIn),
+                storageLimitInForce: false, deadline: deadlineIn.map { clock().addingTimeInterval($0) },
                 sliceSeconds: sliceSeconds, intervalSeconds: intervalSeconds,
-                clock: { Date() })
+                clock: clock)
             run.sliceMaxRequests = maxRequests
             run.listingRangeMessages = rangeMessages
             run.requestTimeoutSeconds = requestTimeout

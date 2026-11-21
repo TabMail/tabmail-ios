@@ -128,6 +128,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         var persistent: Bool = false
         /// The tagged status the injected failure answers with: "NO" or "BAD".
         var status: String = "NO"
+        /// Instead of a tagged answer, these bytes alone: a malformed answer
+        /// the client's response parser fails on.
+        var malformedAnswer: String? = nil
     }
 
     /// One deterministic mailbox reset applied only after the matching
@@ -587,6 +590,14 @@ final class FakeIMAPServer: @unchecked Sendable {
         var heldGateReleased: Set<String> = []
         /// Set by `stop()`: a held command is let go so its handler can end.
         var heldGatesAbandoned = false
+        /// How many requests a hold has stopped so far (`holdNextCommand`,
+        /// `holdListingFetches`), and how many of those have since answered:
+        /// `holdsStarted()`, `heldRequestsInProgress()`.
+        var holdsStarted = 0
+        var holdsFinished = 0
+        /// How many malformed answers (`answerNextCommandOverLimit`,
+        /// `answerNextCommandUndecodable`) the server began to send.
+        var malformedAnswersSent = 0
         /// Like `stalls`, but the hold ends the session as soon as the client
         /// closes the connection. See `stallNextCommandWatchingClient`.
         var watchedStalls: [String: [Double]] = [:]
@@ -996,6 +1007,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         let armed: Bool = withState { state in
             guard state.heldGates[upperKey] == false else { return false }
             state.heldGates[upperKey] = true
+            state.holdsStarted += 1
             return true
         }
         guard armed else { return }
@@ -1003,7 +1015,49 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { state in
             state.heldGates[upperKey] = nil
             state.heldGateReleased.remove(upperKey)
+            state.holdsFinished += 1
         }
+    }
+
+    /// How many requests a hold (`holdNextCommand`, `holdListingFetches`) has
+    /// stopped since the server started. Only grows.
+    func holdsStarted() -> Int {
+        withState { $0.holdsStarted }
+    }
+
+    /// How many requests a hold stopped that have not gone on to answer yet: a
+    /// released request counts until its handler has passed the hold.
+    func heldRequestsInProgress() -> Int {
+        withState { $0.holdsStarted - $0.holdsFinished }
+    }
+
+    /// Test seam: answer the next command containing `fragment` with one
+    /// untagged line longer than the client's response buffer
+    /// (`IMAPFetchMapping.responseBufferLimit`) and no tagged answer: the
+    /// client's framing parser gives up on it (`PayloadTooLargeError`), a
+    /// genuine too-large answer, unlike a tagged NO that only names one.
+    func answerNextCommandOverLimit(containing fragment: String) {
+        let line = "* OK " + String(repeating: "x", count: IMAPFetchMapping.responseBufferLimit + 1) + "\r\n"
+        injectMalformedAnswer(line, containing: fragment)
+    }
+
+    /// Test seam: answer the next command containing `fragment` with one
+    /// untagged FETCH whose UID is not a number, and no tagged answer: the
+    /// client's response parser cannot decode it (`IMAPDecoderError`).
+    func answerNextCommandUndecodable(containing fragment: String) {
+        injectMalformedAnswer("* 1 FETCH (UID notanumber)\r\n", containing: fragment)
+    }
+
+    private func injectMalformedAnswer(_ bytes: String, containing fragment: String) {
+        withState { state in
+            state.injectedFailureCountdowns[fragment.uppercased(), default: []]
+                .append(InjectedFailure(skip: 0, message: "", malformedAnswer: bytes))
+        }
+    }
+
+    /// How many malformed answers the server began to send.
+    func malformedAnswersSent() -> Int {
+        withState { $0.malformedAnswersSent }
     }
 
     /// Test seam: like `stallNextCommand`, but while the answer is held the
@@ -2277,6 +2331,13 @@ final class FakeIMAPServer: @unchecked Sendable {
                             _ = state.testInitiatedCloseFds.insert(fd)
                         }
                         break clientLoop
+                    }
+                    if let malformed = matchedFailure.malformedAnswer {
+                        // No tagged answer: the client fails on these bytes, and
+                        // may close the connection before the rest is written.
+                        withState { $0.malformedAnswersSent += 1 }
+                        sendLine(fd: fd, malformed)
+                        continue
                     }
                     sendLine(fd: fd, "\(tag) \(matchedFailure.status) \(matchedFailure.message)\r\n")
                     continue
@@ -3578,6 +3639,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                 state.listingFetchSizesByMailbox[mailbox, default: []].append(matched.count)
                 guard let over = state.listingHoldByMailbox[mailbox], matched.count > over else { return nil }
                 state.listingHeldByMailbox[mailbox, default: 0] += 1
+                state.holdsStarted += 1
                 return (state.listingReleasesByMailbox[mailbox] ?? 0) + 1
             }
             // This connection's own thread: holding it delays no other connection.
@@ -3585,7 +3647,10 @@ final class FakeIMAPServer: @unchecked Sendable {
                 while !withState({ ($0.listingReleasesByMailbox[mailbox] ?? 0) >= heldUntil || $0.heldGatesAbandoned }) {
                     usleep(2_000)
                 }
-                withState { $0.listingHeldByMailbox[mailbox, default: 1] -= 1 }
+                withState { state in
+                    state.listingHeldByMailbox[mailbox, default: 1] -= 1
+                    state.holdsFinished += 1
+                }
             }
         }
         var response = ""

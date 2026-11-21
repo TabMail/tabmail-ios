@@ -458,6 +458,54 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    @Test("Before the older-mail walk starts, a window listing whose lowest UID's header record cannot be read: once that record reads, the next catch-up loads the message, and the window floor is that UID")
+    @MainActor
+    func unreadableLowestWindowUIDIsLoadedOnceItReads() async throws {
+        let server = Array(1...200)
+        let window = Array((server.count - SyncConfig.syncMessageLimit + 1)...server.count)
+        let lowest = window[0]
+        try await Self.withWorld("floor-unreadable", server: server, local: Array(window.dropFirst()), walkStarted: false) { w in
+            // The window's lowest message has a header record the client cannot read.
+            var messages = server.map { Self.message($0) }
+            let index = try #require(server.firstIndex(of: lowest))
+            messages[index] = Self.message(lowest, date: "not a date")
+            w.server.setMessages(messages, in: Self.path)
+            w.server.suppressFetchInternalDate(in: Self.path, uids: [lowest])
+            try await w.makeFullSyncDue()
+            try await w.foregroundSync()
+            try w.expectNotHeld([lowest], "setup: the unreadable message was not inserted")
+
+            // The record reads again; the catch-up runs before any window listing does.
+            w.server.setMessages(server.map { Self.message($0) }, in: Self.path)
+            w.server.suppressFetchInternalDate(in: Self.path, uids: [])
+            try await w.markOwed()
+            try await w.workerRun()
+            try w.expectHeldExactly(window, "#1062: the window's lowest message, unreadable when the window listed it, is loaded once it reads")
+            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState) == lowest,
+                    "#1062: the window floor is the lowest UID the window named, read or not")
+            let folder = try w.folder()
+            #expect(!folder.backfillComplete && folder.backfillUidCursor == nil, "setup: the walk has still not started")
+        }
+    }
+
+    @Test("A window listing whose SELECT reports no UIDVALIDITY records no window floor; the next one under a known epoch records it")
+    @MainActor
+    func windowFloorNeedsAKnownEpoch() async throws {
+        let server = Array(1...20)
+        try await Self.withWorld("floor-epoch", server: server, local: server, walkStarted: false) { w in
+            func floor() throws -> Int? { CatchUpWindowFloor.read(try w.folder().catchUpState) }
+            #expect(try floor() == nil, "setup: no window listing has recorded a floor")
+            w.server.suppressSelectUidValidity(for: Self.path)
+            try await w.makeFullSyncDue()
+            try await w.foregroundSync()
+            #expect(try floor() == nil, "#1062: a listing of unknown numbering records no floor, so none can outlive an epoch change")
+            w.server.restoreSelectUidValidity(for: Self.path)
+            try await w.makeFullSyncDue()
+            try await w.foregroundSync()
+            #expect(try floor() == 1, "setup: a listing under a known epoch records the floor")
+        }
+    }
+
     @Test("Under a storage limit before the walk starts, loads start at the higher of the window floor and the lowest held UID; with no limit, at the window floor",
           arguments: [true, false])
     @MainActor
