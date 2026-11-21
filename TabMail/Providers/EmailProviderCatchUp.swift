@@ -189,15 +189,6 @@ enum CatchUpLapse {
     }
 }
 
-/// The lowest id a window listing of the folder has reached, for a provider that
-/// windows by UID (#1062). The full sync's window merge
-/// (`SyncEngine.recordCatchUpWindowFloor`) keeps it under `key` in the folder's
-/// catch-up state JSON, as the lowest value any window listing in the folder's
-/// current epoch reached; the catch-up apply carries it across its own state
-/// writes, and a turnover clears it with the state. Rows other paths write
-/// (infinite scroll pages by date) never move it. Before the older-mail walk
-/// starts, a catch-up loads missing mail only from here up: new mail beyond the
-/// window is the catch-up's, older mail is the walk's.
 /// Loads the engine dropped from a listing in progress (#1062): an apply whose
 /// read was over-age (`CatchUpReadLatch`) moved the listing past messages it did
 /// not insert. The engine sets this key to `true` in the state's JSON object; a
@@ -209,6 +200,15 @@ enum CatchUpSkippedLoads {
     static let key = "skippedLoads"
 }
 
+/// The lowest id a window listing of the folder has reached, for a provider that
+/// windows by UID (#1062). The full sync's window merge
+/// (`SyncEngine.recordCatchUpWindowFloor`) keeps it under `key` in the folder's
+/// catch-up state JSON, as the lowest value any window listing in the folder's
+/// current epoch reached; the catch-up apply carries it across its own state
+/// writes, and a turnover clears it with the state. Rows other paths write
+/// (infinite scroll pages by date) never move it. Before the older-mail walk
+/// starts, a catch-up loads missing mail only from here up: new mail beyond the
+/// window is the catch-up's, older mail is the walk's.
 enum CatchUpWindowFloor {
     /// The key of the floor in a state's JSON object.
     static let key = "windowFloor"

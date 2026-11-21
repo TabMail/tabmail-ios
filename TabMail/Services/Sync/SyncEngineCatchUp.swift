@@ -377,7 +377,7 @@ extension SyncEngine {
             let readAge = CatchUpWallClock.now().timeIntervalSince(readStartedAt)
             if latch.checkOverAge()
                 && !(result.flagUpdates.isEmpty && result.loaded.isEmpty) && DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): read began \(Int(readAge)) s ago — \(result.flagUpdates.count) read/flag update(s) and \(result.loaded.count) load(s) not applied")
+                BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): read began \(Int(readAge)) s ago — \(result.flagUpdates.count) read/flag update(s) not applied; of \(result.loaded.count) load(s), \(latch.loadsSkipped ? "those after the over-age latch set were dropped" : "none was dropped")")
             }
             if !removedIds.isEmpty { removeHeadersFromFTS(removedIds) }
             if updatedFlags > 0 || !removedIds.isEmpty {

@@ -1006,13 +1006,16 @@ never `CatchUpContext.clock`. Nothing is persisted and no content is kept.
 **Loads too (2026-11-13, later the same day).** The rule above guarded only read and flag updates,
 so a move that completed after a read listed and loaded a message, and before its apply, put the old
 id back in the source folder (the #106 ghost; Memory 127). The direct load's insert now applies the
-same rule inside each insert chunk's transaction (`insertBackfillBatch` with `catchUpReadStartedAt`,
-from `SyncEngine.applyCatchUpResult`): it skips a message the shared 30 s protection still holds or
+same rule inside each insert chunk's transaction (`insertBackfillBatch` with `catchUpRead`, a
+`CatchUpReadLatch`, from `SyncEngine.applyCatchUpResult`; *superseded name:* `catchUpReadStartedAt`): it skips a message the shared 30 s protection still holds or
 whose completion-log time is at or after `readStartedAt` (`SyncEngine.catchUpReadPredatesAction`, the
 one check the flag path also uses), and an over-age read (`SyncEngine.catchUpReadIsOverAge`) inserts
 no load at all. A skipped load is not a failure and marks nothing: the state is written, and a
 message the server still lists in the folder is missing again at the next listing. The sentence above
-that counts loads among what an over-age read still applies is superseded and kept as written.
+that counts loads among what an over-age read still applies is superseded and kept as written. *Amended 2026-11-20 (#1062):* over-age is a one-way latch (`CatchUpReadLatch`) checked before
+the insert, in each insert chunk and in the transaction; chunks inserted before it sets stay, later
+loads are dropped, and a dropped load makes the listing unclean (`CatchUpSkippedLoads.key`), so an owed
+folder stays owed. The "inserts no load at all" wording above is superseded and kept as written.
 Gmail's and Outlook's direct loads share the insert, so both are covered; the page walk passes no read
 start and is unchanged.
 

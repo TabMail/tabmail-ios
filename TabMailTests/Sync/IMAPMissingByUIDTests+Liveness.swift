@@ -105,7 +105,6 @@ extension IMAPMissingByUIDTests {
             #expect((try w.changeState()).selfHealDue, "#1062: a listing whose loads were skipped does not settle the mark")
             let state = try #require(try w.catchUpState(), "#1062: the stored catch-up state still decodes")
             #expect(state.listing == nil && state.completionStamp != nil, "#1062: the completion is kept, not replaced")
-            #expect(state.skippedLoads == nil, "#1062: the skipped-loads flag is not left for the next listing")
             let clock = CatchUpTestClock()
             clock.advance(by: Self.pastTheHold)
             let start = w.server.recordedCommands().count
@@ -163,6 +162,71 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    /// Runs `body` with a wall clock that is in time (10 s after `readStartedAt`)
+    /// for the first `inTimeChecks` reads and past the retention for every later one.
+    static func withScriptedOverAge(readStartedAt: Date, inTimeChecks: Int, _ body: () async throws -> Void) async rethrows {
+        let reads = OSAllocatedUnfairLock(initialState: 0)
+        CatchUpWallClock.nowForTesting.withLock { $0 = {
+            let n = reads.withLock { $0 += 1; return $0 }
+            return n <= inTimeChecks ? readStartedAt.addingTimeInterval(10)
+                : readStartedAt.addingTimeInterval(SyncConfig.catchUpCompletionLogRetentionSeconds + 60)
+        } }
+        defer { CatchUpWallClock.nowForTesting.withLock { $0 = nil } }
+        try await body()
+    }
+
+    @Test("The latch sets only in the transaction: the load lands, the flag update is withheld, the listing is clean")
+    @MainActor
+    func overAgeLatchFlipsOnlyInTheTransaction() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-latch-txn", server: server, local: server) { w in
+            w.server.setFlags(["\\Seen"], in: Self.path, uid: 3)
+            try await w.dropLocal([12])
+            try await w.markOwed()
+            let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages))
+            let result = try #require(read.results.first)
+            #expect(result.completedListing?.clean == true && result.loaded.contains { $0.id == "12" }
+                    && result.flagUpdates.contains { $0.messageId == "3" }, "setup: a clean completion with a load and a flag update")
+            let readStartedAt = Date()
+            // Checks: before the insert, the one insert chunk, then the transaction.
+            try await Self.withScriptedOverAge(readStartedAt: readStartedAt, inTimeChecks: 2) {
+                _ = await w.engine.applyCatchUpResult(
+                    result, windowMode: .uid, readStartedAt: readStartedAt, selfHealOwedAtRead: read.owedAtRead)
+            }
+            let folderId = w.folderId
+            let isRead = try await w.pool.read { db in
+                try Bool.fetchOne(db, sql: "SELECT isRead FROM messageHeader WHERE folderId = ? AND messageId = '3'", arguments: [folderId])
+            }
+            #expect((try w.held()).contains(12), "#1062: the load landed before the latch set")
+            #expect(isRead == false, "#1062: the transaction's own check withholds the over-age flag update")
+            #expect(!(try w.changeState()).selfHealDue, "#1062: no load was dropped, so the listing is clean and settles")
+        }
+    }
+
+    @Test("The latch sets between insert chunks: the first chunk lands, later ones are dropped, the listing is unclean")
+    @MainActor
+    func overAgeLatchFlipsBetweenChunks() async throws {
+        let server = Array(1...260)
+        let missing = Array(101...(100 + SyncConfig.backfillInsertChunkSize + 30))
+        try await Self.withWorld("owed-latch-chunks", server: server, local: server) { w in
+            try await w.dropLocal(missing)
+            try await w.markOwed()
+            let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages))
+            let result = try #require(read.results.first)
+            #expect(result.completedListing != nil && result.loaded.count > SyncConfig.backfillInsertChunkSize,
+                    "setup: one completing result with more loads than one insert chunk")
+            let readStartedAt = Date()
+            // Checks: before the insert and the first chunk in time; the second chunk on, over-age.
+            try await Self.withScriptedOverAge(readStartedAt: readStartedAt, inTimeChecks: 2) {
+                _ = await w.engine.applyCatchUpResult(
+                    result, windowMode: .uid, readStartedAt: readStartedAt, selfHealOwedAtRead: read.owedAtRead)
+            }
+            let landed = Set(try w.held()).intersection(missing)
+            #expect(landed.count == SyncConfig.backfillInsertChunkSize, "#1062: exactly the first chunk landed (\(landed.count))")
+            #expect((try w.changeState()).selfHealDue, "#1062: the dropped later chunk makes the listing unclean")
+        }
+    }
+
     @Test("An owed folder whose listing completed unclean is listed again once its change counter moves past the stamp")
     @MainActor
     func uncleanOwedFolderRelistsWhenTheCounterMoves() async throws {
@@ -207,13 +271,16 @@ extension IMAPMissingByUIDTests {
             _ = await w.engine.applyCatchUpResult(
                 result, windowMode: .uid, readStartedAt: overAge, selfHealOwedAtRead: read.owedAtRead)
             #expect(!(try w.held()).contains(12), "setup: the over-age apply skipped the load")
+            #expect(try w.catchUpState()?.skippedLoads == true, "#1062: the dropped load is recorded on the listing in progress")
             let clock = CatchUpTestClock()
             for _ in 0..<10 where try w.catchUpState()?.listing != nil { await w.slice(clock: clock) }
             #expect(try w.catchUpState()?.listing == nil, "setup: a later in-time slice completed the listing")
             #expect((try w.changeState()).selfHealDue, "#1062: skipped loads in an earlier slice keep the listing unclean")
+            #expect(try w.catchUpState()?.skippedLoads == nil, "#1062: completion clears the record for the next listing")
             clock.advance(by: Self.pastTheNextCheck)
-            for _ in 0..<10 where !(try w.held()).contains(12) { await w.slice(clock: clock) }
+            for _ in 0..<10 where !(try w.held()).contains(12) || (try w.catchUpState()?.listing != nil) { await w.slice(clock: clock) }
             #expect((try w.held()).contains(12), "#1062: the daily check lists and loads the message")
+            #expect(!(try w.changeState()).selfHealDue, "#1062: the next clean listing settles the mark")
         }
     }
 
