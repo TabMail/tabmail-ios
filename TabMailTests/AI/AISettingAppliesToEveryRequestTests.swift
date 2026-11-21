@@ -434,7 +434,14 @@ struct AISettingAppliesToEveryRequestTests {
 
     // MARK: - Reply: a rate-limit retry
 
-    private func reply(_ service: AIService) async throws -> String? {
+    /// The precache reply as the backend sends it: the JSON object the reply parser reads, as the
+    /// `assistant` text of the stream's `final` event.
+    private static let replyBody = "Thursday works."
+    private static let replyTextMessage = "Thursday works for me."
+    private static let replyAnswer =
+        #"{"assistant":"{\"subject\":\"Re: Quarterly planning\",\"body\":\"Thursday works.\",\"text_message\":\"Thursday works for me.\"}"}"#
+
+    private func reply(_ service: AIService) async throws -> ReplyResult? {
         try await service.generateReply(
             subject: "Quarterly planning", from: "Sender", fromAddress: "sender@company.com",
             to: "sender@company.com", cc: "", bodyText: "Can we meet on Thursday?", userName: "Recipient",
@@ -451,7 +458,7 @@ struct AISettingAppliesToEveryRequestTests {
         let answered = Answered()
         http.register(path: "/completions/chat", method: "POST") { _ in
             guard answered.next() == 1 else {
-                return Self.stream(#"{"assistant":"Subject: Re: Quarterly planning\nBody: Thursday works."}"#)
+                return Self.stream(Self.replyAnswer)
             }
             // AI is turned off while the first request is out, which the backend rate limits.
             setting.turnOff()
@@ -467,14 +474,21 @@ struct AISettingAppliesToEveryRequestTests {
 
             setting.turnOn()
             let answeredReply = try await reply(service)
-            #expect(answeredReply != nil)
+            #expect(answeredReply == ReplyResult(body: Self.replyBody, textMessage: Self.replyTextMessage))
             #expect(http.recordedCalls().count == 2)
         }
     }
 
     // MARK: - Summary and action: a job that waited, and a request already out
 
-    /// Answers the summary prompt with a blurb and the action prompt with an action.
+    /// The summary as the backend sends it: the JSON object the summary parser reads, as the
+    /// `assistant` text of the stream's `final` event.
+    private static let summaryBlurb = "A short summary."
+    private static let summaryTextMessage = "Notes from the call."
+    private static let summaryAnswer =
+        #"{"assistant":"{\"todos\":[],\"summary\":\"A short summary.\",\"reminder\":null,\"text_message\":\"Notes from the call.\"}"}"#
+
+    /// Answers the summary prompt with a summary and the action prompt with an action.
     private func registerSummaryAndAction(_ http: FakeHTTP.Scenario, onEach: @escaping @Sendable () -> Void = {}) {
         http.register(path: "/completions/chat", method: "POST") { request in
             onEach()
@@ -482,7 +496,7 @@ struct AISettingAppliesToEveryRequestTests {
             let prompt = ((json["messages"] as? [[String: Any]])?.first?["content"] as? String) ?? ""
             return prompt == "system_prompt_action"
                 ? Self.stream(#"{"assistant":"{\"action\":\"archive\"}"}"#)
-                : Self.stream(#"{"assistant":"Two-line summary: A short summary."}"#)
+                : Self.stream(Self.summaryAnswer)
         }
     }
 
@@ -493,7 +507,7 @@ struct AISettingAppliesToEveryRequestTests {
             subject: "Quarterly planning", from: "Sender", fromAddress: "sender@company.com",
             date: Date(), bodyText: "Notes from the planning call.", htmlContent: nil,
             hasExistingAction: false, userName: "Recipient", kbText: "", actionPrompt: "",
-            recipientStatus: ""
+            recipientStatus: "", isSentByUser: false
         )
     }
 
@@ -512,7 +526,14 @@ struct AISettingAppliesToEveryRequestTests {
             let summary = try await service.generateSummary(
                 subject: "Quarterly planning", from: "Sender", fromAddress: "sender@company.com", date: Date(),
                 bodyText: "Notes from the planning call.", htmlContent: nil, userName: "Recipient", kbText: "")
-            #expect(summary.blurb == nil && summary.todos == nil && summary.reminderDate == nil)
+            // The whole empty result, as the entry check returns: nothing at all, the text
+            // message included.
+            #expect(summary.blurb == nil)
+            #expect(summary.todos == nil)
+            #expect(summary.reminderDate == nil)
+            #expect(summary.reminderTime == nil)
+            #expect(summary.reminderContent == nil)
+            #expect(summary.textMessage == nil)
             let action = try await service.classifyAction(
                 subject: "Quarterly planning", from: "Sender", fromAddress: "sender@company.com",
                 bodyText: "Notes from the planning call.", htmlContent: nil, summary: summary,
@@ -521,8 +542,10 @@ struct AISettingAppliesToEveryRequestTests {
             #expect(http.recordedCalls().isEmpty)
 
             setting.turnOn()
-            let result = try #require(try await process(service))
-            #expect(result.summary.blurb != nil)
+            let processed = try await process(service)
+            let result = try #require(processed)
+            #expect(result.summary.blurb == Self.summaryBlurb)
+            #expect(result.summary.textMessage == Self.summaryTextMessage)
             #expect(result.action == .archive)
             #expect(http.recordedCalls().count == 2)
         }
@@ -538,8 +561,9 @@ struct AISettingAppliesToEveryRequestTests {
         let service = makeService(http, setting)
 
         try await withRealSetting(aiOff: false) {
-            let result = try #require(try await process(service))
-            #expect(result.summary.blurb != nil)
+            let processed = try await process(service)
+            let result = try #require(processed)
+            #expect(result.summary.blurb == Self.summaryBlurb)
             #expect(result.action == nil)
             #expect(http.recordedCalls().count == 1)
         }
