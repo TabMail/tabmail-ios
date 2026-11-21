@@ -32,8 +32,9 @@ import UIKit
 ///     the outbox (offline it may stay there for long) and once it is sent, until an email from
 ///     someone else arrives; that email's own AI Reply then shows. (The Sending bubble itself:
 ///     `ChatSendingBubbleTests`.)
-///  8. A chat that landed at the bottom is still at the bottom once its top or bottom inset
-///     changes and settles, whichever order the landing and the inset arrive in.
+///  8. A chat that lands at the bottom under a tall top bar is still at the bottom once the bar
+///     shrinks and settles, the device's order; and one landed at the bottom stays there while
+///     its bottom inset grows and shrinks.
 ///
 /// What was asked is read back from the summary queue; which rows are on screen is read from the
 /// bubbles' accessibility frames (each email has its own subject).
@@ -244,7 +245,7 @@ struct ChatThreadViewLifecycleTests {
     /// Waits, by polling the layout, until the scroll's inset on `edge` passes `inset` and the inset
     /// and the distance from the bottom hold still for several passes; a timeout fails the test.
     /// Returns that distance.
-    private static func settledBelow(_ scroll: UIScrollView, edge: KeyPath<UIEdgeInsets, CGFloat> = \.top,
+    private static func settledBelow(_ scroll: UIScrollView, edge: KeyPath<UIEdgeInsets, CGFloat>,
                                      inset: (CGFloat) -> Bool,
                                      sourceLocation: SourceLocation = #_sourceLocation) async throws -> CGFloat {
         var last: [CGFloat]?
@@ -262,58 +263,69 @@ struct ChatThreadViewLifecycleTests {
         return try #require(last, sourceLocation: sourceLocation)[1]
     }
 
-    /// Lands the chat at the bottom, then moves one safe-area edge of the hosting controller alone
-    /// by `growth` and back, and checks the chat is still at the bottom after each step settles.
-    private func expectBottomKeptThroughInsetChange(
-        edge: KeyPath<UIEdgeInsets, CGFloat>, extra: WritableKeyPath<UIEdgeInsets, CGFloat>, growth: CGFloat,
-        sourceLocation: SourceLocation = #_sourceLocation
-    ) async throws {
+    /// The device's order: the top bar is tall as the chat lands and then settles shorter. The
+    /// header's own height is driven (`ChatHeaderTestSeam`): the root controller's
+    /// `additionalSafeAreaInsets.top` grows this scroll view's inset but never shrinks it back
+    /// (memory 036).
+    @Test("A chat that lands under a tall top bar is still at the bottom once the bar shrinks")
+    func topInsetChangeKeepsTheBottom() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let seam = ChatHeaderTestSeam.shared
+        defer { seam.extraHeight = 0 }
+        // About what the settling top bar takes off after its first pass.
+        let shrink: CGFloat = 400
+        // Tall before the chat opens, so the landing happens under the tall inset.
+        seam.extraHeight = shrink
         let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { scroll in
-            let controller = try #require(scroll.window?.rootViewController, "the hosting controller", sourceLocation: sourceLocation)
-            defer { controller.additionalSafeAreaInsets = .zero }
-            let landed = try await Self.settledBelow(scroll, edge: edge, inset: { _ in true }, sourceLocation: sourceLocation)
-            let settledInset = scroll.adjustedContentInset[keyPath: edge]
-            try #require(abs(landed) < 2, "control: the chat lands at the bottom first, got \(landed)", sourceLocation: sourceLocation)
+            let landed = try await Self.settledBelow(scroll, edge: \.top, inset: { _ in true })
+            let tallInset = scroll.adjustedContentInset.top
+            try #require(tallInset > shrink, "control: the chat lands under the tall bar, got inset \(tallInset)")
+            try #require(abs(landed) < 2, "control: the chat lands at the bottom first, got \(landed)")
             // The landing is still held: nothing has scrolled by hand or by offset.
-            #expect(!scroll.isDragging && !scroll.isDecelerating && !scroll.isTracking, "control: no scroll began",
-                    sourceLocation: sourceLocation)
+            #expect(!scroll.isDragging && !scroll.isDecelerating && !scroll.isTracking, "control: no scroll began")
             let contentHeight = scroll.contentSize.height
             let containerHeight = scroll.bounds.height
 
-            var insets = UIEdgeInsets.zero
-            insets[keyPath: extra] = growth
-            controller.additionalSafeAreaInsets = insets
-            let grown = try await Self.settledBelow(scroll, edge: edge, inset: { $0 > settledInset + growth / 2 },
-                                                    sourceLocation: sourceLocation)
+            seam.extraHeight = 0
+            let target = tallInset - shrink
+            let shrunk = try await Self.settledBelow(scroll, edge: \.top, inset: { abs($0 - target) < 1 })
+            #expect(tallInset - scroll.adjustedContentInset.top > shrink / 2, "control: the top inset really shrank")
             #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
-                    "control: only the inset changed", sourceLocation: sourceLocation)
-            #expect(abs(grown) < 2, "at the bottom after the inset grows, got \(grown) below the screen",
-                    sourceLocation: sourceLocation)
-
-            controller.additionalSafeAreaInsets = .zero
-            let shrunk = try await Self.settledBelow(scroll, edge: edge, inset: { $0 == settledInset },
-                                                     sourceLocation: sourceLocation)
-            #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
-                    "control: only the inset changed", sourceLocation: sourceLocation)
-            #expect(abs(shrunk) < 2, "at the bottom after the inset shrinks, got \(shrunk) below the screen",
-                    sourceLocation: sourceLocation)
+                    "control: only the inset changed")
+            #expect(abs(shrunk) < 2, "at the bottom after the top bar shrinks, got \(shrunk) below the screen")
         }
-        #expect(abs(opened.belowScreen) < 2, "still at the bottom at the end, got \(opened.belowScreen)",
-                sourceLocation: sourceLocation)
-    }
-
-    @Test("A chat landed at the bottom is still at the bottom after the top bar grows and shrinks its inset")
-    func topInsetChangeKeepsTheBottom() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
-        // Large enough to move the inset by about what the settling top bar moves it.
-        try await expectBottomKeptThroughInsetChange(edge: \.top, extra: \.top, growth: 400)
+        #expect(abs(opened.belowScreen) < 2, "still at the bottom at the end, got \(opened.belowScreen)")
     }
 
     @Test("A chat landed at the bottom is still at the bottom after its bottom inset grows and shrinks")
     func bottomInsetChangeKeepsTheBottom() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
         // About a keyboard's height, as when the reply field is focused before any scroll.
-        try await expectBottomKeptThroughInsetChange(edge: \.bottom, extra: \.bottom, growth: 300)
+        let growth: CGFloat = 300
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { scroll in
+            let controller = try #require(scroll.window?.rootViewController, "the hosting controller")
+            defer { controller.additionalSafeAreaInsets = .zero }
+            let landed = try await Self.settledBelow(scroll, edge: \.bottom, inset: { _ in true })
+            let settledInset = scroll.adjustedContentInset.bottom
+            try #require(abs(landed) < 2, "control: the chat lands at the bottom first, got \(landed)")
+            // The landing is still held: nothing has scrolled by hand or by offset.
+            #expect(!scroll.isDragging && !scroll.isDecelerating && !scroll.isTracking, "control: no scroll began")
+            let contentHeight = scroll.contentSize.height
+            let containerHeight = scroll.bounds.height
+
+            controller.additionalSafeAreaInsets = UIEdgeInsets(top: 0, left: 0, bottom: growth, right: 0)
+            let grown = try await Self.settledBelow(scroll, edge: \.bottom, inset: { $0 > settledInset + growth / 2 })
+            #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
+                    "control: only the inset changed")
+            #expect(abs(grown) < 2, "at the bottom after the inset grows, got \(grown) below the screen")
+
+            controller.additionalSafeAreaInsets = .zero
+            let shrunk = try await Self.settledBelow(scroll, edge: \.bottom, inset: { abs($0 - settledInset) < 1 })
+            #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
+                    "control: only the inset changed")
+            #expect(abs(shrunk) < 2, "at the bottom after the inset shrinks, got \(shrunk) below the screen")
+        }
+        #expect(abs(opened.belowScreen) < 2, "still at the bottom at the end, got \(opened.belowScreen)")
     }
 
     /// SwiftUI reports a bubble's visibility only when it changes, so an older email already on
