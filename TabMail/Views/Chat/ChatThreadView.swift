@@ -363,7 +363,8 @@ struct ChatThreadView: View {
                 // the bottom with a top inset filling the rest; that fill goes a pass or more after
                 // the thread lands, and on that inset change the platform keeps the offset plus the
                 // top inset, which moves a bottom landing past the bottom by the fill (memory 036).
-                // So the landing is issued again on every size or inset change until a scroll begins.
+                // So the landing is issued again on every size or inset change until the user's
+                // scroll (`endLanding`) or a jump-button tap ends it.
                 .onScrollGeometryChange(for: [CGFloat].self) { geo in
                     [geo.containerSize.height, geo.contentSize.height, geo.contentInsets.top, geo.contentInsets.bottom]
                 } action: { old, new in
@@ -518,8 +519,8 @@ struct ChatThreadView: View {
         if Self.userTookOver(phase) { scrollTarget = nil }
     }
 
-    /// Where the open lands (`scrollOnceLoaded`). Held until a scroll of any kind begins, so the
-    /// landing is issued again while the screen settles; then the user's scroll owns the screen.
+    /// Where the open lands (`scrollOnceLoaded`). Held until the user's scroll (`userTookOver`) or a
+    /// jump-button tap, so the landing is issued again while the screen settles; then the user owns it.
     @State private var scrollTarget: ScrollTarget?
 
     /// Reads every other copy the thread loaded of an email the chat shows, the first time it
