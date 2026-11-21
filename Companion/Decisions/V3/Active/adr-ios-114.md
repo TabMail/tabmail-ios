@@ -298,9 +298,11 @@ same AI result, kept as long as the email itself is shown.
    - `defaultScrollAnchor(.bottom)` opens at the newest email. The landing `scrollTo` is issued once
      the thread is loaded, and again on every container size, content size or inset change until
      a scroll of any kind begins (memory 036: a first scroll can be dropped while the screen
-     settles; the top bar settles shorter after the first pass, and on a top inset change the
-     platform keeps the offset plus the top inset, which moves a bottom landing past the bottom by
-     the shrink; amended 2026-11-20, mechanism measured 2026-11-21). The first
+     settles; and the first pass shows the opened email alone, which `defaultScrollAnchor(.bottom)`
+     sits at the bottom with a top inset filling the rest of the screen. That fill goes 150 to 600
+     ms after the thread lands, and on that inset change the platform keeps the offset plus the
+     top inset, which moves a bottom landing past the bottom by the fill; amended 2026-11-20,
+     mechanism measured 2026-11-21). The first
      scroll records the members' unread state itself (`noteMembers`) before choosing where to land:
      SwiftUI runs the thread-loaded and members changes in either order, and the screen tests caught
      the chat opening at the bottom with the Unread line missing.
@@ -315,14 +317,13 @@ same AI result, kept as long as the email itself is shown.
      (`aBodyThatLandsWhileTheChatIsNotLookingShowsItsSummary`, 2026-11-15) an email whose body lands
      while the chat is on screen, after a background return that cancelled and rebuilt the queue,
      while another screen covers the chat, or across a relaunch shows its summary once the chat is
-     shown again; and (2026-11-21) a chat that lands at the bottom while its top bar is still tall
-     never shows past its bottom once the bar settles shorter:
-     `firstTallerTopBarNeverShowsPastTheBottom` (the device's own order, undriven) and
-     `topBarDroppingRightAfterTheLandingNeverShowsPastTheBottom` (the bar's height driven through
-     the DEBUG-only `ChatHeaderTestSeam` and dropped right after the landing). Both count display
-     frames from the landing on, and allow no two frames in a row past the bottom. They do not
-     check the settled position: without the re-issue a later platform update clamps the offset
-     back, sometimes, so a settled check passes either way (memory 036).
+     shown again; and (2026-11-21, `fillGoingAfterTheLandingNeverShowsPastTheBottom`) a chat whose
+     thread arrives under the first pass's fill never shows past its bottom when the fill goes. The
+     test holds the chat's thread lookup until the first pass has shown the fill, so the thread
+     always lands under it (the device's order), then counts display frames and allows no two in a
+     row past the bottom. It does not check the settled position: without the re-issue a later
+     platform update sometimes clamps the offset back, so a settled check passes either way. A real
+     top bar that shrinks keeps the bottom by itself and cannot show the bug (memory 036).
 
    **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
    In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible

@@ -317,11 +317,12 @@ struct ChatThreadView: View {
                     proxy.scrollTo(target.id, anchor: target.anchor)
                 }
                 // The first scroll can be dropped while the screen is still settling (memory 036),
-                // late content (attachment chips, a summary) changes the heights, and the top bar
-                // settles shorter after the first pass. On a top inset change the platform keeps the
-                // offset plus the top inset, which moves a bottom landing past the bottom by the
-                // shrink (memory 036): the landing is issued again on every container, content or
-                // inset change until a scroll begins.
+                // and late content (attachment chips, a summary) changes the heights. The first
+                // pass shows the opened email alone, which `defaultScrollAnchor(.bottom)` sits at
+                // the bottom with a top inset filling the rest; that fill goes a pass or more after
+                // the thread lands, and on that inset change the platform keeps the offset plus the
+                // top inset, which moves a bottom landing past the bottom by the fill (memory 036).
+                // So the landing is issued again on every size or inset change until a scroll begins.
                 .onScrollGeometryChange(for: [CGFloat].self) { geo in
                     [geo.containerSize.height, geo.contentSize.height, geo.contentInsets.top, geo.contentInsets.bottom]
                 } action: { _, _ in
@@ -354,10 +355,6 @@ struct ChatThreadView: View {
                                     reportContent: { AISummariesNotice.reportContent(items: thread.items, unsent: unsentReplies) })
                     tutorialCard(thread)
                 }
-                #if DEBUG
-                // Test seam: lets a screen test make the top bar taller, then shorter, alone.
-                .padding(.bottom, ChatHeaderTestSeam.shared.extraHeight)
-                #endif
                 // The open swipe is reachable only below the header.
                 .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).maxY } action: {
                     headerBottom = $0
@@ -785,16 +782,6 @@ struct ChatThreadView: View {
         }
     }
 }
-
-#if DEBUG
-/// Test-only extra height at the bottom of the chat's top bar, so a screen test can land the chat
-/// under a tall top inset and then shrink it, without changing the content or the container.
-@MainActor @Observable
-final class ChatHeaderTestSeam {
-    static let shared = ChatHeaderTestSeam()
-    var extraHeight: CGFloat = 0
-}
-#endif
 
 /// When a chat row counts as shown: its visible part is at least `ChatViewLayout.shownShareOfRow`
 /// of the row, or at least `ChatViewLayout.shownShareOfViewport` of the chat's visible height. One

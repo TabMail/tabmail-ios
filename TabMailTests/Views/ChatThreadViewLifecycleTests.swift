@@ -32,8 +32,9 @@ import UIKit
 ///     the outbox (offline it may stay there for long) and once it is sent, until an email from
 ///     someone else arrives; that email's own AI Reply then shows. (The Sending bubble itself:
 ///     `ChatSendingBubbleTests`.)
-///  8. A chat that lands at the bottom while its top bar is still tall never shows past its bottom
-///     once the bar settles shorter: not for two frames in a row, and not once settled.
+///  8. A chat whose thread arrives after its first pass, which showed the opened email alone sat
+///     at the bottom by a top inset filling the rest, never shows past its bottom when that fill
+///     goes: not for two frames in a row.
 ///
 /// What was asked is read back from the summary queue; which rows are on screen is read from the
 /// bubbles' accessibility frames (each email has its own subject).
@@ -146,25 +147,21 @@ struct ChatThreadViewLifecycleTests {
     }
 
     /// Opens the chat on `headers[openedIndex]` and waits until the queue and the scroll settle;
-    /// `then` runs after that, and the queue is read again once it settles. `firstPass` is asked
-    /// every few milliseconds from the window's first appearance, so it can act in the layout
-    /// pass after the one it waits for, until it returns true.
+    /// `then` runs after that, and the queue is read again once it settles.
     private func open(
         unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool = false, tall: Int? = nil,
         height: CGFloat = 852,
-        then action: (@MainActor (UIScrollView) async throws -> Void)? = nil,
-        firstPass: (@MainActor (UIScrollView) -> Bool)? = nil
+        then action: (@MainActor (UIScrollView) async throws -> Void)? = nil
     ) async throws -> Opened {
         try await HostedAccessibility.withAutomation {
             try await openWithAutomation(unreadFrom: unreadFrom, openedIndex: openedIndex,
                                          highlights: highlights, landsAway: landsAway, tall: tall,
-                                         height: height, firstPass: firstPass, then: action)
+                                         height: height, then: action)
         }
     }
 
     private func openWithAutomation(
         unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool, tall: Int?, height: CGFloat,
-        firstPass: (@MainActor (UIScrollView) -> Bool)?,
         then action: (@MainActor (UIScrollView) async throws -> Void)?
     ) async throws -> Opened {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -194,12 +191,6 @@ struct ChatThreadViewLifecycleTests {
 
         func chatScroll() -> UIScrollView? {
             Self.scrollViews(controller.view).max { $0.contentSize.height < $1.contentSize.height }
-        }
-        if let firstPass {
-            for _ in 0..<2000 {
-                if let scroll = chatScroll(), firstPass(scroll) { break }
-                try await Task.sleep(for: .milliseconds(2))
-            }
         }
         if landsAway {
             for _ in 0..<80 {
@@ -249,109 +240,6 @@ struct ChatThreadViewLifecycleTests {
         #expect(opened.older.isEmpty,
                 "at the bottom every email on screen is among the newest asked for, so no older one asks: \(opened.older) vs \(opened.partlyShown.sorted())")
         #expect(!opened.queued.contains(0), "the oldest email waits for a scroll")
-    }
-
-    /// Waits, by polling the layout, until the scroll's inset on `edge` passes `inset` and the inset
-    /// and `measure` hold still for several passes; a timeout fails the test. Returns `measure`.
-    private static func settled(_ scroll: UIScrollView, edge: KeyPath<UIEdgeInsets, CGFloat>,
-                                inset: (CGFloat) -> Bool, measure: @MainActor (UIScrollView) throws -> CGFloat,
-                                sourceLocation: SourceLocation = #_sourceLocation) async throws -> CGFloat {
-        var last: [CGFloat]?
-        var stableFor = 0
-        for _ in 0..<80 where stableFor < 6 {
-            try await Task.sleep(for: .milliseconds(100))
-            let current = scroll.adjustedContentInset[keyPath: edge]
-            guard inset(current) else { stableFor = 0; last = nil; continue }
-            let now = [current, try measure(scroll)]
-            stableFor = now == last ? stableFor + 1 : 0
-            last = now
-        }
-        try #require(stableFor >= 6, "the inset and the scroll settle, got inset \(scroll.adjustedContentInset[keyPath: edge]), measured \(String(describing: last))",
-                     sourceLocation: sourceLocation)
-        return try #require(last, sourceLocation: sourceLocation)[1]
-    }
-
-    /// Counts, once the chat has landed at its bottom, the frames it shows past that bottom, read
-    /// from a display link on the main run loop. Frames, not time: a stalled main thread draws no
-    /// frame, so a stall can neither hide an offset left past the bottom nor stretch a correction
-    /// made in the next update.
-    @MainActor
-    final class PastTheBottomFrames: NSObject {
-        private var scroll: (@MainActor () -> UIScrollView?)?
-        private var link: CADisplayLink?
-        private var run = 0
-        /// The top inset as the chat landed at its bottom; nil until it has.
-        private(set) var insetAtLanding: CGFloat?
-        /// Frames read since the chat landed at its bottom.
-        private(set) var frames = 0
-        /// The most frames in a row the chat showed past its bottom.
-        private(set) var longestRun = 0
-        var started: Bool { scroll != nil }
-
-        /// `landedUnder` is the top inset when the caller has already seen the landing, so a
-        /// change made right after it counts from the first frame.
-        func start(on scroll: @escaping @MainActor () -> UIScrollView?, landedUnder inset: CGFloat? = nil) {
-            self.scroll = scroll
-            insetAtLanding = inset
-            let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
-            link.add(to: .main, forMode: .common)
-            self.link = link
-        }
-
-        func stop() {
-            link?.invalidate()
-            link = nil
-        }
-
-        @objc private func tick(_ link: CADisplayLink) {
-            guard let scroll = scroll?() else { return }
-            let below = ChatThreadViewLifecycleTests.below(scroll)
-            if insetAtLanding == nil {
-                guard scroll.contentSize.height > scroll.bounds.height, abs(below) < 2 else { return }
-                insetAtLanding = scroll.adjustedContentInset.top
-            }
-            frames += 1
-            run = below < -2 ? run + 1 : 0
-            longestRun = max(longestRun, run)
-        }
-    }
-
-    // Issue #1122. On a top inset change the platform keeps the offset plus the top inset, so a
-    // top bar that settles shorter after a bottom landing moves the offset past the bottom by the
-    // shrink, until the landing is issued again (in the next update) or a later platform update
-    // happens to clamp it (or never). A check of the settled position cannot tell the two apart;
-    // the frames in between can (memory 036).
-
-    /// The device's order, driven: the top bar is made taller through the header's own height
-    /// (`ChatHeaderTestSeam`; the root controller's `additionalSafeAreaInsets.top` grows this
-    /// scroll view's inset but never shrinks it back, memory 036) and drops in the frame after the
-    /// chat first lands at the bottom under it.
-    @Test("A chat whose top bar drops right after its bottom landing never shows past its bottom")
-    func topBarDroppingRightAfterTheLandingNeverShowsPastTheBottom() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
-        let seam = ChatHeaderTestSeam.shared
-        defer { seam.extraHeight = 0 }
-        let shrink: CGFloat = 400
-        seam.extraHeight = shrink
-        let frames = PastTheBottomFrames()
-        defer { frames.stop() }
-        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false, then: { scroll in
-            try #require(seam.extraHeight == 0 && frames.started,
-                         "control: the chat first landed at the bottom under the tall bar, which then dropped")
-            let settledBelow = try await Self.settled(scroll, edge: \.top, inset: { $0 < shrink }, measure: { Self.below($0) })
-            frames.stop()
-            #expect(frames.frames > 10, "control: frames were read from the drop until the chat settled, got \(frames.frames)")
-            #expect(frames.longestRun <= 1, "past the bottom for \(frames.longestRun) frames in a row after the bar dropped")
-            #expect(abs(settledBelow) < 2, "at the bottom once the bar has dropped, got \(settledBelow) below the screen")
-        }, firstPass: { scroll in
-            // The first pass with the chat loaded and at its bottom under the tall bar drops it.
-            guard scroll.contentSize.height > scroll.bounds.height, scroll.adjustedContentInset.top > shrink,
-                  abs(Self.below(scroll)) < 2 else { return false }
-            frames.start(on: { [weak scroll] in scroll }, landedUnder: scroll.adjustedContentInset.top)
-            seam.extraHeight = 0
-            return true
-        })
-        #expect(abs(opened.belowScreen) < 2, "still at the bottom at the end, got \(opened.belowScreen)")
     }
 
     /// SwiftUI reports a bubble's visibility only when it changes, so an older email already on
@@ -713,26 +601,17 @@ struct ChatThreadViewLifecycleTests {
         let belowScreen: CGFloat
     }
 
-    /// What the frames showed from the chat's bottom landing until it settled.
-    private struct BottomFrames {
-        let frames: Int
-        let longestRunPastTheBottom: Int
-        let insetAtLanding: CGFloat?
-        let settledInset: CGFloat
-    }
-
     private static func textViews(_ view: UIView) -> [UITextView] {
         ((view as? UITextView).map { [$0] } ?? []) + view.subviews.flatMap { textViews($0) }
     }
 
     /// Opens the all-read thread, signed in, with `ready` as the newest email's AI Reply, and reads
-    /// the bottom once the scroll and the field have not moved for a while, with every frame
-    /// from the bottom landing on.
-    private func bottom(ready: String) async throws -> (settled: Bottom, frames: BottomFrames) {
+    /// the bottom once the scroll and the field have not moved for a while.
+    private func bottom(ready: String) async throws -> Bottom {
         try await HostedAccessibility.withAutomation { try await bottomWithAutomation(ready: ready) }
     }
 
-    private func bottomWithAutomation(ready: String) async throws -> (settled: Bottom, frames: BottomFrames) {
+    private func bottomWithAutomation(ready: String) async throws -> Bottom {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         let queue = ActiveAIQueue.shared
@@ -755,13 +634,7 @@ struct ChatThreadViewLifecycleTests {
         }.environment(\.hasTabMailSession, true))
         window.rootViewController = controller
         window.makeKeyAndVisible()
-        let chatScroll: @MainActor () -> UIScrollView? = { [weak controller] in
-            controller.flatMap { Self.scrollViews($0.view).max(by: { $0.contentSize.height < $1.contentSize.height }) }
-        }
-        let recorder = PastTheBottomFrames()
-        recorder.start(on: chatScroll)
         defer {
-            recorder.stop()
             window.isHidden = true
             window.rootViewController = nil
             ChatPillState.shared.removeAllSessions()
@@ -771,7 +644,7 @@ struct ChatThreadViewLifecycleTests {
         var stableFor = 0
         for _ in 0..<120 where stableFor < 6 {
             try await Task.sleep(for: .milliseconds(100))
-            guard let scroll = chatScroll(),
+            guard let scroll = Self.scrollViews(controller.view).max(by: { $0.contentSize.height < $1.contentSize.height }),
                   let field = Self.textViews(controller.view).first(where: { $0.text == ready }),
                   let newestBubble = Self.bubbleFrames(in: controller.view).first(where: { $0.index == Self.length - 1 }) else {
                 stableFor = 0
@@ -784,34 +657,16 @@ struct ChatThreadViewLifecycleTests {
             stableFor = now == last ? stableFor + 1 : 0
             last = now
         }
-        recorder.stop()
         await queue.clearForTesting()
         await queue.setDispatchSuppressedForTesting(false)
         try #require(stableFor >= 6, "the chat and its field settle, got \(String(describing: last))")
-        let settled = try #require(last)
-        let settledInset = try #require(chatScroll(), "the chat's scroll view").adjustedContentInset.top
-        return (settled, BottomFrames(frames: recorder.frames, longestRunPastTheBottom: recorder.longestRun,
-                                      insetAtLanding: recorder.insetAtLanding, settledInset: settledInset))
-    }
-
-    /// The device's own order, undriven (issue #1122): the chat lands at its bottom under the top
-    /// bar's first, taller layout, and the bar settles shorter after the landing.
-    @Test("A chat that lands at the bottom under its first, taller top bar never shows past its bottom once the bar settles")
-    func firstTallerTopBarNeverShowsPastTheBottom() async throws {
-        let opened = try await bottom(ready: "Sounds good.")
-        let landedUnder = try #require(opened.frames.insetAtLanding, "control: frames saw the chat land at its bottom")
-        #expect(landedUnder - opened.frames.settledInset > 100,
-                "control: the top bar settled shorter after the landing, from \(landedUnder) to \(opened.frames.settledInset)")
-        #expect(opened.frames.frames > 10, "control: frames were read from the landing until the chat settled, got \(opened.frames.frames)")
-        #expect(opened.frames.longestRunPastTheBottom <= 1,
-                "past the bottom for \(opened.frames.longestRunPastTheBottom) frames in a row as the bar settled")
-        #expect(abs(opened.settled.belowScreen) < 2, "at the bottom once settled, got \(opened.settled.belowScreen)")
+        return try #require(last)
     }
 
     @Test("At the bottom, the newest bubble stays above the reply field, a six-line ready AI Reply included")
     func newestBubbleClearsATallField() async throws {
-        let short = try await bottom(ready: "Sounds good.").settled
-        let long = try await bottom(ready: "Thanks for sending the detailed schedule, I can attend the planning session on Tuesday afternoon and will bring the updated budget numbers, the contractor estimates and the notes from our last discussion. I will also check the two open questions with the team beforehand and send the revised agenda by Monday so everyone has time to review it.").settled
+        let short = try await bottom(ready: "Sounds good.")
+        let long = try await bottom(ready: "Thanks for sending the detailed schedule, I can attend the planning session on Tuesday afternoon and will bring the updated budget numbers, the contractor estimates and the notes from our last discussion. I will also check the two open questions with the team beforehand and send the revised agenda by Monday so everyone has time to review it.")
         #expect(abs(short.belowScreen) < 2 && abs(long.belowScreen) < 2,
                 "both open at the bottom: \(short.belowScreen), \(long.belowScreen)")
         // What the user sees: the newest bubble ends above the field's text in both chats. The text
@@ -1048,6 +903,224 @@ struct ChatThreadViewLifecycleTests {
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
         try await waitFor { fieldTexts().contains(later) }
         #expect(fieldTexts().contains(later), "a new email from someone else is their turn: \(fieldTexts())")
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
+    }
+
+    // MARK: - 8. The first pass's fill
+
+    // Issue #1122. The chat's first pass shows the opened email alone, and
+    // `defaultScrollAnchor(.bottom)` sits that short content at the bottom with a top inset that
+    // fills the rest of the screen (screen height = fill + content + bottom inset). The thread
+    // arrives under that fill and the chat lands at its bottom; the fill goes a pass or more later,
+    // and on that inset change the platform keeps the offset plus the top inset, so the chat shows
+    // past its bottom by the fill until the landing is issued again, or until a later platform
+    // update clamps it (or never). A check of the settled position cannot tell those apart; the
+    // frames in between can (memory 036). A real top bar that shrinks keeps the bottom by itself.
+
+    /// Holds the chat's thread lookup on its reader thread until released (bounded): the lookup's
+    /// first read, the Trash and Spam folder ids (`ThreadDetection.related`). Every such read waits
+    /// while armed, so the chat's first pass shows the opened email alone.
+    final class ThreadLookupHold: Sendable {
+        struct State { var armed = false; var released = false; var held = 0; var timedOut = false }
+        let state = Mutex(State())
+        private let gate = DispatchSemaphore(value: 0)
+        /// Holds nothing until armed, so the migrations and the fixture's writes run free.
+        func arm() { state.withLock { $0.armed = true } }
+        func release() {
+            let first = state.withLock { value -> Bool in
+                defer { value.released = true }
+                return !value.released
+            }
+            if first { gate.signal() }
+        }
+        func statement(_ sql: String) {
+            guard sql.contains(#"SELECT "id" FROM "folder" WHERE "role" IN"#) else { return }
+            let holds = state.withLock { value -> Bool in
+                guard value.armed, !value.released else { return false }
+                value.held += 1
+                return true
+            }
+            guard holds else { return }
+            if gate.wait(timeout: .now() + 30) == .timedOut {
+                state.withLock { $0.timedOut = true }
+            } else {
+                // Lets the next held lookup through as well.
+                gate.signal()
+            }
+        }
+    }
+
+    /// Reads the chat's scroll view on every display frame until the chat has settled at its
+    /// bottom after the fill went. Frames, not time: a stalled main thread draws no frame, so a
+    /// stall can neither hide a frame past the bottom nor stretch a correction made in the next
+    /// update. It releases the held thread lookup at the first frame that shows the fill.
+    @MainActor
+    final class FillFrames: NSObject {
+        struct Frame: CustomStringConvertible {
+            let number: Int
+            let content: CGFloat
+            let top: CGFloat
+            let offset: CGFloat
+            let below: CGFloat
+            var description: String { "#\(number) content \(content) top \(top) offset \(offset) below \(below)" }
+        }
+        /// Frames in a row with nothing moving that count as settled.
+        static let settledFrames = 10
+        /// Frames after which a chat that has not settled fails the test.
+        static let frameCap = 3600
+
+        private let scroll: @MainActor () -> UIScrollView?
+        private let onFill: @MainActor () -> Void
+        private var link: CADisplayLink?
+        private var number = 0
+        private var run = 0
+        private var still = 0
+        private var last: Frame?
+        private var waiter: CheckedContinuation<Bool, Never>?
+        private var result: Bool?
+        /// The first pass's top inset, filling the screen above the opened email alone.
+        private(set) var fill: CGFloat?
+        /// Frames that showed the whole thread at its bottom under that fill.
+        private(set) var landedUnderFill = 0
+        /// Frames read with the whole thread loaded.
+        private(set) var threadFrames = 0
+        /// The most frames in a row that showed past the bottom.
+        private(set) var longestRunPastTheBottom = 0
+        /// Each frame whose geometry differed from the one before.
+        private(set) var changes: [Frame] = []
+
+        init(scroll: @escaping @MainActor () -> UIScrollView?, onFill: @escaping @MainActor () -> Void) {
+            self.scroll = scroll
+            self.onFill = onFill
+        }
+
+        func start() {
+            let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+            link.add(to: .main, forMode: .common)
+            self.link = link
+        }
+
+        func stop() {
+            link?.invalidate()
+            link = nil
+        }
+
+        /// True once the chat has settled at its bottom after the fill went; false at the frame cap.
+        func settled() async -> Bool {
+            if let result { return result }
+            return await withCheckedContinuation { waiter = $0 }
+        }
+
+        private func finish(_ settled: Bool) {
+            guard result == nil else { return }
+            result = settled
+            stop()
+            waiter?.resume(returning: settled)
+            waiter = nil
+        }
+
+        @objc private func tick(_ link: CADisplayLink) {
+            number += 1
+            if number >= Self.frameCap {
+                finish(false)
+                return
+            }
+            guard let scroll = scroll() else { return }
+            let height = scroll.bounds.height
+            let frame = Frame(number: number, content: scroll.contentSize.height, top: scroll.adjustedContentInset.top,
+                              offset: scroll.contentOffset.y, below: ChatThreadViewLifecycleTests.below(scroll))
+            if let last, last.content == frame.content, last.top == frame.top, last.offset == frame.offset {
+                still += 1
+            } else {
+                still = 0
+                changes.append(frame)
+            }
+            last = frame
+            guard let fill else {
+                // The first pass: the opened email alone, sat at the bottom by a top inset that
+                // fills the rest of the screen.
+                if frame.content < height, frame.top > 0,
+                   abs(frame.top + frame.content + scroll.adjustedContentInset.bottom - height) < 1 {
+                    self.fill = frame.top
+                    onFill()
+                }
+                return
+            }
+            guard frame.content > height else { return }
+            threadFrames += 1
+            if abs(frame.top - fill) < 1, abs(frame.below) < 2 { landedUnderFill += 1 }
+            run = frame.below < -2 ? run + 1 : 0
+            longestRunPastTheBottom = max(longestRunPastTheBottom, run)
+            if frame.top < fill - 100, abs(frame.below) < 2, still >= Self.settledFrames { finish(true) }
+        }
+    }
+
+    @Test("A chat whose thread arrives under its first pass's fill never shows past its bottom when the fill goes")
+    func fillGoingAfterTheLandingNeverShowsPastTheBottom() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation { try await fillGoingAfterTheLanding() }
+    }
+
+    private func fillGoingAfterTheLanding() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let hold = ThreadLookupHold()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        // A held lookup keeps a reader; the chat's other reads must still run.
+        config.maximumReaderCount = 16
+        config.prepareDatabase { db in db.trace { hold.statement("\($0)") } }
+        let pool = try DatabasePool(path: directory.appendingPathComponent("t.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        let queue = ActiveAIQueue.shared
+        await queue.setDispatchSuppressedForTesting(true)
+        await queue.clearForTesting()
+        defer {
+            hold.release()
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        ChatPillState.shared.removeAllSessions()
+        let headers = try Self.insertThread(unreadFrom: nil, pool: pool)
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        hold.arm()
+        let controller = UIHostingController(rootView: NavigationStack {
+            ChatThreadView(messageId: headers[Self.length - 1].id)
+        })
+        let frames = FillFrames(scroll: { [weak controller] in
+            controller.flatMap { Self.scrollViews($0.view).max(by: { $0.contentSize.height < $1.contentSize.height }) }
+        }, onFill: { hold.release() })
+        frames.start()
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            frames.stop()
+            window.isHidden = true
+            window.rootViewController = nil
+            ChatPillState.shared.removeAllSessions()
+        }
+
+        let settled = await frames.settled()
+        let held = hold.state.withLock { $0 }
+        print("CHATFRAMES fill \(String(describing: frames.fill)), held \(held.held), landed under the fill \(frames.landedUnderFill), "
+              + "thread frames \(frames.threadFrames), longest run past the bottom \(frames.longestRunPastTheBottom), settled \(settled)\n"
+              + frames.changes.map(\.description).joined(separator: "\n"))
+        #expect(held.held > 0 && !held.timedOut, "control: the thread lookup was held, then released at the fill, not timed out")
+        let fill = try #require(frames.fill, "control: the first pass showed the opened email alone, sat at the bottom by a fill")
+        #expect(frames.landedUnderFill > 0, "control: the thread landed at its bottom under the first pass's fill of \(fill)")
+        #expect(frames.threadFrames > 10, "control: frames were read from the thread's arrival until it settled, got \(frames.threadFrames)")
+        #expect(frames.longestRunPastTheBottom <= 1,
+                "past the bottom for \(frames.longestRunPastTheBottom) frames in a row when the fill went")
+        #expect(settled, "the chat settles at its bottom once the fill has gone")
         await queue.clearForTesting()
         await queue.setDispatchSuppressedForTesting(false)
     }
