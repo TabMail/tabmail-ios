@@ -28,8 +28,9 @@ import Testing
 /// replacement lands under a preview freeze; and the earlier/later split follows the new one.
 ///
 /// `.serialized`, `.processGlobalState`: the view model observes process-wide
-/// notifications and the test installs the shared `AppDatabase`.
-@Suite("The opened email is never also a thread row", .serialized, .processGlobalState)
+/// notifications and the test installs the shared `AppDatabase`. `.timeLimit`: a reader that
+/// never ends fails its case instead of holding the suite.
+@Suite("The opened email is never also a thread row", .serialized, .processGlobalState, .timeLimit(.minutes(1)))
 struct MessageDetailOpenedRowTests {
 
     /// Sentinel `object` for test posts of `.nseMergeDidCommit`, so count contracts in
@@ -224,6 +225,9 @@ struct MessageDetailOpenedRowTests {
         }
 
         func reached(_ point: MessageDetailViewModel.DisplayReadPoint) -> Bool { events.contains(.read(point)) }
+        /// Thread scans asked for since the timeline was installed.
+        var allScansAsked: Int { scansAsked(after: -1) }
+
         func scansAsked(after index: Int) -> Int {
             events.suffix(from: min(index + 1, events.count)).filter { if case .scanAsked = $0 { return true } else { return false } }.count
         }
@@ -478,6 +482,10 @@ struct MessageDetailOpenedRowTests {
         for change in firstOpens {
             #expect(!change.scanAskedAtOnce, "opening an email where none was opened asks for no extra scan")
         }
+        // The open's own scan after the lost header starts from no opened email and is not asked
+        // for; the only scan is the poll's after it fetched the body.
+        #expect(timeline.allScansAsked == 1,
+                "the recovery and the poll's fetch ask for exactly one thread scan, the poll's own")
         #expect(vm.messageBody != nil, "control: the poll fetched the body")
         #expect(violations.checks > 0, "control: the publications were checked")
         #expect(violations.found.isEmpty, "\(violations.found)")
@@ -485,6 +493,43 @@ struct MessageDetailOpenedRowTests {
                 "a whole-chat action takes the opened email and both replies, each once; the reply that came with the body is there because the poll's own thread scan ran")
         try await expectEveryStoredCopyListedOnce(
             vm, among: [inboxCopy.id, allMailCopy.id, reply.id, laterReply.id], pool: pool)
+    }
+
+    @MainActor
+    @Test("the wait for thread scans does not end while another display reader still runs")
+    func scanWaitWaitsForEveryDisplayReader() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let (inboxCopy, _, _) = try insertCopyThread(into: pool)
+
+        let vm = try await openWithThread(inboxCopy, pool: pool)
+        defer { vm.cancelBodyPollForTesting() }
+        let timeline = Timeline(vm)
+        // Pull-to-refresh holds its display turn at its header read; no thread scan is asked for.
+        let gate = FetchGate()
+        let previousRead = vm._displayReadHook
+        vm._displayReadHook = { point in
+            await previousRead?(point)
+            if point == .refetchResolve { await gate.hold() }
+        }
+        let refresh = Task { await vm.refetchBody() }
+        do {
+            try await waitUntil("the refresh to hold its read") { gate.reached }
+            #expect(timeline.allScansAsked == 0, "control: no thread scan is asked for while the read is held")
+            #expect(!vm.displayTurnIsIdleForTesting, "control: the refresh holds a display turn")
+            await #expect(throws: TimedOut.self, "the wait does not end while a display reader runs") {
+                try await self.settle(vm, seconds: 0.3)
+            }
+        } catch {
+            gate.open()
+            try? await withTimeout(seconds: 5) { await refresh.value }
+            throw error
+        }
+        gate.open()
+        await refresh.value
+        try await settle(vm)
+        #expect(vm.message?.id == inboxCopy.id, "control: the refresh kept the opened email")
+        #expect(timeline.allScansAsked == 1, "control: the refresh asked for its own thread scan after its fetch")
     }
 
     /// The Inbox copy is on screen from the notification's snapshot but not stored yet; the All
@@ -550,7 +595,7 @@ struct MessageDetailOpenedRowTests {
             try await expectEveryStoredCopyListedOnce(vm, among: ids, pool: pool)
         } catch {
             gate.open()
-            await load.value
+            try? await withTimeout(seconds: 5) { await load.value }
             try? await settle(vm)
             throw error
         }
@@ -607,7 +652,7 @@ struct MessageDetailOpenedRowTests {
         } catch {
             PreviewFreezeGate.shared.end()
             gate.open()
-            await load.value
+            try? await withTimeout(seconds: 5) { await load.value }
             try? await settle(vm)
             throw error
         }
