@@ -580,6 +580,12 @@ extension IMAPMissingByUIDTests {
           arguments: IMAPMissingByUIDTests.fuzzSeeds)
     @MainActor
     func seededSchedulesConverge(_ seed: UInt64) async throws {
+        // Debug-gated diagnostics for a replay: `TEST_RUNNER_TABMAIL_TEST_DEBUG_LOG=1`
+        // turns the app's debug logs on for this test, so a red seed shows its
+        // mechanism in the log. Off by default.
+        let debugLog = ProcessInfo.processInfo.environment["TABMAIL_TEST_DEBUG_LOG"] == "1"
+        if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true } }
+        defer { if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } } }
         // Acceptance (Testing Rule 11): this schedule rediscovers the removal of
         // the header load's epoch guard (`loadMissing`'s observed-epoch check:
         // the turnover arm loads a lost UID across the turnover) and the loss of
