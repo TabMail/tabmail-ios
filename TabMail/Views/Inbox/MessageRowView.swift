@@ -34,12 +34,13 @@ struct MessageRowView: View {
 
     /// The chat view's switch, as the row can observe it: the Settings toggle, the AI choice and the
     /// opt-out are observed, so the row repaints when any of them changes. AI is off as
-    /// `AIService.isAIOff` reads it: no AI choice yet, or opted out.
+    /// `AIService.isAIOff` reads it: no AI choice yet, or opted out. A tutorial run shows what it
+    /// teaches, as its opens do (`ChatViewConfig.followingTutorial`, which observes the run).
     private var chatViewActive: Bool {
-        ChatViewConfig.isActive(
+        ChatViewConfig.followingTutorial(ChatViewConfig.isActive(
             enabledByUser: chatViewEnabled,
             aiOn: !DemoModeStore.shared.hidesAIContent
-                && ChatViewConfig.isAIOn(aiOff: !aiChoiceMade || optOutAllAI, subscribed: AISubscriptionGate.shared.isActive))
+                && ChatViewConfig.isAIOn(aiOff: !aiChoiceMade || optOutAllAI, subscribed: AISubscriptionGate.shared.isActive)))
     }
 
     /// Effective sender (or recipient) display:
