@@ -1393,3 +1393,18 @@ open does; the glyph has its label, hint and a full 44-point target at the trail
 and the subject stays centred. A control pins that the long-press sheet still sends its own type and
 content with no extra line. TipKit is not used for the flag, because its store cannot be reset inside
 the test process (ADR-IOS-085), so a tip's show-once rule could not be tested.
+
+The same suite pins that a report the backend took says "Report Submitted" exactly once, whatever
+happens to the view that asked for it, and a report it did not take says nothing (#1113):
+- `aScrolledRowKeepsItsReport`: a lazy list's reporting row scrolls away and back while the report
+  sends; the sheet stays, and the answer shows the confirmation once, alone.
+- `aRemovedRowsTakenReportConfirmsOnce`: a sync removes the reporting row from its `List` while the
+  report sends; the sheet goes with the row, and the answer still shows the confirmation once.
+- `aSystemClosedPopoversReportConfirmsOnlyWhenTaken`: the system closes the notice's popover and its
+  sheet while the report sends; a taken report shows the confirmation once, a refused one nothing.
+- An old answer (a sheet its caller closed, an owner or notice removed and recreated, a popover the
+  system closed and the notice reopened, at four timings) shows the confirmation once over whatever
+  is up, and neither it nor its OK closes, changes or finishes the next report:
+  `aClosedSheetsAnswerBeforeTheNextReport`, `aClosedSheetsAnswerDuringTheNextReport`,
+  `aRemovedOwnersTakenAnswerConfirmsOnce`, `aRemovedNoticesTakenAnswerConfirmsOnce`,
+  `anOldAnswerLeavesTheNextSendAlone`, `aSystemClosedPopoversAnswerNeverChangesTheNext`.
