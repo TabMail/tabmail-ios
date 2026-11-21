@@ -415,6 +415,10 @@ struct TabMailApp: App {
                             DraftOpenEarlyCloseTestScene()
                         } else if ProcessInfo.processInfo.arguments.contains("--draft-close-ui-test") {
                             ServerDraftCloseTestScene()
+                        } else if ProcessInfo.processInfo.arguments.contains("--chat-swipe-ui-test") {
+                            ChatSwipeTestScene()
+                        } else if ProcessInfo.processInfo.arguments.contains("--keyboard-focus-ui-test") {
+                            KeyboardFocusTestScene()
                         } else {
                             RootView()
                         }

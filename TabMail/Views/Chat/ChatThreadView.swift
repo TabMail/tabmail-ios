@@ -68,8 +68,11 @@ struct ChatThreadView: View {
     @State private var showsReplyTo = false
     @State private var showsOnlyList = false
     @State private var forwardMessage: MessageHeader?
-    /// The one open swipe: the chat's, or a bubble's id.
-    @State private var openSwipeId: String?
+    /// What is open among the chat's swipes (`ChatSwipeOpen`).
+    @State private var swipeOpen = ChatSwipeOpen()
+    /// Where the header ends and the reply field starts, in the swipes' space (`ChatSwipeOpen.reach`).
+    @State private var headerBottom = -CGFloat.infinity
+    @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
     @Environment(\.dismiss) private var dismiss
 
@@ -332,7 +335,7 @@ struct ChatThreadView: View {
                 // everywhere else never trashes.
                 .modifier(ChatSwipeReveal(
                     id: Self.chatSwipeId, edge: .trailing, buttons: chatSwipeButtons(offersArchive: offersArchive),
-                    allowsFullSwipe: offersArchive, openId: $openSwipeId))
+                    allowsFullSwipe: offersArchive, open: swipeOpen))
                 .accessibilityActions {
                     ForEach(chatSwipeButtons(offersArchive: offersArchive)) { button in
                         Button(button.title, action: button.action)
@@ -347,6 +350,11 @@ struct ChatThreadView: View {
                     ChatSubjectLine(subject: subject(thread), labels: context.labels, landed: didInitialScroll,
                                     reportContent: { AISummariesNotice.reportContent(items: thread.items, unsent: unsentReplies) })
                     tutorialCard(thread)
+                }
+                // The open swipe is reachable only below the header.
+                .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).maxY } action: {
+                    headerBottom = $0
+                    swipeOpen.reach(top: $0, bottom: pillTop)
                 }
             }
             .overlay {
@@ -364,8 +372,17 @@ struct ChatThreadView: View {
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
                         if !chatExpanded { pillHeight = height }
                     }
+                    // ...and above the reply field.
+                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
+                        pillTop = $0
+                        swipeOpen.reach(top: headerBottom, bottom: $0)
+                    }
             }
         }
+        // While a swipe is open, a drag or tap anywhere else on the screen only closes it. The
+        // closer's anchor fills the space every swipe frame is measured in.
+        .background(ChatSwipeCloser(open: swipeOpen))
+        .coordinateSpace(.named(ChatSwipeOpen.space))
     }
 
     @ViewBuilder
@@ -391,7 +408,7 @@ struct ChatThreadView: View {
             onOpen: { cardMessage = item.header })
         .modifier(ChatSwipeReveal(
             id: item.id, edge: .leading, buttons: bubbleSwipeButtons(item, thread: thread),
-            allowsFullSwipe: false, openId: $openSwipeId))
+            allowsFullSwipe: false, open: swipeOpen))
         .id(item.id)
         // Shown by one rule for every height (`ChatRowVisibility`), measured against the scroll
         // view, so a row taller than the screen is shown too.
