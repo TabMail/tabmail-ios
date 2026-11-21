@@ -75,8 +75,8 @@ struct ChatSwipeTestScene: View {
     /// editor (signed out it shows the sign-in bar instead) and the field its signed-in hint.
     private let signedIn = ProcessInfo.processInfo.arguments.contains("--chat-swipe-signed-in")
     /// `--chat-swipe-open-panel-later`: a strip under the whole navigation stack holds "Open the
-    /// panel soon", which opens the chat's panel `panelOpenDelay` after the tap, as an agent's
-    /// answer does, so a drag the test is still holding is cut off by it.
+    /// panel soon", which simulates the panel's expansion `panelOpenDelay` after the tap
+    /// (`openPanelSoon`), so a drag the test is still holding is cut off by it.
     private let openPanelLater = ProcessInfo.processInfo.arguments.contains("--chat-swipe-open-panel-later")
     static let panelOpenDelay: Duration = .seconds(2)
 
@@ -218,8 +218,10 @@ struct ChatSwipeTestScene: View {
         NotificationCenter.default.post(name: .messageDataDidChange, object: id)
     }
 
-    /// Opens the open chat's panel after `panelOpenDelay`, through the notification an agent's
-    /// answer posts (`.openMessageWithChat`).
+    /// Simulates the panel's expansion that interrupts a held drag: after `panelOpenDelay` it posts
+    /// `.openMessageWithChat`, the notification a tap on the inbox's agent toast posts, so the chat expands
+    /// its panel through that path. It is not an agent's answer, which opens the panel directly
+    /// (`ChatThreadView.agentAnswered`); either way the panel opening turns the field's pan off.
     private static func openPanelSoon() async {
         try? await Task.sleep(for: panelOpenDelay)
         NotificationCenter.default.post(name: .openMessageWithChat, object: nil,

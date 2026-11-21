@@ -1069,8 +1069,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    only while it goes more up than sideways) reaches `fieldDragOpenDistance` (60 pt), or when its
    predicted end does: the travel plus `ChatViewLayout.fieldFlickCarry` (0.25 s) of travel at the
    let-go velocity (`ChatFieldDrag.predictedEnd`), which is SwiftUI's own projection
-   (`DragGesture.Value.predictedEndTranslation`), so exactly the flicks that opened the panel before
-   the pan still open it, and only when that predicted end is more up than sideways. A drag 30 pt up
+   (`DragGesture.Value.predictedEndTranslation`), and only when that predicted end is more up than
+   sideways. The parity is for equivalent samples (amended 2026-11-21): a let-go with the same
+   travel and velocity SwiftUI's drag reported, on a drag that passes the begin rule, opens the
+   panel exactly when it did before the pan; it is not a promise for every physical flick, which
+   UIKit's pan and SwiftUI's drag measure in their own ways. A drag 30 pt up
    let go at 90 pt/s predicts 52.5 pt and settles back; at 120 pt/s it predicts 60 pt and opens. The
    pan stays on while the field has focus (mock v15 M2: "Type a question ... Drag up: your words ride
    along"), so a short draft in the focused field opens the panel the same way and keeps its words;

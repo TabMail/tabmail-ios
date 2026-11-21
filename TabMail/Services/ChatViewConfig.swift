@@ -149,7 +149,10 @@ enum ChatViewLayout {
     /// (`ChatFieldDrag.predictedEnd`), in seconds of travel at that speed: SwiftUI's own
     /// projection (`DragGesture.Value.predictedEndTranslation`, a quarter second; its `velocity` is
     /// four times the predicted end minus the travel), which the drag used before it became a
-    /// UIKit pan, so the same flicks open the panel.
+    /// UIKit pan. The parity this gives is for equivalent samples: a let-go with the same travel and
+    /// velocity SwiftUI's drag reported, on a drag that passes the pan's begin rule
+    /// (`ChatFieldDrag.begins`), opens the panel exactly when it did. It is not a promise that every
+    /// physical flick does, since UIKit's pan and SwiftUI's drag measure a finger in their own ways.
     static let fieldFlickCarry: CGFloat = 0.25
     /// The pill's spring (the panel opening and closing, the field's swell springing back): its
     /// response in seconds and its damping ratio. A drag's settle lasts this spring's own settling
