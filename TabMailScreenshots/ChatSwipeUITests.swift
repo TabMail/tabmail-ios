@@ -443,7 +443,9 @@ final class ChatSwipeUITests: XCTestCase {
     private static let shortFlick: CGFloat = 40
 
     /// The focused field: a drag up in text that overflows the field's lines scrolls that text, so
-    /// the panel stays shut and the field keeps its focus. A short draft's drag opens the panel
+    /// the panel stays shut and the field keeps its focus. The text is first scrolled to its top, so
+    /// the drag has room; which line is at the top is read by tapping the text's top-left corner and
+    /// typing a mark there. A short draft's drag opens the panel
     /// (`testDragUpOnAShortFocusedDraftOpensThePanelWithIt`).
     func testDragUpInOverflowingTextScrollsIt() {
         let app = launchIntoChat()
@@ -453,10 +455,66 @@ final class ChatSwipeUITests: XCTestCase {
         field.typeText(Self.overflowingText)
         let long = typedField(containing: Self.overflowingLastLine, in: app)
         XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
-        dragUp(atY: long.frame.midY, in: app)
+        // Down to the text's top: the field's drag takes only drags up, so this is the text's scroll.
+        textScroll(long, by: Self.toTheTextsTop, in: app)
+        XCTAssertEqual(topLine(of: long), "Line 1", "control: the text is at its top, with room to scroll")
+        textScroll(long, by: -Self.withinTheScrollRoom, in: app)
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the drag scrolled the overflowing text; the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "and the field kept its focus")
+        let after = topLine(of: long)
+        XCTAssertNotNil(after, "control: a line is at the text's top")
+        XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag")
+        XCTAssertEqual(long.value as? String, Self.overflowingText, "control: the text is unchanged")
     }
+
+    /// A slow vertical drag in the text from its middle, held at the end so it does not coast.
+    private func textScroll(_ text: XCUIElement, by travel: CGFloat, in app: XCUIApplication) {
+        let start = text.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: travel)),
+                    withVelocity: .slow, thenHoldForDuration: Self.scrollSettleHold)
+    }
+
+    /// The line at the top of the text: a tap at its top-left corner puts the caret at that line's
+    /// start, a typed mark shows where, and the mark is deleted again.
+    private func topLine(of text: XCUIElement) -> String? {
+        text.coordinate(withNormalizedOffset: .zero).withOffset(Self.insideTheTextsCorner).tap()
+        text.typeText(Self.lineMark)
+        let value = text.value as? String ?? ""
+        text.typeText(XCUIKeyboardKey.delete.rawValue)
+        return value.components(separatedBy: "\n").first { $0.hasPrefix(Self.lineMark) }.map { String($0.dropFirst(Self.lineMark.count)) }
+    }
+
+    /// Past the text's whole height, so a drag down reaches its top; a drag up of less than its
+    /// scroll room (three lines past the field's six, about 20 points each); the hold after either;
+    /// where in the text's top-left corner the tap lands; the mark typed there.
+    private static let toTheTextsTop: CGFloat = 300
+    private static let withinTheScrollRoom: CGFloat = 40
+    private static let scrollSettleHold: TimeInterval = 0.5
+    private static let insideTheTextsCorner = CGVector(dx: 6, dy: 6)
+    private static let lineMark = "#"
+
+    /// The focused field with words: a long press at the start of its text puts the caret there, so
+    /// the next typed character lands first. The text's long press runs while the field's drag waits;
+    /// were the long press made to wait for the drag, it could not begin until the finger lifts, and
+    /// the caret would stay at the end.
+    func testLongPressInTheFocusedFieldMovesTheCaret() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        field.tap()
+        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.caretPhrase)
+        let typed = typedField(containing: Self.caretPhrase, in: app)
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the phrase is in the field")
+        typed.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: Self.insideTheTextsCorner.dx, dy: 0))
+            .press(forDuration: Self.textLongPressHold)
+        typed.typeText(Self.lineMark)
+        XCTAssertEqual(typed.value as? String, Self.lineMark + Self.caretPhrase,
+                       "the long press put the caret at the text's start")
+        XCTAssertFalse(app.buttons["chatClose"].exists, "control: the press opened nothing")
+    }
+
+    /// One short line, typed so the caret ends after it.
+    private static let caretPhrase = "Lunch works"
 
     /// The focused field with words: a press held until the text view's own long press takes it
     /// (the loupe, caret placement), then moved up past the open distance, stays the text's. The

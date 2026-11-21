@@ -201,6 +201,8 @@ struct ChatFieldDragTests {
         #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: innerTap), "a tap inside the text view too")
         #expect(!coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: text.panGestureRecognizer),
                 "the scroll never waits for the drag (that would wait both ways)")
+        #expect(!coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: press),
+                "the text's long press never waits for the drag (it could not begin until the finger lifts)")
         #expect(!coordinator.gestureRecognizer(pan, shouldRequireFailureOf: tap), "the drag never waits for a tap")
         #expect(!coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: tap), "the drag runs alone")
 

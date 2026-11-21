@@ -1074,9 +1074,15 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel`,
    `testShortDragUpOnTheReplyFieldSettlesBack` and `testDraggedOpenPanelClosesOnCloseAndOnTheDim`
    (taps), `ChatReplyFieldTests.fieldDragWiring`, the pan's rules in `ChatFieldDragTests`, and
-   `testDragUpInOverflowingTextScrollsIt` (the text view's scroll first; was
+   `testDragUpInOverflowingTextScrollsIt` (the text view's scroll first: scrolled to its top, a
+   drag up within its scroll room moves another line to the top, read by tapping the top-left
+   corner and typing a mark; was
    `testDragUpInOverflowingTextScrollsItAndShortTextOpens`, whose short half ran signed out, where
-   the sign-in bar replaces the panel's editor), `testDragUpOnAShortFocusedDraftOpensThePanelWithIt`
+   the sign-in bar replaces the panel's editor), the text's long press
+   (`testLongPressInTheFocusedFieldMovesTheCaret`: a held press at the text's start puts the caret
+   there; `testLongPressThenDragUpInTheFocusedFieldStaysTheTexts`: a held press then a drag up
+   stays the text's; `ChatFieldDragTests.textViewOrdering`: the long press never waits for the
+   field's drag), `testDragUpOnAShortFocusedDraftOpensThePanelWithIt`
    (signed in through the fixture's `--chat-swipe-signed-in`: the panel's editor holds the draft),
    `testDragCutOffByThePanelOpeningSettlesAndTheNextDragWorks` (the fixture's
    `--chat-swipe-open-panel-later` opens the panel under a held drag, which turns the pan off: the
