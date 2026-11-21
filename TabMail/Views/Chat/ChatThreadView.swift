@@ -282,6 +282,7 @@ struct ChatThreadView: View {
             .presentationDragIndicator(.visible)
         }
         .fullScreenCover(item: $readyReply) { ready in
+            let _ = ChatThreadView.logReadyCard(ready)
             // Today's Reply All compose, with the AI Suggestion in its box: the full reply of the
             // row the ghost showed, read with it, so the card holds the reply that was tapped. It
             // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
@@ -382,10 +383,15 @@ struct ChatThreadView: View {
                     proxy.scrollTo(target.id, anchor: target.anchor)
                 }
                 // The first scroll can be dropped while the screen is still settling (memory 036),
-                // and late content (attachment chips, a summary) changes the heights: the landing
-                // is issued again on every size change until a scroll begins.
+                // and late content (attachment chips, a summary) changes the heights. The first
+                // pass shows the opened email alone, which `defaultScrollAnchor(.bottom)` sits at
+                // the bottom with a top inset filling the rest; that fill goes a pass or more after
+                // the thread lands, and on that inset change the platform keeps the offset plus the
+                // top inset, which moves a bottom landing past the bottom by the fill (memory 036).
+                // So the landing is issued again on every size or inset change until the user's
+                // scroll (`endLanding`) or a jump-button tap ends it.
                 .onScrollGeometryChange(for: [CGFloat].self) { geo in
-                    [geo.containerSize.height, geo.contentSize.height]
+                    [geo.containerSize.height, geo.contentSize.height, geo.contentInsets.top, geo.contentInsets.bottom]
                 } action: { old, new in
                     #if DEBUG
                     NSLog("[cv9diag] size %@ -> %@ target=%@", String(describing: old), String(describing: new), String(describing: scrollTarget?.id))
@@ -424,7 +430,8 @@ struct ChatThreadView: View {
             // through it (Messages).
             .safeAreaBar(edge: .top, spacing: 0) {
                 VStack(spacing: 0) {
-                    ChatSubjectLine(subject: subject(thread), labels: context.labels)
+                    ChatSubjectLine(subject: subject(thread), labels: context.labels, landed: didInitialScroll,
+                                    reportContent: { AISummariesNotice.reportContent(items: thread.items, unsent: unsentReplies) })
                     tutorialCard(thread)
                 }
                 // The open swipe is reachable only below the header.
@@ -537,8 +544,8 @@ struct ChatThreadView: View {
         if Self.userTookOver(phase) { scrollTarget = nil }
     }
 
-    /// Where the open lands (`scrollOnceLoaded`). Held until a scroll of any kind begins, so the
-    /// landing is issued again while the screen settles; then the user's scroll owns the screen.
+    /// Where the open lands (`scrollOnceLoaded`). Held until the user's scroll (`userTookOver`) or a
+    /// jump-button tap, so the landing is issued again while the screen settles; then the user owns it.
     @State private var scrollTarget: ScrollTarget?
 
     /// Reads every other copy the thread loaded of an email the chat shows, the first time it
@@ -802,6 +809,13 @@ struct ChatThreadView: View {
         TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)
     }
 
+    /// Debug-gated: each build of the ready card's content, with the draft it names.
+    static func logReadyCard(_ ready: ChatReadyReply) {
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) cachedReplyLen=\(ready.message.cachedReply?.count ?? -1)")
+        }
+    }
+
     /// A tap on the AI Suggestion: the Reply All compose card with it written out (the suggestion
     /// shows only while the reply goes to everyone). In the tutorial only the step that asks for it
     /// opens the card.
@@ -809,6 +823,9 @@ struct ChatThreadView: View {
         if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion {
             _ = TutorialCoordinator.shared.admits(.other)
             return
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Chat] openSuggestion message=\(newest.id) alreadyOpen=\(readyReply != nil)")
         }
         readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
             replyAllTo: newest, accounts: context.accounts))

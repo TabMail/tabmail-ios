@@ -676,7 +676,7 @@ struct ChatThreadViewLifecycleTests {
                              ghost: ghost.frame,
                              belowScreen: Self.below(scroll),
                              fieldTexts: Self.textViews(controller.view).map(\.text))
-            stableFor = now == last ? stableFor + 1 : 0
+            stableFor = abs(now.belowScreen) < 2 && now == last ? stableFor + 1 : 0
             last = now
         }
         await queue.clearForTesting()

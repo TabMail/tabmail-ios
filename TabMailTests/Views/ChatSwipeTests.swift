@@ -590,26 +590,49 @@ struct ChatSwipeTests {
 
     // MARK: - The back swipes wait for the rule
 
+    /// A screen that records when its appearance transition has finished.
+    private final class AppearanceProbe: UIViewController {
+        private(set) var hasAppeared = false
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            hasAppeared = true
+        }
+    }
+
+    /// Waits until `screen` has finished appearing. UIKit ends a new window's appearance transition,
+    /// and a push's, on a later pass; presenting or pushing before then unbalances the transitions
+    /// ("Unbalanced calls to begin/end appearance transitions") and the sheet may never show.
+    private static func waitUntilAppeared(_ screen: AppearanceProbe, _ what: String,
+                                          sourceLocation: SourceLocation = #_sourceLocation) async throws {
+        for _ in 0..<500 {
+            if screen.hasAppeared { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(screen.hasAppeared, "control: \(what) has appeared", sourceLocation: sourceLocation)
+    }
+
     /// A real navigation controller with a pushed screen, on screen, so its back swipes are live.
     /// `presented`: the pushed chat lives in a second navigation controller presented as a sheet
-    /// over the first (search opens chats that way).
+    /// over the first (search opens chats that way). Each step waits for the one before it to
+    /// finish appearing, as a user's taps do.
     private static func pushedChat(presented: Bool = false) async throws -> (nav: UINavigationController, window: UIWindow) {
-        // Each stack is whole (list and pushed chat) before it goes on screen, so no push lands
-        // inside an appearance transition.
-        let stack = { let nav = UINavigationController(); nav.setViewControllers([UIViewController(), UIViewController()], animated: false); return nav }
-        let root = presented ? UINavigationController(rootViewController: UIViewController()) : stack()
+        let first = AppearanceProbe()
+        let root = UINavigationController(rootViewController: first)
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.rootViewController = root
         window.makeKeyAndVisible()
-        root.view.layoutIfNeeded()
+        try await waitUntilAppeared(first, "the window's first screen")
         var nav = root
         if presented {
-            nav = stack()
-            // The presentation is in the window only once UIKit calls its completion.
-            await withCheckedContinuation { done in root.present(nav, animated: false) { done.resume() } }
+            let sheetFirst = AppearanceProbe()
+            nav = UINavigationController(rootViewController: sheetFirst)
+            root.present(nav, animated: false)
+            try await waitUntilAppeared(sheetFirst, "the presented stack's first screen")
         }
-        nav.view.layoutIfNeeded()
+        let chat = AppearanceProbe()
+        nav.pushViewController(chat, animated: false)
+        try await waitUntilAppeared(chat, "the pushed chat")
         return (nav, window)
     }
 

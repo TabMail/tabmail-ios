@@ -420,6 +420,130 @@ final class ChatSwipeUITests: XCTestCase {
         return XCTWaiter.wait(for: [shown], timeout: timeout) == .completed
     }
 
+    /// With a reply draft already saved for the email, a tap on the ghost opens the compose card
+    /// with its body: the full suggestion (text only the card shows, never the ghost's), never the
+    /// saved draft's words. Opened, checked and closed three times. While tabmail-ios#1124 is open
+    /// the suggestion box is missing from accessibility every time, deterministically: the compose
+    /// scroll view's class swap happens at its first layout update, before the suggestion arrives
+    /// from `loadDraftOrPrepopulate`'s database reads. That is why the expected failure is strict.
+    /// Only when Use Suggestion can be found does the third open tap it, put the suggestion in the
+    /// body, and Close then Save, leaving the saved draft as it was beside one draft of the card's
+    /// own; otherwise every close discards. A screenshot is attached when the test ends, pass or
+    /// fail, and one more just before any tap on Use Suggestion.
+    func testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody() {
+        let app = launchIntoChatFromSavedDraftFixture()
+        addTeardownBlock {
+            let shot = XCTAttachment(screenshot: app.screenshot())
+            shot.name = "saved-draft-ghost-card"
+            shot.lifetime = .keepAlways
+            self.add(shot)
+        }
+        let ghost = app.descendants(matching: .any)["chat.aiSuggestion"].firstMatch
+        XCTAssertTrue(ghost.waitForExistence(timeout: 10), "control: the ghost shows")
+        // The row's reply changes under the ghost with no refresh: the card must still open with
+        // the reply the user taps, never the row's later text.
+        app.buttons["Rewrite the AI Suggestion"].tap()
+        var usedSuggestion = false
+        for pass in 1...Self.cardOpenPasses {
+            XCTAssertTrue(ghost.waitForExistence(timeout: 10), "control: the ghost shows (pass \(pass))")
+            ghost.tap()
+            XCTAssertTrue(app.buttons["Close"].firstMatch.waitForExistence(timeout: 10), "the card opens (pass \(pass))")
+            XCTAssertTrue(app.buttons["Send"].firstMatch.exists, "the card shows Send (pass \(pass))")
+            let use = app.buttons["Use Suggestion"]
+            // The suggestion box, Dismiss and Use Suggestion: the checks the class swap hides.
+            // Once tabmail-ios#1124 is fixed they pass, and the strict expectation turns this red.
+            // The helper stops at the first failure; an expected one must not end the test, so the
+            // later passes, the discard path, the drag back and the Drafts marker still run.
+            continueAfterFailure = true
+            XCTExpectFailure("tabmail-ios#1124: the compose scroll view's class swap hides the AI Suggestion box from accessibility", strict: true) {
+                XCTAssertTrue(use.waitForExistence(timeout: 10), "the card opens and shows Use Suggestion (pass \(pass))")
+                XCTAssertTrue(app.buttons["Dismiss"].exists, "the card shows Dismiss (pass \(pass))")
+                // The full reply's closing line: only the card shows it, never the ghost's text message.
+                let box = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
+                    Self.cardOnlyText, Self.cardOnlyText)).firstMatch
+                XCTAssertTrue(box.exists, "the card shows its suggestion box (pass \(pass))")
+            }
+            continueAfterFailure = false
+            // While tabmail-ios#1124 hides the box these two cannot fail: those words could only
+            // appear inside the box. The invariant that the card never shows them rests on the hosted
+            // seam test (ComposeSuggestionPersistTests.cardShowsTheTappedSuggestionNotTheRowsLaterReply).
+            XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
+                Self.savedDraftWords, Self.savedDraftWords)).firstMatch.exists, "never the saved draft's words (pass \(pass))")
+            XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
+                Self.rewrittenWords, Self.rewrittenWords)).firstMatch.exists, "never the row's rewritten reply (pass \(pass))")
+            // Steps that need a tap on Use Suggestion run only while the button can be found
+            // (tabmail-ios#1124); never a tap by coordinate.
+            guard pass == Self.cardOpenPasses, use.exists else {
+                closeCard(in: app, saving: false)
+                continue
+            }
+            let before = XCTAttachment(screenshot: app.screenshot())
+            before.name = "saved-draft-ghost-card-before-use"
+            before.lifetime = .keepAlways
+            add(before)
+            use.tap()
+            let editor = app.textViews.matching(NSPredicate(format: "value CONTAINS %@", Self.cardOnlyText)).firstMatch
+            XCTAssertTrue(editor.waitForExistence(timeout: 5), "Use Suggestion fills the body")
+            XCTAssertTrue(editor.isHittable, "the body editor is on screen")
+            XCTAssertFalse(app.textViews.matching(NSPredicate(format: "value CONTAINS %@", Self.savedDraftWords)).firstMatch.exists,
+                           "never the saved draft's words in the body")
+            closeCard(in: app, saving: true)
+            usedSuggestion = true
+        }
+        // Back on the fixture's list, which reads Drafts again: the saved draft keeps its words and
+        // was never saved over. When Use Suggestion was tapped and saved, the card saved one draft
+        // of its own, holding the suggestion; otherwise every close discarded, so it saved none.
+        dragFromEdge(atY: app.frame.height / 2, in: app)
+        XCTAssertTrue(wentBack(app), "an edge drag goes back to the fixture list")
+        let marker = app.staticTexts["fixture.savedDraft"]
+        XCTAssertTrue(marker.waitForExistence(timeout: 10))
+        let expected = usedSuggestion
+            ? "Saved draft kept: yes; separate replies: 1; holding the suggestion: 1"
+            : "Saved draft kept: yes; separate replies: 0; holding the suggestion: 0"
+        let after = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", expected), object: marker)
+        XCTAssertEqual(XCTWaiter.wait(for: [after], timeout: 5), .completed, "the saved draft stays in Drafts: \(marker.label)")
+    }
+
+    /// How many times the saved-draft test opens and checks the card.
+    private static let cardOpenPasses = 3
+
+    /// Launches the saved-draft fixture and checks, before Open chat, that the reply draft is saved.
+    private func launchIntoChatFromSavedDraftFixture() -> XCUIApplication {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test", "--chat-swipe-saved-draft"]
+        // Every run proves the card asks for no Contacts access, even on a simulator that answered.
+        app.resetAuthorizationStatus(for: .contacts)
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Chat swipe fixture"].waitForExistence(timeout: 20))
+        let marker = app.staticTexts["fixture.savedDraft"]
+        XCTAssertTrue(marker.waitForExistence(timeout: 5), "control: the fixture shows what Drafts holds")
+        XCTAssertEqual(marker.label, "Saved draft kept: yes; separate replies: 0; holding the suggestion: 0", "control: the reply draft is saved")
+        app.buttons["Open chat"].tap()
+        XCTAssertTrue(subject(in: app).waitForExistence(timeout: 10))
+        XCTAssertTrue(bubble(3, in: app).waitForExistence(timeout: 10))
+        return app
+    }
+
+    /// Closes the compose card; when it asks to save, Save or Discard.
+    private func closeCard(in app: XCUIApplication, saving: Bool) {
+        app.buttons["Close"].firstMatch.tap()
+        let prompt = app.alerts["Save Draft?"]
+        if prompt.waitForExistence(timeout: 3) {
+            prompt.buttons[saving ? "Save" : "Discard"].tap()
+        } else {
+            XCTAssertFalse(saving, "Close asks to save once the body holds the suggestion")
+        }
+        XCTAssertTrue(app.buttons["Close"].waitForNonExistence(timeout: 5), "the card closes")
+    }
+
+    /// The fixture's saved draft (`ChatSwipeTestScene`).
+    private static let savedDraftWords = "My own words, not sent yet"
+    /// The full reply's closing line, which the card's suggestion box shows and the ghost does not.
+    private static let cardOnlyText = "Thanks."
+    /// The fixture's quiet rewrite of the row's reply (`ChatSwipeTestScene.rewrittenReply`).
+    private static let rewrittenWords = "A rewritten reply."
+
     func testOpenActionsTapOnAnotherBubbleClosesAndDropsTheKeyboard() {
         let app = launchIntoChat()
         let field = replyField(in: app)

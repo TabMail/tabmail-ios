@@ -25,6 +25,8 @@ struct ChatSwipeTestScene: View {
     @State private var showsSheet = false
     @State private var mailbox: String?
     @State private var pushedId: String?
+    /// `--chat-swipe-saved-draft`: what Drafts holds for the fixture, read each time the list shows.
+    @State private var draftMarker = ""
     /// The tutorial variant's chat: Priya's practice email.
     @State private var practiceId: String?
     private let inSheet = ProcessInfo.processInfo.arguments.contains("--chat-swipe-in-sheet")
@@ -38,6 +40,12 @@ struct ChatSwipeTestScene: View {
     /// jump button is tapped, while its scroll animates.
     nonisolated private static let suggestionOnJump = ProcessInfo.processInfo.arguments.contains("--chat-swipe-suggestion-on-jump")
     private let tutorialCard = ProcessInfo.processInfo.arguments.contains("--chat-swipe-tutorial-card")
+    /// `--chat-swipe-saved-draft`: the newest email has its AI Suggestion from the start, and a reply
+    /// draft is already saved for it under its usual reply key (`Draft.draftKey(replyTo:)`), so the
+    /// ghost's card opens next to a saved draft it must leave alone.
+    nonisolated private static let savedDraft = ProcessInfo.processInfo.arguments.contains("--chat-swipe-saved-draft")
+    /// The saved draft's words.
+    nonisolated static let savedDraftBody = "My own words, not sent yet"
     nonisolated private static let accountID = "chat-swipe-fixture"
     nonisolated private static let count = 4
     /// The email "Remove a bubble" takes out of the chat.
@@ -57,6 +65,10 @@ struct ChatSwipeTestScene: View {
     nonisolated private static let readyAtOpen = ProcessInfo.processInfo.arguments.contains("--chat-swipe-ready")
     /// The late AI Suggestion's text message.
     nonisolated static let lateSuggestion = "Sounds good, see you Tuesday."
+    /// The newest email's full AI Suggestion, as the fixture writes it.
+    nonisolated static let fullReply = "Hello,\n\n\(lateSuggestion)\n\nThanks."
+    /// What "Rewrite the AI Suggestion" puts in the newest row's reply, unannounced.
+    nonisolated static let rewrittenReply = "Hello,\n\nA rewritten reply.\n\nRegards."
 
     var body: some View {
         Group {
@@ -98,6 +110,14 @@ struct ChatSwipeTestScene: View {
                         Button("Release the AI Suggestion") { Task { await Self.writeSuggestion() } }
                             .padding()
                     }
+                } else if Self.savedDraft {
+                    // Below the whole stack, like the other strips. Rewrites the newest row's reply
+                    // with no `.messageDataDidChange`, so the ghost keeps the reply the user taps.
+                    VStack(spacing: 0) {
+                        NavigationStack { list }
+                        Button("Rewrite the AI Suggestion") { Task { await Self.rewriteSuggestionQuietly() } }
+                            .padding()
+                    }
                 } else {
                     NavigationStack { list }
                 }
@@ -125,8 +145,30 @@ struct ChatSwipeTestScene: View {
             if !tutorialCard {
                 Button(armed ? "Removal armed" : "Remove a bubble") { arm() }
             }
+            if Self.savedDraft {
+                // Never the draft's words: a test reads that they stay out of the card.
+                Text(draftMarker).accessibilityIdentifier("fixture.savedDraft")
+            }
         }
         .navigationTitle("Fixture list")
+        .onAppear { Task { await readDrafts() } }
+    }
+
+    /// "Saved draft kept: yes" while the saved reply draft holds its words and was never saved
+    /// over, how many drafts the card saved under keys of their own, and how many of those hold the
+    /// full AI Suggestion. Counts only: never any draft's words.
+    private func readDrafts() async {
+        guard Self.savedDraft else { return }
+        let accountID = Self.accountID
+        let (kept, separate, holding) = (try? await AppDatabase.dbPool.read { db -> (Bool, Int, Int) in
+            let drafts = try Draft.filter(Column("accountId") == accountID).fetchAll(db)
+            let kept = drafts.contains {
+                !$0.id.hasPrefix(Draft.separateReplyPrefix) && $0.body == Self.savedDraftBody && $0.updatedAt == $0.createdAt
+            }
+            let own = drafts.filter { $0.id.hasPrefix(Draft.separateReplyPrefix) }
+            return (kept, own.count, own.filter { $0.body.contains(Self.fullReply) }.count)
+        }) ?? (false, -1, -1)
+        draftMarker = "Saved draft kept: \(kept ? "yes" : "no"); separate replies: \(separate); holding the suggestion: \(holding)"
     }
 
     private static func headerId(_ index: Int) -> String {
@@ -150,12 +192,22 @@ struct ChatSwipeTestScene: View {
         let id = headerId(count - 1)
         _ = try? await AppDatabase.dbPool.write { db in
             guard var header = try MessageHeader.fetchOne(db, key: id) else { return }
-            header.cachedReply = "Hello,\n\n\(lateSuggestion)\n\nThanks."
+            header.cachedReply = fullReply
             header.replyTextMessage = lateSuggestion
             try header.save(db)
         }
         NSLog("[cv9diag] late suggestion written")
         NotificationCenter.default.post(name: .messageDataDidChange, object: id)
+    }
+
+    /// Rewrites the newest row's reply with no `.messageDataDidChange`: the open chat is not told,
+    /// so its ghost still holds the reply it showed, and a tap must open the card with that one.
+    private static func rewriteSuggestionQuietly() async {
+        let id = headerId(count - 1)
+        _ = try? await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
+                           arguments: [rewrittenReply, id])
+        }
     }
 
     /// The tutorial variant: a real chat-view run of Part 2 on the real demo seed, as
@@ -198,6 +250,7 @@ struct ChatSwipeTestScene: View {
             try await AppDatabase.dbPool.write { db in
                 // Each launch owns only this synthetic account's fixture rows.
                 try MessageHeader.filter(Column("accountId") == accountID).deleteAll(db)
+                if Self.savedDraft { try Draft.filter(Column("accountId") == accountID).deleteAll(db) }
                 var account = Account(emailAddress: "me@example.com", displayName: "Chat swipe fixture", provider: .imap)
                 account.id = accountID
                 try account.save(db)
@@ -234,9 +287,27 @@ struct ChatSwipeTestScene: View {
                     header.summaryTextMessage = index == 0 && Self.tall
                         ? "Note 0: " + String(repeating: "A long line that fills the screen. ", count: 80)
                         : "Note \(index): a short line."
+                    if Self.savedDraft, index == Self.count - 1 {
+                        header.cachedReply = Self.fullReply
+                        header.replyTextMessage = Self.lateSuggestion
+                    }
                     try header.save(db)
+                    if Self.savedDraft, index == Self.count - 1 {
+                        let key = Draft.draftKey(replyTo: "\(accountID):\(header.stableId)", isForward: false, newId: nil)
+                        let stamp = now.timeIntervalSince1970
+                        try Draft.deleteOne(db, key: key)
+                        try Draft(
+                            id: key, accountId: accountID,
+                            toJSON: "[\"sender\(index)@example.com\"]", ccJSON: "[]", bccJSON: "[]",
+                            subject: "Re: Swipe fixture lunch", body: Self.savedDraftBody,
+                            replyToId: header.id, isForward: false, editHistoryJSON: nil,
+                            createdAt: stamp, updatedAt: stamp,
+                            serverDraftId: nil, serverPushStatus: nil,
+                            rfc822MessageId: nil, attachmentsDirName: nil).insert(db)
+                    }
                 }
             }
+            await readDrafts()
             status = "Fixture ready"
             ready = true
         } catch {
