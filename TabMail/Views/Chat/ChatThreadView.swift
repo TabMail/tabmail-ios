@@ -347,7 +347,8 @@ struct ChatThreadView: View {
             // through it (Messages).
             .safeAreaBar(edge: .top, spacing: 0) {
                 VStack(spacing: 0) {
-                    ChatSubjectLine(subject: subject(thread), labels: context.labels)
+                    ChatSubjectLine(subject: subject(thread), labels: context.labels, landed: didInitialScroll,
+                                    reportContent: { AISummariesNotice.reportContent(items: thread.items, unsent: unsentReplies) })
                     tutorialCard(thread)
                 }
                 // The open swipe is reachable only below the header.

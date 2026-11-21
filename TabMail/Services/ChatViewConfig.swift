@@ -79,6 +79,13 @@ enum ChatViewLayout {
     static let subjectLineSpacing: CGFloat = 2
     /// Room under the subject line, inside the header's bar, so its letters clear the bar's edge.
     static let subjectLineBottomGap: CGFloat = 6
+    /// The AI summaries glyph at the subject line's trailing edge, before Dynamic Type scales it.
+    static let aiNoticeGlyphSize: CGFloat = 13
+    /// Its tap target, full size whatever the glyph's size (Apple's 44-point minimum).
+    static let aiNoticeTapTarget: CGFloat = 44
+    /// The popover's width and the room between its title, note and report button.
+    static let aiNoticeWidth: CGFloat = 300
+    static let aiNoticeSpacing: CGFloat = 10
     /// The jump-to-bottom button shows once the bottom is this far below the screen.
     static let jumpButtonThreshold: CGFloat = 240
     static let jumpButtonSize: CGFloat = 40
