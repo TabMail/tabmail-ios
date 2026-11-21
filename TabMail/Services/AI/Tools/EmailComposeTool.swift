@@ -19,6 +19,12 @@ struct EmailComposeTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        try await execute(arguments: arguments, invocation: .noninteractive)
+    }
+
+    /// `invocation.composeOrigin`: the chat that asked, where the compose card opens
+    /// (ADR-IOS-053 Phase 2). Without one no screen can open it, so the tool fails fast.
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         // Parse recipients
         let to = Self.parseStringArray(arguments["to"]) ?? Self.parseStringArray(arguments["recipients"]) ?? []
         let cc = Self.parseStringArray(arguments["cc"]) ?? []
@@ -50,6 +56,9 @@ struct EmailComposeTool: AgentTool, Sendable {
 
         if to.isEmpty {
             return ComposeOutcome.failed("recipients parameter is required and must contain at least one recipient").describeForLLM
+        }
+        guard let origin = invocation.composeOrigin else {
+            return ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM
         }
 
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] Opening compose: to=\(to) cc=\(cc) subject=\(subject ?? "(none)") bodyLen=\(body?.count ?? 0) requestLen=\(composeRequest?.count ?? 0)") }
@@ -86,6 +95,7 @@ struct EmailComposeTool: AgentTool, Sendable {
                 bcc: bcc,
                 subject: generatedSubject,
                 body: generatedBody,
+                origin: origin,
                 onOutcome: onOutcome,
                 outcomeState: state
             )

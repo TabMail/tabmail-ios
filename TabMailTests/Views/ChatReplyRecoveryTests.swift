@@ -127,7 +127,6 @@ struct ChatReplyRecoveryTests {
         await queue.clearForTesting()
         let router = AgentToolRouter.shared
         router.resetComposeQueueForTesting()
-        router.pendingCompose = nil
         ChatPillState.shared.removeAllSessions()
         ChatPillState.shared.aiService = backend.service
         defer {
@@ -135,7 +134,6 @@ struct ChatReplyRecoveryTests {
             ChatPillState.shared.removeAllSessions()
             backend.http.close()
             router.resetComposeQueueForTesting()
-            router.pendingCompose = nil
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }

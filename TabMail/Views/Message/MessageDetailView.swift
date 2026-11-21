@@ -316,14 +316,9 @@ struct MessageDetailView: View {
         .fullScreenCover(item: $forwardMessage) { msg in
             ComposeView(replyTo: msg, isForward: true)
         }
+        // The email screen chat's own compose cards, taken by its pill (ADR-IOS-053 Phase 2).
         .fullScreenCover(item: $agentCompose) { req in
             composeViewForAgentRequest(req)
-        }
-        .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
-            if newId != nil {
-                agentCompose = AgentToolRouter.shared.pendingCompose
-                AgentToolRouter.shared.pendingCompose = nil
-            }
         }
         .sheet(item: $moveMessage) { msg in
             MoveFolderPicker(accountId: msg.accountId, currentFolderPath: msg.folderPath) { destinationPath in
@@ -594,7 +589,7 @@ struct MessageDetailView: View {
 
                 DynamicIslandChat(message: chatContextMessage ?? message, isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
                     showAgentToast(text)
-                })
+                }, onAgentCompose: { agentCompose = $0 })
 
                 Menu {
                     RestrictedMailActionButton(

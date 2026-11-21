@@ -687,16 +687,19 @@ struct ChatReplyFieldTests {
         let tool = EmailReplyTool(context: ToolContext(db: db, translator: translator, router: router))
         var fieldReply: ChatFieldReply?
         if case .field(let onlyTo) = origin { fieldReply = ChatFieldReply(emailKey: ChatThread.copyKey(header), onlyTo: onlyTo) }
-        let invocation = ToolInvocation(fieldReply: fieldReply)
+        // Asked in the chat view, which takes the request (ADR-IOS-053 Phase 2).
+        let asked = ComposeOrigin(sessionKey: "thread:chat", screen: .chat)
+        let invocation = ToolInvocation(fieldReply: fieldReply, composeOrigin: asked)
         let task = Task { @MainActor () -> String in
             try await tool.execute(
                 arguments: ["unique_id": .int(1), "body": .string("Friday works")].merging(arguments) { $1 }, invocation: invocation)
         }
         defer { task.cancel() }
         var pending: AgentToolRouter.ComposeRequest?
+        let host = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [asked.sessionKey])
         let deadline = Date().addingTimeInterval(5)
         while pending == nil, Date() < deadline {
-            pending = router.pendingCompose
+            pending = router.takeCompose(for: host)
             await Task.yield()
         }
         let req = try #require(pending, "the tool opens a reply")
@@ -830,7 +833,10 @@ struct ChatReplyFieldTests {
                 "no card decides the kind or the Reply All recipients itself; the one call left is the header's people")
         // A card from a field request: the agent's closing words open nothing; a field send starts afresh.
         #expect(Self.count("fieldComposeOpened = req.fieldReply != nil", in: chat) == 1)
-        #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false })", in: chat) == 1)
+        #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false }, onAgentCompose: openAgentCompose)", in: chat) == 1)
+        // The card and fieldComposeOpened are set only for a request this chat's own pill took
+        // (ADR-IOS-053 Phase 2; ChatComposeRoutingTests runs it with the inbox and the email screen mounted).
+        #expect(Self.count("private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) { fieldComposeOpened = req.fieldReply != nil agentCompose = ChatAgentCard(", in: chat) == 1)
         #expect(Self.count("private func agentAnswered() { guard !fieldComposeOpened else { return }", in: chat) == 1)
         #expect(Self.count("fieldComposeOpened = true", in: chat) == 0)
         #expect(Self.count("if replyTo != nil { replyTarget = .replyAll }", in: chat) == 1, "a sent reply clears it")
@@ -845,12 +851,25 @@ struct ChatReplyFieldTests {
         #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) }", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
         #expect(Self.count("let fieldReply = field?.fieldReply", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)", in: island) == 1,
+        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply, composeOrigin: origin)", in: island) == 1,
                 "and travel with the request to the agent's tools")
+        // With the chat that asked, read as the send starts; the field's request belongs to the chat view.
+        #expect(Self.count("let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)", in: island) == 1)
+        #expect(Self.count("return ComposeOrigin(sessionKey: sessionKey, screen: fieldReply != nil ? .chat : screen)", in: island) == 1)
         // A recovered send keeps them: the resume carries the cut-off send's request, the retry the
         // failed send as it was sent (ChatReplyRecoveryTests sends both through the real chat).
         #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply)", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply)", in: island) == 1)
+        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply, composeOrigin: origin)", in: island) == 1)
+        #expect(Self.count("let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: resume.fieldReply)", in: island) == 1)
+        // No screen takes another screen's compose request: no global slot is left to race for.
+        for path in ["TabMail/Views/Chat/ChatThreadView.swift", "TabMail/Views/Inbox/InboxView.swift", "TabMail/Views/Message/MessageDetailView.swift"] {
+            let text = try Self.source(path)
+            #expect(Self.count("pendingCompose", in: text) == 0, "\(path) takes compose requests only through its pill")
+        }
+        let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
+        let detail = try Self.source("TabMail/Views/Message/MessageDetailView.swift")
+        #expect(Self.count("onAgentCompose: { agentCompose = $0 })", in: inbox) == 1)
+        #expect(Self.count("onAgentCompose: { agentCompose = $0 })", in: detail) == 1)
         #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply)", in: island) == 1)
         #expect(Self.count("lastFailedSend = .init(text: text, field: field)", in: island) == 1)
         #expect(Self.count("sendAgentChat(failed.text, field: failed.field)", in: island) == 1)

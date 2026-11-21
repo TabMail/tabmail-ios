@@ -642,7 +642,7 @@ struct InboxView: View {
                 if !DemoModeStore.shared.hidesAIContent {
                     DynamicIslandChat(isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
                         showAgentToast(text, sessionKey: "inbox")
-                    })
+                    }, onAgentCompose: { agentCompose = $0 })
                 }
 
                 if !chatExpanded && sideButtonsReady {
@@ -875,14 +875,9 @@ struct InboxView: View {
         .fullScreenCover(item: $draftOpen) { open in
             DraftComposePresenter(source: open.source)
         }
+        // The inbox chat's own compose cards, taken by its pill (ADR-IOS-053 Phase 2).
         .fullScreenCover(item: $agentCompose) { req in
             composeViewForAgentRequest(req)
-        }
-        .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
-            if newId != nil {
-                agentCompose = AgentToolRouter.shared.pendingCompose
-                AgentToolRouter.shared.pendingCompose = nil
-            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .agentSessionDidFinish).receive(on: DispatchQueue.main)) { notification in
             guard let sessionKey = notification.userInfo?["sessionKey"] as? String else { return }

@@ -32,7 +32,7 @@ extension ComposeOutcome {
 /// Shared reference-type state attached to each `AgentToolRouter.ComposeRequest`.
 /// Gives the helper's outcome closure a stable identity to guard against
 /// double-resume (ComposeView's `send()` + `.onDisappear` both firing) and
-/// also lets `dispatchNextIfIdle()` skip requests whose Task was cancelled
+/// also lets `takeCompose(for:)` drop requests whose Task was cancelled
 /// before the window ever appeared.
 ///
 /// Thread-safe: `tryResolve(_:)` is invoked from MainActor ComposeView callbacks
@@ -119,17 +119,19 @@ final class RecentlyCompletedComposeCache {
 
 /// Router for FSM-style agent tools that trigger UI actions (compose/reply/forward).
 /// Matching TB's FSM pattern: tool fires → UI opens → tool returns status message.
-/// On iOS, the FSM is simpler: we set `pendingCompose` and the hosting view
-/// (InboxView / MessageDetailView) observes it and presents ComposeView.
+/// On iOS, a compose tool queues a `ComposeRequest` stamped with the chat that asked
+/// (`ComposeOrigin`); that chat's pill takes it (`takeCompose(for:)`) and its screen
+/// presents ComposeView (ADR-IOS-053 Phase 2).
 @MainActor @Observable
 final class AgentToolRouter {
     static let shared = AgentToolRouter()
 
-    /// Currently-active compose request awaiting capture by a hosting view
-    /// (`InboxView` / `MessageDetailView`). Written only by `dispatchNextIfIdle()`;
-    /// nilled by the consuming view after capture. External callers MUST NOT write
-    /// this directly — use `enqueueCompose(_:)` to respect FIFO ordering. See ADR-IOS-030.
-    var pendingCompose: ComposeRequest?
+    /// Bumped whenever a queued compose request may have become takeable: a request
+    /// was queued, or the last compose window closed. The only observable compose
+    /// state: every host pill watches it and asks `takeCompose(for:)` for its own
+    /// requests, so no view ever takes another screen's request (ADR-IOS-053 Phase 2,
+    /// replacing the global `pendingCompose` slot that the first observer took).
+    private(set) var composeOffer = 0
 
     /// Short-TTL cache of recently-successful sends keyed by the replied/forwarded
     /// message. See `RecentlyCompletedComposeCache` for rationale.
@@ -138,11 +140,12 @@ final class AgentToolRouter {
 
     // MARK: - Compose FIFO Queue (ADR-IOS-030)
 
-    /// FIFO queue of agent compose requests waiting for the compose UI to be free.
-    /// In-memory only; lost on app kill (acceptable — agent compose tool calls are
-    /// transient session intent, not durable user actions). See ADR-IOS-030.
+    /// FIFO queue of agent compose requests waiting for the compose UI to be free
+    /// and for the screen that asked to take them. In-memory only; lost on app kill
+    /// (acceptable — agent compose tool calls are transient session intent, not
+    /// durable user actions). See ADR-IOS-030.
     /// Marked `@ObservationIgnored` because no view should observe queue contents —
-    /// only `pendingCompose` is the public observable handoff slot.
+    /// only `composeOffer` is observable.
     @ObservationIgnored private var composeQueue: [ComposeRequest] = []
 
     /// Number of currently-presented `ComposeView` instances, tracked via the
@@ -151,23 +154,52 @@ final class AgentToolRouter {
     /// increment the count, so a manual compose blocks queued agent compose requests.
     @ObservationIgnored private var presentationCount: Int = 0
 
-    /// True between the moment a request is dispatched (`pendingCompose` set) and the
+    /// True between the moment a host takes a request (`takeCompose(for:)`) and the
     /// moment its `ComposeView` actually appears on screen (`composePresentationDidBegin`).
-    /// Closes a race window: the view nils `pendingCompose` synchronously in its `onChange`
-    /// handler before the cover finishes presenting, leaving a brief gap where both
-    /// `pendingCompose == nil` and `presentationCount == 0` are true even though a request
-    /// is mid-dispatch. Without this flag, a second `enqueueCompose` arriving in that
-    /// window would overwrite the in-flight request and lose it.
+    /// Closes a race window: the host's cover is still presenting, so
+    /// `presentationCount == 0` even though a request is mid-dispatch. Without this
+    /// flag, another host could take a second request in that window and present a
+    /// second compose window over the first.
     @ObservationIgnored private var awaitingAppear: Bool = false
 
-    /// Enqueue a compose request from an agent tool. Fire-and-forget — the tool returns
-    /// immediately and the queue dispatches asynchronously as compose windows free up.
-    /// If no compose UI is currently presented and no prior request is mid-dispatch,
-    /// the request is dispatched immediately. Otherwise it waits its turn FIFO.
-    /// See ADR-IOS-030.
+    /// The screen a host pill stands for, asking for its compose requests: its screen
+    /// kind and the keys of the chat it shows (own key first, then the thread's).
+    struct ComposeHost: Equatable {
+        let screen: ComposeOrigin.Screen
+        let sessionKeys: [String]
+
+        /// Whether `origin` asked this host: the same kind of screen showing the chat that asked.
+        func asked(_ origin: ComposeOrigin) -> Bool {
+            origin.screen == screen && sessionKeys.contains(origin.sessionKey)
+        }
+    }
+
+    /// Enqueue a compose request from an agent tool. The request waits in FIFO order
+    /// until no compose UI is presented and the screen that asked takes it
+    /// (`takeCompose(for:)`); the offer tells every host pill to look. See ADR-IOS-030.
     func enqueueCompose(_ request: ComposeRequest) {
         composeQueue.append(request)
-        dispatchNextIfIdle()
+        composeOffer += 1
+    }
+
+    /// The oldest queued request `host` asked for, removed from the queue, or nil.
+    /// Nil while a compose UI is presented (`presentationCount > 0`) or a taken
+    /// request's window has not appeared yet (`awaitingAppear`): one compose window at
+    /// a time (ADR-IOS-030). Requests other screens asked for are left in place and
+    /// never block this one; a request whose screen is not showing waits until it is,
+    /// or until its tool is cancelled.
+    ///
+    /// First drops every queued request whose Task was cancelled before it was taken
+    /// (`outcomeState.resolved`, flipped by `enqueueComposeAndAwaitOutcome`'s
+    /// `onCancel` handler): presenting a compose window for a tool that already
+    /// returned would leave the user confused and the follow-on `onOutcome` calls
+    /// dangling.
+    func takeCompose(for host: ComposeHost) -> ComposeRequest? {
+        guard !awaitingAppear, presentationCount == 0 else { return nil }
+        composeQueue.removeAll { $0.outcomeState.resolved }
+        guard let index = composeQueue.firstIndex(where: { host.asked($0.origin) }) else { return nil }
+        awaitingAppear = true
+        return composeQueue.remove(at: index)
     }
 
     /// Called by `ComposeView.onAppear`. Marks the compose UI as busy so the queue holds
@@ -178,35 +210,14 @@ final class AgentToolRouter {
         awaitingAppear = false
     }
 
-    /// Called by `ComposeView.onDisappear`. When all compose UI is gone, dispatches
-    /// the next queued request (if any) so it presents immediately after the previous
-    /// window's dismissal animation completes.
+    /// Called by `ComposeView.onDisappear`. When all compose UI is gone, offers the
+    /// queue again so the next request presents right after the previous window's
+    /// dismissal, on the screen that asked for it.
     func composePresentationDidEnd() {
         presentationCount = max(0, presentationCount - 1)
         if presentationCount == 0 {
-            dispatchNextIfIdle()
+            composeOffer += 1
         }
-    }
-
-    /// Pop the next queued compose request and publish it via `pendingCompose`,
-    /// triggering the existing onChange/fullScreenCover machinery in InboxView/MessageDetailView.
-    /// No-ops when a compose UI is currently presented (`presentationCount > 0`),
-    /// a previous dispatch is mid-flight (`awaitingAppear == true`), the slot is occupied
-    /// (`pendingCompose != nil`), or the queue is empty.
-    ///
-    /// Also skips any leading queue entries whose Task was cancelled before
-    /// dispatch (their `outcomeState.resolved` was flipped by
-    /// `enqueueComposeAndAwaitOutcome`'s `onCancel` handler). Presenting a
-    /// compose window for a tool that already returned would leave the user
-    /// confused and the follow-on `onOutcome` calls dangling.
-    private func dispatchNextIfIdle() {
-        guard !awaitingAppear, pendingCompose == nil, presentationCount == 0 else { return }
-        while composeQueue.first?.outcomeState.resolved == true {
-            composeQueue.removeFirst()
-        }
-        guard !composeQueue.isEmpty else { return }
-        awaitingAppear = true
-        pendingCompose = composeQueue.removeFirst()
     }
 
     /// Test-only: number of requests currently waiting in the FIFO queue.
@@ -215,12 +226,12 @@ final class AgentToolRouter {
     /// Test-only: current presentation count (number of `ComposeView`s on screen).
     var composePresentationCount: Int { presentationCount }
 
-    /// Test-only: whether a request is mid-dispatch (set, but cover not yet appeared).
+    /// Test-only: whether a request is mid-dispatch (taken, but cover not yet appeared).
     var composeAwaitingAppear: Bool { awaitingAppear }
 
     /// Test-only: is the head-of-queue request already resolved (cancelled before
-    /// dispatch)? Returns `nil` when the queue is empty. Exposes what tests need
-    /// to verify the stale-skip behavior in `dispatchNextIfIdle` without leaking
+    /// it was taken)? Returns `nil` when the queue is empty. Exposes what tests need
+    /// to verify the stale-drop behavior in `takeCompose(for:)` without leaking
     /// the full `ComposeRequest` type across the test boundary.
     var firstQueuedRequestResolvedForTesting: Bool? {
         composeQueue.first?.outcomeState.resolved
@@ -229,8 +240,7 @@ final class AgentToolRouter {
     /// Test-only: the request at the head of the queue, as the compose that takes it will read it.
     var firstQueuedRequestForTesting: ComposeRequest? { composeQueue.first }
 
-    /// Test-only: reset queue + counters between tests. Does NOT touch `pendingCompose`
-    /// so existing tests are unaffected.
+    /// Test-only: reset queue + counters between tests.
     func resetComposeQueueForTesting() {
         composeQueue.removeAll()
         presentationCount = 0
@@ -255,6 +265,10 @@ final class AgentToolRouter {
         let bcc: [String]
         let subject: String?
         let body: String?
+        /// The chat that asked (ADR-IOS-053 Phase 2): only a pill of that screen kind
+        /// showing that chat takes the request (`takeCompose(for:)`), so the card opens
+        /// on the screen that asked, built by that screen.
+        let origin: ComposeOrigin
         /// A `.reply` built from the reply-all recipient set (the AI reply
         /// tool). Carried into ComposeView so the send records reply-all on
         /// the original, like the Reply All button (#915).
@@ -271,8 +285,8 @@ final class AgentToolRouter {
         let onOutcome: @MainActor (ComposeOutcome) -> Void
 
         /// Shared idempotence + staleness flag. Threaded into the request by
-        /// `enqueueComposeAndAwaitOutcome` so `dispatchNextIfIdle` can skip
-        /// requests whose Task was cancelled before dispatch.
+        /// `enqueueComposeAndAwaitOutcome` so `takeCompose(for:)` can drop
+        /// requests whose Task was cancelled before they were taken.
         let outcomeState: ComposeOutcomeState
 
         init(
@@ -283,6 +297,7 @@ final class AgentToolRouter {
             bcc: [String],
             subject: String?,
             body: String?,
+            origin: ComposeOrigin,
             isReplyAll: Bool = false,
             fieldReply: ChatFieldReply? = nil,
             onOutcome: @escaping @MainActor (ComposeOutcome) -> Void = { _ in },
@@ -295,6 +310,7 @@ final class AgentToolRouter {
             self.bcc = bcc
             self.subject = subject
             self.body = body
+            self.origin = origin
             self.isReplyAll = isReplyAll
             self.fieldReply = fieldReply
             self.onOutcome = onOutcome
@@ -575,8 +591,8 @@ extension AgentToolRouter {
     /// The `make` closure receives both a one-shot `onOutcome` callback and
     /// the shared `ComposeOutcomeState` instance; threading both into the
     /// returned `ComposeRequest` keeps the idempotence machinery intact and
-    /// lets `dispatchNextIfIdle()` skip requests whose Task was cancelled
-    /// before dispatch.
+    /// lets `takeCompose(for:)` drop requests whose Task was cancelled
+    /// before they were taken.
     ///
     /// Exactly-once resume is guaranteed by:
     ///   - `ComposeOutcomeState.tryResolve` — atomic first-wins flag
@@ -618,8 +634,8 @@ extension AgentToolRouter {
             // Invoked on an arbitrary thread by the cooperative cancellation
             // machinery, potentially *before* the operation closure runs (see
             // cancellation-before-entry case above). `tryResolve` flips
-            // `resolved` atomically so the dispatcher's stale-skip in
-            // `dispatchNextIfIdle()` sees a consistent value, and
+            // `resolved` atomically so the stale-drop in
+            // `takeCompose(for:)` sees a consistent value, and
             // `ComposeContinuationGuard.resume` is idempotent — so we always
             // call resume rather than gating on tryResolve (which the
             // in-operation path may have already flipped).

@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note:** **2026-11-21: `pendingCompose` is gone (ADR-IOS-053 Phase 2).** A compose tool queues a `ComposeRequest` stamped with `ComposeOrigin`. The asking screen's `DynamicIslandChat` takes it with `AgentToolRouter.takeCompose(for:)` whenever `composeOffer` moves, its chat keys change, or it comes on screen, and hands it to its host through `onAgentCompose`. The FIFO mechanics below are unchanged. Tests take requests with `takeCompose(for: ComposeTestOrigin.inboxHost)` and run the tools with `ComposeTestOrigin.invocation`; a tool with no origin fails fast.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Agent Compose FIFO Queue (ADR-IOS-030)
 - **Problem solved**: Agent compose tools (`email_compose`, `email_reply`, `email_forward`) used to write directly to `AgentToolRouter.pendingCompose` (single slot). If a compose window was already presented (manual or prior agent), the second request was silently dropped because SwiftUI cannot stack two `fullScreenCover`s from one source view. The LLM still got a success string back.

@@ -266,14 +266,6 @@ struct ChatThreadView: View {
             guard didInitialScroll, isOnScreen else { return }
             askForSummaries()
         }
-        .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
-            guard newId != nil, let req = AgentToolRouter.shared.pendingCompose else { return }
-            // Asked for in a reply field: the agent's closing words open nothing. Who the card goes
-            // to travels with the request (`fieldReply`); this chat's own state decides nothing.
-            fieldComposeOpened = req.fieldReply != nil
-            agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))
-            AgentToolRouter.shared.pendingCompose = nil
-        }
         .sheet(item: $cardMessage) { msg in
             // Today's detail of that email, from the bottom; swipe down to return.
             NavigationStack {
@@ -857,7 +849,8 @@ struct ChatThreadView: View {
                     clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
                     tutorialMove: tutorialMove(thread)),
-                onFieldSend: { _ in fieldComposeOpened = false })
+                onFieldSend: { _ in fieldComposeOpened = false },
+                onAgentCompose: openAgentCompose)
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.replyPillId)
@@ -899,6 +892,15 @@ struct ChatThreadView: View {
             .padding(.vertical, 3)
             .background(Capsule().fill(Palette.boxBg))
             .overlay(Capsule().stroke(Palette.separator, lineWidth: 0.5))
+    }
+
+    /// A compose card this chat's agent asked for, taken by this chat's pill (ADR-IOS-053 Phase 2),
+    /// never one another screen asked for. Asked for in the reply field: the agent's closing words
+    /// open nothing. Who the card goes to travels with the request (`fieldReply`); this chat's own
+    /// state decides nothing.
+    private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
+        fieldComposeOpened = req.fieldReply != nil
+        agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))
     }
 
     /// The agent finished a request from the field with something to say: the sheet rises with

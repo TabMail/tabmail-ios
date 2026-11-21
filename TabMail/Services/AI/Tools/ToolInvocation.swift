@@ -25,16 +25,47 @@ struct ToolInvocation: Sendable {
     /// The agent's reply to that email carries it (`ComposeRequest.fieldReply`); nil for every
     /// other request.
     let fieldReply: ChatFieldReply?
+    /// The chat that sent the request, where a compose card the turn asks for opens (ADR-IOS-053
+    /// Phase 2): only a screen of that kind showing that chat takes the request. Nil when no screen
+    /// can open one; the compose tools then fail fast instead of waiting for a card.
+    let composeOrigin: ComposeOrigin?
 
-    init(uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil, fieldReply: ChatFieldReply? = nil) {
+    init(
+        uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil, fieldReply: ChatFieldReply? = nil,
+        composeOrigin: ComposeOrigin? = nil
+    ) {
         self.uiSink = uiSink
         self.sessionKey = sessionKey
         self.fieldReply = fieldReply
+        self.composeOrigin = composeOrigin
     }
 
     /// The no-UI invocation used by every non-interactive completion caller and
     /// as the `AgentTool` protocol/default fallback.
     static let noninteractive = ToolInvocation(uiSink: nil, sessionKey: nil)
+}
+
+/// Where an agent's compose card opens: the chat session that asked, and the kind of screen it was
+/// asked on (ADR-IOS-053 Phase 2). Captured as the send starts; the compose tools stamp it on their
+/// `AgentToolRouter.ComposeRequest`, and only a pill of that screen kind whose chat holds the session
+/// key takes the request (`AgentToolRouter.takeCompose(for:)`). So the card opens on the screen that
+/// asked, built by that screen, whichever other screens are mounted.
+struct ComposeOrigin: Hashable, Sendable {
+    enum Screen: Hashable, Sendable {
+        /// The inbox's own chat.
+        case inbox
+        /// The email screen (`MessageDetailView`).
+        case email
+        /// The chat view (`ChatThreadView`), whose reply field's choice the card applies.
+        case chat
+    }
+
+    let sessionKey: String
+    let screen: Screen
+
+    /// Why a compose tool invoked with no origin fails fast: no screen could ever take its card,
+    /// so it never waits for one (as a confirmation tool with no sink, ADR-IOS-053).
+    static let noScreenReason = "no chat screen to open the compose window on"
 }
 
 /// MainActor delivery channel owned by exactly one chat session. Replaces the

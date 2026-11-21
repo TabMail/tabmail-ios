@@ -54,6 +54,12 @@ struct DynamicIslandChat: View {
     let replyField: ChatReplyField?
     /// The user's own words went from the field to the agent.
     var onFieldSend: ((String) -> Void)?
+    /// The host presents the agent's compose cards that this pill's chat asked for (ADR-IOS-053
+    /// Phase 2): the pill takes them from the router while it is on screen and hands each one
+    /// here. Nil: the host presents none, and this pill's turns can open no compose card.
+    var onAgentCompose: ((AgentToolRouter.ComposeRequest) -> Void)?
+    /// The pill is on screen, so its host can present the compose cards its chat asked for.
+    @State private var composeHostShown = false
     @Environment(\.hasTabMailSession) var hasTabMailSession
     /// Reply field: the words sent to the agent, shown pulsing while it works.
     @State var fieldSentText: String?
@@ -123,6 +129,38 @@ struct DynamicIslandChat: View {
     private var chatKeys: [String] {
         guard message != nil else { return [sessionKey] }
         return threadKeys.first == sessionKey ? threadKeys : [sessionKey] + threadKeys.filter { $0 != sessionKey }
+    }
+    /// The kind of screen this pill's host is, for the compose cards its chat asks for
+    /// (ADR-IOS-053 Phase 2). Nil when the host presents none (the compose editor's chat, a host
+    /// without `onAgentCompose`).
+    private var composeScreen: ComposeOrigin.Screen? {
+        guard onAgentCompose != nil, composeContext == nil else { return nil }
+        if replyField != nil { return .chat }
+        return message != nil ? .email : .inbox
+    }
+    /// Where a compose card a turn asks for opens, read as the turn starts. A turn carrying the
+    /// reply field's send belongs to the chat view, where the field and the choice it carries live,
+    /// even when it is retried or resumed from another screen of the thread.
+    private func composeOrigin(sessionKey: String, fieldReply: ChatFieldReply?) -> ComposeOrigin? {
+        guard let screen = composeScreen else { return nil }
+        return ComposeOrigin(sessionKey: sessionKey, screen: fieldReply != nil ? .chat : screen)
+    }
+    /// What the pill takes its compose requests on: the router's offer, and the screen it stands
+    /// for while it is on screen (nil off screen, or when its host presents none).
+    private struct ComposeTakeWatch: Equatable {
+        let offer: Int
+        let host: AgentToolRouter.ComposeHost?
+    }
+    private var composeTakeWatch: ComposeTakeWatch {
+        let host = composeHostShown
+            ? composeScreen.map { AgentToolRouter.ComposeHost(screen: $0, sessionKeys: chatKeys) } : nil
+        return ComposeTakeWatch(offer: AgentToolRouter.shared.composeOffer, host: host)
+    }
+    /// Takes the oldest compose request this screen's chat asked for and hands it to the host.
+    private func takeAgentCompose(for host: AgentToolRouter.ComposeHost?) {
+        guard let host, let onAgentCompose,
+              let request = AgentToolRouter.shared.takeCompose(for: host) else { return }
+        onAgentCompose(request)
     }
     /// What the chat shows: about an email, the whole thread's chat (`ThreadChatReader`).
     private var shownMessages: [ChatMessage] {
@@ -250,7 +288,8 @@ struct DynamicIslandChat: View {
         onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?) -> Void)? = nil,
         onAgentReply: ((String) -> Void)? = nil,
         replyField: ChatReplyField? = nil,
-        onFieldSend: ((String) -> Void)? = nil
+        onFieldSend: ((String) -> Void)? = nil,
+        onAgentCompose: ((AgentToolRouter.ComposeRequest) -> Void)? = nil
     ) {
         self.message = message
         self.draftSubject = draftSubject
@@ -275,6 +314,7 @@ struct DynamicIslandChat: View {
         self.onAgentReply = onAgentReply
         self.replyField = replyField
         self.onFieldSend = onFieldSend
+        self.onAgentCompose = onAgentCompose
     }
 
     /// Max expanded height as fraction of screen height.
@@ -646,6 +686,10 @@ struct DynamicIslandChat: View {
             guard let message else { return }
             await loadThreadChat(about: message)
         }
+        // The compose cards this screen's chat asked for (ADR-IOS-053 Phase 2), taken while the
+        // pill is on screen, whenever one may have become takeable or the chat's keys change.
+        // Another screen's request is never taken here, whichever screens are mounted.
+        .onChange(of: composeTakeWatch) { _, watch in takeAgentCompose(for: watch.host) }
         .onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
             fieldFill.apply(.confirmationCard)
@@ -735,6 +779,7 @@ struct DynamicIslandChat: View {
             }
         }
         .onAppear {
+            composeHostShown = true
             // Sync isWorking with ActiveAgentTracker on view (re)appearance.
             // .onChange only fires on CHANGES — if the agent started/finished while
             // this view was off-screen, isWorking would be stale.
@@ -747,6 +792,7 @@ struct DynamicIslandChat: View {
             }
         }
         .onDisappear {
+            composeHostShown = false
             // Recording must never outlive its UI: if this pill vanishes while
             // dictating (host view dismissed/torn down), stop the mic and cancel
             // any pending auto-restart so it can't re-arm after removal
@@ -2369,6 +2415,8 @@ struct DynamicIslandChat: View {
         let capturedSessionKey = sessionKey
         // Sent from the reply field: the request carries the field's send as it started.
         let fieldReply = field?.fieldReply
+        // The screen whose chat asked, where a compose card the turn asks for opens.
+        let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)
 
         activeChatTask = Task {
             // Ensure email context is registered before building enrichedText.
@@ -2465,7 +2513,8 @@ struct DynamicIslandChat: View {
                 // by) the session that launched the turn — never a global slot that
                 // other mounted pills race for.
                 let invocation = ToolInvocation(
-                    uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)
+                    uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply,
+                    composeOrigin: origin)
                 let response: ChatResponse?
                 response = try await TutorialChatScript.response(for: script, invocation: invocation) {
                     try await ChatPillState.shared.aiService.sendChatMessage(
@@ -2631,6 +2680,8 @@ struct DynamicIslandChat: View {
         // Captured with the session id: a demo turn is written only while its demo runs.
         let admission = DemoModeStore.shared.chatAdmission
         let capturedSessionKey = sessionKey
+        // The screen resuming the turn (the chat, for the field's request), where a compose card opens.
+        let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: resume.fieldReply)
 
         activeChatTask = Task {
             do {
@@ -2638,7 +2689,8 @@ struct DynamicIslandChat: View {
                     request: resume.request,
                     onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
                     invocation: ToolInvocation(
-                        uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply)
+                        uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply,
+                        composeOrigin: origin)
                 )
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."

@@ -7,8 +7,8 @@ import GRDB
 
 /// Client-side `email_reply` FSM tool matching TB addon's `email_reply.js`.
 /// Opens a reply compose window for a specific email.
-/// On iOS, this sets `AgentToolRouter.pendingCompose` which the UI observes
-/// and presents ComposeView with `replyTo:`.
+/// On iOS, this queues a `ComposeRequest` for the chat that asked (`ComposeOrigin`),
+/// whose screen presents ComposeView with `replyTo:` (ADR-IOS-053 Phase 2).
 struct EmailReplyTool: AgentTool, Sendable {
     let name = "email_reply"
     private let ctx: ToolContext
@@ -24,6 +24,8 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// `invocation.fieldReply`: the request was sent from the chat's reply field. A reply to the
     /// email that field replies to carries it, so its compose goes to the people chosen then; a
     /// reply to any other email keeps its own recipients (ADR-IOS-114 decision 11).
+    /// `invocation.composeOrigin`: the chat that asked, where the reply's compose card opens
+    /// (ADR-IOS-053 Phase 2). Without one no screen can open it, so the tool fails fast.
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         // Parse unique_id (numeric ID from ChatIdTranslator)
         let numericId: Int
@@ -71,6 +73,10 @@ struct EmailReplyTool: AgentTool, Sendable {
         let to = Self.applyRecipientDelta(base: replyAll.to, adds: addTo, removes: removeTo)
         let cc = Self.applyRecipientDelta(base: replyAll.cc, adds: addCc, removes: removeCc)
         let bcc = Self.applyRecipientDelta(base: [], adds: addBcc, removes: removeBcc)
+
+        guard let origin = invocation.composeOrigin else {
+            return ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM
+        }
 
         // Parse optional request (compose instruction) and body separately.
         // TB's "request" goes through runComposeEdit() to generate the actual reply content.
@@ -155,6 +161,7 @@ struct EmailReplyTool: AgentTool, Sendable {
                 bcc: bcc,
                 subject: generatedSubject,
                 body: generatedBody,
+                origin: origin,
                 // Recipients start from the reply-all set, so the send
                 // records reply-all on the original (#915).
                 isReplyAll: true,

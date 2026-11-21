@@ -44,10 +44,10 @@ struct EmailComposeToolOutcomeTests {
     ) async -> AgentToolRouter.ComposeRequest? {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
-            if let req = router.pendingCompose { return req }
+            if let req = router.takeCompose(for: ComposeTestOrigin.inboxHost) { return req }
             await Task.yield()
         }
-        return router.pendingCompose
+        return router.takeCompose(for: ComposeTestOrigin.inboxHost)
     }
 
     @Test("Tool name is email_compose")
@@ -67,10 +67,10 @@ struct EmailComposeToolOutcomeTests {
                 "to": .array([.string("a@b.com")]),
                 "subject": .string("Hello"),
                 "body": .string("Body text"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel()
             _ = try? await task.value
             return
@@ -95,10 +95,10 @@ struct EmailComposeToolOutcomeTests {
             try await tool.execute(arguments: [
                 "to": .array([.string("a@b.com")]),
                 "subject": .string("Bye"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel()
             _ = try? await task.value
             return
@@ -118,10 +118,10 @@ struct EmailComposeToolOutcomeTests {
             try await tool.execute(arguments: [
                 "to": .array([.string("a@b.com")]),
                 "subject": .string("Fail"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel()
             _ = try? await task.value
             return
@@ -152,7 +152,6 @@ struct EmailComposeToolOutcomeTests {
         #expect(result.hasPrefix("Failed: "))
         #expect(result.contains("recipients"))
         #expect(router.composeQueueDepth == 0)
-        #expect(router.pendingCompose == nil)
     }
 
     @Test("Missing recipients arg → uniform 'Failed: ' shape, never enqueues")
@@ -166,6 +165,37 @@ struct EmailComposeToolOutcomeTests {
         ])
         #expect(result.hasPrefix("Failed: "))
         #expect(router.composeQueueDepth == 0)
-        #expect(router.pendingCompose == nil)
+    }
+
+    @Test("A compose asked with no chat screen fails fast and queues nothing")
+    func noOriginFailsFast() async throws {
+        let (ctx, _, router) = try makeContext()
+        let result = try await EmailComposeTool(context: ctx).execute(arguments: [
+            "to": .array([.string("a@example.com")]),
+            "subject": .string("Hello"),
+        ])
+        #expect(result == ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM)
+        #expect(router.composeQueueDepth == 0, "no card waits for a screen that can never take it")
+    }
+
+    @Test("The compose request carries the chat that asked")
+    func requestCarriesItsOrigin() async throws {
+        let (ctx, _, router) = try makeContext()
+        let tool = EmailComposeTool(context: ctx)
+        let task = Task { @MainActor () -> String in
+            try await tool.execute(arguments: [
+                "to": .array([.string("a@example.com")]),
+                "subject": .string("Hello"),
+            ], invocation: ComposeTestOrigin.invocation)
+        }
+        guard let req = await waitForPendingCompose(on: router) else {
+            Issue.record("Helper did not queue a request the asking chat could take")
+            task.cancel()
+            _ = try? await task.value
+            return
+        }
+        #expect(req.origin == ComposeTestOrigin.inbox)
+        req.onOutcome(.cancelled)
+        _ = try await task.value
     }
 }
