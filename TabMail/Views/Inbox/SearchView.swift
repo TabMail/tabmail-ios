@@ -95,11 +95,7 @@ struct SearchView: View {
                 }
             }
             .navigationDestination(for: OpenTarget.self) { target in
-                MessageOpenView(
-                    messageId: target.headerId,
-                    expectedRfc822MessageId: target.provenRfc822MessageId,
-                    expectedObservedUidValidity: target.provenObservedUidValidity,
-                    highlightsMessage: true)
+                Self.destination(for: target)
             }
         }
         .background(Palette.previewPaneBg)
@@ -266,6 +262,17 @@ struct SearchView: View {
         /// with no usable Message-ID (`ExpectedMessageIdentity`'s epoch arm).
         /// Nil for remote results and rows with no proven epoch.
         var provenObservedUidValidity: Int? = nil
+    }
+
+    /// The open a result's tap navigates to: its address with both witnesses
+    /// search found it under, so the chat or the detail it opens marks read only
+    /// that message.
+    static func destination(for target: OpenTarget) -> MessageOpenView {
+        MessageOpenView(
+            messageId: target.headerId,
+            expectedRfc822MessageId: target.provenRfc822MessageId,
+            expectedObservedUidValidity: target.provenObservedUidValidity,
+            highlightsMessage: true)
     }
 
     /// Resolve a REMOTE search result to a current durable headerId, folder-

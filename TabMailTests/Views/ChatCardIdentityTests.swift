@@ -68,10 +68,10 @@ struct ChatCardIdentityTests {
         NSEDataBridge.latestStagedRows.withLock { $0 = [] }
     }
 
+    /// Every write admitted so far has run, the ones a gesture's registration enqueues on an
+    /// unstructured hop included (a raw FIFO barrier can overtake that hop).
     private func drainWriteQueue() async {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            Task { await AccountManager.shared.enqueueWrite { cont.resume() } }
-        }
+        await AccountManager.shared.awaitWriteQueueDrain()
     }
 
     /// The card's open, as `ChatThreadView`'s card sheet makes it: the bubble's address and its
@@ -154,6 +154,67 @@ struct ChatCardIdentityTests {
         }
         let chat = ChatThreadView(messageId: shown.id, expectedObservedUidValidity: searchedEpoch)
         await chat.viewModel.markReadOnOpenIfNeeded()
+        let registered = intentCycles()
+        let expected: [String] = reseated ? [] : [shown.id]
+        #expect(registered == expected, "a read is registered only for the email search found")
+        gate.finish()
+        await drainWriteQueue()
+        let after = try await pool.read { db in try MessageHeader.fetchOne(db, key: atAddress.id) }
+        let afterSubject = after?.subject
+        let afterRead = after?.isRead
+        #expect(afterSubject == atAddress.subject, "control: the row at the address is the one the test put there")
+        #expect(afterRead == !reseated)
+    }
+
+    /// The handoff itself, from search's destination on: `SearchView.destination` builds the open a
+    /// result's tap navigates to, and the open (`MessageOpenView`) builds the chat or today's detail
+    /// from it, whichever the Chat View setting routes to. The view model each builds gets the epoch
+    /// search found: on an address re-seated under a new epoch its open marks nothing read; on the
+    /// unchanged address (the same-epoch control) the email is marked read.
+    @Test("Search's open carries the epoch it found to the chat's and to the detail's view model",
+          arguments: [true, false], [false, true])
+    func searchOpenCarriesTheEpoch(opensInChat: Bool, reseated: Bool) async throws {
+        let (pool, inbox, dir, previous) = try makeDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir); clearShared() }
+        clearShared()
+        var found = header(rfc: "<unused@example.com>", inbox: inbox)
+        found.rfc822MessageId = nil
+        let searchedEpoch = try #require(found.observedUidValidity)
+        let shown = found
+        try await pool.write { db in try shown.insert(db) }
+        var seated = shown
+        if reseated {
+            // A UIDVALIDITY reset puts another email without a Message-ID at the same address.
+            seated.subject = "Another email"
+            seated.observedUidValidity = searchedEpoch + 1
+        }
+        let atAddress = seated
+        if reseated {
+            #expect(atAddress.id == shown.id, "the replacement sits at the same address")
+            try await pool.write { db in
+                try shown.delete(db)
+                try atAddress.insert(db)
+            }
+        }
+        let target = SearchView.OpenTarget(
+            headerId: shown.id, provenRfc822MessageId: nil, provenObservedUidValidity: searchedEpoch)
+        let open = SearchView.destination(for: target)
+        let route = MessageOpenView.route(
+            messageId: open.messageId, expectedRfc822MessageId: open.expectedRfc822MessageId,
+            expectedObservedUidValidity: open.expectedObservedUidValidity,
+            opensInChat: opensInChat, pool: PrioritizedDatabase(pool: pool))
+        let expectedRoute: MessageOpenView.Route = opensInChat ? .chat : .detail
+        #expect(route == expectedRoute, "control: the open goes to the \(opensInChat ? "chat" : "detail")")
+        // Hold the write queue so a registered read is still observable below.
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
+        }
+        // The view model the routed view builds (its State's initial value, read before the view
+        // is installed).
+        let viewModel = opensInChat ? open.chat.viewModel : open.detail.viewModel
+        await viewModel.markReadOnOpenIfNeeded()
         let registered = intentCycles()
         let expected: [String] = reseated ? [] : [shown.id]
         #expect(registered == expected, "a read is registered only for the email search found")

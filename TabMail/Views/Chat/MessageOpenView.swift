@@ -59,17 +59,27 @@ struct MessageOpenView: View {
         case .draftEditor(let header):
             DraftComposePresenter(source: .header(header))
         case .chat:
-            ChatThreadView(
-                messageId: messageId,
-                expectedRfc822MessageId: expectedRfc822MessageId,
-                expectedObservedUidValidity: expectedObservedUidValidity,
-                highlightsOpenedMessage: highlightsMessage)
+            chat
         case .detail:
-            MessageDetailView(
-                messageId: messageId,
-                opensWithSkeletonDwell: opensWithSkeletonDwell,
-                expectedRfc822MessageId: expectedRfc822MessageId,
-                expectedObservedUidValidity: expectedObservedUidValidity)
+            detail
         }
+    }
+
+    /// The chat this open shows, carrying the open's witnesses to its view model.
+    var chat: ChatThreadView {
+        ChatThreadView(
+            messageId: messageId,
+            expectedRfc822MessageId: expectedRfc822MessageId,
+            expectedObservedUidValidity: expectedObservedUidValidity,
+            highlightsOpenedMessage: highlightsMessage)
+    }
+
+    /// Today's detail this open shows, carrying the open's witnesses to its view model.
+    var detail: MessageDetailView {
+        MessageDetailView(
+            messageId: messageId,
+            opensWithSkeletonDwell: opensWithSkeletonDwell,
+            expectedRfc822MessageId: expectedRfc822MessageId,
+            expectedObservedUidValidity: expectedObservedUidValidity)
     }
 }
