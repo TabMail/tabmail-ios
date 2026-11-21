@@ -571,6 +571,173 @@ struct AgentToolRouterComposeQueueTests {
     }
 }
 
+// MARK: - Removed Account Tests
+
+/// THE SYSTEM PROPERTY pinned here: a compose card waiting for its screen never opens for an
+/// account that was removed meanwhile, and its turn never hangs on it. The email it answers is
+/// gone (the card would open with another account's From), or the chat that asked can never show
+/// again (the card would wait forever). The request ends with a plain failure the model reads, and
+/// nothing opens; requests of other accounts, and new emails asked in the inbox, are untouched.
+@Suite("AgentToolRouter compose requests of a removed account")
+@MainActor
+struct AgentToolRouterRemovedAccountTests {
+    private static let gone = "acc-gone"
+    private static let kept = "acc-kept"
+    private static let goneThread = ChatThreadKey.key(accountId: gone, threadId: "t-1")
+
+    /// The outcomes each request's tool received, by request subject.
+    @MainActor
+    private final class Outcomes {
+        var bySubject: [String: ComposeOutcome] = [:]
+    }
+
+    /// The outcome state of the request a tool queued.
+    @MainActor
+    private final class HeldState {
+        var state: ComposeOutcomeState?
+    }
+
+    private static func header(account: String) -> MessageHeader {
+        MessageHeader(
+            messageId: "1", subject: "Lunch", from: "Alex", fromAddress: "alex@example.com",
+            to: "me@example.com", date: Date(), snippet: "",
+            folderId: "\(account):INBOX", accountId: account, folderPath: "INBOX", isInInbox: true)
+    }
+
+    private static func request(
+        _ subject: String, mode: AgentToolRouter.ComposeRequest.Mode, replyTo: MessageHeader?,
+        origin: ComposeOrigin, outcomes: Outcomes
+    ) -> AgentToolRouter.ComposeRequest {
+        AgentToolRouter.ComposeRequest(
+            mode: mode, replyTo: replyTo, to: ["alex@example.com"], cc: [], bcc: [],
+            subject: subject, body: nil, origin: origin,
+            onOutcome: { outcomes.bySubject[subject] = $0 })
+    }
+
+    private static func isRemovedFailure(_ outcome: ComposeOutcome?) -> Bool {
+        if case .failed(let reason)? = outcome { return reason == AgentToolRouter.removedAccountReason }
+        return false
+    }
+
+    @Test("Removing an account ends its waiting requests, from any screen, and leaves the others waiting")
+    func endsTheRemovedAccountsRequests() {
+        let router = AgentToolRouter()
+        let outcomes = Outcomes()
+        let fromChat = ComposeOrigin(sessionKey: Self.goneThread, screen: .chat)
+        let fromEmail = ComposeOrigin(sessionKey: Self.goneThread, screen: .email)
+        router.enqueueCompose(Self.request("inbox reply to gone", mode: .reply, replyTo: Self.header(account: Self.gone),
+                                           origin: ComposeTestOrigin.inbox, outcomes: outcomes))
+        router.enqueueCompose(Self.request("chat email of gone", mode: .compose, replyTo: nil, origin: fromChat, outcomes: outcomes))
+        router.enqueueCompose(Self.request("email screen forward of gone", mode: .forward, replyTo: Self.header(account: Self.gone),
+                                           origin: fromEmail, outcomes: outcomes))
+        router.enqueueCompose(Self.request("inbox reply to kept", mode: .reply, replyTo: Self.header(account: Self.kept),
+                                           origin: ComposeTestOrigin.inbox, outcomes: outcomes))
+        router.enqueueCompose(Self.request("inbox new email", mode: .compose, replyTo: nil,
+                                           origin: ComposeTestOrigin.inbox, outcomes: outcomes))
+        #expect(router.composeQueueDepth == 5)
+
+        router.endComposeRequests(ofRemovedAccount: Self.gone)
+
+        #expect(Self.isRemovedFailure(outcomes.bySubject["inbox reply to gone"]), "the email it answers is gone")
+        #expect(Self.isRemovedFailure(outcomes.bySubject["chat email of gone"]), "its chat can never show again")
+        #expect(Self.isRemovedFailure(outcomes.bySubject["email screen forward of gone"]))
+        #expect(outcomes.bySubject["inbox reply to kept"] == nil && outcomes.bySubject["inbox new email"] == nil,
+                "another account's requests, and a new email from the inbox, still wait")
+        #expect(router.composeQueueDepth == 2)
+
+        // The inbox shows again: it opens the kept account's reply, never the removed one's.
+        let first = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+        #expect(first?.subject == "inbox reply to kept")
+        router.composePresentationDidBegin()
+        router.composePresentationDidEnd()
+        let second = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+        #expect(second?.subject == "inbox new email")
+        router.composePresentationDidBegin()
+        router.composePresentationDidEnd()
+        #expect(router.takeCompose(for: ComposeTestOrigin.inboxHost) == nil)
+        #expect(router.takeCompose(for: AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [Self.goneThread])) == nil)
+    }
+
+    @Test("A request of a removed account that arrives later ends at once, and no screen is asked to look")
+    func laterRequestEndsAtOnce() {
+        let router = AgentToolRouter()
+        let outcomes = Outcomes()
+        router.endComposeRequests(ofRemovedAccount: Self.gone)
+        let offer = router.composeOffer
+
+        router.enqueueCompose(Self.request("late reply to gone", mode: .reply, replyTo: Self.header(account: Self.gone),
+                                           origin: ComposeTestOrigin.inbox, outcomes: outcomes))
+        router.enqueueCompose(Self.request("late chat email of gone", mode: .compose, replyTo: nil,
+                                           origin: ComposeOrigin(sessionKey: Self.goneThread, screen: .chat), outcomes: outcomes))
+
+        #expect(Self.isRemovedFailure(outcomes.bySubject["late reply to gone"]))
+        #expect(Self.isRemovedFailure(outcomes.bySubject["late chat email of gone"]))
+        #expect(router.composeQueueDepth == 0)
+        #expect(router.composeOffer == offer)
+        #expect(router.takeCompose(for: ComposeTestOrigin.inboxHost) == nil)
+
+        // Another account's request still queues as before.
+        router.enqueueCompose(Self.request("late reply to kept", mode: .reply, replyTo: Self.header(account: Self.kept),
+                                           origin: ComposeTestOrigin.inbox, outcomes: outcomes))
+        #expect(outcomes.bySubject["late reply to kept"] == nil)
+        #expect(router.takeCompose(for: ComposeTestOrigin.inboxHost)?.subject == "late reply to kept")
+    }
+
+    @Test("The tool waiting on a removed account's card returns a plain failure: its turn ends")
+    func waitingToolReturnsFailure() async {
+        let router = AgentToolRouter()
+        let chat = ComposeOrigin(sessionKey: Self.goneThread, screen: .chat)
+        let held = HeldState()
+        let task = Task { @MainActor () -> ComposeOutcome in
+            await router.enqueueComposeAndAwaitOutcome { onOutcome, state in
+                held.state = state
+                return AgentToolRouter.ComposeRequest(
+                    mode: .reply, replyTo: Self.header(account: Self.gone),
+                    to: ["alex@example.com"], cc: [], bcc: [], subject: "Re: Lunch", body: nil,
+                    origin: chat, onOutcome: onOutcome, outcomeState: state)
+            }
+        }
+        await Task.yield()
+        await Task.yield()
+        #expect(router.composeQueueDepth == 1, "the card waits for its chat")
+
+        router.endComposeRequests(ofRemovedAccount: Self.gone)
+
+        // Never hang the run on a regression: a request left unresolved is cancelled first.
+        guard held.state?.resolved == true else {
+            Issue.record("the removal left the tool waiting")
+            task.cancel()
+            _ = await task.value
+            return
+        }
+        let outcome = await task.value
+        #expect(outcome.describeForLLM == ComposeOutcome.failed(AgentToolRouter.removedAccountReason).describeForLLM)
+        #expect(router.composeQueueDepth == 0)
+    }
+
+    /// The router is told only once the account's rows are gone, and the removal does not suspend
+    /// on it before `disconnectAccount`'s tombstone (an aborted removal keeps its cards waiting:
+    /// `DestructiveCleanupReliabilityTests.accountRemovalRollsBackAtomically`).
+    @Test("Account removal ends the account's compose requests right after its commit")
+    func removalEndsRequestsAfterCommit() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let raw = try String(contentsOf: projectRoot.appendingPathComponent("TabMail/Services/Account/AccountManagerSetup.swift"),
+                             encoding: .utf8)
+        let text = raw.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let call = "Task { @MainActor in AgentToolRouter.shared.endComposeRequests(ofRemovedAccount: acctId) }"
+        #expect(text.components(separatedBy: "endComposeRequests(ofRemovedAccount:").count - 1 == 1)
+        let commit = try #require(text.range(of: "try Self.removeAccountRowsTxn(db, accountId: acctId, wasPrimary: wasPrimary)"))
+        let rollback = try #require(text.range(of: "throw error", range: commit.upperBound..<text.endIndex))
+        let ends = try #require(text.range(of: call))
+        let tombstone = try #require(text.range(of: "await disconnectAccount(account, deletingCredentials: cleanupInventory.0)"))
+        #expect(rollback.upperBound <= ends.lowerBound, "after the commit and its rollback branch")
+        #expect(ends.upperBound <= tombstone.lowerBound, "before disconnectAccount, as a Task this actor does not await")
+    }
+}
+
 // MARK: - Blocking Compose Helper Tests
 
 /// Tests the outcome-awaiting helper `enqueueComposeAndAwaitOutcome` — the

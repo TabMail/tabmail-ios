@@ -128,3 +128,69 @@ struct EmailForwardToolTests {
         #expect(result.contains("request parameter is required"))
     }
 }
+
+/// Where the forward's compose card opens (ADR-IOS-053 Phase 2). Each test owns a fresh
+/// `AgentToolRouter` injected through `ToolContext`, like `EmailReplyToolTests`.
+@Suite("EmailForwardTool card origin")
+@MainActor
+struct EmailForwardToolOriginTests {
+
+    private func makeContext() throws -> (ToolContext, DatabaseQueue, MockChatIdTranslator, AgentToolRouter) {
+        let db = try TestDatabase.make()
+        let translator = MockChatIdTranslator()
+        let router = AgentToolRouter()
+        return (ToolContext(db: db, translator: translator, router: router), db, translator, router)
+    }
+
+    @Test("A forward asked with no chat screen fails fast and queues nothing")
+    func noOriginFailsFast() async throws {
+        let (ctx, db, translator, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "msgF20", subject: "Agenda")
+        await translator.seed(header.id, as: 20)
+
+        let result = try await EmailForwardTool(context: ctx).execute(arguments: [
+            "unique_id": .int(20),
+            "to": .array([.string("sam@example.com")]),
+            "body": .string("For you")
+        ])
+        #expect(result == ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM)
+        #expect(router.composeQueueDepth == 0, "no card waits for a screen that can never take it")
+    }
+
+    @Test("The forward request carries the screen that asked, and only that screen takes it")
+    func requestCarriesItsOrigin() async throws {
+        let (ctx, db, translator, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "msgF21", subject: "Agenda")
+        await translator.seed(header.id, as: 21)
+        let asked = ComposeOrigin(sessionKey: ChatThreadKey.key(for: header), screen: .email)
+        let invocation = ToolInvocation(composeOrigin: asked)
+
+        let tool = EmailForwardTool(context: ctx)
+        let task = Task { @MainActor () -> String in
+            try await tool.execute(arguments: [
+                "unique_id": .int(21),
+                "to": .array([.string("sam@example.com")]),
+                "body": .string("For you")
+            ], invocation: invocation)
+        }
+        let deadline = Date().addingTimeInterval(2.0)
+        while router.composeQueueDepth == 0 && Date() < deadline {
+            await Task.yield()
+        }
+        #expect(router.firstQueuedRequestForTesting?.origin == asked, "the request names the screen that asked")
+        #expect(router.firstQueuedRequestForTesting?.to == ["sam@example.com"])
+        let inbox = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+        #expect(inbox == nil, "the inbox never takes the email screen's request")
+        let chat = router.takeCompose(for: AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [asked.sessionKey]))
+        #expect(chat == nil, "nor the chat of the same thread")
+        let req = router.takeCompose(for: AgentToolRouter.ComposeHost(screen: .email, sessionKeys: [asked.sessionKey]))
+        #expect(req?.origin == asked, "the email screen that asked takes it")
+        req?.onOutcome(.cancelled)
+        if req == nil { task.cancel() }
+        _ = try? await task.value
+    }
+}

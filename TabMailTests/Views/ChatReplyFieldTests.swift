@@ -876,4 +876,38 @@ struct ChatReplyFieldTests {
         #expect(Self.count("replyField?.onlyTo", in: island) == 0 && Self.count("replyField?.isNoReply", in: island) == 0,
                 "no send reads the field's choice later")
     }
+
+    /// ADR-IOS-053 Phase 2: the census of the turns that can reach a compose tool. Every invocation
+    /// the app builds is one of three: the pill's send and its resume, which name the screen that
+    /// asked (every send, retry, resend, rewind and tutorial prompt goes through `sendAgentChat`),
+    /// and the compose editor's chat, whose host is a compose window and opens no agent card, so a
+    /// compose tool there fails fast. Every other caller (reply precompute, inline edit, the BYOK
+    /// check) runs `.noninteractive`, where a compose tool fails fast too. A new turn that builds
+    /// its own invocation fails here until it names its screen or is added with its reason.
+    @Test("Every agent turn that could open a compose card names the screen that asked")
+    func everyTurnNamesItsScreen() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sources = try #require(FileManager.default.enumerator(at: projectRoot.appendingPathComponent("TabMail"), includingPropertiesForKeys: nil))
+        var built: [String: Int] = [:]
+        for case let url as URL in sources where url.pathExtension == "swift" && url.lastPathComponent != "ToolInvocation.swift" {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let count = Self.count("ToolInvocation(", in: text)
+            if count > 0 { built[url.lastPathComponent] = count }
+        }
+        #expect(built == ["DynamicIslandChatButton.swift": 3], "only the pill builds invocations: \(built)")
+
+        let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        #expect(Self.count("composeOrigin: origin)", in: island) == 2, "the send and the resume name the screen that asked")
+        #expect(Self.count("invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey) )", in: island) == 1,
+                "the compose editor's chat, which opens no card, names none")
+        #expect(Self.count("guard onAgentCompose != nil, composeContext == nil else { return nil }", in: island) == 1,
+                "a compose editor's pill has no compose screen")
+        // Every turn of the pill starts in one of the two.
+        #expect(Self.count("let origin = composeOrigin(", in: island) == 2)
+        #expect(Self.count("activeChatTask = Task {", in: island) == Self.count("let origin = composeOrigin(", in: island) + 1,
+                "one turn task per named start, and the compose editor's")
+    }
 }

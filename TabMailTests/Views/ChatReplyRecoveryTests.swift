@@ -292,6 +292,8 @@ struct ChatReplyRecoveryTests {
                 let request = try #require(router.firstQueuedRequestForTesting)
                 #expect(request.fieldReply == ChatFieldReply(emailKey: ChatThread.copyKey(chat.email), onlyTo: ["david@example.com"]),
                         "the reply carries the choice made when the request was sent: \(String(describing: request.fieldReply))")
+                #expect(request.origin == ComposeOrigin(sessionKey: ChatThreadKey.key(for: chat.email), screen: .chat),
+                        "the recovered turn's card opens in the chat view that asked: \(request.origin)")
                 let reply = ChatReplyCompose.make(agent: request, accounts: chat.accounts)
                 #expect(reply == ChatReplyCompose(isReplyAll: false, to: ["david@example.com"], cc: [], bcc: []),
                         "a plain reply to only David: \(reply)")
@@ -341,6 +343,8 @@ struct ChatReplyRecoveryTests {
                 let request = try #require(router.firstQueuedRequestForTesting)
                 #expect(request.fieldReply == ChatFieldReply(emailKey: ChatThread.copyKey(chat.email), onlyTo: nil),
                         "the reply carries the choice made when the request was sent, nobody: \(String(describing: request.fieldReply))")
+                #expect(request.origin == ComposeOrigin(sessionKey: ChatThreadKey.key(for: chat.email), screen: .chat),
+                        "the recovered turn's card opens in the chat view that asked: \(request.origin)")
                 let reply = ChatReplyCompose.make(agent: request, accounts: chat.accounts)
                 #expect(reply.isReplyAll, "a Reply All: \(reply)")
 

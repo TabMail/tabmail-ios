@@ -9,7 +9,7 @@ import Testing
 
 @Suite("IOS-CLEANUP-001 destructive cleanup", .serialized, .processGlobalState)
 struct DestructiveCleanupReliabilityTests {
-    @Test("account-removal DB abort preserves credentials, files, row, and cancels prepared debt")
+    @Test("account-removal DB abort preserves credentials, files, row and waiting compose cards, and cancels prepared debt")
     func accountRemovalRollsBackAtomically() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -78,6 +78,7 @@ struct DestructiveCleanupReliabilityTests {
             }
             AppDatabase.shared.withLock { $0 = previousDatabase }
             TestDatabaseTeardown.retire(pool: pool, directory: directory)
+            await MainActor.run { AgentToolRouter.shared.resetComposeQueueForTesting() }
         }
 
         do {
@@ -99,10 +100,32 @@ struct DestructiveCleanupReliabilityTests {
                 """)
             }
 
+            // An agent compose card for the account's email, asked in its chat and waiting for it.
+            let waitingCard = await MainActor.run { () -> UUID in
+                let router = AgentToolRouter.shared
+                router.resetComposeQueueForTesting()
+                let email = MessageHeader(
+                    messageId: "1", subject: "Keep", from: "Alex", fromAddress: "alex@example.com",
+                    to: accountSnapshot.emailAddress, date: Date(), snippet: "",
+                    folderId: "\(accountSnapshot.id):INBOX", accountId: accountSnapshot.id,
+                    folderPath: "INBOX", isInInbox: true)
+                let request = AgentToolRouter.ComposeRequest(
+                    mode: .reply, replyTo: email, to: ["alex@example.com"], cc: [], bcc: [],
+                    subject: "Re: Keep", body: nil,
+                    origin: ComposeOrigin(sessionKey: ChatThreadKey.key(for: email), screen: .chat))
+                router.enqueueCompose(request)
+                return request.id
+            }
+
             await #expect(throws: (any Error).self) {
                 try await AccountManager.shared.removeAccount(account, warnedSavedFiles: 0)
             }
 
+            let cardStillWaits = await MainActor.run {
+                AgentToolRouter.shared.composeQueueDepth == 1
+                    && AgentToolRouter.shared.firstQueuedRequestForTesting?.id == waitingCard
+            }
+            #expect(cardStillWaits, "an aborted removal ends no compose card of the account")
             #expect(try await pool.read { try Account.fetchCount($0) } == 1)
             #expect(try await pool.read { try OutboxMessage.fetchCount($0) } == 1)
             #expect(KeychainHelper.loadString(key: passwordKey) == "password")
