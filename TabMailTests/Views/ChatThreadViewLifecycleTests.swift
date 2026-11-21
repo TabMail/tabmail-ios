@@ -51,8 +51,10 @@ struct ChatThreadViewLifecycleTests {
     /// summaries, ten minutes apart (no time stamps between them). `unreadFrom`: emails from this
     /// index on are unread. `newestReady`: the newest email's ready AI Suggestion.
     /// `tall`: this email's bubble holds `tallText`, many times the screen's height, with no summary
-    /// stored yet, so it still asks for one.
-    private static func insertThread(unreadFrom: Int?, newestReady: String? = nil, tall: Int? = nil, pool: DatabasePool) throws -> [MessageHeader] {
+    /// stored yet, so it still asks for one. `newestFiltered`: the newest email is filtered (no
+    /// tag to reply, the empty-reply sentinel), so no AI Suggestion row joins the chat.
+    private static func insertThread(unreadFrom: Int?, newestReady: String? = nil, newestFiltered: Bool = false,
+                                     tall: Int? = nil, pool: DatabasePool) throws -> [MessageHeader] {
         _ = try FolderEpochTestFixture.makeAccount(id: account, provider: .gmail, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: account, path: "INBOX", role: .inbox, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: account, path: "Drafts", role: .drafts, pool: pool)
@@ -74,6 +76,10 @@ struct ChatThreadViewLifecycleTests {
             if index == length - 1, let newestReady {
                 header.cachedReply = "Hello,\n\n\(newestReady)\n\nThanks."
                 header.replyTextMessage = newestReady
+            }
+            if index == length - 1, newestFiltered {
+                header.actionTag = ActionTag.none
+                header.cachedReply = ""
             }
             let row = header
             try pool.write { db in
@@ -314,7 +320,9 @@ struct ChatThreadViewLifecycleTests {
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
         saved.setChatView(on: true)
-        let headers = try Self.insertThread(unreadFrom: nil, pool: pool)
+        // The newest email is filtered, so no AI Suggestion row joins the chat as it lands: the
+        // control below measures the landing's own effect on the screen.
+        let headers = try Self.insertThread(unreadFrom: nil, newestFiltered: true, pool: pool)
         let index = Dictionary(uniqueKeysWithValues: headers.enumerated().map { ($1.id, $0) })
 
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
