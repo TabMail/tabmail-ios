@@ -20,7 +20,8 @@ import Testing
 /// queue into the next suite.
 ///
 /// `.serialized, .processGlobalState`: the harness swaps `AppDatabase.shared` and reads
-/// `AccountManager.shared`'s write queue and intent-cycle register.
+/// `AccountManager.shared`'s write queue and intent-cycle register; the search opens set the Chat
+/// View and AI settings (and put them back).
 @Suite("Chat card opens the email the bubble showed", .serialized, .processGlobalState)
 @MainActor
 struct ChatCardIdentityTests {
@@ -167,16 +168,25 @@ struct ChatCardIdentityTests {
     }
 
     /// The handoff itself, from search's destination on: `SearchView.destination` builds the open a
-    /// result's tap navigates to, and the open (`MessageOpenView`) builds the chat or today's detail
-    /// from it, whichever the Chat View setting routes to. The view model each builds gets the epoch
-    /// search found: on an address re-seated under a new epoch its open marks nothing read; on the
-    /// unchanged address (the same-epoch control) the email is marked read.
+    /// result's tap navigates to, the open routes as its body does (`route(pool:)`, with the Chat
+    /// View setting it took when it was made), and it builds the chat or today's detail it shows.
+    /// The view model each builds gets the epoch search found: on an address re-seated under a new
+    /// epoch its open marks nothing read; on the unchanged address (the same-epoch control) the
+    /// email is marked read. The chat glows the email search found.
     @Test("Search's open carries the epoch it found to the chat's and to the detail's view model",
           arguments: [true, false], [false, true])
     func searchOpenCarriesTheEpoch(opensInChat: Bool, reseated: Bool) async throws {
         let (pool, inbox, dir, previous) = try makeDB()
-        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir); clearShared() }
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        defer {
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+            clearShared()
+        }
         clearShared()
+        saved.setChatView(on: opensInChat)
+        let live = ChatViewConfig.opensInChat
+        #expect(live == opensInChat, "control: the Chat View setting routes opens to the \(opensInChat ? "chat" : "detail")")
         var found = header(rfc: "<unused@example.com>", inbox: inbox)
         found.rfc822MessageId = nil
         let searchedEpoch = try #require(found.observedUidValidity)
@@ -199,10 +209,7 @@ struct ChatCardIdentityTests {
         let target = SearchView.OpenTarget(
             headerId: shown.id, provenRfc822MessageId: nil, provenObservedUidValidity: searchedEpoch)
         let open = SearchView.destination(for: target)
-        let route = MessageOpenView.route(
-            messageId: open.messageId, expectedRfc822MessageId: open.expectedRfc822MessageId,
-            expectedObservedUidValidity: open.expectedObservedUidValidity,
-            opensInChat: opensInChat, pool: PrioritizedDatabase(pool: pool))
+        let route = open.route(pool: PrioritizedDatabase(pool: pool))
         let expectedRoute: MessageOpenView.Route = opensInChat ? .chat : .detail
         #expect(route == expectedRoute, "control: the open goes to the \(opensInChat ? "chat" : "detail")")
         // Hold the write queue so a registered read is still observable below.
@@ -213,7 +220,15 @@ struct ChatCardIdentityTests {
         }
         // The view model the routed view builds (its State's initial value, read before the view
         // is installed).
-        let viewModel = opensInChat ? open.chat.viewModel : open.detail.viewModel
+        let viewModel: MessageDetailViewModel
+        if opensInChat {
+            let chat = open.chat
+            let highlights = chat.highlightsOpenedMessage
+            #expect(highlights, "the chat search opens glows the email search found")
+            viewModel = chat.viewModel
+        } else {
+            viewModel = open.detail.viewModel
+        }
         await viewModel.markReadOnOpenIfNeeded()
         let registered = intentCycles()
         let expected: [String] = reseated ? [] : [shown.id]
@@ -225,6 +240,102 @@ struct ChatCardIdentityTests {
         let afterRead = after?.isRead
         #expect(afterSubject == atAddress.subject, "control: the row at the address is the one the test put there")
         #expect(afterRead == !reseated)
+    }
+
+    /// Search found a draft with no Message-ID under one epoch; a UIDVALIDITY reset then put another
+    /// draft at the same address under a new epoch. The open search's destination builds routes as
+    /// its body does: the replacement never opens in the draft editor, and the chat or the detail
+    /// shown instead marks nothing read. Without a witness the same address opens in the draft
+    /// editor (the control that the row there is a draft).
+    @Test("Search's open of a draft re-seated under a new epoch shows no draft editor and marks nothing read",
+          arguments: [true, false])
+    func searchOpenOfAReplacedDraft(opensInChat: Bool) async throws {
+        let (pool, _, dir, previous) = try makeDB()
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        defer {
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+            clearShared()
+        }
+        clearShared()
+        saved.setChatView(on: opensInChat)
+        let searchedEpoch = 11
+        var drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: Self.account)
+        drafts.lastKnownUidValidity = searchedEpoch + 1
+        let draftsFolder = drafts
+        var found = MessageHeader(
+            messageId: "4343", subject: "Draft search found", from: "User", fromAddress: "user@example.com",
+            to: "sender@example.com", date: Date(), snippet: "", folderId: draftsFolder.id,
+            accountId: Self.account, folderPath: draftsFolder.path, isInInbox: false)
+        found.headerComplete = true
+        found.observedUidValidity = searchedEpoch
+        let shown = found
+        // A UIDVALIDITY reset puts another draft without a Message-ID at the same address.
+        var replacement = found
+        replacement.subject = "Another draft"
+        replacement.observedUidValidity = searchedEpoch + 1
+        let seated = replacement
+        #expect(seated.id == shown.id, "the replacement sits at the same address")
+        try await pool.write { db in
+            try draftsFolder.insert(db)
+            try shown.insert(db)
+        }
+        try await pool.write { db in
+            try shown.delete(db)
+            try seated.insert(db)
+        }
+        let database = PrioritizedDatabase(pool: pool)
+        let fetched = try await pool.read { db in try MessageHeader.fetchOne(db, key: seated.id) }
+        let stored = try #require(fetched)
+        let unwitnessed = MessageOpenView(messageId: shown.id).route(pool: database)
+        #expect(unwitnessed == .draftEditor(stored), "control: without a witness the address opens in the draft editor")
+
+        let target = SearchView.OpenTarget(
+            headerId: shown.id, provenRfc822MessageId: nil, provenObservedUidValidity: searchedEpoch)
+        let open = SearchView.destination(for: target)
+        let route = open.route(pool: database)
+        let expectedRoute: MessageOpenView.Route = opensInChat ? .chat : .detail
+        #expect(route == expectedRoute,
+                "the replacement never opens in the draft editor; the \(opensInChat ? "chat" : "detail") refuses it instead")
+        // Hold the write queue so a registered read is still observable below.
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
+        }
+        let viewModel = opensInChat ? open.chat.viewModel : open.detail.viewModel
+        await viewModel.markReadOnOpenIfNeeded()
+        let registered = intentCycles()
+        #expect(registered.isEmpty, "no read is registered for the replacement")
+        gate.finish()
+        await drainWriteQueue()
+        let after = try await pool.read { db in try MessageHeader.fetchOne(db, key: seated.id) }
+        let afterSubject = after?.subject
+        let afterRead = after?.isRead
+        #expect(afterSubject == seated.subject, "control: the row at the address is the replacement")
+        #expect(afterRead == false, "the replacement stays unread")
+    }
+
+    /// The two lines no unit test can reach, pinned by source. Search's destination is registered
+    /// inside SearchView's own NavigationStack, whose path only a tap on a live search result
+    /// fills, so it is read here: it shows exactly the open `SearchView.destination` builds (the
+    /// tests above drive that open). `MessageOpenView`'s body shows the route `route(pool:)`
+    /// computes, the one the tests above take, and is the only caller of the static route.
+    @Test("Search registers one destination, built by SearchView.destination; the open's body shows route(pool:)")
+    func searchOpenWiring() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        func flat(_ path: String) throws -> String {
+            try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+        let search = try flat("TabMail/Views/Inbox/SearchView.swift")
+        #expect(search.components(separatedBy: ".navigationDestination(").count == 2, "search registers one destination")
+        #expect(search.components(separatedBy: ".navigationDestination(for: OpenTarget.self) { target in Self.destination(for: target) }").count == 2,
+                "a result's tap shows the open SearchView.destination builds")
+        let open = try flat("TabMail/Views/Chat/MessageOpenView.swift")
+        #expect(open.components(separatedBy: "var body: some View { switch route(pool: AppDatabase.dbPool) {").count == 2,
+                "the body shows the route route(pool:) computes")
+        #expect(open.components(separatedBy: "Self.route(").count == 2, "the static route has one caller, route(pool:)")
     }
 
     @Test("The chat's card passes the bubble's Message-ID with its address")

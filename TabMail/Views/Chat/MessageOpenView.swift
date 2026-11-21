@@ -52,10 +52,16 @@ struct MessageOpenView: View {
         return opensInChat ? .chat : .detail
     }
 
+    /// This open's route, the one its body shows: its address with every witness it carries, and
+    /// the Chat View choice it took when it was made.
+    func route(pool: PrioritizedDatabase) -> Route {
+        Self.route(messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
+                   expectedObservedUidValidity: expectedObservedUidValidity,
+                   opensInChat: opensInChat, pool: pool)
+    }
+
     var body: some View {
-        switch Self.route(messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
-                          expectedObservedUidValidity: expectedObservedUidValidity,
-                          opensInChat: opensInChat, pool: AppDatabase.dbPool) {
+        switch route(pool: AppDatabase.dbPool) {
         case .draftEditor(let header):
             DraftComposePresenter(source: .header(header))
         case .chat:
