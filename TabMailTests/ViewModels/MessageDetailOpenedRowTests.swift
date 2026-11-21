@@ -28,9 +28,9 @@ import Testing
 /// replacement lands under a preview freeze; and the earlier/later split follows the new one.
 ///
 /// `.serialized`, `.processGlobalState`: the view model observes process-wide
-/// notifications and the test installs the shared `AppDatabase`. `.timeLimit`: a reader that
-/// never ends fails its case instead of holding the suite.
-@Suite("The opened email is never also a thread row", .serialized, .processGlobalState, .timeLimit(.minutes(1)))
+/// notifications and the test installs the shared `AppDatabase`. Every wait in a case has its
+/// own deadline (`waitUntil`, `run`), so a reader that never ends fails its case.
+@Suite("The opened email is never also a thread row", .serialized, .processGlobalState)
 struct MessageDetailOpenedRowTests {
 
     /// Sentinel `object` for test posts of `.nseMergeDidCommit`, so count contracts in
@@ -150,6 +150,42 @@ struct MessageDetailOpenedRowTests {
             guard Date() < deadline else { throw TimedOut(what: what) }
             try await Task.sleep(for: .milliseconds(20))
         }
+    }
+
+    /// Whether work started with `start` has ended, and its task, so a case that gives up on it
+    /// can cancel it.
+    @MainActor
+    final class Started {
+        var ended = false
+        var task: Task<Void, Never>?
+    }
+
+    /// Starts `work` without waiting for it. A case waits for it with a deadline (`finish`).
+    @MainActor
+    private func start(_ work: @escaping @MainActor () async -> Void) -> Started {
+        let started = Started()
+        started.task = Task {
+            await work()
+            started.ended = true
+        }
+        return started
+    }
+
+    /// Waits, with a deadline, until `started` has ended; on timeout cancels it and fails.
+    @MainActor
+    private func finish(_ started: Started, _ what: String, seconds: Double = 5) async throws {
+        do {
+            try await waitUntil(what, seconds: seconds) { started.ended }
+        } catch {
+            started.task?.cancel()
+            throw error
+        }
+    }
+
+    /// Runs `work` and waits for it with a deadline.
+    @MainActor
+    private func run(_ what: String, seconds: Double = 5, _ work: @escaping @MainActor () async -> Void) async throws {
+        try await finish(start(work), what, seconds: seconds)
     }
 
     /// The server fetch every case uses unless it names its own: stores a body for the email.
@@ -308,18 +344,25 @@ struct MessageDetailOpenedRowTests {
         return (inboxCopy, allMailCopy, reply)
     }
 
-    /// Opens `opened` with the thread loaded, as the screen shows it.
+    /// Opens `opened` with the thread loaded, as the screen shows it. A case that counts thread
+    /// scans passes `observeNotifications: false`, so a process-wide notification another suite
+    /// posts late cannot ask this view model for a scan; its thread loads through `reloadThread`.
     @MainActor
     private func openWithThread(
         _ opened: MessageHeader, pool: DatabasePool,
+        observeNotifications: Bool = true,
         fetchBody: ((MessageHeader) async throws -> Void)? = nil
     ) async throws -> MessageDetailViewModel {
         let vm = MessageDetailViewModel(
             messageId: opened.id, dbPool: pool,
             fetchBodyOverride: fetchBody ?? { msg in try await Self.storeBody(msg, in: pool) },
-            observeNotifications: true)
+            observeNotifications: observeNotifications)
         vm._testSeedMessage(opened)
-        NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        if observeNotifications {
+            NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+        } else {
+            vm.reloadThread()
+        }
         try await waitUntil("the thread to load") { vm.hasLoadedThread && vm.displayTurnIsIdleForTesting }
         return vm
     }
@@ -352,7 +395,7 @@ struct MessageDetailOpenedRowTests {
         let violations = Violations(vm, keeping: [reply.id, replyAllMailCopy.id])
         let timeline = Timeline(vm)
         try await removeInboxCopy(inboxCopy, from: pool)
-        await vm.refetchBody()
+        try await run("the refresh to end") { await vm.refetchBody() }
         try await settle(vm)
 
         #expect(vm.message?.id == allMailCopy.id, "precondition: the open re-resolved onto the All Mail copy")
@@ -389,7 +432,7 @@ struct MessageDetailOpenedRowTests {
         let violations = Violations(vm, keeping: [later.id])
         let timeline = Timeline(vm)
         try await removeInboxCopy(inboxCopy, from: pool)
-        await vm.refetchBody()
+        try await run("the refresh to end") { await vm.refetchBody() }
         try await settle(vm)
 
         #expect(vm.message?.id == allMailCopy.id, "precondition: the open re-resolved onto the All Mail copy")
@@ -418,7 +461,7 @@ struct MessageDetailOpenedRowTests {
         let timeline = Timeline(vm)
         // The Inbox label goes before the open reads: its resolve finds the All Mail copy.
         try await removeInboxCopy(inboxCopy, from: pool)
-        await vm.loadBody()
+        try await run("the open to end") { await vm.loadBody() }
         try await settle(vm)
 
         #expect(timeline.reached(.openResolve), "control: the open's resolve ran")
@@ -449,7 +492,7 @@ struct MessageDetailOpenedRowTests {
         // The Inbox label goes while the open fetches the Inbox copy's body: the open reads the
         // header back, finds nothing and publishes no opened email. The body poll recovers the
         // header onto the All Mail copy, then fetches that copy's body.
-        let vm = try await openWithThread(inboxCopy, pool: pool, fetchBody: { msg in
+        let vm = try await openWithThread(inboxCopy, pool: pool, observeNotifications: false, fetchBody: { msg in
             if msg.id == inboxCopyId {
                 try await pool.write { db in
                     try db.execute(sql: "DELETE FROM messageHeader WHERE id = ?", arguments: [inboxCopyId])
@@ -465,7 +508,7 @@ struct MessageDetailOpenedRowTests {
 
         let violations = Violations(vm, keeping: [reply.id])
         let timeline = Timeline(vm)
-        await vm.loadBody()
+        try await run("the open to end") { await vm.loadBody() }
         // The poll's first server fetch comes after its 2s tick; it publishes the body and the
         // header and asks for its scan in one display turn.
         try await waitUntil("the poll to recover the All Mail copy and its body", seconds: 8) {
@@ -502,7 +545,7 @@ struct MessageDetailOpenedRowTests {
         defer { cleanUp(pool, dir, previous) }
         let (inboxCopy, _, _) = try insertCopyThread(into: pool)
 
-        let vm = try await openWithThread(inboxCopy, pool: pool)
+        let vm = try await openWithThread(inboxCopy, pool: pool, observeNotifications: false)
         defer { vm.cancelBodyPollForTesting() }
         let timeline = Timeline(vm)
         // Pull-to-refresh holds its display turn at its header read; no thread scan is asked for.
@@ -512,7 +555,7 @@ struct MessageDetailOpenedRowTests {
             await previousRead?(point)
             if point == .refetchResolve { await gate.hold() }
         }
-        let refresh = Task { await vm.refetchBody() }
+        let refresh = start { await vm.refetchBody() }
         do {
             try await waitUntil("the refresh to hold its read") { gate.reached }
             #expect(timeline.allScansAsked == 0, "control: no thread scan is asked for while the read is held")
@@ -522,11 +565,11 @@ struct MessageDetailOpenedRowTests {
             }
         } catch {
             gate.open()
-            try? await withTimeout(seconds: 5) { await refresh.value }
+            try? await finish(refresh, "the refresh to end")
             throw error
         }
         gate.open()
-        await refresh.value
+        try await finish(refresh, "the refresh to end")
         try await settle(vm)
         #expect(vm.message?.id == inboxCopy.id, "control: the refresh kept the opened email")
         #expect(timeline.allScansAsked == 1, "control: the refresh asked for its own thread scan after its fetch")
@@ -579,7 +622,7 @@ struct MessageDetailOpenedRowTests {
 
         let violations = Violations(vm, keeping: [reply.id])
         let timeline = Timeline(vm)
-        let load = Task { await vm.loadBody() }
+        let load = start { await vm.loadBody() }
         // The held fetch is released and the open joined on every way out, so no task outlives
         // the fixture.
         do {
@@ -595,12 +638,12 @@ struct MessageDetailOpenedRowTests {
             try await expectEveryStoredCopyListedOnce(vm, among: ids, pool: pool)
         } catch {
             gate.open()
-            try? await withTimeout(seconds: 5) { await load.value }
+            try? await finish(load, "the open to end")
             try? await settle(vm)
             throw error
         }
         gate.open()
-        await load.value
+        try await finish(load, "the open to end")
         try await settle(vm)
         #expect(violations.found.isEmpty, "\(violations.found)")
         let finalRows = vm.chatRows.map(\.id)
@@ -624,7 +667,7 @@ struct MessageDetailOpenedRowTests {
         let violations = Violations(vm, keeping: [reply.id])
         let timeline = Timeline(vm)
         PreviewFreezeGate.shared.begin()
-        let load = Task { await vm.loadBody() }
+        let load = start { await vm.loadBody() }
         do {
             try await waitUntil("the open to reach its server fetch") { gate.reached }
             try await settle(vm)
@@ -652,12 +695,12 @@ struct MessageDetailOpenedRowTests {
         } catch {
             PreviewFreezeGate.shared.end()
             gate.open()
-            try? await withTimeout(seconds: 5) { await load.value }
+            try? await finish(load, "the open to end")
             try? await settle(vm)
             throw error
         }
         gate.open()
-        await load.value
+        try await finish(load, "the open to end")
         try await settle(vm)
         #expect(violations.found.isEmpty, "\(violations.found)")
         try await expectEveryStoredCopyListedOnce(vm, among: ids, pool: pool)
@@ -711,7 +754,7 @@ struct MessageDetailOpenedRowTests {
             splitAtReplacement.later = vm.laterMessages.map(\.id)
         }
         try await removeInboxCopy(inboxCopy, from: pool)
-        await vm.refetchBody()
+        try await run("the refresh to end") { await vm.refetchBody() }
         try await settle(vm)
 
         #expect(vm.message?.id == allMailCopy.id, "precondition: the open re-resolved onto the All Mail copy")
