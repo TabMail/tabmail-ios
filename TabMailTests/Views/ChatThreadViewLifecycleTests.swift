@@ -32,6 +32,8 @@ import UIKit
 ///     the outbox (offline it may stay there for long) and once it is sent, until an email from
 ///     someone else arrives; that email's own AI Reply then shows. (The Sending bubble itself:
 ///     `ChatSendingBubbleTests`.)
+///  8. A chat that landed at the bottom is still at the bottom once the top bar's inset changes
+///     and settles, whichever order the landing and the inset arrive in.
 ///
 /// What was asked is read back from the summary queue; which rows are on screen is read from the
 /// bubbles' accessibility frames (each email has its own subject).
@@ -237,6 +239,54 @@ struct ChatThreadViewLifecycleTests {
         #expect(opened.older.isEmpty,
                 "at the bottom every email on screen is among the newest asked for, so no older one asks: \(opened.older) vs \(opened.partlyShown.sorted())")
         #expect(!opened.queued.contains(0), "the oldest email waits for a scroll")
+    }
+
+    /// Waits, by polling the layout, until the scroll's top inset passes `inset` and the inset and
+    /// the distance from the bottom hold still for several passes; a timeout fails the test.
+    /// Returns that distance.
+    private static func settledBelow(_ scroll: UIScrollView, topInset inset: (CGFloat) -> Bool,
+                                     sourceLocation: SourceLocation = #_sourceLocation) async throws -> CGFloat {
+        var last: [CGFloat]?
+        var stableFor = 0
+        for _ in 0..<80 where stableFor < 6 {
+            try await Task.sleep(for: .milliseconds(100))
+            guard inset(scroll.adjustedContentInset.top) else { stableFor = 0; last = nil; continue }
+            let now = [scroll.adjustedContentInset.top, below(scroll)]
+            stableFor = now == last ? stableFor + 1 : 0
+            last = now
+        }
+        try #require(stableFor >= 6, "the top inset and the scroll settle, got inset \(scroll.adjustedContentInset.top), below \(String(describing: last))",
+                     sourceLocation: sourceLocation)
+        return try #require(last, sourceLocation: sourceLocation)[1]
+    }
+
+    @Test("A chat landed at the bottom is still at the bottom after the top bar grows and shrinks its inset")
+    func topInsetChangeKeepsTheBottom() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let seam = ChatHeaderTestSeam.shared
+        defer { seam.extraHeight = 0 }
+        // Large enough to move the inset by about what the settling top bar moves it.
+        let growth: CGFloat = 400
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { scroll in
+            let landed = try await Self.settledBelow(scroll, topInset: { _ in true })
+            let settledInset = scroll.adjustedContentInset.top
+            try #require(abs(landed) < 2, "control: the chat lands at the bottom first, got \(landed)")
+            // The landing is still held: nothing has scrolled by hand or by offset.
+            #expect(!scroll.isDragging && !scroll.isDecelerating && !scroll.isTracking, "control: no scroll began")
+            let contentHeight = scroll.contentSize.height
+            let containerHeight = scroll.bounds.height
+
+            seam.extraHeight = growth
+            let grown = try await Self.settledBelow(scroll, topInset: { $0 > settledInset + growth / 2 })
+            #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
+                    "control: only the inset changed")
+            #expect(abs(grown) < 2, "at the bottom after the inset grows, got \(grown) below the screen")
+
+            seam.extraHeight = 0
+            let shrunk = try await Self.settledBelow(scroll, topInset: { $0 == settledInset })
+            #expect(abs(shrunk) < 2, "at the bottom after the inset shrinks, got \(shrunk) below the screen")
+        }
+        #expect(abs(opened.belowScreen) < 2, "still at the bottom at the end, got \(opened.belowScreen)")
     }
 
     /// SwiftUI reports a bubble's visibility only when it changes, so an older email already on
