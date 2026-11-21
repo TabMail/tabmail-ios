@@ -13,7 +13,9 @@ import Testing
 /// a UIDVALIDITY reset can put a different email at the same address before the detail resolves
 /// it; the card passes the bubble's Message-ID with the address, so the detail marks nothing read
 /// then. The unchanged email is still marked read (the control). The same holds for a chat opened
-/// from search on an email with no Message-ID: it carries the address epoch search found.
+/// from search on an email with no Message-ID: it carries the address epoch search found. A search
+/// open never shows the draft editor for a draft that is not the one search found, whether its
+/// Message-ID or, for a draft with none, its address epoch tells them apart.
 ///
 /// The account is Gmail: the witness check is the same for every provider, and a Gmail read's queued
 /// operation fails at once here, where an IMAP one would try to connect and hold the shared write
@@ -314,6 +316,56 @@ struct ChatCardIdentityTests {
         let afterRead = after?.isRead
         #expect(afterSubject == seated.subject, "control: the row at the address is the replacement")
         #expect(afterRead == false, "the replacement stays unread")
+    }
+
+    /// Search found a draft by its Message-ID; the draft now at that address has another
+    /// Message-ID, under the same address epoch. A usable Message-ID is the witness, ahead of the
+    /// epoch: the open search's destination builds, routed as its body routes it, never opens the
+    /// other draft in the draft editor. The control: an open carrying the Message-ID of the draft
+    /// there opens it in the draft editor.
+    @Test("Search's open of a draft whose Message-ID is not the one search found shows no draft editor; a matching one does",
+          arguments: [true, false])
+    func searchOpenOfADraftWithAnotherMessageID(opensInChat: Bool) async throws {
+        let (pool, _, dir, previous) = try makeDB()
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        defer {
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+            clearShared()
+        }
+        clearShared()
+        saved.setChatView(on: opensInChat)
+        let epoch = 11
+        var drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: Self.account)
+        drafts.lastKnownUidValidity = epoch
+        let draftsFolder = drafts
+        var draft = MessageHeader(
+            messageId: "4444", subject: "Another draft", from: "User", fromAddress: "user@example.com",
+            to: "sender@example.com", date: Date(), snippet: "", folderId: draftsFolder.id,
+            accountId: Self.account, folderPath: draftsFolder.path, isInInbox: false)
+        draft.rfc822MessageId = "<other@example.com>"
+        draft.headerComplete = true
+        draft.observedUidValidity = epoch
+        let atAddress = draft
+        try await pool.write { db in
+            try draftsFolder.insert(db)
+            try atAddress.insert(db)
+        }
+        let database = PrioritizedDatabase(pool: pool)
+        let fetched = try await pool.read { db in try MessageHeader.fetchOne(db, key: atAddress.id) }
+        let stored = try #require(fetched)
+
+        let mismatched = SearchView.destination(for: SearchView.OpenTarget(
+            headerId: atAddress.id, provenRfc822MessageId: "<found@example.com>", provenObservedUidValidity: epoch))
+        let route = mismatched.route(pool: database)
+        let expectedRoute: MessageOpenView.Route = opensInChat ? .chat : .detail
+        #expect(route == expectedRoute,
+                "another Message-ID at the address never opens in the draft editor; the \(opensInChat ? "chat" : "detail") refuses it instead")
+
+        let matching = SearchView.destination(for: SearchView.OpenTarget(
+            headerId: atAddress.id, provenRfc822MessageId: "<other@example.com>", provenObservedUidValidity: epoch))
+        let matchingRoute = matching.route(pool: database)
+        #expect(matchingRoute == .draftEditor(stored), "control: the draft's own Message-ID opens it in the draft editor")
     }
 
     /// The two lines no unit test can reach, pinned by source. Search's destination is registered
