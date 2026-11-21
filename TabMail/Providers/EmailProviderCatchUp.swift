@@ -151,9 +151,11 @@ struct CatchUpFolderResult: Sendable {
     /// runs another slice only after one in which an applied result made progress,
     /// or in which a folder first left a request in flight (#1062),
     /// so a folder whose requests keep failing is tried again at the worker's next
-    /// cycle, never at network rate (#766). The progress of a folder whose call
-    /// left a request in flight (`requestMayBeInFlight`) does not count toward
-    /// another slice (#1062).
+    /// cycle, never at network rate (#766). A foreground cycle takes one slice
+    /// whatever it made.
+    /// *Superseded (#1062, in place):* "The progress of a folder whose call left a
+    /// request in flight (`requestMayBeInFlight`) does not count toward another
+    /// slice": the slice that adds such a folder takes another for that reason.
     /// *Superseded (#1062):* "runs another slice only after one in which an
     /// applied result made progress": a slice whose only progress came from a
     /// folder left out from then on also takes one more, so the folders still

@@ -522,7 +522,13 @@ extension IMAPProvider {
                     // false (a cap-only change, see `madeProgress` below), while one
                     // that started the listing or answered an earlier range made
                     // progress. The listing keeps its place, and the folder's next
-                    // call asks from there at most the capped width. A range of one
+                    // call asks from there at most the capped width: after a
+                    // timeout, a call of a later run (this run leaves the folder
+                    // out); after an answer too large or undecodable, nothing is in
+                    // flight, so a later slice of this same run may be that call.
+                    // *Superseded (#1062, in place):* "the folder's next call asks
+                    // from there" with only the timeout's reason given, which read
+                    // as if every such retry waited for a later run. A range of one
                     // UID that fails stays unconfirmed: the listing never moves past
                     // it, and the next call asks it again. Another caller (the
                     // worker's next cycle, the walk) can still reach the folder soon
@@ -779,8 +785,8 @@ extension IMAPProvider {
             // first reconnect and log in again on the link that just timed out
             // (#1062). Only this range's own request can have timed out here:
             // every earlier timeout ended the call. If this range was the
-            // listing's last, its next call completes it at once, with no
-            // request, as not clean.
+            // listing's last, its next call, in a later run (this run leaves the
+            // folder out), completes it at once, with no request, as not clean.
             // *Superseded (#1062):* "may still hold the folder's connection": a
             // timed-out request closes its session at once.
             if requestTimedOut { break rangeLoop }
@@ -999,8 +1005,10 @@ extension IMAPProvider {
                 BackfillResult(id: $0.messageId, header: $0, htmlBody: nil, textBody: nil, error: nil)
             }
             let undecoded = fetched.undecoded.filter(requested.contains)
+            // Every UID is logged: the batch is already at most
+            // `SyncConfig.catchUpLoadBatchSize`.
             if !undecoded.isEmpty, DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CatchUp] \(path): \(undecoded.count) header record(s) could not be read (UIDs \(undecoded.prefix(20))) — left missing, held like an unanswered UID")
+                BackgroundSyncLogger.logDebug("[CatchUp] \(path): \(undecoded.count) header record(s) could not be read (UIDs \(undecoded)) — left missing, held like an unanswered UID")
             }
             // A record the client could not read is that UID's failure alone: it
             // is not loaded, the rest of the batch is, and it is held like an

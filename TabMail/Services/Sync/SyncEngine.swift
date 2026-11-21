@@ -33,6 +33,11 @@ actor SyncEngine {
     /// `SyncConfig.catchUpSliceIntervalSeconds`. In memory only; a relaunch starts afresh.
     var catchUpSliceWindowEnds: [String: Date] = [:]
 
+    #if DEBUG
+    /// Test-only seam (`setCatchUpSliceStartHookForTesting`): called with the
+    /// folders each catch-up slice asks, as it starts. Nil outside tests.
+    var catchUpSliceStartHookForTesting: (@Sendable ([String]) -> Void)?
+    #endif
 
     /// Generation counter per account — prevents stale task defer from clearing
     /// a replacement task's dictionary entry after resetCrawlState.

@@ -218,9 +218,14 @@ extension SyncEngine {
     /// so a push or silent-push delta that arrives meanwhile waits at most one
     /// slice. The slice's clock starts when its turn starts, never while it waits.
     /// A foreground cycle (`run.deadline == nil`) runs one slice; the background
-    /// processing job runs slices until its deadline. Either stops after a slice
-    /// that made no progress, so a folder whose requests keep failing is retried at
-    /// the next cycle, not at network rate. The run never asks a folder again after
+    /// processing job runs slices until its deadline, and stops after a slice
+    /// whose folders made no progress and that left no folder out it had not
+    /// left out before, so a folder whose requests keep failing is retried at
+    /// the next cycle, not at network rate.
+    /// *Superseded (#1062, in place):* "Either stops after a slice that made no
+    /// progress": a background slice that adds a folder to the left-out set
+    /// takes another, and a foreground cycle stops after its one slice whatever
+    /// it made. The run never asks a folder again after
     /// its call left a request that may still be in flight
     /// (`CatchUpFolderResult.requestMayBeInFlight`, #1062; IMAP: a request that
     /// timed out), whatever progress that call made: abandoning the request
@@ -289,6 +294,9 @@ extension SyncEngine {
                     BackgroundSyncLogger.logDebug("[CatchUp] folder read failed: \(error)")
                     return .ran(CatchUpSliceResult())
                 }
+                #if DEBUG
+                self.catchUpSliceStartHookForTesting?(folderIds)
+                #endif
                 let ran = (try? await queue.execute(priority: .headerFetch) {
                     await self.runCatchUp(provider: provider, folderIds: folderIds, context: context)
                 }) ?? CatchUpSliceResult()
@@ -330,6 +338,16 @@ extension SyncEngine {
         return madeProgress
     }
 
+    #if DEBUG
+    /// Test-only seam: install `catchUpSliceStartHookForTesting`, called with
+    /// the folders a slice of `runCatchUpRun` asks, as the slice starts (inside
+    /// the account's turn, before its first request), so a test can tell which
+    /// slice sent each request. Compiled out of Release.
+    func setCatchUpSliceStartHookForTesting(_ hook: (@Sendable ([String]) -> Void)?) {
+        catchUpSliceStartHookForTesting = hook
+    }
+    #endif
+
     /// What one turn of `runCatchUpRun` did.
     private enum CatchUpSliceOutcome {
         /// The account's previous slice window is still open: nothing was sent.
@@ -345,7 +363,11 @@ extension SyncEngine {
     /// The account's syncable folders as they are now (`syncableFoldersInOrder`,
     /// the folders the full sync syncs), in the full sync's order, then every
     /// other folder owed a check after a move retired without proof
-    /// (`FolderChangeState.selfHealDue`, #1062), so its mark always clears.
+    /// (`FolderChangeState.selfHealDue`, #1062), so it is always listed: its
+    /// mark clears at a clean listing, and stays open after an unclean one until
+    /// a later clean one.
+    /// *Superseded (#1062, in place):* "so its mark always clears": an unclean
+    /// completion leaves it owed.
     private func syncableFolderIds(accountId: String) async throws -> [String] {
         let folders = try await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId).fetchAll(db)
@@ -709,7 +731,10 @@ extension SyncEngine {
         // loaded or proven gone. A listing that passed anything over, or whose
         // loads this apply skipped as an over-age read, is unclean: the folder
         // stays owed and is listed again at the daily full check (an owed folder
-        // gets it even with a bookmark, in the provider's catch-up plan), never sooner.
+        // gets it even with a bookmark, in the provider's catch-up plan), or
+        // sooner when the folder's change counter (HIGHESTMODSEQ) moves.
+        // *Superseded (#1062, in place):* "never sooner": an owed folder is
+        // untracked, so a moved counter lists it before the daily check.
         let clean = result.completedListing.map { $0.clean && !skippedLoads } ?? false
         let startedAfterMark = result.completedListing.map {
             $0.lapseCountAtStart >= (changeState.selfHealLapse ?? 0)
