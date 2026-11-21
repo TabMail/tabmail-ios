@@ -1048,7 +1048,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    upward travel and no velocity, so a flick inside the text never opens the panel. UIKit cannot
    start a recognizer that failed earlier in the same touch, so waiting for the scroll could never
    hand the rest of a drag to the field; sharing the touch keeps one delivery and one release path.
-   Known limit: past its end the text's own bounce runs while the field swells. Text that does not
+   The collapsed reply editor's text never bounces vertically: the pan turns its vertical bounce off
+   (`bouncesVertically`) when a touch first lands in it, before the touch moves, and never turns it
+   back on, so past its end the text stays at its end while the field swells, as in H2; its own
+   scroll, caret and selection are unchanged (amended 2026-11-21; it replaces the known limit
+   "past its end the text's own bounce runs while the field swells"). Text that does not
    scroll (a short draft) leaves the field the whole drag. *Superseded 2026-11-21 (overflowing
    text could never drag the panel open):* "The field's text view goes first where it did: the pan
    waits for its scroll (text overflowing the six lines) and its long presses (caret, loupe,

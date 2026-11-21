@@ -512,7 +512,8 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
 /// focuses the field as before. In the focused field's overflowing text it runs alongside the
 /// text's scroll and hands on only the field's share of the drag (`Coordinator.share`): none while
 /// the text can still scroll, the rest of the same drag once the text has reached its end (mock
-/// v15 H2).
+/// v15 H2). That text never bounces vertically (`Coordinator.touchDown`), so past its end it stays
+/// at its end while the field swells.
 struct ChatFieldPan: UIGestureRecognizerRepresentable {
     /// Off over the open panel and in the tutorial. Turning it off mid-drag cancels the drag, which
     /// ends as an interrupted one.
@@ -587,9 +588,13 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         }
 
         /// A new drag's first touch landed on `view`: the text around it, if any, and its scroll
-        /// position now.
+        /// position now. That text stops bouncing vertically here, before the touch has moved, and
+        /// never bounces again: past its end the rest of the drag is the field's, and the text holds
+        /// still at its end while the field swells (mock v15 H2). Its own scroll, caret and
+        /// selection are unchanged.
         func touchDown(on view: UIView?) {
             text = Self.scrollingText(around: view)
+            text?.bouncesVertically = false
             textStart = text?.contentOffset.y ?? 0
         }
 
