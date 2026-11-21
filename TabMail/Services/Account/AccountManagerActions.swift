@@ -333,22 +333,16 @@ extension AccountManager {
         }) ?? []
         var byId = Dictionary(uniqueKeysWithValues: durable.map { ($0.id, $0) })
         let missingIds = ids.filter { byId[$0] == nil }
-        if !missingIds.isEmpty {
-            let missingSet = Set(missingIds)
-            let staged = NSEDataBridge.latestStagedRows.withLock { rows in
-                rows.filter { missingSet.contains($0.headerId) }
-            }
-            for row in staged { byId[row.headerId] = row.toMessageHeader() }
-        }
+        byId.merge(Self.stagedHeadersForAction(ids: missingIds)) { stored, _ in stored }
         // Preserve caller's id order; ids that resolved to nothing are dropped.
         return ids.compactMap { byId[$0] }
     }
 
     /// The headers synthesized from `NSEDataBridge.latestStagedRows` for the given
-    /// ids, keyed by header id (the caller lets a stored row win over these), with
-    /// the same projection `resolveHeadersForAction` uses for a staged row.
-    /// Synchronous, for a MainActor reader that reads the store itself
-    /// (`MessageDetailViewModel.lookupChatRows`).
+    /// ids, keyed by header id (the caller lets a stored row win over these). The one
+    /// staged-row projection for an action: `resolveHeadersForAction` takes it for
+    /// the ids the store lacks, and `MessageDetailViewModel.lookupChatRows` (a
+    /// synchronous MainActor reader that reads the store itself) for every id.
     nonisolated static func stagedHeadersForAction(ids: [String]) -> [String: MessageHeader] {
         guard !ids.isEmpty else { return [:] }
         let idSet = Set(ids)

@@ -711,11 +711,12 @@ same AI result, kept as long as the email itself is shown.
    rows, with the projection the move's resolver uses (`AccountManager.stagedHeadersForAction`).
    `lookupChatRows` reads the staged rows before the store, and a stored row wins, so an email the
    merge stores and unstages during that read is in one of them. The move's own resolver
-   (`AccountManager.resolveHeadersForAction`) keeps its order (store, then the staged rows for the
-   ids the store lacks): it serves every action, so a change to its order belongs in its own change
-   with outcome tests for every caller (tabmail-ios #1149; until then a whole-chat move during the
-   opened email's promotion can leave that email in place, which is no regression: before, a
-   staged-only opener was never moved). A row neither stored nor staged is not taken, since there
+   (`AccountManager.resolveHeadersForAction`, which takes the same staged projection) keeps its
+   order (store, then the staged rows for the ids the store lacks): it serves every action, so a
+   change to its order belongs in its own change with outcome tests for every caller (tabmail-ios
+   #1149; until then a whole-chat move during the opened email's promotion can leave that email in
+   place, which is no regression: the move's resolver had the same window before this change). A
+   row neither stored nor staged is not taken, since there
    is no row to move or restore. Each moved row's undo entry records its folder as the chat holds it
    (the visible location is the undo source) and its action tag and sort order as read, with a
    pending tag change on top (`AccountManager.overlayAdjustedSnapshot(_:in:)`). The overlay snapshot
@@ -738,9 +739,11 @@ same AI result, kept as long as the email itself is shown.
    by the next sync). Tests (`MessageDetailThreadActionTests`): `archiveUndoKeepsTheLatestTag`,
    `archiveDuringASwipeRecordsTheLatestTag`, `archiveWhileARefreshWaitsRecordsTheLatestTag`,
    `archiveAfterAnUnpostedTagWriteRecordsTheStoredTag`, `archiveRecordsAPendingTagChange`,
-   `archiveRecordsAPendingTagClear`, `archiveRecordsATagThatLandsDuringItsRead`,
-   `trashAndMoveRecordTheStoredTagOnEveryRow`, `archiveRecordsTheFolderTheChatHolds`,
+   `archiveRecordsAPendingTagClear`, `archiveRecordsAPendingNoneTag`,
+   `archiveRecordsATagThatLandsDuringItsRead`, `trashAndMoveRecordTheStoredTagOnEveryRow`,
+   `trashAndMoveRecordTheStoredTagOnFiledRows`, `archiveRecordsTheFolderTheChatHolds`,
    `archiveTakesAStagedOpener`, `archiveTakesTheStoredRowOverItsStagedCopy`,
+   `archiveTakesAStoredRowWithNoTagOverItsTaggedStagedCopy`,
    `archiveLeavesOutARowNoLongerStored`, `unreadableRowsMoveNothing`,
    `archiveRecordsTheStoredTagInEveryAccount`. Related, not changed here: a manual tag write after
    a mailbox reset between its resolve and its write (tabmail-ios #1150).

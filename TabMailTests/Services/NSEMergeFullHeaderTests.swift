@@ -181,6 +181,7 @@ struct NSEMergeFullHeaderTests {
         #expect(headerA?.reminderContent == nil)
         #expect(headerA?.summaryTextMessage == nil)
         #expect(headerA?.actionTag == nil)               // AI deferred to phase 2
+        #expect(headerA?.tagSortOrder == 99)             // the untagged sort bucket, with no tag
         let bodyCountA = try dbA.read {
             try MessageBody.filter(Column("id") == hidA).fetchCount($0)
         }

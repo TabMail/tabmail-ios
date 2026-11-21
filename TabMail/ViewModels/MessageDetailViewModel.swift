@@ -183,10 +183,12 @@ final class MessageDetailViewModel {
     /// Test seam: called synchronously on every assignment of a `DisplayField`,
     /// with the new value already in place, so a test sees every publication.
     @ObservationIgnored var _publicationHook: (@MainActor (DisplayField) -> Void)?
-    /// Test seam: called synchronously right after a whole-chat action read its rows
-    /// (`recordChatMove`, after `lookupChatRows`), so a test can land a write between that
-    /// read and the rest of the action. No production caller sets it.
-    @ObservationIgnored var _chatRowsReadHook: (@MainActor () -> Void)?
+    /// Test seam: called synchronously INSIDE a whole-chat action's read of its rows
+    /// (`lookupChatRows`), after both fetches, so the read's database snapshot is fixed and a
+    /// test can land a write, an overlay retire or an unstage within that read. Called on the
+    /// read's thread, so it must not touch MainActor state. Debug builds only; no production
+    /// caller sets it.
+    @ObservationIgnored var _chatRowsReadHook: (@Sendable () -> Void)?
     /// The row changes held back while the screen is frozen, waiting for the release to replay them.
     var pendingRefreshIdsForTesting: Set<String> { pendingRefreshIds }
     /// How many times each field was assigned since init.
@@ -2346,9 +2348,6 @@ final class MessageDetailViewModel {
     ) -> Set<String> {
         let overlay = manager.snapshotOverlay()
         guard let stored = lookupChatRows(members) else { return [] }
-        #if DEBUG
-        _chatRowsReadHook?()
-        #endif
         let groups: [MoveGroup] = UndoableAction.byAccount(members).compactMap { share in
             guard let accountId = share.first?.accountId, let folder = destination(accountId) else { return nil }
             let movable: [MessageHeader] = share.compactMap { member in
@@ -2475,9 +2474,15 @@ final class MessageDetailViewModel {
         let folderIds = Array(Set(members.map(\.folderId)))
         let ids = members.map(\.id)
         let staged = AccountManager.stagedHeadersForAction(ids: ids)
+        #if DEBUG
+        let readHook = _chatRowsReadHook
+        #endif
         guard let read = try? dbPool.read({ db -> (roles: [String: FolderRole], rows: [String: MessageHeader]) in
             let roles = Dictionary(try Folder.fetchAll(db, keys: folderIds).map { ($0.id, $0.role) }) { first, _ in first }
             let rows = Dictionary(try MessageHeader.fetchAll(db, keys: ids).map { ($0.id, $0) }) { first, _ in first }
+            #if DEBUG
+            readHook?()
+            #endif
             return (roles: roles, rows: rows)
         }) else { return nil }
         return (roles: read.roles, rows: read.rows.merging(staged) { stored, _ in stored })
