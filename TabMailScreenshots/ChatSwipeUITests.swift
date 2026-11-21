@@ -263,11 +263,36 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(wentBack(app), "a right drag from the field goes back")
     }
 
+    /// Starts in the screen's margin beside the field, outside the field's glass.
     func testNothingOpenEdgeDragOnTheReplyFieldGoesBack() {
         let app = launchIntoChat()
         dragFromEdge(atY: replyField(in: app).frame.midY, in: app)
         XCTAssertTrue(wentBack(app), "an edge drag at the field goes back")
     }
+
+    /// Starts on the field's glass itself, where it overlaps the back swipe's zone at the screen's
+    /// left edge (the field's side inset is narrower than that zone): the field's own drag and its
+    /// text leave the back swipe the touch, so it goes back.
+    func testNothingOpenEdgeDragStartingOnTheReplyFieldGoesBack() {
+        let app = launchIntoChat()
+        let pill = app.descendants(matching: .any)["chatReplyPill"].firstMatch
+        XCTAssertTrue(pill.waitForExistence(timeout: 5), "control: the field's glass")
+        XCTAssertTrue(pill.isHittable, "control: the field is hittable")
+        let y = replyField(in: app).frame.midY
+        let x = pill.frame.minX + Self.insideTheFieldsEdge
+        let onTheGlass = pill.frame.contains(CGPoint(x: x, y: y))
+        XCTAssertTrue(onTheGlass, "control: the start (\(x), \(y)) is on the field's glass \(pill.frame)")
+        XCTAssertLessThan(x, Self.backSwipeEdgeWidth, "control: and inside the back swipe's zone")
+        let start = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: x, dy: y))
+        start.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: y / app.frame.height)))
+        XCTAssertTrue(wentBack(app), "an edge drag that starts on the field goes back")
+    }
+
+    /// `ChatViewLayout.backSwipeEdgeWidth`, the back swipe's zone at the left edge, and how far into
+    /// the field's glass from its leading edge the overlap drag starts (the field's side inset,
+    /// `ChatViewLayout.fieldSideInset`, is 16 points, so this lands at 20).
+    private static let backSwipeEdgeWidth: CGFloat = 24
+    private static let insideTheFieldsEdge: CGFloat = 4
 
     /// Signed in, the focused field with a short draft: the drag up opens the panel, whose editor
     /// (not the sign-in bar a signed-out panel shows) holds the same draft.
@@ -668,6 +693,24 @@ final class ChatSwipeUITests: XCTestCase {
 
     /// One short line, typed so the caret ends after it.
     private static let caretPhrase = "Lunch works"
+
+    /// Signed in, an overflowing draft at its top: a double tap on its first word makes the text
+    /// view's own selection of that word, and the typed word replaces exactly that selection. The
+    /// field's drag beside the text leaves its selection alone; the panel stays shut.
+    func testDoubleTapInOverflowingTextSelectsAWordToReplace() {
+        let app = launchIntoChat(signedIn: true)
+        let long = signedInDraftAtItsTop(Self.overflowingText, lastLine: Self.overflowingLastLine, in: app)
+        long.coordinate(withNormalizedOffset: .zero).withOffset(Self.insideTheTextsCorner).doubleTap()
+        long.typeText(Self.replacementWord)
+        let replaced = Self.replacementWord + String(Self.overflowingText.dropFirst(Self.firstWord.count))
+        XCTAssertEqual(long.value as? String, replaced, "the double tap selected the first word, and the typed word replaced it")
+        XCTAssertFalse(app.buttons["chatClose"].exists, "control: the panel stays shut")
+        XCTAssertTrue(markerReads(focused: true, in: app), "control: the field kept its focus")
+    }
+
+    /// The overflowing draft's first word, and the word typed over its selection.
+    private static let firstWord = "Line"
+    private static let replacementWord = "Row"
 
     /// The focused field with words: a press held until the text view's own long press takes it
     /// (the loupe, caret placement), then moved up past the open distance, stays the text's. The
