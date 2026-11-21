@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
-import Synchronization
 
 /// IMAP's opaque per-folder catch-up state (ADR-IOS-107), stored as JSON in
 /// `Folder.catchUpState`. Only `IMAPProvider` decodes it; the engine writes only
@@ -418,7 +417,6 @@ extension IMAPProvider {
                             try await self.getUidNextWithEpoch(folder: path)
                         }
                     } catch {
-                        CatchUpWireTrace.callerEnded("UIDNEXT read", folder: path, error: error)
                         if DebugModeManager.isLoggingEnabled() {
                             BackgroundSyncLogger.logDebug("[CatchUp] \(path): UIDNEXT read failed (\(error)) — stopping this folder for the pass")
                         }
@@ -470,7 +468,6 @@ extension IMAPProvider {
                         try await self.listFlagsInUIDRange(folder: path, from: lo, to: hi)
                     }
                 } catch {
-                    CatchUpWireTrace.callerEnded("listing \(lo):\(hi)", folder: path, error: error)
                     // A range too slow or too large to answer is cut by the walk's
                     // own rule (`UIDWalkCursor.halves`) to the half next to where the
                     // listing stands in its direction of travel (upward: the lower
@@ -601,7 +598,6 @@ extension IMAPProvider {
                         try await self.searchMembership(folder: path, uids: toConfirm, range: loadRange)
                     }
                 } catch {
-                    CatchUpWireTrace.callerEnded("membership proof \(lo):\(hi)", folder: path, error: error)
                     if DebugModeManager.isLoggingEnabled() {
                         BackgroundSyncLogger.logDebug("[CatchUp] \(path) \(lo):\(hi): membership proof failed (\(error)) — unresolved")
                     }
@@ -865,7 +861,6 @@ extension IMAPProvider {
                     try await self.searchExistingUIDs(folder: path, uids: unanswered)
                 }, false)
             } catch {
-                CatchUpWireTrace.callerEnded("SEARCH for \(unanswered.count) unanswered UID(s)", folder: path, error: error)
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[CatchUp] \(path): SEARCH for \(unanswered.count) unanswered UID(s) failed (\(error)) — resuming at \(unanswered[0])")
                 }
@@ -896,7 +891,6 @@ extension IMAPProvider {
                     try await self.fetchCatchUpHeaders(folder: path, uids: batch, expectedEpoch: epoch)
                 }
             } catch {
-                CatchUpWireTrace.callerEnded("load of \(batch.count) UID(s) from \(batch[0])", folder: path, error: error)
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[CatchUp] \(path): load of \(batch.count) missing UID(s) failed (\(error)) — resuming at \(batch[0])")
                 }
@@ -933,48 +927,5 @@ extension IMAPProvider {
             }
         }
         return load
-    }
-}
-
-/// Debug-gated wire timing of the catch-up's requests (#1062): one line per
-/// step of each request (asked; the folder connection acquired, with its id;
-/// each command sent, and answered or failed) and per caller timeout or
-/// failure, each with the time in milliseconds and the request's number. A
-/// request queued behind an earlier one on the same folder connection then
-/// reads apart from a server that answered late. Off unless debug logging is
-/// on, and no decision reads it.
-enum CatchUpWireTrace {
-    private static let requests = Mutex<Int>(0)
-
-    /// A new request's number and its "asked" line; nil, and no line, with
-    /// debug logging off.
-    static func asked(_ kind: String, folder: String, detail: String) -> Int? {
-        guard DebugModeManager.isLoggingEnabled() else { return nil }
-        let number = requests.withLock { count -> Int in
-            count += 1
-            return count
-        }
-        line("req=\(number) asked \(kind) \(detail)", folder: folder)
-        return number
-    }
-
-    /// One step of request `number` (nil: asked with debug logging off).
-    static func step(_ number: Int?, _ event: String, folder: String,
-                     connection: ObjectIdentifier? = nil, detail: String = "") {
-        guard let number, DebugModeManager.isLoggingEnabled() else { return }
-        let connectionText = connection.map { " conn=\(String(UInt(bitPattern: $0.hashValue), radix: 16))" } ?? ""
-        line("req=\(number) \(event)\(connectionText) \(detail)", folder: folder)
-    }
-
-    /// What the caller saw end a request: its timeout or the error it threw.
-    static func callerEnded(_ what: String, folder: String, error: any Error) {
-        guard DebugModeManager.isLoggingEnabled() else { return }
-        line("caller: \(what) ended: \(error)", folder: folder)
-    }
-
-    private static func line(_ text: String, folder: String) {
-        guard DebugModeManager.isLoggingEnabled() else { return }
-        let millis = Int((Date().timeIntervalSince1970 * 1000).rounded())
-        BackgroundSyncLogger.logDebug("[CatchUpWire] t=\(millis) '\(folder)' \(text)")
     }
 }

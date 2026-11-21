@@ -7341,10 +7341,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// The mirror is sound only for the walk's per-chunk COMPARISON, which fails
     /// closed on disagreement; it is not sound for the value the walk writes.
     func getUidNextWithEpoch(folder: String) async throws -> (uidNext: Int?, observedEpoch: UInt32?) {
-        let trace = CatchUpWireTrace.asked("UIDNEXT read", folder: folder, detail: "")
-        do {
-        return try await withFolderConnection(folder: folder) { server in
-            CatchUpWireTrace.step(trace, "acquired, sent SELECT", folder: folder, connection: ObjectIdentifier(server))
+        try await withFolderConnection(folder: folder) { server in
             // T1.3 (round 8): TRACKED. This is the crawl's walk-start SELECT —
             // the one the walk's per-chunk checks compare against. A raw
             // `selectMailbox` here left the mirror holding whatever the pinned
@@ -7352,8 +7349,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // be an epoch from a different pass entirely. See
             // `selectMailboxTracked`'s scope note.
             let selection = try await selectMailboxTracked(server, folder: folder)
-            CatchUpWireTrace.step(trace, "answered SELECT", folder: folder, connection: ObjectIdentifier(server),
-                                  detail: "uidNext \(selection.uidNext.value)")
             let observed = selection.uidValidity.value
             // 🚨 BOTH HALVES ARE NORMALISED FOR ABSENCE OF EVIDENCE, and only
             // the epoch used to be. `Mailbox.Selection`'s UIDNEXT and
@@ -7372,10 +7367,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // `nil` makes it unrepresentable as one at the decision site.
             let next = selection.uidNext.value
             return (next != 0 ? Int(next) : nil, observed != 0 ? observed : nil)
-        }
-        } catch {
-            CatchUpWireTrace.step(trace, "failed", folder: folder, detail: "\(error)")
-            throw error
         }
     }
 
@@ -7433,22 +7424,17 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         guard !uids.isEmpty else { return UIDExistenceResult(found: [], uidValidity: 0) }
         try Task.checkCancellation()
 
-        let trace = CatchUpWireTrace.asked("SEARCH UIDs", folder: folder, detail: "\(uids.count) UID(s) from \(uids[0])")
-        do {
         return try await withFolderConnection(folder: folder) { server in
-            CatchUpWireTrace.step(trace, "acquired, sent SELECT", folder: folder, connection: ObjectIdentifier(server))
             // T5.3 PORT — `v2final:…:IMAPProvider.searchExistingUIDs(folder:uids:)`
             // tracks this SELECT. The epoch this call RETURNS is still the one
             // bound to this very `Mailbox.Selection` (below) — the mirror write is
             // additive and no consumer of `UIDExistenceResult` reads the mirror.
             let selection = try await selectMailboxTracked(server, folder: folder)
-            CatchUpWireTrace.step(trace, "answered SELECT, sent SEARCH", folder: folder, connection: ObjectIdentifier(server))
             var searchSet = UIDSet()
             for uid in uids { searchSet.insert(UID(uid)) }
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(
                 identifierSet: searchSet, criteria: [.all]
             )
-            CatchUpWireTrace.step(trace, "answered SEARCH", folder: folder, connection: ObjectIdentifier(server))
             // Membership of each requested UID, never an expansion of the
             // answer; an answer naming a UID outside the request proves nothing.
             let listed = try extResult.listed(within: searchSet)
@@ -7456,10 +7442,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 found: Set(uids.filter { listed.contains(UID($0)) }),
                 uidValidity: selection.uidValidity.value
             )
-        }
-        } catch {
-            CatchUpWireTrace.step(trace, "failed", folder: folder, detail: "\(error)")
-            throw error
         }
     }
 
@@ -7487,17 +7469,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ) async throws -> (flags: [UInt32: (isRead: Bool, isFlagged: Bool, isDeleted: Bool)], uidValidity: UInt32, uidNext: UInt32?, exists: Int) {
         guard from >= 1, to >= from else { return ([:], 0, nil, 0) }
         try Task.checkCancellation()
-        let trace = CatchUpWireTrace.asked("listing", folder: folder, detail: "\(from):\(to)")
-        do {
         return try await withFolderConnection(folder: folder) { server in
-            CatchUpWireTrace.step(trace, "acquired, sent SELECT", folder: folder, connection: ObjectIdentifier(server))
             let selection = try await selectMailboxTracked(server, folder: folder)
-            CatchUpWireTrace.step(trace, "answered SELECT, sent FETCH", folder: folder, connection: ObjectIdentifier(server),
-                                  detail: "exists \(selection.messageCount), uidNext \(selection.uidNext.value)")
             let infos = try await server.fetchMessageInfos(
                 uidRange: UID(UInt32(from))...UID(UInt32(to)), options: .uidFlagsOnly)
-            CatchUpWireTrace.step(trace, "answered FETCH", folder: folder, connection: ObjectIdentifier(server),
-                                  detail: "\(infos.count) record(s)")
             var flags: [UInt32: (isRead: Bool, isFlagged: Bool, isDeleted: Bool)] = [:]
             for info in infos {
                 guard let uid = info.uid else {
@@ -7511,10 +7486,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let uidNext = selection.uidNext.value
             return (flags, selection.uidValidity.value, uidNext != 0 ? uidNext : nil, selection.messageCount)
         }
-        } catch {
-            CatchUpWireTrace.step(trace, "failed", folder: folder, detail: "\(error)")
-            throw error
-        }
     }
 
     /// The membership proof of one listing range (#1062): `UID SEARCH UID <set>`
@@ -7525,26 +7496,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// one of THIS SELECT.
     func searchMembership(folder: String, uids: [UInt32], range: ClosedRange<Int>?) async throws -> UIDExistenceResult {
         try Task.checkCancellation()
-        let rangeText = range.map { "\($0.lowerBound):\($0.upperBound)" } ?? "none"
-        let trace = CatchUpWireTrace.asked("membership proof", folder: folder, detail: "\(uids.count) UID(s), range \(rangeText)")
-        do {
         return try await withFolderConnection(folder: folder) { server in
-            CatchUpWireTrace.step(trace, "acquired, sent SELECT", folder: folder, connection: ObjectIdentifier(server))
             let selection = try await selectMailboxTracked(server, folder: folder)
-            CatchUpWireTrace.step(trace, "answered SELECT, sent SEARCH", folder: folder, connection: ObjectIdentifier(server))
             var searchSet = MessageIdentifierSet<UID>()
             for uid in uids { searchSet.insert(UID(uid)) }
             if let range { searchSet.insert(range: range) }
             let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(
                 identifierSet: searchSet, criteria: [.all])
-            CatchUpWireTrace.step(trace, "answered SEARCH", folder: folder, connection: ObjectIdentifier(server))
             let listed = try extResult.listed(within: searchSet)
             return UIDExistenceResult(
                 found: Set(listed.toArray().map(\.value)), uidValidity: selection.uidValidity.value)
-        }
-        } catch {
-            CatchUpWireTrace.step(trace, "failed", folder: folder, detail: "\(error)")
-            throw error
         }
     }
 
@@ -7557,27 +7518,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         try Task.checkCancellation()
         var uidSet = UIDSet()
         for uid in uids { uidSet.insert(UID(uid)) }
-        let firstText = uids.first.map(String.init) ?? "none"
-        let trace = CatchUpWireTrace.asked("header load", folder: folder, detail: "\(uids.count) UID(s) from \(firstText)")
-        let fetched: (infos: [SwiftMail.MessageInfo], observed: UInt32)
-        do {
-        fetched =
+        let fetched: (infos: [SwiftMail.MessageInfo], observed: UInt32) =
             try await withFolderConnection(folder: folder) { server in
-                CatchUpWireTrace.step(trace, "acquired, sent SELECT", folder: folder, connection: ObjectIdentifier(server))
                 let selection = try await selectMailboxTracked(server, folder: folder)
                 // Under another numbering these UIDs name other messages: the
                 // FETCH is never sent, only the observed epoch returns (#1062).
                 guard selection.uidValidity.value == expectedEpoch else { return ([], selection.uidValidity.value) }
-                CatchUpWireTrace.step(trace, "answered SELECT, sent FETCH", folder: folder, connection: ObjectIdentifier(server))
-                let infos = try await server.fetchMessageInfosBulk(using: uidSet)
-                CatchUpWireTrace.step(trace, "answered FETCH", folder: folder, connection: ObjectIdentifier(server),
-                                      detail: "\(infos.count) record(s)")
-                return (infos, selection.uidValidity.value)
+                return (try await server.fetchMessageInfosBulk(using: uidSet), selection.uidValidity.value)
             }
-        } catch {
-            CatchUpWireTrace.step(trace, "failed", folder: folder, detail: "\(error)")
-            throw error
-        }
         var decoded: [MessageHeaderInfo] = []
         var undecoded: [UInt32] = []
         for info in fetched.infos {
