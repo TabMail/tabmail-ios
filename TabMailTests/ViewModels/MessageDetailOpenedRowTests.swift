@@ -547,6 +547,11 @@ struct MessageDetailOpenedRowTests {
 
         let vm = try await openWithThread(inboxCopy, pool: pool, observeNotifications: false)
         defer { vm.cancelBodyPollForTesting() }
+        // A second screen on the same email that does observe notifications: it shows that a
+        // merge notification posted below is delivered.
+        let witness = try await openWithThread(inboxCopy, pool: pool)
+        defer { witness.cancelBodyPollForTesting() }
+        witness._threadScanRequestHook = { _ in }
         let timeline = Timeline(vm)
         // Pull-to-refresh holds its display turn at its header read; no thread scan is asked for.
         let gate = FetchGate()
@@ -563,6 +568,13 @@ struct MessageDetailOpenedRowTests {
             await #expect(throws: TimedOut.self, "the wait does not end while a display reader runs") {
                 try await self.settle(vm, seconds: 0.3)
             }
+            // A merge notification, as another suite may post late, reaches a screen that observes
+            // notifications and asks nothing of this one.
+            NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
+            try await waitUntil("the merge notification to reach the observing screen") {
+                witness.threadScansAskedForTesting > 0
+            }
+            #expect(timeline.allScansAsked == 0, "a merge notification asks no thread scan of a screen that does not observe notifications")
         } catch {
             gate.open()
             try? await finish(refresh, "the refresh to end")
@@ -572,7 +584,37 @@ struct MessageDetailOpenedRowTests {
         try await finish(refresh, "the refresh to end")
         try await settle(vm)
         #expect(vm.message?.id == inboxCopy.id, "control: the refresh kept the opened email")
-        #expect(timeline.allScansAsked == 1, "control: the refresh asked for its own thread scan after its fetch")
+        #expect(timeline.allScansAsked == 1, "the only thread scan asked for is the refresh's own, after its fetch")
+    }
+
+    /// Whether work saw its task cancelled.
+    @MainActor
+    final class SawCancel {
+        var value = false
+    }
+
+    @MainActor
+    @Test("a wait for started work that runs out fails the case and cancels the work")
+    func finishThatRunsOutCancelsTheWork() async throws {
+        let gate = FetchGate()
+        let sawCancel = SawCancel()
+        let held = start {
+            await gate.hold()
+            sawCancel.value = Task.isCancelled
+        }
+        do {
+            try await waitUntil("the work to hold") { gate.reached }
+            await #expect(throws: TimedOut.self, "the wait fails when the work does not end in time") {
+                try await self.finish(held, "the held work", seconds: 0.2)
+            }
+        } catch {
+            gate.open()
+            try? await finish(held, "the released work")
+            throw error
+        }
+        gate.open()
+        try await finish(held, "the released work")
+        #expect(sawCancel.value, "the work that ran out was cancelled")
     }
 
     /// The Inbox copy is on screen from the notification's snapshot but not stored yet; the All
@@ -623,8 +665,8 @@ struct MessageDetailOpenedRowTests {
         let violations = Violations(vm, keeping: [reply.id])
         let timeline = Timeline(vm)
         let load = start { await vm.loadBody() }
-        // The held fetch is released and the open joined on every way out, so no task outlives
-        // the fixture.
+        // The held fetch is released and the open joined on every way out; an open that does not
+        // end in time is cancelled and fails the case.
         do {
             try await waitUntil("the open to reach its server fetch") { gate.reached }
             // Only the reload can scan while the open's fetch is held.
