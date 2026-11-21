@@ -62,6 +62,17 @@ struct ComposeOrigin: Hashable, Sendable {
 
     let sessionKey: String
     let screen: Screen
+    /// The account a new email the turn asks for is sent from, bound as the turn starts: the
+    /// account of the email the chat view or email screen was opened on. Nil in the inbox, whose
+    /// card picks its account when it opens. Replies and forwards are sent from their email's
+    /// account and never read it (`AgentToolRouter.ComposeRequest.fromAccountId`).
+    let fromAccountId: String?
+
+    init(sessionKey: String, screen: Screen, fromAccountId: String? = nil) {
+        self.sessionKey = sessionKey
+        self.screen = screen
+        self.fromAccountId = fromAccountId
+    }
 
     /// Why a compose tool invoked with no origin fails fast: no screen could ever take its card,
     /// so it never waits for one (as a confirmation tool with no sink, ADR-IOS-053).

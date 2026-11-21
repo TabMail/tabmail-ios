@@ -118,7 +118,8 @@ struct EmailReplyTool: AgentTool, Sendable {
                     mode: "edit_reply",
                     relatedHeader: header,
                     relatedBodyText: relatedBodyText,
-                    db: ctx.db
+                    db: ctx.db,
+                    ai: ctx.aiService
                 )
                 generatedSubject = result.subject
                 generatedBody = result.body ?? generatedBody

@@ -1678,6 +1678,11 @@ actor AccountManager {
         // queue, calendar provider, or refresh coordinator.
         if caldavConfigIds != nil {
             _ = removedAccountRuntimeFence.withLock { $0.insert(account.id) }
+            // An agent compose card still waiting for its screen can no longer open right for
+            // this account. The fence now refuses new requests and takes; this ends the waiting
+            // ones (their tools report the removal). Not awaited, so nothing here suspends
+            // before the routes below are detached.
+            Task { @MainActor in AgentToolRouter.shared.endComposeRequestsOfRemovedAccounts() }
         }
         let coordinator = oauthCoordinators.removeValue(forKey: account.id)
         let provider = providers.removeValue(forKey: account.id)

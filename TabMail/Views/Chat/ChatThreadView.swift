@@ -850,7 +850,9 @@ struct ChatThreadView: View {
                     onlyTo: replyTarget.only,
                     tutorialMove: tutorialMove(thread)),
                 onFieldSend: { _ in fieldComposeOpened = false },
-                onAgentCompose: openAgentCompose)
+                onAgentCompose: openAgentCompose,
+                composeFromAccountId: viewModel.message?.accountId,
+                composeHostCovered: isAnyPresentation)
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.replyPillId)
@@ -931,11 +933,12 @@ struct ChatThreadView: View {
         switch req.mode {
         case .compose:
             ComposeView(
-                suggestedBody: req.body, account: context.accounts.first { $0.id == viewModel.message?.accountId },
+                suggestedBody: req.body, account: context.accounts.first { $0.id == req.fromAccountId },
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
                 onAgentOutcome: onOutcome)
         case .reply:
-            card.reply.composeView(replyTo: req.replyTo, suggestedBody: req.body, onAgentOutcome: onOutcome)
+            card.reply.composeView(
+                replyTo: req.replyTo, suggestedBody: req.body, draftId: card.draftId, onAgentOutcome: onOutcome)
         case .forward:
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body, isForward: true,

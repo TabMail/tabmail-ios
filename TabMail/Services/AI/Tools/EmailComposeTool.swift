@@ -75,7 +75,8 @@ struct EmailComposeTool: AgentTool, Sendable {
                     body: body,
                     request: composeRequest,
                     mode: "edit_new",
-                    db: ctx.db
+                    db: ctx.db,
+                    ai: ctx.aiService
                 )
                 generatedSubject = result.subject ?? generatedSubject
                 generatedBody = result.body ?? generatedBody
@@ -108,7 +109,8 @@ struct EmailComposeTool: AgentTool, Sendable {
     /// Shared compose edit flow matching TB's `runComposeEdit()`.
     /// Resolves account/prompts, builds `ComposeEditContext`, and calls `performInlineEdit()`.
     /// Used by email_compose (mode "edit_new"), email_reply (mode "edit_reply"),
-    /// and email_forward (mode "edit_forward") tools for full TB parity.
+    /// and email_forward (mode "edit_forward") tools for full TB parity. `ai`: the tool's
+    /// `ToolContext.aiService`, which makes the model call.
     static func runComposeEdit(
         recipients: [String],
         subject: String?,
@@ -117,7 +119,8 @@ struct EmailComposeTool: AgentTool, Sendable {
         mode: String,
         relatedHeader: MessageHeader? = nil,
         relatedBodyText: String? = nil,
-        db: (any DatabaseReader & Sendable)? = nil
+        db: (any DatabaseReader & Sendable)? = nil,
+        ai: AIService
     ) async throws -> InlineEditResult {
         let dbReader = db ?? AppDatabase.rawPool
         // Get sender info from primary account (matching TB's user identity
@@ -197,7 +200,7 @@ struct EmailComposeTool: AgentTool, Sendable {
 
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] runComposeEdit: mode=\(mode) recipients=\(recipients.count) request=\(request.prefix(80))") }
 
-        return try await AIService.shared.performInlineEdit(
+        return try await ai.performInlineEdit(
             currentSubject: subject ?? "",
             currentBody: body ?? "",
             context: context,

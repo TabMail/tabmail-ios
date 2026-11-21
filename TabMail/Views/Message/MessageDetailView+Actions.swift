@@ -66,8 +66,10 @@ extension MessageDetailView {
 
     // MARK: - Agent Tool Compose
 
-    var currentAccount: Account? {
-        guard let accountId = viewModel.message?.accountId else { return nil }
+    /// The account a new email the agent asked for is sent from: the one bound when its turn
+    /// started (`ComposeRequest.fromAccountId`), never whichever email this screen shows now.
+    func fromAccount(of req: AgentToolRouter.ComposeRequest) -> Account? {
+        guard let accountId = req.fromAccountId else { return nil }
         return try? AppDatabase.dbPool.read { db in try Account.fetchOne(db, key: accountId) }
     }
 
@@ -88,7 +90,7 @@ extension MessageDetailView {
         case .compose:
             ComposeView(
                 suggestedBody: req.body,
-                account: currentAccount,
+                account: fromAccount(of: req),
                 prefillTo: req.to,
                 prefillCc: req.cc,
                 prefillBcc: req.bcc,

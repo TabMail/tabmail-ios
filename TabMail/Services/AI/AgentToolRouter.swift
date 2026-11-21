@@ -162,13 +162,18 @@ final class AgentToolRouter {
     /// second compose window over the first.
     @ObservationIgnored private var awaitingAppear: Bool = false
 
-    /// Accounts removed in this process (`endComposeRequests(ofRemovedAccount:)`). A request
-    /// that involves one of them ends at once instead of queueing: its email or its chat is gone.
-    @ObservationIgnored private var removedAccountIds: Set<String> = []
+    /// Whether an account's removal has committed: `AccountManager`'s runtime fence
+    /// (`isRuntimeRemoved`), set synchronously by `disconnectAccount` before it first suspends.
+    /// A request that depends on such an account ends instead of queueing or being taken.
+    @ObservationIgnored private let isAccountRemoved: @Sendable (String) -> Bool
 
-    /// What a compose tool tells the model when the account its request involves was removed
+    /// What a compose tool tells the model when an account its request depends on was removed
     /// while the request waited for its screen.
     static let removedAccountReason = "the email account was removed before the compose window opened"
+
+    init(isAccountRemoved: @escaping @Sendable (String) -> Bool = { AccountManager.shared.isRuntimeRemoved($0) }) {
+        self.isAccountRemoved = isAccountRemoved
+    }
 
     /// The screen a host pill stands for, asking for its compose requests: its screen
     /// kind and the keys of the chat it shows (own key first, then the thread's).
@@ -186,7 +191,7 @@ final class AgentToolRouter {
     /// until no compose UI is presented and the screen that asked takes it
     /// (`takeCompose(for:)`); the offer tells every host pill to look. See ADR-IOS-030.
     func enqueueCompose(_ request: ComposeRequest) {
-        if removedAccountIds.contains(where: request.involves(account:)) {
+        if dependsOnRemovedAccount(request) {
             request.onOutcome(.failed(Self.removedAccountReason))
             return
         }
@@ -194,18 +199,24 @@ final class AgentToolRouter {
         composeOffer += 1
     }
 
-    /// Ends every queued request that involves the removed account `accountId`, and every later
-    /// one: the email it replies to or forwards is gone, or the chat that asked can never show
-    /// again, so the card would wait forever or open with another account's From. Each request's
-    /// tool returns `.failed(removedAccountReason)` and nothing opens. Called once the removal
-    /// has committed (`AccountManager.removeAccount`).
-    func endComposeRequests(ofRemovedAccount accountId: String) {
-        removedAccountIds.insert(accountId)
-        let ended = composeQueue.filter { $0.involves(account: accountId) }
-        composeQueue.removeAll { $0.involves(account: accountId) }
+    /// Ends every queued request that depends on an account whose removal has committed
+    /// (`ComposeRequest.accountIds`, read against the fence): its card would open with a gone
+    /// email or a From address it can no longer send from, or wait under a chat key the screens
+    /// no longer read. Each request's tool returns
+    /// `.failed(removedAccountReason)` and nothing opens. Scheduled by `disconnectAccount` right
+    /// after it sets the fence, which refuses every later request (`enqueueCompose`) and every
+    /// take (`takeCompose(for:)`) in between.
+    func endComposeRequestsOfRemovedAccounts() {
+        let ended = composeQueue.filter { dependsOnRemovedAccount($0) }
+        guard !ended.isEmpty else { return }
+        composeQueue.removeAll { dependsOnRemovedAccount($0) }
         for request in ended {
             request.onOutcome(.failed(Self.removedAccountReason))
         }
+    }
+
+    private func dependsOnRemovedAccount(_ request: ComposeRequest) -> Bool {
+        request.accountIds.contains(where: isAccountRemoved)
     }
 
     /// The oldest queued request `host` asked for, removed from the queue, or nil.
@@ -219,10 +230,13 @@ final class AgentToolRouter {
     /// (`outcomeState.resolved`, flipped by `enqueueComposeAndAwaitOutcome`'s
     /// `onCancel` handler): presenting a compose window for a tool that already
     /// returned would leave the user confused and the follow-on `onOutcome` calls
-    /// dangling.
+    /// dangling. Then ends every request whose account was removed
+    /// (`endComposeRequestsOfRemovedAccounts`), so none is handed out between the fence and
+    /// its scheduled drain.
     func takeCompose(for host: ComposeHost) -> ComposeRequest? {
         guard !awaitingAppear, presentationCount == 0 else { return nil }
         composeQueue.removeAll { $0.outcomeState.resolved }
+        endComposeRequestsOfRemovedAccounts()
         guard let index = composeQueue.firstIndex(where: { host.asked($0.origin) }) else { return nil }
         awaitingAppear = true
         return composeQueue.remove(at: index)
@@ -271,7 +285,6 @@ final class AgentToolRouter {
         composeQueue.removeAll()
         presentationCount = 0
         awaitingAppear = false
-        removedAccountIds.removeAll()
     }
 
     /// A request to open the compose UI, produced by email_compose/reply/forward tools.
@@ -350,12 +363,21 @@ final class AgentToolRouter {
             case forward
         }
 
-        /// Whether the request depends on account `accountId`: the email it replies to or
-        /// forwards is that account's, or it was asked in a chat about one of that account's
-        /// threads (the chat view or the email screen). A new email asked in the inbox depends
-        /// on no account: its host picks one when the card opens.
-        func involves(account accountId: String) -> Bool {
-            replyTo?.accountId == accountId || ChatThreadKey.parse(origin.sessionKey)?.accountId == accountId
+        /// The account a new email is sent from, bound when the turn started
+        /// (`ComposeOrigin.fromAccountId`). Nil for a reply or forward, sent from its email's
+        /// account, and for a new email asked in the inbox, whose card picks its account.
+        var fromAccountId: String? { mode == .compose ? origin.fromAccountId : nil }
+
+        /// The accounts the request depends on: the account of the email it replies to or
+        /// forwards, the account its new email is sent from, and the account whose thread key
+        /// the asking turn ran under (the chat view or the email screen; the inbox's key names
+        /// none). Removing one of them ends the request: its email or its From address is gone,
+        /// and the removed account's key is not among the keys a screen reads once that
+        /// account's emails are gone, even where the merged thread's chat still shows through a
+        /// surviving account's emails (ADR-IOS-114 decision 14). A new email asked in the inbox
+        /// depends on none.
+        var accountIds: [String] {
+            [replyTo?.accountId, fromAccountId, ChatThreadKey.parse(origin.sessionKey)?.accountId].compactMap { $0 }
         }
     }
 

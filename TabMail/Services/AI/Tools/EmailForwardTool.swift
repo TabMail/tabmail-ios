@@ -105,7 +105,8 @@ struct EmailForwardTool: AgentTool, Sendable {
                     request: wrappedRequest,
                     mode: "edit_forward",
                     relatedHeader: header,
-                    relatedBodyText: relatedBodyText
+                    relatedBodyText: relatedBodyText,
+                    ai: ctx.aiService
                 )
                 generatedSubject = result.subject
                 generatedBody = result.body ?? generatedBody

@@ -58,6 +58,12 @@ struct DynamicIslandChat: View {
     /// Phase 2): the pill takes them from the router while it is on screen and hands each one
     /// here. Nil: the host presents none, and this pill's turns can open no compose card.
     var onAgentCompose: ((AgentToolRouter.ComposeRequest) -> Void)?
+    /// The account a new email this pill's turns ask for is sent from: the host's opened email's
+    /// account, bound to each turn as it starts (`ComposeOrigin.fromAccountId`). Nil in the inbox.
+    let composeFromAccountId: String?
+    /// The host's own sheet or cover is up over the pill: it takes no compose card until that
+    /// closes, so a card never opens under it.
+    let composeHostCovered: Bool
     /// The pill is on screen, so its host can present the compose cards its chat asked for.
     @State private var composeHostShown = false
     @Environment(\.hasTabMailSession) var hasTabMailSession
@@ -138,21 +144,24 @@ struct DynamicIslandChat: View {
         if replyField != nil { return .chat }
         return message != nil ? .email : .inbox
     }
-    /// Where a compose card a turn asks for opens, read as the turn starts. A turn carrying the
-    /// reply field's send belongs to the chat view, where the field and the choice it carries live,
-    /// even when it is retried or resumed from another screen of the thread.
+    /// Where a compose card a turn asks for opens, and the account a new email it asks for is
+    /// sent from, read as the turn starts. A turn carrying the reply field's send belongs to the
+    /// chat view, where the field and the choice it carries live, even when it is retried or
+    /// resumed from another screen of the thread.
     private func composeOrigin(sessionKey: String, fieldReply: ChatFieldReply?) -> ComposeOrigin? {
         guard let screen = composeScreen else { return nil }
-        return ComposeOrigin(sessionKey: sessionKey, screen: fieldReply != nil ? .chat : screen)
+        return ComposeOrigin(sessionKey: sessionKey, screen: fieldReply != nil ? .chat : screen,
+                             fromAccountId: composeFromAccountId)
     }
     /// What the pill takes its compose requests on: the router's offer, and the screen it stands
-    /// for while it is on screen (nil off screen, or when its host presents none).
+    /// for while it is on screen and uncovered (nil off screen, under its host's own sheet or
+    /// cover, or when its host presents none).
     private struct ComposeTakeWatch: Equatable {
         let offer: Int
         let host: AgentToolRouter.ComposeHost?
     }
     private var composeTakeWatch: ComposeTakeWatch {
-        let host = composeHostShown
+        let host = composeHostShown && !composeHostCovered
             ? composeScreen.map { AgentToolRouter.ComposeHost(screen: $0, sessionKeys: chatKeys) } : nil
         return ComposeTakeWatch(offer: AgentToolRouter.shared.composeOffer, host: host)
     }
@@ -289,7 +298,9 @@ struct DynamicIslandChat: View {
         onAgentReply: ((String) -> Void)? = nil,
         replyField: ChatReplyField? = nil,
         onFieldSend: ((String) -> Void)? = nil,
-        onAgentCompose: ((AgentToolRouter.ComposeRequest) -> Void)? = nil
+        onAgentCompose: ((AgentToolRouter.ComposeRequest) -> Void)? = nil,
+        composeFromAccountId: String? = nil,
+        composeHostCovered: Bool = false
     ) {
         self.message = message
         self.draftSubject = draftSubject
@@ -315,6 +326,8 @@ struct DynamicIslandChat: View {
         self.replyField = replyField
         self.onFieldSend = onFieldSend
         self.onAgentCompose = onAgentCompose
+        self.composeFromAccountId = composeFromAccountId
+        self.composeHostCovered = composeHostCovered
     }
 
     /// Max expanded height as fraction of screen height.
@@ -1208,7 +1221,7 @@ struct DynamicIslandChat: View {
                                         }
                                     } else if !hasLaterUserMsg {
                                         Button("Re-send message", systemImage: "arrow.clockwise") {
-                                            resendLastUserMessage(text: msg.content, afterIndex: index)
+                                            resendLastUserMessage(text: msg.content, field: msg.fieldSend, afterIndex: index)
                                         }
                                     } else if message != nil {
                                         // Message-detail: rewind in-place (no session history)
@@ -2399,7 +2412,7 @@ struct DynamicIslandChat: View {
         }
 
         // Show only the user's raw text in chat bubble (not the enriched prefix)
-        chatMessages.append(ChatMessage(role: .user, content: text, timestamp: Date()))
+        chatMessages.append(ChatMessage(role: .user, content: text, timestamp: Date(), fieldSend: field))
         isWorking = true
         ActiveAgentTracker.shared.setWorking(sessionKey)
         resetStatusQueue()
@@ -2820,10 +2833,12 @@ struct DynamicIslandChat: View {
     }
 
     /// Re-send the last user message (same session). Removes the agent response/error below it.
-    private func resendLastUserMessage(text: String, afterIndex index: Int) {
+    /// Sent from the reply field, it is sent again as it was sent (`field`, read from its bubble
+    /// before the trim), with its email and who the user chose in Reply to, as Retry does.
+    private func resendLastUserMessage(text: String, field: ChatFieldSend?, afterIndex index: Int) {
         trimForResendLast(atIndex: index)
         lastFailedSend = nil
-        sendAgentChat(text)
+        sendAgentChat(text, field: field)
     }
 
     /// Rewind chat to an earlier user message (message-detail context).

@@ -589,7 +589,8 @@ struct MessageDetailView: View {
 
                 DynamicIslandChat(message: chatContextMessage ?? message, isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
                     showAgentToast(text)
-                }, onAgentCompose: { agentCompose = $0 })
+                }, onAgentCompose: { agentCompose = $0 },
+                composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)
 
                 Menu {
                     RestrictedMailActionButton(

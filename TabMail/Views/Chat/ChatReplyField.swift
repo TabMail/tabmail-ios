@@ -278,7 +278,18 @@ struct ChatReadyReply: Identifiable {
 struct ChatAgentCard: Identifiable {
     let request: AgentToolRouter.ComposeRequest
     let reply: ChatReplyCompose
+    /// A reply to the people chosen in Reply to (`fieldReply.onlyTo`) saves to a draft of its own,
+    /// as `ChatReadyReply` does: a reply draft already saved for that email (a Reply All, say)
+    /// neither sets the card's recipients nor is saved over. Nil: the reply's usual draft.
+    let draftId: String?
     var id: UUID { request.id }
+
+    init(request: AgentToolRouter.ComposeRequest, reply: ChatReplyCompose) {
+        self.request = request
+        self.reply = reply
+        draftId = request.fieldReply?.onlyTo == nil ? nil
+            : request.replyTo.map { Draft.separateReplyKey(replyTo: "\($0.accountId):\($0.stableId)") }
+    }
 }
 
 /// A reply in the outbox the chat does not show as an email yet, shown as the user's bubble at the
