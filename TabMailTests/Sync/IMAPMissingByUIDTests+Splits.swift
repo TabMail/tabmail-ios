@@ -39,17 +39,40 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    /// Run the worker on the scaled slow link and check the timeout path: the
-    /// listing completes across calls, and a range that timed out is never
-    /// asked again at its own width.
+    /// Run the worker on the scaled slow link, run after run, until the
+    /// folder's listing completes, and check the timeout path: a run asks the
+    /// folder nothing after its listing request timed out, so each run holds at
+    /// most one listing timeout and the listing completes across runs, all on
+    /// the slow link; and a range that timed out is never asked again at its own
+    /// width. `ceiling` is the test's bound on listing requests; the returned
+    /// cost counts every listing request of those runs.
+    /// *Superseded (#1062):* one worker run, in which "the listing completes
+    /// across calls": the run now leaves the folder out after its timeout.
     @MainActor
-    static func runOnSlowLink(_ w: World, overRecords: Int) async throws -> (fetches: Int, ranges: [ClosedRange<Int>]) {
+    static func runOnSlowLink(_ w: World, overRecords: Int, ceiling: Int) async throws -> (fetches: Int, ranges: [ClosedRange<Int>]) {
         w.server.slowListingFetch(in: path, overRecords: overRecords, seconds: slowAnswerSeconds)
         defer { w.server.slowListingFetch(in: path, overRecords: overRecords, seconds: nil) }
         let sizesBefore = w.server.listingFetchSizes(in: path).count
         let start = w.server.recordedCommands().count
-        try await w.workerRun(deadlineIn: slowLinkDeadline, requestTimeout: scaledTimeout,
-                              sliceSeconds: scaledSliceSeconds, intervalSeconds: scaledIntervalSeconds)
+        // Every run but the last ends on a listing timeout, and every timeout is
+        // a listing request within the ceiling.
+        let runBound = ceiling + 1
+        var runs = 0
+        repeat {
+            let runSizesBefore = w.server.listingFetchSizes(in: path).count
+            // Each run's first slice waits for the account's slice window, which
+            // outlasts the late answer of the previous run's timed-out range.
+            try await w.workerRun(deadlineIn: slowLinkDeadline, requestTimeout: scaledTimeout,
+                                  sliceSeconds: scaledSliceSeconds, intervalSeconds: scaledIntervalSeconds)
+            runs += 1
+            let timeoutsInRun = w.server.listingFetchSizes(in: path).dropFirst(runSizesBefore).filter { $0 > overRecords }.count
+            #expect(timeoutsInRun <= 1,
+                    "#1062: a run asks the folder nothing after its listing request timed out: \(timeoutsInRun) listing timeouts in run \(runs)")
+        } while try w.catchUpState()?.listing != nil && runs < runBound
+        // The cost below then counts every listing request of the repair: none
+        // is left for a later run on a link without the delay.
+        #expect(try w.catchUpState()?.listing == nil,
+                "#1062: the listing completed on the slow link, within \(runBound) runs (\(runs) ran)")
         let commands = Array(w.server.recordedCommands().dropFirst(start))
         let ranges = listingRanges(commands)
         let sizes = Array(w.server.listingFetchSizes(in: path).dropFirst(sizesBefore))
@@ -128,7 +151,7 @@ extension IMAPMissingByUIDTests {
     /// the band packs 5000 into a range of that width.
     static let bunchedServer = Array(1...200) + Array(1_000_001...1_005_000)
 
-    @Test("A bunched folder on a slow link whose slice is shorter than one request: a range that times out stops the folder for that call with its width halved, the next call goes on from the same place, and the listing completes across calls within a request ceiling")
+    @Test("A bunched folder on a slow link whose slice is shorter than one request: a range that times out stops the folder for that run with its width halved, the next run goes on from the same place, and the listing completes across runs within a request ceiling")
     @MainActor
     func bunchedFolderListsWithinACeiling() async throws {
         // Debug-gated diagnostics for one run (#1062): `TEST_RUNNER_TABMAIL_TEST_DEBUG_LOG=1`.
@@ -142,13 +165,16 @@ extension IMAPMissingByUIDTests {
             let missing = [50, 1_000_500, 1_004_900]
             try await w.dropLocal(missing)
             try await w.markOwed()
-            let cost = try await Self.runOnSlowLink(w, overRecords: tooMany)
             // Ceiling: the band halves at most log2(UIDNEXT) times on its way
             // down, plus one range per `tooMany / 2` messages once it answers.
             let halvings = Int(log2(Double(server.max()! + 1)).rounded(.up))
             let answering = server.count / (tooMany / 2) + 1
             let ceiling = 2 * halvings + answering
+            let cost = try await Self.runOnSlowLink(w, overRecords: tooMany, ceiling: ceiling)
             #expect(cost.fetches <= ceiling, "a bounded number of listing requests: \(cost.fetches) > \(ceiling)")
+            // The slow-link runs did the repair, so the cost above bounds it.
+            try w.expectHeldExactly(server, "#1062 bunched, on the slow link")
+            #expect(!(try w.changeState()).selfHealDue, "#1062: the listing completed and settled on the slow link")
             // Once the app is at rest, every message the server holds is held.
             try await w.reachRest("#1062 bunched")
             try w.expectHeldExactly(server, "#1062 bunched")
@@ -198,7 +224,7 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    @Test("A first listing range that times out, with a slice shorter than one request: the next call asks half its width from the same place, never the full width again, and the listing completes across calls within a request ceiling")
+    @Test("A first listing range that times out, with a slice shorter than one request: each run holds at most one timeout, the next run asks half its width from the same place, never the full width again, and the listing completes across runs within a request ceiling")
     @MainActor
     func firstRangeThatTimesOutCompletesAfterSplits() async throws {
         // Debug-gated diagnostics for one run (#1062): `TEST_RUNNER_TABMAIL_TEST_DEBUG_LOG=1`.
@@ -212,12 +238,12 @@ extension IMAPMissingByUIDTests {
             let missing = [5, 1500, 2995]
             try await w.dropLocal(missing)
             try await w.markOwed()
-            let cost = try await Self.runOnSlowLink(w, overRecords: tooMany)
-            let first = try #require(cost.ranges.first, "setup: the listing ran")
-            #expect(first.count > tooMany, "setup: the first range was too large for the link: \(first)")
             // Every answering range holds about `tooMany`; each one before it
             // timed out at most once at twice its width.
             let ceiling = 2 * (server.count / tooMany + 1)
+            let cost = try await Self.runOnSlowLink(w, overRecords: tooMany, ceiling: ceiling)
+            let first = try #require(cost.ranges.first, "setup: the listing ran")
+            #expect(first.count > tooMany, "setup: the first range was too large for the link: \(first)")
             #expect(cost.fetches <= ceiling, "#1062: a bounded number of listing requests: \(cost.fetches) > \(ceiling)")
             try w.expectHeldExactly(server, "#1062 first range timed out")
             #expect(!(try w.changeState()).selfHealDue, "#1062: the listing completed and settled")
@@ -463,13 +489,15 @@ extension IMAPMissingByUIDTests {
     // MARK: - The stored width across calls
 
     /// Write the folder's catch-up state: a listing in progress at `nextUid`,
-    /// with `rangeWidth` stored (nil: none, as a listing written before the field).
+    /// with `rangeWidth` stored (nil: none, as a listing written before the field),
+    /// and `loadHeldSince`: a hold on `nextUid` running since then.
     @MainActor
     static func setListing(_ w: World, nextUid: Int, rangeWidth: Int?,
-                           widthCap: Int? = nil, top: Int? = nil) async throws {
+                           widthCap: Int? = nil, top: Int? = nil, loadHeldSince: Date? = nil) async throws {
         var listing = IMAPCatchUpState.Listing(nextUid: nextUid, rangeWidth: rangeWidth)
         listing.widthCap = widthCap
         listing.top = top
+        listing.loadHeldSince = loadHeldSince
         let state = IMAPCatchUpState(epoch: UInt32(epoch), listing: listing)
         let raw = try #require(state.encoded())
         let folderId = w.folderId
@@ -550,6 +578,9 @@ extension IMAPMissingByUIDTests {
         let server = Array(1...10) + Array(far...(far + 10))
         let missing = far + 5
         try await Self.withWorld("width-cap-dropped", server: server, local: server.filter { $0 != missing }) { w in
+            // The warm-up loaded it: the device loses it again, so the repair is this scenario's.
+            try await w.dropLocal([missing])
+            try w.expectNotHeld([missing], "#1062 cap dropped")
             try await Self.setListing(w, nextUid: 1, rangeWidth: maxSpan, top: server.last)
             let clock = CatchUpTestClock()
             w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
@@ -760,27 +791,43 @@ extension IMAPMissingByUIDTests {
         return IMAPCatchUpState.decode(raw)
     }
 
-    /// One background run on the scaled link, `inFlightSliceRequests` per slice.
-    @MainActor
-    static func inFlightRun(_ w: World) async throws {
-        try await w.workerRun(maxRequests: inFlightSliceRequests, deadlineIn: slowLinkDeadline, requestTimeout: scaledTimeout,
-                              sliceSeconds: scaledSliceSeconds, intervalSeconds: scaledIntervalSeconds)
+    /// How long an in-flight test's run may take: well within its deadline. A
+    /// run that kept taking slices once only its left-out folder had work would
+    /// run to the deadline.
+    static let leftOutRunSeconds: TimeInterval = slowLinkDeadline / 2
+
+    /// One background run on the scaled link, `maxRequests` per slice: a slice
+    /// shorter than a request's timeout, as in production, so a timeout spends
+    /// its slice. Returns the run's own answer (an applied result made progress)
+    /// and how long the run took.
+    @MainActor @discardableResult
+    static func inFlightRun(_ w: World, maxRequests: Int = inFlightSliceRequests) async throws -> (didWork: Bool, seconds: TimeInterval) {
+        let started = Date()
+        let didWork = try await w.workerRun(maxRequests: maxRequests, deadlineIn: slowLinkDeadline, requestTimeout: scaledTimeout,
+                                            sliceSeconds: scaledSliceSeconds, intervalSeconds: scaledIntervalSeconds)
+        return (didWork, Date().timeIntervalSince(started))
     }
 
-    /// The run of an in-flight test, after the folder's request timed out at
-    /// the command `timedOut`: the folder got no request after it, and the
-    /// healthy folder kept being asked in later slices until its listing
-    /// completed.
+    /// The run of an in-flight test, which took `runSeconds`, after the
+    /// folder's request timed out at the command `timedOut`: the folder got no
+    /// request after it; the healthy folder was asked after it, so in a later
+    /// slice (the timeout spent its own), until its listing completed; and the
+    /// run ended once only the left-out folder had work.
+    /// *Superseded (#1062):* "the healthy folder kept being asked in later
+    /// slices", counted as at least two listing ranges after the timeout.
     @MainActor
-    static func expectFolderLeftOutOfTheRun(_ w: World, from start: Int, timedOut: Int,
+    static func expectFolderLeftOutOfTheRun(_ w: World, from start: Int, timedOut: Int, runSeconds: TimeInterval,
                                             sourceLocation: SourceLocation = #_sourceLocation) throws {
         let after = requests(to: path, w.server, from: start).filter { $0.index > timedOut }.map { $0.command }
         #expect(after.isEmpty, "#1062: the run never asks the folder again after its request timed out: \(after)",
                 sourceLocation: sourceLocation)
         let healthy = listingRanges(requests(to: healthyPath, w.server, from: timedOut + 1).map { $0.command })
-        #expect(healthy.count >= 2, "#1062: the healthy folder keeps being asked in later slices of the run: \(healthy)",
+        #expect(!healthy.isEmpty, "#1062: the healthy folder is asked in a later slice of the same run: \(healthy)",
                 sourceLocation: sourceLocation)
         #expect(try healthyState(w)?.listing == nil, "#1062: the healthy folder's listing completed in the same run",
+                sourceLocation: sourceLocation)
+        #expect(runSeconds < leftOutRunSeconds,
+                "#1062: the run ends once only the left-out folder has work: it took \(runSeconds) s of its \(slowLinkDeadline) s",
                 sourceLocation: sourceLocation)
     }
 
@@ -794,7 +841,7 @@ extension IMAPMissingByUIDTests {
         return listingRanges(requests(to: path, w.server, from: start).map { $0.command }).first
     }
 
-    @Test("A call that starts a listing and times out on its first range: the run never asks that folder again while a healthy folder of the account goes on in later slices; the listing keeps the top it learned, and the next run asks half the timed-out width from the same UID")
+    @Test("A call that starts a listing and times out on its first range: the run never asks that folder again while a healthy folder of the account goes on in later slices, and the run ends once only that folder has work; the listing keeps the top it learned, and the next run asks half the timed-out width from the same UID")
     @MainActor
     func timeoutOnTheCallThatStartsAListingLeavesTheFolderOutOfTheRun() async throws {
         let server = Array(1...20)
@@ -804,13 +851,13 @@ extension IMAPMissingByUIDTests {
             #expect(try w.catchUpState()?.listing == nil, "setup: no listing is stored, so the call starts one")
             w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
             let start = w.server.recordedCommands().count
-            try await Self.inFlightRun(w)
+            let run = try await Self.inFlightRun(w)
             w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil)
             let asked = Self.requests(to: Self.path, w.server, from: start)
             let timedOut = try #require(asked.first { !Self.listingRanges([$0.command]).isEmpty }, "setup: the folder's first range was asked")
             let range = try #require(Self.listingRanges([timedOut.command]).first)
             #expect(range.lowerBound == 1, "setup: the new listing's first range starts at the folder's first UID: \(range)")
-            try Self.expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index)
+            try Self.expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index, runSeconds: run.seconds)
             let listing = try #require(try w.catchUpState()?.listing, "#1062: the listing the call started is saved")
             #expect(listing.top == server.last, "#1062: the saved listing keeps the top the call learned")
             #expect(listing.nextUid == range.lowerBound, "#1062: the listing stays at the UID whose range timed out")
@@ -822,7 +869,7 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    @Test("A call that answers a range and then times out on the next: the run never asks that folder again while a healthy folder of the account goes on in later slices; the listing keeps the place the answer moved it to, and the next run asks half the timed-out width from there")
+    @Test("A call that answers a range and then times out on the next: the run never asks that folder again while a healthy folder of the account goes on in later slices, and the run ends once only that folder has work; the listing keeps the place the answer moved it to, and the next run asks half the timed-out width from there")
     @MainActor
     func timeoutAfterAnAnsweredRangeLeavesTheFolderOutOfTheRun() async throws {
         let server = Array(1...20)
@@ -834,7 +881,7 @@ extension IMAPMissingByUIDTests {
             try await Self.setListing(w, nextUid: 1, rangeWidth: nil, widthCap: cap, top: server.last)
             w.server.slowListingFetch(in: Self.path, overRecords: cap, seconds: Self.slowAnswerSeconds)
             let start = w.server.recordedCommands().count
-            try await Self.inFlightRun(w)
+            let run = try await Self.inFlightRun(w)
             w.server.slowListingFetch(in: Self.path, overRecords: cap, seconds: nil)
             let asked = Self.requests(to: Self.path, w.server, from: start)
             let listed = asked.filter { !Self.listingRanges([$0.command]).isEmpty }
@@ -842,7 +889,7 @@ extension IMAPMissingByUIDTests {
             #expect(Self.listingRanges(listed.prefix(2).map { $0.command }) == [1...cap, (cap + 1)...(cap + grown)],
                     "setup: one call answered a range at the cap and asked the next at the doubled cap")
             let timedOut = try #require(listed.dropFirst().first, "setup: the second range was asked")
-            try Self.expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index)
+            try Self.expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index, runSeconds: run.seconds)
             let listing = try #require(try w.catchUpState()?.listing, "setup: the listing is in progress")
             #expect(listing.nextUid == cap + 1, "#1062: the saved listing keeps the place the answered range moved it to")
             #expect(listing.top == server.last, "#1062: the saved listing keeps its top")
@@ -851,6 +898,340 @@ extension IMAPMissingByUIDTests {
             let next = try await Self.firstRangeOfTheNextRun(w)
             #expect(next == (cap + 1)...(cap + capped),
                     "#1062: the next run asks half the timed-out width from the UID after the answered range: \(next.map { "\($0)" } ?? "none")")
+        }
+    }
+
+    @Test("A run whose only progress is that of the folder whose request then timed out: the folder is never asked again, the run ends once only that folder has work, and the run still reports the folder's applied progress as work")
+    @MainActor
+    func soleProgressOfALeftOutFolderEndsTheRunAndCounts() async throws {
+        let server = Array(1...20)
+        let cap = 5
+        try await Self.withWorld("in-flight-sole-progress", server: server, local: server) { w in
+            // No healthy folder: the account's INBOX completed its listing in
+            // the warm-up and has nothing due. The folder's first range answers;
+            // the second, at the doubled cap, holds more than the link answers in time.
+            try await Self.setListing(w, nextUid: 1, rangeWidth: nil, widthCap: cap, top: server.last)
+            w.server.slowListingFetch(in: Self.path, overRecords: cap, seconds: Self.slowAnswerSeconds)
+            let start = w.server.recordedCommands().count
+            let run = try await Self.inFlightRun(w)
+            w.server.slowListingFetch(in: Self.path, overRecords: cap, seconds: nil)
+            let asked = Self.requests(to: Self.path, w.server, from: start)
+            let listed = asked.filter { !Self.listingRanges([$0.command]).isEmpty }
+            let grown = cap * SyncConfig.catchUpWidthCapGrowthFactor
+            #expect(Self.listingRanges(listed.prefix(2).map { $0.command }) == [1...cap, (cap + 1)...(cap + grown)],
+                    "setup: one call answered a range at the cap and asked the next at the doubled cap")
+            let timedOut = try #require(listed.dropFirst().first, "setup: the second range was asked")
+            let after = asked.filter { $0.index > timedOut.index }.map { $0.command }
+            #expect(after.isEmpty, "#1062: the run never asks the folder again after its request timed out: \(after)")
+            #expect(try w.catchUpState()?.listing?.nextUid == cap + 1, "setup: the call's progress was applied")
+            #expect(run.didWork, "#1062: the run reports the left-out folder's applied progress as work")
+            #expect(run.seconds < Self.leftOutRunSeconds,
+                    "#1062: the run ends once only the left-out folder has work: it took \(run.seconds) s of its \(Self.slowLinkDeadline) s")
+            // Let the late answer free the connection before the world closes.
+            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
+        }
+    }
+
+    /// The account's second folder whose requests time out (a Sent folder).
+    static let secondPath = "Sent"
+
+    /// Write `listing` as the catch-up state of the account's folder at
+    /// `folderPath`, last tried at `lastAttemptAt`.
+    @MainActor
+    static func writeListing(_ w: World, folderPath: String, _ listing: IMAPCatchUpState.Listing, lastAttemptAt: Date) async throws {
+        var state = IMAPCatchUpState(epoch: UInt32(epoch), listing: listing)
+        state.lastAttemptAt = lastAttemptAt
+        let raw = try #require(state.encoded())
+        let folderId = "\(w.accountId):\(folderPath)"
+        try await w.pool.write { db in
+            try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [raw, folderId])
+        }
+    }
+
+    /// Give the account its second folder (`secondPath`): the server and the
+    /// device hold `uids` there, its listing is in progress at the first of them
+    /// with `siteWidth` stored, it was last tried at `lastAttemptAt`, and every
+    /// listing request in it is answered only after the timeout.
+    @MainActor
+    static func addSecondSlowFolder(_ w: World, uids: [Int], lastAttemptAt: Date) async throws {
+        w.server.setMessages(uids.map { message($0) }, in: secondPath)
+        w.server.setUidValidity(epoch, for: secondPath)
+        try FolderEpochTestFixture.insertFolder(accountId: w.accountId, path: secondPath, role: .sent, pool: w.pool,
+                                                totalCount: uids.count, lastKnownUidNext: (uids.max() ?? 0) + 1,
+                                                lastKnownUidValidity: epoch)
+        try FolderEpochTestFixture.insertHeaders(accountId: w.accountId, path: secondPath, uids: uids, pool: w.pool)
+        var listing = IMAPCatchUpState.Listing(nextUid: uids[0], rangeWidth: siteWidth)
+        listing.top = uids.last
+        try await writeListing(w, folderPath: secondPath, listing, lastAttemptAt: lastAttemptAt)
+        w.server.slowListingFetch(in: secondPath, overRecords: 0, seconds: slowAnswerSeconds)
+    }
+
+    @Test("Two folders time out in different slices of one run, each on a call that makes no progress: neither is asked again after its own timeout, the run goes on past each timeout slice, and the healthy folder completes its listing in later slices")
+    @MainActor
+    func leftOutFoldersAccumulateOverTheRun() async throws {
+        let server = Array(1...20)
+        try await Self.withWorld("in-flight-two-folders", server: server, local: server) { w in
+            try await Self.startHealthyListing(w)
+            // Tried longest ago first: the healthy folder (never tried) takes
+            // the first slice, the folder the second, the second folder the third.
+            let now = Date()
+            var listing = IMAPCatchUpState.Listing(nextUid: server[0], rangeWidth: Self.siteWidth)
+            listing.top = server.last
+            try await Self.writeListing(w, folderPath: Self.path, listing, lastAttemptAt: now.addingTimeInterval(-7200))
+            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
+            try await Self.addSecondSlowFolder(w, uids: server, lastAttemptAt: now.addingTimeInterval(-3600))
+            let start = w.server.recordedCommands().count
+            let run = try await Self.inFlightRun(w)
+            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil)
+            w.server.slowListingFetch(in: Self.secondPath, overRecords: 0, seconds: nil)
+            func firstListing(_ mailbox: String) -> (index: Int, command: String)? {
+                Self.requests(to: mailbox, w.server, from: start).first { !Self.listingRanges([$0.command]).isEmpty }
+            }
+            let first = try #require(firstListing(Self.path), "setup: the folder's range was asked")
+            #expect(try w.catchUpState()?.listing?.nextUid == server[0],
+                    "setup: the folder's call made no progress: the listing stays at its first UID")
+            // The timeout spent its slice, and the call made no progress: the run
+            // goes on only because the slice left the folder out.
+            let second = try #require(firstListing(Self.secondPath),
+                                      "#1062: the run goes on past the first timeout slice and asks the second folder in a later slice")
+            #expect(second.index > first.index, "setup: the second folder timed out after the first")
+            for (mailbox, timedOut) in [(Self.path, first), (Self.secondPath, second)] {
+                let after = Self.requests(to: mailbox, w.server, from: start).filter { $0.index > timedOut.index }.map { $0.command }
+                #expect(after.isEmpty, "#1062: the run never asks \(mailbox) again after its request timed out: \(after)")
+            }
+            let healthy = Self.listingRanges(Self.requests(to: Self.healthyPath, w.server, from: second.index + 1).map { $0.command })
+            #expect(!healthy.isEmpty, "#1062: the healthy folder is asked after the second timeout, in a later slice of the same run: \(healthy)")
+            #expect(try Self.healthyState(w)?.listing == nil, "#1062: the healthy folder's listing completed in the same run")
+            #expect(run.seconds < Self.leftOutRunSeconds,
+                    "#1062: the run ends once only the left-out folders have work: it took \(run.seconds) s of its \(Self.slowLinkDeadline) s")
+            // Let the late answers free the connections before the world closes.
+            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
+        }
+    }
+
+    // MARK: - Every request that times out leaves its folder out (#1062)
+
+    /// The folder of the per-request tests: UIDs no request of the healthy
+    /// folder names (it holds `healthyServer`), so a fragment of the folder's own
+    /// SEARCH holds only that SEARCH. Listed from its first UID in ranges of
+    /// `siteWidth`; `siteMissing` is in the first one.
+    static let siteServer = Array(101...120)
+    static let siteWidth = 5
+    static let siteMissing = 103
+
+    /// One run in which the folder's request whose command contains one of
+    /// `fragments` is answered only after the timeout: the folder is never asked
+    /// again in the run, the healthy folder goes on in a later slice, and the run
+    /// ends once only the folder has work (`expectFolderLeftOutOfTheRun`).
+    @MainActor
+    static func expectRunLeavesOutTheFolder(_ w: World, timingOut fragments: [String], maxRequests: Int = inFlightSliceRequests,
+                                            sourceLocation: SourceLocation = #_sourceLocation) async throws {
+        for fragment in fragments { w.server.stallNextCommand(containing: fragment, seconds: slowAnswerSeconds) }
+        let start = w.server.recordedCommands().count
+        let run = try await inFlightRun(w, maxRequests: maxRequests)
+        let held = fragments.map { $0.uppercased() }
+        let timedOut = try #require(requests(to: path, w.server, from: start).first { request in
+            held.contains { request.command.uppercased().contains($0) }
+        }, "setup: the folder's request held past the timeout was asked", sourceLocation: sourceLocation)
+        try expectFolderLeftOutOfTheRun(w, from: start, timedOut: timedOut.index, runSeconds: run.seconds,
+                                        sourceLocation: sourceLocation)
+        // Let the late answer free the connection before the world closes.
+        try await Task.sleep(for: .seconds(slowAnswerSeconds))
+    }
+
+    /// Start the folder's listing at its first UID, ranges of `siteWidth`.
+    @MainActor
+    static func startSiteListing(_ w: World) async throws {
+        try await setListing(w, nextUid: siteServer[0], rangeWidth: siteWidth, top: siteServer.last)
+    }
+
+    @Test("The UIDNEXT read of a call that starts a listing times out: the run never asks that folder again, while a healthy folder of the account goes on in a later slice, and the run ends once only that folder has work")
+    @MainActor
+    func uidNextTimeoutLeavesTheFolderOutOfTheRun() async throws {
+        try await Self.withWorld("in-flight-uidnext", server: Self.siteServer, local: Self.siteServer) { w in
+            try await Self.startHealthyListing(w)
+            try await w.markOwed()
+            #expect(try w.catchUpState()?.listing == nil, "setup: no listing is stored, so the call reads the folder's UIDNEXT first")
+            // The folder's SELECT, either quoting: the UIDNEXT read is its first request in the run.
+            try await Self.expectRunLeavesOutTheFolder(w, timingOut: ["SELECT \(Self.path)", "SELECT \"\(Self.path)\""])
+            let listing = try #require(try w.catchUpState()?.listing, "setup: the call saved the listing it started")
+            #expect(listing.top == nil, "setup: the UIDNEXT read timed out before the listing learned its top")
+        }
+    }
+
+    @Test("A range's membership proof times out: the run never asks that folder again, while a healthy folder of the account goes on in a later slice, and the run ends once only that folder has work")
+    @MainActor
+    func proofTimeoutLeavesTheFolderOutOfTheRun() async throws {
+        let first = Self.siteServer[0]
+        try await Self.withWorld("in-flight-proof", server: Self.siteServer, local: Self.siteServer) { w in
+            try await Self.startHealthyListing(w)
+            try await Self.startSiteListing(w)
+            // The proof of the first range names it whole.
+            try await Self.expectRunLeavesOutTheFolder(w, timingOut: ["UID \(first):\(first + Self.siteWidth - 1)"])
+        }
+    }
+
+    /// Make `siteMissing` a missing message whose header record the client
+    /// cannot read: its load leaves the UID unanswered, and the SEARCH for it
+    /// (`UID SEARCH UID <uid>`) is the request a test holds.
+    @MainActor
+    static func makeSiteMissingUnreadable(_ w: World) async throws {
+        let server = siteServer, unreadable = siteMissing
+        var messages = server.map { message($0) }
+        let index = try #require(server.firstIndex(of: unreadable))
+        messages[index] = message(unreadable, date: "not a date")
+        w.server.setMessages(messages, in: path)
+        w.server.suppressFetchInternalDate(in: path, uids: [unreadable])
+        try await w.dropLocal([unreadable])
+    }
+
+    @Test("The SEARCH a carried range still owes for a UID whose header record could not be read times out: the run never asks that folder again, while a healthy folder of the account goes on in a later slice, and the run ends once only that folder has work")
+    @MainActor
+    func carriedUnansweredSearchTimeoutLeavesTheFolderOutOfTheRun() async throws {
+        try await Self.withWorld("in-flight-unanswered-carried", server: Self.siteServer, local: Self.siteServer) { w in
+            try await Self.makeSiteMissingUnreadable(w)
+            try await Self.startHealthyListing(w)
+            try await Self.startSiteListing(w)
+            // `inFlightSliceRequests` per slice: the folder's first call lists the
+            // range, proves it and loads the UID, and carries the SEARCH it owes
+            // (no request left); a later call asks that SEARCH first.
+            try await Self.expectRunLeavesOutTheFolder(w, timingOut: ["UID \(Self.siteMissing)"])
+        }
+    }
+
+    @Test("The SEARCH for a UID whose header record could not be read, asked right after its load, times out: the run never asks that folder again, while a healthy folder of the account goes on in a later slice, and the run ends once only that folder has work")
+    @MainActor
+    func unansweredSearchTimeoutLeavesTheFolderOutOfTheRun() async throws {
+        try await Self.withWorld("in-flight-unanswered", server: Self.siteServer, local: Self.siteServer) { w in
+            try await Self.makeSiteMissingUnreadable(w)
+            try await Self.startHealthyListing(w)
+            try await Self.startSiteListing(w)
+            // One request more per slice: the folder's first call lists the
+            // range, proves it, loads the UID and asks its SEARCH in the same call.
+            try await Self.expectRunLeavesOutTheFolder(w, timingOut: ["UID \(Self.siteMissing)"],
+                                                       maxRequests: Self.inFlightSliceRequests + 1)
+        }
+    }
+
+    @Test("The header load of a missing message times out: the run never asks that folder again, while a healthy folder of the account goes on in a later slice, and the run ends once only that folder has work")
+    @MainActor
+    func headerLoadTimeoutLeavesTheFolderOutOfTheRun() async throws {
+        try await Self.withWorld("in-flight-load", server: Self.siteServer, local: Self.siteServer) { w in
+            try await w.dropLocal([Self.siteMissing])
+            try await Self.startHealthyListing(w)
+            try await Self.startSiteListing(w)
+            // The healthy folder misses nothing, so the only header load is the folder's.
+            try await Self.expectRunLeavesOutTheFolder(w, timingOut: ["ENVELOPE"])
+        }
+    }
+
+    @Test("A folder's request times out and its result is not applied (a reset of the folder began while the request was out): the slice still reports the folder's request as possibly in flight")
+    @MainActor
+    func timedOutFolderIsInFlightWhenItsApplyIsSkipped() async throws {
+        let server = Array(1...20)
+        try await Self.withWorld("in-flight-skipped", server: server, local: server) { w in
+            let folderId = w.folderId
+            try await Self.setListing(w, nextUid: 7, rangeWidth: 5, top: server.last)
+            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
+            let start = w.server.recordedCommands().count
+            await AccountManager.shared.clearRecentlyCompletedForTesting()
+            async let sliced = w.engine.runCatchUp(provider: w.provider, folderIds: [folderId], context: CatchUpContext(
+                deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages,
+                requestTimeoutSeconds: Self.scaledTimeout))
+            var polls = 0
+            while Self.listingRanges(w.server.recordedCommands().dropFirst(start)).isEmpty, polls < Self.suspensionPolls {
+                try await Task.sleep(for: .milliseconds(10))
+                polls += 1
+            }
+            #expect(polls < Self.suspensionPolls, "setup: the folder's range was asked")
+            // The folder's reset reaction begins while the range's request is
+            // out: the apply then writes nothing of the call's result.
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET uidValidityResetPendingAt = ? WHERE id = ?", arguments: [Date(), folderId])
+            }
+            let slice = await sliced
+            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil)
+            #expect(try w.catchUpState()?.listing?.widthCap == nil, "setup: the apply wrote nothing, not even the cap the call set")
+            #expect(!slice.progressed, "setup: nothing of the folder's result was applied")
+            #expect(slice.inFlightFolderIds == [folderId],
+                    "#1062: a timed-out request is reported in flight whatever the apply did: \(slice.inFlightFolderIds)")
+            // Let the late answer free the connection before the world closes.
+            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
+        }
+    }
+
+    @Test("A call that sees another numbering applies nothing and reports a request of that call that timed out as in flight, and one that did not as not")
+    func otherNumberingCarriesTheCallsTimeout() {
+        let timedOut = IMAPProvider.otherNumbering(folderId: "account:\(Self.path)", epoch: 7, requestTimedOut: true)
+        #expect(timedOut.requestMayBeInFlight, "#1062: the call's timeout is still reported in flight")
+        #expect(timedOut.epoch == 7 && !timedOut.madeProgress && timedOut.newState == nil,
+                "#1062: nothing of the call applies; the observed numbering is reported")
+        let answered = IMAPProvider.otherNumbering(folderId: "account:\(Self.path)", epoch: nil, requestTimedOut: false)
+        #expect(!answered.requestMayBeInFlight && answered.epoch == nil, "#1062: no timeout, nothing in flight")
+    }
+
+    // MARK: - A timeout past the hold bound ends the call (#1062)
+
+    /// One call that lists `range`, held since past the bound, and whose request
+    /// containing `fragment` times out: the range is passed over and saved, the
+    /// folder gets no further request in that call, and the next call lists from
+    /// past the range. The call's budget is never spent (no deadline, a clock
+    /// that stands still, no request cap) and the listing has ranges left, so
+    /// only the end of the call after the timeout stops the next range's request.
+    @MainActor
+    static func expectPassOverEndsTheCall(_ w: World, range: ClosedRange<Int>, timingOut fragment: String,
+                                          clock: CatchUpTestClock,
+                                          sourceLocation: SourceLocation = #_sourceLocation) async throws {
+        w.server.stallNextCommand(containing: fragment, seconds: slowAnswerSeconds)
+        let start = w.server.recordedCommands().count
+        await w.slice(clock: clock, requestTimeout: scaledTimeout)
+        let asked = requests(to: path, w.server, from: start)
+        #expect(listingRanges(asked.map { $0.command }).first == range, "setup: the call listed \(range) first",
+                sourceLocation: sourceLocation)
+        let timedOut = try #require(asked.first { $0.command.uppercased().contains(fragment.uppercased()) },
+                                    "setup: the request held past the timeout was asked", sourceLocation: sourceLocation)
+        let after = asked.filter { $0.index > timedOut.index }.map { $0.command }
+        #expect(after.isEmpty, "#1062: after a timeout past the hold bound the folder gets no further request in that call: \(after)",
+                sourceLocation: sourceLocation)
+        let listing = try #require(try w.catchUpState()?.listing, "#1062: the listing stays in progress",
+                                   sourceLocation: sourceLocation)
+        #expect(listing.passedOver == true, "#1062: the passed-over range is saved, so the listing completes as not clean",
+                sourceLocation: sourceLocation)
+        #expect(listing.nextUid == range.upperBound + 1 && listing.loadHeldSince == nil && listing.carried == nil,
+                "#1062: the listing is saved past the passed-over range: \(listing)", sourceLocation: sourceLocation)
+        // Let the late answer free the connection.
+        try await Task.sleep(for: .seconds(slowAnswerSeconds))
+        let next = try await nextRange(w, clock)
+        #expect(next?.lowerBound == range.upperBound + 1,
+                "#1062: the next call goes on from past the passed-over range: \(next.map { "\($0)" } ?? "none")",
+                sourceLocation: sourceLocation)
+    }
+
+    @Test("A range's membership proof times out with its hold past the bound: the range is passed over and saved, the folder gets no further request in that call, and the next call goes on from past the range")
+    @MainActor
+    func proofTimeoutPastTheHoldEndsTheCall() async throws {
+        let first = Self.siteServer[0]
+        try await Self.withWorld("pass-over-proof", server: Self.siteServer, local: Self.siteServer) { w in
+            let clock = CatchUpTestClock()
+            try await Self.setListing(w, nextUid: first, rangeWidth: Self.siteWidth, top: Self.siteServer.last,
+                                      loadHeldSince: clock.now.addingTimeInterval(-Self.pastTheHold))
+            try await Self.expectPassOverEndsTheCall(w, range: first...(first + Self.siteWidth - 1),
+                                                     timingOut: "SEARCH", clock: clock)
+        }
+    }
+
+    @Test("A missing message's header load times out with its hold past the bound: the range is passed over and saved, the folder gets no further request in that call, and the next call goes on from past the range")
+    @MainActor
+    func headerLoadTimeoutPastTheHoldEndsTheCall() async throws {
+        let missing = Self.siteMissing
+        try await Self.withWorld("pass-over-load", server: Self.siteServer, local: Self.siteServer) { w in
+            try await w.dropLocal([missing])
+            let clock = CatchUpTestClock()
+            // The range starts at the missing message, where its hold runs.
+            try await Self.setListing(w, nextUid: missing, rangeWidth: Self.siteWidth, top: Self.siteServer.last,
+                                      loadHeldSince: clock.now.addingTimeInterval(-Self.pastTheHold))
+            try await Self.expectPassOverEndsTheCall(w, range: missing...(missing + Self.siteWidth - 1),
+                                                     timingOut: "ENVELOPE", clock: clock)
         }
     }
 

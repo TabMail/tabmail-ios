@@ -265,9 +265,15 @@ extension IMAPProvider {
         let path = folder.path
         var completed = false
         // A request of this call timed out (#1062): it may still hold the
-        // folder's connection until its late answer, so the call reports it as in
-        // flight (`CatchUpFolderResult.requestMayBeInFlight`) and the run never
-        // asks this folder again.
+        // folder's connection until its late answer, so the call asks the folder
+        // nothing more (every timeout ends the range loop, a pass-over past the
+        // hold bound included), reports it as in flight
+        // (`CatchUpFolderResult.requestMayBeInFlight`), and the run never asks
+        // this folder again.
+        // *Superseded (#1062):* "so the call reports it as in flight [...] and
+        // the run never asks this folder again": a proof or load timeout past
+        // the hold bound passed the range over and listed the next one in the
+        // same call.
         var requestTimedOut = false
 
         // The UID range listed (#1062). Its lower bound is where the range the
@@ -725,7 +731,8 @@ extension IMAPProvider {
                 // A held UID, a failed request with nothing loaded, a failed
                 // membership proof (unresolved from `lo`), or a stop on the UID
                 // already held: held for a bounded time. Past it, the held and
-                // unasked UIDs count as done, the range moves on, and the listing
+                // unasked UIDs count as done, the range moves on (after a timeout,
+                // in the folder's next call, see below), and the listing
                 // completes as not clean.
                 let since = runningHold ?? context.clock()
                 if context.clock().timeIntervalSince(since) < holdSeconds {
@@ -738,6 +745,14 @@ extension IMAPProvider {
             }
             listing.loadHeldSince = nil
             listing.nextUid = hi + 1
+            // A request of this range that timed out may still hold the
+            // folder's connection (`requestMayBeInFlight`): past the hold bound
+            // the range is passed over and saved as above, and the folder stops
+            // for this call instead of listing the next range (#1062). Only this
+            // range's own request can have timed out here: every earlier timeout
+            // ended the call. If this range was the listing's last, its next
+            // call completes it at once, with no request, as not clean.
+            if requestTimedOut { break rangeLoop }
         }
 
         // Progress: the listing moved or completed, or something applies. A range

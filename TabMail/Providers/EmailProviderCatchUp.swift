@@ -149,10 +149,15 @@ struct CatchUpFolderResult: Sendable {
     /// an attempt (a request that failed or timed out before anything moved, a page
     /// still held). The backfill worker
     /// runs another slice only after one in which an applied result made progress,
+    /// or in which a folder first left a request in flight (#1062),
     /// so a folder whose requests keep failing is tried again at the worker's next
     /// cycle, never at network rate (#766). The progress of a folder whose call
     /// left a request in flight (`requestMayBeInFlight`) does not count toward
     /// another slice (#1062).
+    /// *Superseded (#1062):* "runs another slice only after one in which an
+    /// applied result made progress": a slice whose only progress came from a
+    /// folder left out from then on also takes one more, so the folders still
+    /// asked go on.
     var madeProgress = false
     /// A request of this call may still be in flight (#1062): the provider
     /// stopped waiting for it, but it can hold the folder's connection until its

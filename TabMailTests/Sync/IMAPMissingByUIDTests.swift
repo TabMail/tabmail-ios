@@ -129,11 +129,14 @@ struct IMAPMissingByUIDTests {
         }
 
         /// The backfill worker's catch-up run, with
-        /// no storage limit, whatever the machine running the test has.
+        /// no storage limit, whatever the machine running the test has. Returns
+        /// the run's own answer (`SyncEngine.runCatchUpRun`: an applied result made
+        /// progress).
+        @discardableResult
         func workerRun(maxRequests: Int = SyncConfig.catchUpSliceMaxRequests, deadlineIn: TimeInterval = 60,
                        requestTimeout: TimeInterval = SyncConfig.catchUpRequestTimeoutSeconds,
                        sliceSeconds: TimeInterval = SyncConfig.catchUpSliceSeconds,
-                       intervalSeconds: TimeInterval = SyncConfig.catchUpSliceIntervalSeconds) async throws {
+                       intervalSeconds: TimeInterval = SyncConfig.catchUpSliceIntervalSeconds) async throws -> Bool {
             await AccountManager.shared.clearRecentlyCompletedForTesting()
             var run = SyncEngine.CatchUpRun(
                 storageLimitInForce: false, deadline: Date().addingTimeInterval(deadlineIn),
@@ -142,7 +145,7 @@ struct IMAPMissingByUIDTests {
             run.sliceMaxRequests = maxRequests
             run.listingRangeMessages = rangeMessages
             run.requestTimeoutSeconds = requestTimeout
-            _ = await engine.runCatchUpRun(account: try account(), run: run)
+            return await engine.runCatchUpRun(account: try account(), run: run)
         }
 
         /// A foreground sync (its full sync only when due), after the protection of

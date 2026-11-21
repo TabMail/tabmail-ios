@@ -223,16 +223,24 @@ extension SyncEngine {
     /// (`CatchUpFolderResult.requestMayBeInFlight`, #1062; IMAP: a request that
     /// timed out), whatever progress that call made: the request may still hold
     /// the folder's connection until its late answer. Later slices of the run
-    /// leave the folder out and go on with the others, and only the progress of
-    /// folders still asked decides whether the run takes another slice, so a slice
-    /// whose only progress came from such a folder ends the run. The set lives in
-    /// this run's memory alone. The state the folder's call saved is kept, and its
+    /// leave the folder out and go on with the others: the run takes another
+    /// slice when a folder still asked made progress, or when the slice left a
+    /// folder out that was not left out before (at most one slice per folder per
+    /// run, each with its window and request cap). The left-out folder's own
+    /// progress never keeps the run going, so the run ends once only left-out
+    /// folders have work. The set lives in this run's memory alone. The state the
+    /// folder's call saved is kept, and its
     /// next call, in a later run, asks at most the capped width. Other callers that
     /// reach the folder meanwhile (the worker's next cycle, the walk) are the
     /// connection's own issue (#1133), open. Generic: a provider without catch-up
     /// returns nothing, and the run stops after one slice. True when a slice's
     /// applied result made progress, a folder left out afterwards included (the
     /// worker's `didWork`).
+    /// *Superseded (#1062):* "only the progress of folders still asked decides
+    /// whether the run takes another slice, so a slice whose only progress came
+    /// from such a folder ends the run": a timeout spends its slice, so the run
+    /// ended whenever the timed-out folder came first in it, and the other folders
+    /// waited for the next run.
     ///
     /// The request rate: a slice sends at most `run.sliceMaxRequests`, and opens a
     /// window of `run.intervalSeconds` (real time) in `catchUpSliceWindowEnds`; no
@@ -282,10 +290,21 @@ extension SyncEngine {
                 madeProgress = madeProgress || ran.progressed
                 // A request that may still be in flight holds its folder's
                 // connection: the folder is left out of the rest of the run, and
-                // its progress does not keep the run going (#1062).
+                // its progress does not keep the run going (#1062). A slice that
+                // added a folder to the set takes another slice, so the folders
+                // still asked go on even when the left-out folder's call was the
+                // slice's only progress (a timeout spends its slice). The set only
+                // grows and its folders are never asked again, so that adds at
+                // most one slice per folder to the run, each with its own window
+                // and request cap. A slice with no folder left to ask, or whose
+                // folders made no progress and added none, ends the run.
+                // *Superseded (#1062):* the run took another slice only when a
+                // folder still asked progressed, so it ended whenever the
+                // timed-out folder came first in its slice.
+                let addedInFlight = !ran.inFlightFolderIds.isSubset(of: inFlight)
                 inFlight.formUnion(ran.inFlightFolderIds)
                 let progressedStillAsked = !ran.progressedFolderIds.subtracting(inFlight).isEmpty
-                guard progressedStillAsked, run.deadline != nil else { break runLoop }
+                guard progressedStillAsked || addedInFlight, run.deadline != nil else { break runLoop }
             }
         }
         return madeProgress

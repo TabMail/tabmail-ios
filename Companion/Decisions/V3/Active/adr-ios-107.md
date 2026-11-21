@@ -172,6 +172,28 @@ The owner's rulings of 2026-11-09:
          connections are free, so their work goes on. The worker's next cycle and the walk can still
          reach the folder while the late answer is outstanding: that is the connection layer's issue,
          #1133, open.
+       - *Amended 2026-11-21 (#1062): the slice that leaves a folder out takes one more slice.* A timeout
+         spends its slice (the slice, `catchUpSliceSeconds` 2 s, is shorter than one request's timeout,
+         `catchUpRequestTimeoutSeconds` 3 s), so when the timed-out folder came first in its slice the
+         other folders made no progress in it, and the rule above ended the run with their work
+         outstanding. The run now takes another slice when a folder not in the set made progress, OR when
+         the slice added a folder to the set. The left-out folder's own progress never counts, and a
+         foreground cycle still runs one slice. Bound: the set only grows, a folder in it is never passed to
+         a slice again, and a folder joins it once, so the second condition adds at most one slice per
+         folder to the run (at most as many as the account has catch-up folders); each such slice keeps its
+         own window (`catchUpSliceIntervalSeconds`) and its own request cap (`catchUpSliceMaxRequests`).
+         Nothing can loop more than once per folder: a folder in the set is filtered out before each slice,
+         so it can neither be asked again nor join again; a slice with no folder left to ask, or whose
+         folder read fails, returns nothing and ends the run; a slice whose folders made no progress and
+         added none ends the run; the deadline still ends it. So the run ends once only left-out folders
+         have work. Connections are per folder (`IMAPProvider.withFolderConnection`, one pinned connection
+         per folder path, exclusive checkout), so the other folders' requests never wait behind the late
+         answer. Rejected: going on while the set is not empty, which keeps taking slices to the deadline
+         once only left-out folders have work. `runCatchUpRun`'s returned Bool is unchanged: it still
+         counts a left-out folder's applied progress, so the foreground worker's next cycle can come at
+         once; pacing across runs is #1133's.
+         *Superseded (2026-11-21):* "Only the progress of folders not in the set decides another slice, so
+         a slice whose only progress came from such a folder ends the run."
      - **The worker's cycle.** `runBackfill` returns true when the walk did work or the catch-up made
        progress, so the foreground worker keeps cycling (the profile's active delay between cycles:
        3 s, or 0.5 s on power) until the listing completes; then a cycle does no work and, with the
@@ -1203,7 +1225,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     re-sizes it from its own count, so the next range need not be the other half. A one-UID range that
     fails stays unconfirmed: the listing never moves past it and the next call asks it again. With no
     stored width, the first range is sized from EXISTS and UIDNEXT. Header-load batches are never split.
-    *Superseded (2026-11-20, same review train):* "is asked again as its halves ... the half next to
+    *Superseded (2026-11-20):* "is asked again as its halves ... the half next to
     where the listing stands first ..., the other next", a retry of both halves inside the same call,
     which could not work while the timed-out request still held the folder's connection. *Replaces:* the width recomputed from each SELECT's EXISTS and UIDNEXT, and a
     listing failure that ended the folder's pass with no split.
@@ -1218,21 +1240,42 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     the next call asks from there at most the capped width (the cap is applied where the next range is
     cut). The cap write is no progress: a call that changed nothing else (a cap-only change) is no
     progress, while a call that started the listing, learned its top or answered an earlier range made
-    progress and keeps what it saved. Whatever progress it made, the call reports the folder's request
-    as possibly in flight (`CatchUpFolderResult.requestMayBeInFlight`): the run never asks a folder again
-    after its request timed out, and goes on with its other folders (see the 2026-11-21 amendment under
-    *How many slices*). The folder's next call, in a later run, asks at most the capped width. A one-UID
+    progress and keeps what it saved. Whatever progress it made, a call whose request timed out reports
+    the folder's request as possibly in flight (`CatchUpFolderResult.requestMayBeInFlight`): the run never
+    asks a folder again after its request timed out, and goes on with its other folders (see the
+    2026-11-21 amendments under *How many slices*). Only a timeout reports it: an answer too large or
+    undecodable caps the width and ends the call the same way, but nothing of it is outstanding, so it
+    reports no request in flight. The folder's next call, in a later run, asks at most the capped width. A one-UID
     range that fails stays unconfirmed. Other callers that reach the folder while the late answer is
     outstanding (the worker's next cycle, the walk) are the connection layer's issue, #1133, open. Why:
     with the shrink factor at 2 the cap (half the width, rounded down) was never wider than the stored
     lower half (rounded up), so the stored half width never set a range; its only effect was that a
     timeout changed the listing and so counted as progress, against the rule that a request that failed
     before anything moved is no progress.
-    *Superseded (2026-11-21, same review train):* "The call is no progress (a cap-only change), so a
+    *Superseded (2026-11-21):* "The call is no progress (a cap-only change), so a
     background run does not ask again at once on the connection the timed-out request still holds: the
     folder is tried again at the next cycle." A call that starts a listing, or answers a range before the
     one that times out, made progress, and the run's progress counted every folder, so the run asked the
     folder again at once on the held connection.
+    *Superseded (2026-11-21):* "Whatever progress it made, the call reports the folder's request as
+    possibly in flight": it read as if a too-large or undecodable answer reported one too.
+  - *Every timeout ends the call (2026-11-21, #1062).* Any catch-up request of a call that times out (the
+    UIDNEXT read, a listing range, a membership proof, a header load, an unanswered UID's SEARCH) ends the
+    folder's call, including a proof, load or SEARCH timeout on a range whose hold is past
+    `backfillPageHoldMinutes`: that range is passed over and saved (`Listing.passedOver`, `nextUid` past
+    the range, the hold cleared, no carry), and the call stops there instead of listing the next range. No
+    new state. The call's result keeps what it found before the timeout (flag updates, proven removals,
+    loaded headers), applied with that state in one transaction. Nothing is lost: the only work the same
+    call did after such a pass-over was to list the following ranges (their FETCH, proof and loads), and
+    the next call does exactly that from `nextUid`, as after a budget stop, with the stored width, cap and
+    top unchanged and a fresh hold for any UID it holds. `passedOver` stays in the listing, so whichever
+    call completes it completes it unclean (an owed folder stays owed); if the passed-over range was the
+    listing's last, the next call completes it at once, with no request. Why: the timed-out request may
+    still hold the folder's connection, and with budget left (a slice whose clock has not run out, or no
+    deadline) the next range's request would wait behind it or reach the next range after its late answer.
+    *Superseded (2026-11-21):* past the hold bound, a proof, load or SEARCH timeout passed the range over
+    and the same call listed the next range; only a slice's time budget, shorter than one timeout, usually
+    stopped it.
   - *Width cap, current (d1 2026-11-20).* A range that times out sets the cap
     (`IMAPCatchUpState.Listing.widthCap`) to its width divided by `SyncConfig.catchUpWidthCapShrinkFactor`;
     each range that answers multiplies it by `SyncConfig.catchUpWidthCapGrowthFactor` (2026-11-20: kept only
@@ -1241,7 +1284,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     cap below only ever shrank, so about 20 timeouts unrelated to range size left a sparse folder at
     one-UID ranges over millions of UIDs. A cap-only change is still no progress. 2026-11-21: the cap is
     all a timeout stores, so the timeout's own write is no progress (*Timeout, current (2026-11-21)*
-    above). *Superseded (2026-11-21, same review train):* "so a timeout is no progress": a call that
+    above). *Superseded (2026-11-21):* "so a timeout is no progress": a call that
     moved its listing before the timeout still made progress.
   - *Width cap after a timeout, superseded by the d1 entry above.* A range that times out also stores a
     width cap (`IMAPCatchUpState.Listing.widthCap`, the stored half width) together with the upper end
@@ -1312,4 +1355,4 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
 passedOver, unclean completion, re-arm lapse, selfHealOwed, selfHealLapse, markListingDue, slow link,
 budget stop, SEARCH failure, date self-heal removed, range sized by EXISTS and UIDNEXT, sparse folder,
 unsolicited FETCH, walk not started, UID-ordered prune, header batch size, width cap, widthCap,
-widthCapThrough, timed-out width, cap growth, cap dropped at the maximum span, clean-only settle, daily relisting of owed folders, storage-limit floor after the walk, request in flight, requestMayBeInFlight, folder left out of the run, held connection, #1133)
+widthCapThrough, timed-out width, cap growth, cap dropped at the maximum span, clean-only settle, daily relisting of owed folders, storage-limit floor after the walk, request in flight, requestMayBeInFlight, folder left out of the run, held connection, one more slice per left-out folder, every timeout ends the call, pass-over ends the call, per-folder connection, #1133)
