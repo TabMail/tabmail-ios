@@ -446,8 +446,15 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// `injectUnsolicitedFetch(in:uid:flags:)`: one extra untagged FETCH
         /// (UID and FLAGS) sent with the next FETCH in the mailbox, whatever it asked.
         var unsolicitedFetchByMailbox: [String: [Int: [String]]] = [:]
-        /// `slowListingFetch(in:overRecords:seconds:)`: per mailbox.
-        var slowListingByMailbox: [String: (overRecords: Int, seconds: Double)] = [:]
+        /// `holdListingFetches(in:overRecords:)`: per mailbox, the record count
+        /// above which a flags-only FETCH is held.
+        var listingHoldByMailbox: [String: Int] = [:]
+        /// Per mailbox, how many times its held listing FETCHes were let go
+        /// (`releaseListingFetches(in:)`): a held FETCH answers once the count
+        /// passes the one it was held at.
+        var listingReleasesByMailbox: [String: Int] = [:]
+        /// Per mailbox, how many listing FETCHes are held now.
+        var listingHeldByMailbox: [String: Int] = [:]
         /// Flags-only FETCHes answered in each mailbox, with how many records each matched.
         var listingFetchSizesByMailbox: [String: [Int]] = [:]
         /// Per-mailbox ESEARCH data for the next UID SEARCHes, in order
@@ -1593,12 +1600,33 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.unsolicitedFetchByMailbox[mailbox, default: [:]][uid] = flags }
     }
 
-    /// Test seam: a slow link. Every flags-only FETCH (no ENVELOPE) in this
-    /// mailbox that matches more than `overRecords` messages is answered only
-    /// after `seconds`, so a client whose timeout is shorter gives it up. Stays
-    /// until `slowListingFetch(in:overRecords:nil)`.
-    func slowListingFetch(in mailbox: String, overRecords: Int, seconds: Double?) {
-        withState { $0.slowListingByMailbox[mailbox] = seconds.map { (overRecords, $0) } }
+    /// Test seam: a link too slow for large listings. Every flags-only FETCH (no
+    /// ENVELOPE) in this mailbox that matches more than `overRecords` messages
+    /// is held after it has read the mailbox, before it answers, until
+    /// `releaseListingFetches(in:)`: the client's request timeout gives it up,
+    /// whatever the timeout's length, and nothing is timed. Stays armed until
+    /// `stopHoldingListingFetches(in:)`.
+    func holdListingFetches(in mailbox: String, overRecords: Int) {
+        withState { $0.listingHoldByMailbox[mailbox] = overRecords }
+    }
+
+    /// Let every listing FETCH held now in this mailbox answer; later ones are
+    /// held again while the hold stays armed.
+    func releaseListingFetches(in mailbox: String) {
+        withState { $0.listingReleasesByMailbox[mailbox, default: 0] += 1 }
+    }
+
+    /// Disarm the hold of this mailbox's listing FETCHes and let the held ones answer.
+    func stopHoldingListingFetches(in mailbox: String) {
+        withState { state in
+            state.listingHoldByMailbox[mailbox] = nil
+            state.listingReleasesByMailbox[mailbox, default: 0] += 1
+        }
+    }
+
+    /// How many listing FETCHes of this mailbox are held now.
+    func heldListingFetchCount(in mailbox: String) -> Int {
+        withState { $0.listingHeldByMailbox[mailbox] ?? 0 }
     }
 
     /// How many records each flags-only FETCH answered in this mailbox matched, in order.
@@ -3545,13 +3573,20 @@ final class FakeIMAPServer: @unchecked Sendable {
         passHeldGate(Self.snapshotGateKey(mailbox))
         let matched = parseSequenceSet(seqStr, uidMode: uidMode, messages: snapshot.messages)
         if itemsStr.contains("FLAGS"), !itemsStr.contains("ENVELOPE") {
-            let slow = withState { state -> Double? in
+            // The release count this FETCH waits past, when it is held.
+            let heldUntil = withState { state -> Int? in
                 state.listingFetchSizesByMailbox[mailbox, default: []].append(matched.count)
-                guard let rule = state.slowListingByMailbox[mailbox], matched.count > rule.overRecords else { return nil }
-                return rule.seconds
+                guard let over = state.listingHoldByMailbox[mailbox], matched.count > over else { return nil }
+                state.listingHeldByMailbox[mailbox, default: 0] += 1
+                return (state.listingReleasesByMailbox[mailbox] ?? 0) + 1
             }
-            // This connection's own thread: blocking delays no other connection.
-            if let slow { usleep(UInt32(slow * 1_000_000)) }
+            // This connection's own thread: holding it delays no other connection.
+            if let heldUntil {
+                while !withState({ ($0.listingReleasesByMailbox[mailbox] ?? 0) >= heldUntil || $0.heldGatesAbandoned }) {
+                    usleep(2_000)
+                }
+                withState { $0.listingHeldByMailbox[mailbox, default: 1] -= 1 }
+            }
         }
         var response = ""
         for (uid, flags) in snapshot.unsolicited.sorted(by: { $0.key < $1.key }) {

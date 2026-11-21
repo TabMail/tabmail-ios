@@ -70,15 +70,20 @@ extension IMAPMissingByUIDTests {
     /// run to the deadline.
     static let leftOutRunSeconds: TimeInterval = slowLinkDeadline / 2
 
-    /// One background run on the scaled link, `maxRequests` per slice: a slice
-    /// shorter than a request's timeout, as in production, so a timeout spends
-    /// its slice. Returns the run's own answer (an applied result made progress)
-    /// and how long the run took.
+    /// One background run, `maxRequests` per slice, with the production request
+    /// timeout and slice (`heldRequestTimeout`, `heldRunSliceSeconds`): the
+    /// request the test holds times out, every request the server answers
+    /// (the healthy folder's included) answers far within the timeout, and a
+    /// slice is shorter than a request's timeout, as in production, so a
+    /// timeout spends its slice. Returns the run's own answer (an applied
+    /// result made progress) and how long the run took.
+    /// *Superseded (#1062):* "on the scaled link": a 0.5 s timeout, which an
+    /// answered request of the healthy folder could reach on a busy machine.
     @MainActor @discardableResult
     static func inFlightRun(_ w: World, maxRequests: Int = inFlightSliceRequests) async throws -> (didWork: Bool, seconds: TimeInterval) {
         let started = Date()
-        let didWork = try await w.workerRun(maxRequests: maxRequests, deadlineIn: slowLinkDeadline, requestTimeout: scaledTimeout,
-                                            sliceSeconds: scaledSliceSeconds, intervalSeconds: scaledIntervalSeconds)
+        let didWork = try await w.workerRun(maxRequests: maxRequests, deadlineIn: slowLinkDeadline, requestTimeout: heldRequestTimeout,
+                                            sliceSeconds: heldRunSliceSeconds)
         return (didWork, Date().timeIntervalSince(started))
     }
 
@@ -473,7 +478,7 @@ extension IMAPMissingByUIDTests {
             let fetch = Self.listingFetchFragment
             func context() -> CatchUpContext {
                 CatchUpContext(deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages,
-                               requestTimeoutSeconds: Self.scaledTimeout)
+                               requestTimeoutSeconds: Self.heldRequestTimeout)
             }
             // The provider's own result for this call, read without an apply:
             // the UIDNEXT read answers, and the first range is held unanswered.
@@ -585,7 +590,7 @@ extension IMAPMissingByUIDTests {
     /// the call was charged (`CatchUpContext.requestsLeft`).
     @MainActor
     static func keptCall(_ w: World, budget: Int = passOverCallRequests, clock: CatchUpTestClock,
-                         requestTimeout: TimeInterval = scaledTimeout) async -> (slice: CatchUpSliceResult, charged: Int) {
+                         requestTimeout: TimeInterval = heldRequestTimeout) async -> (slice: CatchUpSliceResult, charged: Int) {
         let context = CatchUpContext(deadline: .distantFuture, clock: { clock.now }, maxRequests: budget,
                                      listingRangeMessages: w.rangeMessages, requestTimeoutSeconds: requestTimeout)
         await AccountManager.shared.clearRecentlyCompletedForTesting()

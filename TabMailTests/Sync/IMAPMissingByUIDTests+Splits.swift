@@ -12,16 +12,20 @@ import Testing
 /// `IMAPMissingByUIDTests`.
 extension IMAPMissingByUIDTests {
 
-    /// The production shape, scaled down so a test runs in seconds: a slice
-    /// shorter than one request's timeout (`catchUpSliceSeconds` 2 s against
-    /// `catchUpRequestTimeoutSeconds` 3 s), so a timeout spends the slice; a
-    /// slow answer later than the timeout; and slices spaced further apart
-    /// than the slow answer, so its late reply has freed the connection by the
-    /// next slice, as on a real link between worker slices.
-    static let scaledSliceSeconds: TimeInterval = 0.3
-    static let scaledTimeout: TimeInterval = 0.5
-    static let slowAnswerSeconds: Double = 1
-    static let scaledIntervalSeconds: TimeInterval = 1.2
+    /// The request timeout of a test whose request times out, the production
+    /// one: the request that must time out is held by the server
+    /// (`FakeIMAPServer.holdListingFetches`, `holdNextCommand`) until the test
+    /// releases it, so it times out whatever the timeout's length, while every
+    /// request the server answers takes far less than this on a busy machine,
+    /// so none of them times out. Nothing is timed against it.
+    static let heldRequestTimeout: TimeInterval = SyncConfig.catchUpRequestTimeoutSeconds
+    /// A run's slice in those tests, the production one: shorter than one
+    /// request's timeout (`catchUpSliceSeconds` 2 s against
+    /// `catchUpRequestTimeoutSeconds` 3 s), so a timeout spends its slice.
+    /// *Superseded (#1062):* a 0.3 s slice, a 0.5 s timeout, a slow answer after
+    /// 1 s and slices 1.2 s apart: an answered request could reach the short
+    /// timeout on a busy machine, and the slow answer raced it from the other side.
+    static let heldRunSliceSeconds: TimeInterval = SyncConfig.catchUpSliceSeconds
     static let slowLinkDeadline: TimeInterval = 180
 
     /// The `lo...hi` of each listing FETCH (`UID FETCH lo:hi (UID FLAGS)`) among `commands`, in order.
@@ -45,13 +49,15 @@ extension IMAPMissingByUIDTests {
     /// most one listing timeout and the listing completes across runs, all on
     /// the slow link; and a range that timed out is never asked again at its own
     /// width. `ceiling` is the test's bound on listing requests; the returned
-    /// cost counts every listing request of those runs.
+    /// cost counts every listing request of those runs. The slow link holds
+    /// every listing FETCH that matches more than `overRecords` messages
+    /// (`FakeIMAPServer.holdListingFetches`), so exactly those time out.
     /// *Superseded (#1062):* one worker run, in which "the listing completes
     /// across calls": the run now leaves the folder out after its timeout.
     @MainActor
     static func runOnSlowLink(_ w: World, overRecords: Int, ceiling: Int) async throws -> (fetches: Int, ranges: [ClosedRange<Int>]) {
-        w.server.slowListingFetch(in: path, overRecords: overRecords, seconds: slowAnswerSeconds)
-        defer { w.server.slowListingFetch(in: path, overRecords: overRecords, seconds: nil) }
+        w.server.holdListingFetches(in: path, overRecords: overRecords)
+        defer { w.server.stopHoldingListingFetches(in: path) }
         let sizesBefore = w.server.listingFetchSizes(in: path).count
         let start = w.server.recordedCommands().count
         // Every run but the last ends on a listing timeout, and every timeout is
@@ -60,10 +66,11 @@ extension IMAPMissingByUIDTests {
         var runs = 0
         repeat {
             let runSizesBefore = w.server.listingFetchSizes(in: path).count
-            // Each run's first slice waits for the account's slice window, which
-            // outlasts the late answer of the previous run's timed-out range.
-            try await w.workerRun(deadlineIn: slowLinkDeadline, requestTimeout: scaledTimeout,
-                                  sliceSeconds: scaledSliceSeconds, intervalSeconds: scaledIntervalSeconds)
+            try await w.workerRun(deadlineIn: slowLinkDeadline, requestTimeout: heldRequestTimeout, sliceSeconds: heldRunSliceSeconds)
+            // The run gave its held FETCH up: let it answer. The answer reaches
+            // no client (the timeout closed that session), and the next run asks
+            // on a new one.
+            w.server.releaseListingFetches(in: path)
             runs += 1
             let timeoutsInRun = w.server.listingFetchSizes(in: path).dropFirst(runSizesBefore).filter { $0 > overRecords }.count
             #expect(timeoutsInRun <= 1,
@@ -539,11 +546,10 @@ extension IMAPMissingByUIDTests {
             let first = 2 * messages
             try await Self.setListing(w, nextUid: 1, rangeWidth: first)
             let clock = CatchUpTestClock()
-            w.server.slowListingFetch(in: Self.path, overRecords: messages, seconds: Self.slowAnswerSeconds)
-            await w.slice(clock: clock, requestTimeout: Self.scaledTimeout)
-            w.server.slowListingFetch(in: Self.path, overRecords: messages, seconds: nil)
-            // Let the late answer free the connection.
-            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
+            // The range of more than `messages` records is held: it times out.
+            w.server.holdListingFetches(in: Self.path, overRecords: messages)
+            await w.slice(clock: clock, requestTimeout: Self.heldRequestTimeout)
+            w.server.stopHoldingListingFetches(in: Self.path)
             let timedOut = try #require(try w.catchUpState()?.listing, "setup: the listing is in progress")
             let half = first / SyncConfig.catchUpWidthCapShrinkFactor
             #expect(timedOut.nextUid == 1, "setup: the listing kept its place")
@@ -583,16 +589,15 @@ extension IMAPMissingByUIDTests {
             try w.expectNotHeld([missing], "#1062 cap dropped")
             try await Self.setListing(w, nextUid: 1, rangeWidth: maxSpan, top: server.last)
             let clock = CatchUpTestClock()
-            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
+            // The range is held: it times out.
+            w.server.holdListingFetches(in: Self.path, overRecords: 0)
             let start = w.server.recordedCommands().count
-            await w.slice(clock: clock, requestTimeout: Self.scaledTimeout)
-            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil)
+            await w.slice(clock: clock, requestTimeout: Self.heldRequestTimeout)
+            w.server.stopHoldingListingFetches(in: Self.path)
             #expect(Self.listingRanges(w.server.recordedCommands().dropFirst(start)) == [1...maxSpan],
                     "setup: one range at the maximum span was asked, and it timed out")
             let half = maxSpan / SyncConfig.catchUpWidthCapShrinkFactor
             #expect(try w.catchUpState()?.listing?.widthCap == half, "setup: the timeout capped the width at half the maximum span")
-            // Let the late answer free the connection.
-            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
             let healed = w.server.recordedCommands().count
             let slices = try await Self.slicesUntilRepaired(
                 w, expected: server, maxRequests: SyncConfig.catchUpSliceMaxRequests, clock: clock, bound: 4)
@@ -671,20 +676,19 @@ extension IMAPMissingByUIDTests {
         let server = Array(1...20)
         try await Self.withWorld("one-uid-timeout", server: server, local: server) { w in
             try await Self.setListing(w, nextUid: 7, rangeWidth: 1, top: server.last)
-            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
-            defer { w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil) }
+            // The range is held: it times out.
+            w.server.holdListingFetches(in: Self.path, overRecords: 0)
+            defer { w.server.stopHoldingListingFetches(in: Self.path) }
             let start = w.server.recordedCommands().count
             let read = try await w.read(CatchUpContext(
                 deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages,
-                requestTimeoutSeconds: Self.scaledTimeout))
+                requestTimeoutSeconds: Self.heldRequestTimeout))
             #expect(Self.listingRanges(w.server.recordedCommands().dropFirst(start)).first == 7...7, "setup: the one-UID range was asked")
             let result = try #require(read.results.first, "setup: the folder was worked")
             let listing = try #require(IMAPCatchUpState.decode(result.newState)?.listing, "#1062: the listing stays in progress")
             #expect(listing.nextUid == 7, "#1062: the listing never moves past a range that did not answer")
             #expect(listing.rangeWidth == 1, "#1062: a one-UID range that fails keeps the width 1")
             #expect(!result.madeProgress, "#1062: a repeat failure at width 1 is no progress, so the run stops")
-            // Let the late answer free the connection before the world closes.
-            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
         }
     }
 
@@ -694,20 +698,19 @@ extension IMAPMissingByUIDTests {
         let server = Array(1...20)
         try await Self.withWorld("one-uid-capped-timeout", server: server, local: server) { w in
             try await Self.setListing(w, nextUid: 7, rangeWidth: 1, widthCap: 1, top: server.last)
-            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
-            defer { w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil) }
+            // The range is held: it times out.
+            w.server.holdListingFetches(in: Self.path, overRecords: 0)
+            defer { w.server.stopHoldingListingFetches(in: Self.path) }
             let start = w.server.recordedCommands().count
             let read = try await w.read(CatchUpContext(
                 deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages,
-                requestTimeoutSeconds: Self.scaledTimeout))
+                requestTimeoutSeconds: Self.heldRequestTimeout))
             #expect(Self.listingRanges(w.server.recordedCommands().dropFirst(start)).first == 7...7, "setup: the one-UID range was asked")
             let result = try #require(read.results.first, "setup: the folder was worked")
             let listing = try #require(IMAPCatchUpState.decode(result.newState)?.listing, "#1062: the listing stays in progress")
             #expect(listing.nextUid == 7, "#1062: the listing never moves past a range that did not answer")
             #expect(listing.rangeWidth == 1, "#1062: a one-UID range that fails keeps the width 1")
             #expect(!result.madeProgress, "#1062: a timeout under a stored cap is no progress, so the run stops")
-            // Let the late answer free the connection before the world closes.
-            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
         }
     }
 
@@ -718,21 +721,20 @@ extension IMAPMissingByUIDTests {
         try await Self.withWorld("halvable-timeout", server: server, local: server) { w in
             let width = 5
             try await Self.setListing(w, nextUid: 7, rangeWidth: width, top: server.last)
-            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
+            // The range is held: it times out.
+            w.server.holdListingFetches(in: Self.path, overRecords: 0)
             let start = w.server.recordedCommands().count
             // One slice of this folder, as the background run takes it.
             await AccountManager.shared.clearRecentlyCompletedForTesting()
             let slice = await w.engine.runCatchUp(provider: w.provider, folderIds: [w.folderId], context: CatchUpContext(
                 deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages,
-                requestTimeoutSeconds: Self.scaledTimeout))
+                requestTimeoutSeconds: Self.heldRequestTimeout))
+            w.server.stopHoldingListingFetches(in: Self.path)
             #expect(Self.listingRanges(w.server.recordedCommands().dropFirst(start)) == [7...(6 + width)],
                     "setup: one range at the stored width was asked, and it timed out")
             #expect(!slice.progressed, "#1062: a timed-out range is no progress, even one that could still be halved: the cap is all it writes")
             #expect(slice.inFlightFolderIds == [w.folderId], "#1062: the slice reports the folder's request as possibly in flight, so the run asks it nothing more")
             #expect(try w.catchUpState()?.listing?.nextUid == 7, "#1062: the listing stays at the UID whose range timed out")
-            // Let the late answer free the connection, as the slice window does.
-            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
-            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil)
             let capped = width / SyncConfig.catchUpWidthCapShrinkFactor
             #expect(try await Self.nextRange(w, CatchUpTestClock()) == 7...(6 + capped),
                     "#1062: the next call asks the timed-out width divided by the shrink factor, from the same UID")

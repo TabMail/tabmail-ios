@@ -19,7 +19,9 @@ extension IMAPMissingByUIDTests {
         commands.filter { $0.uppercased().contains("FETCH") && $0.uppercased().contains("ENVELOPE") }
     }
 
-    /// Polls for a slow answer to arrive; reaching the bound is a setup failure.
+    /// Polls for a held listing, or for a reset waiting for the slice's turn;
+    /// reaching the bound is a setup failure.
+    /// *Superseded (#1062):* "for a slow answer to arrive".
     static let carryPolls = 300
 
     /// Slices of `maxRequests` until the folder holds `expected` and its listing
@@ -55,9 +57,9 @@ extension IMAPMissingByUIDTests {
             try await w.dropLocal(Self.carryMissing)
             try await w.markOwed()
             let clock = CatchUpTestClock()
-            // The listing answers late, so the reset is issued inside the slice.
-            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
-            let start = w.server.recordedCommands().count
+            // The listing is held until the reset waits for the slice's turn,
+            // so the reset is issued inside the slice. Nothing is timed.
+            w.server.holdListingFetches(in: Self.path, overRecords: 0)
             // The slice holds the account's turn, as every production slice does
             // (`runCatchUpRun`). Two requests after the listing's start: the
             // listing and its proof; the loads are carried.
@@ -65,23 +67,34 @@ extension IMAPMissingByUIDTests {
                 await w.slice(maxRequests: Self.newListingStartRequests + 2, clock: clock)
             }
             var polls = 0
-            while Self.listingRanges(w.server.recordedCommands().dropFirst(start)).isEmpty, polls < Self.carryPolls {
+            while w.server.heldListingFetchCount(in: Self.path) == 0, polls < Self.carryPolls {
                 try await Task.sleep(for: .milliseconds(10))
                 polls += 1
             }
-            #expect(polls < Self.carryPolls, "setup: the slice sent its listing")
-            // The Settings reset, then a window listing records a floor again, as
-            // the next full sync does, so a kept carry would load.
-            // The production entry point the Settings view calls.
-            switch reset {
-            case .accountMessageData: try await w.engine.resetMessageData(accountId: accountId)
-            case .wipeLocalIndex: try await w.engine.wipeLocalIndex()
+            #expect(polls < Self.carryPolls, "setup: the slice's listing is held")
+            // The Settings reset, through the production entry point the Settings
+            // view calls; it waits for the slice's turn.
+            let engine = w.engine
+            let resetting = Task { @MainActor in
+                switch reset {
+                case .accountMessageData: try await engine.resetMessageData(accountId: accountId)
+                case .wipeLocalIndex: try await engine.wipeLocalIndex()
+                }
             }
+            polls = 0
+            while await engine.syncPassWaiterCountForTesting(accountId: accountId) == 0, polls < Self.carryPolls {
+                try await Task.sleep(for: .milliseconds(10))
+                polls += 1
+            }
+            #expect(polls < Self.carryPolls, "setup: the reset waits for the slice's turn")
+            w.server.stopHoldingListingFetches(in: Self.path)
             await sliced
+            try await resetting.value
+            // Then a window listing records a floor again, as the next full sync
+            // does, so a kept carry would load.
             try await pool.write { db in
                 try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, db: db)
             }
-            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil)
             let heldAfterReset = try w.held()
             #expect(heldAfterReset.isEmpty, "#1062: no pre-reset pick is inserted after the reset: \(heldAfterReset)")
             let state = try w.catchUpState()
