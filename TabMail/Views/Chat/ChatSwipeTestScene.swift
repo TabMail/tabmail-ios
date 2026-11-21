@@ -17,7 +17,9 @@ import SwiftUI
 /// chat (Priya's, from the real tutorial seed) in Part 2, so its coach card sits in the header under
 /// the subject. "Move the tutorial on" moves the run to Part 3 at once, which takes the card away
 /// while the chat stays open: it sits in a strip under the whole navigation stack, outside the
-/// chat's region, so it is on screen with the chat and no earlier gesture can reach it.
+/// chat's region, so it is on screen with the chat and no earlier gesture can reach it. With
+/// `--chat-swipe-signed-in` the scene has a TabMail session; with `--chat-swipe-open-panel-later` a
+/// strip opens the chat's panel a moment after its tap.
 struct ChatSwipeTestScene: View {
     @State private var ready = false
     @State private var status = "Preparing fixture"
@@ -69,6 +71,14 @@ struct ChatSwipeTestScene: View {
     nonisolated static let fullReply = "Hello,\n\n\(lateSuggestion)\n\nThanks."
     /// What "Rewrite the AI Suggestion" puts in the newest row's reply, unannounced.
     nonisolated static let rewrittenReply = "Hello,\n\nA rewritten reply.\n\nRegards."
+    /// `--chat-swipe-signed-in`: the scene runs with a TabMail session, so the open panel shows its
+    /// editor (signed out it shows the sign-in bar instead) and the field its signed-in hint.
+    private let signedIn = ProcessInfo.processInfo.arguments.contains("--chat-swipe-signed-in")
+    /// `--chat-swipe-open-panel-later`: a strip under the whole navigation stack holds "Open the
+    /// panel soon", which opens the chat's panel `panelOpenDelay` after the tap, as an agent's
+    /// answer does, so a drag the test is still holding is cut off by it.
+    private let openPanelLater = ProcessInfo.processInfo.arguments.contains("--chat-swipe-open-panel-later")
+    static let panelOpenDelay: Duration = .seconds(2)
 
     var body: some View {
         Group {
@@ -110,6 +120,13 @@ struct ChatSwipeTestScene: View {
                         Button("Release the AI Suggestion") { Task { await Self.writeSuggestion() } }
                             .padding()
                     }
+                } else if openPanelLater {
+                    // Below the whole stack, like the other strips, so the reply bar ends above it.
+                    VStack(spacing: 0) {
+                        NavigationStack { list }
+                        Button("Open the panel soon") { Task { await Self.openPanelSoon() } }
+                            .padding()
+                    }
                 } else if Self.savedDraft {
                     // Below the whole stack, like the other strips. Rewrites the newest row's reply
                     // with no `.messageDataDidChange`, so the ghost keeps the reply the user taps.
@@ -125,6 +142,7 @@ struct ChatSwipeTestScene: View {
                 Text(status)
             }
         }
+        .environment(\.hasTabMailSession, signedIn)
         .task { await seed() }
         .onReceive(NotificationCenter.default.publisher(for: .chatJumpTappedForTesting)) { _ in
             guard Self.suggestionOnJump else { return }
@@ -198,6 +216,14 @@ struct ChatSwipeTestScene: View {
         }
         NSLog("[cv9diag] late suggestion written")
         NotificationCenter.default.post(name: .messageDataDidChange, object: id)
+    }
+
+    /// Opens the open chat's panel after `panelOpenDelay`, through the notification an agent's
+    /// answer posts (`.openMessageWithChat`).
+    private static func openPanelSoon() async {
+        try? await Task.sleep(for: panelOpenDelay)
+        NotificationCenter.default.post(name: .openMessageWithChat, object: nil,
+                                        userInfo: ["messageId": headerId(count - 1)])
     }
 
     /// Rewrites the newest row's reply with no `.messageDataDidChange`: the open chat is not told,

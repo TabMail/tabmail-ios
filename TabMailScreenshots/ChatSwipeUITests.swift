@@ -139,18 +139,24 @@ final class ChatSwipeUITests: XCTestCase {
 
         dragFieldOpen(in: app)
         let close = app.buttons["chatClose"]
-        // The dim between the navigation bar's bottom and the panel's top: a tap higher up lands on
-        // the navigation bar, which takes it.
+        // The dim between the navigation bar's bottom and the panel's top, both on screen: the bar
+        // from its own frame, the panel's top from the app's marker (the panel's own frame), so no
+        // group inside the panel stands in for its edge. A tap higher up lands on the navigation
+        // bar, which takes it; lower, on the panel.
         let barBottom = app.navigationBars.firstMatch.frame.maxY
-        let panelTop = openPanelTop(in: app, below: barBottom, close: close.frame)
-        XCTAssertNotNil(panelTop, "control: the open panel's top is found")
-        guard let panelTop else { return }
-        XCTAssertLessThan(barBottom, panelTop, "control: there is dim between the navigation bar \(barBottom) and the panel \(panelTop) to tap")
-        let dimY = (barBottom + panelTop) / 2
-        tap(atY: dimY, dx: 0.5, in: app)
+        let open = settledDragMarker(in: app)
+        XCTAssertNotNil(open, "control: the marker shows the open panel")
+        guard let open, let panelTop = open.fieldTop else { return }
+        XCTAssertLessThan(barBottom + 2 * Self.dimTapMargin, panelTop,
+                          "control: there is dim between the navigation bar \(barBottom) and the panel \(panelTop) to tap")
+        tap(atY: (barBottom + panelTop) / 2, dx: 0.5, in: app)
         XCTAssertTrue(close.waitForNonExistence(timeout: 3), "a tap on the dim closed the panel")
+        XCTAssertEqual(readDragMarker(in: app)?.dims, open.dims + 1, "the dim's own tap handler took the tap")
         XCTAssertTrue(isInChat(app), "the chat stays")
     }
+
+    /// How far from the navigation bar and the panel a dim tap must land to be the dim's.
+    private static let dimTapMargin: CGFloat = 10
 
     /// The swell is not the field's room: across a short drag and its settle the chat does not move.
     /// XCUITest reads frames only once the app is idle, after the spring, so the app's marker
@@ -164,9 +170,9 @@ final class ChatSwipeUITests: XCTestCase {
         // it at rest too, so the control compares a row's top with a row's top.
         let rest = readDragMarker(in: app)
         XCTAssertNotNil(rest, "control: the marker shows at rest")
-        guard let rest else { return }
+        guard let rest, let restingGlass = rest.fieldTop else { return }
         let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
-        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -40)),
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -Self.shortDragTravel)),
                     withVelocity: .slow, thenHoldForDuration: 0.3)
         let marker = dragMarker(afterDrags: 1, in: app)
         XCTAssertNotNil(marker, "control: the marker recorded one finished drag")
@@ -175,12 +181,20 @@ final class ChatSwipeUITests: XCTestCase {
         // A drag is never a tap: the field does not take focus, so no keyboard moves the chat.
         XCTAssertTrue(markerReads(focused: false, in: app), "the short drag left the field unfocused")
         XCTAssertEqual(marker.newestMinY, rest.newestMinY, accuracy: 1, "control: the marker's newest row is the row read at rest")
+        // The glass rose under the held finger (read by the app while the finger was down)...
+        XCTAssertGreaterThan(marker.rise, Self.shortDragTravel / 2, "the field's glass swelled under the finger: \(marker.rise)")
+        XCTAssertLessThanOrEqual(marker.rise, Self.shortDragTravel + 1, "no further than the finger went")
+        // ...and is back at its resting top once settled.
+        XCTAssertEqual(marker.fieldTop ?? -1, restingGlass, accuracy: 1, "the swell settled back")
         XCTAssertLessThan(marker.move, 1, "the chat stayed through the swell and the settle: moved \(marker.move)")
         XCTAssertTrue(marker.heldAtSettle, "the freeze is still held through the cooldown after the settle")
         XCTAssertFalse(marker.frozen, "the freeze is released once the drag has settled")
         XCTAssertEqual(newest.frame.minY, before, accuracy: 1, "the chat is where it was once settled")
         XCTAssertFalse(app.buttons["chatClose"].exists, "control: the short drag did not open the panel")
     }
+
+    /// The short drag's travel: under the open distance.
+    private static let shortDragTravel: CGFloat = 40
 
     /// A drag that opens the panel lets go of the user-interaction freeze too.
     func testDragThatOpensThePanelReleasesTheFreeze() {
@@ -193,6 +207,96 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertFalse(marker.frozen, "the freeze is released after a drag that opened the panel")
         XCTAssertTrue(app.buttons["chatClose"].exists, "control: the panel is still open")
     }
+
+    /// A drag held past the open distance when the panel opens under it, as an agent's answer opens
+    /// it: opening turns the field's pan off, which cuts the drag off. The freeze the drag held is
+    /// released, and once the panel closes the field is back at rest, no swell left, and the next
+    /// drag opens the panel. (A cut-off drag cannot itself open the panel, as `fieldDragWiring` pins
+    /// by reading; here the panel is open either way.)
+    func testDragCutOffByThePanelOpeningSettlesAndTheNextDragWorks() {
+        let app = launchIntoChat(openPanelLater: true)
+        let field = replyField(in: app)
+        let rest = settledDragMarker(in: app)
+        guard let restingGlass = rest?.fieldTop else {
+            XCTFail("control: the marker shows the field at rest")
+            return
+        }
+        app.buttons["Open the panel soon"].tap()
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        // Up past the open distance at once, then held until well after the panel has opened.
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -Self.heldDragTravel)),
+                    withVelocity: .default, thenHoldForDuration: Self.holdPastThePanelOpening)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "control: the panel opened under the held drag")
+        let marker = dragMarker(afterDrags: 1, in: app)
+        XCTAssertNotNil(marker, "control: the marker recorded the one drag")
+        guard let marker else { return }
+        XCTAssertFalse(marker.frozen, "the cut-off drag released the freeze")
+        app.buttons["chatClose"].tap()
+        XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "control: Close closed the panel")
+        let closed = settledDragMarker(in: app)
+        XCTAssertEqual(closed?.fieldTop ?? -1, restingGlass, accuracy: 1, "the field is back at rest, no swell left")
+        dragFieldOpen(in: app)
+    }
+
+    /// The held drag's travel, past the open distance, and how long it is held: past the fixture's
+    /// panel opening (`ChatSwipeTestScene.panelOpenDelay`, two seconds after the tap) with margin.
+    private static let heldDragTravel: CGFloat = 150
+    private static let holdPastThePanelOpening: TimeInterval = 4
+
+    /// With the actions of a bubble open, a drag up from the reply field far enough to open the
+    /// panel only closes them: the closer takes it, as it takes every drag while something is open.
+    func testOpenActionsDragUpOnTheReplyFieldOnlyCloses() {
+        let app = launchIntoChat()
+        openBubble(2, in: app)
+        let field = replyField(in: app)
+        XCTAssertTrue(field.isHittable, "control: the reply field is on screen")
+        dragUp(atY: field.frame.midY, in: app)
+        XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "it closed the actions")
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "and did not open the panel")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    /// With nothing open, a back swipe that starts on the reply field goes back: the field's drag
+    /// takes only drags more up than sideways.
+    func testNothingOpenRightDragOnTheReplyFieldGoesBack() {
+        let app = launchIntoChat()
+        dragRight(atY: replyField(in: app).frame.midY, in: app)
+        XCTAssertTrue(wentBack(app), "a right drag from the field goes back")
+    }
+
+    func testNothingOpenEdgeDragOnTheReplyFieldGoesBack() {
+        let app = launchIntoChat()
+        dragFromEdge(atY: replyField(in: app).frame.midY, in: app)
+        XCTAssertTrue(wentBack(app), "an edge drag at the field goes back")
+    }
+
+    /// Signed in, the focused field with a short draft: the drag up opens the panel, whose editor
+    /// (not the sign-in bar a signed-out panel shows) holds the same draft.
+    func testDragUpOnAShortFocusedDraftOpensThePanelWithIt() {
+        let app = launchIntoChat(signedIn: true)
+        let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
+        field.tap()
+        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.shortQuestion)
+        let typed = typedField(containing: Self.shortQuestion, in: app)
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
+        dragUp(atY: typed.frame.midY, in: app)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag opened the panel while the field had focus")
+        XCTAssertFalse(app.staticTexts[Self.signInBarText].exists, "control: signed in, the panel has its editor, not the sign-in bar")
+        let open = settledDragMarker(in: app)
+        let editor = typedField(containing: Self.shortQuestion, in: app)
+        XCTAssertTrue(editor.waitForExistence(timeout: 3), "the panel's editor holds the draft")
+        XCTAssertEqual(editor.value as? String, Self.shortQuestion, "the draft, whole and unchanged")
+        if let panelTop = open?.fieldTop {
+            XCTAssertGreaterThanOrEqual(editor.frame.minY, panelTop, "inside the open panel")
+        } else {
+            XCTFail("control: the marker shows the open panel")
+        }
+    }
+
+    /// The signed-in field's hint (`ChatReplyField.placeholder`), and the open panel's sign-in bar.
+    private static let signedInPlaceholder = "Reply or ask anything"
+    private static let signInBarText = "Sign in to TabMail for AI features and push notifications"
 
     /// With the first-time tip showing, as a new user sees it: the tip is on screen, and it takes
     /// no touch from the field. The first drag opens the panel; in a fresh launch, the first tap
@@ -280,7 +384,7 @@ final class ChatSwipeUITests: XCTestCase {
         repeat {
             RunLoop.current.run(until: Date().addingTimeInterval(Self.restReadInterval))
             let now = readDragMarker(in: app)
-            if let now, let last, Self.sameSpan(now.tip, last.tip) { return now }
+            if let now, let last, Self.sameSpan(now.tip, last.tip), now.fieldTop == last.fieldTop { return now }
             last = now
         } while Date() < deadline
         return last
@@ -339,9 +443,9 @@ final class ChatSwipeUITests: XCTestCase {
     private static let shortFlick: CGFloat = 40
 
     /// The focused field: a drag up in text that overflows the field's lines scrolls that text, so
-    /// the panel stays shut and the field keeps its focus; with a short question the same drag opens
-    /// the panel and the words ride along (mock M2), so the drag still works while typing.
-    func testDragUpInOverflowingTextScrollsItAndShortTextOpens() {
+    /// the panel stays shut and the field keeps its focus. A short draft's drag opens the panel
+    /// (`testDragUpOnAShortFocusedDraftOpensThePanelWithIt`).
+    func testDragUpInOverflowingTextScrollsIt() {
         let app = launchIntoChat()
         let field = replyField(in: app)
         field.tap()
@@ -352,18 +456,6 @@ final class ChatSwipeUITests: XCTestCase {
         dragUp(atY: long.frame.midY, in: app)
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the drag scrolled the overflowing text; the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "and the field kept its focus")
-        app.terminate()
-
-        let short = launchIntoChat()
-        let shortField = replyField(in: short)
-        shortField.tap()
-        XCTAssertTrue(waitForFocus(shortField, true, timeout: 5), "control: the reply field has the keyboard")
-        shortField.typeText(Self.shortQuestion)
-        let typed = typedField(containing: Self.shortQuestion, in: short)
-        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
-        dragUp(atY: typed.frame.midY, in: short)
-        XCTAssertTrue(short.buttons["chatClose"].waitForExistence(timeout: 3), "the drag opened the panel while the field had focus")
-        XCTAssertTrue(typedField(containing: Self.shortQuestion, in: short).exists, "and the words rode along")
     }
 
     /// The focused field with words: a press held until the text view's own long press takes it
@@ -992,7 +1084,8 @@ final class ChatSwipeUITests: XCTestCase {
                                 lateSuggestion: Bool = false, unread: Bool = false,
                                 suggestionOnJump: Bool = false, writing: Bool = false,
                                 readyAtOpen: Bool = false, fieldDragTip: Bool = false,
-                                textSize: String? = nil) -> XCUIApplication {
+                                textSize: String? = nil, signedIn: Bool = false,
+                                openPanelLater: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
@@ -1007,6 +1100,8 @@ final class ChatSwipeUITests: XCTestCase {
             + (host == .tutorialCard ? ["--chat-swipe-tutorial-card"] : [])
             + (fieldDragTip ? ["--chat-field-drag-tip"] : [])
             + (textSize.map { ["-UIPreferredContentSizeCategoryName", $0] } ?? [])
+            + (signedIn ? ["--chat-swipe-signed-in"] : [])
+            + (openPanelLater ? ["--chat-swipe-open-panel-later"] : [])
         app.launch()
         switch host {
         case .stack, .tutorialCard:
@@ -1053,11 +1148,11 @@ final class ChatSwipeUITests: XCTestCase {
         return false
     }
 
-    private func replyField(in app: XCUIApplication) -> XCUIElement {
+    private func replyField(in app: XCUIApplication, placeholder: String = ChatSwipeUITests.replyPlaceholder) -> XCUIElement {
         let field = app.descendants(matching: .any).matching(NSPredicate(
             format: "(elementType == %d OR elementType == %d) AND placeholderValue == %@",
             XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue,
-            Self.replyPlaceholder)).firstMatch
+            placeholder)).firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5), "control: the reply field, found by its placeholder")
         return field
     }
@@ -1084,6 +1179,12 @@ final class ChatSwipeUITests: XCTestCase {
         /// bottom and the field stack's top), in the app's chat space.
         let tip: (CGFloat, CGFloat)?
         let room: (CGFloat, CGFloat)?
+        /// The top of the field's glass on screen, swell included (the open panel's top while it is
+        /// open); how far it rose above its place at the last drag's start while the finger moved;
+        /// and how many taps the open panel's dim took.
+        let fieldTop: CGFloat?
+        let rise: CGFloat
+        let dims: Int
     }
 
     /// `<top>:<bottom>`, or nil for "none".
@@ -1105,7 +1206,10 @@ final class ChatSwipeUITests: XCTestCase {
               let move = fields["move"].flatMap(Double.init), let frozen = fields["frozen"] else { return nil }
         return DragMarker(drags: drags, watching: watching == "1", hasBaseline: base == "1", newestMinY: CGFloat(at),
                           heldAtSettle: held == "1", move: CGFloat(move), frozen: frozen == "1",
-                          tip: Self.span(fields["tip"]), room: Self.span(fields["room"]))
+                          tip: Self.span(fields["tip"]), room: Self.span(fields["room"]),
+                          fieldTop: fields["field"].flatMap(Double.init).flatMap { $0 < 0 ? nil : CGFloat($0) },
+                          rise: CGFloat(fields["rise"].flatMap(Double.init) ?? 0),
+                          dims: fields["dims"].flatMap(Int.init) ?? 0)
     }
 
     /// The marker once it has seen `drags` drags and stopped watching the last one.
@@ -1128,23 +1232,6 @@ final class ChatSwipeUITests: XCTestCase {
 
     private func navigationBarY(in app: XCUIApplication) -> CGFloat {
         app.buttons["Forward"].frame.midY
-    }
-
-    /// The open panel's top: the highest top, below the navigation bar, of an element that holds
-    /// Close (the panel's header bar), read from one snapshot of the app.
-    private func openPanelTop(in app: XCUIApplication, below barBottom: CGFloat, close: CGRect) -> CGFloat? {
-        guard let root = try? app.snapshot() else { return nil }
-        let closeCenter = CGPoint(x: close.midX, y: close.midY)
-        var top: CGFloat?
-        var pending: [any XCUIElementSnapshot] = [root]
-        while let element = pending.popLast() {
-            let frame = element.frame
-            if element.elementType == .other, frame.minY > barBottom, frame.minY <= close.minY, frame.contains(closeCenter) {
-                top = min(top ?? frame.minY, frame.minY)
-            }
-            pending += element.children
-        }
-        return top
     }
 
     private func tap(atY y: CGFloat, dx: CGFloat, in app: XCUIApplication) {

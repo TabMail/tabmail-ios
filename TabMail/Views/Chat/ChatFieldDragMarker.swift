@@ -13,11 +13,15 @@ import SwiftUI
 /// background, so no layout change).
 ///
 /// The label reads `drags=<n> watching=<0|1> base=<0|1> at=<points> move=<points> held=<0|1>
-/// frozen=<0|1> tip=<top>:<bottom>|none room=<top>:<bottom>|none`: `base` once the drag's start had the newest row's place,
+/// frozen=<0|1> tip=<top>:<bottom>|none room=<top>:<bottom>|none field=<points> rise=<points>
+/// dims=<n>`: `base` once the drag's start had the newest row's place,
 /// `at` the newest row's last reported top, `held` whether the freeze was still held halfway
 /// through the cooldown after the settle (`heldAtSettle`), `frozen` whether it is held now, `tip`
 /// the field's drag tip's whole card while it shows (XCUITest sees only its words), `room` the space
-/// it must fit in, both in the chat's space.
+/// it must fit in, both in the chat's space; `field` the top of the field's glass on screen, swell
+/// included (the open panel's top while it is open), `rise` how far that top rose above where it
+/// was at the last drag's start while the finger moved (the swell XCUITest cannot see), and `dims`
+/// how many taps the open panel's dim has taken.
 enum ChatFieldDragMarker {
     static let identifier = "chatFieldDragMarker"
 
@@ -57,6 +61,32 @@ enum ChatFieldDragMarker {
             content
             #endif
         }
+    }
+
+    /// On the field's glass, swell included (before `pill(on:)` takes the swell back out of the
+    /// layout): reports its top on screen.
+    struct Glass: ViewModifier {
+        func body(content: Content) -> some View {
+            #if DEBUG
+            if Probe.isActive {
+                content.onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minY } action: {
+                    Probe.shared.glassMoved(to: $0)
+                }
+            } else {
+                content
+            }
+            #else
+            content
+            #endif
+        }
+    }
+
+    /// The open panel's dim took a tap (debug builds only; nothing in release).
+    @MainActor
+    static func dimTapped() {
+        #if DEBUG
+        if Probe.isActive { Probe.shared.dims += 1 }
+        #endif
     }
 
     /// On the field's drag tip: reports where its whole card is while it shows, and the room it
@@ -116,6 +146,20 @@ enum ChatFieldDragMarker {
             tipFrame = frame.flatMap { $0.height >= 1 ? $0 : nil }
         }
 
+        /// The field's glass top on screen now, where it was at the last drag's start, and how far
+        /// it rose above that while the drag moved.
+        private(set) var glassTop: CGFloat?
+        private var glassRest: CGFloat?
+        private(set) var rise: CGFloat = 0
+        private var dragging = false
+        var dims = 0
+
+        func glassMoved(to minY: CGFloat) {
+            glassTop = minY
+            guard dragging, let glassRest else { return }
+            rise = max(rise, glassRest - minY)
+        }
+
         func newestMoved(to minY: CGFloat) {
             newestMinY = minY
             guard watching, let baseline else { return }
@@ -123,6 +167,7 @@ enum ChatFieldDragMarker {
         }
 
         func dragChanged(_ dragging: Bool) {
+            self.dragging = dragging
             if dragging {
                 drags += 1
                 watching = true
@@ -130,6 +175,8 @@ enum ChatFieldDragMarker {
                 baseline = newestMinY
                 largestMove = 0
                 heldAtSettle = false
+                glassRest = glassTop
+                rise = 0
                 return
             }
             let token = UUID()
@@ -149,7 +196,7 @@ enum ChatFieldDragMarker {
             let at = String(format: "%.1f", newestMinY ?? -1)
             let tip = tipFrame.map { String(format: "%.1f:%.1f", $0.minY, $0.maxY) } ?? "none"
             let room = tipRoom.map { String(format: "%.1f", $0) }.joined(separator: ":")
-            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room)"
+            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims)"
         }
     }
 

@@ -1074,10 +1074,22 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel`,
    `testShortDragUpOnTheReplyFieldSettlesBack` and `testDraggedOpenPanelClosesOnCloseAndOnTheDim`
    (taps), `ChatReplyFieldTests.fieldDragWiring`, the pan's rules in `ChatFieldDragTests`, and
-   `testDragUpInOverflowingTextScrollsItAndShortTextOpens` (the text view's scroll first). The swell and the settle are covered by
+   `testDragUpInOverflowingTextScrollsIt` (the text view's scroll first; was
+   `testDragUpInOverflowingTextScrollsItAndShortTextOpens`, whose short half ran signed out, where
+   the sign-in bar replaces the panel's editor), `testDragUpOnAShortFocusedDraftOpensThePanelWithIt`
+   (signed in through the fixture's `--chat-swipe-signed-in`: the panel's editor holds the draft),
+   `testDragCutOffByThePanelOpeningSettlesAndTheNextDragWorks` (the fixture's
+   `--chat-swipe-open-panel-later` opens the panel under a held drag, which turns the pan off: the
+   freeze is released, the field is back at rest, the next drag opens),
+   `testOpenActionsDragUpOnTheReplyFieldOnlyCloses` and the two back swipes that start on the field
+   (`testNothingOpenRightDragOnTheReplyFieldGoesBack`, `testNothingOpenEdgeDragOnTheReplyFieldGoesBack`).
+   `testDraggedOpenPanelClosesOnCloseAndOnTheDim` taps the dim halfway between the nav bar's bottom
+   and the open panel's top as the marker reads it, and checks the dim's own tap handler counted the
+   tap (`ChatFieldDragMarker.dimTapped`), so a tap that lands on the panel cannot pass. The swell and the settle are covered by
    `ChatSwipeUITests.testShortDragOnTheReplyFieldKeepsTheChat`, which reads the debug marker
    `ChatFieldDragMarker` (the newest row's largest move from the drag's start until well after the
-   settle, and whether the freeze is still held halfway through the cooldown), by
+   settle, whether the freeze is still held halfway through the cooldown, and how far the glass's
+   top rose while the finger was down against where it rests after), by
    `testDragThatOpensThePanelReleasesTheFreeze` (the same marker's freeze state) and by
    `ChatReplyFieldTests.fieldDragSettleIsThePillSpring` (the settle is the pill spring's).
    (`fieldDragSettleFences`, which pinned the deleted settle token, gate and timer chain, was

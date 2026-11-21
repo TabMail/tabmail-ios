@@ -491,7 +491,10 @@ struct ChatThreadView: View {
                     Color.black.opacity(0.3)
                         .ignoresSafeArea()
                         .contentShape(Rectangle())
-                        .onTapGesture { withAnimation(Self.pillSpring) { chatExpanded = false } }
+                        .onTapGesture {
+                            ChatFieldDragMarker.dimTapped()
+                            withAnimation(Self.pillSpring) { chatExpanded = false }
+                        }
                         .transition(.opacity)
                 }
             }
@@ -923,6 +926,8 @@ struct ChatThreadView: View {
                     showChat: chatExpanded || TutorialCoordinator.shared.isRunning
                         ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } }),
                 onFieldSend: { _ in fieldComposeOpened = false })
+            // Debug UI tests only: the glass's top, swell included (`ChatFieldDragMarker`).
+            .modifier(ChatFieldDragMarker.Glass())
             // The swell is not the field's room: its glass grows upward, and the same swell is taken
             // back out of the layout here, springing back in the same transaction, so the field's
             // measured height, the bar, its inset and the chat never move under a drag.
