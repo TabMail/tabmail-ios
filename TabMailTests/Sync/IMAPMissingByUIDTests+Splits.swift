@@ -456,6 +456,11 @@ extension IMAPMissingByUIDTests {
             #expect(try floor() == 0, "#1062: the catch-up's state write carries the floor")
             #expect(IMAPCatchUpState.decode(try w.folder().catchUpState) != nil, "#1062: the provider still reads its own state")
 
+            // A floor of a new epoch replaces the old one, even a higher one.
+            try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 15, epoch: Self.epoch + 1, db: db) }
+            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch + 1) == 15 && floor() == nil,
+                    "#1062: a floor of another epoch replaces the old one, which is no longer read")
+
             // NULL and non-object states.
             for raw in [nil, "not json", "[1, 2]"] as [String?] {
                 try await w.pool.write { db in
@@ -512,6 +517,27 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    @Test("Before the walk starts, a window listing none of whose header records can be read still records the lowest UID it named as the window floor")
+    @MainActor
+    func windowFloorCountsAWindowWithNoReadableHeader() async throws {
+        let server = Array(1...200)
+        let window = Array((server.count - SyncConfig.syncMessageLimit + 1)...server.count)
+        try await Self.withWorld("floor-all-unreadable", server: server, local: [], walkStarted: false) { w in
+            var messages = server.map { Self.message($0) }
+            for uid in window {
+                let index = try #require(server.firstIndex(of: uid))
+                messages[index] = Self.message(uid, date: "not a date")
+            }
+            w.server.setMessages(messages, in: Self.path)
+            w.server.suppressFetchInternalDate(in: Self.path, uids: Set(window))
+            try await w.makeFullSyncDue()
+            try await w.foregroundSync()
+            try w.expectNotHeld(window, "setup: no window message was inserted")
+            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == window[0],
+                    "#1062: the window floor is the lowest UID the window named, with no header read")
+        }
+    }
+
     @Test("A window listing whose SELECT reports no UIDVALIDITY records no window floor; the next one under a known epoch records it")
     @MainActor
     func windowFloorNeedsAKnownEpoch() async throws {
@@ -562,26 +588,35 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    @Test("Under a storage limit with the walk complete and no local row, the scan starts at the walk's start, not above the prune cutoff, while loads start above the cutoff")
+    @Test("Under a storage limit with the walk complete, local rows below the prune cutoff are still reconciled (an expunge removes one, a flag change reaches another), while nothing at or below the cutoff loads and the mail above it does")
     @MainActor
-    func scanFloorIsNotRaisedByTheCutoff() async throws {
+    func rowsBelowTheCutoffAreStillReconciled() async throws {
         let server = Array(1...40)
         let cutoff = 20
+        let flagged = 5, expunged = 8
         try await Self.withWorld("scan-floor-cutoff", server: server, local: server) { w in
-            try await w.dropLocal(server)
+            try await w.dropLocal(server.filter { $0 != flagged && $0 != expunged })
             let folderId = w.folderId
             try await w.pool.write { db in
                 try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: cutoff, epoch: Self.epoch, db: db)
             }
+            w.server.setMessages(server.filter { $0 != expunged }.map(Self.message), in: Self.path)
+            w.server.setFlags(["\\Seen"], in: Self.path, uid: flagged)
             try await w.markOwed()
             let start = w.server.recordedCommands().count
             let loads = try await Self.runUnderTheLimit(w)
             let ranges = Self.listingRanges(Self.requests(to: Self.path, w.server, from: start).map { $0.command })
-            #expect(ranges.first?.lowerBound == 1,
-                    "#1062: the scan starts at the walk's start, below the cutoff, so a row cached there meanwhile is still reconciled: \(ranges)")
+            #expect(ranges.contains { $0.contains(flagged) && $0.contains(expunged) },
+                    "#1062: the listing reaches the local rows below the cutoff: \(ranges)")
             let below = Array(1...cutoff).filter { uid in loads.contains { Self.uidSet($0).contains(uid) } }
             #expect(below.isEmpty, "#1062: nothing at or below the cutoff loads: \(below)")
-            try w.expectHeldExactly(Array((cutoff + 1)...40), "#1062: the mail above the cutoff loads")
+            try w.expectHeldExactly([flagged] + Array((cutoff + 1)...40),
+                                    "#1062: the expunged row below the cutoff is removed, the mail above the cutoff loads")
+            let isRead = try await w.pool.read { db in
+                try Bool.fetchOne(db, sql: "SELECT isRead FROM messageHeader WHERE folderId = ? AND messageId = ?",
+                                  arguments: [folderId, "\(flagged)"])
+            }
+            #expect(isRead == true, "#1062: the flag change on the row below the cutoff is applied")
         }
     }
 

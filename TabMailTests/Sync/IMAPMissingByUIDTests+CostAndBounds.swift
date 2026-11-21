@@ -402,7 +402,8 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    /// One catch-up run under a storage limit; the header FETCHes it sent.
+    /// One catch-up run under a storage limit; the header FETCHes it sent to
+    /// the test folder (`path`), so another mailbox's load never counts.
     @MainActor
     static func runUnderTheLimit(_ w: World) async throws -> [String] {
         let start = w.server.recordedCommands().count
@@ -413,7 +414,7 @@ extension IMAPMissingByUIDTests {
         run.listingRangeMessages = w.rangeMessages
         await AccountManager.shared.clearRecentlyCompletedForTesting()
         _ = await w.engine.runCatchUpRun(account: try w.account(), run: run)
-        return w.server.recordedCommands().dropFirst(start).filter {
+        return requests(to: path, w.server, from: start).map { $0.command }.filter {
             $0.uppercased().contains("FETCH") && $0.uppercased().contains("ENVELOPE")
         }
     }
@@ -588,6 +589,137 @@ extension IMAPMissingByUIDTests {
             } else {
                 #expect(cutoff == nil, "#1062: a date-order prune records no cutoff: \(String(describing: cutoff))")
             }
+        }
+    }
+
+    @Test("A prune cutoff of another epoch is ignored by the catch-up's own read, with no seed to replace it (no local row): under a limit the missing mail at or below it loads; with no limit the catch-up's state write keeps the cutoff under its own epoch",
+          arguments: [true, false])
+    @MainActor
+    func pruneCutoffOfAnotherEpochIsIgnoredByTheProvider(limit: Bool) async throws {
+        let server = Array(1...40)
+        let cutoff = 20
+        try await Self.withWorld("prune-other-epoch-\(limit)", server: server, local: server) { w in
+            try await w.dropLocal(server)
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: cutoff, epoch: Self.epoch + 1, db: db)
+            }
+            try await w.markOwed()
+            if limit {
+                _ = try await Self.runUnderTheLimit(w)
+            } else {
+                try await w.workerRun()
+            }
+            try w.expectHeldExactly(server, "#1062: a cutoff of another epoch is not a floor: the missing mail at or below it loads")
+            if !limit {
+                let state = try w.folder().catchUpState
+                #expect(CatchUpPruneCutoff.read(state, epoch: Self.epoch + 1) == cutoff && CatchUpPruneCutoff.read(state, epoch: Self.epoch) == nil,
+                        "#1062: the catch-up's state write carries the cutoff under its own epoch, never rebound to the current one")
+            }
+        }
+    }
+
+    @Test("Under a storage limit, a folder whose prune recorded a cutoff in its epoch is never seeded: a cutoff below the first local UID stays where the prune put it, and the missing mail above it loads")
+    @MainActor
+    func legacySeedNeverOverridesARealCutoff() async throws {
+        let server = Array(1...40)
+        let realCutoff = 5, firstLocal = 21
+        try await Self.withWorld("prune-seed-real", server: server, local: server) { w in
+            try await w.dropLocal(Array(1..<firstLocal))
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: realCutoff, epoch: Self.epoch, db: db)
+            }
+            try await w.markOwed()
+            let loads = try await Self.runUnderTheLimit(w)
+            let reloaded = Array(1...realCutoff).filter { uid in loads.contains { Self.uidSet($0).contains(uid) } }
+            #expect(reloaded.isEmpty, "#1062: nothing at or below the recorded cutoff loads: \(reloaded)")
+            try w.expectHeldExactly(Array((realCutoff + 1)...40), "#1062: the missing mail above the recorded cutoff loads")
+            #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == realCutoff,
+                    "#1062: no seed replaces a cutoff the prune recorded")
+        }
+    }
+
+    @Test("The one-time seed's guards: it is one below the lower of the first local UID and the window floor of the CURRENT epoch only; none for a folder with a cutoff in its epoch, a pending turnover, an unknown epoch, or no local row")
+    @MainActor
+    func legacySeedGuards() async throws {
+        let server = Array(1...40)
+        let firstLocal = 21
+        try await Self.withWorld("prune-seed-guards", server: server, local: server) { w in
+            try await w.dropLocal(Array(1..<firstLocal))
+            let folderId = w.folderId
+            func seed() async throws -> (uid: Int, epoch: Int)? {
+                try await w.pool.read { db in try SyncEngine.catchUpPruneCutoffSeed(folderId: folderId, db: db) }
+            }
+            func reset(_ sql: String = "UPDATE folder SET catchUpState = NULL WHERE id = ?") async throws {
+                try await w.pool.write { db in try db.execute(sql: sql, arguments: [folderId]) }
+            }
+            try await reset()
+            var got = try await seed()
+            #expect(got?.uid == firstLocal - 1 && got?.epoch == Self.epoch, "#1062: one below the first local UID, in the folder's epoch: \(String(describing: got))")
+
+            try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, epoch: Self.epoch + 1, db: db) }
+            got = try await seed()
+            #expect(got?.uid == firstLocal - 1, "#1062: a window floor of another epoch does not lower the seed: \(String(describing: got))")
+
+            try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 15, epoch: Self.epoch, db: db) }
+            got = try await seed()
+            #expect(got?.uid == 14, "#1062: a window floor of the current epoch below the first local UID lowers the seed: \(String(describing: got))")
+
+            try await w.pool.write { db in try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: 3, epoch: Self.epoch, db: db) }
+            #expect(try await seed() == nil, "#1062: no seed for a folder with a cutoff in its epoch")
+            try await reset()
+
+            try await reset("UPDATE folder SET uidValidityResetPendingAt = CURRENT_TIMESTAMP WHERE id = ?")
+            #expect(try await seed() == nil, "#1062: no seed while a turnover is pending")
+            try await reset("UPDATE folder SET uidValidityResetPendingAt = NULL WHERE id = ?")
+            #expect(try await seed() != nil, "setup: the folder is seed-eligible again")
+
+            let stored = try w.folder().lastKnownUidValidity
+            try await reset("UPDATE folder SET lastKnownUidValidity = NULL WHERE id = ?")
+            #expect(try await seed() == nil, "#1062: no seed under an unknown epoch")
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = ? WHERE id = ?", arguments: [stored, folderId])
+            }
+
+            try await w.dropLocal(Array(firstLocal...40))
+            #expect(try await seed() == nil, "#1062: no seed for a folder with no local row")
+        }
+    }
+
+    @Test("Under a storage limit, a folder whose one-time seed cannot be written is left out of the slice, so nothing pruned before the cutoff existed loads; the next run seeds it and still loads nothing pruned")
+    @MainActor
+    func failedSeedLeavesTheFolderOutOfTheSlice() async throws {
+        let server = Array(1...40)
+        let pruned = Array(1...20), kept = Array(21...40)
+        try await Self.withWorld("prune-seed-fails", server: server, local: server) { w in
+            try await w.dropLocal(pruned)
+            try await w.markOwed()
+            let folderId = w.folderId
+            let trigger = "fail_seed_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            // Only the seed writes a cutoff into a state that holds none.
+            try await w.pool.write { db in
+                try db.execute(sql: """
+                    CREATE TRIGGER \(trigger) BEFORE UPDATE OF catchUpState ON folder
+                    WHEN NEW.id = '\(folderId)'
+                        AND json_valid(NEW.catchUpState) AND json_extract(NEW.catchUpState, '$.pruneCutoff') IS NOT NULL
+                        AND (OLD.catchUpState IS NULL OR NOT json_valid(OLD.catchUpState)
+                             OR json_extract(OLD.catchUpState, '$.pruneCutoff') IS NULL)
+                    BEGIN SELECT RAISE(ABORT, 'seed write fails'); END
+                    """)
+            }
+            var loads = try await Self.runUnderTheLimit(w)
+            try await w.pool.write { db in try db.execute(sql: "DROP TRIGGER IF EXISTS \(trigger)") }
+            var reloaded = pruned.filter { uid in loads.contains { Self.uidSet($0).contains(uid) } }
+            #expect(reloaded.isEmpty, "#1062: a folder with no seed is not read: nothing pruned loads: \(reloaded)")
+            try w.expectHeldExactly(kept, "#1062: the held rows are the kept ones")
+            #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == nil, "setup: the seed was not written")
+
+            loads = try await Self.runUnderTheLimit(w)
+            reloaded = pruned.filter { uid in loads.contains { Self.uidSet($0).contains(uid) } }
+            #expect(reloaded.isEmpty, "#1062: once seeded, nothing pruned loads: \(reloaded)")
+            #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == kept[0] - 1,
+                    "#1062: the next run seeds the folder")
         }
     }
 

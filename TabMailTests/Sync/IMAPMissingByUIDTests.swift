@@ -139,10 +139,11 @@ struct IMAPMissingByUIDTests {
                        requestTimeout: TimeInterval = SyncConfig.catchUpRequestTimeoutSeconds,
                        sliceSeconds: TimeInterval = SyncConfig.catchUpSliceSeconds,
                        intervalSeconds: TimeInterval = SyncConfig.catchUpSliceIntervalSeconds,
+                       storageLimit: Bool = false,
                        clock: @escaping @Sendable () -> Date = { Date() }) async throws -> Bool {
             await AccountManager.shared.clearRecentlyCompletedForTesting()
             var run = SyncEngine.CatchUpRun(
-                storageLimitInForce: false, deadline: deadlineIn.map { clock().addingTimeInterval($0) },
+                storageLimitInForce: storageLimit, deadline: deadlineIn.map { clock().addingTimeInterval($0) },
                 sliceSeconds: sliceSeconds, intervalSeconds: intervalSeconds,
                 clock: clock)
             run.sliceMaxRequests = maxRequests
@@ -412,16 +413,17 @@ struct IMAPMissingByUIDTests {
 
     // MARK: - I2: no request outside the budget
 
-    @Test("An owed folder: the foreground sync sends no date search, and a worker slice with no budget sends nothing and writes nothing")
+    @Test("An owed folder: the foreground sync sends no date search, and a worker slice with no budget sends nothing and writes nothing, under a storage limit too (no prune cutoff is seeded)",
+          arguments: [false, true])
     @MainActor
-    func owedCheckSpendsOnlyTheCatchUpBudget() async throws {
-        try await Self.withWorld("i2", server: Array(1...20) + Array(1001...1060), local: Array(2...20) + Array(1011...1060)) { w in
+    func owedCheckSpendsOnlyTheCatchUpBudget(limit: Bool) async throws {
+        try await Self.withWorld("i2-\(limit)", server: Array(1...20) + Array(1001...1060), local: Array(2...20) + Array(1011...1060)) { w in
             try await w.markOwed()
             // The slice with no budget runs first: work a foreground sync leaves
             // running (body downloads, other folders) would land in its window.
             let before = try w.folder()
             let mid = w.server.recordedCommands().count
-            try await w.workerRun(maxRequests: 0)
+            try await w.workerRun(maxRequests: 0, storageLimit: limit)
             let sent = w.server.recordedCommands().dropFirst(mid).filter { command in
                 ["SELECT", "EXAMINE", "FETCH", "SEARCH"].contains { command.uppercased().contains($0) }
             }

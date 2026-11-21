@@ -4,8 +4,29 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
+
+/// A gate inside a slice's sync turn, before the slice sends anything: the
+/// test learns the turn is taken, then releases the slice. No IMAP command is
+/// waiting meanwhile, so no command timer can race the handshake.
+final class SliceTurnGate: Sendable {
+    private let state = Mutex<(inTurn: Bool, released: Bool)>((false, false))
+
+    var inTurn: Bool { state.withLock { $0.inTurn } }
+    func enter() { state.withLock { $0.inTurn = true } }
+    func release() { state.withLock { $0.released = true } }
+
+    /// Waits until released or `bound` seconds pass; true when released.
+    func waitForRelease(bound: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(bound)
+        while !state.withLock({ $0.released }), Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return state.withLock { $0.released }
+    }
+}
 
 /// A carried catch-up range across what can change between the slice that
 /// carried it and the one that resumes it (#1062): a Settings reset, a
@@ -19,16 +40,15 @@ extension IMAPMissingByUIDTests {
         commands.filter { $0.uppercased().contains("FETCH") && $0.uppercased().contains("ENVELOPE") }
     }
 
-    /// The request timeout of the slice a Settings-reset test holds: far longer
-    /// than any step of the reset handshake can take, so the held listing is
-    /// answered once released, never timed out, and the slice carries its
-    /// range. The bound matters only on failure.
-    static let resetHandshakeRequestTimeout: TimeInterval = 60
-    /// How long a step of that handshake (the held listing, the reset waiting
-    /// for the slice's turn) may take to happen before the test fails; every
-    /// wait ends as soon as its step happens.
-    /// *Superseded (#1062):* 300 polls 10 ms apart, about 3 s, the production
-    /// request timeout the held listing could reach first.
+    /// How long a step of the Settings-reset handshake (the slice taking its
+    /// turn, the reset waiting for it) may take to happen before the test
+    /// fails; every wait ends as soon as its step happens. The slice is held
+    /// at a gate in its turn before it sends anything (`SliceTurnGate`), so no
+    /// request or command timer runs while it waits.
+    /// *Superseded (#1062):* the slice's listing FETCH was held on the wire
+    /// under a 60 s request timeout, which the client's own FETCH command
+    /// timeout could still end first; before that, 300 polls 10 ms apart,
+    /// about 3 s, the production request timeout the held listing could reach.
     static let resetHandshakeStepBound: TimeInterval = 30
 
     /// Slices of `maxRequests` until the folder holds `expected` and its listing
@@ -53,7 +73,7 @@ extension IMAPMissingByUIDTests {
         case wipeLocalIndex
     }
 
-    @Test("A Settings reset issued while a slice is in flight waits for the slice's sync turn: after it no pre-reset pick is inserted, no pre-reset progress is kept, and the next slice loads nothing from the old carry before it lists",
+    @Test("A Settings reset issued while a slice holds the account's sync turn waits for it: after it no pre-reset pick is inserted, no pre-reset progress is kept, and the next slice loads nothing from the old carry before it lists",
           arguments: SettingsReset.allCases)
     @MainActor
     func resetDuringASliceIsNeverUndone(_ reset: SettingsReset) async throws {
@@ -64,25 +84,25 @@ extension IMAPMissingByUIDTests {
             try await w.dropLocal(Self.carryMissing)
             try await w.markOwed()
             let clock = CatchUpTestClock()
-            // The listing is held until the reset waits for the slice's turn,
-            // so the reset is issued inside the slice. Nothing is timed.
-            w.server.holdListingFetches(in: Self.path, overRecords: 0)
             // The slice holds the account's turn, as every production slice does
-            // (`runCatchUpRun`). Two requests after the listing's start: the
-            // listing and its proof; the loads are carried. Its requests outlast
-            // the handshake (`resetHandshakeRequestTimeout`), so the held listing
-            // is answered, not timed out. What the slice left is read inside its
-            // turn, before the reset can run.
+            // (`runCatchUpRun`), and waits at a gate in it until the reset waits
+            // for that turn, so the reset is issued inside the slice. Nothing is
+            // sent while it waits, so nothing is timed. Two requests after the
+            // listing's start: the listing and its proof; the loads are carried.
+            // What the slice left is read inside its turn, before the reset can run.
+            let gate = SliceTurnGate()
+            let bound = Self.resetHandshakeStepBound
             async let sliced: IMAPCatchUpState.CarriedRange? = w.engine.oneSyncAtATime(accountId: accountId) {
-                await w.slice(maxRequests: Self.newListingStartRequests + 2, clock: clock,
-                              requestTimeout: Self.resetHandshakeRequestTimeout)
+                gate.enter()
+                guard await gate.waitForRelease(bound: 2 * bound) else { return nil }
+                await w.slice(maxRequests: Self.newListingStartRequests + 2, clock: clock)
                 return try? w.catchUpState()?.listing?.carried
             }
-            var deadline = Date().addingTimeInterval(Self.resetHandshakeStepBound)
-            while w.server.heldListingFetchCount(in: Self.path) == 0, Date() < deadline {
+            var deadline = Date().addingTimeInterval(bound)
+            while !gate.inTurn, Date() < deadline {
                 try await Task.sleep(for: .milliseconds(10))
             }
-            #expect(w.server.heldListingFetchCount(in: Self.path) > 0, "setup: the slice's listing is held")
+            #expect(gate.inTurn, "setup: the slice holds the account's turn")
             // The Settings reset, through the production entry point the Settings
             // view calls; it waits for the slice's turn.
             let engine = w.engine
@@ -92,13 +112,13 @@ extension IMAPMissingByUIDTests {
                 case .wipeLocalIndex: try await engine.wipeLocalIndex()
                 }
             }
-            deadline = Date().addingTimeInterval(Self.resetHandshakeStepBound)
+            deadline = Date().addingTimeInterval(bound)
             while await engine.syncPassWaiterCountForTesting(accountId: accountId) == 0, Date() < deadline {
                 try await Task.sleep(for: .milliseconds(10))
             }
             #expect(await engine.syncPassWaiterCountForTesting(accountId: accountId) > 0,
                     "setup: the reset waits for the slice's turn")
-            w.server.stopHoldingListingFetches(in: Self.path)
+            gate.release()
             let carriedBeforeTheReset = await sliced
             #expect(carriedBeforeTheReset != nil, "setup: the slice carried its range before the reset ran")
             try await resetting.value

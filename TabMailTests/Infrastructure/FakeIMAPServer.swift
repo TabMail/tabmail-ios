@@ -456,8 +456,6 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// (`releaseListingFetches(in:)`): a held FETCH answers once the count
         /// passes the one it was held at.
         var listingReleasesByMailbox: [String: Int] = [:]
-        /// Per mailbox, how many listing FETCHes are held now.
-        var listingHeldByMailbox: [String: Int] = [:]
         /// Flags-only FETCHes answered in each mailbox, with how many records each matched.
         var listingFetchSizesByMailbox: [String: [Int]] = [:]
         /// Per-mailbox ESEARCH data for the next UID SEARCHes, in order
@@ -1692,11 +1690,6 @@ final class FakeIMAPServer: @unchecked Sendable {
             state.listingHoldByMailbox[mailbox] = nil
             state.listingReleasesByMailbox[mailbox, default: 0] += 1
         }
-    }
-
-    /// How many listing FETCHes of this mailbox are held now.
-    func heldListingFetchCount(in mailbox: String) -> Int {
-        withState { $0.listingHeldByMailbox[mailbox] ?? 0 }
     }
 
     /// How many records each flags-only FETCH answered in this mailbox matched, in order.
@@ -3643,7 +3636,6 @@ final class FakeIMAPServer: @unchecked Sendable {
             let heldUntil = withState { state -> Int? in
                 state.listingFetchSizesByMailbox[mailbox, default: []].append(matched.count)
                 guard let over = state.listingHoldByMailbox[mailbox], matched.count > over else { return nil }
-                state.listingHeldByMailbox[mailbox, default: 0] += 1
                 state.holdsStarted += 1
                 return (state.listingReleasesByMailbox[mailbox] ?? 0) + 1
             }
@@ -3652,10 +3644,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                 while !withState({ ($0.listingReleasesByMailbox[mailbox] ?? 0) >= heldUntil || $0.heldGatesAbandoned }) {
                     usleep(2_000)
                 }
-                withState { state in
-                    state.listingHeldByMailbox[mailbox, default: 1] -= 1
-                    state.holdsFinished += 1
-                }
+                withState { $0.holdsFinished += 1 }
             }
         }
         var response = ""
