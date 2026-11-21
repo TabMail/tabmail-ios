@@ -467,25 +467,91 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertEqual(long.value as? String, Self.overflowingText, "control: the text is unchanged")
     }
 
-    /// The same draft and the same start, but the drag carries on past the text's end: the rest of
-    /// the same drag is the field's (mock v15 H2), so it opens the panel.
-    func testDragUpInOverflowingTextPastItsEndOpensThePanel() {
-        let app = launchIntoChat()
-        let field = replyField(in: app)
-        field.tap()
-        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
-        field.typeText(Self.overflowingText)
-        let long = typedField(containing: Self.overflowingLastLine, in: app)
-        XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
-        textScroll(long, by: Self.toTheTextsTop, in: app)
-        XCTAssertEqual(topLine(of: long), "Line 1", "control: the text is at its top, with room to scroll")
+    /// Signed in, the same draft and the same start, but the drag carries on past the text's end:
+    /// the rest of the same drag is the field's (mock v15 H2), so it opens the panel, whose editor
+    /// holds the whole draft, inside the panel and above the keyboard when one shows.
+    func testDragUpInOverflowingTextPastItsEndOpensThePanel() throws {
+        let app = launchIntoChat(signedIn: true)
+        let long = signedInDraftAtItsTop(Self.overflowingText, lastLine: Self.overflowingLastLine, in: app)
         XCTAssertFalse(app.buttons["chatClose"].exists, "control: the panel is shut")
         textScroll(long, by: -Self.pastTheTextsEnd, in: app)
         XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag past the text's end opened the panel")
+        XCTAssertFalse(app.staticTexts[Self.signInBarText].exists, "control: signed in, the panel has its editor, not the sign-in bar")
+        let panelTop = try XCTUnwrap(settledDragMarker(in: app)?.fieldTop, "control: the marker shows the open panel")
+        let editor = typedField(containing: Self.overflowingLastLine, in: app)
+        XCTAssertTrue(editor.waitForExistence(timeout: 3), "the panel's editor holds the draft")
+        XCTAssertEqual(editor.value as? String, Self.overflowingText, "the whole draft, unchanged")
+        XCTAssertGreaterThanOrEqual(editor.frame.minY, panelTop - 1, "inside the open panel")
+        let keyboard = app.keyboards.firstMatch
+        if keyboard.exists {
+            XCTAssertLessThanOrEqual(editor.frame.maxY, keyboard.frame.minY + 1, "above the keyboard")
+        }
+    }
+
+    /// Signed in, a draft whose scroll room is larger than the open distance, at its top: a drag up
+    /// further than the open distance that stays inside that room is all the text's. The field's
+    /// glass does not rise under it, the panel stays shut, the field keeps its focus, and the text
+    /// moved on.
+    func testDragUpPastTheOpenDistanceInsideTheTextsRoomIsAllTheTexts() throws {
+        let app = launchIntoChat(signedIn: true)
+        let long = signedInDraftAtItsTop(Self.longDraft, lastLine: Self.longDraftLastLine, in: app)
+        XCTAssertGreaterThan(Self.insideTheLongDraftsRoom, Self.openDistance, "control: the drag goes past the open distance")
+        textScroll(long, by: -Self.insideTheLongDraftsRoom, in: app)
+        let marker = try XCTUnwrap(dragMarker(afterDrags: 1, in: app), "control: the field's pan saw the drag")
+        XCTAssertLessThan(marker.rise, 1, "the text kept the whole drag; the field's glass did not rise: \(marker.rise)")
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the panel stays shut")
+        XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
+        let after = topLine(of: long)
+        XCTAssertNotNil(after, "control: a line is at the text's top")
+        XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag")
+        XCTAssertEqual(long.value as? String, Self.longDraft, "control: the draft is unchanged")
+    }
+
+    /// Signed in, the nine-line draft at its top, and a drag up further than the open distance in
+    /// all but past the text's end by less than it: the text scrolls to its end and stops there,
+    /// with no bounce past it, and only the rest of the drag is the field's. The glass rises under
+    /// that rest, but not far enough to open the panel, so it settles back.
+    func testDragUpPastTheTextsEndByLessThanTheOpenDistanceSettlesBack() throws {
+        let app = launchIntoChat(signedIn: true)
+        let long = signedInDraftAtItsTop(Self.overflowingText, lastLine: Self.overflowingLastLine, in: app)
+        XCTAssertGreaterThan(Self.acrossTheTextsEnd, Self.openDistance, "control: the whole drag goes past the open distance")
+        textScroll(long, by: -Self.acrossTheTextsEnd, in: app)
+        let marker = try XCTUnwrap(dragMarker(afterDrags: 1, in: app), "control: the field's pan saw the drag")
+        XCTAssertGreaterThan(marker.rise, 1, "past the text's end the rest of the drag swelled the field: \(marker.rise)")
+        XCTAssertLessThan(marker.rise, Self.openDistance, "only the rest past the text's end: \(marker.rise)")
+        let pastEnd = try XCTUnwrap(marker.textPastEnd, "control: the marker reports the text's place")
+        XCTAssertLessThan(pastEnd, 1, "the text stopped at its end and did not bounce past it while the field swelled: \(pastEnd)")
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the panel stays shut")
+        XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
+        XCTAssertEqual(long.value as? String, Self.overflowingText, "control: the draft is unchanged")
     }
 
     /// The text's scroll room (three lines, about 60 points) plus well past the open distance.
     private static let pastTheTextsEnd: CGFloat = 220
+    /// Past the open distance in all, yet past the nine-line draft's end (its scroll room, more
+    /// than `withinTheScrollRoom`) by less than the open distance.
+    private static let acrossTheTextsEnd: CGFloat = 90
+    /// A draft with ten lines past the field's six (about 220 points of scroll room), and a drag up
+    /// past the open distance well inside that room.
+    private static let longDraftLineCount = 16
+    private static let longDraft = (1...longDraftLineCount).map { "Line \($0)" }.joined(separator: "\n")
+    private static let longDraftLastLine = "Line \(longDraftLineCount)"
+    private static let insideTheLongDraftsRoom: CGFloat = 120
+
+    /// Signed in, the focused field with `text` typed into it and scrolled back to its top, so a
+    /// drag up has the text's whole scroll room; returns the field, found by `lastLine`.
+    private func signedInDraftAtItsTop(_ text: String, lastLine: String, in app: XCUIApplication) -> XCUIElement {
+        let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
+        field.tap()
+        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(text)
+        let long = typedField(containing: lastLine, in: app)
+        XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
+        // Down to the text's top: the field's drag takes only drags up, so this is the text's scroll.
+        textScroll(long, by: Self.toTheTextsTop, in: app)
+        XCTAssertEqual(topLine(of: long), "Line 1", "control: the text is at its top, with room to scroll")
+        return long
+    }
 
     /// A slow vertical drag in the text from its middle, held at the end so it does not coast.
     private func textScroll(_ text: XCUIElement, by travel: CGFloat, in app: XCUIApplication) {
@@ -1263,6 +1329,9 @@ final class ChatSwipeUITests: XCTestCase {
         let fieldTop: CGFloat?
         let rise: CGFloat
         let dims: Int
+        /// How far the text under the last drag went past its end while the drag moved (nil when
+        /// the marker does not say).
+        let textPastEnd: CGFloat?
     }
 
     /// `<top>:<bottom>`, or nil for "none".
@@ -1287,7 +1356,8 @@ final class ChatSwipeUITests: XCTestCase {
                           tip: Self.span(fields["tip"]), room: Self.span(fields["room"]),
                           fieldTop: fields["field"].flatMap(Double.init).flatMap { $0 < 0 ? nil : CGFloat($0) },
                           rise: CGFloat(fields["rise"].flatMap(Double.init) ?? 0),
-                          dims: fields["dims"].flatMap(Int.init) ?? 0)
+                          dims: fields["dims"].flatMap(Int.init) ?? 0,
+                          textPastEnd: fields["over"].flatMap(Double.init).map { CGFloat($0) })
     }
 
     /// The marker once it has seen `drags` drags and stopped watching the last one.

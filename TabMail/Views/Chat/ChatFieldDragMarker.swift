@@ -14,14 +14,16 @@ import SwiftUI
 ///
 /// The label reads `drags=<n> watching=<0|1> base=<0|1> at=<points> move=<points> held=<0|1>
 /// frozen=<0|1> tip=<top>:<bottom>|none room=<top>:<bottom>|none field=<points> rise=<points>
-/// dims=<n>`: `base` once the drag's start had the newest row's place,
+/// dims=<n> over=<points>`: `base` once the drag's start had the newest row's place,
 /// `at` the newest row's last reported top, `held` whether the freeze was still held halfway
 /// through the cooldown after the settle (`heldAtSettle`), `frozen` whether it is held now, `tip`
 /// the field's drag tip's whole card while it shows (XCUITest sees only its words), `room` the space
 /// it must fit in, both in the chat's space; `field` the top of the field's glass on screen, swell
 /// included (the open panel's top while it is open), `rise` how far that top rose above where it
-/// was at the last drag's start while the finger moved (the swell XCUITest cannot see), and `dims`
-/// how many taps the open panel's dim has taken.
+/// was at the last drag's start while the finger moved (the swell XCUITest cannot see), `dims`
+/// how many taps the open panel's dim has taken, and `over` how far the text under the last drag
+/// went past its end while the drag moved (its scroll position as the field's pan read it; 0 if it
+/// never did).
 enum ChatFieldDragMarker {
     static let identifier = "chatFieldDragMarker"
 
@@ -89,6 +91,15 @@ enum ChatFieldDragMarker {
         #endif
     }
 
+    /// The field's pan read the text under its drag `points` past its end (negative short of it)
+    /// (debug builds only; nothing in release).
+    @MainActor
+    static func textPastEnd(_ points: CGFloat) {
+        #if DEBUG
+        if Probe.isActive { Probe.shared.textPastEnd(points) }
+        #endif
+    }
+
     /// On the field's drag tip: reports where its whole card is while it shows, and the room it
     /// must fit in (the header's bottom and the field stack's top), all in the chat's space
     /// (`ChatSwipeOpen.space`), so the test compares them in one space in any orientation.
@@ -153,6 +164,12 @@ enum ChatFieldDragMarker {
         private(set) var rise: CGFloat = 0
         private var dragging = false
         var dims = 0
+        /// How far the text under the last drag went past its end while it moved.
+        private(set) var pastEnd: CGFloat = 0
+
+        func textPastEnd(_ points: CGFloat) {
+            pastEnd = max(pastEnd, points)
+        }
 
         func glassMoved(to minY: CGFloat) {
             glassTop = minY
@@ -177,6 +194,7 @@ enum ChatFieldDragMarker {
                 heldAtSettle = false
                 glassRest = glassTop
                 rise = 0
+                pastEnd = 0
                 return
             }
             let token = UUID()
@@ -196,7 +214,7 @@ enum ChatFieldDragMarker {
             let at = String(format: "%.1f", newestMinY ?? -1)
             let tip = tipFrame.map { String(format: "%.1f:%.1f", $0.minY, $0.maxY) } ?? "none"
             let room = tipRoom.map { String(format: "%.1f", $0) }.joined(separator: ":")
-            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims)"
+            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(String(format: "%.1f", pastEnd))"
         }
     }
 

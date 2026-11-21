@@ -620,6 +620,8 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             } else if handOff == nil {
                 handOff = drag.travel.width
             }
+            // Debug UI tests only: how far the text went past its end (`ChatFieldDragMarker`).
+            ChatFieldDragMarker.textPastEnd(offset - end)
             return ChatFieldDrag.fieldShare(of: drag, textScrolled: min(offset, end) - textStart,
                                             handOff: handOff)
         }
