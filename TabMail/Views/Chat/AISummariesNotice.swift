@@ -86,7 +86,7 @@ struct AISummariesNoticeButton: View {
     /// reliably observe that state, so Cancel and the answer could not close the sheet.
     @State private var showsReport = false
     /// The report's presentation, owned with its flag: the popover, and the sheet on it, can be
-    /// closed by the system while a report sends, and nothing on them runs then.
+    /// closed by the system while a report sends, and nothing on them clears the flag then.
     @State private var reportPresentation = ReportPresentation()
     #if DEBUG
     /// Tells mounted buttons apart in the debug log.
@@ -144,7 +144,8 @@ struct AISummariesNoticeButton: View {
 
     /// Opens the notice afresh. A report from an earlier popover is over: the system may have
     /// closed that popover with its sheet still up, so nothing cleared the flag or ended the
-    /// presentation. Retire it, so a late answer acts on nothing, and start with no sheet up.
+    /// presentation. Retire it, so a late answer cannot close or finish this one, and start with no
+    /// sheet up. A late answer the backend took still says "Report Submitted", once.
     private func openNotice() {
         reportPresentation.next()
         showsReport = false
@@ -161,8 +162,9 @@ struct AISummariesNoticeButton: View {
 }
 
 /// The popover's content: the note, "Report a concern", and the report sheet it presents. An
-/// answer from a report whose popover has gone cannot reach a later one: the shared sheet ties
-/// each answer to its own presentation.
+/// answer from a report whose popover has gone cannot close or finish a later one: the shared
+/// sheet ties each answer to its own presentation. If the backend took it, it still says "Report
+/// Submitted", once, over whatever is up.
 private struct AISummariesNoticePopover: View {
     let reportContent: () -> String
     let send: ReportConcernSend

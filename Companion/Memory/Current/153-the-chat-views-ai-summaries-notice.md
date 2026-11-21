@@ -20,9 +20,18 @@ and "Report a concern". The chat pill keeps its own "AI responses may contain er
   the two never compete for one presenter; when the report is done (Cancel, a swipe down, a report
   not taken, or OK on "Report Submitted", via the sheet's `onFinish`) the popover closes. Two
   popovers asked for in the same frame may both be refused: then nothing shows and the notice stays
-  due. The shared report sheet shows "Report Submitted" from its `onDismiss`, once the sheet has
-  gone, because UIKit refuses an alert while its presenter is still closing the sheet; this covers
-  the long-press report too. Debug builds trace all of this with `[AINotice` lines.
+  due. Debug builds trace all of this with `[AINotice` lines.
+- **"Report Submitted" (2026-11-21, #1113):** the confirmation belongs to the report, not to the
+  view that asked for it (`ReportConcernSubmission` in `ReportConcernModifier.swift`). Once the
+  backend has taken the report and the sheet's own `WindowProbe` says the sheet has gone, UIKit
+  shows it from the top of the key window (`ReportConcernConfirmation`), after any presentation
+  still moving there, because UIKit refuses an alert while its presenter is still closing the
+  sheet. A report not taken shows nothing. This covers the long-press report too. Before #1113 the
+  shared sheet showed it as a SwiftUI alert from its `onDismiss`, and it was lost when the
+  reporting row was recycled or removed, or the system closed the notice's popover, while the
+  report sent. An old answer still shows it once, over whatever is up, but never closes, changes
+  or finishes a later report (`ReportPresentation`), so its OK never closes a popover the user has
+  reopened.
 - **Report:** "Report a concern" opens the shared report sheet (`reportConcernSheet`, extracted from
   the long-press `ReportConcernModifier`) with type `.summary` and every summary in the chat, the
   emails and the replies still sending or not sent, newest first
