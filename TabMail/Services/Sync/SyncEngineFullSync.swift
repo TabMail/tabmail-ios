@@ -1482,9 +1482,9 @@ extension SyncEngine {
             // older-mail walk has started (the load floor is then the lowest
             // UID a window listing reached, `CatchUpWindowFloor`). Read before this pass
             // inserts anything.
-            if provider.staleWindowMode == .uid,
-               let lowestListed = messages.compactMap({ Int($0.messageId) }).min() {
-                if let newestHeld = try Int.fetchOne(db, sql: """
+            if provider.staleWindowMode == .uid {
+                if let lowestListed = messages.compactMap({ Int($0.messageId) }).min(),
+                   let newestHeld = try Int.fetchOne(db, sql: """
                        SELECT MAX(CAST(messageId AS INTEGER)) FROM messageHeader WHERE folderId = ?
                        """, arguments: [folderId]),
                    lowestListed > newestHeld + 1 {
@@ -1492,8 +1492,21 @@ extension SyncEngine {
                 }
                 // Where window listings reach down to: the catch-up's load floor
                 // before the walk starts (`CatchUpWindowFloor`). After the lapse
-                // mark, which leaves a NULL state NULL.
-                try Self.recordCatchUpWindowFloor(folderId: folderId, lowest: lowestListed, db: db)
+                // mark, which leaves a NULL state NULL. The lowest UID the server
+                // NAMED in the window, the ones whose header could not be read
+                // (`coverage.unmaterialisedIds`, from the same FETCH) included: a
+                // floor from the read headers alone sits above an unreadable
+                // lowest UID, and a catch-up before the walk would never load it
+                // once it reads. Only under a known epoch for this response: a
+                // floor from UIDs of unknown numbering could outlive an epoch
+                // change (ADR-IOS-061), so none is written.
+                // *Superseded (#1062):* the floor was the lowest UID of the read
+                // headers, written whatever the response's epoch.
+                let namedUids = messages.compactMap { Int($0.messageId) }
+                    + coverage.unmaterialisedIds.compactMap { Int($0) }
+                if sourceBoundEpoch != nil, let lowestNamed = namedUids.min() {
+                    try Self.recordCatchUpWindowFloor(folderId: folderId, lowest: lowestNamed, db: db)
+                }
             }
             // Load pending operation message IDs to avoid undoing optimistic UI.
             // IMPORTANT: Filter by (accountId, folderPath) to prevent cross-folder UID collisions.
