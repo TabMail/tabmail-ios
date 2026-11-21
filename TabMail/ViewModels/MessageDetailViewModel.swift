@@ -172,17 +172,11 @@ final class MessageDetailViewModel {
     /// Test seam: called synchronously each time a thread scan is asked for, with the id of
     /// the opened email it starts from.
     @ObservationIgnored var _threadScanRequestHook: (@MainActor (String) -> Void)?
-    /// Every thread scan asked for while `_threadScanRequestHook` was set that
-    /// `settleThreadScansForTesting` has not awaited yet.
-    @ObservationIgnored private var threadScansForTesting: [Task<Void, Never>] = []
-
-    /// Test seam: awaits every thread scan asked for so far, and any asked for while waiting,
-    /// so each one has read and published (or was skipped for a newer one) when it returns.
-    func settleThreadScansForTesting() async {
-        while !threadScansForTesting.isEmpty {
-            await threadScansForTesting.removeFirst().value
-        }
-    }
+    /// Test seams: thread scans asked for while `_threadScanRequestHook` was set, and how many
+    /// of them have ended (read and published, or skipped for a newer one). A test waits, with
+    /// its own deadline, until the two match.
+    @ObservationIgnored private(set) var threadScansAskedForTesting = 0
+    @ObservationIgnored private(set) var threadScansEndedForTesting = 0
 
     /// A screen field a display publication assigns.
     enum DisplayField { case message, messageBody, threadMessages }
@@ -2899,13 +2893,17 @@ final class MessageDetailViewModel {
         noteThreadScanRequestForTesting(scan, anchor: msg.id)
     }
 
-    /// Test seam: records each thread scan asked for, so a test can see which write asked for
-    /// one and await every scan it asked for. No-op outside DEBUG.
+    /// Test seam: counts each thread scan asked for and when it ends, so a test can see which
+    /// write asked for one and wait until every scan it asked for has ended. No-op outside DEBUG.
     private func noteThreadScanRequestForTesting(_ scan: Task<Void, Never>, anchor: String) {
         #if DEBUG
-        // Kept only while a test listens, so a debug build of the app holds no finished scans.
+        // Only while a test listens, so a debug build of the app starts no extra tasks.
         guard let hook = _threadScanRequestHook else { return }
-        threadScansForTesting.append(scan)
+        threadScansAskedForTesting += 1
+        Task { [weak self] in
+            await scan.value
+            self?.threadScansEndedForTesting += 1
+        }
         hook(anchor)
         #endif
     }

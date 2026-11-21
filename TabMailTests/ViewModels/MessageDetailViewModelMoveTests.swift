@@ -464,7 +464,7 @@ struct MessageDetailMarkReadOnArchiveDeleteTests {
         var header = MessageHeader(
             messageId: messageId, subject: "Test",
             from: "sender@example.com", fromAddress: "sender@example.com",
-            to: "me@example.com", date: Date(timeIntervalSince1970: 1_800_000_000),
+            to: "me@example.com", date: Date().addingTimeInterval(-3600),
             snippet: "body",
             folderId: "acc1:\(Self.inboxPath)", accountId: "acc1",
             folderPath: Self.inboxPath, isInInbox: true
@@ -513,7 +513,8 @@ struct MessageDetailMarkReadOnArchiveDeleteTests {
     }
 
     private func opsInDrainOrder(_ pool: DatabasePool) async throws -> [PendingOperation] {
-        try await pool.read { db in try PendingOperation.order(Column("createdAt").asc).fetchAll(db) }
+        // The drain's own order: `queuePosition`, allocated at insert (wall-clock `createdAt` can tie).
+        try await pool.read { db in try PendingOperation.order(Column("queuePosition").asc).fetchAll(db) }
     }
 
     @Test("detail archive of an unread message: the on-screen focused row shows read immediately, and the durable end state is read + archived with the read op recorded before the move")
@@ -627,6 +628,9 @@ struct MessageDetailMarkReadOnArchiveDeleteTests {
         let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: card.id) }
         #expect(final?.isRead == settingOn)
         #expect(final?.folderPath == Self.archivePath)
+        let opened = try await pool.read { db in try MessageHeader.fetchOne(db, key: focused.id) }
+        #expect(opened?.isRead == false, "the opened email stays unread")
+        #expect(opened?.folderPath == Self.inboxPath, "the opened email stays where it was")
 
         let ops = try await opsInDrainOrder(pool)
         let expected: [OperationType] = settingOn ? [.markRead, .move] : [.move]
