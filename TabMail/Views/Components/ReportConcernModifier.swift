@@ -217,9 +217,10 @@ struct ReportConcernSheetModifier: ViewModifier {
     /// An extra line saying what the report sends, when that is more than the pressed content.
     let contentNotice: String?
     let send: ReportConcernSend
-    /// Called once the report is done: the sheet closed with nothing more to show, or the
-    /// Submitted alert was dismissed. Not called for a report whose caller has since opened a
-    /// later one.
+    /// Called once the report is done: the sheet left with nothing sent (Cancel, a swipe down, or
+    /// the sheet taken down before Report), a report not taken once its sheet has gone, or OK on
+    /// "Report Submitted". A sent report does not call it once its caller has opened a later
+    /// report or its presentation is gone; a sheet that leaves with nothing sent always calls it.
     var onFinish: (() -> Void)?
     /// Set by a caller whose `isPresented` flag outlives the view this sheet is attached to (the
     /// notice's flag lives on its button, the sheet on the popover's content): the caller then
@@ -305,8 +306,9 @@ private struct ReportConcernSheet: View {
                     Button("Cancel") {
                         isPresented = false
                     }
-                    // While the report is sending, the sheet stays, as it does for a swipe down:
-                    // a reply after the sheet had gone would have no sheet to show its result.
+                    // While the report is sending, the sheet stays, as it does for a swipe down,
+                    // until the answer closes it. "Report Submitted" does not depend on this: it
+                    // waits for the sheet to go, however it goes (`ReportConcernSubmission`).
                     .disabled(isSubmitting)
                 }
                 ToolbarItem(placement: .confirmationAction) {
@@ -355,7 +357,9 @@ private struct ReportConcernSheet: View {
             let accepted = await send(contentType, content(), selectedCategory, reason.isEmpty ? nil : reason)
             isSubmitting = false
             // Only the presentation that sent this closes: the caller's flag may now show a later
-            // report, or its owner may be gone.
+            // report. The weak capture does not let `presentation` go while the send runs: this
+            // body reads `send`, `isSubmitting` and `isPresented` through the sheet, which holds
+            // `presentation` too. Writing the flag of a caller that has gone does nothing.
             if let presentation, presentation.current == sentFor {
                 isPresented = false
             }

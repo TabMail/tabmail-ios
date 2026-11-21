@@ -20,8 +20,10 @@ import UIKit
 ///     target, and leaves the subject centred.
 ///  4. A report the backend took says "Report Submitted" exactly once, whatever happened to the
 ///     view that asked for it (a row scrolled away and back, a row removed, a popover the system
-///     closed); a report it did not take says nothing. An old answer never closes, changes or
-///     finishes a later report.
+///     closed); a report it did not take says nothing. It waits for the sheet to leave, and the
+///     report finishes once: on OK, or for a refused report once the sheet has left, never when
+///     the sheet of a sent report leaves. An old answer never closes, changes or finishes a later
+///     report.
 @Suite("Chat AI summaries notice, hosted", .serialized, .processGlobalState)
 @MainActor
 struct ChatAISummariesNoticeHostedTests {
@@ -556,9 +558,13 @@ struct ChatAISummariesNoticeHostedTests {
         #expect(confirmations(controller) == 0, "\(note): Report Submitted shows only once")
     }
 
-    /// Waits a second and checks that no "Report Submitted" shows.
+    /// How long a check waits for something that must not happen: long enough for a presentation
+    /// asked for on the next turn, after a transition still moving, to have landed.
+    private static let quietPeriod: Duration = .seconds(1)
+
+    /// Waits `quietPeriod` and checks that no "Report Submitted" shows.
     private static func expectNoConfirmation(in controller: UIViewController, _ note: String) async throws {
-        try await Task.sleep(for: .seconds(1))
+        try await Task.sleep(for: quietPeriod)
         #expect(confirmations(controller) == 0,
                 "\(note): no Report Submitted: \(String(describing: topPresented(controller)))")
     }
@@ -687,12 +693,59 @@ struct ChatAISummariesNoticeHostedTests {
                                          "the sheet closed and the alert shows: \(String(describing: Self.topPresented(controller)))")
                 #expect(alert.title == "Report Submitted")
                 #expect(!Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice), "the sheet is gone")
+                // The report is not done until OK: the notice's popover stays, with the alert on it.
+                let popover = try #require(controller.presentedViewController, "the notice's popover")
+                #expect(popover !== alert && popover.presentedViewController === alert,
+                        "Report Submitted sits on the notice's popover: \(String(describing: popover))")
+                #expect(HostedAccessibility.labels(in: popover.view).contains(AISummariesNotice.title)
+                        && !HostedAccessibility.labels(in: popover.view).contains(AISummariesNotice.reportNotice),
+                        "the popover is the notice, with no sheet: \(HostedAccessibility.labels(in: popover.view))")
+                try await Task.sleep(for: Self.quietPeriod)
+                #expect(controller.presentedViewController === popover && popover.presentedViewController === alert,
+                        "the popover stays under Report Submitted until OK: \(String(describing: Self.topPresented(controller)))")
                 try Self.pressOK(on: alert)
                 try await Self.waitUntil { controller.presentedViewController == nil }
                 #expect(controller.presentedViewController == nil,
                         "after OK no popover remains: \(String(describing: Self.topPresented(controller)))")
             }
             try await Self.expectNeverOpensAgain(firstOpen)
+        }
+    }
+
+    /// Drives `ReportConcernSubmission` directly, so the order is the test's, not UIKit's: an
+    /// answer that comes while the sheet is still up (or asked to close but not yet closing) must
+    /// wait, because UIKit refuses an alert while its presenter is still closing the sheet.
+    @Test("A taken report says Report Submitted only once its sheet has left, exactly once, and finishes once on OK; a refused one finishes once, only once its sheet has left")
+    func reportSubmittedWaitsForTheSheetToLeave() async throws {
+        try await Self.hosting(Color.clear) { controller in
+            // Taken.
+            let finishes = Finishes()
+            let taken = ReportConcernSubmission { finishes.count += 1 }
+            taken.answered(true)
+            try await Self.expectNoConfirmation(in: controller, "taken, sheet still up")
+            #expect(controller.presentedViewController == nil,
+                    "taken, sheet still up: nothing is presented: \(String(describing: Self.topPresented(controller)))")
+            taken.sheetLeft()
+            let alert = try await Self.waitForConfirmation(in: controller, "taken, sheet left")
+            #expect(controller.presentedViewController === alert, "taken: from the key window's top")
+            taken.sheetLeft()
+            try await Task.sleep(for: Self.quietPeriod)
+            #expect(Self.confirmations(controller) == 1, "a second departure shows no second Report Submitted")
+            #expect(finishes.count == 0, "taken: not done before OK, got \(finishes.count)")
+            try await Self.dismissConfirmation(alert, in: controller, "taken")
+            #expect(finishes.count == 1, "taken: OK finishes it exactly once, got \(finishes.count)")
+
+            // Refused.
+            let refusals = Finishes()
+            let refused = ReportConcernSubmission { refusals.count += 1 }
+            refused.answered(false)
+            try await Self.expectNoConfirmation(in: controller, "refused, sheet still up")
+            #expect(refusals.count == 0, "refused: not done while the sheet is up, got \(refusals.count)")
+            refused.sheetLeft()
+            #expect(refusals.count == 1, "refused: done once the sheet has left, got \(refusals.count)")
+            refused.sheetLeft()
+            try await Self.expectNoConfirmation(in: controller, "refused, sheet left")
+            #expect(refusals.count == 1, "refused: done exactly once, got \(refusals.count)")
         }
     }
 
@@ -932,20 +985,23 @@ struct ChatAISummariesNoticeHostedTests {
                 state.open = false  // the caller closes it while the report is sending
                 try await Self.waitUntil { controller.presentedViewController == nil }
                 #expect(controller.presentedViewController == nil, "control: the sheet closed")
-                let finished = finishes.count
+                // Once the sheet's departure has been handled (on the turn after it leaves its
+                // window), a sent report is not done: nothing has finished, in absolute terms.
+                try await Self.expectNoConfirmation(in: controller, "the closed sheet, before its answer")
+                #expect(finishes.count == 0, "a sent report's sheet leaving finishes nothing, got \(finishes.count)")
                 held.release(true)
                 let alert = try await Self.waitForConfirmation(in: controller, "the closed sheet's answer")
                 #expect(controller.presentedViewController === alert, "Report Submitted alone, from the caller")
-                #expect(finishes.count == finished, "the report is not done before OK")
+                #expect(finishes.count == 0, "the report is not done before OK, got \(finishes.count)")
                 try await Self.dismissConfirmation(alert, in: controller, "the closed sheet's answer")
-                #expect(finishes.count == finished + 1, "OK finishes the report, once")
+                #expect(finishes.count == 1, "OK finishes the report, once, got \(finishes.count)")
                 state.open = true
                 try await Self.waitUntil { Self.sheetIsUp(controller) }
                 let sheetView = try #require(Self.topPresented(controller)?.view, "control: the next sheet appeared")
                 #expect(Self.isEnabled("Report", in: sheetView) && Self.isEnabled("Cancel", in: sheetView),
                         "the next report starts afresh")
                 try await Self.cancelShowsNothing(in: controller)
-                #expect(finishes.count == finished + 2, "and the next report's own finish")
+                #expect(finishes.count == 2, "and the next report's own finish, got \(finishes.count)")
             }
         }
     }

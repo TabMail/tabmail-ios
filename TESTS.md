@@ -1402,6 +1402,14 @@ happens to the view that asked for it, and a report it did not take says nothing
   report sends; the sheet goes with the row, and the answer still shows the confirmation once.
 - `aSystemClosedPopoversReportConfirmsOnlyWhenTaken`: the system closes the notice's popover and its
   sheet while the report sends; a taken report shows the confirmation once, a refused one nothing.
+- `reportSubmittedWaitsForTheSheetToLeave`: drives `ReportConcernSubmission` directly in a key
+  window. A taken answer shows nothing while the sheet is up; the sheet's departure shows the
+  confirmation exactly once, a second departure adds none, and OK finishes the report exactly once.
+  A refused answer finishes nothing until the sheet has left, then exactly once.
+- `submittedReportClosesTheSheet`: the notice's popover stays, with the confirmation on it, until OK,
+  and goes only after OK (a sent report's sheet leaving does not finish it).
+- `aClosedSheetsAnswerBeforeTheNextReport` also pins, as absolute counts, that a sent report's sheet
+  leaving finishes nothing: no finish after the close has settled, one on OK.
 - An old answer (a sheet its caller closed, an owner or notice removed and recreated, a popover the
   system closed and the notice reopened, at four timings) shows the confirmation once over whatever
   is up, and neither it nor its OK closes, changes or finishes the next report:

@@ -32,6 +32,7 @@ and "Report a concern". The chat pill keeps its own "AI responses may contain er
   report sent. An old answer still shows it once, over whatever is up, but never closes, changes
   or finishes a later report (`ReportPresentation`), so its OK never closes a popover the user has
   reopened.
+  Pinned by `reportSubmittedWaitsForTheSheetToLeave` (no alert until the sheet has gone, then once; finish once) and `submittedReportClosesTheSheet` (the popover stays under the alert until OK).
 - **Report:** "Report a concern" opens the shared report sheet (`reportConcernSheet`, extracted from
   the long-press `ReportConcernModifier`) with type `.summary` and every summary in the chat, the
   emails and the replies still sending or not sent, newest first
