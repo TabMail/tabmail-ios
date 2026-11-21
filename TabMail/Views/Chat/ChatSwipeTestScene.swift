@@ -25,13 +25,27 @@ struct ChatSwipeTestScene: View {
     @State private var showsSheet = false
     @State private var mailbox: String?
     @State private var pushedId: String?
+    /// `--chat-swipe-saved-draft`: what Drafts holds for the fixture, read each time the list shows.
+    @State private var draftMarker = ""
     /// The tutorial variant's chat: Priya's practice email.
     @State private var practiceId: String?
     private let inSheet = ProcessInfo.processInfo.arguments.contains("--chat-swipe-in-sheet")
     private let inSplit = ProcessInfo.processInfo.arguments.contains("--chat-swipe-in-split")
     /// `--chat-swipe-tall`: the oldest email's text message runs past the screen, so the chat scrolls.
     nonisolated private static let tall = ProcessInfo.processInfo.arguments.contains("--chat-swipe-tall")
+    /// `--chat-swipe-unread`: every email is unread, so the chat lands at the Unread line above the
+    /// oldest email; with `--chat-swipe-tall` that is far from the bottom.
+    nonisolated private static let unread = ProcessInfo.processInfo.arguments.contains("--chat-swipe-unread")
+    /// `--chat-swipe-suggestion-on-jump`: the newest email's AI Suggestion lands the moment the
+    /// jump button is tapped, while its scroll animates.
+    nonisolated private static let suggestionOnJump = ProcessInfo.processInfo.arguments.contains("--chat-swipe-suggestion-on-jump")
     private let tutorialCard = ProcessInfo.processInfo.arguments.contains("--chat-swipe-tutorial-card")
+    /// `--chat-swipe-saved-draft`: the newest email has its AI Suggestion from the start, and a reply
+    /// draft is already saved for it under its usual reply key (`Draft.draftKey(replyTo:)`), so the
+    /// ghost's card opens next to a saved draft it must leave alone.
+    nonisolated private static let savedDraft = ProcessInfo.processInfo.arguments.contains("--chat-swipe-saved-draft")
+    /// The saved draft's words.
+    nonisolated static let savedDraftBody = "My own words, not sent yet"
     nonisolated private static let accountID = "chat-swipe-fixture"
     nonisolated private static let count = 4
     /// The email "Remove a bubble" takes out of the chat.
@@ -39,6 +53,16 @@ struct ChatSwipeTestScene: View {
     /// How long after "Remove a bubble" the email leaves: long enough for a test to open the chat
     /// and that bubble's actions first.
     private static let removalDelay: Duration = .seconds(8)
+    /// `--chat-swipe-late-suggestion`: a strip under the whole navigation stack holds "Release the
+    /// AI Suggestion", which writes the newest email's AI Suggestion when the test taps it, so the
+    /// test decides that it lands only after its drag or jump has come to rest.
+    private let lateSuggestionRelease = ProcessInfo.processInfo.arguments.contains("--chat-swipe-late-suggestion")
+    /// The late AI Suggestion's text message.
+    nonisolated static let lateSuggestion = "Sounds good, see you Tuesday."
+    /// The newest email's full AI Suggestion, as the fixture writes it.
+    nonisolated static let fullReply = "Hello,\n\n\(lateSuggestion)\n\nThanks."
+    /// What "Rewrite the AI Suggestion" puts in the newest row's reply, unannounced.
+    nonisolated static let rewrittenReply = "Hello,\n\nA rewritten reply.\n\nRegards."
 
     var body: some View {
         Group {
@@ -73,6 +97,21 @@ struct ChatSwipeTestScene: View {
                         }
                         .padding()
                     }
+                } else if lateSuggestionRelease {
+                    // Below the whole stack, like the tutorial strip, so the reply bar ends above it.
+                    VStack(spacing: 0) {
+                        NavigationStack { list }
+                        Button("Release the AI Suggestion") { Task { await Self.writeSuggestion() } }
+                            .padding()
+                    }
+                } else if Self.savedDraft {
+                    // Below the whole stack, like the other strips. Rewrites the newest row's reply
+                    // with no `.messageDataDidChange`, so the ghost keeps the reply the user taps.
+                    VStack(spacing: 0) {
+                        NavigationStack { list }
+                        Button("Rewrite the AI Suggestion") { Task { await Self.rewriteSuggestionQuietly() } }
+                            .padding()
+                    }
                 } else {
                     NavigationStack { list }
                 }
@@ -81,6 +120,10 @@ struct ChatSwipeTestScene: View {
             }
         }
         .task { await seed() }
+        .onReceive(NotificationCenter.default.publisher(for: .chatJumpTappedForTesting)) { _ in
+            guard Self.suggestionOnJump else { return }
+            Task { await Self.writeSuggestion() }
+        }
     }
 
     private var list: some View {
@@ -96,8 +139,30 @@ struct ChatSwipeTestScene: View {
             if !tutorialCard {
                 Button(armed ? "Removal armed" : "Remove a bubble") { arm() }
             }
+            if Self.savedDraft {
+                // Never the draft's words: a test reads that they stay out of the card.
+                Text(draftMarker).accessibilityIdentifier("fixture.savedDraft")
+            }
         }
         .navigationTitle("Fixture list")
+        .onAppear { Task { await readDrafts() } }
+    }
+
+    /// "Saved draft kept: yes" while the saved reply draft holds its words and was never saved
+    /// over, how many drafts the card saved under keys of their own, and how many of those hold the
+    /// full AI Suggestion. Counts only: never any draft's words.
+    private func readDrafts() async {
+        guard Self.savedDraft else { return }
+        let accountID = Self.accountID
+        let (kept, separate, holding) = (try? await AppDatabase.dbPool.read { db -> (Bool, Int, Int) in
+            let drafts = try Draft.filter(Column("accountId") == accountID).fetchAll(db)
+            let kept = drafts.contains {
+                !$0.id.hasPrefix(Draft.separateReplyPrefix) && $0.body == Self.savedDraftBody && $0.updatedAt == $0.createdAt
+            }
+            let own = drafts.filter { $0.id.hasPrefix(Draft.separateReplyPrefix) }
+            return (kept, own.count, own.filter { $0.body.contains(Self.fullReply) }.count)
+        }) ?? (false, -1, -1)
+        draftMarker = "Saved draft kept: \(kept ? "yes" : "no"); separate replies: \(separate); holding the suggestion: \(holding)"
     }
 
     private static func headerId(_ index: Int) -> String {
@@ -112,6 +177,30 @@ struct ChatSwipeTestScene: View {
             _ = try? await AppDatabase.dbPool.write { db in try MessageHeader.deleteOne(db, key: id) }
             // As a sync's merge announces it: the open chat re-reads its emails.
             NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+        }
+    }
+
+    /// Writes the newest email's AI Suggestion as the AI's reply write does, so the open chat gets
+    /// a late row height.
+    private static func writeSuggestion() async {
+        let id = headerId(count - 1)
+        _ = try? await AppDatabase.dbPool.write { db in
+            guard var header = try MessageHeader.fetchOne(db, key: id) else { return }
+            header.cachedReply = fullReply
+            header.replyTextMessage = lateSuggestion
+            try header.save(db)
+        }
+        NSLog("[cv9diag] late suggestion written")
+        NotificationCenter.default.post(name: .messageDataDidChange, object: id)
+    }
+
+    /// Rewrites the newest row's reply with no `.messageDataDidChange`: the open chat is not told,
+    /// so its ghost still holds the reply it showed, and a tap must open the card with that one.
+    private static func rewriteSuggestionQuietly() async {
+        let id = headerId(count - 1)
+        _ = try? await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
+                           arguments: [rewrittenReply, id])
         }
     }
 
@@ -155,6 +244,7 @@ struct ChatSwipeTestScene: View {
             try await AppDatabase.dbPool.write { db in
                 // Each launch owns only this synthetic account's fixture rows.
                 try MessageHeader.filter(Column("accountId") == accountID).deleteAll(db)
+                if Self.savedDraft { try Draft.filter(Column("accountId") == accountID).deleteAll(db) }
                 var account = Account(emailAddress: "me@example.com", displayName: "Chat swipe fixture", provider: .imap)
                 account.id = accountID
                 try account.save(db)
@@ -172,14 +262,32 @@ struct ChatSwipeTestScene: View {
                     header.inReplyTo = index == 0 ? nil : "<swipe-\(index - 1)@example.com>"
                     header.headerComplete = true
                     header.bodyComplete = true
-                    header.isRead = true
+                    header.isRead = !Self.unread
                     header.summaryBlurb = "Note \(index)"
                     header.summaryTextMessage = index == 0 && Self.tall
                         ? "Note 0: " + String(repeating: "A long line that fills the screen. ", count: 80)
                         : "Note \(index): a short line."
+                    if Self.savedDraft, index == Self.count - 1 {
+                        header.cachedReply = Self.fullReply
+                        header.replyTextMessage = Self.lateSuggestion
+                    }
                     try header.save(db)
+                    if Self.savedDraft, index == Self.count - 1 {
+                        let key = Draft.draftKey(replyTo: "\(accountID):\(header.stableId)", isForward: false, newId: nil)
+                        let stamp = now.timeIntervalSince1970
+                        try Draft.deleteOne(db, key: key)
+                        try Draft(
+                            id: key, accountId: accountID,
+                            toJSON: "[\"sender\(index)@example.com\"]", ccJSON: "[]", bccJSON: "[]",
+                            subject: "Re: Swipe fixture lunch", body: Self.savedDraftBody,
+                            replyToId: header.id, isForward: false, editHistoryJSON: nil,
+                            createdAt: stamp, updatedAt: stamp,
+                            serverDraftId: nil, serverPushStatus: nil,
+                            rfc822MessageId: nil, attachmentsDirName: nil).insert(db)
+                    }
                 }
             }
+            await readDrafts()
             status = "Fixture ready"
             ready = true
         } catch {

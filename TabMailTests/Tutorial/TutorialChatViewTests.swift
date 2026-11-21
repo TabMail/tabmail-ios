@@ -49,7 +49,7 @@ struct TutorialChatViewContentTests {
         let open = try #require(card(.replyToPriya, .reuseReply, .inbox))
         #expect(open.title.contains("Open Priya"))
         let ready = try #require(card(.replyToPriya, .reuseReply, .chat))
-        #expect(ready.message.contains("Tap Send"))
+        #expect(ready.message.contains("Tap the AI Suggestion") && !ready.message.contains("Tap Send"))
         let ask = try #require(card(.makeTemplate, .reuseReply, .chat))
         #expect(ask.message.contains("tap Send"))
         #expect(card(.makeTemplate, .reuseReply, .inbox) != nil, "back in the inbox the card says where to go")
@@ -111,7 +111,7 @@ struct TutorialChatViewContentTests {
         }
     }
 
-    @Test("The reply field moves only in Priya's chat in the chat view: the AI Reply, then the request")
+    @Test("The reply field moves only in Priya's chat in the chat view: a tap on the AI Suggestion, then the request")
     func fieldMoves() {
         typealias C = TutorialCoordinator
         for step in Self.allSteps.map(Optional.some) + [nil] {
@@ -120,7 +120,7 @@ struct TutorialChatViewContentTests {
                     let move = C.fieldMove(for: step, inPracticeChat: practice, teachesChat: teachesChat)
                     let expected: C.FieldMove?
                     switch step {
-                    case .replyToPriya where practice && teachesChat: expected = .sendReadyReply
+                    case .replyToPriya where practice && teachesChat: expected = .tapSuggestion
                     case .makeTemplate where practice && teachesChat: expected = .ask(.saveReplyAsTemplate)
                     default: expected = nil
                     }
@@ -164,7 +164,7 @@ struct TutorialChatViewContentTests {
         }
     }
 
-    /// The Sent bubble shows the AI Reply's text message, so the scripted edit must not
+    /// The Sent bubble shows the AI Suggestion's text message, so the scripted edit must not
     /// turn the reply into something else.
     @MainActor
     @Test("The chat view's edit keeps the reply a yes, as its Sent bubble says; today's edit declines")
@@ -251,7 +251,7 @@ struct TutorialChatViewSeedTests {
             preferredId: opened.id)
     }
 
-    @Test("Priya's and Jordan's chats hold a conversation, every bubble has its text, and Priya's AI Reply is ready")
+    @Test("Priya's and Jordan's chats hold a conversation, every bubble has its text, and Priya's AI Suggestion is ready")
     func seededChats() throws {
         let fixture = try install()
         defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
@@ -264,7 +264,7 @@ struct TutorialChatViewSeedTests {
         #expect(priya.items.allSatisfy { $0.textMessage != nil })
         let newest = try #require(priya.newest)
         #expect(newest.messageId == DemoSeed.TutorialFixture.priyaOffsite)
-        let ready = try #require(ChatReplyField.readyText(newest: newest, isOwn: false), "the field holds the AI Reply")
+        let ready = try #require(ChatReplyField.suggestionText(newest: newest, usersTurn: false, onlyTo: nil), "the AI Suggestion is ready")
         #expect(ready.contains("I'm in"))
 
         let jordan = try chat(DemoSeed.TutorialFixture.jordanFlights, pool: pool)
@@ -283,7 +283,7 @@ struct TutorialChatViewSeedTests {
         #expect(jordanRow.memberCount == 1)
     }
 
-    @Test("Every seeded email outside Drafts has a text message, and an AI Reply text exactly when it has a reply")
+    @Test("Every seeded email outside Drafts has a text message, and an AI Suggestion text exactly when it has a reply")
     func everyEmailHasItsText() throws {
         let fixture = try install()
         defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
@@ -385,8 +385,8 @@ struct TutorialChatViewRunTests {
             #expect(ChatViewConfig.opensInChat)
             #expect(!TutorialCoordinator.chatViewOnForTutorial, "the next run would not")
 
-            // Part 2: the AI Reply waits in Priya's field; the inbox chat has nothing to send.
-            #expect(coordinator.fieldMove(inPracticeChat: true) == .sendReadyReply)
+            // Part 2: the AI Suggestion waits in Priya's chat; the inbox chat has nothing to send.
+            #expect(coordinator.fieldMove(inPracticeChat: true) == .tapSuggestion)
             #expect(coordinator.fieldMove(inPracticeChat: false) == nil)
             #expect(coordinator.chatPrompt == nil)
             // The edit keeps the reply a yes.
@@ -602,30 +602,33 @@ struct TutorialChatViewWiringTests {
         text.components(separatedBy: needle).count - 1
     }
 
-    @Test("The tutorial's field holds the AI Reply, then the request, and nothing else")
+    @Test("The tutorial's field holds the request and nothing else: never the AI Suggestion")
     func fieldText() {
-        let ready = "Thanks Priya, I'm in."
         let field = { (move: TutorialCoordinator.FieldMove?) in
-            ChatReplyField(readyText: ready, isNoReply: false, clearCount: 0, tutorialMove: move)
+            ChatReplyField(example: nil, isNoReply: false, clearCount: 0, tutorialMove: move)
         }
-        #expect(DynamicIslandChat.tutorialFieldText(field(.sendReadyReply)) == ready)
+        #expect(DynamicIslandChat.tutorialFieldText(field(.tapSuggestion)) == nil, "the move is a tap on the ghost")
         #expect(DynamicIslandChat.tutorialFieldText(field(.ask(.saveReplyAsTemplate)))
                 == TutorialCoordinator.ChatPrompt.saveReplyAsTemplate.rawValue)
         #expect(DynamicIslandChat.tutorialFieldText(field(nil)) == nil)
     }
 
-    @Test("The field's Send: the AI Reply opens compose, the request goes to the scripted agent")
+    @Test("The ghost's tap opens compose in its step only; the field's Send takes the request to the scripted agent")
     func fieldSendWiring() throws {
         let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
-        #expect(Self.count("TutorialChatInputBar( prompt: Self.tutorialFieldText(field), isWorking: isWorking, label: field.tutorialMove == .sendReadyReply ? \"AI Reply\" : nil, send: { sendTutorialField(field) })", in: field) == 1)
-        #expect(Self.count("case .sendReadyReply: onSendReadyReply?()", in: field) == 1)
+        #expect(Self.count("TutorialChatInputBar( prompt: Self.tutorialFieldText(field), isWorking: isWorking, send: { sendTutorialField(field) })", in: field) == 1)
+        #expect(Self.count("case .tapSuggestion, nil: break", in: field) == 1, "the field's Send never opens compose")
         #expect(Self.count("TutorialCoordinator.shared.chatPromptSent(prompt) let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) } sendAgentChat(prompt.rawValue, script: prompt, field: send)", in: field) == 1)
         let pill = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count("if let status = script?.workingStatus { enqueueStatus(status) }", in: pill) == 1, "Saving template shows while it works")
         #expect(Self.count("if (isInboxChat || replyField != nil) && TutorialCoordinator.shared.highlightsChatClose {", in: pill) == 1,
                 "the chat's sheet rings its close as the inbox chat's does")
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(Self.count("tutorialMove: TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)", in: chat) == 1)
+        #expect(Self.count("TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)", in: chat) == 1)
+        #expect(Self.count("tutorialMove: tutorialMove(thread)", in: chat) == 1)
+        #expect(Self.count("ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) { openSuggestion(on: newest, tutorialMove: move) }", in: chat) == 1)
+        #expect(Self.count("if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion { _ = TutorialCoordinator.shared.admits(.other) return }", in: chat) == 1,
+                "in the tutorial only the step that asks for it opens the card")
         #expect(Self.count("TutorialCoordinator.shared.messageOpened(accountId: opened.accountId, messageId: opened.messageId)", in: chat) == 1,
                 "the chat opened at Jordan's email completes part 3")
     }

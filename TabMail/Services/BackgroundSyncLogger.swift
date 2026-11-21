@@ -50,8 +50,8 @@ enum BackgroundSyncLogger {
     /// Log a chat/AI error with context. Captures tool failures, empty responses, connection errors.
     ///
     /// The error line is always kept; the user's words (`userMessage`) only while debug logging is
-    /// on. They can be the email itself: the chat view's reply field holds the AI Reply, written
-    /// from the email, and a resend or rewind replays it. Gating here covers every caller.
+    /// on. They can quote the email itself (a reply typed in the chat view's reply field), and a
+    /// resend or rewind replays them. Gating here covers every caller.
     ///
     /// **BOTH spans this writes are outside our control, and both are bounded and
     /// escaped here — in the façade — rather than at each call site:**

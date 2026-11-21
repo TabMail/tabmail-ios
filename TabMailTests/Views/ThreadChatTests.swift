@@ -171,7 +171,7 @@ struct ThreadChatTests {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded, isWorking: $host.working,
                 replyField: inChatView && host.message != nil
-                    ? ChatReplyField(readyText: nil, isNoReply: false, clearCount: 0) : nil)
+                    ? ChatReplyField(example: nil, isNoReply: false, clearCount: 0) : nil)
             .environment(\.hasTabMailSession, true)
         }
     }

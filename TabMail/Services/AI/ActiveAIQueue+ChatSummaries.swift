@@ -21,7 +21,7 @@ extension ActiveAIQueue {
         return folder.role != .drafts
     }
 
-    /// Summaries for the emails a shown chat asks for (ADR-IOS-114, owner 2026-11-09): its newest
+    /// Summaries for the emails a shown chat asks for (ADR-IOS-114): its newest
     /// `ChatViewConfig.summaryWindow` and the emails shown, newest first, at the open, each re-show
     /// and each queue rebuild; each that changed in the database; and each older email as it comes
     /// on screen. Each one that lacks a summary with a text message, the user's own included,

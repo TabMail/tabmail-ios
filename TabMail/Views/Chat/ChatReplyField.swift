@@ -6,12 +6,14 @@ import Foundation
 import GRDB
 
 /// The chat's reply field (ADR-IOS-114 decision 10): the pill on the newest email becomes
-/// [mic] [field] [Send]. The field holds the ready AI Reply's text message when there is one; Send
-/// with it unchanged opens the compose card with the full AI Reply, and anything else the user says
-/// or types goes to the agent on the newest email, as today's Chat pill on that email.
+/// [mic] [field] [Send]. The field holds only the user's words: the ready AI Suggestion waits as a
+/// ghost bubble in the chat (`ChatSuggestionBubble`), and a tap on it opens the compose card.
+/// Everything the user says or types goes to the agent on the newest email, as today's Chat pill
+/// on that email. Under the empty field an "e.g." line shows a change the user could ask for
+/// (`example`); a tap puts it in the field and never sends it.
 struct ChatReplyField: Equatable {
-    /// The ready AI Reply's text message; nil when there is none.
-    let readyText: String?
+    /// The change the "e.g." line offers; nil shows no line.
+    let example: String?
     /// The newest email is from a no-reply address.
     let isNoReply: Bool
     /// Changes when the field must empty: the reply went out, or the agent answered in the
@@ -24,26 +26,12 @@ struct ChatReplyField: Equatable {
 
     var placeholder: String { isNoReply ? "Ask anything" : "Reply or ask anything" }
 
-    /// What Send does with the field's text.
-    enum Route: Equatable {
-        /// The ready AI Reply, unchanged: straight to the compose card, no agent.
-        case readyReply
-        /// The user's own words: the agent.
-        case agent
-    }
-
-    /// With recipients changed the ready AI Reply was written for everyone, so Send has the agent
-    /// write it again for the people chosen.
-    static func route(text: String, readyText: String?, recipientsChanged: Bool = false) -> Route {
-        guard let readyText, !recipientsChanged else { return .agent }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
-            == readyText.trimmingCharacters(in: .whitespacesAndNewlines) ? .readyReply : .agent
-    }
-
-    /// The ready AI Reply of the thread's newest email, as the field shows it: its text message,
-    /// while the full reply is stored. Nothing for the user's own email or a no-reply sender.
-    static func readyText(newest: MessageHeader, isOwn: Bool) -> String? {
-        guard !isOwn, !EmailFilter.isNoReply(newest.fromAddress),
+    /// The ready AI Suggestion of the thread's newest email, as its ghost bubble shows it: its text
+    /// message, while the full reply is stored. Nothing on the user's turn, for a no-reply sender,
+    /// or while the reply goes only to people chosen in Reply to (`onlyTo`): the suggestion was
+    /// written for everyone.
+    static func suggestionText(newest: MessageHeader, usersTurn: Bool, onlyTo: [ChatThread.Person]?) -> String? {
+        guard !usersTurn, onlyTo == nil, !EmailFilter.isNoReply(newest.fromAddress),
               let reply = newest.cachedReply, !reply.isEmpty,
               let text = newest.replyTextMessage, !text.isEmpty else { return nil }
         return text
@@ -74,27 +62,21 @@ struct ChatReplyField: Equatable {
     }
 }
 
-/// The chat input's words and what the reply field shows. One rule (owner
-/// 2026-11-07): the ready AI Reply shows in the field while it holds no words of the user's, typed
-/// or said; once the user empties the field by hand it stays empty for that email; a completed send
-/// empties only the words that were sent. The field and the open chat sheet share the words, so the
-/// rule is the same in both.
+/// The chat input's words, which are all the reply field shows: the AI Suggestion never enters the
+/// field (it waits as a ghost bubble in the chat). A completed send empties only the words that
+/// were sent. The field and the open chat sheet share the words, so the rule is the same in both.
 ///
-/// ONE API (owner 2026-11-08, the ADR-035 shape): `apply` is the only way the words change, for
+/// ONE API (the ADR-035 shape): `apply` is the only way the words change, for
 /// typing, dictation, a send, a completion and the app's own edits, and the view cannot write them
 /// any other way (`words` is `private(set)`). Every change is synchronous on the main actor, so the
 /// main actor is the FIFO lock: each change runs whole, in arrival order, and none is held across
-/// an await. The AI Reply never enters: what the field shows is a function of the words and the
-/// state at render (`shown`), so no late reply can land on the user's words or on another email.
+/// an await. No AI text enters, so no late suggestion can land on the user's words.
 /// The one asynchronous producer that replaces words, the on-device live transcript, enters with
 /// a change-counter compare (`heard`): it is dropped once anything else changed the words.
 struct ChatFieldFill {
     /// The user's own words in the input: typed, said, or put there by the app for them (an Edit).
-    /// Never an AI Reply.
+    /// Never AI text.
     private(set) var words = ""
-    /// The email (`ChatThread.copyKey`) the user emptied the field on by hand: no AI Reply shows
-    /// while it is the newest. A newer email is a new turn and shows its own.
-    private(set) var emptiedOn: String?
     /// The user's words when they last sent, from the field or from the open sheet; nil once that
     /// send completed. An answer or a sent reply completes it, so it empties only those words:
     /// words the user wrote after it are newer and stay.
@@ -107,10 +89,6 @@ struct ChatFieldFill {
 
     /// Every change to the words.
     enum Change {
-        /// The user edited the input from `shown` to the new text, which is now their words. In the
-        /// reply field, emptying it while it showed something keeps the AI Reply out of it for
-        /// `email`.
-        case typed(String, shown: String, email: String?, replyField: Bool)
         /// A dictation's text came back: it is added to the words as they are now.
         case said(String)
         /// An on-device dictation starts: its live transcript adds to the words as they are now.
@@ -118,7 +96,8 @@ struct ChatFieldFill {
         /// The live transcript so far. Dropped if anything else changed the words since the
         /// transcript's last write (the change counter).
         case heard(String)
-        /// The app puts words in for the user (an Edit of an earlier message).
+        /// The words become this text: the user's edit of the input, or words the app puts in for
+        /// them (an Edit of an earlier message, or the "e.g." line's change).
         case put(String)
         /// Send from the open sheet: the words go, and nothing is left to complete.
         case sentFromSheet
@@ -135,12 +114,6 @@ struct ChatFieldFill {
     mutating func apply(_ change: Change) {
         let before = words
         switch change {
-        case let .typed(typed, shown, email, replyField):
-            // A set that leaves the shown text as it was is no edit (an untouched AI Reply stays
-            // the app's, not the user's words).
-            guard typed != shown else { return }
-            if replyField, typed.isEmpty, !shown.isEmpty { emptiedOn = email }
-            words = typed
         case let .said(text):
             words = DictationController.appending(text, to: words)
         case .startHearing:
@@ -166,14 +139,6 @@ struct ChatFieldFill {
             if clears { words = "" }
         }
         if words != before { changes += 1 }
-    }
-
-    /// What the field shows: the user's words, or with none the newest email's ready AI Reply
-    /// `ready`, unless the user emptied the field on that email or spoke last (`busy`: a dictation
-    /// is bringing their words, or the agent is still answering them).
-    func shown(ready: String?, busy: Bool, email: String?) -> String {
-        guard words.isEmpty, !busy, let ready, emptiedOn == nil || email != emptiedOn else { return words }
-        return ready
     }
 
     /// Whether the last send's completion may empty the words: they are still the words sent, or
@@ -236,15 +201,11 @@ struct ChatReplyCompose: Equatable {
     let cc: [String]
     let bcc: [String]
 
-    /// The ready AI Reply to `message`: a Reply All to the newest email's people exactly when nobody
-    /// is chosen in Reply to (`target.only == nil`); with people chosen, a plain reply to only them,
-    /// with no Cc or Bcc.
-    static func make(replyTo message: MessageHeader?, target: ChatReplyTarget, accounts: [Account]) -> ChatReplyCompose {
-        if let only = target.only {
-            return ChatReplyCompose(isReplyAll: false, to: only.map(\.address), cc: [], bcc: [])
-        }
-        let audience = message.map { buildReplyAllRecipients(for: $0, allAccounts: accounts) }
-        return ChatReplyCompose(isReplyAll: audience != nil, to: audience?.to ?? [], cc: audience?.cc ?? [], bcc: [])
+    /// The AI Suggestion to `message`: a Reply All to its people. The suggestion shows only while
+    /// nobody is chosen in Reply to (`ChatReplyField.suggestionText`).
+    static func make(replyAllTo message: MessageHeader, accounts: [Account]) -> ChatReplyCompose {
+        let audience = buildReplyAllRecipients(for: message, allAccounts: accounts)
+        return ChatReplyCompose(isReplyAll: true, to: audience.to, cc: audience.cc, bcc: [])
     }
 
     /// The agent's reply, read from its request alone, never from the chat showing the card: whether
@@ -266,23 +227,33 @@ struct ChatReplyCompose: Equatable {
     }
 
     /// The compose card, opened in this kind, as main's Reply All entries open it.
+    /// `draftId`: the draft it saves to; nil, the reply's usual one.
     @MainActor
     func composeView(
-        replyTo message: MessageHeader?, suggestedBody: String? = nil,
+        replyTo message: MessageHeader?, suggestedBody: String? = nil, draftId: String? = nil,
         onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
     ) -> ComposeView {
         ComposeView(
             replyTo: message, suggestedBody: suggestedBody, isReplyAll: isReplyAll,
             prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,
-            prefillBcc: bcc.isEmpty ? nil : bcc, onAgentOutcome: onAgentOutcome)
+            prefillBcc: bcc.isEmpty ? nil : bcc, prefillDraftId: draftId, onAgentOutcome: onAgentOutcome)
     }
 }
 
-/// The ready AI Reply's compose card: the email it answers and how it opens.
+/// The ready AI Suggestion's compose card: the email it answers and how it opens.
 struct ChatReadyReply: Identifiable {
     let message: MessageHeader
     let compose: ChatReplyCompose
+    /// A draft of its own: the chat leaves the reply draft already saved for this email alone
+    /// (it stays in Drafts), so the card never opens, saves over or deletes it.
+    let draftId: String
     var id: MessageHeader.ID { message.id }
+
+    init(message: MessageHeader, compose: ChatReplyCompose) {
+        self.message = message
+        self.compose = compose
+        draftId = Draft.separateReplyKey(replyTo: "\(message.accountId):\(message.stableId)")
+    }
 }
 
 /// A compose card the agent opens in the chat, with how a reply opens, read as it opened.
@@ -294,7 +265,7 @@ struct ChatAgentCard: Identifiable {
 
 /// A reply in the outbox the chat does not show as an email yet, shown as the user's bubble at the
 /// bottom of the chat whose email it answers. Read from the database and the chat's own emails,
-/// with nothing kept in memory (owner 2026-11-09): every outbox row whose In-Reply-To is the
+/// with nothing kept in memory: every outbox row whose In-Reply-To is the
 /// Message-ID of an email in the chat, from any account (the reply may go out from another account
 /// than the email it answers). A failed row reads "Not sent", with Retry and Delete; any other
 /// "Sending". Its text is the summary made at Send (`SentEmailSummary`), "Summarizing" until then.

@@ -107,7 +107,7 @@ struct TutorialFinishView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Label("Tap a tag to act. Hold it to change.", systemImage: "checkmark")
                 if teachesChat {
-                    Label("Send the AI Reply, or say anything: a reply or a request.", systemImage: "checkmark")
+                    Label("Tap the AI Suggestion, or say anything: a reply or a request.", systemImage: "checkmark")
                 } else {
                     Label("Turn a good reply into a template.", systemImage: "checkmark")
                 }

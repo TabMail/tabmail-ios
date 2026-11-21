@@ -90,7 +90,7 @@ struct BackgroundSyncLoggerTests {
             let log = AppLogStore.read(channel: .chatError)
             #expect(log.contains(marker), "the error itself is always kept")
             #expect(log.contains("User message: what happened") == debugLogging,
-                    "the user's words can be the email (the reply field's AI Reply): debug logging only")
+                    "the user's words can be the email (a reply typed in the reply field): debug logging only")
         }
     }
 
