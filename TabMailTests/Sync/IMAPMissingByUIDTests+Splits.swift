@@ -504,8 +504,8 @@ extension IMAPMissingByUIDTests {
             let loads = Self.requests(to: Self.path, w.server, from: start).map { $0.command }.filter {
                 $0.uppercased().hasPrefix("UID FETCH") && $0.uppercased().contains("ENVELOPE")
             }
-            #expect(loads.contains { Self.uidSet($0).contains(lowest) },
-                    "#1062: the catch-up's header load of the folder asks the recovered UID: \(loads)")
+            let asksLowest = loads.contains { Self.uidSet($0).contains(lowest) }
+            #expect(asksLowest, "#1062: the catch-up's header load of the folder asks the recovered UID: \(loads)")
             try w.expectHeldExactly(window, "#1062: the window's lowest message, unreadable when the window listed it, is loaded once it reads")
             #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == lowest,
                     "#1062: the window floor is the lowest UID the window named, read or not")
@@ -615,8 +615,9 @@ extension IMAPMissingByUIDTests {
             let loads = Self.headerFetches(asked)
             #expect(loads.isEmpty, "#1062: a floor of another epoch counts for nothing: nothing loads: \(loads)")
             try w.expectHeldExactly(local, "#1062: nothing below the held rows loads before a floor of this epoch")
-            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == nil
-                        && CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch + 1) == 1,
+            let state = try w.folder().catchUpState
+            #expect(CatchUpWindowFloor.read(state, epoch: Self.epoch) == nil
+                        && CatchUpWindowFloor.read(state, epoch: Self.epoch + 1) == 1,
                     "#1062: the catch-up's state write carries the old floor under its own epoch, never rebound to the current one")
 
             // Control: a floor of the current epoch loads the rest.
