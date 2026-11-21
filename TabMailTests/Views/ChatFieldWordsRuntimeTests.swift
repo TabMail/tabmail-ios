@@ -985,7 +985,7 @@ struct ChatFieldWordsRuntimeTests {
         }
     }
 
-    @Test("A compose card from the field empties the field on its Send; a compose card from elsewhere keeps the typed words")
+    @Test("A compose card from the field empties the field on its Send; a compose card from elsewhere keeps the typed words: in the field, on the device and in a fresh store")
     func fieldCardEmptiesElsewhereCardKeeps() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
         try await HostedAccessibility.withAutomation {
@@ -1011,6 +1011,13 @@ struct ChatFieldWordsRuntimeTests {
                     backend.proceed.signal()
                     try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
                     try await Self.settle()
+                    await ChatFieldWords.shared.written()
+                    #expect(try Self.stored(pool) == [:], "the field's sent words are not kept on the device")
+                    // A fresh store on the same database, as the next app run reads it (the pill
+                    // stays mounted for side 2, so the app's store is not replaced here).
+                    let fresh = ChatFieldWords(database: { PrioritizedDatabase(pool: pool) })
+                    await fresh.load(key)
+                    #expect(fresh.fill(for: key).words == "", "a fresh store shows none of the sent words: \(fresh.fill(for: key).words)")
 
                     // Side 2: words typed, then a card from a request sent elsewhere goes out.
                     let typed = "Words the user is writing"
@@ -1023,6 +1030,11 @@ struct ChatFieldWordsRuntimeTests {
                 }
                 await ChatFieldWords.shared.written()
                 #expect(try Self.stored(pool) == [key: "Words the user is writing"])
+                // A fresh store, as the next app run: the typed words come back.
+                await Self.newRun { PrioritizedDatabase(pool: pool) }
+                await ChatFieldWords.shared.load(key)
+                #expect(ChatFieldWords.shared.fill(for: key).words == "Words the user is writing",
+                        "a fresh store: \(ChatFieldWords.shared.fill(for: key).words)")
             }
         }
     }
