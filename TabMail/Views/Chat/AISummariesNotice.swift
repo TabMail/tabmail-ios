@@ -145,10 +145,11 @@ struct AISummariesNoticeButton: View {
     /// Opens the notice afresh. A report from an earlier popover is over: the system may have
     /// closed that popover with its sheet still up, so nothing cleared the flag or ended the
     /// presentation. Retire it, so a late answer cannot close or finish this one, and start with no
-    /// sheet up. A late answer the backend took still says "Report Submitted", once. SwiftUI can
-    /// present the closed popover's sheet again, which can be in a window for a moment before UIKit
-    /// refuses it; that sheet was shown for the presentation retired here, so when it leaves it
-    /// finishes nothing.
+    /// sheet up. A late answer the backend took still says "Report Submitted", once. At the system's
+    /// close SwiftUI can present the closed popover's sheet again, which is in a window for a moment
+    /// before UIKit refuses it; it reaches that window before a reopen can run (right after the
+    /// close in the logs), so it counts for the presentation retired here and finishes nothing when
+    /// it leaves. A reopen before it reaches its window would count it for this presentation.
     private func openNotice() {
         reportPresentation.next()
         showsReport = false
@@ -226,14 +227,14 @@ private struct AISummariesNoticePopover: View {
     #endif
 }
 
-/// Calls `onWindow` when UIKit puts this view in a window, which happens only for a presentation
-/// that is actually shown.
+/// Calls `onWindow` when UIKit puts this view in a window. A window does not prove the presentation
+/// stays on screen: the report sheet SwiftUI presents again from a closed popover is in a window
+/// for a moment before UIKit refuses it.
 struct WindowProbe: UIViewRepresentable {
     let onWindow: () -> Void
     /// Runs when UIKit tells the probe it has no window (`didMoveToWindow` with `window` nil), as
-    /// when it leaves its window. A caller that ends something on it checks what the view was on
-    /// screen for (`ReportConcernSheet`): a sheet SwiftUI presents again from a closed popover can
-    /// be in a window for a moment before UIKit refuses it.
+    /// when it leaves its window. A caller that ends something on it checks which presentation was
+    /// current when the view reached its window (`ReportConcernSheet`).
     var onDetach: () -> Void = {}
 
     final class Probe: UIView {

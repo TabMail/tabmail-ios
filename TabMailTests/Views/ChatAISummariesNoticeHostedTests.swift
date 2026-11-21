@@ -25,9 +25,11 @@ import UIKit
 ///     the sheet of a sent report leaves. An old answer never closes, changes or finishes a later
 ///     report.
 ///  5. A sheet that leaves with nothing sent finishes its caller only for the presentation that was
-///     current while it was on screen: a sheet SwiftUI presents again from a popover the system
-///     closed, which can be in a window for a moment before UIKit refuses it, was shown for the
-///     presentation the reopen retired, so it never closes the reopened notice.
+///     current when it reached its window. A sheet SwiftUI presents again from a popover the system
+///     closed is in a window for a moment, right after the close and before the user reopens the
+///     notice, so it counts for the presentation the reopen retires and does not close the
+///     reopened notice. This relies on that order: a reopen before that sheet reaches its window
+///     would count it for the reopened presentation.
 @Suite("Chat AI summaries notice, hosted", .serialized, .processGlobalState)
 @MainActor
 struct ChatAISummariesNoticeHostedTests {
@@ -1234,10 +1236,10 @@ struct ChatAISummariesNoticeHostedTests {
     /// popover or the sheet runs, and the report's flag and presentation live on the button. The
     /// notice reopens with no sheet, and the next report's open retires the old presentation, so
     /// the old answer, before or after the next report starts sending, says "Report Submitted"
-    /// once over whatever is up, and its OK closes and changes nothing. SwiftUI also presents the
-    /// old sheet again from the closed popover, which UIKit refuses; that sheet can be in a window
-    /// for a moment, but it was shown for the retired presentation, so it does not close the
-    /// reopened notice when it leaves.
+    /// once over whatever is up, and its OK closes and changes nothing. At the close SwiftUI also
+    /// presents the old sheet again from the closed popover, which UIKit refuses; that sheet is in a
+    /// window for a moment before the reopen, so it counts for the retired presentation and does
+    /// not close the reopened notice when it leaves.
     @Test("A popover the system closed while its report sends: the old answer says so once and never closes or changes the next report")
     func aSystemClosedPopoversAnswerNeverChangesTheNext() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
@@ -1530,13 +1532,15 @@ struct ChatAISummariesNoticeHostedTests {
     // MARK: - A sheet UIKit refused
 
     /// The system closes the notice's popover with its report sheet up, before or after Report,
-    /// and the user opens the notice again. The reopen retires the old presentation and clears the
-    /// report flag; SwiftUI then presents the old sheet again from the closed popover, a fresh sheet
-    /// that UIKit refuses ("whose view is not in the window hierarchy" in the test logs). That sheet
-    /// can be in a window for a moment first, but it was shown for the presentation the reopen
-    /// retired, so its departure finishes nothing; the old popover's own sheet left before the
-    /// reopen. The reopened notice stays open, with nothing on it, an old refusal leaves it open
-    /// too, and its own report still opens and finishes it on Cancel.
+    /// and the user opens the notice again. At the close, with the report flag still set, SwiftUI
+    /// presents the old sheet again from the closed popover: a fresh sheet that is in a window for
+    /// a moment (15 to 25 ms after the close in the test logs, before the reopen) and that UIKit
+    /// then refuses ("whose view is not in the window hierarchy"). It reached its window while the
+    /// old presentation was current, and the reopen retires that presentation and clears the flag,
+    /// so its departure finishes nothing; the old popover's own sheet left before the reopen. The
+    /// reopened notice stays open, with nothing on it, an old refusal leaves it open too, and its
+    /// own report still opens and finishes it on Cancel. A reopen before the fresh sheet reaches its
+    /// window would count that sheet for the reopened presentation; this test relies on that order.
     @Test("A popover the system closed with its report sheet up, sent or not: the reopened notice stays open until its own report finishes it")
     func aClosedPopoversSheetNeverClosesTheReopenedNotice() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")

@@ -221,9 +221,9 @@ struct ReportConcernSheetModifier: ViewModifier {
     /// the sheet taken down before Report), a report not taken once its sheet has gone, or OK on
     /// "Report Submitted". A sent report does not call it once its caller has opened a later
     /// report or its presentation is gone. A sheet that leaves with nothing sent calls it only if
-    /// the presentation that was current while it was on screen still is: one that never had a
-    /// window, or one shown for a presentation its caller has retired since (the closed popover's
-    /// sheet SwiftUI presents again, which can be in a window for a moment), calls nothing.
+    /// the presentation that was current when it reached its window still is: one that never had a
+    /// window, or one that reached it before its caller retired that presentation (the closed
+    /// popover's sheet SwiftUI presents again, in a window for a moment), calls nothing.
     var onFinish: (() -> Void)?
     /// Set by a caller whose `isPresented` flag outlives the view this sheet is attached to (the
     /// notice's flag lives on its button, the sheet on the popover's content): the caller then
@@ -354,9 +354,9 @@ private struct ReportConcernSheet: View {
                                    "gone with nothing sent: finishes presentation \(presentation.current)")
                     onFinish?()
                 } else {
-                    // Shown for a presentation its caller has retired since (the closed popover's
-                    // sheet SwiftUI presents again), or never in a window: not the current report's
-                    // to end.
+                    // Reached its window before its caller retired that presentation (the closed
+                    // popover's sheet SwiftUI presents again), or never had one: not the current
+                    // report's to end.
                     noticeDebugLog("report sheet \(ObjectIdentifier(life))",
                                    "gone with nothing sent, shown for \(String(describing: life.shownFor)): finishes nothing, current \(presentation.current)")
                 }

@@ -1419,11 +1419,13 @@ happens to the view that asked for it, and a report it did not take says nothing
   `aRemovedOwnersTakenAnswerConfirmsOnce`, `aRemovedNoticesTakenAnswerConfirmsOnce`,
   `anOldAnswerLeavesTheNextSendAlone`, `aSystemClosedPopoversAnswerNeverChangesTheNext`.
 - A sheet that leaves with nothing sent finishes its caller only for the presentation that was
-  current while it was on screen (round 4):
+  current when it reached its window (round 4):
   - `aSystemClosedPopoversAnswerNeverChangesTheNext` and
-    `aClosedPopoversSheetNeverClosesTheReopenedNotice`: the closed popover's sheet SwiftUI presents
-    again is in a window for a moment, shown for the presentation the reopen retired; when it leaves
-    it never closes the reopened notice.
+    `aClosedPopoversSheetNeverClosesTheReopenedNotice`: at the system close SwiftUI presents the
+    closed popover's sheet again, which is in a window for a moment before the reopen, so it counts
+    for the presentation the reopen retires and does not close the reopened notice when it leaves.
+    These rely on that order: a reopen before the stray sheet reaches its window would count it for
+    the reopened presentation.
   - `aClosedPopoverDoesNotReopenTheSheet`, `aRemovedNoticesTakenAnswerConfirmsOnce` (final Cancel):
     a sheet on screen for the current presentation still closes the notice on Cancel.
 - Superseded (round 3, flag deleted in round 4): only a sheet that was on screen leaves; a sheet
