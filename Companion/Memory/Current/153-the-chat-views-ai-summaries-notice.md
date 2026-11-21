@@ -33,7 +33,23 @@ and "Report a concern". The chat pill keeps its own "AI responses may contain er
   or finishes a later report (`ReportPresentation`), so its OK never closes a popover the user has
   reopened.
   Pinned by `reportSubmittedWaitsForTheSheetToLeave` (no alert until the sheet has gone, then once; finish once) and `submittedReportClosesTheSheet` (the popover stays under the alert until OK).
-- **A sheet that leaves with nothing sent (#1113, round 2):** it finishes the caller (closes the
+- **A sheet UIKit refused reports nothing (#1113, round 3, current):** `WindowProbe` reports
+  `onDetach` only after it has reported a window (one `attached` flag on `WindowProbe.Probe`).
+  Apple's `UIView.didMoveToWindow()` note: the window "may be nil … when the receiver has just been
+  removed from its superview or when the receiver has just been added to a superview that is not
+  attached to a window". The round-1 probe turned every nil window into a departure, so a sheet
+  UIKit refused (never in a window) reported one when SwiftUI added it and another when it removed
+  it; the 6cfeecca7 test logs show one or two "report finished, closing the popover" lines right
+  after each refusal. Now that sheet reports nothing, and a sheet that was on screen and leaves with
+  nothing sent always finishes its caller, as in round 1. The round-2 gate below
+  (`ReportPresentation.open`/`asked`, `ReportSheetLife.shownFor`) is deleted: it compensated for
+  the probe's wrong signal, and it made the notice's Cancel depend on `.onChange(of: isPresented)`
+  firing inside the popover's content, which the 6cfeecca7 logs showed not firing (0 of 8 report
+  opens logged `showsReport -> true`). The old popover's own sheet can only race a reopen within
+  one run-loop turn, which a tap cannot do. Debug builds log each report sheet's window attach,
+  detach and finish as `[AINotice … report sheet …` lines. Pinned by `aWindowlessProbeReportsNothing`
+  and `aClosedPopoversSheetNeverClosesTheReopenedNotice`.
+- **SUPERSEDED by round 3 above. A sheet that leaves with nothing sent (#1113, round 2):** it finishes the caller (closes the
   popover) only if it was in a window for a report the caller asked for (`ReportPresentation.open`)
   and still shows. Once the system has closed the popover with its sheet up, the next change of
   the report flag (the notice reopening clears it) makes SwiftUI present that sheet again from the

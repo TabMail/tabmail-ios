@@ -108,32 +108,13 @@ typealias ReportConcernSend = @MainActor (ReportContentType, String, ReportCateg
 
 /// Which presentation of a report sheet is current. A send's answer closes and finishes only the
 /// presentation that sent it: once a later one has opened, or its caller retired it, the answer
-/// leaves the caller alone, so it never closes or finishes a later report. A sheet that leaves with
-/// nothing sent finishes the caller only if it showed for a presentation the caller asked a sheet
-/// for and still shows. Not every sheet is one the caller asked for: once the system has closed a
-/// popover with its report sheet up, a change of the caller's flag makes SwiftUI present that
-/// sheet again from the closed popover, a fresh sheet that UIKit refuses. Whether a report the
+/// leaves the caller alone, so it never closes or finishes a later report. Whether a report the
 /// backend took says "Report Submitted" does not depend on this (see `ReportConcernSubmission`).
 @MainActor
 final class ReportPresentation {
     private(set) var current = 0
-    /// The last presentation the caller asked a sheet for. The first one counts as asked for: a
-    /// caller whose flag starts set shows its sheet without the flag changing.
-    private var opened = 0
 
-    /// The caller asks for the sheet: a new presentation.
-    func open() {
-        current += 1
-        opened = current
-    }
-
-    /// The caller retires the current presentation and asks for no sheet (the notice opening
-    /// afresh): an earlier presentation's answer or sheet no longer closes or finishes anything.
     func next() { current += 1 }
-
-    /// The presentation a sheet showing now belongs to: the current one if the caller asked a sheet
-    /// for it, nil once the caller has retired it.
-    var asked: Int? { opened == current ? current : nil }
 }
 
 /// A sent report, from Report to its end. The send holds it, not the view that asked for the
@@ -239,9 +220,9 @@ struct ReportConcernSheetModifier: ViewModifier {
     /// Called once the report is done: the sheet left with nothing sent (Cancel, a swipe down, or
     /// the sheet taken down before Report), a report not taken once its sheet has gone, or OK on
     /// "Report Submitted". A sent report does not call it once its caller has opened a later
-    /// report or its presentation is gone. A sheet that leaves with nothing sent calls it only if
-    /// it was in a window for a presentation the caller asked a sheet for and still shows; a sheet
-    /// UIKit refused, or one for a presentation the caller retired, calls nothing.
+    /// report or its presentation is gone; a sheet that leaves with nothing sent always calls it.
+    /// A sheet that never had a window (one UIKit refused) has not left, and calls nothing
+    /// (`WindowProbe` reports no departure for it).
     var onFinish: (() -> Void)?
     /// Set by a caller whose `isPresented` flag outlives the view this sheet is attached to (the
     /// notice's flag lives on its button, the sheet on the popover's content): the caller then
@@ -256,9 +237,9 @@ struct ReportConcernSheetModifier: ViewModifier {
     func body(content view: Content) -> some View {
         view
             .onChange(of: isPresented) { _, shows in
-                // A new presentation, asked for: an earlier one's answer or sheet no longer closes
-                // or finishes anything. The form starts afresh with the sheet's own state.
-                if shows { presentation.open() }
+                // A new presentation: an earlier one's answer no longer closes or finishes anything.
+                // The form starts afresh with the sheet's own state.
+                if shows { presentation.next() }
             }
             .sheet(isPresented: $isPresented) {
                 ReportConcernSheet(isPresented: $isPresented, contentType: contentType, content: content,
@@ -274,10 +255,6 @@ struct ReportConcernSheetModifier: ViewModifier {
 private final class ReportSheetLife {
     /// The sheet is in a window, as its probe last saw.
     var inWindow = false
-    /// The presentation this sheet showed for, set when UIKit puts it in a window: the caller's
-    /// current one, if the caller asked a sheet for it. Nil for a sheet that never had a window,
-    /// or that SwiftUI put up for a presentation the caller had retired.
-    var shownFor: Int?
     /// The report this sheet sent, if any. It settles once the sheet has gone.
     var submission: ReportConcernSubmission?
 }
@@ -353,32 +330,24 @@ private struct ReportConcernSheet: View {
         // or taken down with the row or popover that presented it, when its onDismiss may not run.
         .background(WindowProbe(onWindow: { [life, presentation] in
             life.inWindow = true
-            // The presentation it shows for. A sheet that never gets a window shows for none, and
-            // so does one SwiftUI put up for a presentation the caller had retired.
-            life.shownFor = presentation.asked
             noticeDebugLog("report sheet \(ObjectIdentifier(life))",
-                           "in a window: shows for \(String(describing: life.shownFor)), current \(presentation.current), sent \(life.submission != nil)")
+                           "in a window: current \(presentation.current), sent \(life.submission != nil)")
         }, onDetach: { [life, presentation, onFinish] in
+            // Only a sheet that was in a window gets here: one UIKit refused reports nothing.
             life.inWindow = false
             noticeDebugLog("report sheet \(ObjectIdentifier(life))",
-                           "left its window: shown for \(String(describing: life.shownFor)), current \(presentation.current), sent \(life.submission != nil)")
+                           "left its window: current \(presentation.current), sent \(life.submission != nil)")
             // On the next turn, once UIKit has finished closing the sheet. A sheet UIKit only
             // moved to another container is back in a window by then, and has not gone.
             Task { @MainActor in
                 guard !life.inWindow else { return }
                 if let submission = life.submission {
                     submission.sheetLeft()
-                } else if life.shownFor == presentation.current {
-                    // Cancel, a swipe down, or a sheet closed before anything was sent, of the
-                    // presentation the caller still shows.
+                } else {
+                    // Cancel, a swipe down, or a sheet closed before anything was sent.
                     noticeDebugLog("report sheet \(ObjectIdentifier(life))",
                                    "gone with nothing sent: finishes presentation \(presentation.current)")
                     onFinish?()
-                } else {
-                    // Never in a window, or shown for a presentation the caller has retired: the
-                    // caller has moved on and may show a later popover, which this must not close.
-                    noticeDebugLog("report sheet \(ObjectIdentifier(life))",
-                                   "gone with nothing sent: finishes nothing, shown for \(String(describing: life.shownFor)), current \(presentation.current)")
                 }
             }
         }))

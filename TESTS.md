@@ -1418,9 +1418,15 @@ happens to the view that asked for it, and a report it did not take says nothing
   `aClosedSheetsAnswerBeforeTheNextReport`, `aClosedSheetsAnswerDuringTheNextReport`,
   `aRemovedOwnersTakenAnswerConfirmsOnce`, `aRemovedNoticesTakenAnswerConfirmsOnce`,
   `anOldAnswerLeavesTheNextSendAlone`, `aSystemClosedPopoversAnswerNeverChangesTheNext`.
-- A sheet that leaves with nothing sent finishes its caller only for a report the caller asked for
-  and still shows:
-  - `aRetiredPresentationsSheetFinishesNothing`: with a presentation the test owns, a sheet up for
+- Only a sheet that was on screen leaves; a sheet UIKit refused reports no departure:
+  - `aWindowlessProbeReportsNothing`: a `WindowProbe.Probe` added to and removed from a superview
+    with no window reports neither a window nor a detach; one that gets a window and leaves it
+    reports exactly one of each.
+  - `aClosedPopoversSheetNeverClosesTheReopenedNotice`: as below; the refused sheet never closes
+    the reopened notice.
+- Superseded (round 2, gate deleted in round 3): a sheet that leaves with nothing sent finishes its
+  caller only for a report the caller asked for and still shows:
+  - `aRetiredPresentationsSheetFinishesNothing` (removed in round 3, it pinned the deleted gate): with a presentation the test owns, a sheet up for
     a presentation retired before it showed, or retired while it is up, finishes nothing on
     Cancel; the next sheet the caller asks for finishes once on Cancel.
   - `aClosedPopoversSheetNeverClosesTheReopenedNotice`: the system closes the notice's popover

@@ -24,9 +24,9 @@ import UIKit
 ///     report finishes once: on OK, or for a refused report once the sheet has left, never when
 ///     the sheet of a sent report leaves. An old answer never closes, changes or finishes a later
 ///     report.
-///  5. A sheet that leaves with nothing sent finishes its caller only for a presentation the caller
-///     asked a sheet for and still shows: a sheet SwiftUI presents again from a popover the system
-///     closed, or one whose presentation the caller retired, never closes the reopened notice.
+///  5. Only a sheet that was on screen leaves: a sheet SwiftUI presents again from a popover the
+///     system closed, which UIKit refuses, never had a window, so it reports no departure and never
+///     closes the reopened notice. The window probe reports a detach only after it reported a window.
 @Suite("Chat AI summaries notice, hosted", .serialized, .processGlobalState)
 @MainActor
 struct ChatAISummariesNoticeHostedTests {
@@ -770,6 +770,29 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
+    /// UIKit calls `didMoveToWindow` with no window both when a view leaves its window and when it
+    /// is added to, or removed from, a superview that has none (as for a sheet UIKit refused). Only
+    /// the first is a departure.
+    @Test("A probe added to and removed from a superview with no window reports nothing; one that gets a window and leaves it reports one of each")
+    func aWindowlessProbeReportsNothing() async throws {
+        var windows = 0
+        var detaches = 0
+        let probe = WindowProbe.Probe()
+        probe.onWindow = { windows += 1 }
+        probe.onDetach = { detaches += 1 }
+        let windowless = UIView()
+        windowless.addSubview(probe)
+        #expect(probe.window == nil, "control: the superview has no window")
+        probe.removeFromSuperview()
+        #expect(windows == 0 && detaches == 0, "windowless: no window and no detach, got \(windows) and \(detaches)")
+        try await Self.hosting(Color.clear) { controller in
+            controller.view.addSubview(probe)
+            #expect(probe.window != nil, "control: the probe is in a window")
+            probe.removeFromSuperview()
+            #expect(windows == 1 && detaches == 1, "in a window, then out: one of each, got \(windows) and \(detaches)")
+        }
+    }
+
     @Test("A landing that could not present the notice leaves it for the next open; once shown it never opens again")
     func anUnpresentedNoticeIsNotUsedUp() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted view")
@@ -1235,7 +1258,7 @@ struct ChatAISummariesNoticeHostedTests {
     /// the old answer, before or after the next report starts sending, says "Report Submitted"
     /// once over whatever is up, and its OK closes and changes nothing. The reopen also makes
     /// SwiftUI present the old sheet again from the closed popover, which UIKit refuses; that sheet
-    /// belongs to the retired presentation and does not close the reopened notice.
+    /// never has a window, reports no departure, and does not close the reopened notice.
     @Test("A popover the system closed while its report sends: the old answer says so once and never closes or changes the next report")
     func aSystemClosedPopoversAnswerNeverChangesTheNext() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
@@ -1525,63 +1548,15 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
-    // MARK: - A sheet the caller did not ask for, or has retired
-
-    /// A caller that holds the presentation, as the notice does, so the test can retire it.
-    private struct RetiringCallerHost: View {
-        @Bindable var state: SheetState
-        let presentation: ReportPresentation
-        let finishes: Finishes
-
-        var body: some View {
-            Color.clear.reportConcernSheet(isPresented: $state.open, contentType: .suggestedReply,
-                                           content: { "pressed reply" }, send: { _, _, _, _ in false },
-                                           onFinish: { [finishes] in finishes.count += 1 },
-                                           presentation: presentation)
-        }
-    }
-
-    /// A sheet that leaves with nothing sent finishes its caller only for a presentation the caller
-    /// asked a sheet for and still shows. Driven directly, so the result does not depend on when
-    /// SwiftUI and UIKit put up or refuse a sheet: a sheet up for a presentation the caller had
-    /// already retired (as the sheet SwiftUI presents again from a popover the system closed, once
-    /// the notice has opened afresh), and a sheet whose presentation the caller retires while it is
-    /// up (as when the notice opens afresh before the old sheet's departure has been handled). Each
-    /// leaves by Cancel; then the caller asks for the next sheet, whose Cancel finishes it once.
-    @Test("A sheet for a presentation the caller retired, before or while it shows, finishes nothing when it leaves; the next sheet asked for finishes once")
-    func aRetiredPresentationsSheetFinishesNothing() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
-        for retired in ["beforeItShows", "whileItShows"] {
-            let state = SheetState()
-            let presentation = ReportPresentation()
-            let finishes = Finishes()
-            if retired == "beforeItShows" { presentation.next() }
-            try await HostedAccessibility.withAutomation {
-                try await Self.hosting(RetiringCallerHost(state: state, presentation: presentation,
-                                                          finishes: finishes)) { controller in
-                    try await Self.waitUntil { Self.sheetIsUp(controller) }
-                    #expect(Self.sheetIsUp(controller), "\(retired): control: the sheet is up")
-                    if retired == "whileItShows" { presentation.next() }
-                    // Waits until the sheet has gone and its departure has been handled.
-                    try await Self.cancelShowsNothing(in: controller)
-                    #expect(finishes.count == 0, "\(retired): the sheet leaving finishes nothing, got \(finishes.count)")
-                    state.open = true
-                    try await Self.waitUntil { Self.sheetIsUp(controller) }
-                    #expect(Self.sheetIsUp(controller), "\(retired): control: the next sheet is up")
-                    try await Self.cancelShowsNothing(in: controller)
-                    #expect(finishes.count == 1, "\(retired): the next sheet's Cancel finishes it once, got \(finishes.count)")
-                }
-            }
-        }
-    }
+    // MARK: - A sheet UIKit refused
 
     /// The system closes the notice's popover with its report sheet up, before or after Report,
     /// and the user opens the notice again. The reopen retires the old presentation and clears the
     /// report flag; SwiftUI then presents the old sheet again from the closed popover, a fresh sheet
-    /// that UIKit refuses ("whose view is not in the window hierarchy" in the test logs). Neither
-    /// that sheet nor the old popover's own sheet, however late its departure is handled, belongs
-    /// to a presentation the notice still shows: the reopened notice stays open, with nothing on it,
-    /// an old refusal leaves it open too, and its own report still opens and finishes it on Cancel.
+    /// that UIKit refuses ("whose view is not in the window hierarchy" in the test logs). That sheet
+    /// never has a window, so it reports no departure; the old popover's own sheet left before the
+    /// reopen. The reopened notice stays open, with nothing on it, an old refusal leaves it open
+    /// too, and its own report still opens and finishes it on Cancel.
     @Test("A popover the system closed with its report sheet up, sent or not: the reopened notice stays open until its own report finishes it")
     func aClosedPopoversSheetNeverClosesTheReopenedNotice() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")

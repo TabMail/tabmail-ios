@@ -147,7 +147,7 @@ struct AISummariesNoticeButton: View {
     /// presentation. Retire it, so a late answer cannot close or finish this one, and start with no
     /// sheet up. A late answer the backend took still says "Report Submitted", once. Clearing the
     /// flag can make SwiftUI ask the closed popover for its sheet again, which UIKit refuses; that
-    /// sheet shows for the retired presentation, so it finishes nothing either.
+    /// sheet never has a window, so its probe reports no departure and it finishes nothing.
     private func openNotice() {
         reportPresentation.next()
         showsReport = false
@@ -226,19 +226,32 @@ private struct AISummariesNoticePopover: View {
 }
 
 /// Calls `onWindow` when UIKit puts this view in a window, which happens only for a presentation
-/// that is actually shown.
+/// that is actually shown. A view added to, or removed from, a superview with no window reports
+/// nothing: a presentation UIKit refused never had a window, so it neither shows nor leaves.
 struct WindowProbe: UIViewRepresentable {
     let onWindow: () -> Void
-    /// Runs when the probe leaves its window.
+    /// Runs when the probe leaves the window it reported, and only then.
     var onDetach: () -> Void = {}
 
     final class Probe: UIView {
         var onWindow: () -> Void = {}
         var onDetach: () -> Void = {}
+        /// The probe has reported a window and not yet left it.
+        private var attached = false
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
-            if window != nil { onWindow() } else { onDetach() }
+            // Apple, UIView.didMoveToWindow(): "The window property may be nil by the time that
+            // this method is called … This occurs when the receiver has just been removed from its
+            // superview or when the receiver has just been added to a superview that is not
+            // attached to a window." A nil window is a departure only after a window.
+            if window != nil {
+                attached = true
+                onWindow()
+            } else if attached {
+                attached = false
+                onDetach()
+            }
         }
     }
 
