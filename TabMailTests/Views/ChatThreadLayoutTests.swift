@@ -227,7 +227,7 @@ struct ChatThreadLayoutTests {
                 #expect(handler(action), "the action runs")
                 try await Self.waitFor { Self.frame(of: "chatClose", in: controller.view) != nil }
                 #expect(Self.frame(of: "chatClose", in: controller.view) != nil, "the panel opened")
-                func stillOffered() -> Bool {
+                @MainActor func stillOffered() -> Bool {
                     HostedAccessibility.elements(under: controller.view)
                         .contains { $0.accessibilityCustomActions?.contains { $0.name == name } ?? false }
                 }
