@@ -350,10 +350,6 @@ struct ChatThreadView: View {
                 VStack(spacing: 0) {
                     ChatSubjectLine(subject: subject(thread), labels: context.labels)
                     tutorialCard(thread)
-                    #if DEBUG
-                    // Test seam: lets a screen test change the top inset alone.
-                    Color.clear.frame(height: ChatHeaderTestSeam.shared.extraHeight)
-                    #endif
                 }
                 // The open swipe is reachable only below the header.
                 .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).maxY } action: {
@@ -782,16 +778,6 @@ struct ChatThreadView: View {
         }
     }
 }
-
-#if DEBUG
-/// Test-only extra height under the chat's header, so a screen test can grow and shrink the
-/// top inset without changing the content or the container.
-@MainActor @Observable
-final class ChatHeaderTestSeam {
-    static let shared = ChatHeaderTestSeam()
-    var extraHeight: CGFloat = 0
-}
-#endif
 
 /// When a chat row counts as shown: its visible part is at least `ChatViewLayout.shownShareOfRow`
 /// of the row, or at least `ChatViewLayout.shownShareOfViewport` of the chat's visible height. One
