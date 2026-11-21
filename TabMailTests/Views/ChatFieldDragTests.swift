@@ -136,6 +136,86 @@ struct ChatFieldDragTests {
         }
     }
 
+    /// A drag that started in the focused field's text, and the field's share of it, worked out by
+    /// hand: the text keeps the drag until its end, the rest of the same drag is the field's.
+    private struct Shared {
+        let travel: CGFloat
+        let velocity: CGFloat
+        let textScrolled: CGFloat
+        let textAtEnd: Bool
+        let share: CGFloat
+        let shareVelocity: CGFloat
+        let opens: Bool
+        let why: String
+    }
+
+    private static let shared: [Shared] = [
+        Shared(travel: -30, velocity: -90, textScrolled: 30, textAtEnd: false, share: 0, shareVelocity: 0, opens: false,
+               why: "the text still had room: it took the whole drag"),
+        Shared(travel: -32, velocity: -2000, textScrolled: 30, textAtEnd: false, share: 0, shareVelocity: 0, opens: false,
+               why: "a fast flick inside the text, the text a sample behind the finger: still the text's"),
+        Shared(travel: -100, velocity: 0, textScrolled: 40, textAtEnd: true, share: -60, shareVelocity: 0, opens: true,
+               why: "the text reached its end 40 in; the rest of the same drag, 60, opens the panel"),
+        Shared(travel: -90, velocity: 0, textScrolled: 40, textAtEnd: true, share: -50, shareVelocity: 0, opens: false,
+               why: "50 past the end is short of the open distance"),
+        Shared(travel: -60, velocity: -120, textScrolled: 40, textAtEnd: true, share: -20, shareVelocity: -120, opens: false,
+               why: "past the end, the flick counts: 20 + 30 = 50 predicted, short"),
+        Shared(travel: -60, velocity: -400, textScrolled: 40, textAtEnd: true, share: -20, shareVelocity: -400, opens: true,
+               why: "past the end, a quick flick predicts 120 and opens"),
+        Shared(travel: -70, velocity: -300, textScrolled: 0, textAtEnd: true, share: -70, shareVelocity: -300, opens: true,
+               why: "text that does not scroll (a short draft) leaves the field the whole drag"),
+        Shared(travel: 20, velocity: 0, textScrolled: -20, textAtEnd: false, share: 0, shareVelocity: 0, opens: false,
+               why: "a drag down scrolls the text back; nothing is the field's"),
+    ]
+
+    @Test("In the focused field's text the text keeps the drag until its end; the rest of the same drag is the field's")
+    func fieldShareOfATextDrag() {
+        for one in Self.shared {
+            let drag = ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: one.travel), velocity: CGSize(width: 0, height: one.velocity))
+            let share = ChatFieldDrag.fieldShare(of: drag, textScrolled: one.textScrolled, textAtEnd: one.textAtEnd)
+            let expected = Self.upward(one.share, one.shareVelocity)
+            let opens = ChatFieldDrag.opens(letGo: share)
+            #expect(share == expected, "\(one.why)")
+            #expect(opens == one.opens, "\(one.why)")
+        }
+    }
+
+    @Test("The pan reads the field's share from the text under the drag's first touch, its scroll since then up to its end")
+    @MainActor
+    func panSharesWithTheTextUnderTheTouch() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let text = UITextView(frame: CGRect(origin: .zero, size: Self.textBox))
+        text.contentSize = Self.textContent
+        text.contentOffset = .zero
+        let inner = UIView()
+        text.addSubview(inner)
+        let end = Self.textContent.height - Self.textBox.height
+
+        coordinator.touchDown(on: inner)
+        text.contentOffset = CGPoint(x: 0, y: end / 2)
+        let inside = coordinator.share(Self.upward(-end / 2, -900))
+        let none = Self.upward(0, 0)
+        #expect(inside == none, "the text had room: none of it is the field's")
+        text.contentOffset = CGPoint(x: 0, y: end + Self.bounce)
+        let past = coordinator.share(Self.upward(-end - 70, -300))
+        let rest = Self.upward(-70, -300)
+        #expect(past == rest,
+                "past the end the rest is the field's; the text's bounce is not counted as the text's")
+
+        coordinator.touchDown(on: UIView())
+        let off = coordinator.share(Self.upward(-70, -300))
+        #expect(off == rest, "off the text, the whole drag is the field's")
+    }
+
+    private static func upward(_ travel: CGFloat, _ velocity: CGFloat) -> ChatHorizontalPan.Sample {
+        ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: travel), velocity: CGSize(width: 0, height: velocity))
+    }
+
+    /// A text view's box and its longer content, and how far it bounces past its end.
+    private static let textBox = CGSize(width: 100, height: 100)
+    private static let textContent = CGSize(width: 100, height: 300)
+    private static let bounce: CGFloat = 15
+
     /// A pan whose travel and speed the test sets, as UIKit reports them to the delegate and the
     /// action.
     private final class MovedPan: UIPanGestureRecognizer {
@@ -179,7 +259,7 @@ struct ChatFieldDragTests {
 
     // UIKit arbitrates two recognizers on a touch by asking their delegates; a unit test cannot make
     // a real touch, so it asks the pan's delegate about recognizers on a real text view.
-    @Test("The text view's scroll and long presses go first; its taps wait for the drag; nothing else is ordered")
+    @Test("The text view's long presses go first, its scroll runs beside the drag, its taps wait for the drag; nothing else is ordered")
     @MainActor
     func textViewOrdering() {
         let coordinator = ChatFieldPan.Coordinator()
@@ -194,8 +274,10 @@ struct ChatFieldDragTests {
         let innerTap = UITapGestureRecognizer()
         inner.addGestureRecognizer(innerTap)
 
-        #expect(coordinator.gestureRecognizer(pan, shouldRequireFailureOf: text.panGestureRecognizer),
-                "overflowing text scrolls before the drag")
+        #expect(coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: text.panGestureRecognizer),
+                "overflowing text scrolls beside the drag, which gets only the field's share")
+        #expect(!coordinator.gestureRecognizer(pan, shouldRequireFailureOf: text.panGestureRecognizer),
+                "the drag does not wait for the text's scroll: a failed drag could not take the rest past the end")
         #expect(coordinator.gestureRecognizer(pan, shouldRequireFailureOf: press), "a held press stays the text's")
         #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: tap), "a drag never ends as the text's tap")
         #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: innerTap), "a tap inside the text view too")
@@ -214,6 +296,9 @@ struct ChatFieldDragTests {
         plain.addGestureRecognizer(plainTap)
         plain.addGestureRecognizer(plainPress)
         #expect(!coordinator.gestureRecognizer(pan, shouldRequireFailureOf: scroll.panGestureRecognizer))
+        #expect(!coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: scroll.panGestureRecognizer),
+                "the chat's own scroll never runs beside the drag")
+        #expect(!coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: press), "nor the text's long press")
         #expect(!coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: scroll.panGestureRecognizer))
         #expect(!coordinator.gestureRecognizer(pan, shouldRequireFailureOf: plainPress))
         #expect(!coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: plainTap))

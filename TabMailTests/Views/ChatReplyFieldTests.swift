@@ -909,7 +909,8 @@ struct ChatReplyFieldTests {
         // One bridge for every chat pan: the field's drag reads the swipes' sample and outcome, with
         // no delivery of its own.
         let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
-        #expect(Self.count("ChatHorizontalPan.deliver(recognizer, moved: moved, ended: ended)", in: swipe) == 1)
+        #expect(Self.count("ChatHorizontalPan.deliver(recognizer, moved: { moved(coordinator.share($0)) }, ended: { ended(coordinator.share($0), $1) })", in: swipe) == 1,
+                "the field's pan hands on only the field's share of each sample (`ChatFieldPan.Coordinator.share`)")
         #expect(Self.count("static func deliver(", in: swipe) == 2, "the bridge's, and the swipe's sideways reading of it")
         #expect(Self.count("recognizer.translation(in:", in: swipe) == 1, "one place samples a pan")
         // VoiceOver opens the panel with a named action on the text field it focuses, offered only

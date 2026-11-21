@@ -442,9 +442,9 @@ final class ChatSwipeUITests: XCTestCase {
     private static let openDistance: CGFloat = 60
     private static let shortFlick: CGFloat = 40
 
-    /// The focused field: a drag up in text that overflows the field's lines scrolls that text, so
-    /// the panel stays shut and the field keeps its focus. The text is first scrolled to its top, so
-    /// the drag has room; which line is at the top is read by tapping the text's top-left corner and
+    /// The focused field: a drag up in text that overflows the field's lines, stopping short of the
+    /// text's end, only scrolls that text, so the panel stays shut and the field keeps its focus. The
+    /// text is first scrolled to its top, so the drag has room; which line is at the top is read by tapping the text's top-left corner and
     /// typing a mark there. A short draft's drag opens the panel
     /// (`testDragUpOnAShortFocusedDraftOpensThePanelWithIt`).
     func testDragUpInOverflowingTextScrollsIt() {
@@ -466,6 +466,26 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag")
         XCTAssertEqual(long.value as? String, Self.overflowingText, "control: the text is unchanged")
     }
+
+    /// The same draft and the same start, but the drag carries on past the text's end: the rest of
+    /// the same drag is the field's (mock v15 H2), so it opens the panel.
+    func testDragUpInOverflowingTextPastItsEndOpensThePanel() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        field.tap()
+        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.overflowingText)
+        let long = typedField(containing: Self.overflowingLastLine, in: app)
+        XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
+        textScroll(long, by: Self.toTheTextsTop, in: app)
+        XCTAssertEqual(topLine(of: long), "Line 1", "control: the text is at its top, with room to scroll")
+        XCTAssertFalse(app.buttons["chatClose"].exists, "control: the panel is shut")
+        textScroll(long, by: -Self.pastTheTextsEnd, in: app)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag past the text's end opened the panel")
+    }
+
+    /// The text's scroll room (three lines, about 60 points) plus well past the open distance.
+    private static let pastTheTextsEnd: CGFloat = 220
 
     /// A slow vertical drag in the text from its middle, held at the end so it does not coast.
     private func textScroll(_ text: XCUIElement, by travel: CGFloat, in app: XCUIApplication) {

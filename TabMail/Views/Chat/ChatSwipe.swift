@@ -509,7 +509,10 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
 /// (`ChatFieldDrag.begins`), so a sideways drag stays a swipe or the back swipe. Once it starts it
 /// cancels the touch for the views under it (`cancelsTouchesInView`), so the field's text view
 /// never takes the let-go as a tap and takes focus; a tap does not move, never starts it, and
-/// focuses the field as before.
+/// focuses the field as before. In the focused field's overflowing text it runs alongside the
+/// text's scroll and hands on only the field's share of the drag (`Coordinator.share`): none while
+/// the text can still scroll, the rest of the same drag once the text has reached its end (mock
+/// v15 H2).
 struct ChatFieldPan: UIGestureRecognizerRepresentable {
     /// Off over the open panel and in the tutorial. Turning it off mid-drag cancels the drag, which
     /// ends as an interrupted one.
@@ -542,9 +545,12 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         recognizer.isEnabled = isEnabled
     }
 
-    /// The swipes' delivery (`ChatHorizontalPan.deliver`), both axes.
+    /// The swipes' delivery (`ChatHorizontalPan.deliver`), both axes, each sample the field's
+    /// share of the drag (`Coordinator.share`).
     func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
-        ChatHorizontalPan.deliver(recognizer, moved: moved, ended: ended)
+        let coordinator = context.coordinator
+        ChatHorizontalPan.deliver(recognizer, moved: { moved(coordinator.share($0)) },
+                                  ended: { ended(coordinator.share($0), $1) })
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
@@ -554,20 +560,58 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             return ChatFieldDrag.begins(translation: ChatHorizontalPan.sample(pan).travel)
         }
 
-        /// The drag runs alone, as a swipe does: once it has the finger, nothing else acts on it.
+        /// The drag runs alone, as a swipe does, except beside the field's own text scroll (only
+        /// while its text overflows the field's six lines): both follow the finger, and the drag
+        /// hands on only the field's share (`share`), so the text keeps the drag until its end.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-            false
+            Self.isTextViews(other) && ChatSwipeCloser.Coordinator.isScroll(other)
         }
 
-        /// The field's text view goes first where it did: its scroll (only while its text overflows
-        /// the field's six lines) and its long presses (caret placement, the loupe, selection). The
-        /// drag starts only once they have declined, so a drag in overflowing text scrolls it and a
-        /// press held before moving stays the text's.
+        /// The field's text view's long presses go first (caret placement, the loupe, selection):
+        /// the drag starts only once they have declined, so a press held before moving stays the
+        /// text's.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer,
                                shouldRequireFailureOf other: UIGestureRecognizer) -> Bool {
-            Self.isTextViews(other)
-                && (ChatSwipeCloser.Coordinator.isScroll(other) || other is UILongPressGestureRecognizer)
+            Self.isTextViews(other) && other is UILongPressGestureRecognizer
+        }
+
+        /// The text the drag's first touch landed in, and where it was scrolled then.
+        private weak var text: UIScrollView?
+        private var textStart: CGFloat = 0
+
+        /// Notes the text under a new drag's first touch.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            if recognizer.numberOfTouches == 0 { touchDown(on: touch.view) }
+            return true
+        }
+
+        /// A new drag's first touch landed on `view`: the text around it, if any, and its scroll
+        /// position now.
+        func touchDown(on view: UIView?) {
+            text = Self.scrollingText(around: view)
+            textStart = text?.contentOffset.y ?? 0
+        }
+
+        /// The field's share of `drag` (`ChatFieldDrag.fieldShare`): how far the text under it has
+        /// scrolled since the touch, up to its end, is the text's. Off the text, all of it.
+        func share(_ drag: ChatHorizontalPan.Sample) -> ChatHorizontalPan.Sample {
+            guard let text else { return drag }
+            let end = max(text.contentSize.height + text.adjustedContentInset.bottom - text.bounds.height,
+                          -text.adjustedContentInset.top)
+            let offset = text.contentOffset.y
+            return ChatFieldDrag.fieldShare(of: drag, textScrolled: min(offset, end) - textStart,
+                                            textAtEnd: offset >= end)
+        }
+
+        /// The scrolling text view (`UITextInput`) that `view` is or sits in.
+        static func scrollingText(around view: UIView?) -> UIScrollView? {
+            var view = view
+            while let current = view {
+                if let scroll = current as? UIScrollView, current is UITextInput { return scroll }
+                view = current.superview
+            }
+            return nil
         }
 
         /// The text view's taps wait for the drag's decision, so a drag never ends as a tap that

@@ -1036,9 +1036,23 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    for) stay in its delegate and what it does with a sample stays in `ChatThreadView`. It starts only on a first movement more
    up than sideways (`ChatFieldDrag.begins`), and once it starts it cancels the touch for the views
    under it (`cancelsTouchesInView`), so a drag, short or long, never ends as a tap that focuses the
-   field; a tap never starts it and focuses the field as before. The field's text view goes first
-   where it did: the pan waits for its scroll (text overflowing the six lines) and its long presses
-   (caret, loupe, selection), and its taps wait for the pan. Its state (`ChatFieldDrag.Progress`) is
+   field; a tap never starts it and focuses the field as before. The field's text view keeps its
+   own gestures: the pan waits for its long presses (caret, loupe, selection), and its taps wait
+   for the pan. **Overflowing text (amended 2026-11-21, mock v15 H2):** while the focused field's
+   text (over its six lines) can still scroll, the text keeps the drag; once it reaches its end,
+   the rest of the SAME drag is the field's: its swell, its open distance and its flick, as for a
+   short draft. The pan runs beside the text's own scroll (`shouldRecognizeSimultaneouslyWith`),
+   notes the text under the drag's first touch and its scroll offset then, and hands on only the
+   field's share of each sample (`ChatFieldPan.Coordinator.share`, `ChatFieldDrag.fieldShare`):
+   the finger's travel less what the text scrolled, counted up to its end; short of the end, no
+   upward travel and no velocity, so a flick inside the text never opens the panel. UIKit cannot
+   start a recognizer that failed earlier in the same touch, so waiting for the scroll could never
+   hand the rest of a drag to the field; sharing the touch keeps one delivery and one release path.
+   Known limit: past its end the text's own bounce runs while the field swells. Text that does not
+   scroll (a short draft) leaves the field the whole drag. *Superseded 2026-11-21 (overflowing
+   text could never drag the panel open):* "The field's text view goes first where it did: the pan
+   waits for its scroll (text overflowing the six lines) and its long presses (caret, loupe,
+   selection), and its taps wait for the pan." Its state (`ChatFieldDrag.Progress`) is
    reset with the pill's spring however the drag ends (`fieldDragEnded`), so a cancelled drag (the
    panel opening on an agent answer mid-drag, which turns the pan off, or a system interruption)
    springs back too. **The release policy** (`ChatFieldDrag.opens(letGo:)`, amended 2026-11-21):
@@ -1074,9 +1088,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel`,
    `testShortDragUpOnTheReplyFieldSettlesBack` and `testDraggedOpenPanelClosesOnCloseAndOnTheDim`
    (taps), `ChatReplyFieldTests.fieldDragWiring`, the pan's rules in `ChatFieldDragTests`, and
-   `testDragUpInOverflowingTextScrollsIt` (the text view's scroll first: scrolled to its top, a
-   drag up within its scroll room moves another line to the top, read by tapping the top-left
-   corner and typing a mark; was
+   `testDragUpInOverflowingTextScrollsIt` (the text keeps a drag short of its end: scrolled to its
+   top, a drag up within its scroll room moves another line to the top, read by tapping the
+   top-left corner and typing a mark, and the panel stays shut),
+   `testDragUpInOverflowingTextPastItsEndOpensThePanel` (the same drag carried past the end opens
+   the panel), `ChatFieldDragTests.fieldShareOfATextDrag` and `panSharesWithTheTextUnderTheTouch`
+   (the field's share; `textViewOrdering` pins the pan beside the text's scroll; the first was
    `testDragUpInOverflowingTextScrollsItAndShortTextOpens`, whose short half ran signed out, where
    the sign-in bar replaces the panel's editor), the text's long press
    (`testLongPressInTheFocusedFieldMovesTheCaret`: a held press at the text's start puts the caret
