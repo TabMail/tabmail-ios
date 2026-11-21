@@ -76,9 +76,11 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
         var widthCap: Int?
         /// The highest UID this listing lists (#1062): the last UIDNEXT - 1 its
         /// SELECTs reported (at least the last local UID). Every call bounds its
-        /// ranges by it, so a listing never asks above the server's top, and an
-        /// empty range never sizes the next one past it. A listing's first call,
-        /// with none stored, asks the folder's UIDNEXT before its first range.
+        /// ranges by it (each range is cut at it), so a listing never asks above
+        /// the server's top. A listing's first call, with none stored, asks the
+        /// folder's UIDNEXT before its first range; a SELECT without UIDNEXT
+        /// leaves it unknown, and the listing does not go on. A change of it is
+        /// progress.
         /// It lives in this state, so it is never used under another UIDVALIDITY
         /// (the state's `epoch`). Unused while a change bookmark bounds the
         /// listing (`bookmarkUpper`).
@@ -309,9 +311,6 @@ extension IMAPProvider {
         // The cap before this call first raised it: restored if the call makes
         // no progress, so a call that moves nothing never widens the next try.
         var capBeforeGrowth: Int?
-        // The carried range's proof request, reserved when the folder starts
-        // (`CatchUpContext.reserveOne`).
-        var proofReserved = false
 
         rangeLoop: while true {
             // The range this turn works: a carried one first (`Listing.carried`),
@@ -334,10 +333,6 @@ extension IMAPProvider {
             var rangeFloor = loadsFrom
             if let carried = listing.carried {
                 listing.carried = nil
-                // Reserved ahead of the time check: a slice shorter than one
-                // request still sends the proof, so a carried listing always
-                // moves (#1062).
-                if !carried.proven { proofReserved = context.reserveOne() }
                 lo = carried.lo
                 hi = carried.hi
                 // A carried UID may be stale: loaded by another path since (now a
@@ -421,7 +416,17 @@ extension IMAPProvider {
                         }
                         return CatchUpFolderResult(folderId: folder.id, epoch: status.observedEpoch)
                     }
-                    let learned = max(lastLocal ?? 0, status.uidNext.map { $0 - 1 } ?? 0)
+                    // A SELECT without UIDNEXT did not say where the folder ends:
+                    // the top is unknown, so none is stored and the folder stops
+                    // for the call, still owed. It never completes on an unknown
+                    // top (#1062, MIS-IOS-004).
+                    guard let knownNext = status.uidNext else {
+                        if DebugModeManager.isLoggingEnabled() {
+                            BackgroundSyncLogger.logDebug("[CatchUp] \(path): SELECT reported no UIDNEXT — top unknown, stopping this folder for the pass")
+                        }
+                        break rangeLoop
+                    }
+                    let learned = max(lastLocal ?? 0, knownNext - 1)
                     upper = learned
                     listing.top = learned
                 }
@@ -497,9 +502,6 @@ extension IMAPProvider {
                 // is applied where the next range is cut (`Listing.widthCap`).
                 span = Self.nextListingRangeSpan(
                     messages: context.listingRangeMessages, width: hi - lo + 1, held: flags.count)
-                // Never past the known top: an empty range's maximum span stops
-                // at it (#1062).
-                if let upper { span = min(span, max(1, upper - hi)) }
                 listing.rangeWidth = span
                 // A range that answers raises the cap again (`Listing.widthCap`),
                 // kept only if the call makes progress (see below).
@@ -554,14 +556,11 @@ extension IMAPProvider {
             // bounded hold as an unloaded UID (#1062). The range is carried
             // unproven meanwhile, so a retry asks only the SEARCH.
             var proofStopped = false
-            // Consumed by this range whether or not it still needs the proof.
-            let reserved = proofReserved
-            proofReserved = false
             if !proven, !candidates.isEmpty || loadRange != nil {
                 // A UID missing from the FETCH is only a candidate: a short FETCH is a
                 // real server shape. The walk's own absence proof decides, under the
                 // same epoch.
-                if !reserved, !context.hasBudget(cost: 1) {
+                if !context.hasBudget(cost: 1) {
                     // The budget ran out after the listing: the range is carried,
                     // so the next call proves it without listing it again (#1062).
                     // *Superseded (#1062):* "budget spent before the membership

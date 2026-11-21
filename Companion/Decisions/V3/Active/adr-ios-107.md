@@ -1109,7 +1109,16 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
   under a limit), so pruned mail is neither listed for load nor loaded. Below the load start a listing
   only checks local rows. The upper bound is the larger of the last local UID and, with a change
   bookmark of the same epoch, the bookmark's UIDNEXT - 1 (by the bookmark, not by tracking), else the
-  listing's own SELECT UIDNEXT - 1.
+  listing's stored top (d6 2026-11-20, below). *Superseded (d6):* "else the listing's own SELECT
+  UIDNEXT - 1", set per call from its first listed range.
+- **Stored top, current (d6 2026-11-20).** `IMAPCatchUpState.Listing.top`, in the epoch-tagged state: the
+  last UIDNEXT - 1 the listing's SELECTs reported, at least the last local UID, raised by every later
+  listed SELECT. A listing's first call with none stored reads the folder's UIDNEXT (one request,
+  UIDVALIDITY checked) before its first range; every range is cut at the top. A SELECT without UIDNEXT
+  is unknown (MIS-IOS-004): no top is stored, the folder stops for the call and stays owed, so a listing
+  never completes on an unknown top. A change of the top alone is progress. Why: with no bookmark, each
+  call's first range was asked blind, and an empty one sized the next to the maximum span, so at one
+  request per call an owed folder walked above the server's top and never completed.
 - **UID-range membership proof.** A FETCH can be short, so a UID in the load range that is absent from
   the FETCH and has no local row is never read as absent: when the range has one, `UID SEARCH` over the
   whole load range (with the removal candidates) proves membership under the same epoch. A UID SEARCH
@@ -1174,7 +1183,8 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     listing failure that ended the folder's pass with no split.
   - *Width cap, current (d1 2026-11-20).* A range that times out sets the cap
     (`IMAPCatchUpState.Listing.widthCap`) to its width divided by `SyncConfig.catchUpWidthCapShrinkFactor`;
-    each range that answers multiplies it by `SyncConfig.catchUpWidthCapGrowthFactor`, and at
+    each range that answers multiplies it by `SyncConfig.catchUpWidthCapGrowthFactor` (d6: kept only
+    when the call makes progress; a call that moves nothing restores the cap it started with), and at
     `catchUpListingMaxRangeSpan` it is dropped. No range-scoped end (`widthCapThrough` removed). Why: the
     cap below only ever shrank, so about 20 timeouts unrelated to range size left a sparse folder at
     one-UID ranges over millions of UIDs. A cap-only change is still no progress.

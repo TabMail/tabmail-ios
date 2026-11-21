@@ -107,18 +107,6 @@ struct CatchUpContext: Sendable {
             return true
         }
     }
-
-    /// Charges one request by the count alone, with no time check (#1062): the
-    /// one request a carried listing owes its proof is reserved when the call
-    /// starts that folder, so a slice shorter than one request still sends it
-    /// and the listing moves. False, and nothing charged, when the count is spent.
-    func reserveOne() -> Bool {
-        charged.withLock { spent in
-            guard spent < maxRequests else { return false }
-            spent += 1
-            return true
-        }
-    }
 }
 
 /// A read/flag state the server reported for one existing message.

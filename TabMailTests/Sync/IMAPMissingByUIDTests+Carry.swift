@@ -257,6 +257,56 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    @Test("The server's UIDNEXT grows during an owed folder's listing: the arrivals are listed and loaded, and no range asks above the top the server had when it was asked")
+    @MainActor
+    func topGrowsDuringTheListing() async throws {
+        let server = Self.carryServer
+        let firstTop = try #require(server.last)
+        let arrivals = Array((firstTop + 1)...(firstTop + SyncConfig.catchUpListingMinRangeSpan / 2))
+        try await Self.withWorld("carry-top-grows", server: server, local: server,
+                                 rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
+            try await w.dropLocal(Self.carryMissing)
+            try await w.markOwed()
+            let clock = CatchUpTestClock()
+            let start = w.server.recordedCommands().count
+            // The UIDNEXT read and the first range: the listing has its top.
+            await w.slice(maxRequests: 2, clock: clock)
+            #expect(try w.catchUpState()?.listing != nil, "setup: the listing is in progress")
+            let beforeArrivals = w.server.recordedCommands().count
+            w.server.setMessages(w.server.messages(in: Self.path) + arrivals.map { Self.message($0) }, in: Self.path)
+            let all = server + arrivals
+            let bound = Self.carryRequestsNeeded + 4
+            let slices = try await Self.slicesUntilRepaired(w, expected: all, maxRequests: 1, clock: clock, bound: 2 * bound)
+            #expect(slices <= bound, "#1062: the listing completes within \(bound) calls: \(slices)")
+            try w.expectHeldExactly(all, "#1062 top grows")
+            let commands = w.server.recordedCommands()
+            let early = Self.listingRanges(Array(commands[start..<beforeArrivals])).filter { $0.upperBound > firstTop }
+            let late = Self.listingRanges(Array(commands.dropFirst(beforeArrivals))).filter { $0.upperBound > all.count }
+            #expect(early.isEmpty && late.isEmpty, "#1062: no range above the live top: \(early) \(late)")
+        }
+    }
+
+    @Test("A server whose SELECT omits UIDNEXT: the owed folder's top is unknown, so its listing never completes and the owed mark stays")
+    @MainActor
+    func unknownTopKeepsTheFolderOwed() async throws {
+        let server = Self.carryServer
+        let missing = Array((server.count - 5)...server.count)
+        try await Self.withWorld("carry-no-uidnext", server: server, local: server,
+                                 rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
+            try await w.dropLocal(missing)
+            try await w.markOwed()
+            w.server.suppressSelectUidNext(for: Self.path)
+            defer { w.server.restoreSelectUidNext(for: Self.path) }
+            let clock = CatchUpTestClock()
+            let completedBefore = try w.catchUpState()?.lastCompletedAt
+            for _ in 0..<3 { await w.slice(clock: clock) }
+            #expect((try w.changeState()).selfHealDue, "#1062: an unknown top never settles the owed mark")
+            #expect(try w.catchUpState()?.lastCompletedAt == completedBefore,
+                    "#1062: the listing did not complete on an unknown top")
+            try w.expectNotHeld(missing, "#1062: nothing is listed under an unknown top")
+        }
+    }
+
     // MARK: - a carried listing on a slow link (#1062)
 
     /// One call whose slice is shorter than one request: time is left until the

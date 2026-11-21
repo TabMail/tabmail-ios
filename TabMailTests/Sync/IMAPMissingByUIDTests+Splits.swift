@@ -545,6 +545,33 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    @Test("A held UID keeps the listing on its range: a call that lists that range again and moves nothing leaves the width cap as it was")
+    @MainActor
+    func noProgressCallKeepsTheCap() async throws {
+        let held = 12
+        let server = Array(1...40)
+        try await Self.withWorld("cap-no-progress", server: server, local: server) { w in
+            try await w.dropLocal([held])
+            w.server.suppressFetchRecord(in: Self.path, uids: [held])
+            defer { w.server.suppressFetchRecord(in: Self.path, uids: []) }
+            try await w.markOwed()
+            let cap = 4
+            try await Self.setListing(w, nextUid: 1, rangeWidth: cap, widthCap: cap, top: server.last)
+            let clock = CatchUpTestClock()
+            var idle = 0
+            for _ in 0..<4 {
+                let before = try #require(try w.catchUpState()?.listing, "setup: the listing is in progress")
+                await w.slice(clock: clock)
+                let after = try #require(try w.catchUpState()?.listing, "setup: the held UID keeps the listing open")
+                guard after.withoutWidthCap == before.withoutWidthCap else { continue }
+                idle += 1
+                #expect(after.widthCap == before.widthCap,
+                        "#1062: a call that moved nothing changed the cap: \(String(describing: before.widthCap)) -> \(String(describing: after.widthCap))")
+            }
+            #expect(idle >= 1, "setup: a call listed the held range again and moved nothing")
+        }
+    }
+
     /// Reload the stored catch-up state through storage, as a restart reads it.
     @MainActor
     static func reloadState(_ w: World) async throws {

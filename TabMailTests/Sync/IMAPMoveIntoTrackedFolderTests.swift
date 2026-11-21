@@ -395,10 +395,20 @@ struct IMAPMoveIntoTrackedFolderTests {
             #expect(w.server.uids(in: "INBOX", rfc822MessageId: Self.target).isEmpty, "below-window: setup: the source no longer holds it")
             let before = try w.heldTarget().map { "\($0.folderPath)/\($0.messageId)" }
             #expect(before.contains("Archive/\(sourceUID)"), "below-window: setup: the unproven MOVE left its remnant under the source UID: \(before)")
-            // Whether a row already holds the copy at its server UID is not a
-            // precondition: the MOVE's drain can relist the owed Archive and
-            // load the copy before this check, which only heals sooner (#1062).
-            // The remnant under the source UID is what the check must remove.
+            // The MOVE's drain can relist the owed Archive and load the copy
+            // while it is still the newest UID (#1062). That row is taken away
+            // here, after the arrivals put the copy below the window, so the
+            // check below must load it from below the window itself.
+            let archiveFolderId = archiveId
+            let copyMessageId = "\(copyUID)"
+            try await w.pool.write { db in
+                try db.execute(sql: "DELETE FROM messageHeader WHERE folderId = ? AND messageId = ?",
+                               arguments: [archiveFolderId, copyMessageId])
+            }
+            let unhealed = try w.heldTarget().map { "\($0.folderPath)/\($0.messageId)" }
+            #expect(!unhealed.contains("Archive/\(copyUID)"), "below-window: setup: no row holds it at its server UID yet: \(unhealed)")
+            let newer = w.server.messages(in: "Archive").filter { $0.uid > copyUID }.count
+            #expect(newer >= SyncConfig.syncMessageLimit, "below-window: setup: the copy is below the newest window when the check runs: \(newer) newer")
 
             // The older-mail check alone heals it: no foreground sync runs.
             await AccountManager.shared.clearRecentlyCompletedForTesting()
