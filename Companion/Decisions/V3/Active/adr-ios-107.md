@@ -1401,8 +1401,11 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     an entry of another epoch reads as absent and is never rebound; none is written under an unknown
     epoch. (2) Loads start at the held range's start (the walk's start once it started, else the epoch's
     window floor; none: nothing loads; with no local row either, nothing is checked: the listing completes
-    with no server read and NOT clean, so an owed folder stays owed until a window listing records a floor;
-    *superseded:* it completed clean); under a storage limit at least one past the epoch's prune cutoff;
+    with no server read and NOT clean, so an owed folder stays owed until a window listing records a floor
+    or its walk starts (accepted limitation: an EMPTY owed folder gets no floor, since an empty window names
+    no UID, so it stays owed until its walk starts; no catch-up request is spent and nothing is lost); with
+    no floor but local rows, the listing reconciles those rows, loads nothing and completes clean, since
+    missing mail with no floor is the walk's and scrolling's to load; *superseded:* it completed clean); under a storage limit at least one past the epoch's prune cutoff;
     nothing else raises it: the first local UID is no evidence of what was pruned. (3) The scan floor is
     the lower of that start (before the cutoff) and the first local UID; the cutoff never raises it. (4)
     The prune cutoff, the only record of what was pruned, is written by the prune in its delete

@@ -670,6 +670,11 @@ extension IMAPMissingByUIDTests {
             got = try await seed()
             #expect(got?.uid == firstLocal - 1, "#1062: a window floor of another epoch does not lower the seed: \(String(describing: got))")
 
+            try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 30, epoch: Self.epoch, db: db) }
+            got = try await seed()
+            #expect(got?.uid == firstLocal - 1,
+                    "#1062: a window floor of the current epoch above the first local UID does not raise the seed (the lower of the two): \(String(describing: got))")
+
             try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 15, epoch: Self.epoch, db: db) }
             got = try await seed()
             #expect(got?.uid == 14, "#1062: a window floor of the current epoch below the first local UID lowers the seed: \(String(describing: got))")

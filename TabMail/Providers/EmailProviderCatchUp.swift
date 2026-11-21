@@ -203,6 +203,11 @@ struct CatchUpCompletedListing: Sendable, Equatable {
     /// none was passed over by the hold bound. An IMAP listing with no load
     /// floor of the folder's epoch and no local row read nothing from the
     /// server and is not clean; one whose mailbox the server reports empty is.
+    /// So an owed folder that is empty, before its older-mail walk starts,
+    /// stays owed until a window listing records a floor (an empty window names
+    /// no UID) or the walk starts; it costs no catch-up request. A listing with
+    /// no load floor but local rows reconciles those rows, loads nothing, and
+    /// is clean: what is missing there is the walk's and scrolling's to load.
     /// *Superseded (#1062):* "and there was a range to list", which read as if
     /// an empty mailbox could never complete clean.
     let clean: Bool
