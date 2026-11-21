@@ -111,6 +111,21 @@ struct DraftAttachmentImportTests {
         #expect(result.attachments[1].mimeType == "image/png")
     }
 
+    @Test("Compose names its picked photos, camera shots and files only through DraftAttachmentImport")
+    func composeUsesTheSharedRules() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("TabMail/Views/Compose/ComposeView.swift"), encoding: .utf8)
+        #expect(source.contains("DraftAttachmentImport.pickedAttachment("))
+        #expect(source.contains("DraftAttachmentImport.cameraAttachment("))
+        #expect(source.contains("DraftAttachmentImport.importFiles("))
+        #expect(!source.contains("\"photo_\\("))
+        #expect(!source.contains("jpegData(compressionQuality:"))
+    }
+
     @Test("Importing no files gives nothing and no failures")
     func importNoFiles() {
         let result = DraftAttachmentImport.importFiles([]) { _ in Data() }

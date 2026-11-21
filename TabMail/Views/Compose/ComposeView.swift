@@ -1909,16 +1909,13 @@ struct ComposeView: View {
             }
             .fullScreenCover(isPresented: $showCamera) {
                 CameraPickerView { image in
-                    guard let data = image.jpegData(compressionQuality: 0.85) else {
-                        recordAttachmentPreparationFailure("Camera photo")
+                    guard let attachment = DraftAttachmentImport.cameraAttachment(
+                        image, existingCount: attachments.count) else {
+                        recordAttachmentPreparationFailure(DraftAttachmentImport.cameraFailureLabel)
                         publishAttachmentPreparationFailuresIfSettled()
                         return
                     }
-                    attachments.append(DraftAttachment(
-                        filename: "photo_\(attachments.count + 1).jpg",
-                        mimeType: "image/jpeg",
-                        data: data
-                    ))
+                    attachments.append(attachment)
                 }
             }
             .dismissKeyboardOnTap()
@@ -1995,21 +1992,17 @@ struct ComposeView: View {
                 var succeeded = false
                 do {
                     if let data = try await item.loadTransferable(type: Data.self) {
-                        let mimeType = item.supportedContentTypes.first?.preferredMIMEType
-                            ?? "application/octet-stream"
-                        let ext = item.supportedContentTypes.first?.preferredFilenameExtension
-                            ?? "dat"
-                        let filename = "photo_\(attachments.count + 1).\(ext)"
-                        attachments.append(DraftAttachment(
-                            filename: filename, mimeType: mimeType, data: data))
+                        attachments.append(DraftAttachmentImport.pickedAttachment(
+                            data: data, contentType: item.supportedContentTypes.first,
+                            existingCount: attachments.count))
                         succeeded = true
                     } else {
                         recordAttachmentPreparationFailure(
-                            "Selected photo or video \(index + 1)")
+                            DraftAttachmentImport.pickedFailureLabel(index: index))
                     }
                 } catch {
                     recordAttachmentPreparationFailure(
-                        "Selected photo or video \(index + 1)")
+                        DraftAttachmentImport.pickedFailureLabel(index: index))
                     if DebugModeManager.isLoggingEnabled() {
                         BackgroundSyncLogger.logDebug("[ComposeView] Photo picker import failed: \(error)")
                     }
@@ -3495,22 +3488,10 @@ struct ComposeView: View {
     private func handleFileImport(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
-            for url in urls {
-                guard url.startAccessingSecurityScopedResource() else {
-                    recordAttachmentPreparationFailure(url.lastPathComponent)
-                    continue
-                }
-                defer { url.stopAccessingSecurityScopedResource() }
-                do {
-                    let data = try Data(contentsOf: url)
-                    let mimeType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
-                    attachments.append(DraftAttachment(filename: url.lastPathComponent, mimeType: mimeType, data: data))
-                } catch {
-                    recordAttachmentPreparationFailure(url.lastPathComponent)
-                    if DebugModeManager.isLoggingEnabled() {
-                        BackgroundSyncLogger.logDebug("[ComposeView] File import failed for \(url.lastPathComponent): \(error)")
-                    }
-                }
+            let imported = DraftAttachmentImport.importFiles(urls)
+            attachments.append(contentsOf: imported.attachments)
+            for label in imported.failures {
+                recordAttachmentPreparationFailure(label)
             }
             publishAttachmentPreparationFailuresIfSettled()
         case .failure(let error):
