@@ -749,14 +749,12 @@ struct SettingsView: View {
     }
 
     private func archiveOldMessages() async {
-        // The mark-as-read setting as it stands when the action starts.
-        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
         let archiveCutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.archiveAgeDays, to: Date()) ?? Date()
         let inboxFolderIds = Set(navigationStore.folders.filter { $0.role == .inbox }.map(\.id))
         guard !inboxFolderIds.isEmpty else { return }
 
         guard let totalArchived = await Self.archiveOldMessages(
-            inboxFolderIds: inboxFolderIds, archiveCutoff: archiveCutoff, marksRead: marksRead) else { return }
+            inboxFolderIds: inboxFolderIds, archiveCutoff: archiveCutoff) else { return }
 
         BackgroundSyncLogger.logDebug("[ArchiveOld] Archived \(totalArchived) messages older than \(SyncConfig.archiveAgeDays) days")
 
@@ -775,17 +773,18 @@ struct SettingsView: View {
     /// move refuses them instead of acting on the replacement email re-seated
     /// at a row's id. `beforeRead` runs after the stamp and before the read,
     /// `afterRead` once the rows are read; both are test seams for those windows
-    /// and production passes nothing. `marksRead` is the mark-as-read setting the
-    /// caller read when the action started.
+    /// and production passes nothing. The mark-as-read setting is read once, as
+    /// the sweep starts, and that value applies to every row it archives.
     @MainActor
     @discardableResult
     static func archiveOldMessages(
         inboxFolderIds: Set<String>,
         archiveCutoff: Date,
-        marksRead: Bool,
         beforeRead: () async -> Void = {},
         afterRead: () async -> Void = {}
     ) async -> Int? {
+        // The mark-as-read setting as it stands when the action starts.
+        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
         let stamp = FolderResetGeneration.current()
         await beforeRead()
         guard let oldMessages = try? await AppDatabase.dbPool.read({ db in
