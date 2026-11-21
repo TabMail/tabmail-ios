@@ -264,6 +264,9 @@ extension IMAPProvider {
         let timeout = context.requestTimeoutSeconds
         let path = folder.path
         var completed = false
+        // The listing had no range to check: no load floor in this epoch and
+        // no local row (#1062). It completes, but not clean.
+        var nothingToCheck = false
         // A request of this call timed out (#1062): the timeout cancelled it,
         // and SwiftMail closes the session of a cancelled command that was on
         // the wire at once (its late answer is never read; the pool keeps the
@@ -416,6 +419,15 @@ extension IMAPProvider {
                 }
             } else {
                 guard let lower else {
+                    // No load floor of this epoch (the walk has not started and
+                    // no window listing recorded one in it) and no local row:
+                    // nothing can be checked or loaded, and nothing was read
+                    // from the server. The listing completes NOT clean, so an
+                    // owed folder stays owed until a window listing records a
+                    // floor and a later listing checks it.
+                    // *Superseded (#1062):* it completed clean, which settled an
+                    // owed mark with no server read.
+                    nothingToCheck = true
                     completed = true
                     break rangeLoop
                 }
@@ -729,6 +741,14 @@ extension IMAPProvider {
                         heldUid = nil
                     }
                 } else {
+                    // No UID is held: a hold clock belongs to the UID at
+                    // `nextUid`, so one left by an earlier hold (its UID since
+                    // cached, loaded, or below a raised floor) never moves to
+                    // another UID with the cursor.
+                    // *Superseded (#1062):* the cursor moved and the old clock
+                    // was kept, so a failed request at the new UID could be
+                    // passed over on the earlier UID's hold.
+                    if listing.nextUid != Int(stop) { listing.loadHeldSince = nil }
                     listing.nextUid = Int(stop)
                 }
                 let carry = leftOver(heldFloor: heldUid)
@@ -818,7 +838,8 @@ extension IMAPProvider {
         result.newState = newState.encoded()
         if completed {
             result.completedListing = CatchUpCompletedListing(
-                lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true && listing.topUnknown != true && state?.skippedLoads != true)
+                lapseCountAtStart: listing.lapseCountAtStart ?? 0,
+                clean: !nothingToCheck && listing.passedOver != true && listing.topUnknown != true && state?.skippedLoads != true)
         }
         result.madeProgress = madeProgress
         result.requestMayBeInFlight = requestTimedOut
@@ -859,8 +880,10 @@ extension IMAPProvider {
         var notAsked: [UInt32] = []
         /// Unanswered UIDs whose SEARCH was not asked or failed (a stop).
         var owedSearch: [UInt32] = []
-        /// The failed request that stopped the loads timed out (#1062): it closed
-        /// the folder connection's session (`CatchUpFolderResult.requestMayBeInFlight`).
+        /// The failed request that stopped the loads timed out (#1062): on the
+        /// wire, it closed the folder connection's session; still waiting for its
+        /// connection, it sent nothing; either way it is reported
+        /// (`CatchUpFolderResult.requestMayBeInFlight`).
         /// *Superseded (#1062):* "it may still hold the folder's connection".
         var timedOut = false
     }

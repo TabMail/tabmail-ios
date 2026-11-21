@@ -10,13 +10,16 @@ import Testing
 
 /// A gate inside a slice's sync turn, before the slice sends anything: the
 /// test learns the turn is taken, then releases the slice. No IMAP command is
-/// waiting meanwhile, so no command timer can race the handshake.
+/// waiting meanwhile, so no command timer can race the handshake. Counts the
+/// slices that reached it (`countSlice`), so a test can hold one of them.
 final class SliceTurnGate: Sendable {
-    private let state = Mutex<(inTurn: Bool, released: Bool)>((false, false))
+    private let state = Mutex<(inTurn: Bool, released: Bool, slices: Int)>((false, false, 0))
 
     var inTurn: Bool { state.withLock { $0.inTurn } }
     func enter() { state.withLock { $0.inTurn = true } }
     func release() { state.withLock { $0.released = true } }
+    /// Counts one more slice at the gate; returns how many have reached it.
+    func countSlice() -> Int { state.withLock { $0.slices += 1; return $0.slices } }
 
     /// Waits until released or `bound` seconds pass; true when released.
     func waitForRelease(bound: TimeInterval) async -> Bool {
@@ -73,7 +76,7 @@ extension IMAPMissingByUIDTests {
         case wipeLocalIndex
     }
 
-    @Test("A Settings reset issued while a slice holds the account's sync turn waits for it: after it no pre-reset pick is inserted, no pre-reset progress is kept, and the next slice loads nothing from the old carry before it lists",
+    @Test("A Settings reset issued while a catch-up run's slice holds the account's sync turn waits for it: after it, the folder's whole catch-up state is gone (the carry, the window floor and the prune cutoff), no pre-reset pick is inserted, and the next slice lists before it loads anything",
           arguments: SettingsReset.allCases)
     @MainActor
     func resetDuringASliceIsNeverUndone(_ reset: SettingsReset) async throws {
@@ -82,27 +85,40 @@ extension IMAPMissingByUIDTests {
                                  rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
             let folderId = w.folderId, accountId = w.accountId, pool = w.pool
             try await w.dropLocal(Self.carryMissing)
+            try await w.pool.write { db in
+                try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, epoch: Self.epoch, db: db)
+                try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: 1, epoch: Self.epoch, db: db)
+            }
             try await w.markOwed()
+            // The production run (`runCatchUpRun`) takes the account's turn for
+            // each slice. Its first slice lists and proves the first range and
+            // carries the loads (two requests after the listing's start); its
+            // second waits at a gate inside its turn, before it sends anything,
+            // until the reset waits for that turn. The run's clock then passes
+            // its deadline, so the held slice sends nothing and no slice starts
+            // after it. Nothing is timed.
             let clock = CatchUpTestClock()
-            // The slice holds the account's turn, as every production slice does
-            // (`runCatchUpRun`), and waits at a gate in it until the reset waits
-            // for that turn, so the reset is issued inside the slice. Nothing is
-            // sent while it waits, so nothing is timed. Two requests after the
-            // listing's start: the listing and its proof; the loads are carried.
-            // What the slice left is read inside its turn, before the reset can run.
             let gate = SliceTurnGate()
             let bound = Self.resetHandshakeStepBound
-            async let sliced: IMAPCatchUpState.CarriedRange? = w.engine.oneSyncAtATime(accountId: accountId) {
+            let pastTheDeadline: TimeInterval = 120
+            await w.engine.setCatchUpSliceStartHookForTesting { _ in
+                guard gate.countSlice() == 2 else { return }
                 gate.enter()
-                guard await gate.waitForRelease(bound: 2 * bound) else { return nil }
-                await w.slice(maxRequests: Self.newListingStartRequests + 2, clock: clock)
-                return try? w.catchUpState()?.listing?.carried
+                _ = await gate.waitForRelease(bound: 2 * bound)
+                clock.advance(by: pastTheDeadline)
             }
+            async let ran = w.workerRun(maxRequests: Self.newListingStartRequests + 2, deadlineIn: pastTheDeadline / 2,
+                                        intervalSeconds: 0, clock: { clock.now })
             var deadline = Date().addingTimeInterval(bound)
             while !gate.inTurn, Date() < deadline {
                 try await Task.sleep(for: .milliseconds(10))
             }
-            #expect(gate.inTurn, "setup: the slice holds the account's turn")
+            #expect(gate.inTurn, "setup: the run's second slice holds the account's turn")
+            let before = try w.folder().catchUpState
+            #expect(IMAPCatchUpState.decode(before)?.listing?.carried != nil,
+                    "setup: the first slice carried its range before the reset")
+            #expect(CatchUpWindowFloor.read(before, epoch: Self.epoch) == 1 && CatchUpPruneCutoff.read(before, epoch: Self.epoch) == 1,
+                    "setup: both keys are stored before the reset")
             // The Settings reset, through the production entry point the Settings
             // view calls; it waits for the slice's turn.
             let engine = w.engine
@@ -119,24 +135,25 @@ extension IMAPMissingByUIDTests {
             #expect(await engine.syncPassWaiterCountForTesting(accountId: accountId) > 0,
                     "setup: the reset waits for the slice's turn")
             gate.release()
-            let carriedBeforeTheReset = await sliced
-            #expect(carriedBeforeTheReset != nil, "setup: the slice carried its range before the reset ran")
+            _ = try await ran
+            await w.engine.setCatchUpSliceStartHookForTesting(nil)
             try await resetting.value
+            let heldAfterReset = try w.held()
+            #expect(heldAfterReset.isEmpty, "#1062: no pre-reset pick is inserted after the reset: \(heldAfterReset)")
+            let raw = try w.folder().catchUpState
+            #expect(raw == nil, "#1062: no pre-reset catch-up state is kept, the carry and both keys included: \(String(describing: raw))")
+
             // Then a window listing records a floor again, as the next full sync
             // does, so a kept carry would load.
             try await pool.write { db in
                 try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, epoch: Self.epoch, db: db)
             }
-            let heldAfterReset = try w.held()
-            #expect(heldAfterReset.isEmpty, "#1062: no pre-reset pick is inserted after the reset: \(heldAfterReset)")
-            let state = try w.catchUpState()
-            #expect(state?.listing == nil, "#1062: no pre-reset progress is kept: \(String(describing: state))")
-
             let next = w.server.recordedCommands().count
             await w.slice(clock: clock)
-            let commands = Array(w.server.recordedCommands().dropFirst(next))
-            let firstListing = commands.firstIndex { !Self.listingRanges([$0]).isEmpty } ?? commands.endIndex
-            let early = Self.headerFetches(commands[..<firstListing])
+            let commands = Self.requests(to: Self.path, w.server, from: next).map { $0.command }
+            let firstListing = commands.firstIndex { !Self.listingRanges([$0]).isEmpty }
+            #expect(firstListing != nil, "#1062: the next slice lists the folder: \(commands)")
+            let early = Self.headerFetches(commands[..<(firstListing ?? commands.endIndex)])
             #expect(early.isEmpty, "#1062: nothing is loaded from the old carry before a listing: \(early)")
         }
     }
@@ -546,7 +563,7 @@ extension IMAPMissingByUIDTests {
 
     // MARK: - a held UID inside a carry
 
-    @Test("A held UID inside a carried range keeps its first hold start across slices that load the rest of the carry; if another path writes its row meanwhile, the hold is dropped",
+    @Test("A held UID inside a carried range keeps its first hold start across slices that load the rest of the carry; if another path writes its row meanwhile, the hold is dropped with its clock, and the next UID that fails, after the old hold's bound, gets a hold of its own instead of being passed over",
           arguments: [false, true])
     @MainActor
     func heldUidInsideACarry(resolvedElsewhere: Bool) async throws {
@@ -585,6 +602,17 @@ extension IMAPMissingByUIDTests {
             if resolvedElsewhere {
                 #expect(second.nextUid != unreadable && second.carried?.heldFloor == nil,
                         "#1062: a held UID now local is held no longer: \(String(describing: second))")
+                #expect(second.loadHeldSince == nil,
+                        "#1062: the hold clock belongs to the held UID and goes with it, never to the UID the cursor moved to: \(String(describing: second.loadHeldSince))")
+                // Past the old hold's bound, the next header load fails: the UID
+                // the cursor now names is held from now, not passed over on the
+                // old hold's clock.
+                clock.advance(by: SyncConfig.backfillPageHoldMinutes * 60)
+                w.server.failNextCommand(containing: "ENVELOPE")
+                await w.slice(maxRequests: 1, clock: clock)
+                let third = try #require(try w.catchUpState()?.listing, "setup: the listing goes on")
+                #expect(third.passedOver != true && third.nextUid == second.nextUid && third.loadHeldSince == clock.now,
+                        "#1062: the failed UID gets a hold of its own: \(String(describing: third))")
             } else {
                 #expect(second.loadHeldSince == holdStart && second.nextUid == unreadable,
                         "#1062: the hold keeps its first start across the carry: \(String(describing: second.loadHeldSince)) vs \(holdStart)")

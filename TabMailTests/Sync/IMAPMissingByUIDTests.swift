@@ -413,17 +413,28 @@ struct IMAPMissingByUIDTests {
 
     // MARK: - I2: no request outside the budget
 
-    @Test("An owed folder: the foreground sync sends no date search, and a worker slice with no budget sends nothing and writes nothing, under a storage limit too (no prune cutoff is seeded)",
-          arguments: [false, true])
+    /// How a slice's budget is spent before it starts.
+    enum SpentBudget: String, CaseIterable, Sendable {
+        /// No request may be sent (time left).
+        case requests
+        /// No time is left (requests left).
+        case time
+    }
+
+    @Test("An owed folder: the foreground sync sends no date search, and a worker slice with no budget (no request left, or no time left) sends nothing and writes nothing, under a storage limit too (no prune cutoff is seeded)",
+          arguments: [false, true], SpentBudget.allCases)
     @MainActor
-    func owedCheckSpendsOnlyTheCatchUpBudget(limit: Bool) async throws {
-        try await Self.withWorld("i2-\(limit)", server: Array(1...20) + Array(1001...1060), local: Array(2...20) + Array(1011...1060)) { w in
+    func owedCheckSpendsOnlyTheCatchUpBudget(limit: Bool, spent: SpentBudget) async throws {
+        try await Self.withWorld("i2-\(limit)-\(spent.rawValue)", server: Array(1...20) + Array(1001...1060), local: Array(2...20) + Array(1011...1060)) { w in
             try await w.markOwed()
             // The slice with no budget runs first: work a foreground sync leaves
             // running (body downloads, other folders) would land in its window.
             let before = try w.folder()
             let mid = w.server.recordedCommands().count
-            try await w.workerRun(maxRequests: 0, storageLimit: limit)
+            switch spent {
+            case .requests: try await w.workerRun(maxRequests: 0, storageLimit: limit)
+            case .time: try await w.workerRun(sliceSeconds: 0, storageLimit: limit)
+            }
             let sent = w.server.recordedCommands().dropFirst(mid).filter { command in
                 ["SELECT", "EXAMINE", "FETCH", "SEARCH"].contains { command.uppercased().contains($0) }
             }

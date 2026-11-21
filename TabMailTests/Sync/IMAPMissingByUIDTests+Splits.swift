@@ -458,7 +458,8 @@ extension IMAPMissingByUIDTests {
 
             // A floor of a new epoch replaces the old one, even a higher one.
             try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 15, epoch: Self.epoch + 1, db: db) }
-            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch + 1) == 15 && floor() == nil,
+            let replaced = try w.folder().catchUpState
+            #expect(CatchUpWindowFloor.read(replaced, epoch: Self.epoch + 1) == 15 && CatchUpWindowFloor.read(replaced, epoch: Self.epoch) == nil,
                     "#1062: a floor of another epoch replaces the old one, which is no longer read")
 
             // NULL and non-object states.
@@ -538,6 +539,33 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    @Test("Before the walk starts, an owed folder with no window floor in its epoch and no local row: the catch-up asks the server nothing and the folder stays owed; once a window floor is recorded, the next listing loads the folder's mail and settles it")
+    @MainActor
+    func folderWithNothingToCheckStaysOwed() async throws {
+        let server = Array(1...20)
+        try await Self.withWorld("nothing-to-check", server: server, local: [], walkStarted: false) { w in
+            let folderId = w.folderId
+            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == nil, "setup: no window floor in this epoch")
+            try await w.markOwed()
+            let start = w.server.recordedCommands().count
+            try await w.workerRun()
+            let asked = Self.requests(to: Self.path, w.server, from: start).map { $0.command }.filter { command in
+                ["SELECT", "EXAMINE", "FETCH", "SEARCH"].contains { command.uppercased().contains($0) }
+            }
+            #expect(asked.isEmpty, "setup: with nothing to check, the folder is asked nothing: \(asked)")
+            #expect(try w.changeState().selfHealDue, "#1062: a listing that read nothing from the server leaves the folder owed")
+
+            // A window listing records a floor in this epoch; the next listing loads.
+            try await w.pool.write { db in
+                try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, epoch: Self.epoch, db: db)
+                try SyncEngine.markCatchUpLapse(folderId: folderId, db: db)
+            }
+            try await w.workerRun()
+            try w.expectHeldExactly(server, "#1062: once a floor of this epoch exists, the owed folder's mail loads")
+            #expect(!(try w.changeState()).selfHealDue, "#1062: and a clean listing settles the owed mark")
+        }
+    }
+
     @Test("A window listing whose SELECT reports no UIDVALIDITY records no window floor; the next one under a known epoch records it")
     @MainActor
     func windowFloorNeedsAKnownEpoch() async throws {
@@ -547,8 +575,15 @@ extension IMAPMissingByUIDTests {
             #expect(try floor() == nil, "setup: no window listing has recorded a floor")
             w.server.suppressSelectUidValidity(for: Self.path)
             try await w.makeFullSyncDue()
+            let start = w.server.recordedCommands().count
             try await w.foregroundSync()
-            #expect(try floor() == nil, "#1062: a listing of unknown numbering records no floor, so none can outlive an epoch change")
+            let windowFetches = Self.requests(to: Self.path, w.server, from: start).map { $0.command }.filter {
+                $0.uppercased().hasPrefix("UID FETCH")
+            }
+            #expect(!windowFetches.isEmpty, "setup: the window listing of the folder ran")
+            let raw = try w.folder().catchUpState
+            #expect(!(raw ?? "").contains(CatchUpWindowFloor.key),
+                    "#1062: a listing of unknown numbering records no floor in any epoch, so none can outlive an epoch change: \(String(describing: raw))")
             w.server.restoreSelectUidValidity(for: Self.path)
             try await w.makeFullSyncDue()
             try await w.foregroundSync()
@@ -571,7 +606,9 @@ extension IMAPMissingByUIDTests {
             try await w.markOwed()
             let start = w.server.recordedCommands().count
             try await w.workerRun()
-            let loads = Self.headerFetches(w.server.recordedCommands().dropFirst(start))
+            let asked = Self.requests(to: Self.path, w.server, from: start).map { $0.command }
+            #expect(!Self.listingRanges(asked).isEmpty, "setup: the folder's listing ran: \(asked)")
+            let loads = Self.headerFetches(asked)
             #expect(loads.isEmpty, "#1062: a floor of another epoch counts for nothing: nothing loads: \(loads)")
             try w.expectHeldExactly(local, "#1062: nothing below the held rows loads before a floor of this epoch")
             #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == nil
@@ -647,9 +684,7 @@ extension IMAPMissingByUIDTests {
             run.listingRangeMessages = w.rangeMessages
             await AccountManager.shared.clearRecentlyCompletedForTesting()
             _ = await w.engine.runCatchUpRun(account: try w.account(), run: run)
-            let headerFetches = w.server.recordedCommands().dropFirst(start).filter {
-                $0.uppercased().contains("FETCH") && $0.uppercased().contains("ENVELOPE")
-            }
+            let headerFetches = Self.headerFetches(Self.requests(to: Self.path, w.server, from: start).map { $0.command })
             let reloaded = pruned.filter { uid in headerFetches.contains { Self.uidSet($0).contains(uid) } }
             if limit {
                 #expect(reloaded.isEmpty, "#1062: under a limit nothing at or below the prune cutoff is loaded: \(reloaded)")

@@ -206,7 +206,9 @@ extension IMAPMissingByUIDTests {
     /// Wait until fewer than `count` held requests are still in progress at the
     /// server (`FakeIMAPServer.heldRequestsInProgress`): a released request's
     /// handler has passed its hold. Bounded; the bound matters only on failure.
+    /// False at once when `count` is not positive: no hold was claimed to join.
     static func joinHeldHandlers(_ server: FakeIMAPServer, below count: Int) async throws -> Bool {
+        guard count > 0 else { return false }
         let deadline = Date().addingTimeInterval(heldHandlerJoinBound)
         while server.heldRequestsInProgress() >= count {
             guard Date() < deadline else { return false }
@@ -731,8 +733,18 @@ extension IMAPMissingByUIDTests {
     /// the test's own needs the folder's connection, which the late request
     /// holds until it is answered": the late answer is never read.
     @MainActor
-    static func answerHeldRequest(_ w: World, holding fragment: String) async throws {
+    /// The released request's handler is joined before the read, so a hold the
+    /// caller arms next under the same fragment is never let go or cleared by
+    /// this one.
+    static func answerHeldRequest(_ w: World, holding fragment: String,
+                                  sourceLocation: SourceLocation = #_sourceLocation) async throws {
+        let inProgress = w.server.heldRequestsInProgress()
+        let claimed = w.server.isHoldingCommand(containing: fragment)
         w.server.releaseHeldCommand(containing: fragment)
+        if claimed {
+            #expect(try await joinHeldHandlers(w.server, below: inProgress),
+                    "setup: the released request's handler went on", sourceLocation: sourceLocation)
+        }
         _ = try await w.provider.getUidNextWithEpoch(folder: path)
     }
 

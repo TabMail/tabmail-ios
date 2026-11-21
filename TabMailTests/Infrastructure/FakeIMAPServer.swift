@@ -960,8 +960,19 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.heldGates[fragment.uppercased()] == true }
     }
 
+    /// Releases the hold `fragment` names: a claimed one (a command waits at
+    /// it) is let go; one armed but never claimed is disarmed. A release thus
+    /// belongs to the hold it found, never to one armed later under the same
+    /// fragment.
     func releaseHeldCommand(containing fragment: String) {
-        withState { $0.heldGateReleased.formUnion([fragment.uppercased()]) }
+        let key = fragment.uppercased()
+        withState { state in
+            switch state.heldGates[key] {
+            case true?: state.heldGateReleased.insert(key)
+            case false?: state.heldGates[key] = nil
+            case nil: break
+            }
+        }
     }
 
     /// Test seam: hold the next FETCH in `mailbox` AFTER it has read the

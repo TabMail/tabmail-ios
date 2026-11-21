@@ -1176,9 +1176,10 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
 
 - **Ranges are cut on UIDs, not on local rows.** The lower bound is where the held range starts
   (`heldRangeStart`: 1 once the older-mail walk is complete, else its cursor + 1); under a storage limit
-  loads start at the higher of that and the first local UID (amended 2026-11-20: was the first local
-  UID alone, which let rows infinite scroll cached below the cursor pull the floor down and load MORE
-  under a limit), so pruned mail is neither listed for load nor loaded. Below the load start a listing
+  loads start above the prune cutoff of the folder's epoch (*superseded in place 2026-11-21 by THE
+  FLOOR RULE below:* "loads start at the higher of that and the first local UID (amended 2026-11-20: was
+  the first local UID alone, which let rows infinite scroll cached below the cursor pull the floor down
+  and load MORE under a limit)"), so pruned mail is neither listed for load nor loaded. Below the load start a listing
   only checks local rows. The upper bound is the larger of the last local UID and, with a change
   bookmark of the same epoch, the bookmark's UIDNEXT - 1 (by the bookmark, not by tracking), else the
   listing's stored top (2026-11-20, below). *Superseded (2026-11-20):* "else the listing's own SELECT
@@ -1399,7 +1400,9 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     (`windowFloor` and `pruneCutoff` are `{uid, epoch}` objects in `catchUpState`, `CatchUpEpochValue`);
     an entry of another epoch reads as absent and is never rebound; none is written under an unknown
     epoch. (2) Loads start at the held range's start (the walk's start once it started, else the epoch's
-    window floor; none: nothing loads); under a storage limit at least one past the epoch's prune cutoff;
+    window floor; none: nothing loads; with no local row either, nothing is checked: the listing completes
+    with no server read and NOT clean, so an owed folder stays owed until a window listing records a floor;
+    *superseded:* it completed clean); under a storage limit at least one past the epoch's prune cutoff;
     nothing else raises it: the first local UID is no evidence of what was pruned. (3) The scan floor is
     the lower of that start (before the cutoff) and the first local UID; the cutoff never raises it. (4)
     The prune cutoff, the only record of what was pruned, is written by the prune in its delete
@@ -1409,8 +1412,11 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     kept. (6) The storage prune shipped long before the cutoff (date order, released versions), so under
     a storage limit a UID-windowed folder with a known epoch, local rows and no cutoff of that epoch gets
     ONE from the catch-up slice, in its turn before the provider reads
-    (`SyncEngine.seedCatchUpPruneCutoffs`): the lower of its first local UID and its window floor, minus
-    one; the window-floor term keeps an unreadable lowest window UID loadable. (7) The catch-up apply
+    (`SyncEngine.seedCatchUpPruneCutoffs`): the lower of its first local UID and its window floor of the
+    CURRENT epoch (none: the first local UID alone), minus one; the window-floor term keeps an unreadable
+    lowest window UID loadable. Only a slice admitted with budget writes it; a folder whose turnover is
+    pending gets none; a folder whose seed read or write fails is left out of that slice and seeded by a
+    later one. A never-pruned folder is seeded too: nothing tells it apart from a pruned one. (7) The catch-up apply
     carries both keys with their own epochs; a turnover and a Settings reset clear them with the state.
     No migration. (8) The cutoff is one number per epoch: under a limit everything at or below it is
     pruned territory, including a UID that was never local (unreadable when its window was listed),

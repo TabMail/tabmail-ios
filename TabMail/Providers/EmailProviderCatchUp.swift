@@ -68,8 +68,13 @@ struct CatchUpContext: Sendable {
     /// Whether the user's Email Index Limit (`StorageEstimator.budgetMB`) was a
     /// finite limit when the run began. The limit means old mail is not kept:
     /// the storage prune deletes the oldest rows once the store passes it
-    /// (ADR-IOS-006). So while it holds, a provider lists no mail older than the
-    /// folder's oldest local row, and so loads none back (ADR-IOS-107 decision 8).
+    /// (ADR-IOS-006). So while it holds, a provider loads nothing the prune
+    /// removed: a UID-windowed provider loads nothing at or below the folder's
+    /// prune cutoff of its epoch (`CatchUpPruneCutoff`), and still reconciles
+    /// local rows below it; a date-windowed one lists no mail older than the
+    /// folder's oldest local row (ADR-IOS-107 decision 8).
+    /// *Superseded (#1062):* "a provider lists no mail older than the folder's
+    /// oldest local row, and so loads none back", for every provider.
     var storageLimitInForce = false
     /// Most requests this call may send (`SyncConfig.catchUpSliceMaxRequests` for a
     /// slice of the backfill worker's catch-up). `Int.max` bounds it by time only.
@@ -190,7 +195,8 @@ struct CatchUpCompletedListing: Sendable, Equatable {
     /// The folder's lapse count (`CatchUpLapse.countKey`) when the listing started.
     let lapseCountAtStart: Int
     /// Every missing message in the listed range was loaded or proven gone:
-    /// none was passed over by the hold bound.
+    /// none was passed over by the hold bound, and there was a range to list
+    /// (an IMAP listing with no load floor and no local row is not clean).
     let clean: Bool
 }
 

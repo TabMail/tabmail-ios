@@ -7,9 +7,11 @@
 > the highest UID it deleted, with the folder's UIDVALIDITY (`CatchUpPruneCutoff`, `pruneCutoff` in
 > the folder's `catchUpState` JSON, no migration), in its own write transaction, only for a UID prune
 > order and only from rows that transaction deleted and that carried the folder's epoch; under a limit
-> the catch-up loads nothing at or below it (ADR-IOS-107, *Storage limit, prune cutoff*). A folder
-> pruned by a released version (no cutoff) gets ONE cutoff from the catch-up under a limit: the lower
-> of its first local UID and its window floor, minus one. *Superseded in place:* in the note below,
+> the catch-up loads nothing at or below it (ADR-IOS-107, *Storage limit, prune cutoff*). Released
+> versions recorded no cutoff, so under a limit every UID-windowed folder with a known epoch, local rows
+> and no cutoff of that epoch gets ONE from the catch-up, whether a released version pruned it or not
+> (nothing tells the two apart): the lower of its first local UID and its window floor of the current
+> epoch (none: the first local UID alone), minus one. *Superseded in place:* in the note below,
 > "its lowest held UID is a clean floor, and the IMAP catch-up loads only above the higher of it and
 > the walk's start" and "the catch-up downloads them once (they sit above the lowest held UID)": a
 > released store's date-holes above the seeded cutoff are downloaded once, as before; holes below it

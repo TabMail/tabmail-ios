@@ -550,22 +550,26 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    @Test("The prune records a cutoff only for a UID prune order, and only from rows it deleted that carry the folder's epoch: a date-order prune records none; rows of no known numbering (one an optimistic move brought in under its source UID, one written before the stamp) never move it",
+    @Test("The prune records a cutoff only for a UID prune order, and only from rows it deleted that carry the folder's epoch: a date-order prune records none; rows of no known numbering (one an optimistic move brought in under its source UID, one written before the stamp) and a row stamped with another epoch never move it",
           arguments: [true, false])
     @MainActor
     func pruneCutoffComesOnlyFromFolderNativeRowsInUIDOrder(uidOrder: Bool) async throws {
         let count = 120
         let server = Array(1...count)
         let stamped = Array(1...3)
+        let otherEpochRow = stamped.count + 1
         try await Self.withWorld("prune-native-\(uidOrder)", server: server, local: server) { w in
             let folderId = w.folderId
             if uidOrder {
-                // Only the three lowest rows carry the folder's epoch.
+                // Only the three lowest rows carry the folder's epoch; the next
+                // one carries another epoch, the rest none.
                 try await w.pool.write { db in
                     try db.execute(sql: """
                         UPDATE messageHeader SET observedUidValidity = NULL
                         WHERE folderId = ? AND CAST(messageId AS INTEGER) > ?
                         """, arguments: [folderId, stamped.count])
+                    try db.execute(sql: "UPDATE messageHeader SET observedUidValidity = ? WHERE folderId = ? AND messageId = ?",
+                                   arguments: [Self.epoch + 1, folderId, "\(otherEpochRow)"])
                 }
             }
             let savedBudget = UserDefaults.standard.object(forKey: StorageEstimator.storageBudgetKey)
@@ -582,17 +586,17 @@ extension IMAPMissingByUIDTests {
             try #require(held.count < count, "setup: the prune deleted rows: \(held.count) of \(count) kept")
             let cutoff = CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch)
             if uidOrder {
-                try #require(!held.contains { stamped.contains($0) } && held.first.map { $0 > stamped.count + 1 } == true,
-                             "setup: the prune deleted the stamped rows and unstamped ones above them")
+                try #require(!held.contains { stamped.contains($0) } && held.first.map { $0 > otherEpochRow + 1 } == true,
+                             "setup: the prune deleted the stamped rows, the other epoch's row and unstamped ones above them")
                 #expect(cutoff == stamped.last,
-                        "#1062: only deleted rows carrying the folder's epoch move the cutoff: \(String(describing: cutoff))")
+                        "#1062: only deleted rows carrying the folder's epoch move the cutoff, not one of another epoch: \(String(describing: cutoff))")
             } else {
                 #expect(cutoff == nil, "#1062: a date-order prune records no cutoff: \(String(describing: cutoff))")
             }
         }
     }
 
-    @Test("A prune cutoff of another epoch is ignored by the catch-up's own read, with no seed to replace it (no local row): under a limit the missing mail at or below it loads; with no limit the catch-up's state write keeps the cutoff under its own epoch",
+    @Test("A prune cutoff of another epoch is ignored by the catch-up's own read, with no seed to replace it (no local row): under a limit the missing mail at or below it loads; with no limit the catch-up's state write keeps the cutoff and a window floor of a third epoch each under its own epoch",
           arguments: [true, false])
     @MainActor
     func pruneCutoffOfAnotherEpochIsIgnoredByTheProvider(limit: Bool) async throws {
@@ -603,6 +607,7 @@ extension IMAPMissingByUIDTests {
             let folderId = w.folderId
             try await w.pool.write { db in
                 try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: cutoff, epoch: Self.epoch + 1, db: db)
+                try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 7, epoch: Self.epoch + 2, db: db)
             }
             try await w.markOwed()
             if limit {
@@ -615,6 +620,9 @@ extension IMAPMissingByUIDTests {
                 let state = try w.folder().catchUpState
                 #expect(CatchUpPruneCutoff.read(state, epoch: Self.epoch + 1) == cutoff && CatchUpPruneCutoff.read(state, epoch: Self.epoch) == nil,
                         "#1062: the catch-up's state write carries the cutoff under its own epoch, never rebound to the current one")
+                #expect(CatchUpWindowFloor.read(state, epoch: Self.epoch + 2) == 7 && CatchUpWindowFloor.read(state, epoch: Self.epoch) == nil
+                            && CatchUpWindowFloor.read(state, epoch: Self.epoch + 1) == nil,
+                        "#1062: and the window floor under its own, a third epoch: neither key takes the other's epoch or the current one")
             }
         }
     }
@@ -669,6 +677,9 @@ extension IMAPMissingByUIDTests {
             try await w.pool.write { db in try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: 3, epoch: Self.epoch, db: db) }
             #expect(try await seed() == nil, "#1062: no seed for a folder with a cutoff in its epoch")
             try await reset()
+            try await w.pool.write { db in try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: 0, epoch: Self.epoch, db: db) }
+            #expect(try await seed() == nil, "#1062: a cutoff of 0 (a seed below UID 1) is a cutoff: no second seed")
+            try await reset()
 
             try await reset("UPDATE folder SET uidValidityResetPendingAt = CURRENT_TIMESTAMP WHERE id = ?")
             #expect(try await seed() == nil, "#1062: no seed while a turnover is pending")
@@ -708,8 +719,15 @@ extension IMAPMissingByUIDTests {
                     BEGIN SELECT RAISE(ABORT, 'seed write fails'); END
                     """)
             }
+            let stateBefore = try w.folder().catchUpState
+            let start = w.server.recordedCommands().count
             var loads = try await Self.runUnderTheLimit(w)
             try await w.pool.write { db in try db.execute(sql: "DROP TRIGGER IF EXISTS \(trigger)") }
+            let asked = Self.requests(to: Self.path, w.server, from: start).map { $0.command }.filter { command in
+                ["SELECT", "EXAMINE", "FETCH", "SEARCH"].contains { command.uppercased().contains($0) }
+            }
+            #expect(asked.isEmpty, "#1062: a folder whose seed failed is asked nothing in that run: \(asked)")
+            #expect(try w.folder().catchUpState == stateBefore, "#1062: and no progress of it is saved")
             var reloaded = pruned.filter { uid in loads.contains { Self.uidSet($0).contains(uid) } }
             #expect(reloaded.isEmpty, "#1062: a folder with no seed is not read: nothing pruned loads: \(reloaded)")
             try w.expectHeldExactly(kept, "#1062: the held rows are the kept ones")
@@ -720,6 +738,33 @@ extension IMAPMissingByUIDTests {
             #expect(reloaded.isEmpty, "#1062: once seeded, nothing pruned loads: \(reloaded)")
             #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == kept[0] - 1,
                     "#1062: the next run seeds the folder")
+        }
+    }
+
+    @Test("A UID-order prune of a folder whose epoch is unknown records no cutoff, even from rows stamped with an epoch")
+    @MainActor
+    func pruneRecordsNoCutoffUnderAnUnknownEpoch() async throws {
+        let count = 120
+        let server = Array(1...count)
+        try await Self.withWorld("prune-unknown-epoch", server: server, local: server) { w in
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = NULL, catchUpState = NULL WHERE id = ?", arguments: [folderId])
+            }
+            let savedBudget = UserDefaults.standard.object(forKey: StorageEstimator.storageBudgetKey)
+            defer { UserDefaults.standard.set(savedBudget, forKey: StorageEstimator.storageBudgetKey) }
+            StorageEstimator.budgetMB = 1
+            let appSupport = try #require(FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
+            try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+            let padding = appSupport.appendingPathComponent("prune-test-padding-\(UUID().uuidString)")
+            try Data(count: 2 * 1024 * 1024).write(to: padding)
+            defer { try? FileManager.default.removeItem(at: padding) }
+            try #require(StorageEstimator.isOverBudget(), "setup: the store is over the limit, so the prune runs")
+            SyncEngine.runPruneIfOverBudget(dbPool: AppDatabase.backgroundPool, pruneOrder: [w.accountId: .uid])
+            try #require(try w.held().count < count, "setup: the prune deleted rows")
+            let state = try w.folder().catchUpState
+            #expect(!(state ?? "").contains(CatchUpPruneCutoff.key),
+                    "#1062: no cutoff is written under an unknown epoch: \(String(describing: state))")
         }
     }
 

@@ -229,9 +229,10 @@ extension SyncEngine {
     /// it made. The run never asks a folder again after
     /// its call left a request that may still be in flight
     /// (`CatchUpFolderResult.requestMayBeInFlight`, #1062; IMAP: a request that
-    /// timed out), whatever progress that call made: abandoning the request
-    /// ended the folder's session (a cancelled IMAP command closes it at once),
-    /// so another request to the folder in this run would first log in again on
+    /// timed out), whatever progress that call made: abandoning a request that
+    /// was on the wire ended the folder's session (a cancelled IMAP command
+    /// closes it at once; one that timed out still waiting for its connection
+    /// sent nothing, and counts the same), so another request to the folder in this run would first log in again on
     /// the link that just timed out, and a second timeout there would cap the
     /// width for a reason that is not the range's size. Later slices of the run
     /// leave the folder out and go on with the others: the run takes another
@@ -296,7 +297,7 @@ extension SyncEngine {
                     return .ran(CatchUpSliceResult())
                 }
                 #if DEBUG
-                self.catchUpSliceStartHookForTesting?(folderIds)
+                await self.catchUpSliceStartHookForTesting?(folderIds)
                 #endif
                 let ran = (try? await queue.execute(priority: .headerFetch) {
                     await self.runCatchUp(provider: provider, folderIds: folderIds, context: context)
@@ -311,8 +312,9 @@ extension SyncEngine {
             case .ran(let ran):
                 madeProgress = madeProgress || ran.progressed
                 // Abandoning a request that may still be in flight ended its
-                // folder's session: the folder is left out of the rest of the run
-                // (#1062). The run takes another slice when any folder the slice
+                // folder's session when it was on the wire (one still waiting
+                // for its connection sent nothing): either way the folder is
+                // left out of the rest of the run (#1062). The run takes another slice when any folder the slice
                 // asked made progress, or when the slice added a folder to the
                 // set. The slice asks only folders outside the set, so a slice
                 // whose only progress came from a folder it left out goes on
@@ -343,8 +345,9 @@ extension SyncEngine {
     /// Test-only seam: install `catchUpSliceStartHookForTesting`, called with
     /// the folders a slice of `runCatchUpRun` asks, as the slice starts (inside
     /// the account's turn, before its first request), so a test can tell which
-    /// slice sent each request. Compiled out of Release.
-    func setCatchUpSliceStartHookForTesting(_ hook: (@Sendable ([String]) -> Void)?) {
+    /// slice sent each request, or hold the slice inside its turn (the hook is
+    /// awaited). Compiled out of Release.
+    func setCatchUpSliceStartHookForTesting(_ hook: (@Sendable ([String]) async -> Void)?) {
         catchUpSliceStartHookForTesting = hook
     }
     #endif
