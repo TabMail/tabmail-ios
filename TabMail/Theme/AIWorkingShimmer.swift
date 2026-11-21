@@ -10,6 +10,11 @@ import SwiftUI
 /// modifier. It produces a soft radial glow that sweeps across the view in a
 /// continuous loop — no hard-edged stripe, just a natural light reflection.
 ///
+/// **Exception:** the chat's AI Suggestion working bubble (`ChatSuggestionWorkingBubble`) shows
+/// three pulsing dots instead, its decided look. Its dots run on their own `TimelineView`, capped at
+/// `ChatSuggestionConfig.dotFrameInterval` like this one, and leave the tree when the row stops
+/// writing. When it shows is the same rule as the inbox row's (`AIWorkingRule`).
+///
 /// Uses `TimelineView` with `paused:` to keep the view always in the tree
 /// (avoids identity loss from if/else branching) while only consuming frames
 /// when active.
