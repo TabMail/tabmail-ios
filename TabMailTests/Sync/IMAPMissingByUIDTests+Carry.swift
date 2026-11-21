@@ -155,16 +155,6 @@ extension IMAPMissingByUIDTests {
             try await pool.write { db in
                 try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, epoch: Self.epoch, db: db)
             }
-            // The body queue's batch download of a message the held slice
-            // loaded sends a FETCH byte-identical to a catch-up header load
-            // (`fetchMessageInfosBulk` with its default attributes), and it
-            // runs on its own schedule, after the reset too. The window below
-            // must hold only the next slice's own requests, so the queue has
-            // drained before it opens; a load from the old carry by that slice
-            // still lands in it.
-            await BackfillBodyQueue.shared.awaitDrain()
-            let bodyQueueEmpty = await BackfillBodyQueue.shared.queuedItemsForTesting.isEmpty
-            #expect(bodyQueueEmpty, "setup: the body queue has drained before the next slice")
             let next = w.server.recordedCommands().count
             await w.slice(clock: clock)
             let commands = Self.requests(to: Self.path, w.server, from: next).map { $0.command }

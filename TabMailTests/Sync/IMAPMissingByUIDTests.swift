@@ -346,9 +346,14 @@ struct IMAPMissingByUIDTests {
         // a check marked after the first one started) loads them and asks
         // the timed-out ranges again at full width.
         // The body queue is process-wide: an earlier suite's items whose
-        // account has no work queue stay pending forever and would keep
-        // `awaitDrain` waiting. Each world starts from an empty queue.
+        // account has no work queue stay pending forever. Each world starts
+        // from an empty queue. Its downloads are then held for the world: a
+        // batch download sends a header FETCH byte-identical to a catch-up
+        // header load, and its body FETCHes would land in the windows these
+        // tests read, which assert exactly what the catch-up sends.
         await BackfillBodyQueue.shared.emptyForTesting()
+        await BackfillBodyQueue.shared.setDispatchSuppressedForTesting(true)
+        defer { await BackfillBodyQueue.shared.setDispatchSuppressedForTesting(false) }
         try await world.workerRun(requestTimeout: untimedRequestTimeout)
         #expect(try world.catchUpState()?.listing == nil,
                 "\(name): setup: the setup catch-up run completed the folder's listing")
