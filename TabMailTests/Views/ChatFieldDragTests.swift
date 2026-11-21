@@ -5,6 +5,7 @@
 import CoreGraphics
 import Foundation
 import Testing
+import UIKit
 @testable import TabMail
 
 /// Dragging the reply field up (`ChatFieldDrag`): the field swells under the finger, only for a drag
@@ -75,6 +76,147 @@ struct ChatFieldDragTests {
         // The same drag that would open without the tip opens with it.
         let drag = CGSize(width: 0, height: -open)
         #expect(ChatFieldDrag.opens(translation: drag, predictedEndTranslation: drag))
+    }
+
+    @Test("Only a first movement more up than sideways starts the field's drag",
+          arguments: [CGSize(width: 0, height: 40), CGSize(width: 80, height: -40), CGSize(width: -80, height: -40), .zero])
+    func sidewaysOrDownDoesNotBegin(_ translation: CGSize) {
+        #expect(!ChatFieldDrag.begins(translation: translation))
+    }
+
+    @Test("A movement up, or up and a little sideways, starts the field's drag")
+    func upwardBegins() {
+        #expect(ChatFieldDrag.begins(translation: CGSize(width: 0, height: -12)))
+        #expect(ChatFieldDrag.begins(translation: CGSize(width: 5, height: -12)))
+    }
+
+    @Test("A let-go with no speed rests where it is; a flick carries further the way it went")
+    func predictedEnd() {
+        let at = CGSize(width: 3, height: -20)
+        #expect(ChatFieldDrag.predictedEnd(translation: at, velocity: .zero) == at)
+        let carried = ChatFieldDrag.predictedEnd(translation: at, velocity: CGSize(width: 0, height: -500))
+        #expect(carried.height < at.height, "an upward flick ends further up")
+        #expect(carried.width == at.width, "no sideways speed, no sideways carry")
+    }
+
+    @Test("A short drag let go still opens when its flick carries the swell to the open distance; a slow let-go does not")
+    func flickOpensThroughThePrediction() throws {
+        let short = CGSize(width: 0, height: -(open / 2))
+        // How far one point per second of upward speed carries a let-go.
+        let perSpeed = -ChatFieldDrag.predictedEnd(translation: .zero, velocity: CGSize(width: 0, height: -1)).height
+        try #require(perSpeed > 0, "control: an upward speed carries the drag up")
+        let reaches = (open - open / 2) / perSpeed
+        let flick = ChatFieldDrag.predictedEnd(translation: short, velocity: CGSize(width: 0, height: -reaches * 2))
+        let slow = ChatFieldDrag.predictedEnd(translation: short, velocity: CGSize(width: 0, height: -reaches / 4))
+        #expect(ChatFieldDrag.opens(translation: short, predictedEndTranslation: flick))
+        #expect(!ChatFieldDrag.opens(translation: short, predictedEndTranslation: slow))
+        #expect(!ChatFieldDrag.opens(translation: short, predictedEndTranslation: short), "held still at the let-go")
+    }
+
+    /// A pan whose travel and speed the test sets, as UIKit reports them to the delegate and the
+    /// action.
+    private final class MovedPan: UIPanGestureRecognizer {
+        var event: UIGestureRecognizer.State = .possible
+        var travel = CGPoint.zero
+        var speed = CGPoint.zero
+        override var state: UIGestureRecognizer.State {
+            get { event }
+            set { event = newValue }
+        }
+        override func translation(in view: UIView?) -> CGPoint { travel }
+        override func velocity(in view: UIView?) -> CGPoint { speed }
+    }
+
+    // SwiftUI keeps a representable's recognizer outside the hosted view tree, so the pan is
+    // checked where it is built, as `ChatSwipeTests` checks the swipes' pan.
+    @Test("The field's pan cancels the touch for the views under it once it starts, and is off where the drag is")
+    @MainActor
+    func panCancelsTheFieldsTouch() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true)
+        #expect(pan.delegate === coordinator)
+        #expect(pan.cancelsTouchesInView, "a started drag takes the touch from the text view, so it never focuses it")
+        #expect(pan.isEnabled)
+        #expect(!ChatFieldPan.makePan(delegate: coordinator, isEnabled: false).isEnabled, "off over the panel and in the tutorial")
+    }
+
+    @Test("The field's pan starts only on a first movement more up than sideways")
+    @MainActor
+    func panStartsOnlyUpward() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let pan = MovedPan()
+        pan.delegate = coordinator
+        pan.travel = CGPoint(x: 0, y: -12)
+        #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == true)
+        for travel in [CGPoint(x: 12, y: -4), CGPoint(x: -12, y: 0), CGPoint(x: 0, y: 12)] {
+            pan.travel = travel
+            #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == false, "\(travel)")
+        }
+    }
+
+    // UIKit arbitrates two recognizers on a touch by asking their delegates; a unit test cannot make
+    // a real touch, so it asks the pan's delegate about recognizers on a real text view.
+    @Test("The text view's scroll and long presses go first; its taps wait for the drag; nothing else is ordered")
+    @MainActor
+    func textViewOrdering() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true)
+        let text = UITextView()
+        let press = UILongPressGestureRecognizer()
+        let tap = UITapGestureRecognizer()
+        text.addGestureRecognizer(press)
+        text.addGestureRecognizer(tap)
+        let inner = UIView()
+        text.addSubview(inner)
+        let innerTap = UITapGestureRecognizer()
+        inner.addGestureRecognizer(innerTap)
+
+        #expect(coordinator.gestureRecognizer(pan, shouldRequireFailureOf: text.panGestureRecognizer),
+                "overflowing text scrolls before the drag")
+        #expect(coordinator.gestureRecognizer(pan, shouldRequireFailureOf: press), "a held press stays the text's")
+        #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: tap), "a drag never ends as the text's tap")
+        #expect(coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: innerTap), "a tap inside the text view too")
+        #expect(!coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: text.panGestureRecognizer),
+                "the scroll never waits for the drag (that would wait both ways)")
+        #expect(!coordinator.gestureRecognizer(pan, shouldRequireFailureOf: tap), "the drag never waits for a tap")
+        #expect(!coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: tap), "the drag runs alone")
+
+        // Off the text view, nothing changes: the chat's scroll and other controls keep their order.
+        let scroll = UIScrollView()
+        let plain = UIView()
+        let plainTap = UITapGestureRecognizer()
+        let plainPress = UILongPressGestureRecognizer()
+        plain.addGestureRecognizer(plainTap)
+        plain.addGestureRecognizer(plainPress)
+        #expect(!coordinator.gestureRecognizer(pan, shouldRequireFailureOf: scroll.panGestureRecognizer))
+        #expect(!coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: scroll.panGestureRecognizer))
+        #expect(!coordinator.gestureRecognizer(pan, shouldRequireFailureOf: plainPress))
+        #expect(!coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: plainTap))
+    }
+
+    @Test("The pan's events swell the field by the travel; the let-go hands on travel, speed and whether it finished")
+    @MainActor
+    func deliveredPan() {
+        let pan = MovedPan()
+        var moves: [CGSize] = []
+        var ends: [(CGSize, CGSize, Bool)] = []
+        func send(_ state: UIGestureRecognizer.State, travel: CGPoint, speed: CGPoint = .zero) {
+            pan.event = state
+            pan.travel = travel
+            pan.speed = speed
+            ChatFieldPan.deliver(pan, changed: { moves.append($0) }, ended: { ends.append(($0, $1, $2)) })
+        }
+        send(.possible, travel: CGPoint(x: 0, y: -50))
+        #expect(moves.isEmpty && ends.isEmpty, "not a drag yet")
+        send(.began, travel: CGPoint(x: 1, y: -12))
+        send(.changed, travel: CGPoint(x: 2, y: -30))
+        #expect(moves == [CGSize(width: 1, height: -12), CGSize(width: 2, height: -30)])
+        send(.ended, travel: CGPoint(x: 2, y: -40), speed: CGPoint(x: 0, y: -300))
+        send(.cancelled, travel: CGPoint(x: 0, y: -70))
+        #expect(ends.count == 2)
+        guard ends.count == 2 else { return }
+        #expect(ends[0].0 == CGSize(width: 2, height: -40) && ends[0].1 == CGSize(width: 0, height: -300) && ends[0].2)
+        #expect(ends[1].0 == CGSize(width: 0, height: -70) && !ends[1].2, "a cancelled drag is not finished, so it never opens")
     }
 
     /// The project root: this file is TabMailTests/Views/ChatFieldDragTests.swift.

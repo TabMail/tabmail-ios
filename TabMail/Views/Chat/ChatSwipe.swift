@@ -384,8 +384,9 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     /// The swipe's pan, asking `delegate` before it starts so a vertical drag stays the scroll
-    /// view's (`Coordinator.gestureRecognizerShouldBegin`).
-    static func makePan(delegate: Coordinator) -> UIPanGestureRecognizer {
+    /// view's (`Coordinator.gestureRecognizerShouldBegin`). The reply field's drag up builds its
+    /// pan here too (`ChatFieldPan`), with its own delegate.
+    static func makePan(delegate: any UIGestureRecognizerDelegate) -> UIPanGestureRecognizer {
         let pan = UIPanGestureRecognizer()
         pan.delegate = delegate
         return pan
@@ -474,6 +475,107 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
                         || other === nav.interactivePopGestureRecognizer
                 }
                 responder = current.next
+            }
+            return false
+        }
+    }
+}
+
+/// The drag up on the chat's collapsed reply field (`ChatFieldDrag`): the swipes' pan bridge
+/// (`ChatHorizontalPan`), vertical. It starts only on a first movement more up than sideways
+/// (`ChatFieldDrag.begins`), so a sideways drag stays a swipe or the back swipe. Once it starts it
+/// cancels the touch for the views under it (`cancelsTouchesInView`), so the field's text view
+/// never takes the let-go as a tap and takes focus; a tap does not move, never starts it, and
+/// focuses the field as before.
+struct ChatFieldPan: UIGestureRecognizerRepresentable {
+    /// Off over the open panel and in the tutorial. Turning it off mid-drag cancels the drag, which
+    /// ends as an interrupted one.
+    let isEnabled: Bool
+    /// The drag's travel since it began.
+    let changed: (CGSize) -> Void
+    /// The drag's travel and its velocity at the let-go, and whether the user finished it (false
+    /// when the system cancelled or failed it).
+    let ended: (CGSize, CGSize, Bool) -> Void
+
+    func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
+        Self.makePan(delegate: context.coordinator, isEnabled: isEnabled)
+    }
+
+    /// The swipes' pan (`ChatHorizontalPan.makePan`) asking `delegate`, cancelling the touch for
+    /// the views under it once it starts (UIKit's default, stated because the field's focus
+    /// depends on it).
+    static func makePan(delegate: Coordinator, isEnabled: Bool) -> UIPanGestureRecognizer {
+        let pan = ChatHorizontalPan.makePan(delegate: delegate)
+        pan.cancelsTouchesInView = true
+        pan.isEnabled = isEnabled
+        return pan
+    }
+
+    func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
+        recognizer.isEnabled = isEnabled
+    }
+
+    func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
+        Self.deliver(recognizer, changed: changed, ended: ended)
+    }
+
+    /// Hands a pan's event on: its travel while it moves; its travel, its velocity, and whether the
+    /// user finished it, once it ends (`ChatHorizontalPan.finished`).
+    static func deliver(_ recognizer: UIPanGestureRecognizer, changed: (CGSize) -> Void,
+                        ended: (CGSize, CGSize, Bool) -> Void) {
+        let travel = size(recognizer.translation(in: recognizer.view))
+        if let finished = ChatHorizontalPan.finished(recognizer.state) {
+            ended(travel, size(recognizer.velocity(in: recognizer.view)), finished)
+        } else if recognizer.state == .began || recognizer.state == .changed {
+            changed(travel)
+        }
+    }
+
+    static func size(_ point: CGPoint) -> CGSize {
+        CGSize(width: point.x, height: point.y)
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        /// Only a first movement more up than sideways starts the drag.
+        func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+            guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
+            return ChatFieldDrag.begins(translation: ChatFieldPan.size(pan.translation(in: pan.view)))
+        }
+
+        /// The drag runs alone, as a swipe does: once it has the finger, nothing else acts on it.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            false
+        }
+
+        /// The field's text view goes first where it did: its scroll (only while its text overflows
+        /// the field's six lines) and its long presses (caret placement, the loupe, selection). The
+        /// drag starts only once they have declined, so a drag in overflowing text scrolls it and a
+        /// press held before moving stays the text's.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldRequireFailureOf other: UIGestureRecognizer) -> Bool {
+            Self.isTextViews(other)
+                && (ChatSwipeCloser.Coordinator.isScroll(other) || other is UILongPressGestureRecognizer)
+        }
+
+        /// The text view's taps wait for the drag's decision, so a drag never ends as a tap that
+        /// focuses the field; a tap never starts the drag, so it focuses the field at once.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+            Self.isTextViews(other) && other is UITapGestureRecognizer
+        }
+
+        /// Whether `other` belongs to a text view (`UITextInput`): installed on it or on a view
+        /// inside it.
+        static func isTextViews(_ other: UIGestureRecognizer) -> Bool {
+            var view = other.view
+            while let current = view {
+                if current is UITextInput { return true }
+                view = current.superview
             }
             return false
         }

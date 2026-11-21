@@ -1028,10 +1028,21 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    settle. The bar also ignores the field's height while the drag is in progress
    (`fieldDragProgress.isDragging`): the drag's start queues the bar's geometry action and the
    `onChange` that sets the settle token together, and SwiftUI runs deferred actions in an
-   unspecified order." The drag's state is a `@GestureState`
-   (`ChatFieldDrag.Progress`) reset with the pill's spring, so a cancelled drag (the panel opening on
-   an agent answer mid-drag, a system interruption) springs back too; the let-go only decides
-   whether the panel opens. The drag holds the user-interaction freeze through `ChatSwipeHold` under
+   unspecified order." The drag is a UIKit pan (`ChatFieldPan`, amended 2026-11-21), the
+   swipes' pan bridge (`ChatHorizontalPan`) turned vertical: it starts only on a first movement more
+   up than sideways (`ChatFieldDrag.begins`), and once it starts it cancels the touch for the views
+   under it (`cancelsTouchesInView`), so a drag, short or long, never ends as a tap that focuses the
+   field; a tap never starts it and focuses the field as before. The field's text view goes first
+   where it did: the pan waits for its scroll (text overflowing the six lines) and its long presses
+   (caret, loupe, selection), and its taps wait for the pan. Its state (`ChatFieldDrag.Progress`) is
+   reset with the pill's spring however the drag ends (`fieldDragEnded`), so a cancelled drag (the
+   panel opening on an agent answer mid-drag, which turns the pan off, or a system interruption)
+   springs back too; only a finished drag can open the panel, from its swell or a flick's predicted
+   swell (`ChatFieldDrag.predictedEnd`, a scroll view's normal deceleration). *Superseded
+   2026-11-21 (a short drag on the field ended as a tap and focused it):* "The drag's state is a
+   `@GestureState` (`ChatFieldDrag.Progress`) reset with the pill's spring, so a cancelled drag (the
+   panel opening on an agent answer mid-drag, a system interruption) springs back too; the let-go
+   only decides whether the panel opens." The drag holds the user-interaction freeze through `ChatSwipeHold` under
    its own id (`ChatThreadView.fieldDragHoldId`) from its start until its swell has settled
    (`ChatThreadView.fieldDragSettle`, the pill spring's own `settlingDuration`, so the two cannot
    drift apart) plus the freeze rule's cooldown (`ChatViewLayout.freezeCooldown`, the part of
@@ -1046,7 +1057,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    with the rest of the chat as built (the ghost dims with it). Tests: `ChatFieldDragTests`,
    `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel`,
    `testShortDragUpOnTheReplyFieldSettlesBack` and `testDraggedOpenPanelClosesOnCloseAndOnTheDim`
-   (taps), `ChatReplyFieldTests.fieldDragWiring`. The swell and the settle are covered by
+   (taps), `ChatReplyFieldTests.fieldDragWiring`, the pan's rules in `ChatFieldDragTests`, and
+   `testDragUpInOverflowingTextScrollsItAndShortTextOpens` (the text view's scroll first). The swell and the settle are covered by
    `ChatSwipeUITests.testShortDragOnTheReplyFieldKeepsTheChat`, which reads the debug marker
    `ChatFieldDragMarker` (the newest row's largest move from the drag's start until well after the
    settle, and whether the freeze is still held halfway through the cooldown), by

@@ -172,6 +172,8 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertNotNil(marker, "control: the marker recorded one finished drag")
         guard let marker else { return }
         XCTAssertTrue(marker.hasBaseline, "control: the drag's start had the newest row's place")
+        // A drag is never a tap: the field does not take focus, so no keyboard moves the chat.
+        XCTAssertTrue(markerReads(focused: false, in: app), "the short drag left the field unfocused")
         XCTAssertEqual(marker.newestMinY, rest.newestMinY, accuracy: 1, "control: the marker's newest row is the row read at rest")
         XCTAssertLessThan(marker.move, 1, "the chat stayed through the swell and the settle: moved \(marker.move)")
         XCTAssertTrue(marker.heldAtSettle, "the freeze is still held through the cooldown after the settle")
@@ -221,6 +223,54 @@ final class ChatSwipeUITests: XCTestCase {
                     withVelocity: .slow, thenHoldForDuration: 0.3)
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "a short drag does not open the panel")
         XCTAssertTrue(replyField(in: app).isHittable, "the field settled back")
+        XCTAssertTrue(markerReads(focused: false, in: app), "and did not take focus, as a tap would")
+    }
+
+    /// The focused field: a drag up in text that overflows the field's lines scrolls that text, so
+    /// the panel stays shut and the field keeps its focus; with a short question the same drag opens
+    /// the panel and the words ride along (mock M2), so the drag still works while typing.
+    func testDragUpInOverflowingTextScrollsItAndShortTextOpens() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        field.tap()
+        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.overflowingText)
+        let long = typedField(containing: Self.overflowingLastLine, in: app)
+        XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
+        dragUp(atY: long.frame.midY, in: app)
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the drag scrolled the overflowing text; the panel stays shut")
+        XCTAssertTrue(markerReads(focused: true, in: app), "and the field kept its focus")
+        app.terminate()
+
+        let short = launchIntoChat()
+        let shortField = replyField(in: short)
+        shortField.tap()
+        XCTAssertTrue(waitForFocus(shortField, true, timeout: 5), "control: the reply field has the keyboard")
+        shortField.typeText(Self.shortQuestion)
+        let typed = typedField(containing: Self.shortQuestion, in: short)
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
+        dragUp(atY: typed.frame.midY, in: short)
+        XCTAssertTrue(short.buttons["chatClose"].waitForExistence(timeout: 3), "the drag opened the panel while the field had focus")
+        XCTAssertTrue(typedField(containing: Self.shortQuestion, in: short).exists, "and the words rode along")
+    }
+
+    /// More lines than the field's six, so its text scrolls; the caret ends on the last line, at the
+    /// left, away from where the drag starts.
+    private static let overflowingLineCount = 9
+    private static let overflowingText = (1...overflowingLineCount).map { "Line \($0)" }.joined(separator: "\n")
+    private static let overflowingLastLine = "Line \(overflowingLineCount)"
+    /// Short, so the caret after it sits left of the field's middle, where the drag starts.
+    private static let shortQuestion = "Free?"
+
+    /// The reply field once it has words in it (it has no placeholder then), found by its text.
+    private func typedField(containing words: String, in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any).matching(NSPredicate(format: "value CONTAINS %@", words)).firstMatch
+    }
+
+    /// A drag up from the middle of the screen's width at `y`, far enough to open the panel.
+    private func dragUp(atY y: CGFloat, in app: XCUIApplication) {
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: y / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -200)))
     }
 
     func testOpenActionsDragOnTheHeaderOnlyCloses() {

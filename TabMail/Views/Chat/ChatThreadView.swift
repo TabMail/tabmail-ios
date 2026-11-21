@@ -65,10 +65,10 @@ struct ChatThreadView: View {
     @State private var pillHeight = ChatViewLayout.pillStartHeight
     /// The chat's own height: the opened pill grows upward out of the bottom bar into it.
     @State private var chatAreaHeight: CGFloat = 0
-    /// A drag up on the collapsed field (`ChatFieldDrag`): reset however the drag ends, a cancelled
-    /// one included, with the pill's spring, so the swell always springs back.
-    @GestureState(resetTransaction: Transaction(animation: ChatThreadView.pillSpring))
-    private var fieldDragProgress = ChatFieldDrag.Progress()
+    /// A drag up on the collapsed field (`ChatFieldDrag`, `ChatFieldPan`): reset however the drag
+    /// ends, a cancelled one included, with the pill's spring, so the swell always springs back
+    /// (`fieldDragEnded`).
+    @State private var fieldDragProgress = ChatFieldDrag.Progress()
     @State private var chatInputFocused = false
     @State private var chatWorking = false
     /// The ready AI Suggestion's compose card: the email it answers, and how it opens.
@@ -927,9 +927,12 @@ struct ChatThreadView: View {
             // back out of the layout here, springing back in the same transaction, so the field's
             // measured height, the bar, its inset and the chat never move under a drag.
             .padding(.top, -fieldDragProgress.swell)
-            // Drag the field up: it swells under the finger and opens the TabMail chat panel. Not
-            // in the tutorial, whose steps open the chat themselves.
-            .simultaneousGesture(fieldDragGesture, isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning)
+            // Drag the field up: it swells under the finger and opens the TabMail chat panel. A
+            // UIKit pan, so once it starts the field's text view loses the touch and a drag never
+            // focuses the field (`ChatFieldPan`). Not in the tutorial, whose steps open the chat
+            // themselves.
+            .gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning,
+                                  changed: fieldDragMoved, ended: fieldDragEnded))
             .onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }
             // Debug UI tests only: what the drag did to the chat (`ChatFieldDragMarker`).
             .modifier(ChatFieldDragMarker.Field(dragging: fieldDragProgress.isDragging))
@@ -963,18 +966,22 @@ struct ChatThreadView: View {
         .animation(Self.pillSpring, value: chatExpanded)
     }
 
-    /// The drag up on the collapsed field (`ChatFieldDrag`). The swell lives in `@GestureState`, so
-    /// it springs back however the drag ends; the let-go only decides whether the panel opens.
-    private var fieldDragGesture: some Gesture {
-        DragGesture(minimumDistance: ChatViewLayout.fieldDragMinimumDistance)
-            .updating($fieldDragProgress) { value, progress, _ in
-                progress = ChatFieldDrag.progress(translation: value.translation)
-            }
-            .onEnded { value in
-                guard ChatFieldDrag.opens(
-                    translation: value.translation, predictedEndTranslation: value.predictedEndTranslation) else { return }
-                withAnimation(Self.pillSpring) { chatExpanded = true }
-            }
+    /// The drag up on the collapsed field moved (`ChatFieldPan`): the field swells under the finger.
+    private func fieldDragMoved(_ translation: CGSize) {
+        fieldDragProgress = ChatFieldDrag.progress(translation: translation)
+    }
+
+    /// The drag up on the collapsed field let go, or was cancelled (`ChatFieldPan`): the swell
+    /// springs back with the pill's spring however it ended, and a finished drag whose swell, or a
+    /// flick's predicted swell, reaches the open distance opens the panel in the same transaction.
+    private func fieldDragEnded(_ translation: CGSize, velocity: CGSize, finished: Bool) {
+        let opens = finished && ChatFieldDrag.opens(
+            translation: translation,
+            predictedEndTranslation: ChatFieldDrag.predictedEnd(translation: translation, velocity: velocity))
+        withAnimation(Self.pillSpring) {
+            fieldDragProgress = ChatFieldDrag.Progress()
+            if opens { chatExpanded = true }
+        }
     }
 
     /// A drag on the field began or ended (finished or cancelled). It holds the interaction freeze

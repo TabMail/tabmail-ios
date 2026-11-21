@@ -140,12 +140,15 @@ enum ChatViewLayout {
     static let fieldLineHeight: CGFloat = 22
     /// The collapsed reply field's corner: a capsule at one line (42 / 2), then fixed as it grows.
     static let fieldCornerRadius: CGFloat = 21
-    /// Dragging the reply field up (`ChatFieldDrag`): the movement before it counts as a drag,
-    /// how far the field may swell under the finger, and the swell (or a flick's predicted
-    /// swell) that opens the panel on let-go.
-    static let fieldDragMinimumDistance: CGFloat = 10
+    /// Dragging the reply field up (`ChatFieldDrag`): how far the field may swell under the
+    /// finger, and the swell (or a flick's predicted swell) that opens the panel on let-go. The
+    /// movement before it counts as a drag is UIKit's own pan's (`ChatFieldPan`).
     static let fieldDragMaxSwell: CGFloat = 220
     static let fieldDragOpenDistance: CGFloat = 60
+    /// How a flick's let-go speed carries on when predicting where the drag would rest
+    /// (`ChatFieldDrag.predictedEnd`): a scroll view's normal deceleration, per millisecond
+    /// (`UIScrollView.DecelerationRate.normal`).
+    static let fieldFlickDecelerationRate: CGFloat = 0.998
     /// The pill's spring (the panel opening and closing, the field's swell springing back): its
     /// response in seconds and its damping ratio. A drag's settle lasts this spring's own settling
     /// duration (`ChatThreadView.fieldDragSettle`).

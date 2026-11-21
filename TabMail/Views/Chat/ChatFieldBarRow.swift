@@ -61,9 +61,10 @@ private struct FieldButtonSlot: ViewModifier {
 /// predicted swell, reaches `ChatViewLayout.fieldDragOpenDistance`; otherwise it settles back.
 /// Only a drag that goes more up than sideways swells the field, so a sideways swipe stays a swipe.
 enum ChatFieldDrag {
-    /// A drag in flight on the field, as the view's `@GestureState`: it resets however the drag
-    /// ends, a cancelled drag included. `isDragging` is the whole drag (the interaction freeze and
-    /// the tip key off it, once per drag); `swell` is how far the field follows the finger.
+    /// A drag in flight on the field (`ChatFieldPan`): the view resets it with the pill's spring
+    /// however the drag ends, a cancelled drag included. `isDragging` is the whole drag (the
+    /// interaction freeze and the tip key off it, once per drag); `swell` is how far the field
+    /// follows the finger.
     struct Progress: Equatable {
         var isDragging = false
         var swell: CGFloat = 0
@@ -80,6 +81,24 @@ enum ChatFieldDrag {
         guard up > 0, up > abs(translation.width) else { return 0 }
         return min(up, ChatViewLayout.fieldDragMaxSwell)
     }
+
+    /// Whether a drag that has travelled `translation` when it first moves is the field's: only one
+    /// more up than sideways, the same drag that swells the field, so a sideways drag stays a swipe.
+    static func begins(translation: CGSize) -> Bool {
+        swell(translation: translation) > 0
+    }
+
+    /// Where a drag let go at `velocity` (points per second) would come to rest: its travel plus
+    /// the distance a scroll view's normal deceleration carries that velocity
+    /// (`ChatViewLayout.fieldFlickDecelerationRate`, a rate per millisecond).
+    static func predictedEnd(translation: CGSize, velocity: CGSize) -> CGSize {
+        let rate = ChatViewLayout.fieldFlickDecelerationRate
+        let carry = rate / (1 - rate) / millisecondsPerSecond
+        return CGSize(width: translation.width + velocity.width * carry,
+                      height: translation.height + velocity.height * carry)
+    }
+
+    private static let millisecondsPerSecond = CGFloat(Duration.seconds(1) / Duration.milliseconds(1))
 
     /// Whether letting go here opens the panel.
     static func opens(translation: CGSize, predictedEndTranslation: CGSize) -> Bool {

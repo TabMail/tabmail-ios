@@ -873,17 +873,23 @@ struct ChatReplyFieldTests {
         #expect(Self.count("OnboardingTipGate.$onboardingComplete", in: tip) == 1, "today's tip gate")
     }
 
-    @Test("The drag's swell is gesture state, reset with the pill's spring however the drag ends; it holds the freeze once per drag")
+    @Test("The drag is the UIKit field pan; its swell resets with the pill's spring however it ends; it holds the freeze once per drag")
     func fieldDragWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        // A cancelled drag resets too, so the field never stays swollen.
-        #expect(Self.count("@GestureState(resetTransaction: Transaction(animation: ChatThreadView.pillSpring)) private var fieldDragProgress = ChatFieldDrag.Progress()", in: chat) == 1)
-        #expect(Self.count(".updating($fieldDragProgress) { value, progress, _ in progress = ChatFieldDrag.progress(translation: value.translation) }", in: chat) == 1)
+        // The SwiftUI drag is gone: a simultaneous SwiftUI drag left the field's text view the
+        // touch, so a short drag ended as a tap and focused the field.
+        #expect(Self.count("DragGesture", in: chat) == 0)
+        #expect(Self.count("@GestureState", in: chat) == 0)
+        #expect(Self.count("fieldDragGesture", in: chat) == 0)
+        #expect(Self.count("@State private var fieldDragProgress = ChatFieldDrag.Progress()", in: chat) == 1)
         #expect(Self.count("@State private var fieldSwell", in: chat) == 0)
-        let gesture = try Self.body(of: "private var fieldDragGesture: some Gesture {", in: chat)
-        let ended = try #require(gesture.range(of: ".onEnded {"))
-        #expect(Self.count("fieldDragProgress", in: String(gesture[ended.upperBound...])) == 0, "the let-go only decides the open")
-        #expect(Self.count("withAnimation(Self.pillSpring) { chatExpanded = true }", in: String(gesture[ended.upperBound...])) == 1)
+        let moved = try Self.body(of: "private func fieldDragMoved(_ translation: CGSize) {", in: chat)
+        #expect(Self.count("fieldDragProgress = ChatFieldDrag.progress(translation: translation) }", in: moved) == 1)
+        #expect(Self.count("chatExpanded", in: moved) == 0, "a move only swells the field")
+        // A cancelled drag resets too, so the field never stays swollen; only a finished drag opens.
+        let ended = try Self.body(of: "private func fieldDragEnded(_ translation: CGSize, velocity: CGSize, finished: Bool) {", in: chat)
+        #expect(Self.count("let opens = finished && ChatFieldDrag.opens( translation: translation, predictedEndTranslation: ChatFieldDrag.predictedEnd(translation: translation, velocity: velocity))", in: ended) == 1)
+        #expect(Self.count("withAnimation(Self.pillSpring) { fieldDragProgress = ChatFieldDrag.Progress() if opens { chatExpanded = true } }", in: ended) == 1)
         // The freeze, under its own id, from the gesture state, so a cancelled drag releases.
         #expect(Self.count(".onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }", in: chat) == 1)
         let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
@@ -893,7 +899,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: Self.fieldDragSettle + ChatViewLayout.freezeCooldown)", in: changed) == 1)
         #expect(Self.count("ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)", in: chat) == 1, "and if the chat goes away")
         // Never in the tutorial, whose steps open the chat themselves, nor over the open panel.
-        #expect(Self.count(".simultaneousGesture(fieldDragGesture, isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning)", in: chat) == 1)
+        #expect(Self.count(".gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning, changed: fieldDragMoved, ended: fieldDragEnded))", in: chat) == 1)
+        #expect(Self.count("simultaneousGesture", in: chat) == 0)
         // VoiceOver opens the panel with a named action on the text field it focuses, offered only
         // while the panel is closed, never on the field's container.
         #expect(ChatViewConfig.showChatActionName == "Show TabMail chat")
