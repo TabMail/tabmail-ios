@@ -1052,6 +1052,37 @@ struct CatchUpApplyTests {
         #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-default", path: "Archive", pool: w.pool) == 3)
     }
 
+    @Test("Under a storage limit, a provider that orders by date never gets the one-time UID prune cutoff seed: its catch-up runs as it does with no limit; the same folder under a UID-order provider is seeded")
+    func dateOrderProviderIsNeverSeeded() async throws {
+        let w = try Self.world("cua-date-seed", storedEpoch: Self.epoch)
+        defer { AppDatabase.shared.withLock { $0 = w.previous }; TestDatabaseTeardown.retire(pool: w.pool, directory: w.dir) }
+        let folderId = w.folderId
+        let seed = try await w.pool.read { db in try SyncEngine.catchUpPruneCutoffSeed(folderId: folderId, db: db) }
+        #expect(seed?.uid == 0 && seed?.epoch == Int(Self.epoch),
+                "setup: the folder is seed-eligible (known epoch, no cutoff, local rows): \(String(describing: seed))")
+        func context(limit: Bool) -> CatchUpContext {
+            var context = CatchUpContext(deadline: .distantFuture, clock: { Date() })
+            context.storageLimitInForce = limit
+            return context
+        }
+
+        let dateOrder = MockEmailProvider(staleWindowMode: .date)
+        await SyncEngine().runCatchUp(provider: dateOrder, folderIds: [folderId], context: context(limit: false))
+        let withoutLimit = try Self.catchUpState(w.pool, folderId)
+        await SyncEngine().runCatchUp(provider: dateOrder, folderIds: [folderId], context: context(limit: true))
+        let underLimit = try Self.catchUpState(w.pool, folderId)
+        #expect(!(underLimit ?? "").contains(CatchUpPruneCutoff.key),
+                "#1062: a date-order provider's folder gets no UID prune cutoff seed: \(String(describing: underLimit))")
+        #expect(underLimit == withoutLimit, "#1062: its catch-up under the limit leaves what it leaves with no limit")
+        #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-date-seed", path: "Archive", pool: w.pool) == 3,
+                "#1062: and its rows are untouched")
+
+        await SyncEngine().runCatchUp(
+            provider: MockEmailProvider(staleWindowMode: .uid), folderIds: [folderId], context: context(limit: true))
+        #expect(CatchUpPruneCutoff.read(try Self.catchUpState(w.pool, folderId), epoch: Int(Self.epoch)) == 0,
+                "setup: the same folder under a UID-order provider is seeded, so the check above can see a seed")
+    }
+
     @Test("The local-row reader reads by range, by ids and in order")
     func reader() async throws {
         let w = try Self.world("cua-reader", storedEpoch: Self.epoch)
