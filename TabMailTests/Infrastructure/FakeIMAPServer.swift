@@ -1326,49 +1326,66 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.honorsSearchUIDSetCriterion = false }
     }
 
+    /// The `SINCE` / `BEFORE` keys of one UID SEARCH, read once per SEARCH.
     /// RFC 3501 §6.4.4 at DAY granularity, which is all the wire form carries
     /// (`date-day "-" date-month "-" date-year`, written unpadded by NIO IMAP as
     /// e.g. `4-Aug-2026`): `SINCE d` matches an INTERNALDATE **on or after** `d`,
     /// `BEFORE d` one **strictly earlier** than `d`. Keys this fake does not model
     /// are ignored, exactly as the un-filtered path ignores all of them.
-    private static func matchesSearchDateCriteria(_ message: Message, args: String) -> Bool {
-        let tokens = args.split(whereSeparator: { $0 == " " || $0 == "(" || $0 == ")" }).map(String.init)
-        guard let messageDay = searchDay(fromInternalDate: message.internalDate) else { return true }
-        var matches = true
-        for (index, token) in tokens.enumerated() {
-            let key = token.uppercased()
-            guard key == "SINCE" || key == "BEFORE", index + 1 < tokens.count,
-                  let bound = searchDay(fromCriterion: tokens[index + 1]) else { continue }
-            if key == "SINCE" {
-                matches = matches && messageDay >= bound
-            } else {
-                matches = matches && messageDay < bound
+    /// Built per SEARCH, never shared: its parser and calendar serve this
+    /// search's messages only, so the cost of a search no longer grows with one
+    /// formatter per message.
+    private struct SearchDateCriteria {
+        /// Each key's UTC day-start, in the order the search names them.
+        let bounds: [(since: Bool, day: Date)]
+        /// The UTC day-start of an `INTERNALDATE` value (`dd-MMM-yyyy HH:mm:ss Z`).
+        let internalDateParser: DateFormatter
+        let utc: Calendar
+
+        /// Nil when the search has no `SINCE` / `BEFORE` key with a date that
+        /// parses: every message then matches, so the date check is skipped.
+        init?(args: String) {
+            let tokens = args.split(whereSeparator: { $0 == " " || $0 == "(" || $0 == ")" }).map(String.init)
+            // A key's date argument: `d-MMM-yyyy` accepts both the unpadded form
+            // NIO IMAP writes and the zero-padded form other clients write;
+            // surrounding quotes are optional per the grammar.
+            let criterionParser = DateFormatter()
+            criterionParser.locale = Locale(identifier: "en_US_POSIX")
+            criterionParser.timeZone = TimeZone(identifier: "UTC")
+            criterionParser.dateFormat = "d-MMM-yyyy"
+            var bounds: [(since: Bool, day: Date)] = []
+            for (index, token) in tokens.enumerated() {
+                let key = token.uppercased()
+                guard key == "SINCE" || key == "BEFORE", index + 1 < tokens.count,
+                      let bound = criterionParser.date(from: tokens[index + 1].trimmingCharacters(in: CharacterSet(charactersIn: "\"")))
+                else { continue }
+                bounds.append((since: key == "SINCE", day: bound))
             }
+            guard !bounds.isEmpty else { return nil }
+            self.bounds = bounds
+            let internalDateParser = DateFormatter()
+            internalDateParser.locale = Locale(identifier: "en_US_POSIX")
+            internalDateParser.dateFormat = "dd-MMM-yyyy HH:mm:ss Z"
+            self.internalDateParser = internalDateParser
+            var utc = Calendar(identifier: .gregorian)
+            utc.timeZone = TimeZone(identifier: "UTC")!
+            self.utc = utc
         }
-        return matches
-    }
 
-    /// The UTC day-start of an `INTERNALDATE` value (`dd-MMM-yyyy HH:mm:ss Z`).
-    private static func searchDay(fromInternalDate value: String) -> Date? {
-        let parser = DateFormatter()
-        parser.locale = Locale(identifier: "en_US_POSIX")
-        parser.dateFormat = "dd-MMM-yyyy HH:mm:ss Z"
-        guard let parsed = parser.date(from: value) else { return nil }
-        var utc = Calendar(identifier: .gregorian)
-        utc.timeZone = TimeZone(identifier: "UTC")!
-        return utc.startOfDay(for: parsed)
-    }
-
-    /// The UTC day-start of a search key's date argument. `d-MMM-yyyy` accepts
-    /// both the unpadded form NIO IMAP writes and the zero-padded form other
-    /// clients write; surrounding quotes are optional per the grammar.
-    private static func searchDay(fromCriterion value: String) -> Date? {
-        let bare = value.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        let parser = DateFormatter()
-        parser.locale = Locale(identifier: "en_US_POSIX")
-        parser.timeZone = TimeZone(identifier: "UTC")
-        parser.dateFormat = "d-MMM-yyyy"
-        return parser.date(from: bare)
+        /// A message whose INTERNALDATE does not parse matches.
+        func matches(_ message: Message) -> Bool {
+            guard let parsed = internalDateParser.date(from: message.internalDate) else { return true }
+            let messageDay = utc.startOfDay(for: parsed)
+            var allMatch = true
+            for bound in bounds {
+                if bound.since {
+                    allMatch = allMatch && messageDay >= bound.day
+                } else {
+                    allMatch = allMatch && messageDay < bound.day
+                }
+            }
+            return allMatch
+        }
     }
 
     /// Test seam (G1): the copies still land exactly where this fake put them,
@@ -3026,12 +3043,15 @@ final class FakeIMAPServer: @unchecked Sendable {
                     .map { Set(Self.resolveUIDSet(tokens[$0 + 1], againstMailboxUIDs: snapshotUIDs)) }
                 : []
             let omitted: Set<Int> = messageIDQuery == nil ? withState { $0.searchOmittedUIDsByMailbox[mailbox] ?? [] } : []
+            // The date keys are read once per SEARCH and checked last among the
+            // keys, on the messages the UID keys leave; none, no date check.
+            let dateCriteria = honorsDates ? SearchDateCriteria(args: subargs) : nil
             let uids = all
                 .filter { message in
                     messageIDQuery.map { message.messageID.trimmingCharacters(in: bracketSet).contains($0) } ?? true
                 }
-                .filter { !honorsDates || Self.matchesSearchDateCriteria($0, args: subargs) }
                 .filter { message in uidSets.allSatisfy { $0.contains(message.uid) } }
+                .filter { message in dateCriteria?.matches(message) ?? true }
                 .filter { !omitted.contains($0.uid) }
                 .map { String($0.uid) }
             return Self.uidSearchReply(tag: tag, uids: uids, esearch: esearch, request: subargs)
