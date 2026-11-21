@@ -147,21 +147,25 @@ struct ChatThreadViewLifecycleTests {
     }
 
     /// Opens the chat on `headers[openedIndex]` and waits until the queue and the scroll settle;
-    /// `then` runs after that, and the queue is read again once it settles.
+    /// `then` runs after that, and the queue is read again once it settles. `firstPass` is asked
+    /// every few milliseconds from the window's first appearance, so it can act in the layout
+    /// pass after the one it waits for, until it returns true.
     private func open(
         unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool = false, tall: Int? = nil,
         height: CGFloat = 852,
-        then action: (@MainActor (UIScrollView) async throws -> Void)? = nil
+        then action: (@MainActor (UIScrollView) async throws -> Void)? = nil,
+        firstPass: (@MainActor (UIScrollView) -> Bool)? = nil
     ) async throws -> Opened {
         try await HostedAccessibility.withAutomation {
             try await openWithAutomation(unreadFrom: unreadFrom, openedIndex: openedIndex,
                                          highlights: highlights, landsAway: landsAway, tall: tall,
-                                         height: height, then: action)
+                                         height: height, firstPass: firstPass, then: action)
         }
     }
 
     private func openWithAutomation(
         unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool, tall: Int?, height: CGFloat,
+        firstPass: (@MainActor (UIScrollView) -> Bool)?,
         then action: (@MainActor (UIScrollView) async throws -> Void)?
     ) async throws -> Opened {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -191,6 +195,12 @@ struct ChatThreadViewLifecycleTests {
 
         func chatScroll() -> UIScrollView? {
             Self.scrollViews(controller.view).max { $0.contentSize.height < $1.contentSize.height }
+        }
+        if let firstPass {
+            for _ in 0..<2000 {
+                if let scroll = chatScroll(), firstPass(scroll) { break }
+                try await Task.sleep(for: .milliseconds(2))
+            }
         }
         if landsAway {
             for _ in 0..<80 {
@@ -243,44 +253,61 @@ struct ChatThreadViewLifecycleTests {
     }
 
     /// Waits, by polling the layout, until the scroll's inset on `edge` passes `inset` and the inset
-    /// and the distance from the bottom hold still for several passes; a timeout fails the test.
-    /// Returns that distance.
-    private static func settledBelow(_ scroll: UIScrollView, edge: KeyPath<UIEdgeInsets, CGFloat>,
-                                     inset: (CGFloat) -> Bool,
-                                     sourceLocation: SourceLocation = #_sourceLocation) async throws -> CGFloat {
+    /// and `measure` hold still for several passes; a timeout fails the test. Returns `measure`.
+    private static func settled(_ scroll: UIScrollView, edge: KeyPath<UIEdgeInsets, CGFloat>,
+                                inset: (CGFloat) -> Bool, measure: @MainActor (UIScrollView) throws -> CGFloat,
+                                sourceLocation: SourceLocation = #_sourceLocation) async throws -> CGFloat {
         var last: [CGFloat]?
         var stableFor = 0
         for _ in 0..<80 where stableFor < 6 {
             try await Task.sleep(for: .milliseconds(100))
             let current = scroll.adjustedContentInset[keyPath: edge]
             guard inset(current) else { stableFor = 0; last = nil; continue }
-            let now = [current, below(scroll)]
+            let now = [current, try measure(scroll)]
             stableFor = now == last ? stableFor + 1 : 0
             last = now
         }
-        try #require(stableFor >= 6, "the inset and the scroll settle, got inset \(scroll.adjustedContentInset[keyPath: edge]), below \(String(describing: last))",
+        try #require(stableFor >= 6, "the inset and the scroll settle, got inset \(scroll.adjustedContentInset[keyPath: edge]), measured \(String(describing: last))",
                      sourceLocation: sourceLocation)
         return try #require(last, sourceLocation: sourceLocation)[1]
     }
+
+    /// Where email `index`'s bubble sits in what the user sees (the scroll view less its insets),
+    /// on screen: its top's distance below the visible top, and its middle's below the visible middle.
+    private static func placement(of index: Int, in scroll: UIScrollView) throws -> (top: CGFloat, middle: CGFloat) {
+        let root = try #require(scroll.window?.rootViewController?.view, "the hosting controller's view")
+        let visible = scroll.convert(scroll.bounds, to: nil).inset(by: scroll.adjustedContentInset)
+        let bubble = try #require(bubbleFrames(in: root).first { $0.index == index }?.frame, "email \(index)'s bubble")
+        return (bubble.minY - visible.minY, bubble.midY - visible.midY)
+    }
+
+    // The held landing follows the settled inset (ADR-IOS-114 decision 9). Once the chat has
+    // settled, a bottom landing cannot show that here: under `defaultScrollAnchor(.bottom)` an
+    // inset change keeps the bottom by itself, so the distance from the bottom never moves. The
+    // Unread line's landing (anchor top) and the opened email's (anchor center) are placements
+    // the platform does not keep, so they move unless the landing is issued again.
 
     /// The device's order: the top bar is tall as the chat lands and then settles shorter. The
     /// header's own height is driven (`ChatHeaderTestSeam`): the root controller's
     /// `additionalSafeAreaInsets.top` grows this scroll view's inset but never shrinks it back
     /// (memory 036).
-    @Test("A chat that lands under a tall top bar is still at the bottom once the bar shrinks")
-    func topInsetChangeKeepsTheBottom() async throws {
+    @Test("A chat that opens at the Unread line under a tall top bar keeps the line at the top once the bar shrinks")
+    func topInsetChangeKeepsTheUnreadLine() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
         let seam = ChatHeaderTestSeam.shared
         defer { seam.extraHeight = 0 }
+        let firstUnread = 20
         // About what the settling top bar takes off after its first pass.
         let shrink: CGFloat = 400
         // Tall before the chat opens, so the landing happens under the tall inset.
         seam.extraHeight = shrink
-        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { scroll in
-            let landed = try await Self.settledBelow(scroll, edge: \.top, inset: { _ in true })
+        _ = try await open(unreadFrom: firstUnread, openedIndex: Self.length - 1, highlights: false, landsAway: true) { scroll in
+            let lineTop: @MainActor (UIScrollView) throws -> CGFloat = { try Self.placement(of: firstUnread, in: $0).top }
+            let landed = try await Self.settled(scroll, edge: \.top, inset: { _ in true }, measure: lineTop)
             let tallInset = scroll.adjustedContentInset.top
             try #require(tallInset > shrink, "control: the chat lands under the tall bar, got inset \(tallInset)")
-            try #require(abs(landed) < 2, "control: the chat lands at the bottom first, got \(landed)")
+            // The Unread line sits just above the first unread email's bubble.
+            try #require(landed >= 0 && landed < shrink / 4, "control: the chat lands at the Unread line, got \(landed)")
             // The landing is still held: nothing has scrolled by hand or by offset.
             #expect(!scroll.isDragging && !scroll.isDecelerating && !scroll.isTracking, "control: no scroll began")
             let contentHeight = scroll.contentSize.height
@@ -288,43 +315,65 @@ struct ChatThreadViewLifecycleTests {
 
             seam.extraHeight = 0
             let target = tallInset - shrink
-            let shrunk = try await Self.settledBelow(scroll, edge: \.top, inset: { abs($0 - target) < 1 })
-            #expect(tallInset - scroll.adjustedContentInset.top > shrink / 2, "control: the top inset really shrank")
+            let shrunk = try await Self.settled(scroll, edge: \.top, inset: { abs($0 - target) < 1 }, measure: lineTop)
             #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
                     "control: only the inset changed")
-            #expect(abs(shrunk) < 2, "at the bottom after the top bar shrinks, got \(shrunk) below the screen")
+            #expect(abs(shrunk - landed) < 2, "the Unread line stays at the top once the bar shrinks, moved \(shrunk - landed)")
         }
-        #expect(abs(opened.belowScreen) < 2, "still at the bottom at the end, got \(opened.belowScreen)")
     }
 
-    @Test("A chat landed at the bottom is still at the bottom after its bottom inset grows and shrinks")
-    func bottomInsetChangeKeepsTheBottom() async throws {
+    @Test("A chat opened at an email keeps it in the middle while its bottom inset grows and shrinks")
+    func bottomInsetChangeKeepsTheOpenedEmail() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let target = 20
         // About a keyboard's height, as when the reply field is focused before any scroll.
         let growth: CGFloat = 300
-        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { scroll in
+        _ = try await open(unreadFrom: nil, openedIndex: target, highlights: true, landsAway: true) { scroll in
             let controller = try #require(scroll.window?.rootViewController, "the hosting controller")
             defer { controller.additionalSafeAreaInsets = .zero }
-            let landed = try await Self.settledBelow(scroll, edge: \.bottom, inset: { _ in true })
+            let middle: @MainActor (UIScrollView) throws -> CGFloat = { try Self.placement(of: target, in: $0).middle }
+            let landed = try await Self.settled(scroll, edge: \.bottom, inset: { _ in true }, measure: middle)
             let settledInset = scroll.adjustedContentInset.bottom
-            try #require(abs(landed) < 2, "control: the chat lands at the bottom first, got \(landed)")
+            try #require(abs(landed) < scroll.bounds.height / 4, "control: the chat lands with the opened email in the middle, got \(landed)")
             // The landing is still held: nothing has scrolled by hand or by offset.
             #expect(!scroll.isDragging && !scroll.isDecelerating && !scroll.isTracking, "control: no scroll began")
             let contentHeight = scroll.contentSize.height
             let containerHeight = scroll.bounds.height
 
             controller.additionalSafeAreaInsets = UIEdgeInsets(top: 0, left: 0, bottom: growth, right: 0)
-            let grown = try await Self.settledBelow(scroll, edge: \.bottom, inset: { $0 > settledInset + growth / 2 })
+            let grown = try await Self.settled(scroll, edge: \.bottom, inset: { $0 > settledInset + growth / 2 }, measure: middle)
             #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
                     "control: only the inset changed")
-            #expect(abs(grown) < 2, "at the bottom after the inset grows, got \(grown) below the screen")
+            #expect(abs(grown - landed) < 2, "the opened email stays in the middle after the inset grows, moved \(grown - landed)")
 
             controller.additionalSafeAreaInsets = .zero
-            let shrunk = try await Self.settledBelow(scroll, edge: \.bottom, inset: { abs($0 - settledInset) < 1 })
+            let shrunk = try await Self.settled(scroll, edge: \.bottom, inset: { abs($0 - settledInset) < 1 }, measure: middle)
             #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
                     "control: only the inset changed")
-            #expect(abs(shrunk) < 2, "at the bottom after the inset shrinks, got \(shrunk) below the screen")
+            #expect(abs(shrunk - landed) < 2, "the opened email stays in the middle after the inset shrinks, moved \(shrunk - landed)")
         }
+    }
+
+    /// The device's order for a bottom landing (issue #1122): the top bar is tall in the chat's
+    /// first pass and drops in the next, before the chat has settled.
+    @Test("A chat whose top bar drops right after its first landing ends at the bottom")
+    func topBarDroppingRightAfterTheLandingKeepsTheBottom() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let seam = ChatHeaderTestSeam.shared
+        defer { seam.extraHeight = 0 }
+        let shrink: CGFloat = 400
+        seam.extraHeight = shrink
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false, then: { scroll in
+            try #require(seam.extraHeight == 0, "control: the chat first landed at the bottom under the tall bar, which then dropped")
+            let settledBelow = try await Self.settled(scroll, edge: \.top, inset: { $0 < shrink }, measure: { Self.below($0) })
+            #expect(abs(settledBelow) < 2, "at the bottom once the bar has dropped, got \(settledBelow) below the screen")
+        }, firstPass: { scroll in
+            // The first pass with the chat loaded and at its bottom under the tall bar drops it.
+            guard scroll.contentSize.height > scroll.bounds.height, scroll.adjustedContentInset.top > shrink,
+                  abs(Self.below(scroll)) < 2 else { return false }
+            seam.extraHeight = 0
+            return true
+        })
         #expect(abs(opened.belowScreen) < 2, "still at the bottom at the end, got \(opened.belowScreen)")
     }
 

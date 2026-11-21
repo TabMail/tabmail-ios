@@ -313,11 +313,15 @@ same AI result, kept as long as the email itself is shown.
      (`aBodyThatLandsWhileTheChatIsNotLookingShowsItsSummary`, 2026-11-15) an email whose body lands
      while the chat is on screen, after a background return that cancelled and rebuilt the queue,
      while another screen covers the chat, or across a relaunch shows its summary once the chat is
-     shown again; and (`topInsetChangeKeepsTheBottom`, 2026-11-20) a chat that lands at the bottom
-     under a tall top bar stays there once the bar alone shrinks, the device's order (the bar's
-     height is driven through the DEBUG-only `ChatHeaderTestSeam`, memory 036), and
-     (`bottomInsetChangeKeepsTheBottom`) one landed at the bottom stays there while its bottom
-     inset alone grows and shrinks.
+     shown again; and (2026-11-21) the held landing follows the settled inset:
+     `topInsetChangeKeepsTheUnreadLine` (a chat that lands at the Unread line under a tall top bar
+     keeps the line at the top once the bar alone shrinks; the bar's height is driven through the
+     DEBUG-only `ChatHeaderTestSeam`, memory 036), `bottomInsetChangeKeepsTheOpenedEmail` (a chat
+     opened at an email keeps it in the middle while its bottom inset alone grows and shrinks), and
+     `topBarDroppingRightAfterTheLandingKeepsTheBottom` (the device's order for a bottom landing:
+     the bar is tall in the first pass and drops in the next). A bottom landing cannot show a
+     settled inset change: `defaultScrollAnchor(.bottom)` keeps the bottom by itself, so the first
+     two tests use landings the platform does not keep (memory 036).
 
    **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
    In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible
