@@ -1143,7 +1143,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
 
 - **Ranges are cut on UIDs, not on local rows.** The lower bound is where the held range starts
   (`heldRangeStart`: 1 once the older-mail walk is complete, else its cursor + 1); under a storage limit
-  loads start at the higher of that and the first local UID (amended d1 2026-11-20: was the first local
+  loads start at the higher of that and the first local UID (amended 2026-11-20: was the first local
   UID alone, which let rows infinite scroll cached below the cursor pull the floor down and load MORE
   under a limit), so pruned mail is neither listed for load nor loaded. Below the load start a listing
   only checks local rows. The upper bound is the larger of the last local UID and, with a change
@@ -1154,7 +1154,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
   last UIDNEXT - 1 the listing's SELECTs reported, at least the last local UID, raised by every later
   listed SELECT. UIDNEXT is read at most once per listing, by a call with no bookmark, no stored top
   and no recorded `topUnknown` (one request, UIDVALIDITY checked, before its first range); every
-  range is cut at the top. When it reports none (a nonconforming server; MIS-IOS-004), no top is stored and
+  range is cut at the top. When it reports none (a nonconforming server; a "could not determine" answer is not an answer), no top is stored and
   the listing records `Listing.topUnknown`: every call of it lists up to the last local UID with no
   further UIDNEXT read (so a slice of one request still lists ranges), flags and removals are reconciled
   as before, an empty folder completes, and the listing completes only as not clean, so an owed folder
@@ -1188,7 +1188,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
   passed over (held, unanswered, a range moved past after its membership SEARCH kept failing), a
   listing whose first UIDNEXT read reported none (`Listing.topUnknown`, 2026-11-20), or loads
   the apply skipped as an over-age read. An unclean completion keeps the folder owed and re-marks
-  nothing: it is listed again at least daily, plus when its change counter moves past the stamp the unclean listing still records; loads dropped as over-age in ANY slice mark the saved state unclean through the provider-neutral key `CatchUpSkippedLoads.key`, and over-age is a one-way latch (`CatchUpReadLatch`) checked before the insert, in each insert chunk and in the transaction (amended d3/d4 2026-11-20; *superseded (d2):* "it is listed again at the daily full check, never hourly"; the d1 rule
+  nothing: it is listed again at least daily, plus when its change counter moves past the stamp the unclean listing still records; loads dropped as over-age in ANY slice mark the saved state unclean through the provider-neutral key `CatchUpSkippedLoads.key`, and over-age is a one-way latch (`CatchUpReadLatch`) checked before the insert, in each insert chunk and in the transaction (amended 2026-11-20; *superseded (2026-11-20):* "it is listed again at the daily full check, never hourly"; the earlier 2026-11-20 rule
   "settled by any completion, passed-over UIDs on the re-read list" is superseded: it recorded only the
   lowest held UID per range and settled with mail on no retry path). An owed folder gets the daily and
   MODSEQ checks even when it holds a bookmark (the plan's `isTracked` = bookmark held AND not owed),
@@ -1202,7 +1202,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
   bookmark keeps the daily and MODSEQ checks off (the bookmark-based planning rule is unchanged).
 - **Unknown epoch fails closed.** A folder whose epoch is unknown is not listed and loads nothing; the
   epochless date repair is not replaced (accepted limitation).
-- **Review fixes (2026-11-20, #1062), current where they differ from the bullets above:**
+- **Amendments (2026-11-20, #1062), current where they differ from the bullets above:**
   - *Range size.* A range's width in UIDs is sized from the folder's EXISTS and UIDNEXT (first the
     stored STATUS values, then each listing SELECT's own): mean UIDs per message times
     `SyncConfig.catchUpListingRangeMessages`, never below `SyncConfig.catchUpListingMinRangeSpan`
@@ -1210,7 +1210,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     the UID space; each range has ONE membership SEARCH, asked as the range itself (plus the removal
     candidates) and never expanded (`searchMembership`). *Replaces:* fixed 1000-UID ranges
     (`catchUpListingRangeSpan`), which made a sparse folder cost one or two requests per 1000 UIDs.
-  - *Range size, current (second review round).* Only the FIRST range is sized from EXISTS and
+  - *Range size, current (2026-11-20).* Only the FIRST range is sized from EXISTS and
     UIDNEXT (a stored count of 0 reads as unknown: the minimum width). Each later range's width comes
     from the previous range's own count (`IMAPProvider.nextListingRangeSpan`), within
     `catchUpListingMinRangeSpan...catchUpListingMaxRangeSpan`, so a bunched folder never puts most of
@@ -1276,7 +1276,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     *Superseded (2026-11-21):* past the hold bound, a proof, load or SEARCH timeout passed the range over
     and the same call listed the next range; only a slice's time budget, shorter than one timeout, usually
     stopped it.
-  - *Width cap, current (d1 2026-11-20).* A range that times out sets the cap
+  - *Width cap, current (2026-11-20).* A range that times out sets the cap
     (`IMAPCatchUpState.Listing.widthCap`) to its width divided by `SyncConfig.catchUpWidthCapShrinkFactor`;
     each range that answers multiplies it by `SyncConfig.catchUpWidthCapGrowthFactor` (2026-11-20: kept only
     when the call makes progress; a call that moves nothing restores the cap it started with), and at
@@ -1286,7 +1286,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     all a timeout stores, so the timeout's own write is no progress (*Timeout, current (2026-11-21)*
     above). *Superseded (2026-11-21):* "so a timeout is no progress": a call that
     moved its listing before the timeout still made progress.
-  - *Width cap after a timeout, superseded by the d1 entry above.* A range that times out also stores a
+  - *Width cap after a timeout, superseded by the current width-cap entry above.* A range that times out also stores a
     width cap (`IMAPCatchUpState.Listing.widthCap`, the stored half width) together with the upper end
     of the range that timed out (`widthCapThrough`); repeated timeouts before the listing moves past
     keep the smallest cap and the highest end. While the listing stands at or below that end, no range
@@ -1298,7 +1298,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     same range on every call. Why it lifts: a cap kept for the rest of the listing would narrow every
     later range after one slow stretch, down to one UID after repeated timeouts, and a large folder
     would never complete its listing (flags, removals and missing-mail loads would stop with it).
-  - *Carried range, current (fourth review round).* A range the budget stops after its listing FETCH
+  - *Carried range, current (2026-11-20).* A range the budget stops after its listing FETCH
     (before the membership SEARCH) or after its proof (before a header batch) is carried in the
     listing (`IMAPCatchUpState.Listing.carried`: the range, its unproven candidates, the missing UIDs,
     the `\Deleted` ones it listed, whether it is proven, and a held UID). The next call goes on with it
@@ -1312,7 +1312,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     SEARCH still holds the range from its start. Superseded: "a budget stop before the proof holds
     the range from `lo`", which made a slice that fits only the listing and the proof list the same
     range forever. No migration.
-    *Fifth review round, current:* the carry stores the load floor its range was listed under
+    *Amended later the same day (2026-11-20), current:* the carry stores the load floor its range was listed under
     (`loadsFrom`); the resume loads only from the higher of that and the current floor, so a rising
     floor (a walk reset, a prune) loads nothing below it and a range listed with no floor proves only
     its candidates. Carried UIDs (missing, `\Deleted`, unanswered, the held one) now local are
@@ -1333,7 +1333,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     UID: new mail beyond the window is a scan's to load, and a scan never waits for the walk's download
     gates (#1063). Only mail older than every local row waits for the walk. *Replaces:* "before the walk
     has started, below the window is the walk's to load" (nothing loaded).
-  - *Load floor before the walk starts, current (second review round).* The floor is the lowest UID a
+  - *Load floor before the walk starts, current (2026-11-20).* The floor is the lowest UID a
     window listing of the folder reached (`CatchUpWindowFloor`, kept under `windowFloor` in the
     folder's `catchUpState` JSON by the window merge, `SyncEngine.recordCatchUpWindowFloor`, as the
     lowest any window listing in the epoch reached; the catch-up apply carries it across its own state

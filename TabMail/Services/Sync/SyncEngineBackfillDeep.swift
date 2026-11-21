@@ -79,7 +79,7 @@ extension SyncEngine {
     /// `.init(nil)` means "the premise is that the folder is UNSTAMPED", which is
     /// a real and common crawl state (a folder holding rows of unproven epoch,
     /// which `bootstrapCrawledFolderUidValidity` refuses to stamp) and MUST still
-    /// be guarded. Round 13 removed self-heal from the unguarded list (its
+    /// be guarded. Self-heal left the unguarded list on 2026-07-31 (its
     /// successor, the catch-up's load of missing UIDs, inserts premised too:
     /// `SyncEngine.applyCatchUpResult`, #1062).
     ///

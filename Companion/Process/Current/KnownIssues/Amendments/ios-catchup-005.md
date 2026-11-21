@@ -14,7 +14,7 @@ epoch): this one is an unknown top.
 
 A listing of a folder with no change bookmark and no stored top (`IMAPCatchUpState.Listing.top`)
 reads the folder's UIDNEXT before its first range. When that SELECT reports no UIDNEXT, the top is
-unknown (MIS-IOS-004: "could not determine" is not an answer): no top is stored, and every call of
+unknown (a "could not determine" answer is not an answer): no top is stored, and every call of
 that listing lists only up to the last local UID, with no further UIDNEXT read. Flags and removals of held mail are reconciled as before, and an
 empty folder completes. Mail above the last local UID is not looked for. The listing can complete
 only as not clean (`Listing.topUnknown`), so a folder owed a check stays owed and is listed again
@@ -39,4 +39,4 @@ Older-mail check; catch-up; missing message; UIDNEXT missing; unknown top; nonco
 fail closed; owed folder; `IMAPProvider.catchUp`; `Listing.top`; `getUidNextWithEpoch`;
 `suppressSelectUidNext`; `topUnknown`; `unknownTopKeepsTheFolderOwed`;
 `unknownTopStillReconcilesFlagsAndRemovals`; `unknownTopOneRequestPerCallCompletes`;
-`laterUidNextStoresTheTopButStaysUnclean`; ADR-IOS-107; MIS-IOS-004; #1062
+`laterUidNextStoresTheTopButStaysUnclean`; ADR-IOS-107; #1062

@@ -443,10 +443,11 @@ extension IMAPProvider {
                         if DebugModeManager.isLoggingEnabled() {
                             BackgroundSyncLogger.logDebug("[CatchUp] \(path): SELECT reported UIDVALIDITY \(status.observedEpoch.map(String.init) ?? "none"), folder holds \(epoch) — applying nothing")
                         }
-                        return Self.otherNumbering(folderId: folder.id, epoch: status.observedEpoch, requestTimedOut: requestTimedOut)
+                        return CatchUpFolderResult(folderId: folder.id, epoch: status.observedEpoch)
                     }
                     // A SELECT without UIDNEXT did not say where the folder ends
-                    // (MIS-IOS-004): no top is stored, this call lists only up to
+                    // (a "could not determine" answer is not an answer, so it is
+                    // never read as a top): no top is stored, this call lists only up to
                     // the last local UID (flags and removals as before; an empty
                     // folder completes at once), and the listing can complete
                     // only as not clean, so nothing settles on it (#1062).
@@ -539,7 +540,7 @@ extension IMAPProvider {
                     if DebugModeManager.isLoggingEnabled() {
                         BackgroundSyncLogger.logDebug("[CatchUp] \(path): SELECT reported UIDVALIDITY \(listed.uidValidity), folder holds \(epoch) — applying nothing")
                     }
-                    return Self.otherNumbering(folderId: folder.id, epoch: listed.uidValidity == 0 ? nil : listed.uidValidity, requestTimedOut: requestTimedOut)
+                    return CatchUpFolderResult(folderId: folder.id, epoch: listed.uidValidity == 0 ? nil : listed.uidValidity)
                 }
                 if bookmarkUpper == nil, let next = listed.uidNext {
                     // The top this listing last learned (`Listing.top`).
@@ -644,7 +645,7 @@ extension IMAPProvider {
                 }
                 if let confirmed {
                     guard confirmed.uidValidity == epoch else {
-                        return Self.otherNumbering(folderId: folder.id, epoch: confirmed.uidValidity == 0 ? nil : confirmed.uidValidity, requestTimedOut: requestTimedOut)
+                        return CatchUpFolderResult(folderId: folder.id, epoch: confirmed.uidValidity == 0 ? nil : confirmed.uidValidity)
                     }
                     result.removedIds += candidates.filter { !confirmed.found.contains($0) }.map(String.init)
                     omitted = confirmed.found.filter { !listedUids.contains($0) && !localUids.contains($0) && loadRange?.contains(Int($0)) == true }.sorted()
@@ -659,7 +660,7 @@ extension IMAPProvider {
                 : await loadMissing(missing, owedSearch: owedSearch, path: path, epoch: epoch, context: context)
             if load.timedOut { requestTimedOut = true }
             if let observed = load.otherEpoch {
-                return Self.otherNumbering(folderId: folder.id, epoch: observed == 0 ? nil : observed, requestTimedOut: requestTimedOut)
+                return CatchUpFolderResult(folderId: folder.id, epoch: observed == 0 ? nil : observed)
             }
             result.loaded += load.loaded
             // A UID the server holds that did not load; one omitted from the FETCH
@@ -787,15 +788,6 @@ extension IMAPProvider {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CatchUp] \(path): flags=\(result.flagUpdates.count) removed=\(result.removedIds.count) loaded=\(result.loaded.count) \(completed ? "listing complete" : "resumes at UID \(listing.nextUid)")")
         }
-        return result
-    }
-
-    /// A call that saw another numbering: nothing of it applies (the apply
-    /// reacts to the observed `epoch`), and a request that timed out earlier in
-    /// the call is still reported in flight (`CatchUpFolderResult.requestMayBeInFlight`, #1062).
-    nonisolated static func otherNumbering(folderId: String, epoch: UInt32?, requestTimedOut: Bool) -> CatchUpFolderResult {
-        var result = CatchUpFolderResult(folderId: folderId, epoch: epoch)
-        result.requestMayBeInFlight = requestTimedOut
         return result
     }
 

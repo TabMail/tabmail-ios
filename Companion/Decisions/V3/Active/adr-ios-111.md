@@ -1031,7 +1031,7 @@ bound, a listing whose first UIDNEXT read reported none (`topUnknown`, 2026-11-2
 re-marks nothing: an owed folder counts as untracked in the catch-up plan even with a bookmark, so it
 is relisted at least daily, plus when its change counter (HIGHESTMODSEQ) moves past the stamp the
 unclean listing still records. A clean completion that started before the mark re-marks the lapse once
-(amended d3 2026-11-20). *Superseded (d2):* "An unclean completion (a UID passed over at the hold
+(amended 2026-11-20). *Superseded (2026-11-20):* "An unclean completion (a UID passed over at the hold
 bound) or one that started before the mark re-marks the catch-up lapse, so a folder holding a new
 bookmark is still listed again until the mark settles." (selfHealDue, owed check, unproven move,
 catch-up, re-arm, #1062)
