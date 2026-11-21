@@ -18,8 +18,9 @@ import Testing
 ///
 /// Production throughout: the row write Send makes (`DraftStore.saveAsync`
 /// through a `ComposeGenerationCursor`), the real held Outbox row,
-/// `PendingSendService.present` and `undo()` (what the toast's Undo button
-/// calls, synchronously), `UndoReopenCompose.composeView(for:)`, and the close
+/// `PendingSendService.present` and `undoAndReopen()` (what the toast's Undo
+/// button calls, synchronously; through `tapToastUndo()`, which returns the
+/// compose it queued to reopen), `UndoReopenCompose.composeView(for:)`, and the close
 /// decision Close calls (`ComposeDraftGuards.closeDecision`, with
 /// `.hasContent`).
 ///
@@ -174,7 +175,7 @@ struct UndoSendReturnsToDraftsTests {
         let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
         let outboxId = try await send(fixture, draft(draftId, fixture, body: words), cursor: cursor)
 
-        let snapshot = try #require(PendingSendService.shared.undo(), "the Undo was not confirmed")
+        let snapshot = try #require(PendingSendService.shared.tapToastUndo(), "the Undo was not confirmed")
 
         #expect(try await outboxRow(fixture, outboxId) == nil)
         #expect(snapshot.returnedToDrafts)
@@ -206,7 +207,7 @@ struct UndoSendReturnsToDraftsTests {
         sent.updatedAt = max(sent.updatedAt, try await row(fixture, draftId).updatedAt) + 1
         _ = try await send(fixture, sent, cursor: cursor)
 
-        let snapshot = try #require(PendingSendService.shared.undo(), "the Undo was not confirmed")
+        let snapshot = try #require(PendingSendService.shared.tapToastUndo(), "the Undo was not confirmed")
         #expect(snapshot.returnedToDrafts)
         try await expectInDraftsAndQueuedForServer(fixture, draftId: draftId, words: latest)
     }
@@ -220,8 +221,8 @@ struct UndoSendReturnsToDraftsTests {
         let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
         _ = try await send(fixture, draft(draftId, fixture, body: words), cursor: cursor)
 
-        #expect(PendingSendService.shared.undo() != nil)
-        #expect(PendingSendService.shared.undo() == nil)
+        #expect(PendingSendService.shared.tapToastUndo() != nil)
+        #expect(PendingSendService.shared.tapToastUndo() == nil)
 
         try await expectInDraftsAndQueuedForServer(fixture, draftId: draftId, words: words)
         #expect(try await serverSaves(fixture, draftId).count == 1)
@@ -246,7 +247,7 @@ struct UndoSendReturnsToDraftsTests {
                 """)
         }
 
-        let snapshot = try #require(PendingSendService.shared.undo(), "the cancellation must still stand")
+        let snapshot = try #require(PendingSendService.shared.tapToastUndo(), "the cancellation must still stand")
 
         #expect(!snapshot.returnedToDrafts)
         #expect(try await outboxRow(fixture, outboxId) == nil)
@@ -274,7 +275,7 @@ struct UndoSendReturnsToDraftsTests {
         let refuser = CommitRefuser()
         fixture.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
 
-        let snapshot = PendingSendService.shared.undo()
+        let snapshot = PendingSendService.shared.tapToastUndo()
         fixture.pool.remove(transactionObserver: refuser)
 
         #expect(snapshot == nil)
@@ -426,7 +427,7 @@ struct UndoSendReturnsToDraftsTests {
                     """)
             }
         }
-        let snapshot = try #require(PendingSendService.shared.undo(), "the Undo was not confirmed")
+        let snapshot = try #require(PendingSendService.shared.tapToastUndo(), "the Undo was not confirmed")
         try #require(snapshot.returnedToDrafts == returned,
                      "precondition: the return \(returned ? "landed" : "failed")")
 

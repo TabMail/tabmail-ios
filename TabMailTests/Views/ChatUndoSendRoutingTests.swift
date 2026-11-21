@@ -96,7 +96,7 @@ struct ChatUndoSendRoutingTests {
     }
 
     private static func readyAIReply(_ fixture: Fixture) -> some View {
-        ChatReplyCompose.make(replyTo: fixture.parent, target: ChatReplyTarget(only: nil), accounts: [fixture.account])
+        ChatReplyCompose.make(replyAllTo: fixture.parent, accounts: [fixture.account])
             .composeView(replyTo: fixture.parent, suggestedBody: "Tuesday works for me.", onAgentOutcome: { _ in })
     }
 
