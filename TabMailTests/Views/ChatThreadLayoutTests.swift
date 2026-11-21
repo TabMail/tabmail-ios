@@ -194,8 +194,16 @@ struct ChatThreadLayoutTests {
                 let send = try #require(Self.frame(of: "chatSend", in: controller.view))
                 let mic = try #require(HostedAccessibility.elements(under: controller.view)
                     .first { $0.accessibilityLabel == "Dictate" }?.accessibilityFrame)
-                // Option B: the hint line, the "e.g." line under it, 10 above and below.
-                #expect(abs(field.height - 60) < 1, "empty signed-in field \(field.height)")
+                // Option B: the hint line, the "e.g." line under it, 10 above and below. The design
+                // mock's 60 assumed a 16-pt caption line; the real caption line at this text size is
+                // 14.33, so the field is 58.33: the padding, one body line, the column's spacing
+                // (`spacing: 2` in `liveReplyFieldBar`), one caption line, the padding.
+                let captionLine = UIFont.preferredFont(
+                    forTextStyle: .caption1,
+                    compatibleWith: UITraitCollection(preferredContentSizeCategory: .large)).lineHeight
+                let expected = ChatViewLayout.fieldVerticalPadding + ChatViewLayout.fieldLineHeight + 2
+                    + captionLine + ChatViewLayout.fieldVerticalPadding
+                #expect(abs(field.height - expected) < 1, "empty signed-in field \(field.height), expected \(expected)")
                 let lineMid = field.maxY - ChatViewLayout.fieldVerticalPadding - ChatViewLayout.fieldLineHeight / 2
                 #expect(abs(send.midY - lineMid) < 1, "Send \(send) on the last line at \(lineMid)")
                 #expect(abs(mic.midY - lineMid) < 1, "mic \(mic) on the last line at \(lineMid)")
@@ -211,13 +219,16 @@ struct ChatThreadLayoutTests {
                 let id = ChatThreadView.replyPillId
                 let name = ChatViewConfig.showChatActionName
                 try await Self.waitFor { Self.frame(of: id, in: controller.view) != nil }
-                let carrier = try #require(HostedAccessibility.elements(under: controller.view)
-                    .first { $0.accessibilityCustomActions?.contains { $0.name == name } ?? false },
-                    "ids: \(HostedAccessibility.identifiers(in: controller.view))")
-                // VoiceOver offers an element's actions only while that element has its focus: the
-                // reply field's text field, never its container.
-                #expect(carrier.isAccessibilityElement,
-                        "the action's element can take VoiceOver focus: \(HostedAccessibility.identifier(of: carrier) ?? "no id")")
+                let carriers = HostedAccessibility.elements(under: controller.view)
+                    .filter { $0.accessibilityCustomActions?.contains { $0.name == name } ?? false }
+                @MainActor func describe(_ element: NSObject) -> String {
+                    "\(type(of: element)) isAccessibilityElement=\(element.isAccessibilityElement) id=\(HostedAccessibility.identifier(of: element) ?? "none")"
+                }
+                // VoiceOver offers an element's actions only while that element has its focus: some
+                // element VoiceOver can focus (the reply field's text field) carries it. SwiftUI may
+                // also put it on a wrapper node that is no element; that one alone would not do.
+                let carrier = try #require(carriers.first { $0.isAccessibilityElement },
+                    "an element VoiceOver can focus carries the action; carriers: \(carriers.map(describe))")
                 #expect(HostedAccessibility.identifier(of: carrier) != id, "not the field's container")
                 #expect(Self.frame(of: "chatClose", in: controller.view) == nil, "control: the panel starts closed")
                 // Run it as VoiceOver's actions rotor does (the text field has no identifier to
@@ -283,7 +294,9 @@ struct ChatThreadLayoutTests {
                     folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: "INBOX"),
                     accountId: Self.account, folderPath: "INBOX", isInInbox: true)
                 arrived.rfc822MessageId = "<layout-arrived@example.com>"
-                arrived.inReplyTo = "<\(parent.rfc822MessageId ?? "")>"
+                // The parent's own id, as stored: thread detection matches ids exactly, so a
+                // bracketed copy of an unbracketed id never joins the thread.
+                arrived.inReplyTo = parent.rfc822MessageId
                 arrived.headerComplete = true
                 arrived.bodyComplete = true
                 arrived.isRead = true
