@@ -639,19 +639,19 @@ struct ChatSummaryQueueTests {
     // MARK: - 6. The switch
 
     /// Everything `ChatViewConfig.isActive` reads, saved and put back so no suite sees residue:
-    /// the user toggle, the AI opt-out and the subscription gate.
+    /// the user toggle, the AI setting (the AI choice and the opt-out) and the subscription gate.
     @MainActor
     struct SavedChatViewState {
         let defaults = UserDefaults.standard
         let toggle = UserDefaults.standard.object(forKey: ChatViewConfig.enabledKey)
-        let optOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
+        let restoreAISetting = AITestSetting.save()
         let gateOpen = AISubscriptionGate.shared.isActive
         let lastKnownActive = UserDefaults.standard.object(forKey: "ai_subscription_last_known_active")
 
-        /// The toggle as given, AI on.
+        /// The toggle as given, AI on (the AI choice made, not opted out).
         func setChatView(on: Bool) {
             defaults.set(on, forKey: ChatViewConfig.enabledKey)
-            AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+            AITestSetting.set(aiOff: false)
             AISubscriptionGate.shared.openGate()
         }
 
@@ -659,7 +659,7 @@ struct ChatSummaryQueueTests {
             if gateOpen { AISubscriptionGate.shared.openGate() } else { AISubscriptionGate.shared.closeGate() }
             defaults.set(lastKnownActive, forKey: "ai_subscription_last_known_active")
             defaults.set(toggle, forKey: ChatViewConfig.enabledKey)
-            AIService.optOutStore.set(optOut, forKey: AIService.optOutAllAIKey)
+            restoreAISetting()
         }
     }
 
@@ -690,6 +690,31 @@ struct ChatSummaryQueueTests {
         #expect(ChatViewConfig.isActive, "AI back on: the user's choice applies again")
     }
 
+    /// The device's one AI setting (`AIService.isAIOff`) decides: before the AI choice is made the
+    /// app shows the classic view, as for an opted-out user. The tutorial is a scripted demo that
+    /// sends no AI request, so it follows Opt Out of AI alone: a tour before the choice teaches the
+    /// chat view.
+    @MainActor
+    @Test("The chat view stays off until the AI choice is made, and follows the choice once it is; the tutorial follows the opt-out alone")
+    func chatViewWaitsForTheAIChoice() {
+        let saved = SavedChatViewState()
+        defer { saved.restore() }
+        saved.setChatView(on: true)
+        #expect(ChatViewConfig.isActive, "control: chosen, AI on, with a plan")
+
+        AITestSetting.clear()
+        #expect(!ChatViewConfig.isActive, "no AI choice yet: the classic view")
+        #expect(TutorialCoordinator.chatViewOnForTutorial, "no AI choice yet: the scripted tutorial still teaches the chat view")
+
+        AITestSetting.set(aiOff: false)
+        #expect(ChatViewConfig.isActive, "AI on: the chat view")
+        #expect(TutorialCoordinator.chatViewOnForTutorial, "AI on: the tutorial teaches the chat view")
+
+        AITestSetting.set(aiOff: true)
+        #expect(!ChatViewConfig.isActive, "opted out: the classic view")
+        #expect(!TutorialCoordinator.chatViewOnForTutorial, "opted out: the tutorial teaches the classic view")
+    }
+
     @Test("The chat view is on only when chosen and with AI on")
     func activeMatrix() {
         for chosen in [false, true] {
@@ -697,9 +722,9 @@ struct ChatSummaryQueueTests {
                 #expect(ChatViewConfig.isActive(enabledByUser: chosen, aiOn: aiOn) == (chosen && aiOn))
             }
         }
-        for optedOut in [false, true] {
+        for aiOff in [false, true] {
             for subscribed in [false, true] {
-                #expect(ChatViewConfig.isAIOn(optedOut: optedOut, subscribed: subscribed) == (!optedOut && subscribed))
+                #expect(ChatViewConfig.isAIOn(aiOff: aiOff, subscribed: subscribed) == (!aiOff && subscribed))
             }
         }
     }

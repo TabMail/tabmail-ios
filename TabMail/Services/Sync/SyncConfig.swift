@@ -376,6 +376,10 @@ enum SyncConfig {
     /// BackfillBodyQueue dispatch batch — items collected per dispatch cycle.
     /// Grouped by folder after collection, so actual per-folder batches may be smaller.
     static let backfillBodyDispatchBatch = 50
+    /// How often a BackfillBodyQueue held by the backfill walk's download gate
+    /// (Wi-Fi-only on an expensive network, low battery, Low Power Mode; #1064)
+    /// checks whether the gate has lifted (seconds).
+    static let backfillBodyGateRecheckSeconds: TimeInterval = 5
     /// Max consecutive IMAP batch-fetch misses (UID not returned at all, as opposed
     /// to an empty body) before treating the message as confirmed gone from the
     /// server and deleting the local header. Per-fetch retries cross cycles because
@@ -619,6 +623,18 @@ enum SyncConfig {
     /// with `max_userip_connections=N`. The rejection locks maxConnections to N - reserved.
     /// Most IMAP servers allow 10-20 per user; enterprise can go higher.
     static let imapMaxConnectionCeiling: Int = 20
+    /// Longest a login made after an eviction (to make room under the server's
+    /// connection limit) waits for the evicted connections' logouts
+    /// (`IMAPProvider.awaitEvictionLogouts`). The server counts a session until
+    /// its LOGOUT is answered, so logging in sooner is refused. Bounded so a
+    /// logout that never answers cannot hold the login: after it the login goes
+    /// ahead and the server's answer decides.
+    static let imapEvictionLogoutWaitSeconds: TimeInterval = 5
+    /// Longest an evicted IDLE connection waits for its DONE to be answered
+    /// before its LOGOUT (`IMAPProvider.evictIdleConnection`). Below
+    /// `imapEvictionLogoutWaitSeconds`, so the LOGOUT still fits in the login's
+    /// wait for it.
+    static let imapIdleEvictionDoneWaitSeconds: TimeInterval = 2
 
     // MARK: - Provider Work Queue Concurrency
     /// Max concurrent operations for Gmail API providers.
@@ -808,17 +824,11 @@ enum SyncConfig {
     /// timeout ends the folder's work for the slice; the state written so far resumes it.
     static let catchUpRequestTimeoutSeconds: TimeInterval = 3
     /// How often an IMAP folder gets a full listing even when nothing signals a
-    /// change (seconds). Runs only on a non-expensive network, oldest folder first.
+    /// change (seconds). Runs on any network, oldest folder first.
     /// Gmail has no such interval: the history delta follows every folder while
     /// its cursor is valid, so a Gmail folder is listed only the first time and
     /// after a lapse of the cursor (`GmailProvider.catchUpPlan`).
     static let catchUpFullCheckIntervalSeconds: TimeInterval = 86_400
-    /// The longest a folder's full listing waits for a non-expensive network
-    /// (seconds), counted from its last completed listing, or from the catch-up's
-    /// first sight of the folder. After that it runs on any network, inside the
-    /// same slices, so a device that is always on cellular or a hotspot still
-    /// gets a full catch-up. About 50 bytes per message.
-    static let catchUpExpensiveNetworkMaxWaitSeconds: TimeInterval = 7 * 86_400
     /// Width of one IMAP listing range, in UIDs (`UID FETCH lo:hi (UID FLAGS)`).
     /// About 50 bytes per message on the wire, so a dense range stays far inside
     /// the request timeout even on a slow link.
@@ -959,7 +969,28 @@ enum SyncConfig {
     // bookmark. Foreground pass (60 s): min(20, 60 - W - 5).
     /// How long a folder's change reads may keep failing on answers from the
     /// server (5xx, a page that cannot be read, a next link that repeats) before
-    /// the reader starts the folder again from a new baseline. A connection loss,
-    /// a cancellation, an authorization failure or a throttle never counts.
+    /// the reader starts the folder again from a new baseline. On Outlook a
+    /// connection loss, a cancellation, an authorization failure or a throttle
+    /// never counts. On IMAP (ADR-IOS-111 #751 item 9) a change session that
+    /// never opens and a request that times out mid-answer do count: either
+    /// leaves the session's state unknown, and lapsing costs one listing.
     static let changeReadFailureLapseSeconds: TimeInterval = 3_600
+    /// IMAP change reader (#751): most messages one folder's read fetches headers
+    /// for in one pass (new arrivals plus changed messages the folder does not
+    /// hold). Over it the folder's bookmark is refused (`.tooFarBehind`): a window
+    /// listing plus one catch-up check is the cheaper path. Same order of work as
+    /// Gmail's `GmailAPI.historyMaxChanges`.
+    static let imapChangeArrivalsLimit = 100
+    /// IMAP change reader: passes in a row whose inbox read timed out before the
+    /// next pass reads the other folders first and the inbox last. One timeout
+    /// keeps the inbox first, so a passing blip never delays new mail; a
+    /// successful inbox read starts the count again.
+    static let imapChangeInboxTimeoutsBeforeReadLast = 2
+    /// IMAP change reader: longest the `SELECT … (QRESYNC …)` may take. Its answer
+    /// lists every change since the bookmark, so it gets more than one ordinary
+    /// request (`changeReadRequestTimeoutSeconds`); it is capped by the pass's
+    /// read budget left plus one ordinary request, so the pass still ends by the
+    /// caller's deadline. A folder whose SELECT keeps timing out is started again
+    /// after `changeReadFailureLapseSeconds`.
+    static let imapChangeSelectTimeoutSeconds: TimeInterval = 15
 }

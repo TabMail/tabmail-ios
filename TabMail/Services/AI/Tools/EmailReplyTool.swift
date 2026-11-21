@@ -38,6 +38,9 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// The production compose edit of every agent compose tool (reply, new email, forward): the
     /// chat's one AI service, the one the card's edits and Recompute use.
     static let chatComposeEdit: ComposeEdit = { context, subject, body, request in
+        if let override = EmailComposeTool.inlineEditOverride {
+            return try await override(context, request)
+        }
         let aiService = await MainActor.run { ChatPillState.shared.aiService }
         return try await aiService.performInlineEdit(
             currentSubject: subject, currentBody: body, context: context, instruction: request, chatHistory: [])

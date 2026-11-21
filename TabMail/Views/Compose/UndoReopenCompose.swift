@@ -41,6 +41,10 @@ struct UndoReopenCompose: View {
             account: reopened?.account,
             isForward: reopened?.draft?.isForward ?? false,
             isReplyAll: reopened?.draft?.isReplyAll ?? false,
+            // The Undo saved the row back to Drafts, so it opens like any draft.
+            // When that save did not land, the row is in no Drafts entry: open it
+            // as unsaved, so Close asks to save it through the normal Save.
+            prefillTreatAsUnsavedChanges: !snapshot.returnedToDrafts,
             prefillDraftId: snapshot.authority.draftId,
             retainedDraftAuthority: snapshot.authority
         )

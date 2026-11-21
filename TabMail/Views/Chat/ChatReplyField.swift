@@ -57,6 +57,24 @@ struct ChatReplyField: Equatable {
         return configured
     }
 
+    /// The AI Suggestion's row under the newest email: `.ready` with the ghost's text once the
+    /// reply is stored (`shown`), `.writing` while the AI still works on the email (the
+    /// inbox row's rule, `AIWorkingRule`: tagged with no reply processed, or untagged in the Inbox
+    /// with an AI source on), else nothing. A filtered email's empty-reply sentinel counts as
+    /// processed, so it never writes. Keyed by the newest email alone, so a new email that arrives
+    /// above a ready ghost, tagged or not yet, puts the row back to `.writing` until its own
+    /// suggestion is stored.
+    static func suggestionPhase(
+        newest: MessageHeader, usersTurn: Bool, onlyTo: [ChatThread.Person]?, aiSourceEnabled: Bool, subscribed: Bool
+    ) -> ChatSuggestionPhase? {
+        if let text = shown(newest: newest, usersTurn: usersTurn, onlyTo: onlyTo)?.textMessage { return .ready(text) }
+        guard !usersTurn, onlyTo == nil, !EmailFilter.isNoReply(newest.fromAddress),
+              AIWorkingRule.isWorking(tagged: newest.actionTag != nil, replyProcessed: newest.suggestion != nil,
+                                      inInbox: newest.isInInbox, aiSourceEnabled: aiSourceEnabled,
+                                      subscribed: subscribed) else { return nil }
+        return .writing
+    }
+
     /// The agent's message for words typed or said in the field: today's Chat pill message on the
     /// newest email (`Regarding [Email](N): …`), with a nudge that the words came from this
     /// email's reply field, so an unclear request is a reply to it. For a no-reply
@@ -434,5 +452,22 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
     /// Delete on a "Not sent" bubble: the Outbox's own Discard for the same row.
     @MainActor func delete() {
         AccountManager.shared.discardOutboxMessageConfirmed(outboxId)
+    }
+}
+
+/// The AI Suggestion's row in the chat (`ChatReplyField.suggestionPhase`): the working bubble while
+/// the AI writes it, then the ghost with its text.
+enum ChatSuggestionPhase: Equatable {
+    case writing
+    case ready(String)
+
+    var isReady: Bool { if case .ready = self { true } else { false } }
+
+    /// Whether a change of the row is the working bubble filling in, the one change that grows the
+    /// row into the ghost with its re-pin in one animation. Anything else (the first value, a new
+    /// email putting the ghost back to writing, a ghost that lands with no working bubble before it,
+    /// a rewrite in place) shows at once.
+    static func fills(from old: Self?, to new: Self?) -> Bool {
+        old == .writing && new?.isReady == true
     }
 }

@@ -228,6 +228,17 @@ same AI result, kept as long as the email itself is shown.
    each read by its own id, as the shown copy is. The dedupe is display only; a Message-ID never
    selects a row to change (ADR-IOS-068 D4), so a copy the thread did not load (Trash, Spam) is not
    touched. Tests: `ChatCopiesTests.openReadsEveryCopy`, `ThreadDetectionTests.copiesAreTheRowsLeftOut`.
+   *Amended 2026-11-21 (#1000, #1001):* the opened email is never also one of the rows, and the
+   rows are the thread of the email opened now. Both hold through the `message` setter, for every
+   writer of it: when the opened id changes, the new id leaves `threadCopies` and `threadMessages`
+   at once and the earlier/later split is recomputed against it
+   (`MessageDetailViewModel.dropOpenedFromThreadRows`), and
+   when one opened email is replaced by another the setter queues the serialized thread reload
+   (`reloadThread`, FIFO behind the writer's display turn, preview-freeze buffered), which rebuilds
+   the rows from the new opened email. So the email screen never shows the opened email twice,
+   `chatRows` never lists a row twice, and the email opened before (another Gmail label's copy,
+   which shares its provider id) is a row or a copy again after that reload whenever the thread
+   load still finds it, so a whole-chat action takes it. Tests: `MessageDetailOpenedRowTests`.
    **What the chat asks for, and where it opens (decided 2026-11-09).** In the decision's words: "Just walk back
    from the recent thing until you walk through the whole thread with some cap. We already have a
    cap somewhere; it's probably good enough. If we scroll further up, we could see more summarizing
@@ -692,6 +703,50 @@ same AI result, kept as long as the email itself is shown.
    unknown role passed the sent and draft check, so Trash took such a row, and an unknown opened
    folder was moved as a user folder. Tests: `MessageDetailThreadActionTests.unknownRoleFailsClosed`,
    `systemFoldersByRoleAcrossAccounts`, `sameNamedFolderInAnotherAccountStays`.
+   *Amended 2026-11-21:* the snapshot fixes which rows an action takes and their folder; it is not
+   the source of the action tag that Undo restores. One read when the action starts takes the folder
+   roles and the stored rows together (`MessageDetailViewModel.lookupChatRows`, which replaces
+   `lookupFolderRoles` for the actions; a failed read still moves nothing). An email the store does
+   not hold yet (a notification opened it while its row is still staged) is taken from the staged
+   rows, with the projection the move's resolver uses (`AccountManager.stagedHeadersForAction`).
+   `lookupChatRows` reads the staged rows before the store, and a stored row wins, so an email the
+   merge stores and unstages during that read is in one of them. The move's own resolver
+   (`AccountManager.resolveHeadersForAction`, which takes the same staged projection) keeps its
+   order (store, then the staged rows for the ids the store lacks): it serves every action, so a
+   change to its order belongs in its own change with outcome tests for every caller (tabmail-ios
+   #1149; until then a whole-chat move during the opened email's promotion can leave that email in
+   place, which is no regression: the move's resolver had the same window before this change). A
+   row neither stored nor staged is not taken, since there
+   is no row to move or restore. Each moved row's undo entry records its folder as the chat holds it
+   (the visible location is the undo source) and its action tag and sort order as read, with a
+   pending tag change on top (`AccountManager.overlayAdjustedSnapshot(_:in:)`). The overlay snapshot
+   is taken before the rows are read, so a pending tag whose write lands and whose overlay entry
+   retires during the read is in one of them; both come before the action's own overlay writes.
+   The rule is the same for every row: the opened email, the shown emails and the hidden copies.
+   Before, the tag came from the chat's rows, which can hold an older tag (a row change waits for
+   its display turn or for a freeze to end, a writer posts no per-row change, and a hidden copy is
+   never refreshed), so Undo wrote the older tag back. Hidden copies are still not refreshed on a
+   row change: no writer that posts a per-row change moves a row to another folder (they write AI
+   fields, tags, read, flag or replied state), so a copy's folder stays as the thread load read it,
+   and the next load reads it again. The notification merge's timing is unchanged (ADR-IOS-047: the
+   first pass stores the header without AI fields, the second pass writes the tag, and its
+   `queueSetTagPendingOp` creates the tag's local queue record, settled locally, not a provider
+   write), and Undo writes its recorded pair as before (`AccountManager.undoMove`). So an action
+   between the two passes records the stored "no tag": an Undo before the second pass ends tagged
+   when that pass runs, and an Undo after it brings the email back untagged until the AI tags it
+   again (tabmail-ios #1153: Undo to refill a missing tag from the AI cache, as every other move
+   into the Inbox does; #1154: the second pass can tag a row archived between the passes, cleared
+   by the next sync). Tests (`MessageDetailThreadActionTests`): `archiveUndoKeepsTheLatestTag`,
+   `archiveDuringASwipeRecordsTheLatestTag`, `archiveWhileARefreshWaitsRecordsTheLatestTag`,
+   `archiveAfterAnUnpostedTagWriteRecordsTheStoredTag`, `archiveRecordsAPendingTagChange`,
+   `archiveRecordsAPendingTagClear`, `archiveRecordsAPendingNoneTag`,
+   `archiveRecordsATagThatLandsDuringItsRead`, `trashAndMoveRecordTheStoredTagOnEveryRow`,
+   `trashAndMoveRecordTheStoredTagOnFiledRows`, `archiveRecordsTheFolderTheChatHolds`,
+   `archiveTakesAStagedOpener`, `archiveTakesTheStoredRowOverItsStagedCopy`,
+   `archiveTakesAStoredRowWithNoTagOverItsTaggedStagedCopy`, `resolverTakesStoredAndStagedRowsInTheOrderAsked`,
+   `archiveLeavesOutARowNoLongerStored`, `unreadableRowsMoveNothing`,
+   `archiveRecordsTheStoredTagInEveryAccount`. Related, not changed here: a manual tag write after
+   a mailbox reset between its resolve and its write (tabmail-ios #1150).
    *Amended 2026-11-15:* "Unread from here" and "Read up to here" change, with each email they
    target, its copies from the same snapshot (`MessageDetailViewModel.setRead`: the
    `threadCopies` rows that `excludeCopies` left out under that email's Message-ID), each by its
@@ -951,6 +1006,32 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `sentReplyTakesTheTurn`, `ChatReplyFieldRuntimeTests.exampleLinePutsTheChange` and
    `suggestionNeverEntersTheField`, `ChatReplyFieldTests.suggestionText` and `exampleFromConfig`,
    `TutorialChatViewTests.fieldText`.
+
+   **Amended 2026-11-20 (the working bubble):** while the suggestion is written its row is the
+   working bubble, `ChatSuggestionWorkingBubble` (the ghost's dashed bubble with three pulsing dots,
+   "AI Suggestion · Writing", identifier `chat.aiSuggestion.writing`; the ghost keeps
+   `chat.aiSuggestion`), always the last chat row above the field. "Being written" is the inbox
+   row's "AI is working" rule under the ghost's own guards (`ChatReplyField.suggestionPhase`). The phase is keyed by the newest email, so
+   a new email that arrives above a ready ghost puts the row back to Writing at once. Only Writing to
+   ready animates (`ChatSuggestionPhase.fills`): the row grows into the ghost over
+   `ChatSuggestionConfig.fillDuration` (0.3 s) with the landing's re-pin `scrollTo` in the same
+   `withAnimation` (`ChatThreadView.showSuggestion`); under Reduce Motion the height changes at once
+   and the ghost fades in (`ghostFadeDuration`, 0.2 s), as the mock's M2. A ghost with no working
+   bubble before it still shows at once: the working bubble is held only while a grow is pending, so
+   opening on a ready suggestion never shows it, and the ghost's removal always follows its
+   transaction. The dots cap at 30 fps. The arrival rise of the new email is not built here.
+
+   **Writing rule (2026-11-20):** Writing shows when the newest email meets the inbox row's one shared
+   predicate, `AIWorkingRule` (tagged with no reply processed, or untagged in the Inbox with an AI
+   source on), which `MessageRowView` calls too; a filtered email's empty-reply sentinel never writes.
+   Tests: `ChatReplyFieldTests.suggestionPhaseWritingThenReady`, `suggestionPhaseNewEmailResetsToWriting`,
+   `workingDots`, `suggestionPhaseWritingRule`, `suggestionFillWiring`;
+   `ChatSwipeUITests.testWorkingBubbleBecomesTheGhostAboveTheField`.
+
+   **With the late-suggestion rule (2026-11-21):** the row's ghost is the suggestion the chat shows
+   (`ChatThreadView.shownSuggestion`, `ChatReplyField.shown(writing:cardOpen:)`), and only the working
+   bubble comes from `suggestionPhase`. So a suggestion stored while a compose card is open shows no row
+   until the card closes, then the ghost at once; while "Writing your email" runs neither shows.
 
 17. **A change asked in the field is a compose edit of the AI Suggestion (amendment 2026-11-18).**
    Every compose returns its email with its text version (the backend's compose prompt, not a

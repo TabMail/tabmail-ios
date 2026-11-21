@@ -169,11 +169,11 @@ enum StartupMigrations {
                     try Folder.updateAll(db,
                         Column("backfillComplete").set(to: false),
                         Column("oldestSyncedDate").set(to: nil as Date?),
-                        Column("lastKnownUidNext").set(to: nil as Int?),
                         Column("backfillUidCursor").set(to: nil as Int?),
                         Column("backfillPageToken").set(to: nil as String?),
                         Column("backfillPageHeldSince").set(to: nil as Date?)
                     )
+                    try SyncEngine.invalidateListingCounters(Folder.all(), resettingCount: false, db: db)
                     try Account.updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
                 }
                 BackgroundSyncLogger.logDebug("[Migration] Clean reset: batch deleted all headers + bodies")

@@ -581,6 +581,12 @@ enum MessageHeaderRekey {
         let safeDestinations = Dictionary(uniqueKeysWithValues: safeDestinationPairs)
 
         var result = MoveFinishResult.empty
+        // ADR-IOS-111 exit rule: the IMAP folders whose local view this
+        // retirement leaves possibly wrong. Each one's change bookmark is dropped
+        // in this transaction, so the folder is listed again (a tracked folder
+        // gets no other listing). IMAP only: a UID is mailbox-local.
+        var possiblyWrongFolderIds: Set<String> = []
+        let sourceFolderId = MessageIdentity.folderId(accountId: op.accountId, folderPath: op.folderPath)
         var visited: Set<String> = []
         for sourceProviderId in op.messageIds where visited.insert(sourceProviderId).inserted {
             // The address this member had when the gesture was issued. On IMAP it
@@ -635,6 +641,9 @@ enum MessageHeaderRekey {
             } else {
                 guard let located = try MessageHeader.fetchOne(db, key: sourceShapedOldId) else {
                     result.removedOldHeaderIds.append(sourceShapedOldId)
+                    // With no proof the message may still sit in the source,
+                    // which the optimistic move emptied locally.
+                    if safeDestinations[sourceProviderId] == nil { possiblyWrongFolderIds.insert(sourceFolderId) }
                     continue
                 }
                 // G3 — only the exact row this operation optimistically moved. A
@@ -656,6 +665,11 @@ enum MessageHeaderRekey {
                     // authority. Retain the row and every external mirror, but
                     // explicitly revoke the stale undo target.
                     result.unsafeUndoOldHeaderIds.append(sourceShapedOldId)
+                    // The row was moved on (a chained move) and still carries this
+                    // op's source UID wherever it now sits: that folder's view is
+                    // possibly wrong; with no proof, so is the source's.
+                    possiblyWrongFolderIds.insert(located.folderId)
+                    if safeDestinations[sourceProviderId] == nil { possiblyWrongFolderIds.insert(sourceFolderId) }
                     continue
                 }
                 row = located
@@ -665,6 +679,16 @@ enum MessageHeaderRekey {
 
             guard let destination = safeDestinations[sourceProviderId] else {
                 result.unsafeUndoOldHeaderIds.append(oldId)
+                // The row stays under its source UID in the folder it sits in
+                // (ADR-IOS-073 consequence 3: recovered by ordinary sync). For a
+                // folder the change reader tracks, ordinary sync is that reader,
+                // which never removes the row: drop its bookmark (below) so the
+                // listing runs again. The source too: a refused move, or one whose
+                // folder is gone, left the message there while the optimistic
+                // move took it out of the local view. Nothing is deleted; no
+                // queued op is touched.
+                possiblyWrongFolderIds.insert(row.folderId)
+                possiblyWrongFolderIds.insert(sourceFolderId)
                 continue
             }
 
@@ -676,6 +700,7 @@ enum MessageHeaderRekey {
                let folderEpoch, folderEpoch > 0,
                folderEpoch != Int(provenEpoch) {
                 result.unsafeUndoOldHeaderIds.append(oldId)
+                possiblyWrongFolderIds.insert(row.folderId)
                 continue
             }
 
@@ -716,6 +741,15 @@ enum MessageHeaderRekey {
                 oldHeaderId: oldId, newHeaderId: newId,
                 newProviderMessageId: newMessageId,
                 newObservedUidValidity: migrated.observedUidValidity))
+        }
+        // ADR-IOS-111 (IMAP reader, exit rule): every folder this retirement
+        // leaves possibly wrong ends its tracking, in this transaction, and is
+        // owed one self-heal pass before it is tracked again (a message the
+        // move left there below the listing window is reached only by it).
+        if !accountScopedIds {
+            for folderId in possiblyWrongFolderIds.sorted() {
+                try SyncEngine.dropChangeBookmark(folderId: folderId, selfHealDue: true, db: db)
+            }
         }
         result.readdressedOperationIds = try readdressQueuedOperations(
             op, accountScopedIds: accountScopedIds,

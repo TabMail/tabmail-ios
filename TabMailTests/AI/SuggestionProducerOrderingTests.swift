@@ -112,18 +112,9 @@ struct SuggestionProducerOrderingTests {
         }
     }
 
+    /// The AI choice made, AI on (`AIService.isAIOff`), for `body`; restored after.
     private func withAIEnabled<T>(_ body: () async throws -> T) async rethrows -> T {
-        let store = AIService.optOutStore
-        let previous = store.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous {
-                store.set(previous, forKey: AIService.optOutAllAIKey)
-            } else {
-                store.removeObject(forKey: AIService.optOutAllAIKey)
-            }
-        }
-        AIService.writeOptOutFlag(false)
-        return try await body()
+        try await AITestSetting.with(aiOff: false, body)
     }
 
     /// Polls `condition` until it holds or `bound` passes; the caller asserts afterwards.

@@ -165,6 +165,7 @@ enum PreviewMocks {
             try pool.write { db in
                 try account.save(db)
                 try inbox.save(db)
+                try SyncEngine.writeListingCounters(ListingCounters(messageCount: inbox.totalCount, uidNext: nil, highestModSeq: nil), folderId: inbox.id, db: db)
                 for h in headers { try h.save(db) }
                 for b in bodies { try b.save(db) }
                 for l in labels { try l.save(db) }

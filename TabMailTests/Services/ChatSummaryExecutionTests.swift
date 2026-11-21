@@ -71,10 +71,7 @@ struct ChatSummaryExecutionTests {
     }
 
     static func withAIOn<T>(_ body: () async throws -> T) async rethrows -> T {
-        let saved = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
-        AIService.writeOptOutFlag(false)
-        defer { AIService.optOutStore.set(saved, forKey: AIService.optOutAllAIKey) }
-        return try await body()
+        try await AITestSetting.with(aiOff: false, body)
     }
 
     /// Indexes `header` in the search index, with `body` when given; `nil` leaves it without one.

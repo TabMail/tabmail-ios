@@ -141,6 +141,8 @@ enum DemoSeed {
             folder.backfillComplete = true
             folder.oldestSyncedDate = Calendar.current.date(byAdding: .day, value: -90, to: Date())
             try folder.insert(db)
+            // The demo stands in for a listing: its count goes through the one writer.
+            try SyncEngine.writeListingCounters(ListingCounters(messageCount: spec.totalCount, uidNext: nil, highestModSeq: nil), folderId: folder.id, db: db)
             folders[spec.path] = folder
         }
         return folders

@@ -125,9 +125,10 @@ final class DemoModeService {
     /// Debug-menu entry: enter demo mode WITHOUT logging out the live user.
     /// NOT `#if DEBUG`-gated (so it works in TestFlight/Release demo builds); it's
     /// reachable only behind the hidden debug menu (10-tap unlock + allow-listed
-    /// user via `DebugModeManager`). Pre-sets the demo consent flags (the operator
-    /// has already consented as a real user) so RootView's demo branch skips the
-    /// consent screens and goes straight to the seeded inbox, then starts demo
+    /// user via `DebugModeManager`). Pre-sets the demo's age and terms flag (the
+    /// operator has already answered it as a real user) so RootView's demo branch
+    /// skips that screen; the demo uses the device's AI setting as it is (its AI
+    /// screen shows only while the device has no AI choice). Then starts demo
     /// exactly like the login-screen path. Demo data is namespaced
     /// (`accountId == "demo-account"`) and wiped on exit; the live account,
     /// session, and real data are never touched.
@@ -136,8 +137,6 @@ final class DemoModeService {
     func startFromDebugMenu() async throws {
         let store = DemoModeStore.shared
         store.hasCompletedConsentGate = true
-        store.hasSeenAIConsent = true
-        store.aiEnabled = true
         try await start()
         store.enteredFromDebugMenu = true
     }
@@ -189,11 +188,11 @@ final class DemoModeService {
         )
         guard DemoModeStore.admits(run) else { return }
 
-        // Open the AI subscription gate when
-        // the user enabled AI in the demo consent gate. Otherwise the chat
+        // Open the AI subscription gate when the device's AI setting is on
+        // (the demo uses the device's setting). Otherwise the chat
         // pill renders the "Subscribe to unlock AI features" lock bar. The
         // tutorial's scripted chat needs the pill too (it calls no AI).
-        if DemoModeStore.shared.aiEnabled || DemoModeStore.shared.isTutorialPractice {
+        if !AIService.isAIOff || DemoModeStore.shared.isTutorialPractice {
             AISubscriptionGate.shared.openGate()
         }
 

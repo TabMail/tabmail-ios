@@ -7,8 +7,9 @@ import Foundation
 /// Whether the chat view, and the AI work only it needs, is on.
 ///
 /// The user switches it in TabMail Settings ("Enable Chat View", on by default). It needs AI:
-/// while AI is off (opted out, or no plan) it is off everywhere, nothing requests summaries for
-/// whole threads, and the user's choice is kept for when AI comes back.
+/// while AI is off (the AI choice not made yet, opted out, or no plan) it is off everywhere,
+/// nothing requests summaries for whole threads, and the user's choice is kept for when AI comes
+/// back.
 ///
 /// Read `isActive` ONCE at the start of an operation and pass the value along; never re-read it
 /// mid-operation.
@@ -21,14 +22,14 @@ enum ChatViewConfig {
         UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
     }
 
-    /// AI is on: not opted out, and a plan (or trial) is active.
+    /// AI is on: the device's AI setting is on (`AIService.isAIOff`: the AI choice made, not opted
+    /// out), and a plan (or trial) is active.
     static var isAIOn: Bool {
-        isAIOn(optedOut: AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey),
-               subscribed: AISubscriptionGate.shared.isActive)
+        isAIOn(aiOff: AIService.isAIOff, subscribed: AISubscriptionGate.shared.isActive)
     }
 
-    static func isAIOn(optedOut: Bool, subscribed: Bool) -> Bool {
-        !optedOut && subscribed
+    static func isAIOn(aiOff: Bool, subscribed: Bool) -> Bool {
+        !aiOff && subscribed
     }
 
     static var isActive: Bool {
@@ -123,6 +124,22 @@ enum ChatSuggestionConfig {
     /// edit in place (true; a tap on it opens the compose card) or the compose card opens with
     /// the edited email (false). The one place this choice is made.
     static let fieldEditRewritesInPlace = true
+    /// The line under the working bubble while the suggestion is written.
+    static let writingLine = "\(label) · Writing"
+    /// The working bubble growing into the ghost, the re-pin scroll in the same transaction.
+    static let fillDuration: Double = 0.3
+    /// Under Reduce Motion the ghost fades in over this as it replaces the working bubble, the only
+    /// motion of the fill (the row's height changes at once). No other insertion fades.
+    static let ghostFadeDuration: Double = 0.2
+    /// The working bubble's dots: each pulses between this opacity and full over the period, the
+    /// next one this much later.
+    static let dotDimOpacity: Double = 0.3
+    static let dotPulsePeriod: Double = 1.2
+    static let dotStagger: Double = 0.2
+    static let dotSize: CGFloat = 6
+    static let dotSpacing: CGFloat = 4
+    /// The dots' frame cap, as the app's other AI indicators (`aiWorkingShimmer`).
+    static let dotFrameInterval: Double = 1.0 / 30
     /// Changes a reply can ask for, shown one at a time as the field's "e.g." line, picked again
     /// each time a chat opens. Content changes only: the text version is already short, so no
     /// style tweaks ("make it shorter").

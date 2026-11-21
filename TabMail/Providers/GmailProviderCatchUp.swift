@@ -9,13 +9,10 @@ import Foundation
 /// no epoch, so unlike IMAP's there is none here.
 struct GmailCatchUpState: Codable, Equatable, Sendable {
     /// When the last listing completed. Until one has, the folder's first
-    /// listing is due; after it, the expensive-network wait counts from here.
+    /// listing is due.
     var lastCompletedAt: Date?
     /// The listing in progress, if any.
     var listing: Listing?
-    /// When the catch-up first saw the folder. Until a listing completes, the
-    /// expensive-network wait is counted from here.
-    var createdAt: Date?
     /// When the catch-up last tried a listing for the folder, whether or not it
     /// succeeded. Drives the order (`CatchUpSchedule.leastRecentlyAttemptedFirst`).
     var lastAttemptAt: Date?
@@ -117,7 +114,7 @@ extension GmailProvider {
 
     /// What a folder needs this pass. Pure, so the decision is testable on its own.
     enum CatchUpPlan: Equatable {
-        /// Nothing: no listing is due, or an expensive network holds it back.
+        /// Nothing: no listing is due.
         case none
         /// List the folder by provider-date ranges, starting at or continuing `listing`.
         case list(GmailCatchUpState.Listing)
@@ -129,16 +126,10 @@ extension GmailProvider {
     /// included); or it starts one when a lapse came after its last completed
     /// listing started (`GmailCatchUpState.lapsedSinceLastListing`). There is no
     /// periodic re-check: while the history cursor is valid the delta follows
-    /// every folder, All Mail included, and a lapse is what loses changes. On an
-    /// expensive network only
-    /// once it has waited `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` since
-    /// its last completed listing (a lapse does not restart the wait). A folder
-    /// with no state on an expensive network gets `.none`; the caller writes a
-    /// state carrying `createdAt` so the wait has a start.
-    nonisolated static func catchUpPlan(state: GmailCatchUpState?, isExpensiveNetwork: Bool, now: Date) -> CatchUpPlan {
-        let waitedTooLong = CatchUpSchedule.waitedTooLong(
-            hasState: state != nil, lastCompletedAt: state?.lastCompletedAt, createdAt: state?.createdAt, now: now)
-        if isExpensiveNetwork && !waitedTooLong { return .none }
+    /// every folder, All Mail included, and a lapse is what loses changes. The
+    /// decision is the same on every network, battery level and power mode: a
+    /// scan always runs; only downloads wait (#1063).
+    nonisolated static func catchUpPlan(state: GmailCatchUpState?) -> CatchUpPlan {
         if let listing = state?.listing { return .list(listing) }
         if state?.lastCompletedAt == nil || state?.lapsedSinceLastListing == true {
             return .list(GmailCatchUpState.Listing(lapseCountAtStart: state?.lapseCount))
@@ -215,15 +206,7 @@ extension GmailProvider {
         guard !folder.path.isEmpty, folder.uidValidityResetPendingAt == nil else { return nil }
 
         let state = GmailCatchUpState.decode(folder.catchUpState)
-        let plan = Self.catchUpPlan(state: state, isExpensiveNetwork: context.isExpensiveNetwork, now: context.clock())
-        guard case .list(var listing) = plan else {
-            guard state == nil else { return nil }
-            // First sight of the folder, held back by the network: record when the
-            // wait began. No request is made.
-            var waiting = CatchUpFolderResult(folderId: folder.id, epoch: nil)
-            waiting.newState = GmailCatchUpState(createdAt: context.clock()).encoded()
-            return waiting
-        }
+        guard case .list(var listing) = Self.catchUpPlan(state: state) else { return nil }
         // A new listing of a folder whose walk is complete reaches down to the
         // epoch, not only to the oldest local row: a message older than every
         // local row that moved in is missing too, and the listing loads it. An
@@ -232,7 +215,7 @@ extension GmailProvider {
         if state?.listing == nil { listing.toEpoch = CatchUpRange.listsToEpoch(folder, context: context) }
 
         var result = CatchUpFolderResult(folderId: folder.id, epoch: nil)
-        var newState = state ?? GmailCatchUpState(createdAt: context.clock())
+        var newState = state ?? GmailCatchUpState()
         let path = folder.path
         let rowLimit = SyncConfig.catchUpGmailRangeRowLimit
         let slack = SyncConfig.catchUpGmailRangeSlackSeconds
@@ -297,16 +280,14 @@ extension GmailProvider {
                         // unfinished or a storage limit was in force.
                         newState.lastCompletedAt = context.clock()
                         newState.listedLapseCount = listing.lapseCountAtStart
-                        guard newState.lapsedSinceLastListing, !context.isExpensiveNetwork else {
+                        guard newState.lapsedSinceLastListing else {
                             listingDone = true
                             break rangeLoop
                         }
                         // A lapse came after this listing started, so a change the
                         // lost history held may sit in a range it had already
-                        // listed: a new listing starts at once, newest first. On an
-                        // expensive network it waits instead, like every listing,
-                        // for `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds`
-                        // after this completion (`catchUpPlan`).
+                        // listed: a new listing starts at once, newest first, on
+                        // any network.
                         listing = GmailCatchUpState.Listing(
                             toEpoch: CatchUpRange.listsToEpoch(folder, context: context), lapseCountAtStart: newState.lapseCount)
                         continue rangeLoop

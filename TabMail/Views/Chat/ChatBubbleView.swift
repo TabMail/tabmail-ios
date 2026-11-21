@@ -231,6 +231,57 @@ struct ChatSuggestionBubble: View {
     static let bubbleId = "chat.aiSuggestion"
 }
 
+/// The AI Suggestion while it is written: the ghost's dashed bubble holding three pulsing dots,
+/// with "AI Suggestion · Writing" under it, in the ghost's place (the last chat row, above the
+/// field). It grows into `ChatSuggestionBubble` when the suggestion is stored. Nothing to tap.
+struct ChatSuggestionWorkingBubble: View {
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            TimelineView(.animation(minimumInterval: ChatSuggestionConfig.dotFrameInterval)) { context in
+                let time = context.date.timeIntervalSinceReferenceDate
+                HStack(spacing: ChatSuggestionConfig.dotSpacing) {
+                    ForEach(0..<3, id: \.self) { index in
+                        Circle()
+                            .fill(Palette.chatSuggestionStroke)
+                            .frame(width: ChatSuggestionConfig.dotSize, height: ChatSuggestionConfig.dotSize)
+                            .opacity(Self.dotOpacity(at: time - Double(index) * ChatSuggestionConfig.dotStagger))
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                    .fill(Palette.chatSuggestionFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                    .stroke(Palette.chatSuggestionStroke, style: StrokeStyle(
+                        lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))
+            )
+            Text(ChatSuggestionConfig.writingLine)
+                .font(.caption2)
+                .foregroundStyle(Theme.textSecondary)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(ChatSuggestionConfig.writingLine)
+        .accessibilityIdentifier(Self.bubbleId)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.horizontal)
+    }
+
+    /// A dot's opacity at `time`: dim, full at half the period, dim again.
+    static func dotOpacity(at time: Double) -> Double {
+        let period = ChatSuggestionConfig.dotPulsePeriod
+        let phase = (time.truncatingRemainder(dividingBy: period) + period).truncatingRemainder(dividingBy: period) / period
+        let rise = 1 - abs(phase * 2 - 1)
+        return ChatSuggestionConfig.dotDimOpacity + (1 - ChatSuggestionConfig.dotDimOpacity) * rise
+    }
+
+    /// The working bubble, as tests find it.
+    static let bubbleId = "chat.aiSuggestion.writing"
+}
+
 /// A reply in the outbox that has not gone out yet (`ChatUnsentReply`): a blue bubble with the
 /// email's summary once it is made ("Summarizing" until then), and under it "Sending", as under
 /// every email of the user's. A send that failed for good reads "Not sent", with the red mark beside

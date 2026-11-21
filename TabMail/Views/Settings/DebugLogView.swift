@@ -162,7 +162,7 @@ struct DebugMenuView: View {
 
             Section("Consent") {
                 Button {
-                    UserDefaults.standard.set(false, forKey: "hasSeenAIConsent")
+                    AIService.optOutStore.set(false, forKey: AIService.aiChoiceMadeKey)
                 } label: {
                     Label("Reset AI Consent", systemImage: "brain")
                 }
@@ -200,7 +200,7 @@ struct DebugMenuView: View {
 
     private func resetSyncProgress() async {
         // Delegate to resetCrawlState which handles: folder cursors, bodyEmptyConfirmed,
-        // ccBccBackfillDone, backfill task cancellation + generation increment.
+        // backfill task cancellation + generation increment.
         await AccountManager.shared.syncEngine.resetCrawlState()
         for account in navigationStore.accounts {
             await AccountManager.shared.syncEngine.startBackfill(account: account)

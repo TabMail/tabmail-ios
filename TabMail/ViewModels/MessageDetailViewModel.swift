@@ -24,6 +24,10 @@ final class MessageDetailViewModel {
     private(set) var messageId: String
     private(set) var message: MessageHeader? {
         didSet {
+            if message?.id != oldValue?.id {
+                dropOpenedFromThreadRows()
+                if oldValue != nil, message != nil { reloadThread() }
+            }
             #if DEBUG
             recordPublicationForTesting(.message)
             #endif
@@ -57,6 +61,32 @@ final class MessageDetailViewModel {
     /// a Message-ID (ADR-IOS-068 D4).
     var chatRows: [MessageHeader] {
         (message.map { [$0] } ?? []) + threadMessages + threadCopies
+    }
+
+    /// The opened email is never also a thread row or copy, and the rows are the thread of
+    /// the email that is opened now. Both hold through the `message` setter, whatever writes
+    /// it: when the opened id changes, the new id leaves `threadCopies` and `threadMessages`
+    /// at once (copies first, so every publication of `threadMessages` already sees rows
+    /// without it), and when one opened email is replaced by another the setter queues the
+    /// serialized thread reload (`reloadThread`), which rebuilds the rows from the new one in
+    /// its display turn. A thread load never returns the email it starts from
+    /// (`ThreadDetection.related`), so the email opened before comes back with that reload as a
+    /// row or a copy whenever the load still finds it in the thread. The earlier/later split
+    /// is relative to the opened email, so it is recomputed for every new one.
+    private func dropOpenedFromThreadRows() {
+        guard let openedId = message?.id else { return }
+        if threadCopies.contains(where: { $0.id == openedId }) {
+            threadCopies.removeAll { $0.id == openedId }
+        }
+        if threadMessages.contains(where: { $0.id == openedId }) {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ThreadDebug] opened email \(openedId.prefix(40)) left the thread rows")
+            }
+            threadMessages.removeAll { $0.id == openedId }
+        }
+        // The split is relative to the opened email, so it follows every new one, also one that
+        // was a hidden copy or no row at all (a row on the same second moves to its other side).
+        recomputeThreadSplit()
     }
 
     /// Guards against concurrent/duplicate `loadBody()` calls.
@@ -139,12 +169,29 @@ final class MessageDetailViewModel {
     /// Same class as the ungated seams above: no input reaches the network, no
     /// production caller sets it.
     @ObservationIgnored var _displayReadHook: (@MainActor (DisplayReadPoint) async -> Void)?
+    /// Test seam: called synchronously each time a thread scan is asked for, with the id of
+    /// the opened email it starts from.
+    @ObservationIgnored var _threadScanRequestHook: (@MainActor (String) -> Void)?
+    /// Test seams: thread scans asked for while `_threadScanRequestHook` was set, and how many
+    /// of them have ended (read and published, or skipped for a newer one). A test waits, with
+    /// its own deadline, until the two match.
+    @ObservationIgnored private(set) var threadScansAskedForTesting = 0
+    @ObservationIgnored private(set) var threadScansEndedForTesting = 0
 
     /// A screen field a display publication assigns.
     enum DisplayField { case message, messageBody, threadMessages }
     /// Test seam: called synchronously on every assignment of a `DisplayField`,
     /// with the new value already in place, so a test sees every publication.
     @ObservationIgnored var _publicationHook: (@MainActor (DisplayField) -> Void)?
+    /// Test seam: called synchronously INSIDE a whole-chat action's read of its rows
+    /// (`lookupChatRows`), between its folder fetch and its row fetch: the folder fetch has fixed
+    /// the read's database snapshot, so a test can land a write, an overlay retire or an unstage
+    /// within that read, before the rows are fetched. Called on the
+    /// read's thread, so it must not touch MainActor state. Debug builds only; no production
+    /// caller sets it.
+    @ObservationIgnored var _chatRowsReadHook: (@Sendable () -> Void)?
+    /// The row changes held back while the screen is frozen, waiting for the release to replay them.
+    var pendingRefreshIdsForTesting: Set<String> { pendingRefreshIds }
     /// How many times each field was assigned since init.
     @ObservationIgnored private(set) var publicationCountForTesting: [DisplayField: Int] = [:]
     /// How many times a display reader read again because a local change or an
@@ -433,9 +480,15 @@ final class MessageDetailViewModel {
         return false
     }
 
-    init(messageId: String, expectedRfc822MessageId: String? = nil) {
+    init(
+        messageId: String,
+        expectedRfc822MessageId: String? = nil,
+        expectedObservedUidValidity: Int? = nil
+    ) {
         self.messageId = messageId
-        self.openIdentity = ExpectedMessageIdentity(capturedRfc822MessageId: expectedRfc822MessageId)
+        self.openIdentity = ExpectedMessageIdentity(
+            capturedRfc822MessageId: expectedRfc822MessageId,
+            capturedObservedUidValidity: expectedObservedUidValidity)
         // ZERO-I/O init (2026-07-03): seed only from the in-memory staged
         // snapshot. This init runs ON THE MAIN ACTOR at tap → view
         // construction, and the previous sync `dbPool.read` here is unbounded
@@ -475,12 +528,15 @@ final class MessageDetailViewModel {
         dbPool: DatabasePool,
         fetchBodyOverride: @escaping (MessageHeader) async throws -> Void,
         observeNotifications: Bool = false,
-        expectedRfc822MessageId: String? = nil
+        expectedRfc822MessageId: String? = nil,
+        expectedObservedUidValidity: Int? = nil
     ) {
         self._dbPoolOverride = PrioritizedDatabase(pool: dbPool)
         self._fetchBodyOverride = fetchBodyOverride
         self.messageId = messageId
-        self.openIdentity = ExpectedMessageIdentity(capturedRfc822MessageId: expectedRfc822MessageId)
+        self.openIdentity = ExpectedMessageIdentity(
+            capturedRfc822MessageId: expectedRfc822MessageId,
+            capturedObservedUidValidity: expectedObservedUidValidity)
         seedAtInit()
         if observeNotifications {
             startAIUpdateListener()
@@ -2285,17 +2341,34 @@ final class MessageDetailViewModel {
     /// when nothing moved, so the chat stays open. A row whose folder role cannot be read (no
     /// Folder row) may be a sent copy or a draft, so it stays; if the roles cannot be read at all,
     /// nothing moves.
+    ///
+    /// The undo entry records each row's folder as shown (the visible location is the undo source)
+    /// and its action tag and sort order as stored (or staged, for an email not stored yet), with a
+    /// pending tag intent on top (`AccountManager.overlayAdjustedSnapshot`), read when the action
+    /// starts and before this action's own overlay writes in `recordMove`. The overlay is taken
+    /// before the rows are read, so a pending tag whose write lands and whose overlay entry retires
+    /// during that read is in the row or in the overlay. The chat's rows can hold an older tag (a
+    /// row change waits for its display turn or for a freeze to end, or its writer posts no per-row
+    /// change, and a hidden copy is not refreshed), and Undo writes the recorded tag back. A row
+    /// neither stored nor staged is not taken: there is no row to move or restore
+    /// (`AccountManager.move` drops it too).
     private func recordChatMove(
         _ members: [MessageHeader], source: ChatMoveSource, roleMove: Bool,
         destination: (_ accountId: String) -> Folder?
     ) -> Set<String> {
-        guard let roles = lookupFolderRoles(Set(members.map(\.folderId))) else { return [] }
+        let overlay = manager.snapshotOverlay()
+        guard let stored = lookupChatRows(members) else { return [] }
         let groups: [MoveGroup] = UndoableAction.byAccount(members).compactMap { share in
             guard let accountId = share.first?.accountId, let folder = destination(accountId) else { return nil }
-            let movable = share.filter { member in
-                guard let role = roles[member.folderId] else { return false }
-                return role != .sent && role != .drafts && source.takes(role: role, folderId: member.folderId)
-                    && member.folderPath != folder.path
+            let movable: [MessageHeader] = share.compactMap { member in
+                guard let row = stored.rows[member.id], let role = stored.roles[member.folderId],
+                      role != .sent, role != .drafts, source.takes(role: role, folderId: member.folderId),
+                      member.folderPath != folder.path else { return nil }
+                let current = manager.overlayAdjustedSnapshot(row, in: overlay)
+                var recorded = member
+                recorded.actionTag = current.actionTag
+                recorded.tagSortOrder = current.tagSortOrder
+                return recorded
             }
             guard !movable.isEmpty else { return nil }
             if roleMove, folder.role == .trash {
@@ -2397,6 +2470,32 @@ final class MessageDetailViewModel {
         try? dbPool.read { db in
             Dictionary(try Folder.fetchAll(db, keys: Array(folderIds)).map { ($0.id, $0.role) }) { first, _ in first }
         }
+    }
+
+    /// For a whole-chat action, in one read: the roles of the rows' folders (a folder with no Folder
+    /// row has none) and the rows as stored. An id the store does not hold yet is taken from the
+    /// staged rows, with the projection the move's resolver uses (`AccountManager.stagedHeadersForAction`); an id neither
+    /// stored nor staged is absent. Nil when the read fails. The staged rows are read first: a merge
+    /// stores a row before a later merge drops it from the staged rows, so a row stored during the
+    /// read is in one of the two.
+    private func lookupChatRows(
+        _ members: [MessageHeader]
+    ) -> (roles: [String: FolderRole], rows: [String: MessageHeader])? {
+        let folderIds = Array(Set(members.map(\.folderId)))
+        let ids = members.map(\.id)
+        let staged = AccountManager.stagedHeadersForAction(ids: ids)
+        #if DEBUG
+        let readHook = _chatRowsReadHook
+        #endif
+        guard let read = try? dbPool.read({ db -> (roles: [String: FolderRole], rows: [String: MessageHeader]) in
+            let roles = Dictionary(try Folder.fetchAll(db, keys: folderIds).map { ($0.id, $0.role) }) { first, _ in first }
+            #if DEBUG
+            readHook?()
+            #endif
+            let rows = Dictionary(try MessageHeader.fetchAll(db, keys: ids).map { ($0.id, $0) }) { first, _ in first }
+            return (roles: roles, rows: rows)
+        }) else { return nil }
+        return (roles: read.roles, rows: read.rows.merging(staged) { stored, _ in stored })
     }
 
     /// Whether ordinary Archive/Move controls must be inert for this row.
@@ -2717,7 +2816,7 @@ final class MessageDetailViewModel {
             BackgroundSyncLogger.logDebug("[ThreadDebug] Finding related for: id=\(msg.id.prefix(40)) rfc822=\(msg.rfc822MessageId ?? "nil") inReplyTo=\(msg.inReplyTo ?? "nil") threadId=\(msg.threadId ?? "nil") computedThreadId=\(msg.computedThreadId) references=\(refsStr) folder=\(msg.folderPath)")
         }
         let pool = dbPool
-        Task { await self.inDisplayTurn {
+        let scan = Task { await self.inDisplayTurn {
             // A newer scan is queued behind this one and reads later: skip.
             guard generation == self.threadLoadGeneration, let msg = self.message else { return }
             // Probe the DB for *any* messages that could plausibly be thread-related,
@@ -2852,5 +2951,21 @@ final class MessageDetailViewModel {
                 }
             }
         } }
+        noteThreadScanRequestForTesting(scan, anchor: msg.id)
+    }
+
+    /// Test seam: counts each thread scan asked for and when it ends, so a test can see which
+    /// write asked for one and wait until every scan it asked for has ended. No-op outside DEBUG.
+    private func noteThreadScanRequestForTesting(_ scan: Task<Void, Never>, anchor: String) {
+        #if DEBUG
+        // Only while a test listens, so a debug build of the app starts no extra tasks.
+        guard let hook = _threadScanRequestHook else { return }
+        threadScansAskedForTesting += 1
+        Task { [weak self] in
+            await scan.value
+            self?.threadScansEndedForTesting += 1
+        }
+        hook(anchor)
+        #endif
     }
 }

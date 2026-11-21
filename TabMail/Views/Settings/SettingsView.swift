@@ -661,10 +661,7 @@ struct SettingsView: View {
             BackgroundSyncLogger.logDebug("[NukeDB] Memory index reset failed after GRDB commit: \(error)")
             derivedIndexFailures.append("conversation memory")
         }
-        // 3. Reset sync-related UserDefaults
-        UserDefaults.standard.set(false, forKey: "ccBccBackfillDone")
-
-        // 4. Compact GRDB — checkpoint WAL then VACUUM to reclaim disk space
+        // 3. Compact GRDB — checkpoint WAL then VACUUM to reclaim disk space
         do {
             try await AppDatabase.dbPool.writeWithoutTransaction { db in
                 try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
@@ -676,7 +673,7 @@ struct SettingsView: View {
         }
         BackgroundSyncLogger.logDebug("[NukeDB] Deleted all email data from GRDB")
 
-        // 5. Delete FTS database
+        // 4. Delete FTS database
         do {
             try await SearchIndex.shared.resetAll()
             BackgroundSyncLogger.logDebug("[NukeDB] Reset FTS database")
@@ -697,7 +694,7 @@ struct SettingsView: View {
         await BodyAssetMaintenance.pruneOrphans()
         BackgroundSyncLogger.logDebug("[NukeDB] Pruned BodyAssetStore orphans")
 
-        // 6. `defer` restarts sync — fresh backfill from top — on every exit.
+        // 5. `defer` restarts sync — fresh backfill from top — on every exit.
         BackgroundSyncLogger.logDebug("[NukeDB] Sync restarted — backfill will re-walk all folders")
     }
 
@@ -752,19 +749,52 @@ struct SettingsView: View {
     }
 
     private func archiveOldMessages() async {
-        // The mark-as-read setting as it stands when the action starts.
-        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
         let archiveCutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.archiveAgeDays, to: Date()) ?? Date()
         let inboxFolderIds = Set(navigationStore.folders.filter { $0.role == .inbox }.map(\.id))
         guard !inboxFolderIds.isEmpty else { return }
 
+        guard let totalArchived = await Self.archiveOldMessages(
+            inboxFolderIds: inboxFolderIds, archiveCutoff: archiveCutoff) else { return }
+
+        BackgroundSyncLogger.logDebug("[ArchiveOld] Archived \(totalArchived) messages older than \(SyncConfig.archiveAgeDays) days")
+
+        // Refresh state
+        isLargeInbox = false
+        UserDefaults.standard.set(false, forKey: "isLargeInbox")
+        oldMessageCount = 0
+    }
+
+    /// The "Archive old messages" sweep. Returns how many rows it asked to move,
+    /// or nil when the read failed or found no old row (nothing was attempted).
+    ///
+    /// The sweep is a gesture on the rows it reads (ADR-IOS-115): the folder
+    /// reset stamp is taken BEFORE the read and bound around the mark-read and
+    /// the move, so a UIDVALIDITY reset that lands between the read and the
+    /// move refuses them instead of acting on the replacement email re-seated
+    /// at a row's id. `beforeRead` runs after the stamp and before the read,
+    /// `afterRead` once the rows are read; both are test seams for those windows
+    /// and production passes nothing. The mark-as-read setting is read once, as
+    /// the sweep starts, and that value applies to every row it archives.
+    @MainActor
+    @discardableResult
+    static func archiveOldMessages(
+        inboxFolderIds: Set<String>,
+        archiveCutoff: Date,
+        beforeRead: () async -> Void = {},
+        afterRead: () async -> Void = {}
+    ) async -> Int? {
+        // The mark-as-read setting as it stands when the action starts.
+        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
+        let stamp = FolderResetGeneration.current()
+        await beforeRead()
         guard let oldMessages = try? await AppDatabase.dbPool.read({ db in
             try MessageHeader
                 .filter(inboxFolderIds.contains(Column("folderId")))
                 .filter(Column("date") < archiveCutoff)
                 .order(Column("date").asc)
                 .fetchAll(db)
-        }), !oldMessages.isEmpty else { return }
+        }), !oldMessages.isEmpty else { return nil }
+        await afterRead()
 
         let byAccount = Dictionary(grouping: oldMessages, by: \.accountId)
         var totalArchived = 0
@@ -796,17 +826,13 @@ struct SettingsView: View {
             // default ON). Strictly before the move and in the same awaited
             // sequence: a move changes the address the read op would have to
             // name. See `AccountManager.markReadBeforeRoleMove`.
-            await AccountManager.shared.markReadBeforeRoleMove(ids: messages.map(\.id), enabled: marksRead)
-            await AccountManager.shared.move(messages, to: archivePath)
+            await FolderResetGeneration.$gestureStamp.withValue(stamp) {
+                await AccountManager.shared.markReadBeforeRoleMove(ids: messages.map(\.id), enabled: marksRead)
+                await AccountManager.shared.move(messages, to: archivePath)
+            }
             totalArchived += messages.count
         }
-
-        BackgroundSyncLogger.logDebug("[ArchiveOld] Archived \(totalArchived) messages older than \(SyncConfig.archiveAgeDays) days")
-
-        // Refresh state
-        isLargeInbox = false
-        UserDefaults.standard.set(false, forKey: "isLargeInbox")
-        oldMessageCount = 0
+        return totalArchived
     }
 
     private func formatStorageMB(_ mb: Double) -> String {

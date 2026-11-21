@@ -334,11 +334,11 @@ final class AppDatabase: Sendable {
                     folderPath: folderPath, instanceEpoch: instanceEpoch)
                 try op.insert(db)
             }
-            // The full sync lists every folder the change reader does not track
-            // (and every folder of an account with no change bookmark), which
-            // corrects the optimistic state of a retired action there. A tracked
-            // folder gets no window listing (ADR-IOS-111): its correction is the
-            // re-read list or the catch-up armed above, not this full sync.
+            // The full sync lists every folder the change reader does not track,
+            // including each folder whose bookmark the recheck above dropped,
+            // which corrects the optimistic state of a retired action there. A
+            // tracked folder gets no window listing (ADR-IOS-111): its correction
+            // is the re-read list or the catch-up armed above, not this full sync.
             try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL")
             try db.execute(sql: """
                 INSERT INTO appReleaseStamp (id, release) VALUES (1, ?)
@@ -353,7 +353,7 @@ final class AppDatabase: Sendable {
         // "did the boundary fire, and how much did it take" when a user reports
         // an action that did not survive an update.
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[AppDatabase] Release boundary crossed to \(currentRelease) — retired \(retiredRows) previous-release pendingOperation row(s) and marked full sync due; re-read list +\(recheck.listedIds) id(s), catch-up armed on \(recheck.armedFolders) folder(s), \(recheck.undecodableRows) undecodable row(s)")
+            BackgroundSyncLogger.logDebug("[AppDatabase] Release boundary crossed to \(currentRelease) — retired \(retiredRows) previous-release pendingOperation row(s) and marked full sync due; re-read list +\(recheck.listedIds) id(s), catch-up armed on \(recheck.armedFolders) folder(s), bookmark dropped on \(recheck.droppedBookmarks) folder(s), \(recheck.undecodableRows) undecodable row(s)")
         }
         return true
     }

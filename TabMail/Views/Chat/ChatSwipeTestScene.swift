@@ -57,6 +57,12 @@ struct ChatSwipeTestScene: View {
     /// AI Suggestion", which writes the newest email's AI Suggestion when the test taps it, so the
     /// test decides that it lands only after its drag or jump has come to rest.
     private let lateSuggestionRelease = ProcessInfo.processInfo.arguments.contains("--chat-swipe-late-suggestion")
+    /// `--chat-swipe-writing`: the newest email is classified with no reply yet, so the chat shows
+    /// the AI Suggestion's working bubble until "Release the AI Suggestion" stores the reply.
+    /// Without it the newest email is filtered, so no working bubble shows.
+    nonisolated private static let writing = ProcessInfo.processInfo.arguments.contains("--chat-swipe-writing")
+    /// `--chat-swipe-ready`: the newest email's AI Suggestion is already stored as the chat opens.
+    nonisolated private static let readyAtOpen = ProcessInfo.processInfo.arguments.contains("--chat-swipe-ready")
     /// The late AI Suggestion's text message.
     nonisolated static let lateSuggestion = "Sounds good, see you Tuesday."
     /// The newest email's full AI Suggestion, as the fixture writes it.
@@ -214,7 +220,9 @@ struct ChatSwipeTestScene: View {
     /// `TutorialChatViewRunTests` starts one.
     private func seedTutorial() async throws {
         UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
-        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+        // A first-launch tour starts before the AI choice: the fixture clears it (another mode may
+        // have recorded one on an earlier launch) and runs that tour, which teaches the chat view.
+        AIConsentPolicy.clearChoice(in: AIService.optOutStore)
         let coordinator = TutorialCoordinator.shared
         await coordinator.start(.reuseReply, hasTabMailSession: false)
         try await DemoModeService.shared.completeSetup()
@@ -242,9 +250,11 @@ struct ChatSwipeTestScene: View {
                 return
             }
             UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
-            // An open goes to the chat only for a subscriber (`MessageOpenView`); the gate persists
-            // across launches, so every mode opens it and runs alike.
+            // An open goes to the chat only for a subscriber with the AI choice made, AI on
+            // (`MessageOpenView`); the gate and the choice persist across launches, so every mode
+            // sets both and runs alike. Nothing is queued for AI (`resume`).
             AISubscriptionGate.shared.openGate()
+            AIService.recordAIChoice(aiEnabled: true, resume: {})
             let accountID = Self.accountID
             let now = Date()
             try await AppDatabase.dbPool.write { db in
@@ -269,6 +279,20 @@ struct ChatSwipeTestScene: View {
                     header.headerComplete = true
                     header.bodyComplete = true
                     header.isRead = !Self.unread
+                    if index == Self.count - 1 {
+                        // The AI's state on the newest email, under the shared "AI is working"
+                        // rule (`AIWorkingRule`): tagged with no reply yet writes; otherwise it is
+                        // filtered (the empty-reply sentinel), so no working bubble shows and a
+                        // released suggestion lands with none before it.
+                        // Stored through the one rule (`replaceSuggestion`) over the none read.
+                        if Self.readyAtOpen {
+                            header.actionTag = .reply
+                            _ = header.replaceSuggestion(with: ReplyResult(body: Self.fullReply, textMessage: Self.lateSuggestion), ifStill: nil)
+                        } else {
+                            header.actionTag = Self.writing ? .reply : ActionTag.none
+                            if !Self.writing { _ = header.replaceSuggestion(with: .filtered, ifStill: nil) }
+                        }
+                    }
                     header.summaryBlurb = "Note \(index)"
                     header.summaryTextMessage = index == 0 && Self.tall
                         ? "Note 0: " + String(repeating: "A long line that fills the screen. ", count: 80)

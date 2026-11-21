@@ -94,7 +94,7 @@ enum ScreenshotMode {
         // Bypass all onboarding gates
         UserDefaults.standard.set(true, forKey: "hasLaunchedBefore")
         UserDefaults.standard.set(true, forKey: AgeAndTermsConsent.completedKey)
-        UserDefaults.standard.set(true, forKey: "hasSeenAIConsent")
+        AIService.optOutStore.set(true, forKey: AIService.aiChoiceMadeKey)
         UserDefaults.standard.set(true, forKey: "hasSeenPushConsent")
         UserDefaults.standard.set(true, forKey: "didMigrateHeaderIds_v2")
         UserDefaults.standard.set(true, forKey: "didClearBodiesForAttachmentEncoding_v1")
@@ -144,11 +144,14 @@ enum ScreenshotMode {
                 for f in folders {
                     try db.execute(
                         sql: """
-                            INSERT INTO folder (id, accountId, name, path, role, unreadCount, totalCount, backfillComplete)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT INTO folder (id, accountId, name, path, role, unreadCount, backfillComplete)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
                             """,
-                        arguments: [f.id, f.accountId, f.name, f.path, f.role, f.unread, f.total, true]
+                        arguments: [f.id, f.accountId, f.name, f.path, f.role, f.unread, true]
                     )
+                    // The synthetic count goes through the counters' one writer.
+                    try SyncEngine.writeListingCounters(
+                        ListingCounters(messageCount: f.total, uidNext: nil, highestModSeq: nil), folderId: f.id, db: db)
                 }
 
                 // --- Messages ---

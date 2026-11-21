@@ -134,6 +134,12 @@ struct InlineEditResult: Sendable {
 
 extension AIService {
 
+    /// What an inline edit returns with AI turned off, at its start or while it runs.
+    static let inlineEditWithAIOff = InlineEditResult(
+        response: "AI calls are disabled.", subject: nil, body: nil, toDelta: nil, ccDelta: nil, bccDelta: nil,
+        textMessage: nil, changeCommand: nil, raw: ""
+    )
+
     /// Perform an inline edit of the compose draft, matching TB's `runComposeEdit()` in edit.js.
     /// Sends the current draft state + user instruction (+ optional chat history for continuous editing)
     /// to the backend via `system_prompt_compose_interactive` with the appropriate edit mode.
@@ -150,7 +156,7 @@ extension AIService {
     ) async throws -> InlineEditResult {
         guard !disableLLMCalls else {
             BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: SKIP — LLM calls disabled")
-            return InlineEditResult(response: "AI calls are disabled.", subject: nil, body: nil, toDelta: nil, ccDelta: nil, bccDelta: nil, textMessage: nil, changeCommand: nil, raw: "")
+            return Self.inlineEditWithAIOff
         }
 
         // Demo Mode budget. One performInlineEdit = one count.
@@ -281,6 +287,14 @@ extension AIService {
         let response: CompletionsResponse
         do {
             response = try await backend.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent, invocation: invocation)
+        } catch is AIOffError {
+            // AI was turned off during the edit: end as the check above does, with no
+            // Demo Mode call used.
+            if inDemo {
+                await MainActor.run { DemoModeStore.shared.refundCall() }
+            }
+            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: stopped — AI turned off")
+            return Self.inlineEditWithAIOff
         } catch {
             if inDemo, DemoModeStore.shouldRefund(for: error) {
                 await MainActor.run { DemoModeStore.shared.refundCall() }

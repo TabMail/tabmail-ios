@@ -31,6 +31,12 @@ import GRDB
 /// every durable action on those accounts permanently — a bricked account, not
 /// a transient no-op.
 ///
+/// (Since the SwiftMail pin `aed5d85`, STATUS asks for UIDNEXT and UIDVALIDITY on
+/// every server, as RFC 3501 §6.3.10 base items, so the UIDPLUS gap above is
+/// closed in the client. The property still holds for a server whose STATUS
+/// leaves UIDVALIDITY out, which is how every case below now models the
+/// STATUS-silent server: `statusWithoutEpochServer`.)
+///
 /// **`0` IS "NOT REPORTED", NOT AN EPOCH — and that is what makes this item
 /// dangerous to get wrong.** `Mailbox.Selection.uidValidity` is non-optional
 /// only because SwiftMail DEFAULTS it (`public var uidValidity: UIDValidity =
@@ -228,6 +234,19 @@ struct SelectSourcedFolderEpochTests {
     private static let nonUidplusCapabilities =
         ["IMAP4rev1", "AUTH=PLAIN", "LITERAL+", "ID", "NAMESPACE", "MOVE", "IDLE"]
 
+    /// A server whose STATUS answers carry no UIDVALIDITY, so any epoch that
+    /// lands in the column can only have come from a SELECT. Since the pinned
+    /// SwiftMail asks STATUS for UIDNEXT and UIDVALIDITY on every server (RFC 3501
+    /// §6.3.10 base items; it used to ask only with UIDPLUS, the gap the doc
+    /// comment above describes), the capability list alone no longer makes STATUS
+    /// silent about the epoch: the server leaving the item out does. The client
+    /// reads an item left out as unknown, never as 0.
+    private static func statusWithoutEpochServer(mailboxes: [String: [FakeIMAPServer.Message]]) -> FakeIMAPServer {
+        let server = FakeIMAPServer(capabilities: nonUidplusCapabilities, mailboxes: mailboxes)
+        for mailbox in mailboxes.keys { server.setStatusOmits(["UIDVALIDITY"], for: mailbox) }
+        return server
+    }
+
     private static func rfc822(messageId: String) -> String {
         """
         From: Test Sender <sender@example.com>\r
@@ -278,8 +297,7 @@ struct SelectSourcedFolderEpochTests {
     @Test("A folder on a non-UIDPLUS server acquires its epoch from the sync SELECT")
     func nonUidplusFolderAcquiresItsEpochFromTheSyncSelect() async throws {
         let liveEpoch = 838_101
-        let server = FakeIMAPServer(
-            capabilities: Self.nonUidplusCapabilities,
+        let server = Self.statusWithoutEpochServer(
             mailboxes: ["INBOX": [Self.message(uid: 1, id: "t12b-nonuidplus@example.com")]])
         server.setUidValidity(liveEpoch, for: "INBOX")
         try server.start()
@@ -303,7 +321,7 @@ struct SelectSourcedFolderEpochTests {
         // STATUS source T1.2 added genuinely reports nothing on this server.
         let status = try await provider.folderStatus(path: "INBOX")
         #expect(status.uidValidity == nil,
-                "precondition: a non-UIDPLUS server carries no UIDVALIDITY on STATUS, so T1.2's writers see nil")
+                "precondition: this server carries no UIDVALIDITY on STATUS, so T1.2's writers see nil")
 
         let engine = await Self.makeEngine(accountId: accountId, provider: provider)
         try await engine.fullSync(account: account, provider: provider)
@@ -340,8 +358,7 @@ struct SelectSourcedFolderEpochTests {
     @Test("Opening a folder marks its epoch")
     func openingAFolderMarksItsEpoch() async throws {
         let liveEpoch = 838_202
-        let server = FakeIMAPServer(
-            capabilities: Self.nonUidplusCapabilities,
+        let server = Self.statusWithoutEpochServer(
             mailboxes: ["Archive": []])
         server.setUidValidity(liveEpoch, for: "Archive")
         try server.start()
@@ -378,8 +395,7 @@ struct SelectSourcedFolderEpochTests {
     /// turns every guard built on this column into a no-op.
     @Test("A SELECT that reports no epoch leaves the column nil")
     func aSelectThatReportsNoEpochLeavesTheColumnNil() async throws {
-        let server = FakeIMAPServer(
-            capabilities: Self.nonUidplusCapabilities,
+        let server = Self.statusWithoutEpochServer(
             mailboxes: ["INBOX": [Self.message(uid: 1, id: "t12b-zero@example.com")]])
         server.suppressSelectUidValidity(for: "INBOX")
         try server.start()
@@ -429,8 +445,7 @@ struct SelectSourcedFolderEpochTests {
     @Test("A SELECT that stops reporting an epoch never answers with the earlier one")
     func aSelectThatStopsReportingNeverAnswersWithTheEarlierEpoch() async throws {
         let firstEpoch = 838_505
-        let server = FakeIMAPServer(
-            capabilities: Self.nonUidplusCapabilities,
+        let server = Self.statusWithoutEpochServer(
             mailboxes: ["INBOX": [Self.message(uid: 1, id: "t12b-stale-mirror@example.com")]])
         server.setUidValidity(firstEpoch, for: "INBOX")
         try server.start()
@@ -485,8 +500,7 @@ struct SelectSourcedFolderEpochTests {
     @Test("A SELECT that reports no epoch never erases a stored epoch")
     func aSelectThatReportsNoEpochNeverErasesAStoredEpoch() async throws {
         let storedEpoch = 838_303
-        let server = FakeIMAPServer(
-            capabilities: Self.nonUidplusCapabilities,
+        let server = Self.statusWithoutEpochServer(
             mailboxes: ["INBOX": [Self.message(uid: 1, id: "t12b-zero-keep@example.com")]])
         server.suppressSelectUidValidity(for: "INBOX")
         try server.start()
@@ -524,8 +538,7 @@ struct SelectSourcedFolderEpochTests {
     func selectSourcedTurnoverNeverOverwritesTheStoredEpoch() async throws {
         let storedEpoch = 838_401
         let liveEpoch = 838_402
-        let server = FakeIMAPServer(
-            capabilities: Self.nonUidplusCapabilities,
+        let server = Self.statusWithoutEpochServer(
             mailboxes: ["INBOX": [Self.message(uid: 1, id: "t12b-turnover@example.com")]])
         server.setUidValidity(liveEpoch, for: "INBOX")
         try server.start()
@@ -617,8 +630,8 @@ struct SelectSourcedFolderEpochTests {
         await mock.setMockedBoundFetchEpoch(fetchEpoch, folderPath: "INBOX")
         await mock.setMockedUidValidity(mirrorEpoch, folderPath: "INBOX")
 
-        _ = try await SyncEngine.runSyncMessages(
-            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool))
+        _ = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
         #expect(after?.lastKnownUidValidity == Int(fetchEpoch),

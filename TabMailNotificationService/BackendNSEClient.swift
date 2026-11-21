@@ -13,6 +13,15 @@ enum BackendNSEClient {
         let assistant: String
     }
 
+    /// Sends one AI request. Test seam: tests bind a fake with `$transport.withValue`.
+    typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+    @TaskLocal static var transport: Transport = { try await URLSession.shared.data(for: $0) }
+
+    /// Whether AI is turned off (Opt Out of AI, the App Group flag the app writes), read
+    /// right before each AI request is sent, so turning AI off stops this run at its next
+    /// request (a summary retry, the action votes). Test seam as `transport`.
+    @TaskLocal static var isAIOff: @Sendable () -> Bool = { NSEState.isAIDisabled() }
+
     /// Wrapper around `[String: Any]` so it can cross concurrent task boundaries.
     /// Safe because callers only ever put JSON-primitive values (String, Bool,
     /// Int, Double) into `raw`, and the dictionary is read-only after construction.
@@ -23,9 +32,6 @@ enum BackendNSEClient {
 
     /// `TabMailProtocolVersion` from this extension's Info.plist (TABMAIL_PROTOCOL_VERSION).
     static let protocolVersion = Bundle.main.infoDictionary?["TabMailProtocolVersion"] as? String
-
-    /// The completions transport; tests bind a fake (same seam as `NSETokenManager.transport`).
-    @TaskLocal static var transport: NSETokenManager.DataForRequest = { try await URLSession.shared.data(for: $0) }
 
     /// Single completions call (summary or chat)
     static func sendCompletions(
@@ -133,6 +139,8 @@ enum BackendNSEClient {
         case success(Data)
         case httpFailure
         case deadline
+        /// Not sent: AI is turned off.
+        case refused
     }
 
     /// Enforces `timeout` as a TRUE wall-clock cap, not the idle timer
@@ -143,7 +151,7 @@ enum BackendNSEClient {
     /// 26.4s under the nominal 12s idle timeout, missing the 27s graceful-exit
     /// watchdog by 9ms; action calls were observed at 16.8s/17.4s/19s+.
     ///
-    /// Races `transport` (`URLSession.shared.data(for:)`) against `Task.sleep` for
+    /// Races the request (`transport`, `URLSession.shared.data(for:)`) against `Task.sleep` for
     /// `timeout` seconds; first finisher wins, then `group.cancelAll()` —
     /// `data(for:)` is cancellation-aware and aborts the in-flight HTTP
     /// request, so the loser doesn't linger. `request.timeoutInterval` is
@@ -151,7 +159,10 @@ enum BackendNSEClient {
     private static func performRequestWithDeadline(_ request: URLRequest, timeout: TimeInterval) async -> Data? {
         let outcome = await withTaskGroup(of: CallOutcome.self) { group -> CallOutcome in
             group.addTask {
-                guard let (data, response) = try? await transport(request),
+                // The AI setting, read right before the send: nothing between this and the
+                // request suspends.
+                guard !BackendNSEClient.isAIOff() else { return .refused }
+                guard let (data, response) = try? await BackendNSEClient.transport(request),
                       let httpResponse = response as? HTTPURLResponse,
                       httpResponse.statusCode == 200 else { return .httpFailure }
                 return .success(data)
@@ -172,6 +183,9 @@ enum BackendNSEClient {
             return nil
         case .deadline:
             NSELog.step("NSE LLM call DEADLINE (\(Int(timeout))s wall-clock) — abandoning")
+            return nil
+        case .refused:
+            NSELog.step("NSE LLM call not sent: AI is turned off")
             return nil
         }
     }

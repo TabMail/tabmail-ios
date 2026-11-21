@@ -42,9 +42,10 @@ struct ComposeEditMarkerTests {
         relatedFrom: "Sam <sam@example.com>", relatedTo: "alex@example.com", relatedCc: "", bodyText: "Are you in?")
 
     static func edit(_ assistant: String) async throws -> (InlineEditResult, String?) {
-        let saved = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
-        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
-        defer { AIService.optOutStore.set(saved, forKey: AIService.optOutAllAIKey) }
+        // The AI choice made, AI on (`AIService.isAIOff`), restored after.
+        let restore = AITestSetting.save()
+        defer { restore() }
+        AITestSetting.set(aiOff: false)
         let version = OSAllocatedUnfairLock<String?>(initialState: nil)
         let http = backend(assistant, version: version)
         defer { http.close() }
@@ -129,9 +130,9 @@ struct ComposeEditMarkerTests {
     @Test("A new email's and a forward's compose edit read the backend's JSON; a malformed one fails",
           arguments: ["edit_new", "edit_forward"], [true, false])
     func everyModeReadsTheJSON(mode: String, wellFormed: Bool) async throws {
-        let saved = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
-        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
-        defer { AIService.optOutStore.set(saved, forKey: AIService.optOutAllAIKey) }
+        let restore = AITestSetting.save()
+        defer { restore() }
+        AITestSetting.set(aiOff: false)
         let version = OSAllocatedUnfairLock<String?>(initialState: nil)
         let answer = wellFormed
             ? ComposeEditJSON.make(response: "Wrote it.", subject: "Offsite plans", body: Self.body,

@@ -1113,10 +1113,11 @@ nothing is ever decided about a UID whose numbering is unproven (ADR-IOS-107). C
   starts after the budget is spent, the removal proof included.
 - **Not the backfill.** With a partial backfill, no command names a UID below the lowest local UID or
   above the highest, and no row is inserted.
-- **Always-expensive network.** After `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` without a
-  completed listing, a folder lists on an expensive network: one never listed, one on a server
-  without CONDSTORE, and one whose listing was parked. The first sight of a folder on an expensive
-  network writes when the wait began and makes no request.
+- **Scans under every download gate (#1063).** A due scan runs on an expensive network, below 20%
+  battery and in Low Power Mode, in the worker and in the background job, and the walk stays held
+  (`scanRunsUnderEveryDownloadGate` per provider); a folder never listed lists at once on an
+  expensive network. *Superseded:* "Always-expensive network. After the expensive-network wait bound
+  without a completed listing, a folder lists on an expensive network [...]".
 - **A new folder.** A folder the full sync itself created follows an older-mail change on the next
   pass.
 - **A just-completed user action** wins over a stale listing, per message.
@@ -1393,3 +1394,74 @@ open does; the glyph has its label, hint and a full 44-point target at the trail
 and the subject stays centred. A control pins that the long-press sheet still sends its own type and
 content with no extra line. TipKit is not used for the flag, because its store cannot be reset inside
 the test process (ADR-IOS-085), so a tip's show-once rule could not be tested.
+
+The same suite pins that a report the backend took says "Report Submitted" exactly once, whatever
+happens to the view that asked for it, and a report it did not take says nothing (#1113):
+- `aScrolledRowKeepsItsReport`: a lazy list's reporting row scrolls away and back while the report
+  sends; the sheet stays, and the answer shows the confirmation once, alone.
+- `aRemovedRowsTakenReportConfirmsOnce`: a sync removes the reporting row while the report sends;
+  the sheet goes with the row, and the answer still shows the confirmation once, alone, with
+  nothing after OK. The rows sit in a `VStack`, not a `List`: a row removed from a `List` kept its
+  sheet up, so the test never reached its case.
+- `aSystemClosedPopoversReportConfirmsOnlyWhenTaken`: the system closes the notice's popover and its
+  sheet while the report sends; a taken report shows the confirmation once, a refused one nothing.
+- `reportSubmittedWaitsForTheSheetToLeave`: drives `ReportConcernSubmission` directly in a key
+  window. A taken answer shows nothing while the sheet is up; the sheet's departure shows the
+  confirmation exactly once, a second departure adds none, and OK finishes the report exactly once.
+  A refused answer finishes nothing until the sheet has left, then exactly once.
+- `submittedReportClosesTheSheet`: the notice's popover stays, with the confirmation on it, until OK,
+  and goes only after OK (a sent report's sheet leaving does not finish it).
+- `aClosedSheetsAnswerBeforeTheNextReport` also pins, as absolute counts, that a sent report's sheet
+  leaving finishes nothing: no finish after the close has settled, one on OK.
+- An old answer (a sheet its caller closed, an owner or notice removed and recreated, a popover the
+  system closed and the notice reopened, at four timings) shows the confirmation once over whatever
+  is up, and neither it nor its OK closes, changes or finishes the next report:
+  `aClosedSheetsAnswerBeforeTheNextReport`, `aClosedSheetsAnswerDuringTheNextReport`,
+  `aRemovedOwnersTakenAnswerConfirmsOnce`, `aRemovedNoticesTakenAnswerConfirmsOnce`,
+  `anOldAnswerLeavesTheNextSendAlone`, `aSystemClosedPopoversAnswerNeverChangesTheNext`.
+- A sheet that leaves with nothing sent finishes its caller only for the presentation that was
+  current when it reached its window (round 4):
+  - `aSystemClosedPopoversAnswerNeverChangesTheNext` and
+    `aClosedPopoversSheetNeverClosesTheReopenedNotice`: at the system close SwiftUI presents the
+    closed popover's sheet again, which is in a window for a moment before the reopen, so it counts
+    for the presentation the reopen retires and does not close the reopened notice when it leaves.
+    These rely on that order: a reopen before the stray sheet reaches its window would count it for
+    the reopened presentation.
+  - `aClosedPopoverDoesNotReopenTheSheet`, `aRemovedNoticesTakenAnswerConfirmsOnce` (final Cancel):
+    a sheet on screen for the current presentation still closes the notice on Cancel.
+- Superseded (round 3, flag deleted in round 4): only a sheet that was on screen leaves; a sheet
+  UIKit refused reports no departure:
+  - `aWindowlessProbeReportsNothing` (removed in round 4, with the probe's `attached` flag; it stayed
+    green with the flag removed): a `WindowProbe.Probe` added to and removed from a superview
+    with no window reports neither a window nor a detach; one that gets a window and leaves it
+    reports exactly one of each.
+  - `aClosedPopoversSheetNeverClosesTheReopenedNotice`: as below; the refused sheet never closes
+    the reopened notice.
+- Superseded (round 2, gate deleted in round 3): a sheet that leaves with nothing sent finishes its
+  caller only for a report the caller asked for and still shows:
+  - `aRetiredPresentationsSheetFinishesNothing` (removed in round 3, it pinned the deleted gate): with a presentation the test owns, a sheet up for
+    a presentation retired before it showed, or retired while it is up, finishes nothing on
+    Cancel; the next sheet the caller asks for finishes once on Cancel.
+  - `aClosedPopoversSheetNeverClosesTheReopenedNotice`: the system closes the notice's popover
+    with its sheet up, before or after Report, and the notice is reopened. SwiftUI then presents
+    the old sheet again from the closed popover, which UIKit refuses; the reopened notice stays
+    open with nothing on it (and after an old refusal), and its own report's Cancel closes it.
+
+## A stale move never redirects a deferred Undo after a folder reset
+
+`FolderResetGenerationTests.staleMoveNeverRedirectsADeferredUndoOfTheReplacement` runs the real
+UIDVALIDITY reset reaction against `FakeIMAPServer`, so a different email (the replacement) is
+re-seated at the shown id. The user archives the replacement and presses Undo while the archive is in
+flight, so the Undo waits as a deferred successor. A move of the same id stamped before the reset then
+arrives by one of five routes: a direct move that would retarget the Undo, a direct move back to
+Archive that would cancel it, an AI delete card of an RFC-less shown row (whose execution-time
+re-resolve hands `move` the optimistically archived row, still keyed by its INBOX id), a batch with a
+member already at the destination, and a batch with an unaffected member that moves for real. The
+stale arm expects the replacement back in INBOX under a new UID on the server (the archive and Undo
+really ran), the stale member terminal and reported through `.messageMovesRefused`, and other members
+acting; a post-reset stamp cancels or redirects the Undo as before. Final placement on the server is
+the oracle here; the wrong-message oracle cannot be armed on the shown email because the user's own
+archive and Undo of the replacement are legitimate. `replyDraftShapedIdIsJudgedByItsOwnFolder` and
+`generationScopeAndReDrive` pin `FolderResetGeneration.refuses(headerId:accountId:)`: an id is judged
+by the folder it names through `MessageIdentity.headerIdBelongsToFolder`, never a hand split, so a
+reply-draft id with extra colons is refused only when its own folder was reset.
