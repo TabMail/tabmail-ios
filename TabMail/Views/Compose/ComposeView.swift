@@ -80,6 +80,65 @@ enum ComposeDraftGuards {
             currentSuggestion: suggestion)
     }
 
+    /// The suggestion a freshly prepopulated compose offers. The caller's
+    /// `suggestedBody` (the reply the user tapped, or an agent's text) always wins;
+    /// only without one does a reply read the email row's current `cachedReply`,
+    /// which protects against caller-side staleness when background AI, P2P sync,
+    /// or a prior in-place edit updated the row after the caller's snapshot.
+    static func suggestionToShow(
+        suggestedBody: String?, isReply: Bool, freshCachedReply: () -> String?
+    ) -> String? {
+        if let suggestedBody, !suggestedBody.isEmpty { return suggestedBody }
+        return isReply ? freshCachedReply() : nil
+    }
+
+    /// The row explicit Save persists: the existing row with the authored fields
+    /// replaced, or, when the key holds no row yet, a new row stamped with the
+    /// reply target's address. `existing` must be the row read under `id`.
+    static func draftToSave(
+        existing: Draft?, id: String, accountId: String,
+        recipients: (to: [String], cc: [String], bcc: [String]),
+        subject: String, body: String, replyTo: MessageHeader?,
+        isForward: Bool, isReplyAll: Bool, attachmentsDirName: String?, now: Double
+    ) -> Draft {
+        if var e = existing {
+            e.isReplyAll = isReplyAll
+            e.toJSON = Draft.encodeStringArray(recipients.to)
+            e.ccJSON = Draft.encodeStringArray(recipients.cc)
+            e.bccJSON = Draft.encodeStringArray(recipients.bcc)
+            e.subject = subject
+            e.body = body
+            e.updatedAt = now
+            e.attachmentsDirName = attachmentsDirName
+            return e
+        }
+        var d = Draft(
+            id: id,
+            accountId: accountId,
+            toJSON: Draft.encodeStringArray(recipients.to),
+            ccJSON: Draft.encodeStringArray(recipients.cc),
+            bccJSON: Draft.encodeStringArray(recipients.bcc),
+            subject: subject,
+            body: body,
+            replyToId: replyTo?.id,
+            isForward: isForward,
+            editHistoryJSON: nil,
+            createdAt: now,
+            updatedAt: now
+        )
+        d.isReplyAll = isReplyAll
+        d.attachmentsDirName = attachmentsDirName
+        // T5.8 — stamp the reply target's ADDRESS beside its (mutable) PK, from
+        // the SAME header `replyToId` was taken from one line above. Written only
+        // on the INSERT branch: the `existing` branch above carries the original
+        // stamp forward untouched, which is correct — the address the user
+        // actually replied to is decided once, at creation, and never re-derived
+        // from whatever happens to sit at that PK later.
+        d.replyToProviderMessageId = replyTo?.messageId
+        d.replyToUidValidity = replyTo?.observedUidValidity
+        return d
+    }
+
     /// What a tap on Send does (#384, ADR-IOS-100). The suggestion bubble and the
     /// body editor are mutually exclusive, so a visible suggestion always sits
     /// over an empty body; sending then means sending that suggestion.
@@ -1112,6 +1171,8 @@ struct ComposeView: View {
     /// nothing: a save now would carry the not-yet-loaded attachments as none and
     /// delete the saved files.
     @State private var isHydratingPreparedDraft = false
+    /// Debug logging only: when this card's onAppear ran, for the bodyBranch log's timing.
+    @State private var debugAppearedAt: ContinuousClock.Instant?
     /// PORT — sticky initial-read state from v2final ComposeDraftGuards.
     /// `.error` is never reinterpreted as genuine absence later in this view.
     @State private var draftReadState: ComposeDraftGuards.ReadState = .notFound
@@ -1457,6 +1518,8 @@ struct ComposeView: View {
                             if showingSuggestion, let suggested = currentSuggestion, !suggested.isEmpty {
                                 suggestionBubble(text: suggested)
                                     .transition(.scale(scale: 0.96).combined(with: .opacity))
+                                    .onAppear { logSuggestionBubble("appeared") }
+                                    .onDisappear { logSuggestionBubble("disappeared") }
                             } else {
                                 TextEditor(text: $messageBody)
                                     .scrollDisabled(true)
@@ -1834,6 +1897,8 @@ struct ComposeView: View {
             // (manual New, contact, reply, replyAll, forward, agent compose, agent draft).
             .onAppear { performLifecycleAppear() }
             .onDisappear { performDisappear() }
+            .onChange(of: showingSuggestion) { old, new in logShowingSuggestionChange(old, new) }
+            .onChange(of: DebugModeManager.isLoggingEnabled() ? bodyBranchKey : "", initial: true) { _, key in logBodyBranch(key) }
             .onChange(of: selectedAccount) {
                 currentSignature = selectedAccount?.signature ?? ""
             }
@@ -1975,6 +2040,33 @@ struct ComposeView: View {
         }
     }
 
+    /// Debug-gated: the suggestion bubble entering or leaving the card.
+    /// Debug-gated diagnostics: every input of the body's bubble-or-editor branch, in one value.
+    private var bodyBranchKey: String {
+        "showing=\(showingSuggestion) suggestionLen=\(currentSuggestion?.count ?? -1) read=\(draftReadState) "
+            + "hydrating=\(isHydratingPreparedDraft) checkingServer=\(isCheckingServerCopy) quoted=\(quotedHTML != nil)"
+    }
+
+    private func logBodyBranch(_ key: String) {
+        if DebugModeManager.isLoggingEnabled() {
+            let bubble = showingSuggestion && !(currentSuggestion ?? "").isEmpty
+            let sinceAppear = debugAppearedAt.map { "\(($0.duration(to: .now) / .milliseconds(1)).rounded())" } ?? "beforeAppear"
+            BackgroundSyncLogger.logDebug("[ComposeView] bodyBranch instance=\(instanceToken) branch=\(bubble ? "bubble" : "editor") msSinceAppear=\(sinceAppear) key=\(key)")
+        }
+    }
+
+    private func logShowingSuggestionChange(_ old: Bool, _ new: Bool) {
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] showingSuggestion \(old)->\(new) instance=\(instanceToken) suggestionLen=\(currentSuggestion?.count ?? -1)")
+        }
+    }
+
+    private func logSuggestionBubble(_ event: String) {
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] suggestion bubble \(event) instance=\(instanceToken) showing=\(showingSuggestion)")
+        }
+    }
+
     private func performDisappear() {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ComposeView] onDisappear instance=\(instanceToken) draftId=\(draftId)")
@@ -2022,6 +2114,7 @@ struct ComposeView: View {
         // block, so the two calls always name the same id.
         DraftSessionRegistry.shared.register(draftId)
         if DebugModeManager.isLoggingEnabled() {
+            debugAppearedAt = ContinuousClock.now
             BackgroundSyncLogger.logDebug("[ComposeView] onAppear instance=\(instanceToken) draftId=\(draftId)")
         }
         contactSearch.requestAccess()
@@ -2504,6 +2597,10 @@ struct ComposeView: View {
             readResult = .failure(error)
         }
         draftReadState = ComposeDraftGuards.readState(readResult)
+        if DebugModeManager.isLoggingEnabled() {
+            let row = try? readResult.get()
+            BackgroundSyncLogger.logDebug("[ComposeView] draft read instance=\(instanceToken) draftId=\(draftId) state=\(draftReadState) bodyLen=\(row?.body.count ?? -1) suggestedBodyLen=\(suggestedBody?.count ?? -1)")
+        }
         guard case .success(let loaded) = readResult else {
             draftReadState = .error
             sendError = "This draft did not finish loading. Close and reopen it to try again."
@@ -2876,6 +2973,9 @@ struct ComposeView: View {
     }
 
     private func saveDraftAndDismiss() async {
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] saveDraftAndDismiss instance=\(instanceToken) draftId=\(draftId) bodyLen=\(messageBody.count)")
+        }
         // B1: refuse to save-to-server while attachments failed to load. Saving
         // here would (a) queue a push of a partial set to the server draft and
         // (b) rewrite the on-disk attachments dir from the empty in-memory list
@@ -3012,44 +3112,11 @@ struct ComposeView: View {
         // actually reaches the server — queueDraftSave drains but pushDraft
         // sees `serverPushStatus == "pushed"` (from the previous push) and
         // bails before sending the update. `existing` was read fail-closed above.
-        let draftToSave: Draft = {
-            if var e = existing {
-                e.isReplyAll = isReplyAll
-                e.toJSON = Draft.encodeStringArray(capTo)
-                e.ccJSON = Draft.encodeStringArray(capCc)
-                e.bccJSON = Draft.encodeStringArray(capBcc)
-                e.subject = capSubject
-                e.body = capBody
-                e.updatedAt = now
-                e.attachmentsDirName = stagingDirName
-                return e
-            }
-            var d = Draft(
-                id: capDraftId,
-                accountId: account.id,
-                toJSON: Draft.encodeStringArray(capTo),
-                ccJSON: Draft.encodeStringArray(capCc),
-                bccJSON: Draft.encodeStringArray(capBcc),
-                subject: capSubject,
-                body: capBody,
-                replyToId: replyTo?.id,
-                isForward: isForward,
-                editHistoryJSON: nil,
-                createdAt: now,
-                updatedAt: now
-            )
-            d.isReplyAll = isReplyAll
-            d.attachmentsDirName = stagingDirName
-            // T5.8 — stamp the reply target's ADDRESS beside its (mutable) PK, from
-            // the SAME header `replyToId` was taken from one line above. Written only
-            // on the INSERT branch: the `existing` branch above carries the original
-            // stamp forward untouched, which is correct — the address the user
-            // actually replied to is decided once, at creation, and never re-derived
-            // from whatever happens to sit at that PK later.
-            d.replyToProviderMessageId = replyTo?.messageId
-            d.replyToUidValidity = replyTo?.observedUidValidity
-            return d
-        }()
+        let draftToSave = ComposeDraftGuards.draftToSave(
+            existing: existing, id: capDraftId, accountId: account.id,
+            recipients: (capTo, capCc, capBcc), subject: capSubject, body: capBody,
+            replyTo: replyTo, isForward: isForward, isReplyAll: isReplyAll,
+            attachmentsDirName: stagingDirName, now: now)
 
         // The staging-cleanup catch covers ONLY the save. Once the save has
         // COMMITTED (either result), the staging dir's fate is decided by the
@@ -3228,16 +3295,17 @@ struct ComposeView: View {
         // from DB — protects against caller-side staleness when background AI,
         // P2P sync, or a prior in-place edit updated cachedReply after the
         // caller's snapshot was captured.
-        let suggestionToShow: String?
-        if let suggestedBody, !suggestedBody.isEmpty {
-            suggestionToShow = suggestedBody
-        } else if let reply = replyTo, !isForward {
-            let freshHeader = try? dbPool.read { db in
-                try MessageHeader.fetchOne(db, key: reply.id)
-            }
-            suggestionToShow = freshHeader?.cachedReply
-        } else {
-            suggestionToShow = nil
+        let suggestionToShow = ComposeDraftGuards.suggestionToShow(
+            suggestedBody: suggestedBody, isReply: replyTo != nil && !isForward,
+            freshCachedReply: {
+                guard let reply = replyTo else { return nil }
+                let freshHeader = try? dbPool.read { db in
+                    try MessageHeader.fetchOne(db, key: reply.id)
+                }
+                return freshHeader?.cachedReply
+            })
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] suggestion instance=\(instanceToken) draftId=\(draftId) suggestionLen=\(suggestionToShow?.count ?? -1)")
         }
         if let suggested = suggestionToShow, !suggested.isEmpty {
             currentSuggestion = suggested
