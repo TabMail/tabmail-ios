@@ -336,8 +336,11 @@ extension IMAPProvider {
                 }
                 localUids = Set(local.compactMap { UInt32($0.messageId) })
                 rangeFloor = carried.loadsFrom.flatMap { listedUnder in loadsFrom.map { max($0, listedUnder) } }
+                // Immutable copies: a local function capturing the mutable
+                // vars is rejected by region isolation.
+                let heldLocally = localUids, loadFloor = rangeFloor
                 func loadable(_ uid: UInt32) -> Bool {
-                    !localUids.contains(uid) && rangeFloor.map { Int(uid) >= $0 } == true
+                    !heldLocally.contains(uid) && loadFloor.map { Int(uid) >= $0 } == true
                 }
                 candidates = carried.candidates.filter(localUids.contains)
                 missing = carried.missing.filter(loadable)
@@ -550,14 +553,15 @@ extension IMAPProvider {
             let held = [load.held, omitted.first].compactMap({ $0 }).min()
             // What a stop (the budget, or a failed request) leaves of this range,
             // carried so no request already paid is asked again (#1062).
+            let floorOfRange = rangeFloor
             func leftOver(heldFloor: UInt32?) -> IMAPCatchUpState.CarriedRange {
                 proofStopped
                     ? Self.carry(lo: lo, hi: hi, candidates: candidates, missing: missing,
                                  deletedListed: deletedListed, proven: false, heldFloor: nil,
-                                 loadsFrom: rangeFloor, unanswered: owedSearch)
+                                 loadsFrom: floorOfRange, unanswered: owedSearch)
                     : Self.carry(lo: lo, hi: hi, candidates: [], missing: load.notAsked,
                                  deletedListed: [], proven: true, heldFloor: heldFloor,
-                                 loadsFrom: rangeFloor, unanswered: load.owedSearch)
+                                 loadsFrom: floorOfRange, unanswered: load.owedSearch)
             }
             if let stop = load.budgetStoppedAt {
                 // The budget ran out before a load batch or an unanswered UID's
