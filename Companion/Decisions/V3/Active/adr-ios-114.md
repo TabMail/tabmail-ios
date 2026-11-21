@@ -1094,10 +1094,18 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    button (TipKit invalidates it with `.tipClosed`; the drag, the focus and the panel opening call
    `ChatFieldDragTip.close()`, `invalidate(reason: .actionPerformed)`), and is not shown over the open panel or in the
    tutorial; there is no tutorial step for it. The overlay hangs on the whole stack in
-   `pill(on:)`, so it sits above "Replying only to" and the no-reply notice, never over them. Tests:
+   `pill(on:)`, so it sits above "Replying only to" and the no-reply notice, never over them. It shows
+   only while the whole card fits between the header's bottom and the field stack's top
+   (`ChatThreadView.tipRoom`, amended 2026-11-21): at a large text size, in landscape (supported on
+   iPhone) or above a tall draft the card could run off the top of the screen, so it waits for room
+   instead, not shown and still eligible for its one showing. `ViewThatFits` measures the card
+   without showing it. Tests:
    `ChatReplyFieldTests.fieldDragTip`, `ChatFieldDragTests.firstDragWithTheTipOpens`,
    `ChatSwipeUITests.testFieldDragTipShowsAndLeavesTheFieldItsTouches` (launched with
-   `--chat-field-drag-tip`, which resets the TipKit datastore and forces the tip on).
+   `--chat-field-drag-tip`, which resets the TipKit datastore and forces the tip on),
+   `testFieldDragTipCardIsWholeOrWaitsForRoom` (landscape at a large text size, then upright; the
+   whole card read from the debug marker `ChatFieldDragMarker.TipCard`),
+   `testFieldDragTipStaysGoneAfterAShortDrag` and `testFieldDragTipStaysGoneAfterATap`.
 
 21. **A new email rises into the open chat (amendment 2026-11-20).** When the newest email changes
    after the chat has landed (`ChatArrival.isArrival`), the new bubble rises from behind the reply

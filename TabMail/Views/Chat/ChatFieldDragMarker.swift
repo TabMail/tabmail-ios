@@ -13,9 +13,11 @@ import SwiftUI
 /// background, so no layout change).
 ///
 /// The label reads `drags=<n> watching=<0|1> base=<0|1> at=<points> move=<points> held=<0|1>
-/// frozen=<0|1>`: `base` once the drag's start had the newest row's place, `at` the newest row's
-/// last reported top, `held` whether the freeze was still held halfway through the cooldown after
-/// the settle (`heldAtSettle`), `frozen` whether it is held now.
+/// frozen=<0|1> tip=<top>:<bottom>|none room=<top>:<bottom>|none`: `base` once the drag's start had the newest row's place,
+/// `at` the newest row's last reported top, `held` whether the freeze was still held halfway
+/// through the cooldown after the settle (`heldAtSettle`), `frozen` whether it is held now, `tip`
+/// the field's drag tip's whole card while it shows (XCUITest sees only its words), `room` the space
+/// it must fit in, both in the chat's space.
 enum ChatFieldDragMarker {
     static let identifier = "chatFieldDragMarker"
 
@@ -57,6 +59,33 @@ enum ChatFieldDragMarker {
         }
     }
 
+    /// On the field's drag tip: reports where its whole card is while it shows, and the room it
+    /// must fit in (the header's bottom and the field stack's top), all in the chat's space
+    /// (`ChatSwipeOpen.space`), so the test compares them in one space in any orientation.
+    struct TipCard: ViewModifier {
+        let roomTop: CGFloat
+        let roomBottom: CGFloat
+
+        func body(content: Content) -> some View {
+            #if DEBUG
+            if Probe.isActive {
+                content
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(ChatSwipeOpen.space)) } action: {
+                        Probe.shared.tipMoved(to: $0)
+                    }
+                    .onChange(of: [roomTop, roomBottom], initial: true) { _, room in
+                        Probe.shared.tipRoom = room
+                    }
+                    .onDisappear { Probe.shared.tipMoved(to: nil) }
+            } else {
+                content
+            }
+            #else
+            content
+            #endif
+        }
+    }
+
     #if DEBUG
     @MainActor @Observable
     final class Probe {
@@ -77,6 +106,15 @@ enum ChatFieldDragMarker {
         private var newestMinY: CGFloat?
         private var baseline: CGFloat?
         private var watchToken: UUID?
+
+        /// The drag tip's card while it shows; nil while it does not (a tip TipKit no longer shows
+        /// lays out empty). With the room it must fit in, top and bottom.
+        private(set) var tipFrame: CGRect?
+        var tipRoom: [CGFloat] = []
+
+        func tipMoved(to frame: CGRect?) {
+            tipFrame = frame.flatMap { $0.height >= 1 ? $0 : nil }
+        }
 
         func newestMoved(to minY: CGFloat) {
             newestMinY = minY
@@ -109,7 +147,9 @@ enum ChatFieldDragMarker {
         var label: String {
             let move = String(format: "%.1f", largestMove)
             let at = String(format: "%.1f", newestMinY ?? -1)
-            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0)"
+            let tip = tipFrame.map { String(format: "%.1f:%.1f", $0.minY, $0.maxY) } ?? "none"
+            let room = tipRoom.map { String(format: "%.1f", $0) }.joined(separator: ":")
+            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room)"
         }
     }
 

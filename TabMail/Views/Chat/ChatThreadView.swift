@@ -951,19 +951,36 @@ struct ChatThreadView: View {
         // The tip hangs by its bottom from a zero-height anchor on the stack's top edge, so it
         // grows upward from there whatever its height. A custom top alignment guide on the TipView
         // itself did not take: the tip was drawn from the stack's top down, over the field.
+        // It shows only while the whole card fits between the header and the stack
+        // (`tipRoom`): at the largest text size, in landscape, or over a tall draft it would run
+        // off the screen. `ViewThatFits` measures the card without showing it, so a card that
+        // does not fit is not shown and keeps its one showing for when it does.
         .overlay(alignment: .top) {
             if !chatExpanded && !TutorialCoordinator.shared.isRunning {
                 Color.clear
                     .frame(height: 0)
                     .overlay(alignment: .bottom) {
-                        TipView(ChatFieldDragTip(), arrowEdge: .bottom)
-                            .fixedSize(horizontal: false, vertical: true)
+                        ViewThatFits(in: .vertical) {
+                            TipView(ChatFieldDragTip(), arrowEdge: .bottom)
+                                .fixedSize(horizontal: false, vertical: true)
+                                // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`).
+                                .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop))
+                            Color.clear.frame(height: 0)
+                        }
+                        .frame(height: tipRoom, alignment: .bottom)
                     }
             }
         }
         .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)
         .padding(.bottom, ChatViewLayout.fieldBottomGap)
         .animation(Self.pillSpring, value: chatExpanded)
+    }
+
+    /// The room above the field stack for its tip: from the header's bottom to the stack's top,
+    /// both measured in the chat's space; none until both are measured.
+    private var tipRoom: CGFloat {
+        let room = pillTop - headerBottom
+        return room.isFinite ? max(0, room) : 0
     }
 
     /// The drag up on the collapsed field moved (`ChatFieldPan`): the field swells under the finger.
