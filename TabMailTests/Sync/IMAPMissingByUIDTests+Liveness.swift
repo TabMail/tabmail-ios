@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import os
 import GRDB
 import Testing
 @testable import TabMail
@@ -102,6 +103,92 @@ extension IMAPMissingByUIDTests {
                 result, windowMode: .uid, readStartedAt: overAge, selfHealOwedAtRead: read.owedAtRead)
             #expect(!(try w.held()).contains(12), "setup: the over-age read's load was skipped")
             #expect((try w.changeState()).selfHealDue, "#1062: a listing whose loads were skipped does not settle the mark")
+            let state = try #require(try w.catchUpState(), "#1062: the stored catch-up state still decodes")
+            #expect(state.listing == nil && state.completionStamp != nil, "#1062: the completion is kept, not replaced")
+            #expect(state.skippedLoads == nil, "#1062: the skipped-loads flag is not left for the next listing")
+            let clock = CatchUpTestClock()
+            clock.advance(by: Self.pastTheHold)
+            let start = w.server.recordedCommands().count
+            await w.slice(clock: clock)
+            #expect(Self.listingRanges(w.server.recordedCommands().dropFirst(start)).isEmpty,
+                    "#1062: no relisting from scratch before the daily check")
+        }
+    }
+
+    @Test("An owed listing slice applied over-age with no loads does not make the listing unclean: the mark settles")
+    @MainActor
+    func overAgeSliceWithoutLoadsKeepsTheListingClean() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-over-age-no-loads", server: server, local: server) { w in
+            try await w.markOwed()
+            let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() }, maxRequests: 3, listingRangeMessages: w.rangeMessages))
+            let result = try #require(read.results.first)
+            #expect(result.completedListing == nil && result.loaded.isEmpty, "setup: a slice with no loads that does not complete")
+            let overAge = CatchUpWallClock.now().addingTimeInterval(-SyncConfig.catchUpCompletionLogRetentionSeconds - 60)
+            _ = await w.engine.applyCatchUpResult(
+                result, windowMode: .uid, readStartedAt: overAge, selfHealOwedAtRead: read.owedAtRead)
+            #expect(try w.catchUpState()?.skippedLoads == nil, "#1062: nothing was dropped, nothing is marked")
+            let clock = CatchUpTestClock()
+            for _ in 0..<10 where try w.catchUpState()?.listing != nil { await w.slice(clock: clock) }
+            #expect(try w.catchUpState()?.listing == nil, "setup: a later slice completed the listing")
+            #expect(!(try w.changeState()).selfHealDue, "#1062: an over-age slice without loads does not keep the mark")
+        }
+    }
+
+    @Test("The over-age latch flips during the insert: the loads still to come are dropped and the listing is unclean")
+    @MainActor
+    func overAgeLatchFlipsMidInsert() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-latch-mid-insert", server: server, local: server) { w in
+            try await w.dropLocal([12])
+            try await w.markOwed()
+            let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages))
+            let result = try #require(read.results.first)
+            #expect(result.completedListing?.clean == true && result.loaded.contains { $0.id == "12" },
+                    "setup: a clean completed listing that loaded the missing message")
+            // The first check (before the insert) is in time; every later one,
+            // starting with the insert chunk's, is past the retention.
+            let readStartedAt = Date()
+            let checks = OSAllocatedUnfairLock(initialState: 0)
+            CatchUpWallClock.nowForTesting.withLock { $0 = {
+                let n = checks.withLock { $0 += 1; return $0 }
+                return n == 1 ? readStartedAt.addingTimeInterval(10)
+                    : readStartedAt.addingTimeInterval(SyncConfig.catchUpCompletionLogRetentionSeconds + 60)
+            } }
+            defer { CatchUpWallClock.nowForTesting.withLock { $0 = nil } }
+            _ = await w.engine.applyCatchUpResult(
+                result, windowMode: .uid, readStartedAt: readStartedAt, selfHealOwedAtRead: read.owedAtRead)
+            #expect(!(try w.held()).contains(12), "#1062: the latch set in the insert chunk drops the load")
+            #expect((try w.changeState()).selfHealDue, "#1062: the dropped load makes the listing unclean")
+        }
+    }
+
+    @Test("An owed folder whose listing completed unclean is listed again once its change counter moves past the stamp")
+    @MainActor
+    func uncleanOwedFolderRelistsWhenTheCounterMoves() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-unclean-counter", server: server, local: server) { w in
+            var messages = server.map(Self.message)
+            messages[11] = Self.message(12, date: "not a date")
+            w.server.setMessages(messages, in: Self.path)
+            w.server.suppressFetchInternalDate(in: Self.path, uids: [12])
+            try await w.dropLocal([12])
+            try await w.markOwed()
+            let clock = CatchUpTestClock()
+            await w.slice(clock: clock)
+            clock.advance(by: Self.pastTheHold)
+            await w.slice(clock: clock)
+            let stamp = try #require(try w.catchUpState()?.completionStamp, "setup: the unclean listing recorded its stamp")
+            #expect((try w.changeState()).selfHealDue, "setup: still owed")
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET lastKnownHighestModSeq = ? WHERE id = ?", arguments: [stamp + 1, folderId])
+            }
+            clock.advance(by: Self.pastTheHold)
+            let start = w.server.recordedCommands().count
+            await w.slice(clock: clock)
+            #expect(!Self.listingRanges(w.server.recordedCommands().dropFirst(start)).isEmpty,
+                    "#1062: a moved change counter relists an owed folder before the daily check")
         }
     }
 

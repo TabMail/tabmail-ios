@@ -962,14 +962,14 @@ extension SyncEngine {
     /// false when a chunk's transaction failed, so some of `headers` have no
     /// row. Neither caller moves its bookkeeping past them then: the walk keeps
     /// its page token, the catch-up writes no state. Only the catch-up sets
-    /// `catchUpReadStartedAt` (when its read began): the insert then skips a
+    /// `catchUpRead` (its read's start and over-age latch): the insert then skips a
     /// message the user's own newer action stands on, which is not a failure
     /// (`insertBackfillBatch`).
     func insertFetchedBackfillMessages(
         _ headers: [MessageHeaderInfo],
         bodies bodyData: [String: (htmlBody: String?, textBody: String?)],
         folder: Folder,
-        catchUpReadStartedAt: Date? = nil,
+        catchUpRead: CatchUpReadLatch? = nil,
         epochPremise: (premise: SyncEngine.CrawlEpochPremise, observedEpoch: UInt32)? = nil
     ) async -> (inserted: Int, allLanded: Bool) {
         // Step 1: Insert headers to GRDB (batch dedup).
@@ -988,7 +988,7 @@ extension SyncEngine {
                 headers, folderId: folder.id, accountId: folder.accountId,
                 folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
                 epochPremise: epochPremise.premise, observedEpoch: epochPremise.observedEpoch,
-                catchUpReadStartedAt: catchUpReadStartedAt
+                catchUpRead: catchUpRead
             ) {
             case .landed(let count, let records, let allLanded):
                 (inserted, ftsRecords, chunkFailed) = (count, records, !allLanded)
@@ -999,7 +999,7 @@ extension SyncEngine {
             (inserted, ftsRecords, chunkFailed) = await insertBackfillBatch(
                 headers, folderId: folder.id, accountId: folder.accountId,
                 folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
-                observedEpoch: nil, catchUpReadStartedAt: catchUpReadStartedAt
+                observedEpoch: nil, catchUpRead: catchUpRead
             )
         }
         if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }

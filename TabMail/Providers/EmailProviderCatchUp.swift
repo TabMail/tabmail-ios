@@ -198,6 +198,17 @@ enum CatchUpLapse {
 /// (infinite scroll pages by date) never move it. Before the older-mail walk
 /// starts, a catch-up loads missing mail only from here up: new mail beyond the
 /// window is the catch-up's, older mail is the walk's.
+/// Loads the engine dropped from a listing in progress (#1062): an apply whose
+/// read was over-age (`CatchUpReadLatch`) moved the listing past messages it did
+/// not insert. The engine sets this key to `true` in the state's JSON object; a
+/// provider carries it while the listing runs, reports the listing's completion
+/// unclean (`CatchUpCompletedListing.clean` false) when it is set, and clears it
+/// when the listing completes. Provider-neutral, like `CatchUpLapse.countKey`.
+enum CatchUpSkippedLoads {
+    /// The key of the flag in a state's JSON object.
+    static let key = "skippedLoads"
+}
+
 enum CatchUpWindowFloor {
     /// The key of the floor in a state's JSON object.
     static let key = "windowFloor"

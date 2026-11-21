@@ -340,9 +340,10 @@ extension SyncEngine {
     /// newer action stands on (`catchUpReadPredatesAction`), and every load of an
     /// over-age read (`catchUpReadIsOverAge`), is not inserted. That is not a
     /// failure: the state is written, and the message, if the server still lists
-    /// it in the folder, is missing again at the next listing. Over-age is decided
-    /// ONCE, here, before the insert, and the same verdict reaches the transaction
-    /// (#1062): an over-age read inserts nothing and its listing is unclean.
+    /// it in the folder, is missing again at the next listing. Over-age is one
+    /// latch (`CatchUpReadLatch`, #1062), checked before the insert, in each insert
+    /// chunk and in the transaction: once over-age, everything after it is, and any
+    /// load it dropped makes the listing unclean.
     @discardableResult
     func applyCatchUpResult(
         _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date,
@@ -352,9 +353,9 @@ extension SyncEngine {
         if !result.loadFailures.isEmpty && DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loadFailures.count) missing id(s) did not load: \(result.loadFailures.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", "))")
         }
-        let appliedAt = CatchUpWallClock.now()
-        let readIsOverAge = Self.catchUpReadIsOverAge(readStartedAt: readStartedAt, now: appliedAt)
-        if !result.loaded.isEmpty, !readIsOverAge, !(await insertCatchUpLoads(result, readStartedAt: readStartedAt)) {
+        let latch = CatchUpReadLatch(readStartedAt: readStartedAt)
+        if !result.loaded.isEmpty, latch.checkOverAge() { latch.noteLoadsSkipped() }
+        if !result.loaded.isEmpty, !latch.loadsSkipped, !(await insertCatchUpLoads(result, latch: latch)) {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loaded.count) loaded message(s) did not all land — nothing written, the listing stays where it was")
             return .skipped
         }
@@ -363,7 +364,7 @@ extension SyncEngine {
         do {
             outcome = try await dbPool.write { db in
                 try Self.applyCatchUpTransaction(
-                    result, windowMode: windowMode, readStartedAt: readStartedAt, readIsOverAge: readIsOverAge,
+                    result, windowMode: windowMode, readStartedAt: readStartedAt, latch: latch,
                     selfHealOwedAtRead: selfHealOwedAtRead, db: db)
             }
         } catch {
@@ -373,8 +374,8 @@ extension SyncEngine {
 
         switch outcome {
         case .applied(let updatedFlags, let removedIds):
-            let readAge = appliedAt.timeIntervalSince(readStartedAt)
-            if readIsOverAge
+            let readAge = CatchUpWallClock.now().timeIntervalSince(readStartedAt)
+            if latch.checkOverAge()
                 && !(result.flagUpdates.isEmpty && result.loaded.isEmpty) && DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): read began \(Int(readAge)) s ago — \(result.flagUpdates.count) read/flag update(s) and \(result.loaded.count) load(s) not applied")
             }
@@ -412,7 +413,7 @@ extension SyncEngine {
     /// oldest kept row (`date`, the prune's own order) is not inserted and counts
     /// as done" — on IMAP that date skip downloaded every pruned hole again at
     /// each listing (ADR-IOS-006 current note).
-    private func insertCatchUpLoads(_ result: CatchUpFolderResult, readStartedAt: Date) async -> Bool {
+    private func insertCatchUpLoads(_ result: CatchUpFolderResult, latch: CatchUpReadLatch) async -> Bool {
         let folderId = result.folderId
         guard let folder = try? await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
               folder.uidValidityResetPendingAt == nil else { return false }
@@ -429,7 +430,7 @@ extension SyncEngine {
             (premise: CrawlEpochPremise(observed), observedEpoch: observed)
         }
         let insert = await insertFetchedBackfillMessages(
-            headers, bodies: bodies, folder: folder, catchUpReadStartedAt: readStartedAt, epochPremise: premise)
+            headers, bodies: bodies, folder: folder, catchUpRead: latch, epochPremise: premise)
         BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): loaded \(headers.count) missing message(s), inserted \(insert.inserted)")
         return insert.allLanded
     }
@@ -493,12 +494,12 @@ extension SyncEngine {
 
     /// The transaction itself. Everything it decides on is read INSIDE it: the folder
     /// row (quarantine, epoch), the pending operations and the recent completions.
-    /// `readIsOverAge`: the caller's one over-age verdict (`catchUpReadIsOverAge`),
-    /// the same one that kept the loads out of the insert (#1062).
+    /// `latch`: the read's one-way over-age verdict (`CatchUpReadLatch`), checked
+    /// again here inside the write; it also says whether a load was dropped (#1062).
     /// `selfHealOwedAtRead`: the folder's `FolderChangeState.selfHealOwed` when
     /// the read began (nil: not known, nothing is re-marked).
     nonisolated static func applyCatchUpTransaction(
-        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date, readIsOverAge: Bool,
+        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date, latch: CatchUpReadLatch,
         selfHealOwedAtRead: Int? = nil, db: Database
     ) throws -> CatchUpApplyOutcome {
         guard let folder = try Folder.fetchOne(db, key: result.folderId),
@@ -528,6 +529,7 @@ extension SyncEngine {
         // it applies no read or flag update at all; its removals and state still
         // apply, so the listing moves on.
 
+        let readIsOverAge = latch.checkOverAge()
         var updatedFlags = 0
         for update in result.flagUpdates where !readIsOverAge {
             let canonicalId = MessageIdentity.headerId(
@@ -579,16 +581,17 @@ extension SyncEngine {
                 ELSE :new END
             WHERE id = :id
             """, arguments: ["new": result.newState, "key": CatchUpLapse.countKey, "id": folder.id])
-        // Loads this apply skipped as an over-age read make the listing unclean
-        // in its SAVED state, as a passed-over UID does (#1062): the state moves
-        // the listing past them, so a later slice that completes it must not
-        // settle the owed mark.
-        let skippedLoads = readIsOverAge && !result.loaded.isEmpty
-        if skippedLoads {
+        // Loads this apply dropped as an over-age read make the listing unclean
+        // in its SAVED state (#1062): the state moves the listing past them, so a
+        // later slice that completes it must not settle the owed mark. The key is
+        // provider-neutral (`CatchUpSkippedLoads`); the provider reads it when the
+        // listing completes. A completing result needs no mark: `clean` below.
+        let skippedLoads = latch.loadsSkipped && !result.loaded.isEmpty
+        if skippedLoads, result.completedListing == nil {
             try db.execute(sql: """
-                UPDATE folder SET catchUpState = json_set(catchUpState, '$.listing.passedOver', json('true'))
-                WHERE id = ? AND json_valid(catchUpState) AND json_type(catchUpState, '$.listing') = 'object'
-                """, arguments: [folder.id])
+                UPDATE folder SET catchUpState = json_set(catchUpState, '$.' || ?, json('true'))
+                WHERE id = ? AND json_valid(catchUpState) AND json_type(catchUpState) = 'object'
+                """, arguments: [CatchUpSkippedLoads.key, folder.id])
         }
         if let windowFloor {
             try Self.recordCatchUpWindowFloor(folderId: folder.id, lowest: windowFloor, db: db)

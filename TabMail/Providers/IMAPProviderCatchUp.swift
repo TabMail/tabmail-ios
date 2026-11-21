@@ -5,7 +5,9 @@
 import Foundation
 
 /// IMAP's opaque per-folder catch-up state (ADR-IOS-107), stored as JSON in
-/// `Folder.catchUpState`. Only `IMAPProvider` reads or writes it.
+/// `Folder.catchUpState`. Only `IMAPProvider` decodes it; the engine writes only
+/// the provider-neutral keys `CatchUpLapse.countKey`, `CatchUpWindowFloor.key` and
+/// `CatchUpSkippedLoads.key` into the JSON object.
 struct IMAPCatchUpState: Codable, Equatable, Sendable {
     /// The UIDVALIDITY every UID and stamp below belongs to. A folder whose known
     /// epoch differs discards the whole state and lists again from UID 1.
@@ -28,6 +30,10 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
     /// under `CatchUpLapse.countKey` (the property name must stay equal to it);
     /// the catch-up carries it forward unchanged.
     var lapseCount: Int?
+    /// The engine dropped loads from the listing in progress
+    /// (`CatchUpSkippedLoads.key`; the property name must stay equal to it), so its
+    /// completion is unclean. Cleared when the listing completes (#1062).
+    var skippedLoads: Bool?
     /// `lapseCount` as it stood when the last COMPLETED listing started.
     var listedLapseCount: Int?
 
@@ -628,13 +634,14 @@ extension IMAPProvider {
             newState.lastCompletedAt = context.clock()
             newState.listedLapseCount = listing.lapseCountAtStart
             newState.listing = nil
+            newState.skippedLoads = nil
         } else {
             newState.listing = listing
         }
         result.newState = newState.encoded()
         if completed {
             result.completedListing = CatchUpCompletedListing(
-                lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true)
+                lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true && state?.skippedLoads != true)
         }
         // Progress: the listing moved or completed, or something applies. A range
         // whose request failed before anything moved is no progress, so the
