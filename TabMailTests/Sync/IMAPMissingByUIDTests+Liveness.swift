@@ -164,6 +164,7 @@ extension IMAPMissingByUIDTests {
 
     /// Runs `body` with a wall clock that is in time (10 s after `readStartedAt`)
     /// for the first `inTimeChecks` reads and past the retention for every later one.
+    @MainActor
     static func withScriptedOverAge(readStartedAt: Date, inTimeChecks: Int, _ body: () async throws -> Void) async rethrows {
         let reads = OSAllocatedUnfairLock(initialState: 0)
         CatchUpWallClock.nowForTesting.withLock { $0 = {
@@ -372,7 +373,7 @@ extension IMAPMissingByUIDTests {
             let engine = w.engine, accountId = w.accountId
             let gate = SyncTurnsForResetTests.Gate(), addedGate = SyncTurnsForResetTests.Gate()
             let held = SyncTurnsForResetTests.Flag()
-            let busy = Task { await engine.oneSyncAtATime(accountId: accountId) { await held.set(); await gate.wait() } }
+            let busy = Task.detached { await engine.oneSyncAtATime(accountId: accountId) { await held.set(); await gate.wait() } }
             #expect(try await SyncTurnsForResetTests.waitFor(held), "setup: the account's turn is held")
             let wipe = Task { try await engine.wipeLocalIndex() }
             #expect(try await SyncTurnsForResetTests.waitForWaiters(engine, accountId, count: 1), "setup: the wipe waits")
@@ -382,7 +383,7 @@ extension IMAPMissingByUIDTests {
             try FolderEpochTestFixture.insertFolder(accountId: added, path: Self.path, role: .archive, pool: w.pool)
             try FolderEpochTestFixture.insertHeaders(accountId: added, path: Self.path, uids: server, pool: w.pool)
             let addedHeld = SyncTurnsForResetTests.Flag()
-            let addedPass = Task { await engine.oneSyncAtATime(accountId: added) { await addedHeld.set(); await addedGate.wait() } }
+            let addedPass = Task.detached { await engine.oneSyncAtATime(accountId: added) { await addedHeld.set(); await addedGate.wait() } }
             #expect(try await SyncTurnsForResetTests.waitFor(addedHeld), "setup: the added account's turn is held")
             await gate.release()
             let queuedOnAdded = try await SyncTurnsForResetTests.waitForWaiters(engine, added, count: 1)
