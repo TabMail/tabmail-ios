@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import SwiftUI
+import UIKit
 
 /// An additional entry shown in the long-press popover under "Report Concern"
 /// (e.g. "Hide Summary Bubbles" on the AI summary bubble, iOS #153).
@@ -105,14 +106,105 @@ enum ReportConcernSheetText {
 /// Sends one report: its type, content, category and optional reason; true once the backend took it.
 typealias ReportConcernSend = @MainActor (ReportContentType, String, ReportCategory, String?) async -> Bool
 
-/// Which presentation of a report sheet is current. A send's answer acts only for the
-/// presentation that sent it: one that ended (dismissed, or its owner removed) is retired, and a
-/// new one starts afresh, so a late answer never closes, finishes or confirms a later report.
+/// Which presentation of a report sheet is current. A send's answer closes and finishes only the
+/// presentation that sent it: once a later one has opened, or its caller retired it, the answer
+/// leaves the caller alone, so it never closes or finishes a later report. Whether a report the
+/// backend took says "Report Submitted" does not depend on this (see `ReportConcernSubmission`).
 @MainActor
 final class ReportPresentation {
     private(set) var current = 0
 
     func next() { current += 1 }
+}
+
+/// A sent report, from Report to its end. The send holds it, not the view that asked for the
+/// report: that view (a list row, or the popover that presented the sheet) may be recycled,
+/// removed or closed while the report sends. A report the backend took says "Report Submitted"
+/// exactly once, after its sheet has gone; a report not taken says nothing.
+@MainActor
+final class ReportConcernSubmission {
+    /// The backend's answer, once it has come.
+    private var accepted: Bool?
+    /// The sheet that sent the report has left the screen.
+    private var sheetGone = false
+    private var settled = false
+    /// The report is done: OK on "Report Submitted", or a report not taken.
+    private let finish: () -> Void
+
+    init(finish: @escaping () -> Void) {
+        self.finish = finish
+    }
+
+    func answered(_ accepted: Bool) {
+        self.accepted = accepted
+        settle()
+    }
+
+    func sheetLeft() {
+        sheetGone = true
+        settle()
+    }
+
+    /// Acts once the answer has come and the sheet has gone: UIKit refuses an alert while its
+    /// presenter is still closing the sheet.
+    private func settle() {
+        guard !settled, sheetGone, let accepted else { return }
+        settled = true
+        if accepted {
+            ReportConcernConfirmation.show(onOK: finish)
+        } else {
+            finish()
+        }
+    }
+}
+
+/// "Report Submitted". UIKit presents it from the top of the key window, not SwiftUI from the view
+/// that asked for the report: that view may be recycled, removed or closed by the time the answer
+/// comes, and an alert attached to it then never shows (as ADR-IOS-045 found for a preview
+/// presented from a list row).
+@MainActor
+enum ReportConcernConfirmation {
+    static let title = "Report Submitted"
+    static let message = "Thank you. We'll review this content."
+    static let ok = "OK"
+
+    /// Shows the confirmation; `onOK` runs when the user dismisses it.
+    static func show(onOK: @escaping () -> Void) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: ok, style: .cancel) { _ in onOK() })
+        // On the next turn, so a presentation already asked for in this one (a sheet the user has
+        // just opened) starts first, and the alert waits for it below.
+        Task { @MainActor in Self.present(alert) }
+    }
+
+    /// Presents `alert` from the top of the key window once nothing there is still opening or
+    /// closing: UIKit refuses a presentation while another one is moving.
+    private static func present(_ alert: UIAlertController) {
+        guard let top = topmost() else {
+            BackgroundSyncLogger.logDebug("[ReportConcern] no window to show Report Submitted in")
+            return
+        }
+        if let moving = top.transitionCoordinator {
+            _ = moving.animate(alongsideTransition: nil) { _ in
+                Task { @MainActor in Self.present(alert) }
+            }
+            return
+        }
+        BackgroundSyncLogger.logDebug("[ReportConcern] showing Report Submitted from \(type(of: top))")
+        top.present(alert, animated: true)
+    }
+
+    /// The view controller on top of the key window, whatever the scene's state: an answer that
+    /// comes while the app is inactive still shows.
+    private static func topmost() -> UIViewController? {
+        let window = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow)
+        var top = window?.rootViewController
+        while let next = top?.presentedViewController { top = next }
+        return top
+    }
 }
 
 /// The report sheet, presented by `isPresented`: category, optional reason, Report. Shared by the
@@ -125,16 +217,14 @@ struct ReportConcernSheetModifier: ViewModifier {
     /// An extra line saying what the report sends, when that is more than the pressed content.
     let contentNotice: String?
     let send: ReportConcernSend
-    /// Called once the report is done: the sheet closed with nothing more to show, or the
-    /// Submitted alert was dismissed.
+    /// Called once the report is done: the sheet left with nothing sent (Cancel, a swipe down, or
+    /// the sheet taken down before Report), a report not taken once its sheet has gone, or OK on
+    /// "Report Submitted". A sent report does not call it once its caller has opened a later
+    /// report or its presentation is gone. A sheet that leaves with nothing sent calls it only if
+    /// the presentation that was current when it reached its window still is: one that never had a
+    /// window, or one that reached it before its caller retired that presentation (the closed
+    /// popover's sheet SwiftUI presents again, in a window for a moment), calls nothing.
     var onFinish: (() -> Void)?
-
-    @State private var showSubmitted = false
-    /// The backend took the report: "Report Submitted" shows once the sheet has gone.
-    @State private var submitted = false
-    @State private var selectedCategory: ReportCategory = .offensive
-    @State private var reason = ""
-    @State private var isSubmitting = false
     /// Set by a caller whose `isPresented` flag outlives the view this sheet is attached to (the
     /// notice's flag lives on its button, the sheet on the popover's content): the caller then
     /// owns the presentation too and retires it whenever it opens that view again. Otherwise the sheet
@@ -148,37 +238,50 @@ struct ReportConcernSheetModifier: ViewModifier {
     func body(content view: Content) -> some View {
         view
             .onChange(of: isPresented) { _, shows in
-                // A new presentation starts with its own state.
-                guard shows else { return }
-                presentation.next()
-                submitted = false
-                isSubmitting = false
-                selectedCategory = .offensive
-                reason = ""
+                // A new presentation: an earlier one's answer no longer closes or finishes anything.
+                // The form starts afresh with the sheet's own state.
+                if shows { presentation.next() }
             }
-            .sheet(isPresented: $isPresented, onDismiss: {
-                // This presentation has ended: an answer still on its way acts on nothing.
-                presentation.next()
-                // The alert waits until the sheet has gone: UIKit refuses to present it while the
-                // sheet is still closing.
-                if submitted {
-                    // The sheet's open handler clears `submitted` for the next presentation.
-                    showSubmitted = true
-                } else {
-                    // Cancel, a swipe down, or a report the backend did not take.
-                    onFinish?()
-                }
-            }) {
-                reportSheet
-            }
-            .alert("Report Submitted", isPresented: $showSubmitted) {
-                Button("OK", role: .cancel) { onFinish?() }
-            } message: {
-                Text("Thank you. We'll review this content.")
+            .sheet(isPresented: $isPresented) {
+                ReportConcernSheet(isPresented: $isPresented, contentType: contentType, content: content,
+                                   contentNotice: contentNotice, send: send, onFinish: onFinish,
+                                   presentation: presentation)
             }
     }
+}
 
-    private var reportSheet: some View {
+/// What a report sheet's window probe reads when the sheet leaves its window. A reference, so the
+/// probe reads the report sent since it was attached, whether or not SwiftUI has updated it since.
+@MainActor
+private final class ReportSheetLife {
+    /// The sheet is in a window, as its probe last saw.
+    var inWindow = false
+    /// The presentation that was current when the sheet was last put in a window; nil until it has
+    /// had one. Taken from the window, not from `onChange(of: isPresented)`, which does not reliably
+    /// fire inside a popover's content.
+    var shownFor: Int?
+    /// The report this sheet sent, if any. It settles once the sheet has gone.
+    var submission: ReportConcernSubmission?
+}
+
+/// The form inside the report sheet. Its state, and the report it sends, live with the sheet, not
+/// with the view that presents it: that view (a list row) can be recycled or removed while the
+/// report sends.
+private struct ReportConcernSheet: View {
+    @Binding var isPresented: Bool
+    let contentType: ReportContentType
+    let content: () -> String
+    let contentNotice: String?
+    let send: ReportConcernSend
+    let onFinish: (() -> Void)?
+    let presentation: ReportPresentation
+
+    @State private var selectedCategory: ReportCategory = .offensive
+    @State private var reason = ""
+    @State private var isSubmitting = false
+    @State private var life = ReportSheetLife()
+
+    var body: some View {
         NavigationStack {
             Form {
                 Section("Category") {
@@ -210,8 +313,9 @@ struct ReportConcernSheetModifier: ViewModifier {
                     Button("Cancel") {
                         isPresented = false
                     }
-                    // While the report is sending, the sheet stays, as it does for a swipe down:
-                    // a reply after the sheet had gone would have no sheet to show its result.
+                    // While the report is sending, the sheet stays, as it does for a swipe down,
+                    // until the answer closes it. "Report Submitted" does not depend on this: it
+                    // waits for the sheet to go, however it goes (`ReportConcernSubmission`).
                     .disabled(isSubmitting)
                 }
                 ToolbarItem(placement: .confirmationAction) {
@@ -227,20 +331,60 @@ struct ReportConcernSheetModifier: ViewModifier {
             .interactiveDismissDisabled(isSubmitting)
         }
         .presentationDetents([.fraction(0.8)])
+        // Says when the sheet has gone, however it went: closed by Cancel, a swipe or the answer,
+        // or taken down with the row or popover that presented it, when its onDismiss may not run.
+        .background(WindowProbe(onWindow: { [life, presentation] in
+            life.inWindow = true
+            life.shownFor = presentation.current
+            noticeDebugLog("report sheet \(ObjectIdentifier(life))",
+                           "in a window: current \(presentation.current), sent \(life.submission != nil)")
+        }, onDetach: { [life, presentation, onFinish] in
+            life.inWindow = false
+            noticeDebugLog("report sheet \(ObjectIdentifier(life))",
+                           "left its window: current \(presentation.current), sent \(life.submission != nil)")
+            // On the next turn, once UIKit has finished closing the sheet. A sheet UIKit only
+            // moved to another container is back in a window by then, and has not gone.
+            Task { @MainActor in
+                guard !life.inWindow else { return }
+                if let submission = life.submission {
+                    submission.sheetLeft()
+                } else if life.shownFor == presentation.current {
+                    // Cancel, a swipe down, or a sheet closed before anything was sent.
+                    noticeDebugLog("report sheet \(ObjectIdentifier(life))",
+                                   "gone with nothing sent: finishes presentation \(presentation.current)")
+                    onFinish?()
+                } else {
+                    // Reached its window before its caller retired that presentation (the closed
+                    // popover's sheet SwiftUI presents again), or never had one: not the current
+                    // report's to end.
+                    noticeDebugLog("report sheet \(ObjectIdentifier(life))",
+                                   "gone with nothing sent, shown for \(String(describing: life.shownFor)): finishes nothing, current \(presentation.current)")
+                }
+            }
+        }))
     }
 
     private func submit() {
         isSubmitting = true
-        let sending = presentation
-        let sentFor = sending.current
-        Task {
-            let success = await send(contentType, content(), selectedCategory, reason.isEmpty ? nil : reason)
-            // The presentation that sent this has ended: its answer touches nothing, not even
-            // the caller's binding, which may now show a later report.
-            guard sending.current == sentFor else { return }
+        let sentFor = presentation.current
+        let sending = ReportConcernSubmission { [weak presentation, onFinish] in
+            // The caller has opened a later report since, or is gone: this one finishes nothing.
+            guard let presentation, presentation.current == sentFor else { return }
+            onFinish?()
+        }
+        life.submission = sending
+        Task { [weak presentation] in
+            let accepted = await send(contentType, content(), selectedCategory, reason.isEmpty ? nil : reason)
             isSubmitting = false
-            submitted = success
-            isPresented = false
+            // Only the presentation that sent this closes: the caller's flag may now show a later
+            // report. The weak capture does not let `presentation` go while the send runs: this
+            // body reads `send`, `isSubmitting` and `isPresented` through the sheet, which holds
+            // `presentation` too. Writing the flag of a caller that has gone does nothing.
+            if let presentation, presentation.current == sentFor {
+                isPresented = false
+            }
+            // Its own answer, whatever happened to the sheet or the view that presented it.
+            sending.answered(accepted)
         }
     }
 }

@@ -86,7 +86,7 @@ struct AISummariesNoticeButton: View {
     /// reliably observe that state, so Cancel and the answer could not close the sheet.
     @State private var showsReport = false
     /// The report's presentation, owned with its flag: the popover, and the sheet on it, can be
-    /// closed by the system while a report sends, and nothing on them runs then.
+    /// closed by the system while a report sends, and nothing on them clears the flag then.
     @State private var reportPresentation = ReportPresentation()
     #if DEBUG
     /// Tells mounted buttons apart in the debug log.
@@ -144,7 +144,12 @@ struct AISummariesNoticeButton: View {
 
     /// Opens the notice afresh. A report from an earlier popover is over: the system may have
     /// closed that popover with its sheet still up, so nothing cleared the flag or ended the
-    /// presentation. Retire it, so a late answer acts on nothing, and start with no sheet up.
+    /// presentation. Retire it, so a late answer cannot close or finish this one, and start with no
+    /// sheet up. A late answer the backend took still says "Report Submitted", once. At the system's
+    /// close SwiftUI can present the closed popover's sheet again, which is in a window for a moment
+    /// before UIKit refuses it; it reaches that window before a reopen can run (right after the
+    /// close in the logs), so it counts for the presentation retired here and finishes nothing when
+    /// it leaves. A reopen before it reaches its window would count it for this presentation.
     private func openNotice() {
         reportPresentation.next()
         showsReport = false
@@ -161,8 +166,9 @@ struct AISummariesNoticeButton: View {
 }
 
 /// The popover's content: the note, "Report a concern", and the report sheet it presents. An
-/// answer from a report whose popover has gone cannot reach a later one: the shared sheet ties
-/// each answer to its own presentation.
+/// answer from a report whose popover has gone cannot close or finish a later one: the shared
+/// sheet ties each answer to its own presentation. If the backend took it, it still says "Report
+/// Submitted", once, over whatever is up.
 private struct AISummariesNoticePopover: View {
     let reportContent: () -> String
     let send: ReportConcernSend
@@ -202,9 +208,10 @@ private struct AISummariesNoticePopover: View {
     }
 }
 
-/// Debug-only trace of the notice's presentations, with what each key window has presented.
+/// Debug-only trace of the notice's presentations and of the report sheet's window probe
+/// (`ReportConcernSheet`), with what each key window has presented.
 /// `@autoclosure`: a release build never builds the tag or the message, nor reads what they read.
-@MainActor private func noticeDebugLog(_ tag: @autoclosure () -> String, _ message: @autoclosure () -> String) {
+@MainActor func noticeDebugLog(_ tag: @autoclosure () -> String, _ message: @autoclosure () -> String) {
     #if DEBUG
     let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
     let presented = windows.compactMap { window -> String? in
@@ -220,11 +227,14 @@ private struct AISummariesNoticePopover: View {
     #endif
 }
 
-/// Calls `onWindow` when UIKit puts this view in a window, which happens only for a presentation
-/// that is actually shown.
+/// Calls `onWindow` when UIKit puts this view in a window. A window does not prove the presentation
+/// stays on screen: the report sheet SwiftUI presents again from a closed popover is in a window
+/// for a moment before UIKit refuses it.
 struct WindowProbe: UIViewRepresentable {
     let onWindow: () -> Void
-    /// Runs when the probe leaves its window.
+    /// Runs when UIKit tells the probe it has no window (`didMoveToWindow` with `window` nil), as
+    /// when it leaves its window. A caller that ends something on it checks which presentation was
+    /// current when the view reached its window (`ReportConcernSheet`).
     var onDetach: () -> Void = {}
 
     final class Probe: UIView {

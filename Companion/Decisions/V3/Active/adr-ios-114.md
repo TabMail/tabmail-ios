@@ -1004,6 +1004,27 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `suggestionNeverEntersTheField`, `ChatReplyFieldTests.suggestionText` and `exampleFromConfig`,
    `TutorialChatViewTests.fieldText`.
 
+   **Amended 2026-11-20 (the working bubble):** while the suggestion is written its row is the
+   working bubble, `ChatSuggestionWorkingBubble` (the ghost's dashed bubble with three pulsing dots,
+   "AI Suggestion · Writing", identifier `chat.aiSuggestion.writing`; the ghost keeps
+   `chat.aiSuggestion`), always the last chat row above the field. "Being written" is the inbox
+   row's "AI is working" rule under the ghost's own guards (`ChatReplyField.suggestionPhase`). The phase is keyed by the newest email, so
+   a new email that arrives above a ready ghost puts the row back to Writing at once. Only Writing to
+   ready animates (`ChatSuggestionPhase.fills`): the row grows into the ghost over
+   `ChatSuggestionConfig.fillDuration` (0.3 s) with the landing's re-pin `scrollTo` in the same
+   `withAnimation` (`ChatThreadView.showSuggestion`); under Reduce Motion the height changes at once
+   and the ghost fades in (`ghostFadeDuration`, 0.2 s), as the mock's M2. A ghost with no working
+   bubble before it still shows at once: the working bubble is held only while a grow is pending, so
+   opening on a ready suggestion never shows it, and the ghost's removal always follows its
+   transaction. The dots cap at 30 fps. The arrival rise of the new email is not built here.
+
+   **Writing rule (2026-11-20):** Writing shows when the newest email meets the inbox row's one shared
+   predicate, `AIWorkingRule` (tagged with no reply processed, or untagged in the Inbox with an AI
+   source on), which `MessageRowView` calls too; a filtered email's empty-reply sentinel never writes.
+   Tests: `ChatReplyFieldTests.suggestionPhaseWritingThenReady`, `suggestionPhaseNewEmailResetsToWriting`,
+   `workingDots`, `suggestionPhaseWritingRule`, `suggestionFillWiring`;
+   `ChatSwipeUITests.testWorkingBubbleBecomesTheGhostAboveTheField`.
+
 ## The longer index line (routed 2026-11-09)
 
 The DECISIONS.md row grew with each decision of the chat view; it moved here when the index went
