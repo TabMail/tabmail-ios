@@ -90,6 +90,10 @@ extension IMAPMissingByUIDTests {
     /// the step is skipped when no row is held, so the sweep checks it still
     /// runs on some seed.
     static let fuzzTurnoverTally = Mutex<(turnovers: Int, seeds: Set<UInt64>)>((0, []))
+    /// The real UIDVALIDITY reset reactions a seeded schedule's slices started
+    /// (through `AccountManager.setUidValidityChangeHandlerForTesting`), so a
+    /// turnover step can wait for them before it completes the reset itself.
+    static let fuzzResetReactions = Mutex<[Task<Void, Never>]>([])
     static var holdSeconds: TimeInterval { SyncConfig.backfillPageHoldMinutes * 60 }
     /// Past the hold bound.
     static var pastTheHold: TimeInterval { holdSeconds + 60 }
@@ -614,6 +618,45 @@ extension IMAPMissingByUIDTests {
             // Oracle: messages the server flags `\Deleted`, never shown.
             var deleted = Set<Int>()
 
+            // The real reset reaction a turnover starts runs as its own task,
+            // beside the schedule's steps. Left unordered, it could quarantine
+            // the folder after the step completed the reset, or purge and
+            // resync it between later steps, so what a later step finds (and
+            // how many draws it takes from the seed) depended on timing, not
+            // on the seed. Each reaction is recorded, and a turnover step waits
+            // for it before completing the reset.
+            Self.fuzzResetReactions.withLock { $0.removeAll() }
+            AccountManager.shared.setUidValidityChangeHandlerForTesting { accountId, folderPath, _, _ in
+                let reaction = Task {
+                    await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: folderPath)
+                }
+                Self.fuzzResetReactions.withLock { $0.append(reaction) }
+            }
+            defer { AccountManager.shared.resetUidValidityChangeHandlerForTesting() }
+
+            /// Waits until no real reset reaction for the folder is running: the
+            /// recorded ones have ended, and none started again in their place
+            /// (a trigger that arrived during one re-runs it when it ends).
+            @MainActor func waitForResetReactions() async throws {
+                while true {
+                    let started = Self.fuzzResetReactions.withLock { tasks in
+                        defer { tasks.removeAll() }
+                        return tasks
+                    }
+                    guard !started.isEmpty else { break }
+                    for reaction in started { await reaction.value }
+                }
+                var polls = 0
+                while polls < Self.restReactionPolls,
+                      await AccountManager.shared.uidValidityReactionInFlight.contains(folderId) {
+                    try await Task.sleep(for: .milliseconds(10))
+                    polls += 1
+                }
+                let stillRunning = await AccountManager.shared.uidValidityReactionInFlight.contains(folderId)
+                #expect(!stillRunning,
+                        "seed \(seed): setup: no reset reaction is running when the step completes the reset")
+            }
+
             /// A slice whose listing FETCH is suspended after the server read its
             /// messages, before it answers; `change` runs at that point.
             func sliceSuspendedAfterTheListing(_ change: @MainActor () async throws -> Void) async throws {
@@ -701,6 +744,7 @@ extension IMAPMissingByUIDTests {
                     }
                     #expect(stray == 0, "seed \(seed): no row under the new epoch before the reaction")
                     Self.fuzzTurnoverTally.withLock { $0.turnovers += 1 }
+                    try await waitForResetReactions()
                     try await completeReset(to: fresh)
                 case 6:
                     // A user move that completes while the slice's listing is suspended.

@@ -940,15 +940,16 @@ extension IMAPMissingByUIDTests {
 
     // MARK: - A call that stops with no timeout leaves nothing in flight (#1062)
 
-    /// The answers a request fails on with no timeout: a reply longer than the
-    /// client's response buffer and a reply the client cannot decode, both
-    /// genuine, so the client's own parser fails on them (the answered
-    /// failures that cap the width as a timeout does,
+    /// The answers a request fails on with no timeout: a reply holding a
+    /// literal larger than the client's parser accepts and a reply the client
+    /// cannot decode, both genuine, so the client's own parser fails on them
+    /// (the answered failures that cap the width as a timeout does,
     /// `UIDWalkCursor.failureCallsForSmallerRange`); and, as their control, an
     /// ordinary tagged refusal.
     /// *Superseded (#1062):* the too-large and undecodable answers were tagged
     /// NOs whose text named the error, which never reached the decoder or the
-    /// receive limit.
+    /// receive limit; then the too-large answer was a line longer than the
+    /// client's response buffer, which a loaded machine timed out on first.
     enum FailingReply: Sendable {
         case overLimit, undecodable, refused
     }
@@ -957,7 +958,7 @@ extension IMAPMissingByUIDTests {
     /// Arm `reply` for the next command containing `fragment`.
     static func arm(_ reply: FailingReply, _ server: FakeIMAPServer, containing fragment: String) {
         switch reply {
-        case .overLimit: server.answerNextCommandOverLimit(containing: fragment)
+        case .overLimit: server.answerNextCommandWithOverLimitLiteral(containing: fragment, literalBytes: overLimitLiteralBytes)
         case .undecodable: server.answerNextCommandUndecodable(containing: fragment)
         case .refused: server.failNextCommand(containing: fragment, message: refusedAnswer)
         }

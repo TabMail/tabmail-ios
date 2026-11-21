@@ -570,7 +570,11 @@ extension IMAPMissingByUIDTests {
     @MainActor
     func windowFloorNeedsAKnownEpoch() async throws {
         let server = Array(1...20)
-        try await Self.withWorld("floor-epoch", server: server, local: server, walkStarted: false) { w in
+        // No CONDSTORE: a full sync then lists the folder's window on every
+        // pass. With it, the second sync would skip the folder as unchanged
+        // (its HIGHESTMODSEQ has not moved) and list nothing.
+        try await Self.withWorld("floor-epoch", capabilities: FakeIMAPServer.defaultCapabilities,
+                                 server: server, local: server, walkStarted: false) { w in
             func floor() throws -> Int? { CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) }
             #expect(try floor() == nil, "setup: no window listing has recorded a floor")
             w.server.suppressSelectUidValidity(for: Self.path)
@@ -580,17 +584,21 @@ extension IMAPMissingByUIDTests {
             // The window listing asks the newest messages by sequence number
             // (`selection.latest`): a plain FETCH with the ENVELOPE, sent to
             // this folder; no catch-up or UID request stands in for it.
-            let windowFetches = Self.requests(to: Self.path, w.server, from: start).map { $0.command }.filter {
-                let command = $0.uppercased()
-                return command.hasPrefix("FETCH ") && command.contains("ENVELOPE")
+            func windowFetches(from start: Int) -> [String] {
+                Self.requests(to: Self.path, w.server, from: start).map { $0.command }.filter {
+                    let command = $0.uppercased()
+                    return command.hasPrefix("FETCH ") && command.contains("ENVELOPE")
+                }
             }
-            #expect(!windowFetches.isEmpty, "setup: the window listing of the folder ran")
+            #expect(!windowFetches(from: start).isEmpty, "setup: the window listing of the folder ran")
             let raw = try w.folder().catchUpState
             #expect(!(raw ?? "").contains(CatchUpWindowFloor.key),
                     "#1062: a listing of unknown numbering records no floor in any epoch, so none can outlive an epoch change: \(String(describing: raw))")
             w.server.restoreSelectUidValidity(for: Self.path)
             try await w.makeFullSyncDue()
+            let second = w.server.recordedCommands().count
             try await w.foregroundSync()
+            #expect(!windowFetches(from: second).isEmpty, "setup: the second sync listed the folder's window again")
             #expect(try floor() == 1, "setup: a listing under a known epoch records the floor")
         }
     }

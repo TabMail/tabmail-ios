@@ -36,6 +36,13 @@ struct IMAPMissingByUIDTests {
     /// new listing's first call a request budget for named steps adds this, so
     /// the budget still reaches those steps.
     static let newListingStartRequests = 1
+    /// A catch-up request timeout no answer of these fixtures reaches, however
+    /// loaded the machine: for runs whose test times nothing. The production
+    /// value (`SyncConfig.catchUpRequestTimeoutSeconds`) is wall-clock time, and
+    /// a listing FETCH of a few thousand records can take longer than that on a
+    /// busy simulator, which leaves a listing unfinished that the test assumed
+    /// complete.
+    static let untimedRequestTimeout: TimeInterval = 60
 
     static func message(_ uid: Int) -> FakeIMAPServer.Message {
         message(uid, date: TestFixtureDate.rfc2822(daysFromAnchor: -ageInDays - (uid % 7)))
@@ -325,7 +332,16 @@ struct IMAPMissingByUIDTests {
                           rangeMessages: rangeMessages)
         // The folder's older-mail check has completed once, as it has on a
         // device that has synced before: no first listing hides what a test asks.
-        try await world.workerRun()
+        // Untimed: with the production timeout, a large listing range of this
+        // setup run could time out on a busy machine and leave its listing
+        // unfinished. The test's own runs would then continue that listing,
+        // which had already passed the UIDs the test drops after setup: it
+        // completes without them, and a second listing (the folder being owed
+        // a check marked after the first one started) loads them and asks
+        // the timed-out ranges again at full width.
+        try await world.workerRun(requestTimeout: untimedRequestTimeout)
+        #expect(try world.catchUpState()?.listing == nil,
+                "\(name): setup: the setup catch-up run completed the folder's listing")
         try await body(world)
         await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
         try? await provider.disconnect()

@@ -99,7 +99,8 @@ extension IMAPMissingByUIDTests {
             // second sends the carried header load, and once its read has
             // returned it waits at a gate inside its turn, before it applies
             // anything, until the reset waits for that turn. The run's clock then
-            // passes its deadline, so no slice starts after it. Nothing is timed.
+            // passes its deadline, so no slice starts after it. Nothing is timed,
+            // its requests included (`untimedRequestTimeout`).
             let clock = CatchUpTestClock()
             let gate = SliceTurnGate()
             let bound = Self.resetHandshakeStepBound
@@ -112,7 +113,7 @@ extension IMAPMissingByUIDTests {
             }
             let start = w.server.recordedCommands().count
             async let ran = w.workerRun(maxRequests: Self.newListingStartRequests + 2, deadlineIn: pastTheDeadline / 2,
-                                        intervalSeconds: 0, clock: { clock.now })
+                                        requestTimeout: Self.untimedRequestTimeout, intervalSeconds: 0, clock: { clock.now })
             var deadline = Date().addingTimeInterval(bound)
             while !gate.inTurn, Date() < deadline {
                 try await Task.sleep(for: .milliseconds(10))

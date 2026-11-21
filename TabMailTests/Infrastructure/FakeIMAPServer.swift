@@ -593,7 +593,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// `holdsStarted()`, `heldRequestsInProgress()`.
         var holdsStarted = 0
         var holdsFinished = 0
-        /// How many malformed answers (`answerNextCommandOverLimit`,
+        /// How many malformed answers (`answerNextCommandWithOverLimitLiteral`,
         /// `answerNextCommandUndecodable`) the server began to send.
         var malformedAnswersSent = 0
         /// Like `stalls`, but the hold ends the session as soon as the client
@@ -1057,12 +1057,20 @@ final class FakeIMAPServer: @unchecked Sendable {
     }
 
     /// Test seam: answer the next command containing `fragment` with one
-    /// untagged line longer than the client's response buffer
-    /// (`IMAPFetchMapping.responseBufferLimit`) and no tagged answer: the
-    /// client's framing parser gives up on it (`PayloadTooLargeError`), a
-    /// genuine too-large answer, unlike a tagged NO that only names one.
-    func answerNextCommandOverLimit(containing fragment: String) {
-        let line = "* OK " + String(repeating: "x", count: IMAPFetchMapping.responseBufferLimit + 1) + "\r\n"
+    /// untagged FETCH whose ENVELOPE date is a literal of `literalBytes` bytes,
+    /// and no tagged answer. A literal in a field the client does not stream
+    /// is bounded by its parser's literal size limit, checked at the literal's
+    /// `{n}` header before any of its bytes are read: one larger than that
+    /// limit fails the request at once (`IMAPDecoderError` around
+    /// `ExceededLiteralSizeLimitError`, and the client closes the connection),
+    /// a genuine too-large answer, unlike a tagged NO that only names one.
+    /// *Superseded (#1062):* one untagged line longer than the client's
+    /// response buffer: the buffer's limit is checked only after each decode
+    /// attempt, which re-parses the buffered line, so on a loaded machine the
+    /// request timed out before the limit was reached.
+    func answerNextCommandWithOverLimitLiteral(containing fragment: String, literalBytes: Int) {
+        let line = "* 1 FETCH (UID 1 ENVELOPE ({\(literalBytes)}\r\n" + String(repeating: "x", count: literalBytes)
+            + " NIL NIL NIL NIL NIL NIL NIL NIL NIL))\r\n"
         injectMalformedAnswer(line, containing: fragment)
     }
 
