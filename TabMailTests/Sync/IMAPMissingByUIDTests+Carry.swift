@@ -82,7 +82,8 @@ extension IMAPMissingByUIDTests {
                 try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, db: db)
             }
             w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil)
-            #expect(try w.held().isEmpty, "#1062: no pre-reset pick is inserted after the reset: \(try w.held())")
+            let heldAfterReset = try w.held()
+            #expect(heldAfterReset.isEmpty, "#1062: no pre-reset pick is inserted after the reset: \(heldAfterReset)")
             let state = try w.catchUpState()
             #expect(state?.listing == nil, "#1062: no pre-reset progress is kept: \(String(describing: state))")
 

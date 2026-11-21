@@ -154,7 +154,8 @@ extension IMAPMissingByUIDTests {
             let outcome = await w.engine.applyCatchUpResult(
                 result, windowMode: .uid, readStartedAt: read.readStartedAt, selfHealOwedAtRead: read.owedAtRead)
             #expect(outcome == .skipped, "#1062: nothing read before the purge applies")
-            #expect(try w.held().isEmpty, "#1062: no row is inserted during the purge: \(try w.held())")
+            let heldDuringPurge = try w.held()
+            #expect(heldDuringPurge.isEmpty, "#1062: no row is inserted during the purge: \(heldDuringPurge)")
             #expect(try w.folder().catchUpState == nil, "#1062: no catch-up state is written over the purge")
         }
     }

@@ -189,7 +189,7 @@ extension IMAPMissingByUIDTests {
                     && result.flagUpdates.contains { $0.messageId == "3" }, "setup: a clean completion with a load and a flag update")
             let readStartedAt = Date()
             // Checks: before the insert, the one insert chunk, then the transaction.
-            try await Self.withScriptedOverAge(readStartedAt: readStartedAt, inTimeChecks: 2) {
+            await Self.withScriptedOverAge(readStartedAt: readStartedAt, inTimeChecks: 2) {
                 _ = await w.engine.applyCatchUpResult(
                     result, windowMode: .uid, readStartedAt: readStartedAt, selfHealOwedAtRead: read.owedAtRead)
             }
@@ -217,7 +217,7 @@ extension IMAPMissingByUIDTests {
                     "setup: one completing result with more loads than one insert chunk")
             let readStartedAt = Date()
             // Checks: before the insert and the first chunk in time; the second chunk on, over-age.
-            try await Self.withScriptedOverAge(readStartedAt: readStartedAt, inTimeChecks: 2) {
+            await Self.withScriptedOverAge(readStartedAt: readStartedAt, inTimeChecks: 2) {
                 _ = await w.engine.applyCatchUpResult(
                     result, windowMode: .uid, readStartedAt: readStartedAt, selfHealOwedAtRead: read.owedAtRead)
             }
@@ -278,7 +278,12 @@ extension IMAPMissingByUIDTests {
             #expect((try w.changeState()).selfHealDue, "#1062: skipped loads in an earlier slice keep the listing unclean")
             #expect(try w.catchUpState()?.skippedLoads == nil, "#1062: completion clears the record for the next listing")
             clock.advance(by: Self.pastTheNextCheck)
-            for _ in 0..<10 where !(try w.held()).contains(12) || (try w.catchUpState()?.listing != nil) { await w.slice(clock: clock) }
+            for _ in 0..<10 {
+                let loaded = try w.held().contains(12)
+                let listing = try w.catchUpState()?.listing
+                if loaded && listing == nil { break }
+                await w.slice(clock: clock)
+            }
             #expect((try w.held()).contains(12), "#1062: the daily check lists and loads the message")
             #expect(!(try w.changeState()).selfHealDue, "#1062: the next clean listing settles the mark")
         }
