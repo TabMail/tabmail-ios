@@ -101,9 +101,13 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-11-20, #1062): unchanged at 6 `open` records.** Adds one
-> `accepted` record, `IOS-CATCHUP-004`: the IMAP older-mail check loads nothing in a folder whose
-> UIDVALIDITY is not known.
+> **Current tracker census (2026-11-20, #1062): unchanged at 6 `open` records.** Adds two
+> `accepted` records: `IOS-CATCHUP-004`, the IMAP older-mail check loads nothing in a folder whose
+> UIDVALIDITY is not known; `IOS-CATCHUP-005`, a folder with no bookmark whose first UIDNEXT read reports
+> none is listed only up to its last local UID and never settles.
+>
+> *Preserved:* "Adds one `accepted` record, `IOS-CATCHUP-004`: the IMAP older-mail check loads
+> nothing in a folder whose UIDVALIDITY is not known."
 >
 > *Preserved:* **Current tracker census (2026-11-15, #915): unchanged at 6 `open` records.** Adds one
 > `accepted` record, `IOS-GRAPH-006`: the Outlook reply/forward mark is lost when another client
@@ -328,6 +332,7 @@ above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `acce
 | [IOS-CATCHUP-002](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-002.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-13, #750)** — a removal the older-mail check proved (gone, or moved elsewhere) is declined while the user's own operation on that message is queued or completed in the last 30 s, and is not tried again until the folder's next listing. Usually the user's move or delete re-keys or removes the row at once; otherwise opening the message removes it (body 404). Shared apply: Outlook, Gmail and IMAP. |
 | [IOS-CATCHUP-003](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-003.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-13, #750)** — an older-mail read whose apply comes 1 hour or more after the read began (for example the app suspended in the middle of a slice) skips every read and flag correction in that result, because the in-memory log of completed user actions keeps only an hour. Removals, loads and the folder's state still apply, so the check never stalls, and no newer user value is overwritten. The skipped corrections wait for the next listing. Shared apply: Outlook, Gmail and IMAP. *Amended later the same day:* such a read also inserts no load (Gmail, Outlook), so "loads" above is superseded; a skipped load is missing again at the next listing, which loads it. |
 | [IOS-CATCHUP-004](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-004.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-20, #1062)** — the IMAP older-mail check lists and loads nothing in a folder whose UIDVALIDITY is not known or whose reset is pending (C3: nothing is decided about an unproven numbering). The deleted date-based self-heal also repaired such folders; that is not replaced. The folder stays owed, and the next listing after a SELECT reports the epoch loads what is missing. |
+| [IOS-CATCHUP-005](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-005.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-20, #1062)** — on a nonconforming server whose SELECT omits UIDNEXT (RFC 3501 §6.3.1, RFC 9051 §6.3.2 require it), a listing of a folder with no bookmark and no stored top lists only up to the last local UID (flags and removals as before) and completes only as not clean: mail above it is not looked for, and an owed folder stays owed and is listed again at the daily check. A later range SELECT without UIDNEXT keeps the stored top. A SELECT that reports UIDNEXT resumes the full listing. |
 
 ### TEST (1)
 

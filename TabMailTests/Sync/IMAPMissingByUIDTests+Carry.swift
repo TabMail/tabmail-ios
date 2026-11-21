@@ -286,11 +286,12 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    @Test("A server whose SELECT omits UIDNEXT: the owed folder's top is unknown, so its listing never completes and the owed mark stays")
+    @Test("A server whose SELECT omits UIDNEXT: an owed folder's listing stores no top, lists nothing above the last local UID, completes not clean so the owed mark stays, and is listed at most once per daily check")
     @MainActor
     func unknownTopKeepsTheFolderOwed() async throws {
         let server = Self.carryServer
         let missing = Array((server.count - 5)...server.count)
+        let lastLocal = server.count - missing.count
         try await Self.withWorld("carry-no-uidnext", server: server, local: server,
                                  rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
             try await w.dropLocal(missing)
@@ -298,12 +299,49 @@ extension IMAPMissingByUIDTests {
             w.server.suppressSelectUidNext(for: Self.path)
             defer { w.server.restoreSelectUidNext(for: Self.path) }
             let clock = CatchUpTestClock()
-            let completedBefore = try w.catchUpState()?.lastCompletedAt
-            for _ in 0..<3 { await w.slice(clock: clock) }
+            let start = w.server.recordedCommands().count
+            var listingRuns = 0
+            for _ in 0..<3 {
+                let before = w.server.recordedCommands().count
+                await w.slice(clock: clock)
+                #expect(try w.catchUpState()?.listing?.top == nil, "#1062: no top is stored on an unknown UIDNEXT")
+                if !Self.listingRanges(Array(w.server.recordedCommands().dropFirst(before))).isEmpty { listingRuns += 1 }
+            }
+            #expect(listingRuns <= 1, "#1062: at most one listing before the daily check is due: \(listingRuns)")
             #expect((try w.changeState()).selfHealDue, "#1062: an unknown top never settles the owed mark")
-            #expect(try w.catchUpState()?.lastCompletedAt == completedBefore,
-                    "#1062: the listing did not complete on an unknown top")
-            try w.expectNotHeld(missing, "#1062: nothing is listed under an unknown top")
+            let asked = Self.listingRanges(Array(w.server.recordedCommands().dropFirst(start)))
+            let above = asked.filter { $0.upperBound > lastLocal }
+            #expect(above.isEmpty, "#1062: nothing above the last local UID \(lastLocal) is listed: \(above)")
+            try w.expectNotHeld(missing, "#1062: nothing is loaded above an unknown top")
+            // The daily check lists it once more, still unsettled.
+            clock.advance(by: Self.pastTheNextCheck)
+            let dayStart = w.server.recordedCommands().count
+            await w.slice(clock: clock)
+            #expect(!Self.listingRanges(Array(w.server.recordedCommands().dropFirst(dayStart))).isEmpty,
+                    "#1062: the daily check lists the folder again")
+            #expect((try w.changeState()).selfHealDue, "#1062: still owed after the daily listing")
+        }
+    }
+
+    @Test("A server whose SELECT omits UIDNEXT: a folder not owed a check still gets its flag changes and removals from the catch-up")
+    @MainActor
+    func unknownTopStillReconcilesFlagsAndRemovals() async throws {
+        let flagged = 20, expunged = 21
+        let server = Array(1...40)
+        try await Self.withWorld("no-uidnext-flags", server: server, local: server) { w in
+            w.server.suppressSelectUidNext(for: Self.path)
+            defer { w.server.restoreSelectUidNext(for: Self.path) }
+            w.server.setMessages(server.filter { $0 != expunged }.map { Self.message($0) }, in: Self.path)
+            w.server.setFlags(["\\Seen"], in: Self.path, uid: flagged)
+            let clock = CatchUpTestClock()
+            await w.slice(clock: clock)
+            let folderId = w.folderId
+            let isRead = try await w.pool.read { db in
+                try Bool.fetchOne(db, sql: "SELECT isRead FROM messageHeader WHERE folderId = ? AND messageId = ?",
+                                  arguments: [folderId, "\(flagged)"])
+            }
+            #expect(isRead == true, "#1062: the flag change is applied under an unknown top")
+            try w.expectHeldExactly(server.filter { $0 != expunged }, "#1062: the removal is applied under an unknown top")
         }
     }
 

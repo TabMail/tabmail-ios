@@ -78,13 +78,18 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
         /// SELECTs reported (at least the last local UID). Every call bounds its
         /// ranges by it (each range is cut at it), so a listing never asks above
         /// the server's top. A listing's first call, with none stored, asks the
-        /// folder's UIDNEXT before its first range; a SELECT without UIDNEXT
-        /// leaves it unknown, and the listing does not go on. A change of it is
-        /// progress.
+        /// folder's UIDNEXT before its first range. When that read reports none,
+        /// no top is stored and the call lists only up to the last local UID
+        /// (`topUnknown`). A later range SELECT without UIDNEXT keeps the top
+        /// already learned. A change of it is progress.
         /// It lives in this state, so it is never used under another UIDVALIDITY
         /// (the state's `epoch`). Unused while a change bookmark bounds the
         /// listing (`bookmarkUpper`).
         var top: Int?
+        /// A UIDNEXT read of this listing reported none (#1062): the listing
+        /// may complete, but never clean, so an owed folder stays owed and is
+        /// listed again at the daily check; nothing settles on an unknown top.
+        var topUnknown: Bool?
         /// A range this listing asked and could not finish in the call that
         /// asked it (#1062): the budget ran out before its membership proof or
         /// before its loads. The next call goes on with it before it asks
@@ -416,19 +421,22 @@ extension IMAPProvider {
                         }
                         return CatchUpFolderResult(folderId: folder.id, epoch: status.observedEpoch)
                     }
-                    // A SELECT without UIDNEXT did not say where the folder ends:
-                    // the top is unknown, so none is stored and the folder stops
-                    // for the call, still owed. It never completes on an unknown
-                    // top (#1062, MIS-IOS-004).
-                    guard let knownNext = status.uidNext else {
+                    // A SELECT without UIDNEXT did not say where the folder ends
+                    // (MIS-IOS-004): no top is stored, this call lists only up to
+                    // the last local UID (flags and removals as before; an empty
+                    // folder completes at once), and the listing can complete
+                    // only as not clean, so nothing settles on it (#1062).
+                    if let knownNext = status.uidNext {
+                        let learned = max(lastLocal ?? 0, knownNext - 1)
+                        upper = learned
+                        listing.top = learned
+                    } else {
                         if DebugModeManager.isLoggingEnabled() {
-                            BackgroundSyncLogger.logDebug("[CatchUp] \(path): SELECT reported no UIDNEXT — top unknown, stopping this folder for the pass")
+                            BackgroundSyncLogger.logDebug("[CatchUp] \(path): SELECT reported no UIDNEXT — top unknown, listing up to the last local UID, not clean")
                         }
-                        break rangeLoop
+                        upper = lastLocal ?? 0
+                        listing.topUnknown = true
                     }
-                    let learned = max(lastLocal ?? 0, knownNext - 1)
-                    upper = learned
-                    listing.top = learned
                 }
                 if let upper, lo > upper {
                     completed = true
@@ -713,7 +721,7 @@ extension IMAPProvider {
         result.newState = newState.encoded()
         if completed {
             result.completedListing = CatchUpCompletedListing(
-                lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true && state?.skippedLoads != true)
+                lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true && listing.topUnknown != true && state?.skippedLoads != true)
         }
         result.madeProgress = madeProgress
         if DebugModeManager.isLoggingEnabled() {

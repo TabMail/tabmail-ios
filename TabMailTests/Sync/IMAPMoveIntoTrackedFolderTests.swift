@@ -407,6 +407,14 @@ struct IMAPMoveIntoTrackedFolderTests {
             }
             let unhealed = try w.heldTarget().map { "\($0.folderPath)/\($0.messageId)" }
             #expect(!unhealed.contains("Archive/\(copyUID)"), "below-window: setup: no row holds it at its server UID yet: \(unhealed)")
+            let archiveState = try await w.pool.read { db in
+                try String.fetchOne(db, sql: "SELECT changeState FROM folder WHERE id = ?", arguments: [archiveFolderId])
+            }
+            let archiveCatchUp = try await w.pool.read { db in
+                try String.fetchOne(db, sql: "SELECT catchUpState FROM folder WHERE id = ?", arguments: [archiveFolderId])
+            }
+            #expect(FolderChangeState(raw: archiveState).selfHealDue || IMAPCatchUpState.decode(archiveCatchUp)?.listing != nil,
+                    "below-window: setup: Archive is still owed or mid-listing before the check")
             let newer = w.server.messages(in: "Archive").filter { $0.uid > copyUID }.count
             #expect(newer >= SyncConfig.syncMessageLimit, "below-window: setup: the copy is below the newest window when the check runs: \(newer) newer")
 
