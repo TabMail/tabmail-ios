@@ -49,6 +49,11 @@ struct ChatThreadLayoutTests {
         header.headerComplete = true
         header.bodyComplete = true
         header.isRead = true
+        // Filtered (no tag to reply, the empty-reply sentinel), so no AI Suggestion row (the Writing
+        // bubble or the ghost) joins the chat: the newest email's bubble is the last row, right above
+        // the field, which is what the layout tests measure.
+        header.actionTag = ActionTag.none
+        header.cachedReply = ""
         let parent = header
         try await pool.write { db in try parent.insert(db) }
         return parent
@@ -284,6 +289,10 @@ struct ChatThreadLayoutTests {
                 arrived.isRead = true
                 arrived.summaryBlurb = "Noon works"
                 arrived.summaryTextMessage = "Noon works"
+                // Filtered like the parent, so the arrival is the last row and nothing sits between
+                // it and the field.
+                arrived.actionTag = ActionTag.none
+                arrived.cachedReply = ""
                 let row = arrived
                 try await AppDatabase.dbPool.write { db in try row.insert(db) }
                 NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
