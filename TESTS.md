@@ -1393,3 +1393,55 @@ open does; the glyph has its label, hint and a full 44-point target at the trail
 and the subject stays centred. A control pins that the long-press sheet still sends its own type and
 content with no extra line. TipKit is not used for the flag, because its store cannot be reset inside
 the test process (ADR-IOS-085), so a tip's show-once rule could not be tested.
+
+The same suite pins that a report the backend took says "Report Submitted" exactly once, whatever
+happens to the view that asked for it, and a report it did not take says nothing (#1113):
+- `aScrolledRowKeepsItsReport`: a lazy list's reporting row scrolls away and back while the report
+  sends; the sheet stays, and the answer shows the confirmation once, alone.
+- `aRemovedRowsTakenReportConfirmsOnce`: a sync removes the reporting row while the report sends;
+  the sheet goes with the row, and the answer still shows the confirmation once, alone, with
+  nothing after OK. The rows sit in a `VStack`, not a `List`: a row removed from a `List` kept its
+  sheet up, so the test never reached its case.
+- `aSystemClosedPopoversReportConfirmsOnlyWhenTaken`: the system closes the notice's popover and its
+  sheet while the report sends; a taken report shows the confirmation once, a refused one nothing.
+- `reportSubmittedWaitsForTheSheetToLeave`: drives `ReportConcernSubmission` directly in a key
+  window. A taken answer shows nothing while the sheet is up; the sheet's departure shows the
+  confirmation exactly once, a second departure adds none, and OK finishes the report exactly once.
+  A refused answer finishes nothing until the sheet has left, then exactly once.
+- `submittedReportClosesTheSheet`: the notice's popover stays, with the confirmation on it, until OK,
+  and goes only after OK (a sent report's sheet leaving does not finish it).
+- `aClosedSheetsAnswerBeforeTheNextReport` also pins, as absolute counts, that a sent report's sheet
+  leaving finishes nothing: no finish after the close has settled, one on OK.
+- An old answer (a sheet its caller closed, an owner or notice removed and recreated, a popover the
+  system closed and the notice reopened, at four timings) shows the confirmation once over whatever
+  is up, and neither it nor its OK closes, changes or finishes the next report:
+  `aClosedSheetsAnswerBeforeTheNextReport`, `aClosedSheetsAnswerDuringTheNextReport`,
+  `aRemovedOwnersTakenAnswerConfirmsOnce`, `aRemovedNoticesTakenAnswerConfirmsOnce`,
+  `anOldAnswerLeavesTheNextSendAlone`, `aSystemClosedPopoversAnswerNeverChangesTheNext`.
+- A sheet that leaves with nothing sent finishes its caller only for the presentation that was
+  current when it reached its window (round 4):
+  - `aSystemClosedPopoversAnswerNeverChangesTheNext` and
+    `aClosedPopoversSheetNeverClosesTheReopenedNotice`: at the system close SwiftUI presents the
+    closed popover's sheet again, which is in a window for a moment before the reopen, so it counts
+    for the presentation the reopen retires and does not close the reopened notice when it leaves.
+    These rely on that order: a reopen before the stray sheet reaches its window would count it for
+    the reopened presentation.
+  - `aClosedPopoverDoesNotReopenTheSheet`, `aRemovedNoticesTakenAnswerConfirmsOnce` (final Cancel):
+    a sheet on screen for the current presentation still closes the notice on Cancel.
+- Superseded (round 3, flag deleted in round 4): only a sheet that was on screen leaves; a sheet
+  UIKit refused reports no departure:
+  - `aWindowlessProbeReportsNothing` (removed in round 4, with the probe's `attached` flag; it stayed
+    green with the flag removed): a `WindowProbe.Probe` added to and removed from a superview
+    with no window reports neither a window nor a detach; one that gets a window and leaves it
+    reports exactly one of each.
+  - `aClosedPopoversSheetNeverClosesTheReopenedNotice`: as below; the refused sheet never closes
+    the reopened notice.
+- Superseded (round 2, gate deleted in round 3): a sheet that leaves with nothing sent finishes its
+  caller only for a report the caller asked for and still shows:
+  - `aRetiredPresentationsSheetFinishesNothing` (removed in round 3, it pinned the deleted gate): with a presentation the test owns, a sheet up for
+    a presentation retired before it showed, or retired while it is up, finishes nothing on
+    Cancel; the next sheet the caller asks for finishes once on Cancel.
+  - `aClosedPopoversSheetNeverClosesTheReopenedNotice`: the system closes the notice's popover
+    with its sheet up, before or after Report, and the notice is reopened. SwiftUI then presents
+    the old sheet again from the closed popover, which UIKit refuses; the reopened notice stays
+    open with nothing on it (and after an old refusal), and its own report's Cancel closes it.
