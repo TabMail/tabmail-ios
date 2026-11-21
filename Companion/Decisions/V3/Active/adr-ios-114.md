@@ -912,6 +912,14 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      The hosted harness intermittently leaves the card's bubble and editor out of the accessibility
      tree, so the card's body content is checked only in XCUITest
      (`ChatSwipeUITests.testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody`).
+     **Superseded 2026-11-21:** the text above is not a harness limit. The cause is the compose
+     scroll view's class swap (`DisableAutoScrollToVisible`'s `object_setClass`), tabmail-ios#1124,
+     and it hides the AI Suggestion box, Dismiss and Use Suggestion from accessibility in the running
+     app too. Until #1124 is fixed the UI test holds those queries under a strict
+     `XCTExpectFailure`, and the card's transitions are pinned by hosted model-entry-point tests
+     (`ComposeSuggestionPersistTests.useSuggestionFillsTheBody`,
+     `cardShowsTheTappedSuggestionNotTheRowsLaterReply`,
+     `cardSaveWritesItsOwnDraftAndLeavesTheSavedOneAlone`).
      The owner ruling that the bubble must never animate in while the compose card slides in is
      still unmet after the revert; it remains open.
    Tests: `ChatSuggestionBubbleTests` (the ghost, its tap opening the card, the in-place rewrite,
