@@ -888,7 +888,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("chatExpanded", in: moved) == 0, "a move only swells the field")
         // A cancelled drag resets too, so the field never stays swollen; only a finished drag opens.
         let ended = try Self.body(of: "private func fieldDragEnded(_ drag: ChatHorizontalPan.Sample, finished: Bool) {", in: chat)
-        #expect(Self.count("let opens = finished && ChatFieldDrag.opens( translation: drag.travel, predictedEndTranslation: ChatFieldDrag.predictedEnd(translation: drag.travel, velocity: drag.velocity))", in: ended) == 1)
+        #expect(Self.count("let opens = finished && ChatFieldDrag.opens(letGo: drag)", in: ended) == 1)
         #expect(Self.count("withAnimation(Self.pillSpring) { fieldDragProgress = ChatFieldDrag.Progress() if opens { chatExpanded = true } }", in: ended) == 1)
         // The freeze, under its own id, from the gesture state, so a cancelled drag releases.
         #expect(Self.count(".onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }", in: chat) == 1)

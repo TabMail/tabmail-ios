@@ -89,21 +89,25 @@ enum ChatFieldDrag {
     }
 
     /// Where a drag let go at `velocity` (points per second) would come to rest: its travel plus
-    /// the distance a scroll view's normal deceleration carries that velocity
-    /// (`ChatViewLayout.fieldFlickDecelerationRate`, a rate per millisecond).
+    /// `ChatViewLayout.fieldFlickCarry` seconds of travel at that velocity, SwiftUI's own drag
+    /// projection.
     static func predictedEnd(translation: CGSize, velocity: CGSize) -> CGSize {
-        let rate = ChatViewLayout.fieldFlickDecelerationRate
-        let carry = rate / (1 - rate) / millisecondsPerSecond
+        let carry = ChatViewLayout.fieldFlickCarry
         return CGSize(width: translation.width + velocity.width * carry,
                       height: translation.height + velocity.height * carry)
     }
-
-    private static let millisecondsPerSecond = CGFloat(Duration.seconds(1) / Duration.milliseconds(1))
 
     /// Whether letting go here opens the panel.
     static func opens(translation: CGSize, predictedEndTranslation: CGSize) -> Bool {
         let predicted = -predictedEndTranslation.height
         let flickedUp = predicted > abs(predictedEndTranslation.width) && predicted >= ChatViewLayout.fieldDragOpenDistance
         return swell(translation: translation) >= ChatViewLayout.fieldDragOpenDistance || flickedUp
+    }
+
+    /// Whether a let-go with this last sample (`ChatHorizontalPan.Sample`) opens the panel: its
+    /// swell, or its predicted swell, reaches the open distance.
+    static func opens(letGo drag: ChatHorizontalPan.Sample) -> Bool {
+        opens(translation: drag.travel,
+              predictedEndTranslation: predictedEnd(translation: drag.travel, velocity: drag.velocity))
     }
 }

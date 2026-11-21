@@ -1041,8 +1041,20 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (caret, loupe, selection), and its taps wait for the pan. Its state (`ChatFieldDrag.Progress`) is
    reset with the pill's spring however the drag ends (`fieldDragEnded`), so a cancelled drag (the
    panel opening on an agent answer mid-drag, which turns the pan off, or a system interruption)
-   springs back too; only a finished drag can open the panel, from its swell or a flick's predicted
-   swell (`ChatFieldDrag.predictedEnd`, a scroll view's normal deceleration). *Superseded
+   springs back too. **The release policy** (`ChatFieldDrag.opens(letGo:)`, amended 2026-11-21):
+   only a finished drag can open the panel. It opens when its swell (its upward travel, counted
+   only while it goes more up than sideways) reaches `fieldDragOpenDistance` (60 pt), or when its
+   predicted end does: the travel plus `ChatViewLayout.fieldFlickCarry` (0.25 s) of travel at the
+   let-go velocity (`ChatFieldDrag.predictedEnd`), which is SwiftUI's own projection
+   (`DragGesture.Value.predictedEndTranslation`), so exactly the flicks that opened the panel before
+   the pan still open it, and only when that predicted end is more up than sideways. A drag 30 pt up
+   let go at 90 pt/s predicts 52.5 pt and settles back; at 120 pt/s it predicts 60 pt and opens. The
+   pan stays on while the field has focus (mock v15 M2: "Type a question ... Drag up: your words ride
+   along"), so a short draft in the focused field opens the panel the same way and keeps its words;
+   only the open panel and the tutorial turn it off. *Superseded 2026-11-21 (it carried a flick about
+   twice as far as SwiftUI's drag had, so slower flicks opened the panel):* "only a finished drag can
+   open the panel, from its swell or a flick's predicted swell (`ChatFieldDrag.predictedEnd`, a
+   scroll view's normal deceleration)." *Superseded
    2026-11-21 (a short drag on the field ended as a tap and focused it):* "The drag's state is a
    `@GestureState` (`ChatFieldDrag.Progress`) reset with the pill's spring, so a cancelled drag (the
    panel opening on an agent answer mid-drag, a system interruption) springs back too; the let-go

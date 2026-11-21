@@ -90,27 +90,50 @@ struct ChatFieldDragTests {
         #expect(ChatFieldDrag.begins(translation: CGSize(width: 5, height: -12)))
     }
 
-    @Test("A let-go with no speed rests where it is; a flick carries further the way it went")
+    @Test("A let-go carries a quarter second of its speed further, SwiftUI's own drag projection")
     func predictedEnd() {
         let at = CGSize(width: 3, height: -20)
-        #expect(ChatFieldDrag.predictedEnd(translation: at, velocity: .zero) == at)
-        let carried = ChatFieldDrag.predictedEnd(translation: at, velocity: CGSize(width: 0, height: -500))
-        #expect(carried.height < at.height, "an upward flick ends further up")
-        #expect(carried.width == at.width, "no sideways speed, no sideways carry")
+        #expect(ChatFieldDrag.predictedEnd(translation: at, velocity: .zero) == at, "held still, it rests where it is")
+        // 8 and -400 points per second for a quarter second: 2 sideways, 100 up.
+        #expect(ChatFieldDrag.predictedEnd(translation: at, velocity: CGSize(width: 8, height: -400)) == CGSize(width: 5, height: -120))
     }
 
-    @Test("A short drag let go still opens when its flick carries the swell to the open distance; a slow let-go does not")
-    func flickOpensThroughThePrediction() throws {
-        let short = CGSize(width: 0, height: -(open / 2))
-        // How far one point per second of upward speed carries a let-go.
-        let perSpeed = -ChatFieldDrag.predictedEnd(translation: .zero, velocity: CGSize(width: 0, height: -1)).height
-        try #require(perSpeed > 0, "control: an upward speed carries the drag up")
-        let reaches = (open - open / 2) / perSpeed
-        let flick = ChatFieldDrag.predictedEnd(translation: short, velocity: CGSize(width: 0, height: -reaches * 2))
-        let slow = ChatFieldDrag.predictedEnd(translation: short, velocity: CGSize(width: 0, height: -reaches / 4))
-        #expect(ChatFieldDrag.opens(translation: short, predictedEndTranslation: flick))
-        #expect(!ChatFieldDrag.opens(translation: short, predictedEndTranslation: slow))
-        #expect(!ChatFieldDrag.opens(translation: short, predictedEndTranslation: short), "held still at the let-go")
+    /// A let-go as UIKit reports it, and whether it opens the panel, worked out by hand from the
+    /// open distance (60) and a quarter second of carry, not from `ChatFieldDrag.predictedEnd`.
+    private struct LetGo {
+        let travel: CGSize
+        let velocity: CGSize
+        let opens: Bool
+        let why: String
+    }
+
+    private static let letGos: [LetGo] = [
+        LetGo(travel: CGSize(width: 0, height: -30), velocity: CGSize(width: 0, height: -90), opens: false,
+              why: "30 up at 90 pt/s predicts 52.5: it settled back with SwiftUI's drag, and still does"),
+        LetGo(travel: CGSize(width: 0, height: -30), velocity: CGSize(width: 0, height: -119), opens: false,
+              why: "predicts 59.75, just short"),
+        LetGo(travel: CGSize(width: 0, height: -30), velocity: CGSize(width: 0, height: -120), opens: true,
+              why: "predicts exactly 60"),
+        LetGo(travel: CGSize(width: 0, height: -10), velocity: CGSize(width: 0, height: -300), opens: true,
+              why: "a short quick flick predicts 85"),
+        LetGo(travel: CGSize(width: 0, height: -59), velocity: .zero, opens: false, why: "held still short of 60"),
+        LetGo(travel: CGSize(width: 0, height: -60), velocity: .zero, opens: true, why: "held still at 60"),
+        LetGo(travel: CGSize(width: 0, height: -70), velocity: CGSize(width: 0, height: 200), opens: true,
+              why: "past 60 opens even when the let-go eases back (predicts 20)"),
+        LetGo(travel: CGSize(width: 0, height: -30), velocity: CGSize(width: -600, height: -300), opens: false,
+              why: "a diagonal flick predicting 150 sideways and 105 up is more sideways than up"),
+        LetGo(travel: CGSize(width: 0, height: -30), velocity: CGSize(width: 300, height: -300), opens: true,
+              why: "predicting 75 sideways and 105 up is more up than sideways"),
+        LetGo(travel: CGSize(width: 0, height: -30), velocity: CGSize(width: 0, height: 400), opens: false,
+              why: "a flick back down"),
+    ]
+
+    @Test("Let-go samples open the panel exactly where SwiftUI's drag did: 30 pt up at 90 pt/s settles back")
+    func letGoOpens() {
+        for letGo in Self.letGos {
+            let drag = ChatHorizontalPan.Sample(travel: letGo.travel, velocity: letGo.velocity)
+            #expect(ChatFieldDrag.opens(letGo: drag) == letGo.opens, "\(letGo.why)")
+        }
     }
 
     /// A pan whose travel and speed the test sets, as UIKit reports them to the delegate and the

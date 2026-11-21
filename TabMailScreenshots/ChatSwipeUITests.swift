@@ -226,6 +226,24 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(markerReads(focused: false, in: app), "and did not take focus, as a tap would")
     }
 
+    /// The same short travel let go fast: the flick's predicted swell opens the panel through the
+    /// installed pan, though the finger stopped short of the open distance.
+    func testShortFlickUpOnTheReplyFieldOpensThePanel() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        XCTAssertTrue(field.isHittable, "control: the reply field is on screen")
+        XCTAssertLessThan(Self.shortFlick, ChatSwipeUITests.openDistance, "control: the finger stops short of the open distance")
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -Self.shortFlick)),
+                    withVelocity: .fast, thenHoldForDuration: 0)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the flick opened the panel")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    /// `ChatViewLayout.fieldDragOpenDistance`, and a flick's travel well short of it.
+    private static let openDistance: CGFloat = 60
+    private static let shortFlick: CGFloat = 40
+
     /// The focused field: a drag up in text that overflows the field's lines scrolls that text, so
     /// the panel stays shut and the field keeps its focus; with a short question the same drag opens
     /// the panel and the words ride along (mock M2), so the drag still works while typing.

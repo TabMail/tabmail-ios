@@ -145,10 +145,12 @@ enum ChatViewLayout {
     /// movement before it counts as a drag is UIKit's own pan's (`ChatFieldPan`).
     static let fieldDragMaxSwell: CGFloat = 220
     static let fieldDragOpenDistance: CGFloat = 60
-    /// How a flick's let-go speed carries on when predicting where the drag would rest
-    /// (`ChatFieldDrag.predictedEnd`): a scroll view's normal deceleration, per millisecond
-    /// (`UIScrollView.DecelerationRate.normal`).
-    static let fieldFlickDecelerationRate: CGFloat = 0.998
+    /// How far a flick's let-go speed carries the drag when predicting where it would rest
+    /// (`ChatFieldDrag.predictedEnd`), in seconds of travel at that speed: SwiftUI's own
+    /// projection (`DragGesture.Value.predictedEndTranslation`, a quarter second; its `velocity` is
+    /// four times the predicted end minus the travel), which the drag used before it became a
+    /// UIKit pan, so the same flicks open the panel.
+    static let fieldFlickCarry: CGFloat = 0.25
     /// The pill's spring (the panel opening and closing, the field's swell springing back): its
     /// response in seconds and its damping ratio. A drag's settle lasts this spring's own settling
     /// duration (`ChatThreadView.fieldDragSettle`).
