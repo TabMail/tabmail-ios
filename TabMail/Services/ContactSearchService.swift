@@ -25,6 +25,10 @@ final class ContactSearchService {
     func requestAccess() {
         // Skip in screenshot mode to avoid permission dialog on erased simulator
         guard !ScreenshotMode.isActive else { return }
+        #if DEBUG
+        // The chat swipe UI tests' fixture never asks for contacts: no prompt can cover the card.
+        guard !ProcessInfo.processInfo.arguments.contains("--chat-swipe-ui-test") else { return }
+        #endif
         // No permission prompt during the guided tutorial (sample mail only).
         guard !TutorialCoordinator.shared.isRunning else { return }
         Task {

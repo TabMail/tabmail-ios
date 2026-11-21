@@ -909,8 +909,14 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      test's missing card body, which motivated the hold, was not a timing issue either: with the
      bubble inserted only after the signal, the card's scroll content (bubble and editor) was still absent from the hosted view tree. The question moved to a UI test in the
      running app (`ChatSwipeUITests`).
+     The hosted harness intermittently leaves the card's bubble and editor out of the accessibility
+     tree, so the card's body content is checked only in XCUITest
+     (`ChatSwipeUITests.testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody`).
+     The owner ruling that the bubble must never animate in while the compose card slides in is
+     still unmet after the revert; it is tracked by the chat-view coordinator.
    Tests: `ChatSuggestionBubbleTests` (the ghost, its tap opening the card, the in-place rewrite,
-   no "AI Reply" string), `ChatThreadViewLifecycleTests.suggestionSitsAtTheSentPosition` and
+   no "AI Reply" string), `ChatSwipeUITests.testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody`
+   (the card's body, Use Suggestion, the saved draft left in Drafts), `ChatThreadViewLifecycleTests.suggestionSitsAtTheSentPosition` and
    `sentReplyTakesTheTurn`, `ChatReplyFieldRuntimeTests.exampleLinePutsTheChange` and
    `suggestionNeverEntersTheField`, `ChatReplyFieldTests.suggestionText` and `exampleFromConfig`,
    `TutorialChatViewTests.fieldText`.

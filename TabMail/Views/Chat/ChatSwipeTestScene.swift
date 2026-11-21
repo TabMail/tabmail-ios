@@ -25,6 +25,8 @@ struct ChatSwipeTestScene: View {
     @State private var showsSheet = false
     @State private var mailbox: String?
     @State private var pushedId: String?
+    /// `--chat-swipe-saved-draft`: what Drafts holds for the fixture, read each time the list shows.
+    @State private var draftMarker = ""
     /// The tutorial variant's chat: Priya's practice email.
     @State private var practiceId: String?
     private let inSheet = ProcessInfo.processInfo.arguments.contains("--chat-swipe-in-sheet")
@@ -125,8 +127,28 @@ struct ChatSwipeTestScene: View {
             if !tutorialCard {
                 Button(armed ? "Removal armed" : "Remove a bubble") { arm() }
             }
+            if Self.savedDraft {
+                // Never the draft's words: a test reads that they stay out of the card.
+                Text(draftMarker).accessibilityIdentifier("fixture.savedDraft")
+            }
         }
         .navigationTitle("Fixture list")
+        .onAppear { Task { await readDrafts() } }
+    }
+
+    /// "Saved draft kept: yes" while the saved reply draft holds its words and was never saved
+    /// over, and how many drafts the card saved under keys of their own.
+    private func readDrafts() async {
+        guard Self.savedDraft else { return }
+        let accountID = Self.accountID
+        let (kept, separate) = (try? await AppDatabase.dbPool.read { db -> (Bool, Int) in
+            let drafts = try Draft.filter(Column("accountId") == accountID).fetchAll(db)
+            let kept = drafts.contains {
+                !$0.id.hasPrefix(Draft.separateReplyPrefix) && $0.body == Self.savedDraftBody && $0.updatedAt == $0.createdAt
+            }
+            return (kept, drafts.filter { $0.id.hasPrefix(Draft.separateReplyPrefix) }.count)
+        }) ?? (false, -1)
+        draftMarker = "Saved draft kept: \(kept ? "yes" : "no"); separate replies: \(separate)"
     }
 
     private static func headerId(_ index: Int) -> String {
@@ -198,6 +220,7 @@ struct ChatSwipeTestScene: View {
             try await AppDatabase.dbPool.write { db in
                 // Each launch owns only this synthetic account's fixture rows.
                 try MessageHeader.filter(Column("accountId") == accountID).deleteAll(db)
+                if Self.savedDraft { try Draft.filter(Column("accountId") == accountID).deleteAll(db) }
                 var account = Account(emailAddress: "me@example.com", displayName: "Chat swipe fixture", provider: .imap)
                 account.id = accountID
                 try account.save(db)
@@ -240,6 +263,7 @@ struct ChatSwipeTestScene: View {
                     }
                 }
             }
+            await readDrafts()
             status = "Fixture ready"
             ready = true
         } catch {
