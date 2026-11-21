@@ -777,8 +777,10 @@ extension IMAPProvider {
             }
             listing.loadHeldSince = nil
             listing.nextUid = hi + 1
-            // A request of this range that timed out closed the folder
-            // connection's session (`requestMayBeInFlight`): past the hold bound
+            // A request of this range that timed out on the wire closed the
+            // folder connection's session (`requestMayBeInFlight`; one that timed
+            // out still waiting for its connection sent nothing, and is treated
+            // the same way): past the hold bound
             // the range is passed over and saved as above, and the folder stops
             // for this call instead of listing the next range, whose request would
             // first reconnect and log in again on the link that just timed out
@@ -1003,11 +1005,12 @@ extension IMAPProvider {
             load.loaded += answered.map {
                 BackfillResult(id: $0.messageId, header: $0, htmlBody: nil, textBody: nil, error: nil)
             }
-            let undecoded = fetched.undecoded.filter(requested.contains)
-            // Every UID is logged: the batch is already at most
-            // `SyncConfig.catchUpLoadBatchSize`.
+            // Each requested UID once: a server may send several unreadable
+            // records for one UID, and the requested set is already at most
+            // `SyncConfig.catchUpLoadBatchSize`, so every UID is logged.
+            let undecoded = Set(fetched.undecoded).intersection(requested).sorted()
             if !undecoded.isEmpty, DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CatchUp] \(path): \(undecoded.count) header record(s) could not be read (UIDs \(undecoded)) — left missing, held like an unanswered UID")
+                BackgroundSyncLogger.logDebug("[CatchUp] \(path): \(undecoded.count) UID(s) whose header record could not be read (\(undecoded)) — left missing, held like an unanswered UID")
             }
             // A record the client could not read is that UID's failure alone: it
             // is not loaded, the rest of the batch is, and it is held like an

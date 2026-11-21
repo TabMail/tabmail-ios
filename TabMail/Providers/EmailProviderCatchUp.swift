@@ -162,12 +162,13 @@ struct CatchUpFolderResult: Sendable {
     /// asked go on.
     var madeProgress = false
     /// A request of this call may still be in flight (#1062): the provider
-    /// stopped waiting for it, and abandoning it ended the folder's session
-    /// (IMAP: a cancelled command that was on the wire closes its connection's
-    /// session at once), so another request to the folder now would first open
-    /// a new session on the link that just timed out. A timeout can also fire
-    /// while the request still waits for a connection (the folder's, or pool
-    /// capacity), before any command is sent; it is reported the same way. The backfill worker's run never asks this
+    /// stopped waiting for it. A request that was on the wire ended the
+    /// folder's session when abandoned (IMAP: a cancelled command closes its
+    /// connection's session at once), so another request to the folder now
+    /// would first open a new session on the link that just timed out. A
+    /// timeout can also fire while the request still waits for a connection
+    /// (the folder's, or pool capacity), before any command is sent; it is
+    /// reported the same way. The backfill worker's run never asks this
     /// folder again, whatever progress the call made, and goes on with its other
     /// folders (`SyncEngine.runCatchUpRun`). Independent of `madeProgress`: the
     /// state the call saved (a listing that moved, a top it learned) is kept as
@@ -275,10 +276,14 @@ enum CatchUpEpochValue {
 /// epoch gets one from the catch-up slice (`SyncEngine.seedCatchUpPruneCutoffs`):
 /// released versions pruned without recording it. The catch-up apply carries it
 /// across its own state writes, and a turnover clears it with the state. Under a
-/// storage limit a catch-up loads nothing at or below it; the first local UID is
-/// no evidence of what was pruned (a cached scroll page sits below the pruned
-/// UIDs, an unreadable window UID below the first local one). Read only when its
-/// epoch is the folder's.
+/// storage limit a catch-up loads nothing at or below it, a never-local UID
+/// included (the UID-ordered prune would have deleted it first); the first local
+/// UID is no evidence of what was pruned (a cached scroll page sits below the
+/// pruned UIDs, an unreadable window UID below the first local one). A seeded
+/// value is an inference, and a deleted row with no epoch stamp never raises
+/// it, so mail above it that was pruned may load once more, stamped, for the
+/// next prune to count. The walk's empty-folder recovery keeps it with the
+/// state; it is inert there, read only when its epoch is the folder's.
 enum CatchUpPruneCutoff {
     /// The key of the cutoff in a state's JSON object: an object holding `uid`
     /// and `epoch`.

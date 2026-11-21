@@ -19,9 +19,12 @@ extension SyncEngine {
     }
 
     /// The prune's oldest-first order for one folder, in its account's sync
-    /// order: an IMAP folder keeps its highest UIDs, so its lowest held UID is a
-    /// clean floor below which nothing is kept, and the catch-up loads nothing
-    /// below it (ADR-IOS-006 current note, #1062). The same `CAST(messageId AS
+    /// order: an IMAP folder keeps its highest UIDs, and the prune records the
+    /// highest UID it deleted (`CatchUpPruneCutoff`), below which the catch-up
+    /// loads nothing under a limit (ADR-IOS-006 current note, #1062).
+    /// *Superseded (#1062):* "its lowest held UID is a clean floor below which
+    /// nothing is kept, and the catch-up loads nothing below it": a scroll page
+    /// caches rows below it, so it is no record of the prune. The same `CAST(messageId AS
     /// INTEGER)` form `SyncEngine.selectStaleHeaders`' UID window uses. A
     /// non-numeric `messageId` in an IMAP folder would read as 0 and so sort
     /// first, pruned before every UID; no IMAP path writes one.

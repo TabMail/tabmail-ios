@@ -52,8 +52,9 @@ struct CatchUpSliceResult: Sendable, Equatable {
     var progressedFolderIds: Set<String> = []
     /// The folders whose call left a request that may still be in flight
     /// (`CatchUpFolderResult.requestMayBeInFlight`, #1062), whether or not the
-    /// result was applied: abandoning the request ended that folder's session,
-    /// whatever the apply did.
+    /// result was applied: abandoning a request that was on the wire ended that
+    /// folder's session, whatever the apply did (a request that timed out still
+    /// waiting for its connection sent nothing, and is reported the same way).
     /// *Superseded (#1062):* "the request may still hold that folder's connection".
     var inFlightFolderIds: Set<String> = []
     /// An applied folder result made progress.
@@ -383,32 +384,55 @@ extension SyncEngine {
     /// pruned there holds rows whose lowest UID is where its kept mail ends, and
     /// nothing records it. Under a storage limit, for a UID-windowed provider, a
     /// folder with a known epoch, local rows and no cutoff in that epoch gets ONE:
-    /// the lower of its first local UID and its window floor in the epoch
-    /// (`CatchUpWindowFloor`), minus one, so nothing pruned there loads again and
-    /// an unreadable lowest window UID still can. From then on only the prune
-    /// moves it. Called by a slice in its turn, before the provider reads, so the
-    /// slice's own read already sees it. A folder whose turnover is pending is
-    /// left alone. A failure is logged and seeds nothing; the next slice tries.
-    func seedCatchUpPruneCutoffs(folderIds: [String]) async {
+    /// the lower of its first local UID and its window floor in the CURRENT epoch
+    /// (`CatchUpWindowFloor`; with none, the first local UID alone), minus one, so
+    /// nothing pruned there loads again and an unreadable lowest window UID still
+    /// can. From then on only the prune moves it. Called by a slice in its turn,
+    /// once the slice is admitted with budget and before the provider reads, so
+    /// the slice's own read already sees it. A folder whose turnover is pending is
+    /// left alone. This is an inference: a date-ordered prune can leave gaps
+    /// above the seed, and the catch-up loads those again ONCE, within the limit,
+    /// as rows stamped with the epoch, which the UID-ordered prune then counts.
+    /// Returns the folders that needed a seed and did not get one (a read or write
+    /// failure): the caller leaves them out of this slice, so no slice loads below
+    /// an unrecorded legacy prune, and the next slice tries again.
+    func seedCatchUpPruneCutoffs(folderIds: [String]) async -> Set<String> {
+        let unseeded: [String]
         do {
-            let unseeded = try await dbPool.read { db in
+            unseeded = try await dbPool.read { db in
                 try folderIds.filter { try Self.catchUpPruneCutoffSeed(folderId: $0, db: db) != nil }
-            }
-            guard !unseeded.isEmpty else { return }
-            try await dbPool.write { db in
-                for folderId in unseeded {
-                    guard let seed = try Self.catchUpPruneCutoffSeed(folderId: folderId, db: db) else { continue }
-                    try Self.recordCatchUpPruneCutoff(folderId: folderId, highest: seed.uid, epoch: seed.epoch, db: db)
-                    if DebugModeManager.isLoggingEnabled() {
-                        BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): prune cutoff seeded at \(seed.uid) (epoch \(seed.epoch))")
-                    }
-                }
             }
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CatchUp] prune cutoff seed failed (\(error)) — the next slice tries again")
+                BackgroundSyncLogger.logDebug("[CatchUp] prune cutoff seed read failed (\(error)) — these folders wait for the next slice")
+            }
+            return Set(folderIds)
+        }
+        guard !unseeded.isEmpty else { return [] }
+        let seeded: [(folderId: String, uid: Int, epoch: Int)]
+        do {
+            seeded = try await dbPool.write { db in
+                var written: [(folderId: String, uid: Int, epoch: Int)] = []
+                for folderId in unseeded {
+                    guard let seed = try Self.catchUpPruneCutoffSeed(folderId: folderId, db: db) else { continue }
+                    try Self.recordCatchUpPruneCutoff(folderId: folderId, highest: seed.uid, epoch: seed.epoch, db: db)
+                    written.append((folderId, seed.uid, seed.epoch))
+                }
+                return written
+            }
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[CatchUp] prune cutoff seed failed (\(error)) — these folders wait for the next slice")
+            }
+            return Set(unseeded)
+        }
+        // Logged after the commit, so only what was written is reported.
+        if DebugModeManager.isLoggingEnabled() {
+            for seed in seeded {
+                BackgroundSyncLogger.logDebug("[CatchUp] \(seed.folderId): prune cutoff seeded at \(seed.uid) (epoch \(seed.epoch))")
             }
         }
+        return []
     }
 
     /// The cutoff `seedCatchUpPruneCutoffs` writes for the folder now, or nil
@@ -442,10 +466,13 @@ extension SyncEngine {
     /// to the production snapshot taken right now".
     @discardableResult
     func runCatchUp(provider: any EmailProvider, folderIds: [String], context: CatchUpContext) async -> CatchUpSliceResult {
-        let ids = folderIds
-        if context.storageLimitInForce, provider.staleWindowMode == .uid {
-            await seedCatchUpPruneCutoffs(folderIds: ids)
+        // The legacy prune cutoff seed writes only for a slice that may send a
+        // request: a slice whose budget is already spent writes nothing.
+        var waitingForSeed = Set<String>()
+        if context.storageLimitInForce, provider.staleWindowMode == .uid, context.hasBudget() {
+            waitingForSeed = await seedCatchUpPruneCutoffs(folderIds: folderIds)
         }
+        let ids = folderIds.filter { !waitingForSeed.contains($0) }
         let folders: [Folder]
         do {
             let rows = try await dbPool.read { db in try Folder.filter(keys: ids).fetchAll(db) }
@@ -476,8 +503,9 @@ extension SyncEngine {
                 result, windowMode: windowMode, readStartedAt: readStartedAt,
                 selfHealOwedAtRead: owedAtRead[result.folderId])
             if result.madeProgress, case .applied = outcome { slice.progressedFolderIds.insert(result.folderId) }
-            // Whatever the apply did: abandoning the request ended the folder's
-            // session. *Superseded (#1062):* "the request may still hold the connection".
+            // Whatever the apply did: abandoning a request that was on the wire
+            // ended the folder's session (one still waiting for its connection
+            // sent nothing, and counts the same). *Superseded (#1062):* "the request may still hold the connection".
             if result.requestMayBeInFlight { slice.inFlightFolderIds.insert(result.folderId) }
         }
         return slice
