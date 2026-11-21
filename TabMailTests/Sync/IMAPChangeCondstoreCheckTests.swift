@@ -224,7 +224,7 @@ struct IMAPChangeCondstoreCheckTests {
         try await C.withWorld(inbox: [1, 2, 3, 4]) { w in
             let base = try await R.baseline(w)
             let completed = IMAPCatchUpState(
-                epoch: UInt32(R.epoch), completionStamp: nil, lastCompletedAt: Date().addingTimeInterval(-60), listing: nil, createdAt: nil)
+                epoch: UInt32(R.epoch), completionStamp: nil, lastCompletedAt: Date().addingTimeInterval(-60), listing: nil)
             try await pool.write { db in
                 try db.execute(sql: "UPDATE folder SET changeCursor = ?, catchUpState = ? WHERE id = ?",
                                arguments: [base, completed.encoded(), folderId])
@@ -242,7 +242,7 @@ struct IMAPChangeCondstoreCheckTests {
             let folder = try #require(try await pool.read { db in try Folder.fetchOne(db, key: folderId) })
             let results = await w.provider.catchUp(
                 folders: [folder], localRows: w.local,
-                context: CatchUpContext(isExpensiveNetwork: false, deadline: .distantFuture, clock: { Date() }))
+                context: CatchUpContext(deadline: .distantFuture, clock: { Date() }))
             let result = try #require(results.first, "the armed catch-up runs")
             #expect(result.removedIds.contains("2"), "the catch-up listing proves the deleted message gone: \(result.removedIds)")
             let state = try #require(IMAPCatchUpState.decode(result.newState))
@@ -421,7 +421,6 @@ struct IMAPChangeCondstoreCheckTests {
     /// Bookmark at count 3, UIDNEXT 4; then UID 4 comes and goes so the next
     /// read SELECTs with nothing to read.
     static func trackedThreeWithASpentUID(_ w: IMAPChangeEngineTests.World) async throws {
-        w.server.honorSearchUIDSetCriterion()
         w.server.setExpungeKeepsHighestModSeq(true, for: IMAPChangeEngineTests.path)
         // A baseline pass (its listing and commit track the folder), then a tracked read.
         try await C.foregroundPass(w)

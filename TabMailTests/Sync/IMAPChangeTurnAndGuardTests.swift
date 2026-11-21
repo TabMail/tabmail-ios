@@ -37,7 +37,6 @@ struct IMAPChangeTurnAndGuardTests {
     @Test("T15: load older holds a page whose message a change read proves gone meanwhile: the message is not re-created, and the call reports more to load")
     func loadOlderNeverRecreatesAProvenGoneMessage() async throws {
         try await E.withWorld("cs-t15", capabilities: C.condstore, serverUIDs: Array(1...6), localUIDs: [4, 5, 6]) { w in
-            w.server.honorSearchUIDSetCriterion()
             w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
             _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
             _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
@@ -63,7 +62,6 @@ struct IMAPChangeTurnAndGuardTests {
     @Test("T16: a standalone folder listing started while a change pass reads waits for that pass's turn, and both complete")
     func standaloneListingWaitsForTheChangePass() async throws {
         try await E.withWorld("cs-t16", capabilities: C.qresync, serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3]) { w in
-            w.server.honorSearchUIDSetCriterion()
             _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
             _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
             w.server.setFlags(["\\Seen"], in: E.path, uid: 1)
@@ -455,7 +453,6 @@ struct IMAPChangeTurnAndGuardTests {
             var rng = SplitMix64(seed: TurnFuzz.seed &+ UInt64(iteration))
             let label = "seed=0x\(String(TurnFuzz.seed, radix: 16)) iteration=\(iteration)"
             try await E.withWorld("cs-t17f-\(iteration)", capabilities: C.condstore, serverUIDs: Array(1...6), localUIDs: [4, 5, 6]) { w in
-                w.server.honorSearchUIDSetCriterion()
                 w.server.setSeededLatencyInjection(seed: TurnFuzz.seed &+ UInt64(iteration) &* 31, maxMilliseconds: TurnFuzz.latencyMaxMilliseconds)
                 let folder = try w.folder()
                 let kinds = (0..<TurnFuzz.tasksPerIteration).map { _ in Int.random(in: 0..<4, using: &rng) }

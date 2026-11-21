@@ -211,7 +211,6 @@ struct IMAPChangeCondstoreTests {
         let world = Self.partlyLoaded()
         let arrival = world.server.count + 1
         try await E.withWorld("cs-t1", capabilities: Self.condstore, serverUIDs: world.server, localUIDs: world.local) { w in
-            w.server.honorSearchUIDSetCriterion()
             w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
             // A baseline pass, then a tracked one.
             _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
@@ -234,7 +233,6 @@ struct IMAPChangeCondstoreTests {
         let world = Self.partlyLoaded()
         let arrival = world.server.count + 1
         try await E.withWorld("cs-t1c", capabilities: Self.condstore, serverUIDs: world.server, localUIDs: world.local) { w in
-            w.server.honorSearchUIDSetCriterion()
             w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
             _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
             _ = try await w.engine.performDeltaSync(account: w.account, provider: w.provider)
@@ -307,7 +305,6 @@ struct IMAPChangeCondstoreTests {
     @Test("A staged notification for a message a tracked read removed comes back with the merge, and the next sync removes it for good")
     func stagedMessageARemovalProvedGoneIsSettledByTheNextSync() async throws {
         try await E.withWorld("cs-nse-gone", capabilities: Self.condstore, serverUIDs: [1, 2, 3, 4], localUIDs: [1, 2, 3, 4]) { w in
-            w.server.honorSearchUIDSetCriterion()
             w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
             try await Self.foregroundPass(w)
             #expect(try Self.tracked(w), "setup: the baseline pass's listing and commit track the folder")
@@ -354,7 +351,6 @@ struct IMAPChangeCondstoreTests {
         let gone = fate != .live
         var outcome = ArrivalRaceOutcome()
         try await E.withWorld(name, capabilities: Self.condstore, serverUIDs: [1], localUIDs: [1]) { w in
-            w.server.honorSearchUIDSetCriterion()
             w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
             try await Self.foregroundPass(w)
             try #require(try Self.tracked(w), "setup: the baseline pass's listing and commit track the folder")
@@ -463,7 +459,6 @@ struct IMAPChangeCondstoreTests {
         let arrival = world.server.count + 1
         let live = world.old + 1
         try await E.withWorld("cs-nse", capabilities: Self.condstore, serverUIDs: world.server, localUIDs: world.local) { w in
-            w.server.honorSearchUIDSetCriterion()
             w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
             try await Self.foregroundPass(w)
             #expect(try Self.tracked(w), "setup: the baseline pass's listing and commit track the folder")
