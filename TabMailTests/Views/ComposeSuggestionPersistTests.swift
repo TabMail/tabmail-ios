@@ -171,21 +171,23 @@ struct ComposeSuggestionPersistTests {
 
     @Test("A card opened with a suggestion shows that one, never the email row's later reply")
     func cardShowsTheTappedSuggestionNotTheRowsLaterReply() throws {
+        let tapped = ReplyResult(body: Self.cardSuggestion, textMessage: "Yes, Tuesday works for me.")
+        let later = ReplyResult(body: Self.laterRowReply, textMessage: nil)
         var rowRead = false
         let shown = ComposeDraftGuards.suggestionToShow(
-            suggestedBody: Self.cardSuggestion, isReply: true,
-            freshCachedReply: { rowRead = true; return Self.laterRowReply })
-        #expect(shown == Self.cardSuggestion)
+            given: tapped, isReply: true,
+            freshSuggestion: { rowRead = true; return later })
+        #expect(shown == tapped)
         #expect(!rowRead, "the row is not consulted when the card was handed a suggestion")
         let accepted = ComposeDraftGuards.acceptingVisibleSuggestion(.init(
-            messageBody: "", showingSuggestion: true, currentSuggestion: shown))
+            messageBody: "", showingSuggestion: true, currentSuggestion: shown?.body))
         #expect(accepted.messageBody == Self.cardSuggestion, "Use Suggestion uses the tapped suggestion")
 
         // Control: with nothing handed in, a reply reads the row; a new message never does.
         #expect(ComposeDraftGuards.suggestionToShow(
-            suggestedBody: nil, isReply: true, freshCachedReply: { Self.laterRowReply }) == Self.laterRowReply)
+            given: nil, isReply: true, freshSuggestion: { later }) == later)
         #expect(ComposeDraftGuards.suggestionToShow(
-            suggestedBody: "", isReply: false, freshCachedReply: { Self.laterRowReply }) == nil)
+            given: nil, isReply: false, freshSuggestion: { later }) == nil)
 
         let prepopulate = try functionBody(
             "private func prepopulate() {",
@@ -193,13 +195,12 @@ struct ComposeSuggestionPersistTests {
         #expect(prepopulate.contains("ComposeDraftGuards.suggestionToShow("),
                 "prepopulate takes its suggestion from the decision")
         // A Forward never offers the parent's AI reply, and the reply read is the email compose opened for.
-        #expect(prepopulate.contains("suggestedBody: suggestedBody, isReply: replyTo != nil && !isForward,"),
+        #expect(prepopulate.contains("given: Self.givenSuggestion(suggestion, suggestedBody: suggestedBody), isReply: replyTo != nil && !isForward,"),
                 "only a reply, never a forward, reads the row's reply")
         let closure = try #require(prepopulate.range(of: "guard let reply = replyTo else { return nil }"))
-        let read = try #require(prepopulate.range(of: "try MessageHeader.fetchOne(db, key: reply.id)"))
-        let cached = try #require(prepopulate.range(of: "return freshHeader?.cachedReply"))
-        #expect(closure.lowerBound < read.lowerBound && read.lowerBound < cached.lowerBound,
-                "the closure reads cachedReply from the row at reply.id")
+        let stored = try #require(prepopulate.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
+        #expect(closure.lowerBound < stored.lowerBound,
+                "the closure reads the stored suggestion from the row at reply.id")
     }
 
     @Test("Use Suggestion then Save writes the card's own draft with the suggestion; the saved reply draft is untouched")
@@ -220,7 +221,7 @@ struct ComposeSuggestionPersistTests {
 
         // The ghost's card, as the chat opens it, then Use Suggestion, then Save.
         let card = ChatReadyReply(
-            message: email, compose: ChatReplyCompose(isReplyAll: false, to: ["sender@example.com"], cc: [], bcc: []))
+            message: email, suggestion: ReplyResult(body: Self.cardSuggestion, textMessage: nil), accounts: [account])
         let accepted = ComposeDraftGuards.acceptingVisibleSuggestion(.init(
             messageBody: "", showingSuggestion: true, currentSuggestion: Self.cardSuggestion))
         let existing = try await db.read { try Draft.fetchOne($0, key: card.draftId) }
@@ -815,12 +816,13 @@ struct ComposeSuggestionPersistTests {
     func prefillReadsTheStoredSuggestionThroughTheIdentityCheck() throws {
         let source = try composeSource()
         let prepopulate = try functionBody("private func prepopulate() {", before: "private func clearAttachmentPreparationFailures() {", in: source)
-        let branch = try #require(prepopulate.range(of: "} else if let reply = replyTo, !isForward {"))
+        let branch = try #require(prepopulate.range(of: "freshSuggestion: {\n"))
         let rest = prepopulate[branch.upperBound...]
-        let read = try #require(rest.range(of: "suggestionToShow = try? dbPool.read { db in\n"))
+        let read = try #require(rest.range(of: "return try? dbPool.read { db -> ReplyResult? in\n"))
         let guardLine = try #require(rest.range(of: "guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }\n"))
         let fetch = try #require(rest.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
-        let otherwise = try #require(rest.range(of: "} else {\n"))
+        // The end of the stored-suggestion read's closure.
+        let otherwise = try #require(rest.range(of: "})\n"))
         #expect(read.lowerBound < guardLine.lowerBound && guardLine.lowerBound < fetch.lowerBound
                 && fetch.lowerBound < otherwise.lowerBound,
                 "the identity check guards the stored-suggestion read, inside it, before the value")

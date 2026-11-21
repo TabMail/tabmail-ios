@@ -199,9 +199,14 @@ struct ChatSwipeTestScene: View {
     /// so its ghost still holds the reply it showed, and a tap must open the card with that one.
     private static func rewriteSuggestionQuietly() async {
         let id = headerId(count - 1)
-        _ = try? await AppDatabase.dbPool.write { db in
-            try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
-                           arguments: [rewrittenReply, id])
+        _ = try? await AppDatabase.dbPool.write { db -> AIWriteOutcome in
+            guard let header = try MessageHeader.fetchOne(db, key: id),
+                  let target = try AIWriteTarget.capture(message: header, db: db) else { return .dropped }
+            // Through the one central writer, over the value stored: only the reply's body changes.
+            let stored = header.suggestion
+            let rewritten = ReplyResult(
+                body: rewrittenReply, textMessage: stored?.textMessage, changeCommand: stored?.changeCommand)
+            return try AccountManager.storeSuggestion(rewritten, replacing: stored, target: target, db: db)
         }
     }
 
@@ -269,8 +274,7 @@ struct ChatSwipeTestScene: View {
                         ? "Note 0: " + String(repeating: "A long line that fills the screen. ", count: 80)
                         : "Note \(index): a short line."
                     if Self.savedDraft, index == Self.count - 1 {
-                        header.cachedReply = Self.fullReply
-                        header.replyTextMessage = Self.lateSuggestion
+                        _ = header.replaceSuggestion(with: ReplyResult(body: Self.fullReply, textMessage: Self.lateSuggestion), ifStill: nil)
                     }
                     try header.save(db)
                     if Self.savedDraft, index == Self.count - 1 {

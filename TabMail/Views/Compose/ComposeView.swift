@@ -80,16 +80,17 @@ enum ComposeDraftGuards {
             currentSuggestion: suggestion)
     }
 
-    /// The suggestion a freshly prepopulated compose offers. The caller's
-    /// `suggestedBody` (the reply the user tapped, or an agent's text) always wins;
-    /// only without one does a reply read the email row's current `cachedReply`,
-    /// which protects against caller-side staleness when background AI, P2P sync,
-    /// or a prior in-place edit updated the row after the caller's snapshot.
+    /// The suggestion a freshly prepopulated compose offers, as one value. The
+    /// suggestion the caller hands the card (`given`, `ComposeView.givenSuggestion`:
+    /// the reply the user tapped, or an agent's text) always wins; only without one
+    /// does a reply read the email row's current suggestion, which protects against
+    /// caller-side staleness when background AI, P2P sync, or a prior in-place edit
+    /// updated the row after the caller's snapshot.
     static func suggestionToShow(
-        suggestedBody: String?, isReply: Bool, freshCachedReply: () -> String?
-    ) -> String? {
-        if let suggestedBody, !suggestedBody.isEmpty { return suggestedBody }
-        return isReply ? freshCachedReply() : nil
+        given: ReplyResult?, isReply: Bool, freshSuggestion: () -> ReplyResult?
+    ) -> ReplyResult? {
+        if let given { return given }
+        return isReply ? freshSuggestion() : nil
     }
 
     /// The row explicit Save persists: the existing row with the authored fields
@@ -3357,19 +3358,17 @@ struct ComposeView: View {
         // from DB — protects against caller-side staleness when background AI,
         // P2P sync, or a prior in-place edit updated cachedReply after the
         // caller's snapshot was captured.
-        let suggestionToShow: ReplyResult?
-        if let given = Self.givenSuggestion(suggestion, suggestedBody: suggestedBody) {
-            suggestionToShow = given
-        } else if let reply = replyTo, !isForward {
-            // Only while the row is still the email replied to: another email seated at its
-            // address (a UIDVALIDITY reset) never lends this card its suggestion.
-            suggestionToShow = try? dbPool.read { db in
-                guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }
-                return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion
-            }
-        } else {
-            suggestionToShow = nil
-        }
+        let suggestionToShow = ComposeDraftGuards.suggestionToShow(
+            given: Self.givenSuggestion(suggestion, suggestedBody: suggestedBody), isReply: replyTo != nil && !isForward,
+            freshSuggestion: {
+                guard let reply = replyTo else { return nil }
+                // Only while the row is still the email replied to: another email seated at its
+                // address (a UIDVALIDITY reset) never lends this card its suggestion.
+                return try? dbPool.read { db -> ReplyResult? in
+                    guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }
+                    return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion
+                }
+            })
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ComposeView] suggestion instance=\(instanceToken) draftId=\(draftId) suggestionLen=\(suggestionToShow?.body.count ?? -1)")
             BackgroundSyncLogger.logDebug("[ComposeView] prepopulate: suggestion \(suggestionToShow.map { "shown, \($0.body.count) chars" } ?? "none") (given \(suggestion != nil), body given \(suggestedBody != nil), reply \(replyTo != nil), forward \(isForward))")
