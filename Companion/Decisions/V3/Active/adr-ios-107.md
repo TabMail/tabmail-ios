@@ -171,7 +171,9 @@ The owner's rulings of 2026-11-09:
          unanswered UID's SEARCH, a header load), because the timeout cancelled the request, and SwiftMail
          closes the session of a cancelled command at once (no LOGOUT; the late answer is never read; the
          pool keeps the connection, released as healthy, and its next command reconnects and logs in
-         again); Gmail and Outlook requests have no per-folder session to end and leave it false). The
+         again; *qualified in place 2026-11-21:* that holds for a command on the wire; a timeout can also
+         fire while the request still waits for a connection, the folder's or pool capacity, before any
+         command is sent, and it is reported in flight the same way); Gmail and Outlook requests have no per-folder session to end and leave it false). The
          run never asks that folder again: `runCatchUpRun` keeps the folder ids in a set
          in its own memory (gone when the run ends, never persisted, no timer), and later slices do not
          pass them to `runCatchUp`. (*Superseded by the next amendment:* "Only the progress of folders not in
@@ -1307,7 +1309,9 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     `backfillPageHoldMinutes`: that range is passed over and saved (`Listing.passedOver`, `nextUid` past
     the range, the hold cleared, no carry), and the call stops there instead of listing the next range. No
     new state. The call's result keeps what it found before the timeout (flag updates, proven removals,
-    loaded headers), applied with that state in one transaction. Nothing is lost: the only work the same
+    loaded headers), applied with that state (*qualified in place 2026-11-21:* the flag updates, removals
+    and state in one transaction; loaded headers are inserted before it, in the insert tail's own chunk
+    transactions, and a failed chunk writes no state). Nothing is lost: the only work the same
     call did after such a pass-over was to list the following ranges (their FETCH, proof and loads), and
     the next call does exactly that from `nextUid`, as after a budget stop, with the stored width, cap and
     top unchanged and a fresh hold for any UID it holds. `passedOver` stays in the listing, so whichever
@@ -1389,6 +1393,30 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     which waits for Wi-Fi under Wi-Fi-only. After the walk starts, the walk-cursor rule stands. No
     migration (the state column is opaque JSON). *Replaces:* the lowest held UID as the floor, which
     let infinite-scroll rows pull it down over old mail.
+  - *THE FLOOR RULE, current (2026-11-21, #1062); the two entries below restate parts of it.* (1) Every
+    floor and cutoff the catch-up stores is stored WITH the UIDVALIDITY it was learned under
+    (`windowFloor` and `pruneCutoff` are `{uid, epoch}` objects in `catchUpState`, `CatchUpEpochValue`);
+    an entry of another epoch reads as absent and is never rebound; none is written under an unknown
+    epoch. (2) Loads start at the held range's start (the walk's start once it started, else the epoch's
+    window floor; none: nothing loads); under a storage limit at least one past the epoch's prune cutoff;
+    nothing else raises it: the first local UID is no evidence of what was pruned. (3) The scan floor is
+    the lower of that start (before the cutoff) and the first local UID; the cutoff never raises it. (4)
+    The prune cutoff, the only record of what was pruned, is written by the prune in its delete
+    transaction from rows it actually deleted that were still in the folder under the same UID and
+    carried the folder's epoch, only for a UID prune order; within an epoch the higher UID is kept. (5)
+    The window floor is the lowest UID a window listing named in the epoch; within an epoch the lower is
+    kept. (6) The storage prune shipped long before the cutoff (date order, released versions), so under
+    a storage limit a UID-windowed folder with a known epoch, local rows and no cutoff of that epoch gets
+    ONE from the catch-up slice, in its turn before the provider reads
+    (`SyncEngine.seedCatchUpPruneCutoffs`): the lower of its first local UID and its window floor, minus
+    one; the window-floor term keeps an unreadable lowest window UID loadable. (7) The catch-up apply
+    carries both keys with their own epochs; a turnover and a Settings reset clear them with the state.
+    No migration. Why: each round of review found another case where a floor inferred from local rows was
+    wrong (an unreadable window UID, a cached scroll page, a floor kept across a renumbering by the
+    walk's empty-folder recovery, which clears the folder's epoch and keeps its state).
+    *Superseded (2026-11-21):* the window floor as a bare number with no epoch; "under a storage limit,
+    the higher of that and the lowest held UID" in *Load floor before the walk starts, current
+    (2026-11-20)* above and "The load floor is the lowest held UID" in *Storage limit* below.
   - *Window floor, current (2026-11-21, #1062).* The window merge records the floor as the lowest UID
     the window listing NAMED: the UIDs it mapped to headers and the UIDs it listed but could not map
     (`coverage.unmaterialisedIds`, a record whose header did not read). It records it only when the
@@ -1409,7 +1437,10 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     now records the highest UID it deleted, with the folder's UIDVALIDITY, under `pruneCutoff` in the
     folder's `catchUpState` JSON (`CatchUpPruneCutoff`, `{uid, epoch}`; written in the prune's own write
     transaction by `SyncEngine.recordCatchUpPruneCutoff`, only when the account's prune order is by UID
-    and the epoch is known; within one epoch the higher UID is kept, another epoch replaces it). Under a
+    and the epoch is known; within one epoch the higher UID is kept, another epoch replaces it; amended
+    the same day: only rows the transaction actually deleted, still in the folder under the same UID and
+    stamped with the folder's epoch, count, so a row a reset or a turnover removed meanwhile, or one an
+    optimistic move brought in under its source UID, never moves it). Under a
     storage limit the load floor is at least the cutoff plus one, read only when its epoch matches the
     listing's; a cutoff of another epoch counts for nothing. The catch-up apply carries it across its own
     state writes, as it carries `windowFloor`; a turnover or a Settings reset clears it with the state.
@@ -1428,4 +1459,5 @@ budget stop, SEARCH failure, date self-heal removed, range sized by EXISTS and U
 unsolicited FETCH, walk not started, UID-ordered prune, header batch size, width cap, widthCap,
 widthCapThrough, timed-out width, cap growth, cap dropped at the maximum span, clean-only settle, daily relisting of owed folders, storage-limit floor after the walk, request in flight, requestMayBeInFlight, folder left out of the run, held connection, one more slice per left-out folder, every timeout ends the call, pass-over ends the call, per-folder connection, #1133,
 window floor named UIDs, unmaterialised UID, known epoch, prune cutoff, pruneCutoff, scroll page after a prune,
-pool capacity wait, healthy folder asked in several slices)
+pool capacity wait, healthy folder asked in several slices, floor rule, epoch-tagged floor, CatchUpEpochValue,
+legacy prune seed, seedCatchUpPruneCutoffs, scan floor below the cutoff, actually deleted rows)

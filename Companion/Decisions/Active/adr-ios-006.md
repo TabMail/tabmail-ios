@@ -1,6 +1,20 @@
 
 ## ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
 
+> **Current note (2026-11-21, #1062): what was pruned is recorded, not inferred.** The lowest held UID
+> is no evidence of what was pruned: an infinite-scroll page caches rows below the pruned UIDs, and a
+> window UID whose header could not be read sits below the first local one. The IMAP prune now records
+> the highest UID it deleted, with the folder's UIDVALIDITY (`CatchUpPruneCutoff`, `pruneCutoff` in
+> the folder's `catchUpState` JSON, no migration), in its own write transaction, only for a UID prune
+> order and only from rows that transaction deleted and that carried the folder's epoch; under a limit
+> the catch-up loads nothing at or below it (ADR-IOS-107, *Storage limit, prune cutoff*). A folder
+> pruned by a released version (no cutoff) gets ONE cutoff from the catch-up under a limit: the lower
+> of its first local UID and its window floor, minus one. *Superseded in place:* in the note below,
+> "its lowest held UID is a clean floor, and the IMAP catch-up loads only above the higher of it and
+> the walk's start" and "the catch-up downloads them once (they sit above the lowest held UID)": a
+> released store's date-holes above the seeded cutoff are downloaded once, as before; holes below it
+> are not.
+>
 > **Current note (2026-11-20, #1062).** The prune deletes each folder oldest-first in that folder's
 > SYNC ORDER, the fetch's ordering dimension (ADR-IOS-042): an IMAP folder loses its LOWEST UIDs
 > first (`CAST(messageId AS INTEGER)`, the form `SyncEngine.selectStaleHeaders` uses); a Gmail or
