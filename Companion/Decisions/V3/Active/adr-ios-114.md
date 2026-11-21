@@ -348,6 +348,15 @@ same AI result, kept as long as the email itself is shown.
      geometry log: without the re-issue the chat showed 488 and 386 points past its bottom, and with
      it the landing came back 2 ms after the jump. A phone check before the chat view merges to
      main is the check.
+   - The bottom inset in the re-issue's key (2026-11-21): the keyboard's arrival changes only the
+     bottom inset, neither the scroll view's size nor its content's. `ChatThreadViewLifecycleTests`
+     `bottomLandingFollowsABottomInset` and `unreadLandingKeepsItsAnchorThroughABottomInset` grow
+     only the bottom safe area (the hosting controller's additional safe-area inset, about a
+     keyboard's height), check that the field rose and the scroll view kept its size, and require
+     the landing to hold: the chat at its bottom, the Unread line where it landed, both for half a
+     second of frames after. The platform either keeps the scroll offset (the newest bubble would
+     end under the risen field) or keeps the bottom (the Unread line would move up with it), so
+     between them the two tests see the bottom-inset term.
 
    **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
    In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible
@@ -1103,9 +1112,20 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `testDragUpInOverflowingTextScrollsIt` (the text keeps a drag short of its end: scrolled to its
    top, a drag up within its scroll room moves another line to the top, read by tapping the
    top-left corner and typing a mark, and the panel stays shut),
-   `testDragUpInOverflowingTextPastItsEndOpensThePanel` (the same drag carried past the end opens
-   the panel), `ChatFieldDragTests.fieldShareOfATextDrag` and `panSharesWithTheTextUnderTheTouch`
-   (the field's share; `textViewOrdering` pins the pan beside the text's scroll; the first was
+   `testDragUpInOverflowingTextPastItsEndOpensThePanel` (signed in, the same drag carried past the
+   end opens the panel, whose editor holds the whole draft, inside the panel and above the
+   keyboard when one shows), `testDragUpPastTheOpenDistanceInsideTheTextsRoomIsAllTheTexts` (a
+   sixteen-line draft: a drag past the open distance inside the text's room leaves the field's
+   glass still and the panel shut), `testDragUpPastTheTextsEndByLessThanTheOpenDistanceSettlesBack`
+   (past the open distance in all but past the end by less: the glass rises only by the rest, the
+   panel stays shut, and the debug marker's `over` shows the text never went past its end),
+   `testDoubleTapInOverflowingTextSelectsAWordToReplace` (the text view's own selection in an
+   overflowing draft: the typed word replaces the double-tapped one),
+   `ChatFieldDragTests.fieldShareOfATextDrag` and `panSharesWithTheTextUnderTheTouch` (the field's
+   share, from a touch-down offset that is not zero; `handOffClearsOnAReversal` and
+   `diagonalThenStraightUp` the hand-off's state, both axes; `textUnderTheTouchDoesNotBounce` the
+   no-bounce rule; `textViewOrdering` pins the pan beside the text's scroll and not beside any other
+   pan in or on the text view, a selection handle's among them; the first was
    `testDragUpInOverflowingTextScrollsItAndShortTextOpens`, whose short half ran signed out, where
    the sign-in bar replaces the panel's editor), the text's long press
    (`testLongPressInTheFocusedFieldMovesTheCaret`: a held press at the text's start puts the caret
@@ -1118,8 +1138,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    drag swollen past the open distance, which turns the pan off: the marker records the opening and
    then the cut, in that order, so the drag ended with the finger still down; the freeze is
    released, the field is back at rest, the next drag opens),
-   `testOpenActionsDragUpOnTheReplyFieldOnlyCloses` and the two back swipes that start on the field
-   (`testNothingOpenRightDragOnTheReplyFieldGoesBack`, `testNothingOpenEdgeDragOnTheReplyFieldGoesBack`).
+   `testOpenActionsDragUpOnTheReplyFieldOnlyCloses` and the back swipes that start at the field
+   (`testNothingOpenRightDragOnTheReplyFieldGoesBack`, `testNothingOpenEdgeDragOnTheReplyFieldGoesBack`
+   from the margin beside it, and `testNothingOpenEdgeDragStartingOnTheReplyFieldGoesBack` from
+   the field's glass where it overlaps the back swipe's zone at the left edge).
    `testDraggedOpenPanelClosesOnCloseAndOnTheDim` taps the dim halfway between the nav bar's bottom
    and the open panel's top as the marker reads it, and checks the dim's own tap handler counted the
    tap (`ChatFieldDragMarker.dimTapped`), so a tap that lands on the panel cannot pass. The swell and the settle are covered by
@@ -1176,7 +1198,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    user's own newest email (their reply, filed from Sent) is not an arrival and does not rise.
    Not decided here and left for later work: the AI Suggestion's working bubble and its growth into
    the ghost. *Since built:* decision 16's working-bubble amendment (2026-11-20). Tests: `ChatArrivalTests`, `ChatThreadLayoutTests.arrivalEndsAboveTheField`,
-   `ChatReplyFieldTests.arrivalWiring`.
+   `ChatReplyFieldTests.arrivalWiring`, and `ChatThreadLayoutTests.arrivalInALongChatMovesItUpWithTheRise`
+   (2026-11-21: the first chat is shorter than the screen and has nothing to scroll; in a chat
+   longer than the screen, held at its bottom, the scroll position as drawn passes through places
+   between where it was and where it ends, rather than jumping in one frame, and the new email
+   ends fully above the field).
 
 ## The longer index line (routed 2026-11-09)
 
