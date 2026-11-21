@@ -470,9 +470,10 @@ extension IMAPMissingByUIDTests {
     /// with `rangeWidth` stored (nil: none, as a listing written before the field).
     @MainActor
     static func setListing(_ w: World, nextUid: Int, rangeWidth: Int?,
-                           widthCap: Int? = nil) async throws {
+                           widthCap: Int? = nil, top: Int? = nil) async throws {
         var listing = IMAPCatchUpState.Listing(nextUid: nextUid, rangeWidth: rangeWidth)
         listing.widthCap = widthCap
+        listing.top = top
         let state = IMAPCatchUpState(epoch: UInt32(epoch), listing: listing)
         let raw = try #require(state.encoded())
         let folderId = w.folderId
@@ -488,7 +489,8 @@ extension IMAPMissingByUIDTests {
         let messages = SyncConfig.catchUpListingRangeMessages
         try await Self.withWorld("stored-width-resized", server: server, local: server, rangeMessages: messages) { w in
             let half = messages / 2
-            try await Self.setListing(w, nextUid: 1, rangeWidth: half)
+            // A listing in progress already knows its top (`Listing.top`).
+            try await Self.setListing(w, nextUid: 1, rangeWidth: half, top: server.last)
             let clock = CatchUpTestClock()
             // Budget for one range: its listing FETCH and its membership SEARCH.
             await w.slice(maxRequests: 2, clock: clock)
@@ -569,7 +571,7 @@ extension IMAPMissingByUIDTests {
     func failingOneUIDRangeStaysUnconfirmed() async throws {
         let server = Array(1...20)
         try await Self.withWorld("one-uid-timeout", server: server, local: server) { w in
-            try await Self.setListing(w, nextUid: 7, rangeWidth: 1)
+            try await Self.setListing(w, nextUid: 7, rangeWidth: 1, top: server.last)
             w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
             defer { w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil) }
             let start = w.server.recordedCommands().count
@@ -592,7 +594,7 @@ extension IMAPMissingByUIDTests {
     func cappedOneUIDRangeTimeoutIsNoProgress() async throws {
         let server = Array(1...20)
         try await Self.withWorld("one-uid-capped-timeout", server: server, local: server) { w in
-            try await Self.setListing(w, nextUid: 7, rangeWidth: 1, widthCap: 1)
+            try await Self.setListing(w, nextUid: 7, rangeWidth: 1, widthCap: 1, top: server.last)
             w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
             defer { w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil) }
             let start = w.server.recordedCommands().count

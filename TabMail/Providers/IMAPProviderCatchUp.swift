@@ -74,6 +74,15 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
         /// server recovers, the width is back within a few ranges, wherever the
         /// timeouts happened. Absent: no cap.
         var widthCap: Int?
+        /// The highest UID this listing lists (#1062): the last UIDNEXT - 1 its
+        /// SELECTs reported (at least the last local UID). Every call bounds its
+        /// ranges by it, so a listing never asks above the server's top, and an
+        /// empty range never sizes the next one past it. A listing's first call,
+        /// with none stored, asks the folder's UIDNEXT before its first range.
+        /// It lives in this state, so it is never used under another UIDVALIDITY
+        /// (the state's `epoch`). Unused while a change bookmark bounds the
+        /// listing (`bookmarkUpper`).
+        var top: Int?
         /// A range this listing asked and could not finish in the call that
         /// asked it (#1062): the budget ran out before its membership proof or
         /// before its loads. The next call goes on with it before it asks
@@ -263,7 +272,8 @@ extension IMAPProvider {
         // which let infinite-scroll rows pull the floor down over old mail. Its upper
         // bound is the larger of the last local UID and, with a change bookmark,
         // the bookmark's UIDNEXT - 1 (the change reader owns everything at or
-        // above it), else the listing's own SELECT UIDNEXT - 1. By the bookmark,
+        // above it), else the top the listing last learned from its own SELECTs
+        // (`Listing.top`). By the bookmark,
         // not by tracking, so the bound holds whichever pass ran first.
         let heldFrom = Self.heldRangeStart(olderMailComplete: folder.backfillComplete, olderMailCursor: folder.backfillUidCursor)
         let firstLocal: Int?
@@ -294,8 +304,14 @@ extension IMAPProvider {
         // `loadsFrom` stays only the boundary below which nothing is loaded.
         let lower = [loadsFrom, firstLocal].compactMap { $0 }.min()
         let bookmarkUpper = bookmark.flatMap { $0.uidValidity == epoch ? Int($0.uidNext) - 1 : nil }
-        var upper: Int? = bookmarkUpper.map { max($0, lastLocal ?? 0) }
+        var upper: Int? = (bookmarkUpper ?? listing.top).map { max($0, lastLocal ?? 0) }
         let holdSeconds = SyncConfig.backfillPageHoldMinutes * 60
+        // The cap before this call first raised it: restored if the call makes
+        // no progress, so a call that moves nothing never widens the next try.
+        var capBeforeGrowth: Int?
+        // The carried range's proof request, reserved when the folder starts
+        // (`CatchUpContext.reserveOne`).
+        var proofReserved = false
 
         rangeLoop: while true {
             // The range this turn works: a carried one first (`Listing.carried`),
@@ -318,6 +334,10 @@ extension IMAPProvider {
             var rangeFloor = loadsFrom
             if let carried = listing.carried {
                 listing.carried = nil
+                // Reserved ahead of the time check: a slice shorter than one
+                // request still sends the proof, so a carried listing always
+                // moves (#1062).
+                if !carried.proven { proofReserved = context.reserveOne() }
                 lo = carried.lo
                 hi = carried.hi
                 // A carried UID may be stale: loaded by another path since (now a
@@ -377,6 +397,34 @@ extension IMAPProvider {
                     from = max(from, next)
                 }
                 lo = from
+                if upper == nil {
+                    // The listing's first call, with no top stored: the folder's
+                    // UIDNEXT first, one request, so no range is asked blind (#1062).
+                    guard context.hasBudget(cost: 1) else {
+                        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[CatchUp] \(path): budget spent before the folder's UIDNEXT") }
+                        break rangeLoop
+                    }
+                    let status: (uidNext: Int?, observedEpoch: UInt32?)
+                    do {
+                        status = try await withTimeout(seconds: timeout) {
+                            try await self.getUidNextWithEpoch(folder: path)
+                        }
+                    } catch {
+                        if DebugModeManager.isLoggingEnabled() {
+                            BackgroundSyncLogger.logDebug("[CatchUp] \(path): UIDNEXT read failed (\(error)) — stopping this folder for the pass")
+                        }
+                        break rangeLoop
+                    }
+                    guard status.observedEpoch == epoch else {
+                        if DebugModeManager.isLoggingEnabled() {
+                            BackgroundSyncLogger.logDebug("[CatchUp] \(path): SELECT reported UIDVALIDITY \(status.observedEpoch.map(String.init) ?? "none"), folder holds \(epoch) — applying nothing")
+                        }
+                        return CatchUpFolderResult(folderId: folder.id, epoch: status.observedEpoch)
+                    }
+                    let learned = max(lastLocal ?? 0, status.uidNext.map { $0 - 1 } ?? 0)
+                    upper = learned
+                    listing.top = learned
+                }
                 if let upper, lo > upper {
                     completed = true
                     break rangeLoop
@@ -415,6 +463,7 @@ extension IMAPProvider {
                         let halved = halves.map { $0.lower.to - $0.lower.from + 1 } ?? 1
                         listing.rangeWidth = halved
                         listing.widthCap = max(1, (hi - lo + 1) / SyncConfig.catchUpWidthCapShrinkFactor)
+                        capBeforeGrowth = nil
                         if DebugModeManager.isLoggingEnabled() {
                             BackgroundSyncLogger.logDebug("[CatchUp] \(path) \(lo):\(hi): listing failed (\(error)) — next call asks \(listing.rangeWidth ?? 1) UID(s) from here")
                         }
@@ -434,8 +483,11 @@ extension IMAPProvider {
                     }
                     return CatchUpFolderResult(folderId: folder.id, epoch: listed.uidValidity == 0 ? nil : listed.uidValidity)
                 }
-                if upper == nil {
-                    upper = max(lastLocal ?? 0, listed.uidNext.map { Int($0) - 1 } ?? 0)
+                if bookmarkUpper == nil, let next = listed.uidNext {
+                    // The top this listing last learned (`Listing.top`).
+                    let learned = max(lastLocal ?? 0, upper ?? 0, Int(next) - 1)
+                    upper = learned
+                    listing.top = learned
                 }
                 // Only records inside the range asked for: a FETCH response for
                 // another UID (an unsolicited flag change elsewhere in the folder) is
@@ -445,9 +497,14 @@ extension IMAPProvider {
                 // is applied where the next range is cut (`Listing.widthCap`).
                 span = Self.nextListingRangeSpan(
                     messages: context.listingRangeMessages, width: hi - lo + 1, held: flags.count)
+                // Never past the known top: an empty range's maximum span stops
+                // at it (#1062).
+                if let upper { span = min(span, max(1, upper - hi)) }
                 listing.rangeWidth = span
-                // A range that answers raises the cap again (`Listing.widthCap`).
+                // A range that answers raises the cap again (`Listing.widthCap`),
+                // kept only if the call makes progress (see below).
                 if let cap = listing.widthCap {
+                    if capBeforeGrowth == nil { capBeforeGrowth = cap }
                     let raised = cap * SyncConfig.catchUpWidthCapGrowthFactor
                     listing.widthCap = raised >= SyncConfig.catchUpListingMaxRangeSpan ? nil : raised
                 }
@@ -497,11 +554,14 @@ extension IMAPProvider {
             // bounded hold as an unloaded UID (#1062). The range is carried
             // unproven meanwhile, so a retry asks only the SEARCH.
             var proofStopped = false
+            // Consumed by this range whether or not it still needs the proof.
+            let reserved = proofReserved
+            proofReserved = false
             if !proven, !candidates.isEmpty || loadRange != nil {
                 // A UID missing from the FETCH is only a candidate: a short FETCH is a
                 // real server shape. The walk's own absence proof decides, under the
                 // same epoch.
-                if !context.hasBudget(cost: 1) {
+                if !reserved, !context.hasBudget(cost: 1) {
                     // The budget ran out after the listing: the range is carried,
                     // so the next call proves it without listing it again (#1062).
                     // *Superseded (#1062):* "budget spent before the membership
@@ -632,6 +692,14 @@ extension IMAPProvider {
             listing.nextUid = hi + 1
         }
 
+        // Progress: the listing moved or completed, or something applies. A range
+        // whose request failed before anything moved is no progress, so the
+        // worker does not list it again at once. The width cap a timeout sets
+        // is no progress either: it only narrows the next try (#1062).
+        let madeProgress = completed || listing.withoutWidthCap != state?.listing?.withoutWidthCap
+            || !result.flagUpdates.isEmpty || !result.removedIds.isEmpty || !result.loaded.isEmpty
+        // No growth of the cap on a call that moved nothing (#1062).
+        if !madeProgress, let capBeforeGrowth { listing.widthCap = capBeforeGrowth }
         var newState = state ?? IMAPCatchUpState(epoch: epoch)
         newState.lastAttemptAt = context.clock()
         if completed {
@@ -648,12 +716,7 @@ extension IMAPProvider {
             result.completedListing = CatchUpCompletedListing(
                 lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true && state?.skippedLoads != true)
         }
-        // Progress: the listing moved or completed, or something applies. A range
-        // whose request failed before anything moved is no progress, so the
-        // worker does not list it again at once. The width cap a timeout sets
-        // is no progress either: it only narrows the next try (#1062).
-        result.madeProgress = completed || listing.withoutWidthCap != state?.listing?.withoutWidthCap
-            || !result.flagUpdates.isEmpty || !result.removedIds.isEmpty || !result.loaded.isEmpty
+        result.madeProgress = madeProgress
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CatchUp] \(path): flags=\(result.flagUpdates.count) removed=\(result.removedIds.count) loaded=\(result.loaded.count) \(completed ? "listing complete" : "resumes at UID \(listing.nextUid)")")
         }

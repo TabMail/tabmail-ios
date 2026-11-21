@@ -232,6 +232,79 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    // MARK: - one request per call, owed folder (#1062)
+
+    @Test("An owed folder, one request per call: the listing completes within a bounded number of calls and never asks a UID above the server's top")
+    @MainActor
+    func owedFolderOneRequestPerCallStaysUnderTheTop() async throws {
+        let server = Self.carryServer
+        let top = try #require(server.last)
+        try await Self.withWorld("carry-one-request-top", server: server, local: server,
+                                 rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
+            try await w.dropLocal(Self.carryMissing)
+            try await w.markOwed()
+            let clock = CatchUpTestClock()
+            let start = w.server.recordedCommands().count
+            // The listing's UIDNEXT read, every request of the repair, and one
+            // call that finds the listing complete.
+            let bound = Self.carryRequestsNeeded + 2
+            let slices = try await Self.slicesUntilRepaired(w, expected: server, maxRequests: 1, clock: clock, bound: 2 * bound)
+            #expect(slices <= bound, "#1062: one request per call converges within \(bound) calls: \(slices)")
+            try w.expectHeldExactly(server, "#1062 one request per call")
+            let asked = Self.listingRanges(Array(w.server.recordedCommands().dropFirst(start)))
+            let above = asked.filter { $0.upperBound > top }
+            #expect(above.isEmpty, "#1062: no listing range asks above the server's top \(top): \(above)")
+        }
+    }
+
+    // MARK: - a carried listing on a slow link (#1062)
+
+    /// One call whose slice is shorter than one request: time is left until the
+    /// call's first UID request goes out, and spent from then on.
+    @MainActor
+    static func callSpentByItsFirstRequest(_ w: World) async {
+        await AccountManager.shared.clearRecentlyCompletedForTesting()
+        let server = w.server
+        let start = server.recordedCommands().count
+        let opened = Date()
+        let context = CatchUpContext(
+            deadline: opened.addingTimeInterval(1),
+            clock: {
+                let sent = server.recordedCommands().dropFirst(start).contains { $0.uppercased().contains("UID ") }
+                return sent ? opened.addingTimeInterval(2) : opened
+            },
+            listingRangeMessages: w.rangeMessages)
+        await w.engine.runCatchUp(provider: w.provider, folderIds: [w.folderId], context: context)
+    }
+
+    @Test("A carried listing on a slow link whose slice is shorter than one request: it completes within a bounded number of calls, and a call that moves nothing never widens the width cap")
+    @MainActor
+    func carriedListingOnASlowLinkCompletes() async throws {
+        let server = Self.carryServer
+        try await Self.withWorld("carry-slow-link", server: server, local: server,
+                                 rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
+            try await w.dropLocal(Self.carryMissing)
+            try await w.markOwed()
+            // A cap from earlier timeouts, so a call that answers a range raises it.
+            try await Self.setListing(w, nextUid: 1, rangeWidth: SyncConfig.catchUpListingMinRangeSpan,
+                                      widthCap: SyncConfig.catchUpListingMinRangeSpan)
+            let bound = Self.carryRequestsNeeded + 2
+            var calls = 0
+            while try w.held() != server || w.catchUpState()?.listing != nil, calls < 2 * bound {
+                let before = try w.catchUpState()?.listing
+                let heldBefore = try w.held()
+                await Self.callSpentByItsFirstRequest(w)
+                calls += 1
+                let after = try w.catchUpState()?.listing
+                guard let after, after.withoutWidthCap == before?.withoutWidthCap, try w.held() == heldBefore else { continue }
+                let capBefore = before?.widthCap ?? Int.max, capAfter = after.widthCap ?? Int.max
+                #expect(capAfter <= capBefore, "#1062: a call that moved nothing widened the cap: \(capBefore) -> \(capAfter)")
+            }
+            #expect(calls <= bound, "#1062: the carried listing completes within \(bound) calls: \(calls)")
+            try w.expectHeldExactly(server, "#1062 slow link")
+        }
+    }
+
     // MARK: - a held UID inside a carry
 
     @Test("A held UID inside a carried range keeps its first hold start across slices that load the rest of the carry; if another path writes its row meanwhile, the hold is dropped",

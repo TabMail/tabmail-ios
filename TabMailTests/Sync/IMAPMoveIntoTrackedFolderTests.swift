@@ -395,7 +395,10 @@ struct IMAPMoveIntoTrackedFolderTests {
             #expect(w.server.uids(in: "INBOX", rfc822MessageId: Self.target).isEmpty, "below-window: setup: the source no longer holds it")
             let before = try w.heldTarget().map { "\($0.folderPath)/\($0.messageId)" }
             #expect(before.contains("Archive/\(sourceUID)"), "below-window: setup: the unproven MOVE left its remnant under the source UID: \(before)")
-            #expect(!before.contains("Archive/\(copyUID)"), "below-window: setup: no row holds it at its server UID yet")
+            // Whether a row already holds the copy at its server UID is not a
+            // precondition: the MOVE's drain can relist the owed Archive and
+            // load the copy before this check, which only heals sooner (#1062).
+            // The remnant under the source UID is what the check must remove.
 
             // The older-mail check alone heals it: no foreground sync runs.
             await AccountManager.shared.clearRecentlyCompletedForTesting()
