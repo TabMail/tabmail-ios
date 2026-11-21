@@ -41,12 +41,27 @@ struct ChatHeaderView: View {
 }
 
 /// The thin line under the navigation bar: the subject and the thread's labels. No band of its own:
-/// it sits in the chat's top bar inset, which the navigation bar's scroll edge covers.
+/// it sits in the chat's top bar inset, which the navigation bar's scroll edge covers. The AI
+/// summaries glyph sits at its trailing edge, under Forward; its tap target overlaps the bar
+/// without making the line taller.
 struct ChatSubjectLine: View {
     let subject: String
     let labels: [UserLabel]
+    /// The chat has landed: the AI summaries notice may open by itself.
+    let landed: Bool
+    /// The chat's AI summaries for "Report a concern", newest first.
+    let reportContent: () -> String
 
     var body: some View {
+        line
+            // Both sides, so the subject stays centred under the names.
+            .padding(.horizontal, ChatViewLayout.aiNoticeTapTarget)
+            .overlay(alignment: .trailing) {
+                AISummariesNoticeButton(landed: landed, reportContent: reportContent)
+            }
+    }
+
+    private var line: some View {
         HStack(spacing: 4) {
             Text(subject)
                 .font(.caption)

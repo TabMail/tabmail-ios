@@ -52,4 +52,10 @@ enum ReportConcernService {
         BackgroundSyncLogger.logDebug("[ReportConcern] \(contentType.rawValue): \(success ? "submitted" : "failed")")
         return success
     }
+
+    /// `report` in the shape the report sheet sends with.
+    @MainActor
+    static func sendReport(contentType: ReportContentType, content: String, category: ReportCategory, reason: String?) async -> Bool {
+        await report(contentType: contentType, content: content, category: category, reason: reason)
+    }
 }
