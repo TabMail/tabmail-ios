@@ -1119,8 +1119,10 @@ struct ChatAISummariesNoticeHostedTests {
                     // that lands mid-presentation leaves them up.
                     try await Self.waitUntil { Self.presentationSettled(controller) }
                     #expect(Self.presentationSettled(controller), "control: the popover and its sheet are on screen")
-                    // The system closes the popover and its sheet; the button stays mounted.
-                    controller.presentedViewController?.dismiss(animated: false)
+                    // The system closes the popover and its sheet; the button stays mounted. Dismissed
+                    // from the root, so both go at once: dismissing the popover itself only closes the
+                    // sheet on top of it, and the popover would then close through the sheet's finish.
+                    controller.dismiss(animated: false)
                     try await Self.waitUntil { controller.presentedViewController == nil }
                     #expect(controller.presentedViewController == nil, "control: the popover and its sheet closed")
                     let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))

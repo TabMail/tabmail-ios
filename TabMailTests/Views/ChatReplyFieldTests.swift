@@ -657,7 +657,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ChatSubjectLine(subject: subject(thread), labels: context.labels, landed: didInitialScroll, reportContent: { AISummariesNotice.reportContent(items: thread.items, unsent: unsentReplies) })", in: chat) == 1)
         // The subject and the coach card are the chat's top bar, so the scroll edge reaches under
         // them; a plain inset has no backdrop and lets the bubbles draw through the subject.
-        #expect(Self.count(".safeAreaBar(edge: .top, spacing: 0) { VStack(spacing: 0) { ChatSubjectLine(subject: subject(thread), labels: context.labels, landed: didInitialScroll, reportContent: { AISummariesNotice.reportContent(items: thread.items, unsent: unsentReplies) }) tutorialCard(thread) } }", in: chat) == 1,
+        #expect(Self.count(".safeAreaBar(edge: .top, spacing: 0) { VStack(spacing: 0) { ChatSubjectLine(subject: subject(thread), labels: context.labels, landed: didInitialScroll, reportContent: { AISummariesNotice.reportContent(items: thread.items, unsent: unsentReplies) }) tutorialCard(thread) }", in: chat) == 1,
                 "the subject and the coach card form the chat's top bar")
         #expect(Self.count(".safeAreaInset(edge: .top", in: chat) == 0, "no plain top inset: it has no scroll-edge backdrop")
         let header = try Self.source("TabMail/Views/Chat/ChatHeaderView.swift")
