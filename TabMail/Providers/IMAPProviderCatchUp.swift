@@ -241,21 +241,26 @@ extension IMAPProvider {
 
         // A state from another epoch describes UIDs that no longer exist: drop it.
         let state = IMAPCatchUpState.decode(folder.catchUpState).flatMap { $0.epoch == epoch ? $0 : nil }
-        // With a bookmark of this epoch, its MODSEQ alone is the folder's
-        // freshness (S-5); without one, the listing's.
         let bookmark = IMAPChangeCursor.decode(folder.changeCursor)
-        let freshModSeq = bookmark.map { $0.uidValidity == epoch ? Int(exactly: $0.highestModSeq) : folder.lastKnownHighestModSeq }
-            ?? folder.lastKnownHighestModSeq
+        // Tracked: a bookmark held AND not owed a check. An owed folder can
+        // regain a bookmark from a change pass, and a tracked folder gets no
+        // daily check, so an owed folder whose listing completed unclean would
+        // never be listed again (#1062). Not `FolderChangeState.tracking`: that
+        // flag is off for a bookmarked folder before its baseline commits and
+        // can be left on with no bookmark (ADR-IOS-111 decision 4).
+        let isTracked = bookmark != nil && !FolderChangeState(raw: folder.changeState).selfHealDue
+        // The folder's freshness: for a tracked folder with a bookmark of this
+        // epoch, the bookmark's MODSEQ alone (#755); for every other folder, an
+        // owed one holding a bookmark included, the listing's, so a moved listing
+        // counter relists an owed folder whatever its bookmark says (#1062).
+        let freshModSeq: Int? = isTracked
+            ? bookmark.map { $0.uidValidity == epoch ? Int(exactly: $0.highestModSeq) : folder.lastKnownHighestModSeq }
+                ?? folder.lastKnownHighestModSeq
+            : folder.lastKnownHighestModSeq
         let plan = Self.catchUpPlan(
             state: state, freshModSeq: freshModSeq,
             now: context.clock(),
-            // Tracked: a bookmark held AND not owed a check. An owed folder can
-            // regain a bookmark from a change pass, and a tracked folder gets no
-            // daily check, so an owed folder whose listing completed unclean would
-            // never be listed again (#1062). Not `FolderChangeState.tracking`: that
-            // flag is off for a bookmarked folder before its baseline commits and
-            // can be left on with no bookmark (ADR-IOS-111 decision 4).
-            isTracked: bookmark != nil && !FolderChangeState(raw: folder.changeState).selfHealDue,
+            isTracked: isTracked,
             rawLapseCount: CatchUpLapse.read(folder.catchUpState))
         guard case .list(var listing) = plan else { return nil }
 

@@ -332,6 +332,103 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    @Test("An owed folder that regained a change bookmark, whose listing completed unclean, is listed again once its stored HIGHESTMODSEQ moves past the stamp though the bookmark has not moved; that listing loads the message, settles the mark and stamps the moved counter")
+    @MainActor
+    func uncleanOwedBookmarkedFolderRelistsWhenTheStoredCounterMoves() async throws {
+        let unreadable = 12
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-bookmarked-counter", server: server, local: server, tracked: true) { w in
+            var messages = server.map(Self.message)
+            messages[unreadable - 1] = Self.message(unreadable, date: "not a date")
+            w.server.setMessages(messages, in: Self.path)
+            w.server.suppressFetchInternalDate(in: Self.path, uids: [unreadable])
+            try await w.dropLocal([unreadable])
+            try await Self.storeServerModSeq(w)
+            try await w.markOwed()
+            // The change reader stores a new bookmark of the folder's epoch after
+            // the mark, before the owed listing starts.
+            try await w.backgroundChangePass()
+            let rawBookmark = try w.folder().changeCursor
+            let bookmark = try #require(IMAPChangeCursor.decode(rawBookmark), "setup: the owed folder regained a bookmark")
+            #expect(bookmark.uidValidity == UInt32(Self.epoch), "setup: the bookmark is of the folder's epoch")
+            #expect((try w.changeState()).selfHealDue, "setup: owed")
+
+            let clock = CatchUpTestClock()
+            await w.slice(clock: clock)
+            for _ in 0..<4 where try w.catchUpState()?.listing != nil {
+                clock.advance(by: Self.pastTheHold)
+                await w.slice(clock: clock)
+            }
+            #expect(try w.catchUpState()?.listing == nil, "setup: the listing completed")
+            #expect((try w.changeState()).selfHealDue, "setup: the unclean completion keeps the folder owed")
+            let stamp = try #require(try w.catchUpState()?.completionStamp, "setup: the unclean listing recorded its stamp")
+
+            // Control: with the stored counter at the stamp, an hour later nothing lists the folder.
+            clock.advance(by: Self.pastTheHold)
+            let quietStart = w.server.recordedCommands().count
+            await w.slice(clock: clock)
+            #expect(Self.listingRanges(w.server.recordedCommands().dropFirst(quietStart)).isEmpty,
+                    "setup: with the stored counter unmoved, no relisting before the daily check")
+
+            // A later window listing stores a newer HIGHESTMODSEQ; no change read
+            // runs, so the bookmark stays where it was.
+            let moved = stamp + 1
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET lastKnownHighestModSeq = ? WHERE id = ?", arguments: [moved, folderId])
+            }
+            let rawBefore = try w.folder().changeCursor
+            let bookmarkBefore = try #require(IMAPChangeCursor.decode(rawBefore), "setup: the folder still holds its bookmark")
+            #expect(Int(exactly: bookmarkBefore.highestModSeq) != moved, "setup: the bookmark's MODSEQ is not the moved counter")
+            w.server.suppressFetchInternalDate(in: Self.path, uids: [])
+            clock.advance(by: Self.pastTheHold)
+            let start = w.server.recordedCommands().count
+            await w.slice(clock: clock)
+            #expect(!Self.listingRanges(w.server.recordedCommands().dropFirst(start)).isEmpty,
+                    "an owed folder is relisted when its stored HIGHESTMODSEQ moves, though its bookmark did not, before the daily check")
+            for _ in 0..<4 where try w.catchUpState()?.listing != nil { await w.slice(clock: clock) }
+            #expect(try w.held().contains(unreadable), "the relisting loads the message once it reads")
+            #expect(!(try w.changeState()).selfHealDue, "the clean relisting settles the mark")
+            #expect(try w.catchUpState()?.completionStamp == moved, "the relisting stamps the moved stored counter")
+            #expect(try w.folder().changeCursor == rawBefore, "setup: no change read moved the bookmark")
+        }
+    }
+
+    @Test("A tracked folder's new listing stamps its same-epoch bookmark's MODSEQ, not the stored HIGHESTMODSEQ; with a bookmark of another epoch it stamps the stored HIGHESTMODSEQ",
+          arguments: [true, false])
+    @MainActor
+    func trackedListingStampsTheBookmarkOfItsEpoch(_ sameEpoch: Bool) async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("tracked-stamp-\(sameEpoch)", server: server, local: server, tracked: true) { w in
+            let folderId = w.folderId
+            let rawSetup = try w.folder().changeCursor
+            let setupBookmark = try #require(IMAPChangeCursor.decode(rawSetup), "setup: the folder holds a bookmark")
+            let bookmarkModSeq = try #require(Int(exactly: setupBookmark.highestModSeq))
+            // The two sources differ, so the stamp names the one the plan took.
+            let storedModSeq = bookmarkModSeq + 7
+            let bookmarkEpoch = sameEpoch ? setupBookmark.uidValidity : setupBookmark.uidValidity + 1
+            let bookmark = IMAPChangeCursor(
+                uidValidity: bookmarkEpoch, highestModSeq: setupBookmark.highestModSeq, uidNext: setupBookmark.uidNext,
+                messageCount: setupBookmark.messageCount).encoded
+            // A lapse makes the tracked folder's one whole-folder check due.
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeCursor = ?, lastKnownHighestModSeq = ? WHERE id = ?",
+                               arguments: [bookmark, storedModSeq, folderId])
+                try SyncEngine.markCatchUpLapse(folderId: folderId, db: db)
+            }
+            #expect(!(try w.changeState()).selfHealDue, "setup: not owed, so the folder is tracked")
+            let clock = CatchUpTestClock()
+            let start = w.server.recordedCommands().count
+            await w.slice(clock: clock)
+            #expect(!Self.listingRanges(w.server.recordedCommands().dropFirst(start)).isEmpty, "setup: the lapse started a listing")
+            for _ in 0..<10 where try w.catchUpState()?.listing != nil { await w.slice(clock: clock) }
+            #expect(try w.catchUpState()?.listing == nil, "setup: the listing completed")
+            let expected = sameEpoch ? bookmarkModSeq : storedModSeq
+            #expect(try w.catchUpState()?.completionStamp == expected,
+                    "a tracked folder's listing stamps \(sameEpoch ? "its same-epoch bookmark's MODSEQ" : "the stored HIGHESTMODSEQ, its bookmark being of another epoch")")
+        }
+    }
+
     @Test("A multi-slice owed listing: an earlier slice applied over-age, a later slice in time; the mark stays and the message loads at the daily check")
     @MainActor
     func overAgeEarlierSliceKeepsTheListingUnclean() async throws {

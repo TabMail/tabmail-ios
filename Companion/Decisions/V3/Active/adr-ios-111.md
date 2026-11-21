@@ -1124,7 +1124,13 @@ unchanged (RFC 7162).
    proof was not narrowed to omit such UIDs: one rule, no second path.
 7. **The turn.** A standalone `syncFolderMessages` lists inside `oneSyncAtATime`, which is re-entrant for the
    task holding it (`@TaskLocal heldSyncTurn`).
-8. The catch-up's MODSEQ freshness for a folder with a same-epoch bookmark is the bookmark's MODSEQ alone.
+8. The catch-up's MODSEQ freshness for a TRACKED folder with a same-epoch bookmark (one not owed a check) is
+   the bookmark's MODSEQ alone: its plan compares nothing (a tracked folder gets no MODSEQ check), and a new
+   listing stamps that MODSEQ. A folder owed a check is untracked in the plan even with a bookmark (amendment
+   2026-11-20 (#1062) above): its freshness stays its stored HIGHESTMODSEQ (`lastKnownHighestModSeq`), so a
+   moved listing counter relists it whatever its bookmark says. A bookmark of another epoch never supplies it.
+   *Superseded in place (2026-11-21):* "for a folder with a same-epoch bookmark", which also took the
+   bookmark's MODSEQ for an owed folder, so its relisting waited for a change read to move the bookmark.
    This amendment changes nothing about network conditions for scans (handled separately).
 
 **Consequences.** CONDSTORE servers get the change reader; the only new provider-neutral seam fields are
