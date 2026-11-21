@@ -296,8 +296,9 @@ same AI result, kept as long as the email itself is shown.
      builds. In a plain stack `onAppear` fires for every row at once, which is why the per-row ask
      uses `onScrollVisibilityChange` (`onGeometryChange` with `ChatRowVisibility` since 2026-11-16).
    - `defaultScrollAnchor(.bottom)` opens at the newest email. The landing `scrollTo` is issued once
-     the thread is loaded, and again on every container or content size change until a scroll of
-     any kind begins (memory 036: a first scroll can be dropped while the screen settles). The first
+     the thread is loaded, and again on every container, content or inset change until a scroll of
+     any kind begins (memory 036: a first scroll can be dropped while the screen settles; the top
+     bar settles its inset after the first pass, amended 2026-11-20). The first
      scroll records the members' unread state itself (`noteMembers`) before choosing where to land:
      SwiftUI runs the thread-loaded and members changes in either order, and the screen tests caught
      the chat opening at the bottom with the Unread line missing.
