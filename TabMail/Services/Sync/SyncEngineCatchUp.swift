@@ -382,7 +382,7 @@ extension SyncEngine {
             // Logged here, outside the write (no logDebug inside a write context).
             if let completed = result.completedListing, !completed.clean || latch.loadsSkipped,
                DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): listing completed unclean (passed over or skipped loads); an owed folder stays owed")
+                BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): listing completed unclean (passed over, top unknown (topUnknown), or skipped loads); an owed folder stays owed")
             }
             if !removedIds.isEmpty { removeHeadersFromFTS(removedIds) }
             if updatedFlags > 0 || !removedIds.isEmpty {

@@ -1114,7 +1114,14 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
 - **Stored top, current (2026-11-20).** `IMAPCatchUpState.Listing.top`, in the epoch-tagged state: the
   last UIDNEXT - 1 the listing's SELECTs reported, at least the last local UID, raised by every later
   listed SELECT. A listing's first call with none stored reads the folder's UIDNEXT (one request,
-  UIDVALIDITY checked) before its first range; every range is cut at the top. A listing with no stored top reads UIDNEXT first. When that read reports none (a nonconforming server; MIS-IOS-004), no top is stored and the call lists only up to the last local UID, so flags and removals are reconciled as before and an empty folder completes; such a listing completes only as not clean, so an owed folder stays owed, is listed again at the daily check, and nothing settles on an unknown top (IOS-CATCHUP-005). A later range SELECT without UIDNEXT keeps the top already learned. A change
+  UIDVALIDITY checked) before its first range; every range is cut at the top. Only that first call
+  ever reads UIDNEXT. When it reports none (a nonconforming server; MIS-IOS-004), no top is stored and
+  the listing records `Listing.topUnknown`: every call of it lists up to the last local UID with no
+  further UIDNEXT read (so a slice of one request still lists ranges), flags and removals are reconciled
+  as before, an empty folder completes, and the listing completes only as not clean, so an owed folder
+  stays owed, is listed again at the daily check, and nothing settles on an unknown top
+  (IOS-CATCHUP-005). A later range SELECT without UIDNEXT keeps the top already learned; one that
+  reports UIDNEXT stores it as the top, the listing goes on to it, and it still completes not clean. A change
   of the top alone is progress. *Superseded (2026-11-20):* "a SELECT without UIDNEXT is unknown: no top
   is stored, the folder stops for the call and stays owed", which also stopped every flag and removal
   check of a folder without a bookmark on such a server. Why: with no bookmark, each
@@ -1139,7 +1146,8 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
 - **Clean and unclean completion; retry.** A folder owed a check (`FolderChangeState.selfHealOwed`, set
   by `dropChangeBookmark(selfHealDue:)` after an unproven move) is settled ONLY by a CLEAN completed
   listing that started at or after the mark (`lapseCountAtStart >= selfHealLapse`). Unclean: anything
-  passed over (held, unanswered, a range moved past after its membership SEARCH kept failing), or loads
+  passed over (held, unanswered, a range moved past after its membership SEARCH kept failing), a
+  listing whose first UIDNEXT read reported none (`Listing.topUnknown`, 2026-11-20), or loads
   the apply skipped as an over-age read. An unclean completion keeps the folder owed and re-marks
   nothing: it is listed again at least daily, plus when its change counter moves past the stamp the unclean listing still records; loads dropped as over-age in ANY slice mark the saved state unclean through the provider-neutral key `CatchUpSkippedLoads.key`, and over-age is a one-way latch (`CatchUpReadLatch`) checked before the insert, in each insert chunk and in the transaction (amended d3/d4 2026-11-20; *superseded (d2):* "it is listed again at the daily full check, never hourly"; the d1 rule
   "settled by any completion, passed-over UIDs on the re-read list" is superseded: it recorded only the

@@ -307,11 +307,13 @@ extension IMAPMissingByUIDTests {
                 #expect(try w.catchUpState()?.listing?.top == nil, "#1062: no top is stored on an unknown UIDNEXT")
                 if !Self.listingRanges(Array(w.server.recordedCommands().dropFirst(before))).isEmpty { listingRuns += 1 }
             }
-            #expect(listingRuns <= 1, "#1062: at most one listing before the daily check is due: \(listingRuns)")
+            #expect(listingRuns == 1, "#1062: the first listing runs and completes, and no other before the daily check: \(listingRuns)")
+            #expect(try w.catchUpState()?.listing == nil, "#1062: the first listing completed")
             #expect((try w.changeState()).selfHealDue, "#1062: an unknown top never settles the owed mark")
             let asked = Self.listingRanges(Array(w.server.recordedCommands().dropFirst(start)))
             let above = asked.filter { $0.upperBound > lastLocal }
             #expect(above.isEmpty, "#1062: nothing above the last local UID \(lastLocal) is listed: \(above)")
+            #expect(asked.contains { $0.upperBound == lastLocal }, "#1062: the listing reaches the last local UID \(lastLocal): \(asked)")
             try w.expectNotHeld(missing, "#1062: nothing is loaded above an unknown top")
             // The daily check lists it once more, still unsettled.
             clock.advance(by: Self.pastTheNextCheck)
@@ -323,18 +325,32 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    @Test("A server whose SELECT omits UIDNEXT: a folder not owed a check still gets its flag changes and removals from the catch-up")
+    /// Whether `commands` hold a SELECT and no UID command: a call that only read UIDNEXT.
+    static func onlyReadUidNext(_ commands: some Collection<String>) -> Bool {
+        let upper = commands.map { $0.uppercased() }
+        return upper.contains { $0.contains("SELECT") } && !upper.contains { $0.contains("UID ") }
+    }
+
+    @Test("A server whose SELECT omits UIDNEXT: a folder not owed a check, at its daily check, reads UIDNEXT, lists up to its highest local UID and gets its flag changes and removals")
     @MainActor
     func unknownTopStillReconcilesFlagsAndRemovals() async throws {
         let flagged = 20, expunged = 21
         let server = Array(1...40)
+        let highest = try #require(server.last)
         try await Self.withWorld("no-uidnext-flags", server: server, local: server) { w in
             w.server.suppressSelectUidNext(for: Self.path)
             defer { w.server.restoreSelectUidNext(for: Self.path) }
             w.server.setMessages(server.filter { $0 != expunged }.map { Self.message($0) }, in: Self.path)
             w.server.setFlags(["\\Seen"], in: Self.path, uid: flagged)
             let clock = CatchUpTestClock()
+            // The setup's run completed the folder's listing: the next one is the daily check.
+            clock.advance(by: Self.pastTheNextCheck)
+            let start = w.server.recordedCommands().count
             await w.slice(clock: clock)
+            let commands = Array(w.server.recordedCommands().dropFirst(start))
+            #expect(commands.contains { $0.uppercased().contains("SELECT") }, "setup: the UIDNEXT read was sent")
+            let asked = Self.listingRanges(commands)
+            #expect(asked.contains { $0.upperBound == highest }, "#1062: a listing range was sent, up to the highest local UID: \(asked)")
             let folderId = w.folderId
             let isRead = try await w.pool.read { db in
                 try Bool.fetchOne(db, sql: "SELECT isRead FROM messageHeader WHERE folderId = ? AND messageId = ?",
@@ -342,6 +358,61 @@ extension IMAPMissingByUIDTests {
             }
             #expect(isRead == true, "#1062: the flag change is applied under an unknown top")
             try w.expectHeldExactly(server.filter { $0 != expunged }, "#1062: the removal is applied under an unknown top")
+        }
+    }
+
+    @Test("A server whose SELECT omits UIDNEXT, one request per call: the listing reads UIDNEXT exactly once, still lists its ranges, loads what is missing up to the last local UID and completes, not clean")
+    @MainActor
+    func unknownTopOneRequestPerCallCompletes() async throws {
+        let server = Self.carryServer
+        try await Self.withWorld("no-uidnext-one-request", server: server, local: server,
+                                 rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
+            try await w.dropLocal(Self.carryMissing.filter { $0 < server.count })
+            try await w.markOwed()
+            w.server.suppressSelectUidNext(for: Self.path)
+            defer { w.server.restoreSelectUidNext(for: Self.path) }
+            let clock = CatchUpTestClock()
+            let bound = Self.carryRequestsNeeded + 2
+            var calls = 0, uidNextReads = 0
+            while try w.held() != server || w.catchUpState()?.listing != nil, calls < 2 * bound {
+                let before = w.server.recordedCommands().count
+                await w.slice(maxRequests: 1, clock: clock)
+                calls += 1
+                if Self.onlyReadUidNext(w.server.recordedCommands().dropFirst(before)) { uidNextReads += 1 }
+            }
+            #expect(calls <= bound, "#1062: one request per call completes within \(bound) calls: \(calls)")
+            #expect(uidNextReads == 1, "#1062: one UIDNEXT read per listing: \(uidNextReads)")
+            try w.expectHeldExactly(server, "#1062 unknown top, one request per call")
+            #expect((try w.changeState()).selfHealDue, "#1062: completed not clean: the owed mark stays")
+        }
+    }
+
+    @Test("A listing that began with an unknown top, then a SELECT reports UIDNEXT: the top is stored, the listing goes on to it and loads the mail above the last local UID, and completes not clean")
+    @MainActor
+    func laterUidNextStoresTheTopButStaysUnclean() async throws {
+        let server = Self.carryServer
+        let missing = Array((server.count - 5)...server.count)
+        try await Self.withWorld("no-uidnext-then-uidnext", server: server, local: server,
+                                 rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
+            try await w.dropLocal(missing)
+            try await w.markOwed()
+            let clock = CatchUpTestClock()
+            w.server.suppressSelectUidNext(for: Self.path)
+            // The listing's one UIDNEXT read reports none.
+            await w.slice(maxRequests: 1, clock: clock)
+            #expect(try w.catchUpState()?.listing?.topUnknown == true, "setup: the top is unknown")
+            w.server.restoreSelectUidNext(for: Self.path)
+            var storedTop: Int?
+            var calls = 0
+            let bound = Self.carryRequestsNeeded + 2
+            while try w.catchUpState()?.listing != nil, calls < 2 * bound {
+                await w.slice(maxRequests: 1, clock: clock)
+                calls += 1
+                if let top = try w.catchUpState()?.listing?.top { storedTop = top }
+            }
+            #expect(storedTop == server.last, "#1062: a later SELECT's UIDNEXT is stored as the top: \(String(describing: storedTop))")
+            try w.expectHeldExactly(server, "#1062: the mail above the last local UID loads once the top is known")
+            #expect((try w.changeState()).selfHealDue, "#1062: a listing that began on an unknown top completes not clean")
         }
     }
 

@@ -1027,7 +1027,7 @@ The self-heal pass an unproven move owes a folder (`healFoldersAfterAnUnprovenMo
 amendment 2026-11-20): a CLEAN completed listing that started after the mark loads every missing UID
 in the held range by UID and calls `markListingDue`, so the next scheduled full sync lists the folder
 and `commitChangeBaseline` tracks it again. An unclean completion (a UID passed over at the hold
-bound, or loads skipped as an over-age read in any slice of the listing) keeps the folder owed and
+bound, a listing whose first UIDNEXT read reported none (`topUnknown`, 2026-11-20), or loads skipped as an over-age read in any slice of the listing) keeps the folder owed and
 re-marks nothing: an owed folder counts as untracked in the catch-up plan even with a bookmark, so it
 is relisted at least daily, plus when its change counter (HIGHESTMODSEQ) moves past the stamp the
 unclean listing still records. A clean completion that started before the mark re-marks the lapse once

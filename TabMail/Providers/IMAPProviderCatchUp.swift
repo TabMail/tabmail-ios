@@ -81,14 +81,17 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
         /// folder's UIDNEXT before its first range. When that read reports none,
         /// no top is stored and the call lists only up to the last local UID
         /// (`topUnknown`). A later range SELECT without UIDNEXT keeps the top
-        /// already learned. A change of it is progress.
+        /// already learned; one that reports UIDNEXT stores it, and the listing
+        /// goes on to it but stays not clean. A change of it is progress.
         /// It lives in this state, so it is never used under another UIDVALIDITY
         /// (the state's `epoch`). Unused while a change bookmark bounds the
         /// listing (`bookmarkUpper`).
         var top: Int?
-        /// A UIDNEXT read of this listing reported none (#1062): the listing
-        /// may complete, but never clean, so an owed folder stays owed and is
-        /// listed again at the daily check; nothing settles on an unknown top.
+        /// This listing's first UIDNEXT read reported none (#1062): every call of
+        /// it lists up to the last local UID (or a top a later SELECT reports)
+        /// with no further UIDNEXT read, and it may complete, but never clean,
+        /// so an owed folder stays owed and is listed again at the daily check;
+        /// nothing settles on an unknown top.
         var topUnknown: Bool?
         /// A range this listing asked and could not finish in the call that
         /// asked it (#1062): the budget ran out before its membership proof or
@@ -311,7 +314,11 @@ extension IMAPProvider {
         // `loadsFrom` stays only the boundary below which nothing is loaded.
         let lower = [loadsFrom, firstLocal].compactMap { $0 }.min()
         let bookmarkUpper = bookmark.flatMap { $0.uidValidity == epoch ? Int($0.uidNext) - 1 : nil }
+        // A listing whose first UIDNEXT read reported none keeps that answer for
+        // all its calls: it lists up to the last local UID and never reads
+        // UIDNEXT again, so a slice of one request still lists ranges (#1062).
         var upper: Int? = (bookmarkUpper ?? listing.top).map { max($0, lastLocal ?? 0) }
+            ?? (listing.topUnknown == true ? lastLocal ?? 0 : nil)
         let holdSeconds = SyncConfig.backfillPageHoldMinutes * 60
         // The cap before this call first raised it: restored if the call makes
         // no progress, so a call that moves nothing never widens the next try.
