@@ -1202,9 +1202,14 @@ extension AccountManager {
             // only the local lie about what that withholding meant. When the
             // admission returns, the ordinary reply-detect sweep re-establishes the
             // flag from the server's own state.
-            let flagAdmission = try AccountManager.admittedOrdinaryActionTargets(
-                [original], accountId: original.accountId,
-                folderPath: original.folderPath, db: db)
+            // No gesture stamp: the original is read here, at execution time,
+            // not from a row someone was shown, so a stamp inherited from the
+            // task that started this drain must not refuse it.
+            let flagAdmission = try FolderResetGeneration.$gestureStamp.withValue(nil) {
+                try AccountManager.admittedOrdinaryActionTargets(
+                    [original], accountId: original.accountId,
+                    folderPath: original.folderPath, db: db)
+            }
             if outbox.isForward {
                 if let flagAdmission {
                     original.isForwarded = true
@@ -1398,7 +1403,7 @@ extension AccountManager {
                                 && Column("role") == FolderRole.sent.rawValue)
                             .fetchOne(db)
                     }) {
-                        try await queue.execute(priority: .userAction) {
+                        _ = try await queue.execute(priority: .userAction) {
                             try await self.syncEngine.syncFolderMessages(
                                 folder: folder, provider: queue.provider)
                         }
@@ -1792,28 +1797,111 @@ extension AccountManager {
             //      the mail is delivered anyway (Proof A, the deadline). That is the IOS-OUTBOX-006 end
             //      state (Outbox Reliability Rules 3 and 10), which nothing recovers.
             // Keep it synchronous.
-            let outcome: (deleted: Bool, dir: String?) = try AppDatabase.dbPool.write { db in
-                guard let msg = try OutboxMessage.fetchOne(db, key: messageId),
-                      msg.outboxStatus != .sending,
-                      msg.sentAt == nil,
-                      try OutboxMessage.deleteOne(db, key: messageId) else {
-                    return (false, nil)
-                }
-                return (true, msg.attachmentsDirName)
+            let outcome = try AppDatabase.dbPool.write { db in
+                try Self.cancelHeldOutboxRow(db: db, messageId: messageId)
             }
             guard outcome.deleted else { return false }
-            if let dirName = outcome.dir {
-                let dir = OutboxMessage.attachmentsBaseDir
-                    .appendingPathComponent(dirName, isDirectory: true)
-                try? FileManager.default.removeItem(at: dir)
-            }
-            NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
-            Task { await self.drainOutbox() }
+            finishOutboxCancellation(attachmentsDirName: outcome.dir)
             return true
         } catch {
             BackgroundSyncLogger.logDebug("[Outbox] ERROR: Failed to cancel \(messageId): \(error)")
             return false
         }
+    }
+
+    /// The database half of `discardOutboxMessageConfirmed`, so it can join a
+    /// larger write: delete the row only while it is unsent and not sending.
+    /// Returns whether it was deleted and the attachment directory it owned.
+    static func cancelHeldOutboxRow(
+        db: Database, messageId: String
+    ) throws -> (deleted: Bool, dir: String?) {
+        guard let msg = try OutboxMessage.fetchOne(db, key: messageId),
+              msg.outboxStatus != .sending,
+              msg.sentAt == nil,
+              try OutboxMessage.deleteOne(db, key: messageId) else {
+            return (false, nil)
+        }
+        return (true, msg.attachmentsDirName)
+    }
+
+    /// The work after an Outbox cancellation commits.
+    nonisolated func finishOutboxCancellation(attachmentsDirName: String?) {
+        if let dirName = attachmentsDirName {
+            let dir = OutboxMessage.attachmentsBaseDir
+                .appendingPathComponent(dirName, isDirectory: true)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
+        Task { await self.drainOutbox() }
+    }
+
+    /// Undo Send's confirmed cancellation, with the kept draft returned to Drafts
+    /// in the SAME write, so no committed state has the Outbox row gone and the
+    /// message in neither the Outbox nor Drafts (ADR-IOS-065, as superseded on v3).
+    ///
+    /// Synchronous like `discardOutboxMessageConfirmed`, for the same reason
+    /// (its comment above): the cancellation must land in the Undo tap's own
+    /// main-actor turn, before the drain's claim.
+    ///
+    /// In one transaction: the cancellation; then, in a savepoint, the kept row
+    /// saved at its own generation (`DraftStore.admitSave` with that generation as
+    /// both new and expected, so it neither rotates nor is re-minted, and a row
+    /// that changed generation is refused) and its Drafts admission
+    /// (`admitDraftToDrafts`, the same write `queueDraftSave` makes). If the
+    /// savepoint fails, the cancellation still commits and `returnedToDrafts` is
+    /// false; the caller opens the compose as unsaved so Close asks to save it.
+    /// `cancelled` false means nothing changed at all.
+    nonisolated func discardOutboxMessageReturningDraftConfirmed(
+        _ messageId: String,
+        authority: PendingSendService.RetainedDraftAuthority
+    ) -> (cancelled: Bool, returnedToDrafts: Bool) {
+        do {
+            // A failed return is reported after the write commits: a log line
+            // written inside the write would outlive a rollback.
+            let outcome = try AppDatabase.dbPool.write {
+                db -> (cancel: (deleted: Bool, dir: String?), admission: DraftsAdmission?, returnError: Error?) in
+                let cancel = try Self.cancelHeldOutboxRow(db: db, messageId: messageId)
+                guard cancel.deleted else { return (cancel, nil, nil) }
+                var admission: DraftsAdmission?
+                var returnError: Error?
+                do {
+                    try db.inSavepoint {
+                        admission = try Self.returnKeptDraftToDrafts(db: db, authority: authority)
+                        return admission == nil ? .rollback : .commit
+                    }
+                } catch {
+                    admission = nil
+                    returnError = error
+                }
+                return (cancel, admission, returnError)
+            }
+            if let returnError = outcome.returnError {
+                BackgroundSyncLogger.logDebug("[UndoSend] kept draft not returned to Drafts: \(authority.draftId) \(returnError)")
+            }
+            guard outcome.cancel.deleted else { return (false, false) }
+            finishOutboxCancellation(attachmentsDirName: outcome.cancel.dir)
+            if let admission = outcome.admission {
+                Task { await self.finishDraftsAdmission(admission) }
+            }
+            return (true, outcome.admission != nil)
+        } catch {
+            BackgroundSyncLogger.logDebug("[Outbox] ERROR: Failed to cancel \(messageId): \(error)")
+            return (false, false)
+        }
+    }
+
+    /// The kept row through the normal draft save, inside the caller's write.
+    /// `nil` when the row is gone or changed, or the save was not applied.
+    static func returnKeptDraftToDrafts(
+        db: Database, authority: PendingSendService.RetainedDraftAuthority
+    ) throws -> DraftsAdmission? {
+        guard var draft = try Draft.fetchOne(db, key: authority.draftId),
+              authority.matches(draft) else { return nil }
+        draft.updatedAt = max(draft.updatedAt, Date().timeIntervalSince1970)
+        guard try DraftStore.admitSave(
+            draft, newEpoch: authority.instanceEpoch,
+            expectedPredecessor: authority.instanceEpoch, db: db) == .applied else { return nil }
+        return try admitDraftToDrafts(db: db, draftId: authority.draftId, accountId: authority.accountId)
     }
 
     #if DEBUG

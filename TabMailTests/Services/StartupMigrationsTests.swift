@@ -87,7 +87,7 @@ struct StartupMigrationsTests {
                 CREATE TABLE folder (
                     id TEXT, backfillComplete INTEGER, oldestSyncedDate DOUBLE,
                     lastKnownUidNext INTEGER, backfillUidCursor INTEGER, backfillPageToken TEXT,
-                    backfillPageHeldSince DATETIME
+                    backfillPageHeldSince DATETIME, totalCount INTEGER DEFAULT 0, lastKnownHighestModSeq INTEGER
                 )
                 """)
             try db.execute(sql: "CREATE TABLE account (id TEXT, lastFullSyncAt DOUBLE)")
@@ -172,8 +172,9 @@ struct StartupMigrationsTests {
             try db.execute(sql: "INSERT INTO messageHeader (id) VALUES ('h1')")
             try db.execute(sql: "INSERT INTO messageBody (id) VALUES ('b1')")
             try db.execute(sql: """
-                INSERT INTO folder (id, backfillComplete, backfillPageToken, backfillPageHeldSince)
-                VALUES ('f1', 1, 'saved-page-token', '2099-01-01 00:00:00.000')
+                INSERT INTO folder (id, backfillComplete, backfillPageToken, backfillPageHeldSince,
+                                    totalCount, lastKnownUidNext, lastKnownHighestModSeq)
+                VALUES ('f1', 1, 'saved-page-token', '2099-01-01 00:00:00.000', 7, 8, 9)
                 """)
         }
 
@@ -189,6 +190,12 @@ struct StartupMigrationsTests {
         }
         #expect(token == nil)
         #expect(heldSince == nil, "the reset left the cleared page's hold time behind")
+        // The wiped mail's listing tuple is forgotten: no STATUS or MODSEQ can match it.
+        let counters = try await queue.read { db -> (Int?, Int?) in
+            let row = try Row.fetchOne(db, sql: "SELECT lastKnownUidNext, lastKnownHighestModSeq FROM folder WHERE id = 'f1'")
+            return (row?["lastKnownUidNext"], row?["lastKnownHighestModSeq"])
+        }
+        #expect(counters.0 == nil && counters.1 == nil, "the reset forgets the listing's UIDNEXT and MODSEQ")
         #expect(ftsResets == 1)  // FTS reset fired in lockstep with the deletes
         #expect(UserDefaults.standard.bool(forKey: "didCleanResetMessageData_v1") == true)
 

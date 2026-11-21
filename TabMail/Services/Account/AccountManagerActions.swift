@@ -182,20 +182,47 @@ struct RoleMoveAdmission: Sendable, Equatable {
 /// directions (ADR-IOS-061 item E); a `(fromAddress, subject, date)` substitute
 /// was likewise authored (`94fac3e79`) and reverted (`3bd9f0bac`). Do not
 /// reintroduce one. The residual is registered as `IOS-IDENTITY-001`.
+///
+/// ⚑ THE EPOCH ARM (tabmail-ios #538) IS NOT A SUBSTITUTE CONTENT WITNESS. A row
+/// with no usable Message-ID but a PROVEN address epoch
+/// (`MessageHeader.observedUidValidity`) carries that epoch instead. It says
+/// nothing about content, so an ordinary duplicate cannot forge it; it records
+/// which UID numbering the captured address belonged to. A UIDVALIDITY turnover
+/// that re-seats a different message under the same composite id gives the
+/// impostor the FRESH epoch, so a present, different current epoch is proof
+/// that the address no longer names the captured message. It refuses ONLY on
+/// that positive fact: a current row whose epoch is nil (address unproven,
+/// which several sync and optimistic writers set legitimately) is NOT refused,
+/// so the arm never widens refusal beyond a proven re-seat. When a usable
+/// Message-ID exists it alone is the witness, because the same message may be
+/// re-seated at the same UID under a new epoch and the content witness admits
+/// that correctly.
 struct ExpectedMessageIdentity: Sendable, Equatable {
-    /// Always a normalized, non-empty RFC 822 Message-ID — normalized ONCE, here,
-    /// through the tree's single identity-COMPARISON normalizer.
-    let rfc822MessageId: String
+    enum Witness: Sendable, Equatable {
+        /// A normalized, non-empty RFC 822 Message-ID — normalized ONCE, here,
+        /// through the tree's single identity-COMPARISON normalizer.
+        case rfc822(String)
+        /// The positive UIDVALIDITY under which the captured address was proven.
+        /// Used only when the message has no usable Message-ID.
+        case addressEpoch(Int)
+    }
 
-    init?(capturedRfc822MessageId: String?) {
-        guard let normalized = MessageIdentity.comparableRfc822Identity(capturedRfc822MessageId) else {
+    let witness: Witness
+
+    init?(capturedRfc822MessageId: String?, capturedObservedUidValidity: Int? = nil) {
+        if let normalized = MessageIdentity.comparableRfc822Identity(capturedRfc822MessageId) {
+            self.witness = .rfc822(normalized)
+        } else if let epoch = capturedObservedUidValidity, epoch > 0 {
+            self.witness = .addressEpoch(epoch)
+        } else {
             return nil
         }
-        self.rfc822MessageId = normalized
     }
 
     init?(header: MessageHeader) {
-        self.init(capturedRfc822MessageId: header.rfc822MessageId)
+        self.init(
+            capturedRfc822MessageId: header.rfc822MessageId,
+            capturedObservedUidValidity: header.observedUidValidity)
     }
 
     /// True when `header` is the same physical message this identity was captured
@@ -243,8 +270,17 @@ struct ExpectedMessageIdentity: Sendable, Equatable {
     ///   original miss was a `existing.rfc822MessageId =` search that was
     ///   structurally blind to the orphan-reclaim arm's `orphaned.` receiver
     ///   (`MIS-007`).
+    ///
+    /// The epoch arm refuses only a PRESENT, DIFFERENT current epoch — see the
+    /// type doc.
     func matches(_ header: MessageHeader) -> Bool {
-        rfc822MessageId == MessageIdentity.comparableRfc822Identity(header.rfc822MessageId)
+        switch witness {
+        case .rfc822(let rfc822MessageId):
+            return rfc822MessageId == MessageIdentity.comparableRfc822Identity(header.rfc822MessageId)
+        case .addressEpoch(let epoch):
+            guard let current = header.observedUidValidity, current > 0 else { return true }
+            return current == epoch
+        }
     }
 
     /// Zero-DB construction from headers a producer ALREADY holds. Ids with no
@@ -674,6 +710,16 @@ extension AccountManager {
         folderPath: String,
         db: Database
     ) throws -> (messages: [MessageHeader], providerIds: [String], observedUidValidity: Int?)? {
+        // The folder finished an id reset after this gesture's view of the row
+        // was taken: the row at this id may be a different email the resync
+        // re-seated with the new epoch, which the epoch check below would admit.
+        guard !FolderResetGeneration.refuses(
+            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)) else {
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] refused: '\(folderPath)' was reset after the gesture (account \(accountId.prefix(8)))")
+            }
+            return nil
+        }
         guard let account = try Account.fetchOne(db, key: accountId) else { return nil }
 
         // Demo is stored as IMAP but is backed by DemoProvider: its local ids are
@@ -773,6 +819,14 @@ extension AccountManager {
 
         func all(_ disposition: RoleMoveDisposition) -> [String: RoleMoveDisposition] {
             Dictionary(uniqueKeysWithValues: rejected.map { ($0.id, disposition) })
+        }
+
+        // Refused because the folder finished an id reset after the gesture:
+        // the message the user acted on is gone, and a retry (under a fresh
+        // stamp) would admit its replacement. Terminal, never retained.
+        if FolderResetGeneration.refuses(
+            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)) {
+            return all(.terminalStale)
         }
 
         guard let account = try Account.fetchOne(db, key: accountId) else { return all(.retainedForRetry) }
@@ -1114,9 +1168,15 @@ extension AccountManager {
         after predecessor: PendingOperation,
         result: MoveFinishResult
     ) async {
-        await enqueueWriteAfterPriorAdmissions { [self, predecessor, result] in
-            await materializeDeferredMoveSuccessorsInFIFO(
-                after: predecessor, result: result)
+        // No reset-generation stamp: the inverse's source address is the one the
+        // provider just proved (`result`, with its own epoch), not a row someone
+        // was shown, and a stamp inherited from whatever task started the drain
+        // belongs to an unrelated earlier gesture.
+        await FolderResetGeneration.$gestureStamp.withValue(nil) {
+            await enqueueWriteAfterPriorAdmissions { [self, predecessor, result] in
+                await materializeDeferredMoveSuccessorsInFIFO(
+                    after: predecessor, result: result)
+            }
         }
     }
 
@@ -1146,7 +1206,10 @@ extension AccountManager {
                       let row = try MessageHeader.fetchOne(db, key: record.newHeaderId),
                       row.accountId == predecessor.accountId,
                       row.folderPath == predecessor.destinationPath,
-                      row.messageId == record.newProviderMessageId
+                      row.messageId == record.newProviderMessageId,
+                      // The destination the provider proved, not a different
+                      // email an id reset has since re-seated at that id.
+                      row.observedUidValidity == record.newObservedUidValidity
                 else { continue }
                 rows[successor.oldHeaderId] = row
             }
@@ -1288,10 +1351,12 @@ extension AccountManager {
                         assignments.append(Column("actionTag").set(to: nil as String?))
                         assignments.append(Column("tagSortOrder").set(to: 99))
                     }
+                    // The cancelled move ends through the exit rule every end takes
+                    // (ADR-IOS-111 item 11), while its rows still sit where it put them.
+                    try AccountOperationExecutor.deleteRetiringOperation(predecessor, db: db)
                     try MessageHeader
                         .filter(msgs.map(\.id).contains(Column("id")))
                         .updateAll(db, assignments)
-                    _ = try PendingOperation.deleteOne(db, key: predecessor.id)
 
                     try Self.restoreInboxAICacheAfterOptimisticMove(
                         headerIds: msgs.map(\.id), accountId: accountId,
@@ -1451,11 +1516,26 @@ extension AccountManager {
         // the net cancel-out. Fold it before re-resolving the deliberately
         // optimistic row (whose durable folder still reflects the predecessor).
         let requestedIds = Set(messages.map(\.id))
+        // A member whose view was read before its folder's UIDVALIDITY reset
+        // names the email re-seated at that id. Refuse it before coalescing,
+        // so it can never cancel or retarget a deferred Undo recorded for the
+        // replacement (ADR-IOS-115). Unstamped callers get no verdict.
+        // The id is checked too: a caller that re-resolves by id (the AI cards)
+        // passes an optimistically moved row whose folderPath is not the shown one.
+        let staleIds = Set(messages.filter {
+            FolderResetGeneration.refuses(folderId: MessageIdentity.folderId(
+                accountId: $0.accountId, folderPath: $0.folderPath))
+                || FolderResetGeneration.refuses(headerId: $0.id, accountId: $0.accountId)
+        }.map(\.id))
+        outcome.set(.terminalStale, ids: Array(staleIds))
         let coalesced = coalesceDeferredMoves(
-            headerIds: requestedIds, destinationPath: destinationPath)
+            headerIds: requestedIds.subtracting(staleIds), destinationPath: destinationPath)
         outcome.merge(coalesced.admission)
-        let remainingMessages = messages.filter { !coalesced.ids.contains($0.id) }
+        let remainingMessages = messages.filter {
+            !coalesced.ids.contains($0.id) && !staleIds.contains($0.id)
+        }
         guard !remainingMessages.isEmpty else {
+            await Self.announceMovesRefused(staleIds)
             BackgroundSyncLogger.logInbox(
                 "[RoleActionTrace] manager.move phase=coalescedAll "
                     + "destination=\(destinationPath) outcome=\(outcome.diagnosticSummary)")
@@ -1510,7 +1590,7 @@ extension AccountManager {
             BackgroundSyncLogger.logInbox(
                 "[RoleActionTrace] manager.move phase=noMovable destination=\(destinationPath) "
                     + "outcome=\(outcome.diagnosticSummary)")
-            await Self.announceMovesRefused(Set(unresolvedIds))
+            await Self.announceMovesRefused(Set(unresolvedIds).union(staleIds))
             return outcome
         }
         await ensureDurable(movable)
@@ -2192,7 +2272,8 @@ extension AccountManager {
                               accountId: accountId, folderPath: forwardDestinationPath)
                     else { return UndoMoveWriteResult() }
                     if let expected = ExpectedMessageIdentity(
-                        capturedRfc822MessageId: member.sourceRfc822MessageId),
+                        capturedRfc822MessageId: member.sourceRfc822MessageId,
+                        capturedObservedUidValidity: member.addressObservedUidValidity),
                        !expected.matches(row) {
                         if DebugModeManager.isLoggingEnabled() {
                             print("[UndoStack] undoMove refused \(member.originalHeaderId): the row at that address is not the message the gesture moved (C3 content witness)")
@@ -2296,7 +2377,9 @@ extension AccountManager {
                               })
                         else { return UndoMoveWriteResult() }
                     }
-                    _ = try PendingOperation.deleteOne(db, key: annihilable[0].id)
+                    // The cancelled move ends through the exit rule every end takes
+                    // (ADR-IOS-111 item 11).
+                    try AccountOperationExecutor.deleteRetiringOperation(annihilable[0], db: db)
                 } else {
                     // A related but non-exact bundle is not evidence the
                     // forward completed. Refuse partial/cross-mailbox/
@@ -2453,10 +2536,7 @@ extension AccountManager {
 
     /// Look up the Drafts folder path for an account.
     func draftsFolderPath(accountId: String) async throws -> String {
-        try await dbPool.read { db in
-            try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.drafts.rawValue)
-                .fetchOne(db)?.path ?? "Drafts"
-        }
+        try await dbPool.read { db in try Self.draftsFolderPath(db: db, accountId: accountId) }
     }
 
     /// Queue a draft save to the server's Drafts folder via PendingOperation.
@@ -2465,115 +2545,224 @@ extension AccountManager {
     @discardableResult
     func queueDraftSave(draftId: String, accountId: String) async -> Bool {
         do {
-            let folderPath = try await draftsFolderPath(accountId: accountId)
-            let ftsInfo = try await dbPool.write {
-                db -> (record: FTSHeaderRecord, bodyText: String)? in
-                guard let draft = try Draft.fetchOne(db, key: draftId),
-                      draft.accountId == accountId,
-                      let instanceEpoch = draft.instanceEpoch,
-                      !instanceEpoch.isEmpty else {
-                    return nil
-                }
-
-                let folderId = "\(accountId):\(folderPath)"
-                let placeholderMessageId = PendingOperation.draftPlaceholderMessageId(
-                    draftId: draft.id, instanceEpoch: instanceEpoch)
-                let placeholderHeaderId = PendingOperation.draftPlaceholderHeaderPK(
-                    accountId: accountId,
-                    draftsFolderPath: folderPath,
-                    draftId: draft.id,
-                    instanceEpoch: instanceEpoch)
-                let account = try Account.fetchOne(db, key: accountId)
-                let senderEmail = account?.emailAddress ?? accountId
-                let senderName = account?.displayName ?? senderEmail
-                let snippet = EmailFilter.snippetFromPlainText(draft.body)
-                // Header text the Drafts list, search and Reply All read: only the
-                // entries that are addresses, each written to read back as itself
-                // (ADR-IOS-092). The draft keeps every entry as written.
-                let to = RecipientEntry(draft.toArray).headerText
-                let cc = RecipientEntry(draft.ccArray).headerText
-                let bcc = RecipientEntry(draft.bccArray).headerText
-
-                var header = try MessageHeader.fetchOne(db, key: placeholderHeaderId)
-                    ?? MessageHeader(
-                        messageId: placeholderMessageId,
-                        subject: draft.subject,
-                        from: senderName,
-                        fromAddress: senderEmail,
-                        to: to,
-                        date: Date(timeIntervalSince1970: draft.updatedAt),
-                        snippet: snippet,
-                        folderId: folderId,
-                        accountId: accountId,
-                        folderPath: folderPath,
-                        isInInbox: false)
-                header.subject = draft.subject
-                header.to = to
-                header.cc = cc
-                header.bcc = bcc
-                header.snippet = snippet
-                header.date = Date(timeIntervalSince1970: draft.updatedAt)
-                // On a date-windowed provider, sync judges this placeholder stale
-                // only when its provider date is at or above the oldest draft on
-                // a partial Drafts page, which holds the newest drafts. Following
-                // each save keeps it there; left at its first save, it falls
-                // below that page once enough newer drafts exist and is not
-                // reconciled away while that lasts.
-                header.providerDate = header.date
-                header.isRead = true
-                header.observedUidValidity = nil
-                try header.save(db)
-                try MessageBody(
-                    contentKey: ContentKey(rawValue: placeholderHeaderId),
-                    htmlContent: MessageBody.plainTextToHTML(draft.body)
-                ).save(db)
-
-                var saveDraftOp = PendingOperation.draftSave(
-                    draftId: draft.id,
-                    accountId: accountId,
-                    folderPath: folderPath,
-                    instanceEpoch: instanceEpoch)
-                try saveDraftOp.insert(db)
-
-                return (
-                    FTSHeaderRecord(
-                        contentKey: ContentKey(rawValue: placeholderHeaderId),
-                        headerId: placeholderHeaderId,
-                        messageId: placeholderMessageId,
-                        subject: draft.subject,
-                        from: "\(senderName) <\(senderEmail)>",
-                        to: to,
-                        cc: cc,
-                        bcc: bcc,
-                        dateMs: Int64(draft.updatedAt * 1000),
-                        folderId: folderId),
-                    draft.body)
+            let admission = try await dbPool.write { db in
+                try Self.admitDraftToDrafts(db: db, draftId: draftId, accountId: accountId)
             }
-
-            guard let ftsInfo else { return false }
-            do {
-                _ = try await SearchIndex.shared.indexHeaders([ftsInfo.record])
-                if !ftsInfo.bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    _ = try await SearchIndex.shared.updateBodies([(
-                        contentKey: ftsInfo.record.contentKey,
-                        body: ftsInfo.bodyText)])
-                }
-            } catch {
-                BackgroundSyncLogger.logDebug("[Queue] WARNING: FTS indexing failed for draft \(ftsInfo.record.headerId): \(error)")
-            }
-            try? await dbPool.write { db in
-                try db.execute(
-                    sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
-                    arguments: [ftsInfo.record.headerId])
-            }
-            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-            Task { await drainPendingQueue() }
+            guard let admission else { return false }
+            await finishDraftsAdmission(admission)
             return true
         } catch {
             BackgroundSyncLogger.logDebug("[Queue] ERROR: queueDraftSave failed: \(error)")
             return false
         }
     }
+
+    /// What one Drafts admission wrote, for the work that follows its commit.
+    struct DraftsAdmission: Sendable {
+        let record: FTSHeaderRecord
+        let bodyText: String
+    }
+
+    /// The Drafts folder path for an account, inside a transaction.
+    static func draftsFolderPath(db: Database, accountId: String) throws -> String {
+        try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.drafts.rawValue)
+            .fetchOne(db)?.path ?? "Drafts"
+    }
+
+    /// The database half of `queueDraftSave`, so it can join a larger write:
+    /// the row's Drafts entry (its uploaded entry when one exists under the
+    /// row's server id, otherwise the optimistic placeholder at the row's own
+    /// generation) with its body, and the `.saveDraft` operation that pushes it.
+    /// `nil` when the row is absent, owned by another account, or has no
+    /// generation.
+    static func admitDraftToDrafts(db: Database, draftId: String, accountId: String) throws -> DraftsAdmission? {
+        let folderPath = try draftsFolderPath(db: db, accountId: accountId)
+        guard let draft = try Draft.fetchOne(db, key: draftId),
+              draft.accountId == accountId,
+              let instanceEpoch = draft.instanceEpoch,
+              !instanceEpoch.isEmpty else {
+            return nil
+        }
+
+        let folderId = "\(accountId):\(folderPath)"
+        let placeholderMessageId = PendingOperation.draftPlaceholderMessageId(
+            draftId: draft.id, instanceEpoch: instanceEpoch)
+        let placeholderHeaderId = PendingOperation.draftPlaceholderHeaderPK(
+            accountId: accountId,
+            draftsFolderPath: folderPath,
+            draftId: draft.id,
+            instanceEpoch: instanceEpoch)
+        let account = try Account.fetchOne(db, key: accountId)
+        let senderEmail = account?.emailAddress ?? accountId
+        let senderName = account?.displayName ?? senderEmail
+        let snippet = EmailFilter.snippetFromPlainText(draft.body)
+        // Header text the Drafts list, search and Reply All read: only the
+        // entries that are addresses, each written to read back as itself
+        // (ADR-IOS-092). The draft keeps every entry as written.
+        let to = RecipientEntry(draft.toArray).headerText
+        let cc = RecipientEntry(draft.ccArray).headerText
+        let bcc = RecipientEntry(draft.bccArray).headerText
+
+        // A draft already uploaded has its Drafts entry under the server copy's
+        // own key once the push completes (`DraftStore.applyPushCompletion`), the
+        // exact provider-native header id `queueDraftDelete` also derives from
+        // `serverDraftId`. Update that entry rather than adding a placeholder
+        // beside it. Where the row's id does not name the moved entry (Gmail, whose
+        // entry is keyed by the contained message id), nothing matches and the
+        // placeholder is used as before. The stored address is reused only when
+        // it is proved to name this folder's copy (mailbox and UIDVALIDITY on
+        // IMAP); otherwise the draft's own placeholder is used and any header
+        // under that UID, which may now be another message, is left untouched.
+        let nativeHeaderId = try provedServerDraftHeaderId(
+            for: draft, accountId: accountId, folderPath: folderPath, db: db)
+        let nativeHeader = try nativeHeaderId.flatMap { try MessageHeader.fetchOne(db, key: $0) }
+        let entryHeaderId = nativeHeader?.id ?? placeholderHeaderId
+
+        var header = try nativeHeader
+            ?? MessageHeader.fetchOne(db, key: placeholderHeaderId)
+            ?? MessageHeader(
+                messageId: placeholderMessageId,
+                subject: draft.subject,
+                from: senderName,
+                fromAddress: senderEmail,
+                to: to,
+                date: Date(timeIntervalSince1970: draft.updatedAt),
+                snippet: snippet,
+                folderId: folderId,
+                accountId: accountId,
+                folderPath: folderPath,
+                isInInbox: false)
+        header.subject = draft.subject
+        header.to = to
+        header.cc = cc
+        header.bcc = bcc
+        header.snippet = snippet
+        header.date = Date(timeIntervalSince1970: draft.updatedAt)
+        // On a date-windowed provider, sync judges this placeholder stale
+        // only when its provider date is at or above the oldest draft on
+        // a partial Drafts page, which holds the newest drafts. Following
+        // each save keeps it there; left at its first save, it falls
+        // below that page once enough newer drafts exist and is not
+        // reconciled away while that lasts.
+        header.providerDate = header.date
+        header.isRead = true
+        if nativeHeader == nil { header.observedUidValidity = nil }
+        try header.save(db)
+        try MessageBody(
+            contentKey: ContentKey(rawValue: entryHeaderId),
+            htmlContent: MessageBody.plainTextToHTML(draft.body)
+        ).save(db)
+
+        var saveDraftOp = PendingOperation.draftSave(
+            draftId: draft.id,
+            accountId: accountId,
+            folderPath: folderPath,
+            instanceEpoch: instanceEpoch)
+        try saveDraftOp.insert(db)
+
+        return DraftsAdmission(
+            record: FTSHeaderRecord(
+                contentKey: ContentKey(rawValue: entryHeaderId),
+                headerId: entryHeaderId,
+                messageId: header.messageId,
+                subject: draft.subject,
+                from: "\(senderName) <\(senderEmail)>",
+                to: to,
+                cc: cc,
+                bcc: bcc,
+                dateMs: Int64(draft.updatedAt * 1000),
+                folderId: folderId),
+            bodyText: draft.body)
+    }
+
+    /// The provider-native address a draft identity names in `folderPath`, or a
+    /// thrown `actionIdentityResolutionFailed` when the address cannot be proved
+    /// to belong there. An IMAP address must name this mailbox, a positive UID
+    /// and the folder's current UIDVALIDITY; any other kind must be non-empty.
+    /// `exactHeaderId` is the header id the server copy is stored under.
+    static func validatedDraftAddress(
+        _ identity: DraftDeleteIdentity,
+        accountId: String,
+        folderPath: String,
+        db: Database
+    ) throws -> (encodedId: String, addressKind: DraftDeleteAddressKind, mintedUidValidity: Int?) {
+        switch identity {
+        case .imap(let addressFolder, let uidValidity, let uid):
+            guard addressFolder == folderPath,
+                  uid > 0,
+                  uidValidity > 0,
+                  let folder = try Folder.fetchOne(db, key: "\(accountId):\(folderPath)"),
+                  folder.lastKnownUidValidity == uidValidity else {
+                throw ProviderError.actionIdentityResolutionFailed(String(uid))
+            }
+            return (String(uid), .providerResource, uidValidity)
+        case .gmail(let resourceId):
+            guard !resourceId.isEmpty else { throw ProviderError.actionIdentityResolutionFailed(resourceId) }
+            return (resourceId, .providerResource, nil)
+        case .gmailContainedMessage(let messageId):
+            guard !messageId.isEmpty else { throw ProviderError.actionIdentityResolutionFailed(messageId) }
+            return (messageId, .gmailContainedMessage, nil)
+        case .outlook(let graphId):
+            guard !graphId.isEmpty else { throw ProviderError.actionIdentityResolutionFailed(graphId) }
+            return (graphId, .providerResource, nil)
+        case .demo(let localId):
+            guard !localId.isEmpty else { throw ProviderError.actionIdentityResolutionFailed(localId) }
+            return (localId, .providerResource, nil)
+        }
+    }
+
+    /// The header id of the server copy a draft row records, only when the row's
+    /// stored address is proved to belong to this Drafts folder by
+    /// `validatedDraftAddress`, the check draft deletion uses. A row carrying an
+    /// IMAP address (mailbox and UIDVALIDITY), or any row in a folder that has a
+    /// UIDVALIDITY, is checked as an IMAP address; a row without one is checked
+    /// by its id alone. `nil` when ownership cannot be proved.
+    static func provedServerDraftHeaderId(
+        for draft: Draft,
+        accountId: String,
+        folderPath: String,
+        db: Database
+    ) throws -> String? {
+        guard let serverId = draft.serverDraftId, !serverId.isEmpty else { return nil }
+        let folder = try Folder.fetchOne(db, key: "\(accountId):\(folderPath)")
+        let identity: DraftDeleteIdentity
+        if draft.serverDraftFolderPath != nil || draft.serverDraftUidValidity != nil
+            || folder?.lastKnownUidValidity != nil {
+            guard let addressFolder = draft.serverDraftFolderPath,
+                  let epoch = draft.serverDraftUidValidity,
+                  let uid = Int(serverId) else { return nil }
+            identity = .imap(folder: addressFolder, uidValidity: epoch, uid: uid)
+        } else {
+            identity = .demo(localId: serverId)
+        }
+        guard let address = try? validatedDraftAddress(
+            identity, accountId: accountId, folderPath: folderPath, db: db) else { return nil }
+        return "\(accountId):\(folderPath):\(address.encodedId)"
+    }
+
+    /// The work after a Drafts admission commits: search indexing, then the
+    /// header becomes visible, then the queue drains.
+    func finishDraftsAdmission(_ admission: DraftsAdmission) async {
+        let ftsInfo = admission
+        do {
+            _ = try await SearchIndex.shared.indexHeaders([ftsInfo.record])
+            if !ftsInfo.bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                _ = try await SearchIndex.shared.updateBodies([(
+                    contentKey: ftsInfo.record.contentKey,
+                    body: ftsInfo.bodyText)])
+            }
+        } catch {
+            BackgroundSyncLogger.logDebug("[Queue] WARNING: FTS indexing failed for draft \(ftsInfo.record.headerId): \(error)")
+        }
+        try? await dbPool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
+                arguments: [ftsInfo.record.headerId])
+        }
+        NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+        Task { await drainPendingQueue() }
+    }
+
     /// Queue a draft delete from the server's Drafts folder via PendingOperation.
     /// Optimistically removes the MessageHeader from the Drafts folder immediately.
     ///
@@ -2613,50 +2802,8 @@ extension AccountManager {
             }
             let deletedAttachmentDir = try await dbPool.write { db -> String? in
                 let folderId = "\(accountId):\(folderPath)"
-                let encodedId: String
-                let addressKind: DraftDeleteAddressKind
-                let mintedUidValidity: Int?
-                switch identity {
-                case .imap(let addressFolder, let uidValidity, let uid):
-                    guard addressFolder == folderPath,
-                          uid > 0,
-                          uidValidity > 0,
-                          let folder = try Folder.fetchOne(db, key: folderId),
-                          folder.lastKnownUidValidity == uidValidity else {
-                        throw ProviderError.actionIdentityResolutionFailed(String(uid))
-                    }
-                    encodedId = String(uid)
-                    addressKind = .providerResource
-                    mintedUidValidity = uidValidity
-                case .gmail(let resourceId):
-                    guard !resourceId.isEmpty else {
-                        throw ProviderError.actionIdentityResolutionFailed(resourceId)
-                    }
-                    encodedId = resourceId
-                    addressKind = .providerResource
-                    mintedUidValidity = nil
-                case .gmailContainedMessage(let messageId):
-                    guard !messageId.isEmpty else {
-                        throw ProviderError.actionIdentityResolutionFailed(messageId)
-                    }
-                    encodedId = messageId
-                    addressKind = .gmailContainedMessage
-                    mintedUidValidity = nil
-                case .outlook(let graphId):
-                    guard !graphId.isEmpty else {
-                        throw ProviderError.actionIdentityResolutionFailed(graphId)
-                    }
-                    encodedId = graphId
-                    addressKind = .providerResource
-                    mintedUidValidity = nil
-                case .demo(let localId):
-                    guard !localId.isEmpty else {
-                        throw ProviderError.actionIdentityResolutionFailed(localId)
-                    }
-                    encodedId = localId
-                    addressKind = .providerResource
-                    mintedUidValidity = nil
-                }
+                let (encodedId, addressKind, mintedUidValidity) = try Self.validatedDraftAddress(
+                    identity, accountId: accountId, folderPath: folderPath, db: db)
 
                 // Display removal follows only an exact provider-native header id.
                 let exactHeaderId = "\(accountId):\(folderPath):\(encodedId)"

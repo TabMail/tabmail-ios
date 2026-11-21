@@ -170,7 +170,7 @@ struct AccountFolderPersistenceTests {
         folder.totalCount = 100
         folder.isFavorite = true
         folder.backfillComplete = true
-        try db.write { try folder.update($0) }
+        try db.write { try folder.updateWithListingCounters($0) }
 
         let fetched = try db.read { try Folder.fetchOne($0, key: folder.id) }
         #expect(fetched?.unreadCount == 42)
@@ -324,7 +324,7 @@ struct AccountFolderPersistenceTests {
         folder.lastKnownUidNext = 12345
         folder.backfillUidCursor = 500
         folder.backfillPageToken = "next_page_token_abc"
-        try db.write { try folder.update($0) }
+        try db.write { try folder.updateWithListingCounters($0) }
 
         let fetched = try db.read { try Folder.fetchOne($0, key: folder.id) }
         #expect(fetched?.oldestSyncedDate != nil)

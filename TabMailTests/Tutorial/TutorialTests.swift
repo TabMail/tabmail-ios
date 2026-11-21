@@ -333,13 +333,14 @@ struct TutorialPracticeTests {
         #expect(answer.contains("[Email]("))
     }
 
-    @Test("Tutorial practice shows the seeded AI content even with demo AI off")
+    @Test("Tutorial practice shows the seeded AI content even with the AI setting off")
     func practiceShowsSeededContent() {
         let store = DemoModeStore.shared
-        defer { store._resetForTests() }
+        let restore = AITestSetting.save()
+        defer { store._resetForTests(); restore() }
         store._resetForTests()
+        AITestSetting.set(aiOff: true)
         store.isActive = true
-        store.aiEnabled = false
         #expect(store.hidesAIContent)
         store.isTutorialPractice = true
         #expect(!store.hidesAIContent)
@@ -357,7 +358,7 @@ struct TutorialPracticeTests {
         store.isActive = true
         store.isTutorialPractice = true
         await #expect {
-            _ = try await BackendClient(llmSession: server.session)
+            _ = try await BackendClient(llmSession: server.session, isAIOff: { false })
                 .transcribeDictation(flac: Data([0]), language: nil, vocabulary: [])
         } throws: { error in
             if case BackendError.unauthorized = error { return true }
@@ -379,7 +380,7 @@ struct TutorialPracticeTests {
             path: "/completions/chat", method: "POST",
             response: .bytes(Data("event: final\ndata: {\"assistant\":\"ok\"}\n\n".utf8),
                              contentType: "text/event-stream"))
-        let client = BackendClient(llmSession: server.session)
+        let client = BackendClient(llmSession: server.session, isAIOff: { false })
         let request = CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil)
 
         store._resetForTests()
@@ -418,7 +419,7 @@ struct TutorialPracticeTests {
         let server = FakeHTTP.Scenario()
         defer { server.close() }
         server.register(path: DictationConfig.warmUpPath, response: .status(200))
-        let client = BackendClient(llmSession: server.session)
+        let client = BackendClient(llmSession: server.session, isAIOff: { false })
 
         store._resetForTests()
         store.isActive = true
@@ -1495,5 +1496,30 @@ struct TutorialLifecycleTests {
         await DemoModeService.shared.exit()
         #expect(!store.isActive)
         #expect(!store.isTutorialPractice, "a signed-in user's AI calls would stay refused until relaunch")
+    }
+
+    @Test("a plain demo's setup opens the subscription gate when the device's AI setting is on, not when it is off",
+          arguments: [false, true])
+    func plainDemoSetupFollowsTheDeviceSetting(aiOff: Bool) async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        let gate = AISubscriptionGate.shared
+        let gateWasActive = gate.isActive
+        let restoreSetting = AITestSetting.save()
+        defer {
+            if gateWasActive { gate.openGate() } else { gate.closeGate() }
+            restoreSetting()
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        gate.closeGate()
+        AITestSetting.set(aiOff: aiOff)
+
+        try await DemoModeService.shared.start(mintToken: false)
+        try #require(store.isActive && !store.isTutorialPractice)
+        try await DemoModeService.shared.completeSetup()
+        #expect(gate.isActive == !aiOff)
+        await DemoModeService.shared.exit()
     }
 }

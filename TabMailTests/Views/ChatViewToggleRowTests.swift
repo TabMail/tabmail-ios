@@ -28,16 +28,16 @@ struct ChatViewToggleRowTests {
         let aiOn = state == .on
         let defaults = UserDefaults.standard
         let savedChoice = defaults.object(forKey: ChatViewConfig.enabledKey)
-        let savedOptOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
+        let restoreAISetting = AITestSetting.save()
         let gate = AISubscriptionGate.shared
         let gateWasOpen = gate.isActive
         defer {
             defaults.set(savedChoice, forKey: ChatViewConfig.enabledKey)
-            AIService.optOutStore.set(savedOptOut, forKey: AIService.optOutAllAIKey)
+            restoreAISetting()
             if gateWasOpen { gate.openGate() } else { gate.closeGate() }
         }
         if state == .noPlan { gate.closeGate() } else { gate.openGate() }
-        AIService.writeOptOutFlag(state == .optedOut)
+        AITestSetting.set(aiOff: state == .optedOut)
         // With AI off the stored choice is on, so the test sees it shown and kept.
         defaults.set(!aiOn, forKey: ChatViewConfig.enabledKey)
         #expect(gate.isActive == (state != .noPlan), "control: the plan state is set")

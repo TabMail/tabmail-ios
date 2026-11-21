@@ -542,4 +542,136 @@ struct NotificationActionRouterTests {
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == nil, "refcount stranded")
         #expect(AccountManager.shared.snapshotOverlay()[id] == nil, "overlay entry stranded")
     }
+
+    // MARK: - (7) The notified UID's epoch (tabmail-ios #538)
+
+    /// A notification's `messageId` is a UID observed under one UIDVALIDITY, and
+    /// the tap can come days later. When a turnover has re-seated a different
+    /// message at that UID, the resolved row carries a different proven epoch
+    /// and the tap must not act on it (C3).
+    @Test("a tap whose notified epoch differs from the resolved row's proven epoch acts on nothing")
+    func tapRefusesARowReseatedUnderANewEpoch() async throws {
+        let (pool, inbox, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        resetStagedGlobal()
+
+        let header = {
+            var h = makeDurableHeader(folder: inbox, messageId: "m-reseated-epoch")
+            h.observedUidValidity = 72
+            return h
+        }()
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+
+        await NotificationActionRouter.execute(
+            actionId: "ARCHIVE", messageId: "m-reseated-epoch", accountId: "acc1",
+            notifiedObservedUidValidity: 71)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "no op may be queued against the re-seated row")
+        #expect(final?.folderPath == inbox.path, "the impostor stays where it is")
+    }
+
+    @Test("a tap whose notified epoch matches the resolved row is dispatched as before")
+    func tapWithTheSameEpochIsDispatched() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        resetStagedGlobal()
+
+        let header = {
+            var h = makeDurableHeader(folder: inbox, messageId: "m-same-epoch")
+            h.observedUidValidity = 72
+            return h
+        }()
+        try await pool.writeWithoutTransaction { db in try header.insert(db) }
+
+        await NotificationActionRouter.execute(
+            actionId: "ARCHIVE", messageId: "m-same-epoch", accountId: "acc1",
+            notifiedObservedUidValidity: 72)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+        #expect(final?.folderPath == archive.path)
+    }
+
+    /// Cold path: no local header, so the op is built on the bare UID and
+    /// stamped with the folder's CURRENT epoch. When the folder has moved past
+    /// the epoch the notification observed that UID under, that stamp would
+    /// authenticate a different message; the op must not be queued.
+    @Test("a cold tap whose notified epoch is not the folder's current epoch queues nothing; a matching one queues")
+    func coldTapRefusedWhenTheFolderEpochMoved() async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        resetStagedGlobal()
+        try await pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "imap@example.com", displayName: "IMAP", provider: .imap)
+            acc.id = "acc-imap-538"
+            try acc.insert(db)
+            var imapInbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc-imap-538")
+            imapInbox.lastKnownUidValidity = 90
+            try imapInbox.insert(db)
+        }
+
+        await NotificationActionRouter.execute(
+            actionId: "MARK_READ", messageId: "4401", accountId: "acc-imap-538",
+            notifiedObservedUidValidity: 89)
+        var ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "the UID was observed under an epoch the folder no longer has")
+
+        await NotificationActionRouter.execute(
+            actionId: "MARK_READ", messageId: "4402", accountId: "acc-imap-538",
+            notifiedObservedUidValidity: 90)
+        ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(ops[0].messageIds == ["4402"])
+        #expect(ops[0].observedUidValidity == 90)
+    }
+
+    /// The cold ARCHIVE/DELETE arm carries the same notified-epoch veto as
+    /// MARK_READ: a mismatching epoch queues nothing, a matching one queues the
+    /// move stamped with that epoch, and a notification with no epoch keeps the
+    /// previous behaviour.
+    @Test("cold ARCHIVE and DELETE: a moved folder epoch queues nothing; a matching or absent notified epoch queues the move", arguments: ["ARCHIVE", "DELETE"])
+    func coldMoveRefusedWhenTheFolderEpochMoved(actionId: String) async throws {
+        let (pool, _, _, _, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
+        resetStagedGlobal()
+        let accountId = "acc-imap-538-\(actionId)"
+        try await pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "imap@example.com", displayName: "IMAP", provider: .imap)
+            acc.id = accountId
+            try acc.insert(db)
+            var imapInbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+            imapInbox.lastKnownUidValidity = 90
+            try imapInbox.insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: accountId).insert(db)
+            try Folder(name: "Trash", path: "Trash", role: .trash, accountId: accountId).insert(db)
+        }
+        let destination = actionId == "ARCHIVE" ? "Archive" : "Trash"
+
+        await NotificationActionRouter.execute(
+            actionId: actionId, messageId: "4501", accountId: accountId,
+            notifiedObservedUidValidity: 89)
+        var ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty, "the UID was observed under an epoch the folder no longer has")
+
+        await NotificationActionRouter.execute(
+            actionId: actionId, messageId: "4502", accountId: accountId,
+            notifiedObservedUidValidity: 90)
+        await NotificationActionRouter.execute(
+            actionId: actionId, messageId: "4503", accountId: accountId)
+        ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+            .sorted { $0.messageIds.first ?? "" < $1.messageIds.first ?? "" }
+        #expect(ops.count == 2)
+        guard ops.count == 2 else { return }
+        for (op, uid) in zip(ops, ["4502", "4503"]) {
+            #expect(op.type == .move)
+            #expect(op.messageIds == [uid])
+            #expect(op.folderPath == "INBOX")
+            #expect(op.destinationPath == destination)
+            #expect(op.observedUidValidity == 90)
+        }
+        let headers = try await pool.read { db in try MessageHeader.fetchCount(db) }
+        #expect(headers == 0, "the cold path writes no local header")
+    }
 }

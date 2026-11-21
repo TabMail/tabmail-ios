@@ -158,8 +158,8 @@ struct DraftPlaceholderStaleWindowTests {
         }
         let provider = MockEmailProvider(staleWindowMode: .date)
         await provider.setFetchMessagesResult(page)
-        _ = try await SyncEngine.runSyncMessages(
-            for: scene.folder, provider: provider, limit: Self.pageLimit, dbPool: PrioritizedDatabase(pool: scene.pool))
+        _ = try await SyncEngine.runListing(
+            for: scene.folder, provider: provider, limit: Self.pageLimit, dbPool: PrioritizedDatabase(pool: scene.pool)).requireResult()
     }
 
     private func placeholderCount(_ scene: Scene) async throws -> Int {

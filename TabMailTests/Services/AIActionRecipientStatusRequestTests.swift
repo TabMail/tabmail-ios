@@ -48,17 +48,7 @@ struct AIActionRecipientStatusRequestTests {
     }
 
     private func withAIEnabled<T>(_ body: () async throws -> T) async rethrows -> T {
-        let store = AIService.optOutStore
-        let previous = store.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous {
-                store.set(previous, forKey: AIService.optOutAllAIKey)
-            } else {
-                store.removeObject(forKey: AIService.optOutAllAIKey)
-            }
-        }
-        AIService.writeOptOutFlag(false)
-        return try await body()
+        try await AITestSetting.with(aiOff: false, body)
     }
 
     private func classify(_ service: AIService, recipientStatus: String) async throws -> ActionTag? {
@@ -119,16 +109,9 @@ struct AIActionRecipientStatusRequestTests {
 
     @Test("classifyAction sends no request when AI is opted out")
     func classifyOptOutSendsNothing() async throws {
-        let store = AIService.optOutStore
-        let previous = store.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous {
-                store.set(previous, forKey: AIService.optOutAllAIKey)
-            } else {
-                store.removeObject(forKey: AIService.optOutAllAIKey)
-            }
-        }
-        AIService.writeOptOutFlag(true)
+        let restore = AITestSetting.save()
+        defer { restore() }
+        AITestSetting.set(aiOff: true)
         let backend = Backend()
         let service = AIService(backendClient: BackendClient(llmSession: backend.http.session))
 

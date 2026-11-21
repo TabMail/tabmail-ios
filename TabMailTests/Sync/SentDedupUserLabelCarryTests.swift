@@ -118,7 +118,7 @@ struct SentDedupUserLabelCarryTests {
 
             var folder = Folder(name: sentPath, path: sentPath, role: .sent, accountId: accountId)
             folder.totalCount = 2
-            try folder.insert(db)
+            try folder.insertWithListingCounters(db)
 
             var decoy = MessageHeader(
                 messageId: decoyMessageId,

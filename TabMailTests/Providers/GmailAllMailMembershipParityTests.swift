@@ -15,6 +15,7 @@ struct GmailAllMailMembershipParityTests {
         [], ["UNREAD"], ["STARRED", "IMPORTANT"], ["CATEGORY_PROMOTIONS"], ["Label_1"],
         ["INBOX"], ["INBOX", "UNREAD"], ["SENT"], ["SENT", "Label_1"], ["TRASH"],
         ["SPAM"], ["DRAFT"], ["CHAT"], ["TRASH", "Label_1"], ["INBOX", "SENT", "TRASH", "SPAM", "DRAFT"],
+        ["SENT", "TRASH"], ["Label_1", "SPAM"], ["STARRED", "TRASH"], ["STARRED", "SPAM"],
     ]
 
     @Test("The listing query is the excluded labels' -in: tokens, in order")
@@ -31,10 +32,12 @@ struct GmailAllMailMembershipParityTests {
         #expect(GmailProvider.folder(GmailProvider.archivePath, containsMessageWithLabels: Array(labels)) == listed)
     }
 
-    @Test("A real folder holds exactly the messages carrying its label", arguments: labelSets)
+    @Test("A real folder holds the messages carrying its label, unless they are in Trash or Spam", arguments: labelSets)
     func labelFolderMembership(labels: Set<String>) {
-        for path in ["INBOX", "SENT", "TRASH", "Label_1"] {
-            #expect(GmailProvider.folder(path, containsMessageWithLabels: Array(labels)) == labels.contains(path))
+        let spamTrash: Set<String> = ["TRASH", "SPAM"]
+        for path in ["INBOX", "SENT", "TRASH", "SPAM", "DRAFT", "STARRED", "Label_1"] {
+            let expected = labels.contains(path) && (spamTrash.contains(path) || labels.isDisjoint(with: spamTrash))
+            #expect(GmailProvider.folder(path, containsMessageWithLabels: Array(labels)) == expected, "\(path) \(labels)")
         }
     }
 }

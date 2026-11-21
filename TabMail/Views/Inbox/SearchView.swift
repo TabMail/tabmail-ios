@@ -98,6 +98,7 @@ struct SearchView: View {
                 MessageOpenView(
                     messageId: target.headerId,
                     expectedRfc822MessageId: target.provenRfc822MessageId,
+                    expectedObservedUidValidity: target.provenObservedUidValidity,
                     highlightsMessage: true)
             }
         }
@@ -261,6 +262,10 @@ struct SearchView: View {
     struct OpenTarget: Hashable {
         let headerId: String
         let provenRfc822MessageId: String?
+        /// The address epoch captured with a LOCAL result, the witness for a row
+        /// with no usable Message-ID (`ExpectedMessageIdentity`'s epoch arm).
+        /// Nil for remote results and rows with no proven epoch.
+        var provenObservedUidValidity: Int? = nil
     }
 
     /// Resolve a REMOTE search result to a current durable headerId, folder-
@@ -510,19 +515,21 @@ struct SearchView: View {
     /// `nonisolated static` for the same reason as the remote helper: it touches no
     /// `@State` and needs no view, so a test can call it with a bare `Database`.
     nonisolated static func resolveLocalResultHeaderId(
-        headerId: String, capturedRfc822MessageId: String?, db: Database
+        headerId: String, capturedRfc822MessageId: String?,
+        capturedObservedUidValidity: Int? = nil, db: Database
     ) throws -> String? {
-        // 1 — no content witness: today's behaviour, and no read at all.
-        guard let captured = MessageIdentity.comparableRfc822Identity(capturedRfc822MessageId) else {
+        // 1 — no witness at all: today's behaviour, and no read at all.
+        guard let captured = ExpectedMessageIdentity(
+            capturedRfc822MessageId: capturedRfc822MessageId,
+            capturedObservedUidValidity: capturedObservedUidValidity) else {
             return headerId
         }
         // 2 — the address no longer names a row.
         guard let current = try MessageHeader.fetchOne(db, key: headerId) else { return nil }
-        // 3 — CONTENT PROOF. Same non-empty Message-ID at the same address ⇒ same
-        //     email, whatever numbering seated it.
-        guard MessageIdentity.comparableRfc822Identity(current.rfc822MessageId) == captured else {
-            return nil
-        }
+        // 3 — PROOF. Same non-empty Message-ID at the same address ⇒ same email,
+        //     whatever numbering seated it; with no Message-ID, a proven different
+        //     address epoch ⇒ a re-seated address (`ExpectedMessageIdentity`).
+        guard captured.matches(current) else { return nil }
         return headerId
     }
 
@@ -612,7 +619,8 @@ struct SearchView: View {
         //    to render would be a regression with no C3 payoff, per `OpenTarget`.
         return .open(OpenTarget(
             headerId: resolvedHeaderId,
-            provenRfc822MessageId: result.capturedRfc822MessageId))
+            provenRfc822MessageId: result.capturedRfc822MessageId,
+            provenObservedUidValidity: result.capturedObservedUidValidity))
     }
 
     /// The COMPLETE visible consequence of one tap, as a value.
@@ -684,6 +692,7 @@ struct SearchView: View {
                 return try Self.resolveLocalResultHeaderId(
                     headerId: headerId,
                     capturedRfc822MessageId: result.capturedRfc822MessageId,
+                    capturedObservedUidValidity: result.capturedObservedUidValidity,
                     db: db
                 )
             }
@@ -964,7 +973,8 @@ struct SearchView: View {
                                 // bearing rather than defensive, and the snippet
                                 // enrichment is the one place a rebuild could
                                 // silently strip the evidence back off again.
-                                capturedRfc822MessageId: result.capturedRfc822MessageId)
+                                capturedRfc822MessageId: result.capturedRfc822MessageId,
+                                capturedObservedUidValidity: result.capturedObservedUidValidity)
                         }
                         var merged = results
                         // Replace only the prior rows that are the SAME message (account +
@@ -1212,7 +1222,8 @@ struct SearchView: View {
                 // Content witness from the row this result is rendered FROM — the
                 // same row `subject`/`from`/`date`/`isRead`/`isFlagged` above come
                 // from, so zero extra I/O. `openResult` re-proves it at tap time.
-                capturedRfc822MessageId: header.rfc822MessageId
+                capturedRfc822MessageId: header.rfc822MessageId,
+                capturedObservedUidValidity: header.observedUidValidity
             )
         }
 
@@ -1371,7 +1382,8 @@ struct SearchView: View {
                         isFlagged: msg.isFlagged,
                         headerId: msg.id,
                         // Same row every other field above comes from — zero extra I/O.
-                        capturedRfc822MessageId: msg.rfc822MessageId
+                        capturedRfc822MessageId: msg.rfc822MessageId,
+                        capturedObservedUidValidity: msg.observedUidValidity
                     )
                 }
         }) ?? []
@@ -1685,6 +1697,10 @@ struct SearchResult: Identifiable, Sendable {
     /// initializer carries it as a trailing defaulted parameter — every existing
     /// `SearchResult(...)` call site stays byte-identical.
     var capturedRfc822MessageId: String? = nil
+    /// The address epoch of the local row this result was rendered from — the
+    /// witness for a row with no usable Message-ID (`ExpectedMessageIdentity`'s
+    /// epoch arm). Remote results carry none.
+    var capturedObservedUidValidity: Int? = nil
 }
 
 // MARK: - Search Result Row

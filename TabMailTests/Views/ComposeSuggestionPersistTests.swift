@@ -92,14 +92,16 @@ struct ComposeSuggestionPersistTests {
             "let hasVisibleSuggestion = acceptedSuggestion != offeredSuggestion"))
         let content = try #require(body.range(of:
             "subject: subject, body: acceptedSuggestion.messageBody"))
-        let changes = try #require(body.range(of: "|| hasVisibleSuggestion"))
-        let decision = try #require(body.range(of: "switch ComposeDraftGuards.closeAction"))
+        let decision = try #require(body.range(of: "switch ComposeDraftGuards.closeDecision"))
+        // The same fact also reaches the decision as unsettled work, so a visible
+        // suggestion counts as an unsaved change.
+        #expect(body.contains("hasUnsettledWork: attachmentPreparationIsUnsettled || hasVisibleSuggestion"),
+                "Close must hand the visible suggestion to the decision as unsettled work")
 
         #expect(transition.lowerBound < visible.lowerBound
             && visible.lowerBound < content.lowerBound
-            && content.lowerBound < changes.lowerBound
-            && changes.lowerBound < decision.lowerBound,
-            "Close must derive one visible-suggestion fact and feed both content and change classification before deciding")
+            && content.lowerBound < decision.lowerBound,
+            "Close must derive one visible-suggestion fact and feed it into content before deciding")
     }
 
     @Test("Hidden, absent, and already accepted suggestions do not replace the draft body")

@@ -457,25 +457,22 @@ extension AccountManager {
                     guard let provider else { return }
                     // Pool creates connections on demand via checkout — no explicit connect needed.
                     for folder in accountFolders where !folder.path.isEmpty {
-                        do {
-                            try await syncEngine.syncFolderMessages(folder: folder, provider: provider)
-                        } catch {
-                            if SyncEngine.isSelectFailedError(error) {
-                                BackgroundSyncLogger.logDebug("[SyncFolders] SELECT failed for \(folder.name) — skipping")
-                                continue
-                            }
-                            // A 404/410 here is a folder the server no longer has (a label or
-                            // folder deleted elsewhere); a message that is gone is absorbed
-                            // inside the listing (Gmail's per-message read; Outlook lists
-                            // messages inline). Skip the folder so the
-                            // account's other folders still sync, rather than ending the sync
-                            // with a red error banner. The full sync removes a vanished folder.
-                            if isHttpGoneStatus(error) {
-                                BackgroundSyncLogger.logDebug("[SyncFolders] 404/410 for \(folder.name) — skipping (folder gone on the server)")
-                                continue
-                            }
-                            throw error
+                        // Every listing goes through the one classifier (#755): an
+                        // unproven listing publishes nothing and is listed again next
+                        // pass. What the user sees is unchanged: a listing that ended
+                        // with an error the refresh showed before (a lost connection)
+                        // still ends the refresh with that error; a folder the server
+                        // refused or no longer has, and an unconfirmed count, are
+                        // skipped silently as before so the other folders still sync.
+                        let outcome = try await syncEngine.syncFolderMessages(folder: folder, provider: provider)
+                        guard case .unproven(_, _, let error) = outcome else { continue }
+                        BackgroundSyncLogger.logDebug("[SyncFolders] listing of \(folder.name) proved nothing — listed again next pass")
+                        guard let error else { continue }
+                        if SyncEngine.isSelectFailedError(error) || error is ProviderListingUnconfirmed || isHttpGoneStatus(error) {
+                            BackgroundSyncLogger.logDebug("[SyncFolders] \(folder.name) skipped: \(error)")
+                            continue
                         }
+                        throw error
                     }
                     // AI processing is now event-driven via ActiveBodyQueue → ActiveAIQueue.
                     // New headers from syncFolderMessages are automatically enqueued.

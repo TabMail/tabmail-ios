@@ -102,9 +102,13 @@ struct ChatThreadView: View {
     private static let chatSwipeId = "chat-swipe"
     private static let pillSpring = Animation.spring(response: 0.45, dampingFraction: 0.82)
 
-    init(messageId: String, expectedRfc822MessageId: String? = nil, highlightsOpenedMessage: Bool = false) {
+    init(
+        messageId: String, expectedRfc822MessageId: String? = nil, expectedObservedUidValidity: Int? = nil,
+        highlightsOpenedMessage: Bool = false
+    ) {
         self._viewModel = State(initialValue: MessageDetailViewModel(
-            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId))
+            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
+            expectedObservedUidValidity: expectedObservedUidValidity))
         self.highlightsOpenedMessage = highlightsOpenedMessage
     }
 

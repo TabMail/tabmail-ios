@@ -761,3 +761,20 @@ extension TestPrimaryProvider {
         createShouldFailWithLimitError = value
     }
 }
+
+// MARK: - Tests: the production pool's reserved slots
+
+@Suite("IMAPProvider pool — reserved slots (production actor)")
+struct IMAPProviderReservedSlotsTests {
+    @Test("Action and IDLE are reserved; the change reader's connection counts only while open: limit 6 without IDLE or a change connection leaves 5 folder slots; no limit leaves ceiling - 2")
+    func productionReservesActionAndIdle() async {
+        let username = "rsv-\(UUID().uuidString.lowercased())"
+        IMAPProvider.persistServerLimit(6, host: "127.0.0.1", username: username)
+        let limited = IMAPProvider(host: "127.0.0.1", port: 1, username: username, password: "x",
+                                   smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        #expect(await limited.poolMaxConnections() == 5)
+        let unlimited = IMAPProvider(host: "127.0.0.1", port: 1, username: "rsv-none-\(UUID().uuidString.lowercased())", password: "x",
+                                     smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        #expect(await unlimited.poolMaxConnections() == SyncConfig.imapMaxConnectionCeiling - 2)
+    }
+}

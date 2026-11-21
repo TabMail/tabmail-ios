@@ -69,17 +69,51 @@ ADR-034.
   `AppStoreAgeCheck.SignificantUpdate` decides, `acknowledgeSignificantUpdate` (iOS 26.4+, run after
   an `.allowed` check) acts. It stores only the last handled major.minor under
   `AppStoreAgeCheck.significantUpdateVersion`. The first run records the version without showing
-  anything (nothing to compare); a new major.minor asks Apple's `requiredRegulatoryFeatures` and, if
-  required, shows `showSignificantUpdateAcknowledgment` before recording; a failure records nothing
-  and asks again on the next foreground.
+  anything (nothing to compare). A new major.minor first asks `isEligibleForAgeFeatures`: the version
+  is recorded only where the rules apply. Where they do not (including a device with no Apple
+  Account), nothing is shown and nothing is recorded, so a device the rules apply to later still gets
+  this version's notice (2026-11-17, issue #972: with no Apple Account, Apple's
+  `requiredRegulatoryFeatures` still listed the notice, and its acknowledgment extension failed with
+  `missingDSID`, drew nothing, and its full-screen host took every tap at every launch). Where the
+  rules apply it asks `requiredRegulatoryFeatures` and, if required, shows
+  `showSignificantUpdateAcknowledgment` before recording; a failure records nothing and asks again on
+  the next foreground. `acknowledge(acknowledged:current:isRegulated:requiresNotice:show:record:)` is
+  the seam; `acknowledgeSignificantUpdate` passes Apple's calls.
+- Apple's notice can stay up and never return (#972, #1010). `AppStoreAgeCheck.Runner.pass` orders
+  RootView's age check and the notice: the age check's in-progress flag clears BEFORE the notice is
+  awaited, so a stuck notice never skips later age checks; the notice has its own flag, so no second
+  notice starts while one is up (2026-11-18). Test: `AppStoreAgeCheckRunnerTests`.
+- Stuck notice across launches (owner 2026-11-18, #1010, option chosen with the fallback approved; no
+  timer): `SignificantUpdate.inProgressVersionKey` holds the major.minor handed to Apple. An UNASKED
+  notice sets it just before `show` and clears it when it returns or throws. A launch that finds it
+  set, for ANY version, first asks `isRegulated` (no UI); where the rules no longer apply the marker
+  clears and nothing is shown or recorded (#972 rule). Otherwise it makes no unasked call and returns
+  `.offerBanner` for the CURRENT version (also when the rules question throws); RootView shows
+  `SignificantUpdateBanner` (SignInAgainBanner shape, above `MailNavigationView` beside
+  `DeletionBanner`), whose tap calls Apple through the same path (`userAsked: true`). A tapped notice
+  never clears the marker, returned or thrown: a return records the version (banner goes), a throw
+  keeps the banner, and every later version also goes through the banner (2026-11-19 review ruling;
+  the first version of this fix ignored a marker for another version and cleared it after a tapped
+  throw). Review fixes (2026-11-19): a tapped notice that fails at any of Apple's three calls returns
+  `.offerBanner` at once; an already-handled version with a kept marker still asks `isRegulated` and clears
+  the marker where the rules no longer apply (no notice, no banner); a launch whose age lookup throws
+  (`.notChecked`) still runs the step when `SignificantUpdate.hasStalledNotice()` (via `Runner.pass`'s
+  `hasStalledNotice`), which with the marker set never calls Apple unasked. Apple documents a throw only "if the feature isn't available"; whether a user dismissal
+  returns or throws is undocumented. The banner state is RootView
+  `@State` set from the ZStack `.task`, so it appears when onboarding ends without a relaunch. Killing the app mid-notice also yields the banner (accepted). The
+  marker is app state, not user data. Tests: `SignificantUpdateStuckNoticeTests`.
 
 Tests: `AgeAndTermsConsentTests`, `AppStoreAgeCheckSimulationTests` (simulated App Store answers),
 `AgeIneligibleDeletionTokenTests` (refusal handshake through the real token path),
-`SignificantUpdateStorageTests` (first-run record and repeat),
+`SignificantUpdateStorageTests` (first-run record and repeat), `AppStoreAgeCheckRunnerGuardTests` (one age check at a time, notice only after `.allowed`, RootView source fence),
+`SignificantUpdateAcknowledgmentTests` (Apple's answers through `acknowledge`: no notice and no record
+where the rules do not apply, shown then recorded once they do, failures record nothing),
+`SignificantUpdateMarkerStorageTests`, `AppStoreAgeCheckRunnerTapTests`, `SignificantUpdateBannerWiringTests`,
 `AgeAndTermsPushGateTests`, `AgeAndTermsDeviceSyncGateTests`.
 Not covered by a test (view wiring; owner smoke list): `ConsentGateView.leave` (OK waits for the
 deletion request, resends on no answer, shows the connection message, signs out only after an answer),
 `RootView.checkAppStoreAge` applying `shown(previous:checked:)`, RootView's `canStartAccountServices` handler
 starting Device Sync and push after sign-in or consent, the eligible path clearing the entered
-date from the view's state, and the Apple-facing arm of `acknowledgeSignificantUpdate` (asking
-`requiredRegulatoryFeatures` and showing the notice needs a regulated-region sandbox account).
+date from the view's state, and Apple's real calls inside `acknowledgeSignificantUpdate` (their
+answers are tested through `acknowledge`; showing the real notice needs a regulated-region sandbox
+account).

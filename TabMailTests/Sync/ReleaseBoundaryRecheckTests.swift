@@ -435,7 +435,7 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
-    @Test("An account with no change bookmark is left alone: nothing listed, no catch-up armed")
+    @Test("An account whose ids name one message across folders, with no change bookmark, is left alone: nothing listed, no catch-up armed")
     func accountWithoutBookmarkIsUntouched() async throws {
         try await Gmail.withWorld(seeds: []) { w in
             try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)

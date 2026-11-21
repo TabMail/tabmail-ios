@@ -72,7 +72,7 @@ struct OutlookChangeReadingTests {
         /// applied in its own transaction, and a new account part is stored.
         @discardableResult
         func read(
-            scope: ChangeScope = .all, now: Date = Date(), requests: Int? = nil, expensive: Bool = false,
+            scope: ChangeScope = .all, now: Date = Date(), requests: Int? = nil,
             reader: ExchangeProvider? = nil
         ) async throws -> ChangeSet {
             let account = try account()
@@ -87,7 +87,7 @@ struct OutlookChangeReadingTests {
             }
             let deadline = requests.map { OutlookChangeReadingTests.deadline(requests: $0, from: now) }
                 ?? now.addingTimeInterval(SyncConfig.changeReadBudgetSeconds)
-            let context = ChangeContext(deadline: deadline, clock: { now }, isExpensiveNetwork: expensive, onProgress: { _ in })
+            let context = ChangeContext(deadline: deadline, clock: { now }, onProgress: { _ in })
             let request = ChangeRequest(
                 folders: folders.map {
                     ChangeFolder(id: $0.id, path: $0.path, role: $0.role, cursor: $0.changeCursor,
@@ -481,24 +481,15 @@ struct OutlookChangeReadingTests {
         }
     }
 
-    // MARK: - The expensive-network wait
-
-    @Test("A non-Inbox baseline waits on an expensive network for at most the bound, counted from first sight; the Inbox does not wait")
-    func expensiveNetworkWaitIsBounded() async throws {
-        try await Self.withWorld(seeds: [Self.seed("a-1", in: Self.archive), Self.seed("i-1", in: Self.inbox)]) { w in
-            let start = Date()
-            try await w.read(now: start, expensive: true)
-            #expect(w.deltaPageRequests(Self.archive) == 0, "the Archive baseline waits")
-            #expect(w.deltaPageRequests(Self.inbox) > 0, "the Inbox baseline does not")
-            #expect(try w.cursor(w.archive)?.baselineSince == start, "first sight is stored with the folder")
-
-            // A new provider (a relaunch) just before the bound: still waits.
-            let bound = SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
-            try await w.read(now: start.addingTimeInterval(bound - 60), expensive: true, reader: w.server.provider())
-            #expect(w.deltaPageRequests(Self.archive) == 0)
-
-            try await w.read(now: start.addingTimeInterval(bound), expensive: true, reader: w.server.provider())
-            #expect(w.deltaPageRequests(Self.archive) > 0, "past the bound it runs on any network")
+    /// A non-Inbox state baseline is a scan: on cellular it runs on the first pass
+    /// (#1063).
+    @Test("On cellular, a non-Inbox state baseline runs on the first pass")
+    func stateBaselineRunsOnCellular() async throws {
+        try await Self.withWorld(seeds: [Self.seed("a-1", in: Self.archive)]) { w in
+            try await DownloadGateHarness.withNetwork(expensive: true) { () async throws in
+                try await w.delta()
+            }
+            #expect(w.deltaPageRequests(Self.archive) > 0, "the Archive baseline waited on cellular")
             #expect(try w.row("a-1", in: w.archive) != nil)
         }
     }

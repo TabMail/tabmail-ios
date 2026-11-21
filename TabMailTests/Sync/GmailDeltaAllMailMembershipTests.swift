@@ -62,7 +62,7 @@ struct GmailDeltaAllMailMembershipTests {
         // `/labels` names every seeded folder: the change read applies it as the
         // folder list (ADR-IOS-111), which removes a folder it does not name.
         let server = StatefulGmailActionServer(
-            messages: seeds, userLabels: [userLabelId: "Label"], systemLabels: ["INBOX", "SENT", "TRASH"])
+            messages: seeds, userLabels: [userLabelId: "Label"], systemLabels: ["INBOX", "SENT", "TRASH", "SPAM"])
         var account = Account(
             emailAddress: "\(accountId)@example.com",
             displayName: "All Mail delta fixture",
@@ -74,6 +74,7 @@ struct GmailDeltaAllMailMembershipTests {
             Folder(name: "Inbox", path: "INBOX", role: .inbox, accountId: accountId),
             Folder(name: "Sent", path: "SENT", role: .sent, accountId: accountId),
             Folder(name: "Trash", path: "TRASH", role: .trash, accountId: accountId),
+            Folder(name: "Spam", path: "SPAM", role: .spam, accountId: accountId),
             Folder(name: "All Mail", path: GmailProvider.archivePath, role: .archive, accountId: accountId),
             Folder(name: "Label", path: userLabelId, role: .custom, accountId: accountId),
         ]
@@ -184,6 +185,40 @@ struct GmailDeltaAllMailMembershipTests {
             #expect(try Self.row("trash-msg", in: allMail, pool: pool) == nil,
                     "a TRASH-labelled message is not in All Mail, so its row must go")
             #expect(try Self.row("trash-msg", in: f.folder("TRASH"), pool: pool) != nil)
+        }
+    }
+
+    /// A kept label (Sent or a user label) and the Trash/Spam label it gains.
+    struct TrashOrSpamCase: CustomTestStringConvertible, Sendable {
+        let kept: String
+        let added: String
+        var testDescription: String { "\(kept)+\(added)" }
+    }
+
+    static let trashOrSpamCases: [TrashOrSpamCase] = [
+        TrashOrSpamCase(kept: "SENT", added: "TRASH"),
+        TrashOrSpamCase(kept: userLabelId, added: "TRASH"),
+        TrashOrSpamCase(kept: userLabelId, added: "SPAM"),
+    ]
+
+    @Test("A message in Trash or Spam leaves Sent and every label it keeps", arguments: trashOrSpamCases)
+    func trashOrSpamLeavesKeptLabelFolders(_ c: TrashOrSpamCase) async throws {
+        try await Self.withDatabase { pool in
+            let f = try Self.makeFixture(pool: pool, seeds: [Self.seed("kept-msg", labels: [c.kept])])
+            defer { f.server.close() }
+            try Self.insertRow("kept-msg", in: f.folder(c.kept), pool: pool)
+
+            f.server.applyLabelChange(providerMessageId: "kept-msg", add: [c.added])
+            try await Self.runDelta(f)
+
+            #expect(f.server.snapshot(providerMessageId: "kept-msg")?.labels.contains(c.kept) == true,
+                    "precondition: the server keeps \(c.kept) on the message")
+            for path in ["INBOX", "SENT", GmailProvider.archivePath, Self.userLabelId] {
+                #expect(try Self.row("kept-msg", in: f.folder(path), pool: pool) == nil,
+                        "a message carrying \(c.added) is a member of no folder but \(c.added); found in \(path)")
+            }
+            #expect(try Self.row("kept-msg", in: f.folder(c.added), pool: pool) != nil,
+                    "the message is in \(c.added)")
         }
     }
 

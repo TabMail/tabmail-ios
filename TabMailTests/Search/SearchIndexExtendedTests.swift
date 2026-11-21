@@ -280,30 +280,6 @@ struct SearchIndexEdgeCaseTests {
         try await index.clearBodies( contentKeys: ["nonexistent_clear:INBOX:999"].map(ContentKey.init(rawValue:)))
     }
 
-    // MARK: - updateCcBcc Edge Cases
-
-    @Test("updateCcBcc for non-existent header is a no-op")
-    func updateCcBccNonExistent() async throws {
-        try await index.updateCcBcc([(headerId: "nonexistent_ccbcc:INBOX:999", cc: "a@b.com", bcc: "c@d.com")].map { (contentKey: ContentKey(rawValue: $0.headerId), cc: $0.cc, bcc: $0.bcc) })
-    }
-
-    @Test("updateCcBcc with unicode addresses succeeds")
-    func updateCcBccUnicode() async throws {
-        let hid = "test_ccbcc_unicode:INBOX:1"
-        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
-            headerId: hid, messageId: "m1", subject: "Unicode CC",
-            from: "a@a.com", to: "b@b.com",
-            dateMs: 1_700_000_000_000
-        )
-        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
-        let inserted = try await index.indexHeaders([record])
-        #expect(inserted == 1)
-
-        try await index.updateCcBcc([(headerId: hid, cc: "名前@example.com", bcc: "тест@example.com")].map { (contentKey: ContentKey(rawValue: $0.headerId), cc: $0.cc, bcc: $0.bcc) })
-
-        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
-    }
-
     // MARK: - Search by Body Content
 
     @Test("keywordSearch finds messages by body text")

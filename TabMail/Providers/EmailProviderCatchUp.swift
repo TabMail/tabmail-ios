@@ -53,14 +53,11 @@ protocol CatchUpLocalRowReader: Sendable {
     func newestRows(folderId: String, orderDatesBefore upper: Date?, limit: Int) async throws -> [CatchUpLocalRow]
 }
 
-/// What one catch-up call (one slice) may spend and on what kind of network. Its
-/// network state and storage-limit flag come from the run's snapshot, taken when the
-/// run started (`SyncEngine.CatchUpRun`; root rule: snapshot settings at operation
-/// start); neither the provider nor the apply re-reads the network state or the
-/// storage limit itself.
+/// What one catch-up call (one slice) may spend. Its storage-limit flag comes from
+/// the run's snapshot, taken when the run started (`SyncEngine.CatchUpRun`; root
+/// rule: snapshot settings at operation start); neither the provider nor the apply
+/// re-reads the storage limit itself. A scan reads no download gate (#1063).
 struct CatchUpContext: Sendable {
-    /// `NetworkMonitor.checkExpensive()` as it stood when the run began.
-    let isExpensiveNetwork: Bool
     /// No request may START at or after this instant.
     let deadline: Date
     /// The clock the budget is measured on. Injectable so a test can spend the
@@ -141,7 +138,7 @@ struct CatchUpFolderResult: Sendable {
     /// The folder's catch-up moved forward in this call: its listing advanced or
     /// completed, or it found something to apply. False when the call only recorded
     /// an attempt (a request that failed or timed out before anything moved, a page
-    /// still held) or a first sight on an expensive network. The backfill worker
+    /// still held). The backfill worker
     /// runs another slice only after one in which an applied result made progress,
     /// so a folder whose requests keep failing is tried again at the worker's next
     /// cycle, never at network rate (#766).
@@ -162,7 +159,7 @@ enum CatchUpLapse {
 }
 
 /// The time rules every provider's catch-up shares: when a folder's full check is
-/// due, and whether an expensive network may still hold it back.
+/// due, and the order folders are worked in.
 enum CatchUpSchedule {
     /// True when the folder has never completed a listing, or its last one
     /// completed at least `interval` ago. A provider with a periodic check passes
@@ -171,16 +168,6 @@ enum CatchUpSchedule {
     static func fullCheckDue(lastCompletedAt: Date?, now: Date, interval: TimeInterval) -> Bool {
         guard let lastCompletedAt else { return true }
         return now.timeIntervalSince(lastCompletedAt) >= interval
-    }
-
-    /// True when a folder WITH a state has waited for a non-expensive network for
-    /// at least `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds`, counted from its
-    /// last completed listing or, before the first, from `createdAt`. A folder with
-    /// no state has not started waiting.
-    static func waitedTooLong(hasState: Bool, lastCompletedAt: Date?, createdAt: Date?, now: Date) -> Bool {
-        guard hasState else { return false }
-        guard let since = lastCompletedAt ?? createdAt else { return true }
-        return now.timeIntervalSince(since) >= SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds
     }
 
     /// `folders` in the order a slice works them: never-tried first, then by the

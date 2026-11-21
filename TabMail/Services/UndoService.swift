@@ -61,6 +61,15 @@ struct UndoMember: Sendable, Equatable {
     /// `ExpectedMessageIdentity`'s doc for why that population fails OPEN.
     let sourceRfc822MessageId: String?
 
+    /// The epoch under which `originalHeaderId` was proven — the address this
+    /// member names NOW, so it follows `rekey`. It is the witness for a member
+    /// with no usable Message-ID (`ExpectedMessageIdentity`'s epoch arm): a
+    /// UIDVALIDITY turnover that re-seats a different message under that id
+    /// gives it a different epoch, and Undo refuses it. Unlike
+    /// `sourceObservedUidValidity` it describes where the message IS, not
+    /// where it came from.
+    private(set) var addressObservedUidValidity: Int?
+
     init(header: MessageHeader) {
         providerMessageId = header.messageId
         sourceFolderId = header.folderId
@@ -71,6 +80,13 @@ struct UndoMember: Sendable, Equatable {
         sourceTagSortOrder = header.tagSortOrder
         originalHeaderId = header.id
         sourceRfc822MessageId = header.rfc822MessageId
+        // The row's epoch proves the address `(folderPath, messageId)`; it is
+        // this member's address witness only when `id` names exactly that
+        // address. A snapshot whose id was already moved elsewhere carries a
+        // source epoch that says nothing about `id`, so it gives no witness.
+        addressObservedUidValidity = header.id == MessageIdentity.headerId(
+            accountId: header.accountId, folderPath: header.folderPath,
+            messageId: header.messageId) ? header.observedUidValidity : nil
     }
 
     /// Follow the row this member names to the destination address the drain
@@ -92,6 +108,7 @@ struct UndoMember: Sendable, Equatable {
     ) {
         originalHeaderId = newHeaderId
         providerMessageId = newProviderMessageId
+        addressObservedUidValidity = newObservedUidValidity
         // An optimistic inverse deliberately clears the row epoch while it
         // waits for the provider to assign its source-folder UID. When that
         // exact inverse later re-keys back into the command's original source,

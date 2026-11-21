@@ -155,17 +155,7 @@ struct AITextMessageCallerTests {
     }
 
     private func withAIEnabled<T>(_ body: () async throws -> T) async rethrows -> T {
-        let store = AIService.optOutStore
-        let previous = store.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous {
-                store.set(previous, forKey: AIService.optOutAllAIKey)
-            } else {
-                store.removeObject(forKey: AIService.optOutAllAIKey)
-            }
-        }
-        AIService.writeOptOutFlag(false)
-        return try await body()
+        try await AITestSetting.with(aiOff: false, body)
     }
 
     private func runJob(_ type: ActiveAIQueue.AIJob.JobType, _ fixture: Fixture, _ service: AIService) async -> Bool {
@@ -703,13 +693,16 @@ struct AITextMessageCallerTests {
         let final = try JSONSerialization.data(withJSONObject: ["assistant": summary])
         let stream = Data(("event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n").utf8)
 
-        let response = await BackendNSEClient.$transport.withValue({ request in
-            seen.withLock { $0 = request }
-            return (stream, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
-        }) {
-            await BackendNSEClient.sendCompletions(
-                promptAlias: "system_prompt_summary", variables: BackendNSEClient.Vars([:]),
-                authToken: "synthetic-token")
+        // The AI setting is not under test here: the extension reads it as on.
+        let response = await BackendNSEClient.$isAIOff.withValue({ false }) {
+            await BackendNSEClient.$transport.withValue({ request in
+                seen.withLock { $0 = request }
+                return (stream, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+            }) {
+                await BackendNSEClient.sendCompletions(
+                    promptAlias: "system_prompt_summary", variables: BackendNSEClient.Vars([:]),
+                    authToken: "synthetic-token")
+            }
         }
 
         let request = try #require(seen.withLock { $0 })

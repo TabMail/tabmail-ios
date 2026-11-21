@@ -561,6 +561,9 @@ struct PendingOperationSnapshot: Sendable {
     /// `.markUnflagged`, `.setTag`, `.removeTag`). Used to skip overwriting
     /// flags/tags the user just toggled.
     let flag: Set<String>
+    /// IDs from tag ops only (`.setTag`, `.removeTag`): the user's own tag change
+    /// not yet on the server, which a sync-side tag rewrite must not undercut.
+    let tag: Set<String>
     /// IDs from user-label ops (`.addUserLabel`, `.removeUserLabel`). Used to skip
     /// overwriting a message's user labels while the user's own label change has
     /// not reached the server (the change apply, #882).
@@ -574,6 +577,7 @@ struct PendingOperationSnapshot: Sendable {
         .markRead, .markUnread, .markFlagged, .markUnflagged, .setTag, .removeTag
     ]
     static let userLabelTypes: Set<OperationType> = [.addUserLabel, .removeUserLabel]
+    static let tagTypes: Set<OperationType> = [.setTag, .removeTag]
 
     /// Build from a pre-fetched list of ops. Callers load ops once inside the
     /// write transaction and pass them here so the filter classification is
@@ -581,6 +585,7 @@ struct PendingOperationSnapshot: Sendable {
     init(ops: [PendingOperation]) {
         var destructive = Set<String>()
         var flag = Set<String>()
+        var tag = Set<String>()
         var userLabel = Set<String>()
         var all = Set<String>()
         for op in ops {
@@ -588,10 +593,12 @@ struct PendingOperationSnapshot: Sendable {
             all.formUnion(ids)
             if Self.destructiveTypes.contains(op.type) { destructive.formUnion(ids) }
             if Self.flagTypes.contains(op.type) { flag.formUnion(ids) }
+            if Self.tagTypes.contains(op.type) { tag.formUnion(ids) }
             if Self.userLabelTypes.contains(op.type) { userLabel.formUnion(ids) }
         }
         self.destructive = destructive
         self.flag = flag
+        self.tag = tag
         self.userLabel = userLabel
         self.all = all
     }
