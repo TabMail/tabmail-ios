@@ -1026,7 +1026,7 @@ struct SuggestionRewriteRouteTests {
                 "control: the unchanged card is the suggestion's")
         for role in ComposeDraftGuards.RecipientRole.allCases {
             var recipients = envelope.recipients
-            recipients[role: role].rejected = ["not an address"]
+            recipients[role].rejected = ["not an address"]
             #expect(!envelope.holds(recipients: recipients, subject: envelope.subject, accountId: "acc1", of: fixture.header),
                     "\(role): a rejected entry")
             #expect(ComposeView.suggestionEditTarget(

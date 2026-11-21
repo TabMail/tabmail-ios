@@ -299,7 +299,7 @@ struct MessageDetailDisplayOrderTests {
         #expect(vm.threadMessages.map(\.replyTextMessage) == ["new reply text"])
         // The chat's AI Suggestion, read from the thread's newest email, is the new one.
         let suggestion = vm.threadMessages.first.flatMap {
-            ChatReplyField.suggestionText(newest: $0, usersTurn: false, onlyTo: nil)
+            ChatReplyField.shown(newest: $0, usersTurn: false, onlyTo: nil)?.textMessage
         }
         #expect(suggestion == "new reply text")
     }

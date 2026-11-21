@@ -148,8 +148,8 @@ struct EmailForwardToolBodyReadTests {
         var all: [ComposeEditContext] { lock.withLock { items } }
     }
 
-    static let attachedSentinel = "ATTACHED-EML-SENTINEL"
-    static let draftBody = "Hi Pat,\n\nSam asks whether we are in for the offsite.\n\nAlex"
+    nonisolated static let attachedSentinel = "ATTACHED-EML-SENTINEL"
+    nonisolated static let draftBody = "Hi Pat,\n\nSam asks whether we are in for the offsite.\n\nAlex"
 
     @Test("A pending reset refuses the forward with no model call and no card; an unchanged email sends its own body",
           arguments: [true, false])
