@@ -645,17 +645,24 @@ struct TutorialChatViewRunTests {
 
     // A first-launch tour starts before the AI choice and teaches the chat view, so its sample email
     // opens as a chat: a real open (`MessageOpenView`, routed as its body routes it) made during the
-    // run goes to the chat. The same open made once the run has ended, still before the choice, goes
+    // run goes to the chat. Neither the tour, its demo setup nor the open records an AI choice or an
+    // opt-out on the device: both values stay absent throughout. Once the run has ended, still
+    // before the choice, an open of a real email (the tour's sample is removed with the demo) goes
     // to today's detail: outside a tour, AI is off until the choice is made.
-    @Test("Before the AI choice, the tour opens its sample email as a chat; after the tour, still before the choice, a fresh open is today's detail")
+    @Test("Before the AI choice, the tour opens its sample email as a chat and records no AI choice; after the tour, still before the choice, an open of a real email is today's detail")
     func openBeforeTheAIChoice() async throws {
         let fixture = try install()
         defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        /// The device AI values (the AI choice and Opt Out of AI) that are stored.
+        func storedAIValues() -> [String] {
+            [AIService.aiChoiceMadeKey, AIService.optOutAllAIKey].filter { AIService.optOutStore.object(forKey: $0) != nil }
+        }
         try await withSettings(chatView: true, aiChoiceMade: false) {
             let coordinator = TutorialCoordinator.shared
             let database = PrioritizedDatabase(pool: fixture.0)
             #expect(AIService.isAIOff, "control: no AI choice yet, so AI is off")
-            var priyaId: String?
+            let beforeRun = storedAIValues()
+            #expect(beforeRun.isEmpty, "before the tour no AI value is stored: \(beforeRun)")
             try await whileRunning(.reuseReply) {
                 #expect(coordinator.teachesChat, "control: the run teaches the chat view")
                 let found = try await fixture.0.read { db in
@@ -663,16 +670,36 @@ struct TutorialChatViewRunTests {
                         && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
                 }
                 let priya = try #require(found, "the demo seed has Priya's email")
-                priyaId = priya.id
+                let beforeOpen = storedAIValues()
+                #expect(beforeOpen.isEmpty, "the tour's setup stores no AI value: \(beforeOpen)")
                 let route = MessageOpenView(messageId: priya.id).route(pool: database)
                 #expect(route == .chat, "the tour opens its sample email as a chat before the AI choice")
+                let afterOpen = storedAIValues()
+                #expect(afterOpen.isEmpty, "the open stores no AI value: \(afterOpen)")
             }
             #expect(!coordinator.isRunning, "control: the run ended")
             #expect(ChatViewConfig.isEnabledByUser, "control: Chat View is still on")
             #expect(AIService.isAIOff, "control: still no AI choice")
-            let id = try #require(priyaId, "the run found Priya's email")
-            let after = MessageOpenView(messageId: id).route(pool: database)
+            let afterRun = storedAIValues()
+            #expect(afterRun.isEmpty, "the tour's end stores no AI value: \(afterRun)")
+
+            // A real email, outside the demo, in a real account's inbox.
+            let accountId = "after-tour"
+            _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: fixture.0)
+            try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: fixture.0)
+            let real = MessageHeader(
+                messageId: "1", subject: "Plans", from: "Alex", fromAddress: "alex@example.com",
+                to: "\(accountId)@example.com", date: Date(), snippet: "Lunch moves to noon",
+                folderId: MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX"),
+                accountId: accountId, folderPath: "INBOX", isInInbox: true)
+            try await fixture.0.write { db in try real.insert(db) }
+            let stored = try await fixture.0.read { db in try MessageHeader.fetchOne(db, key: real.id) }
+            #expect(stored?.accountId == accountId, "control: the real email is stored, outside the demo account")
+            #expect(accountId != DemoSeed.demoAccountId, "control: the account is not the demo's")
+            let after = MessageOpenView(messageId: real.id).route(pool: database)
             #expect(after == .detail, "outside the tour, before the AI choice, an open is today's detail")
+            let afterRealOpen = storedAIValues()
+            #expect(afterRealOpen.isEmpty, "the open after the tour stores no AI value: \(afterRealOpen)")
         }
     }
 
