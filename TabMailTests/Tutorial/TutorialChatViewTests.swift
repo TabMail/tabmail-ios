@@ -337,7 +337,9 @@ struct TutorialChatViewRunTests {
     }
 
     /// Runs `body` with the Chat View setting and the AI setting as given (the AI choice made,
-    /// opted out or not; or, with `aiChoiceMade` false, no AI choice yet), then puts both back.
+    /// opted out or not; or, with `aiChoiceMade` false, no AI choice yet), then puts both back,
+    /// with the subscription gate as it was found (`AIGateTestState`: its open state, its checked
+    /// bit and both stored values).
     private func withSettings(chatView: Bool, optedOut: Bool = false, aiChoiceMade: Bool = true,
                               _ body: () async throws -> Void) async throws {
         let defaults = UserDefaults.standard
@@ -346,12 +348,12 @@ struct TutorialChatViewRunTests {
         let progressKeys = ["tutorial.version", "tutorial.completedLessons", "tutorial.discoveries"]
         let savedProgress = progressKeys.map { defaults.object(forKey: $0) }
         let gate = AISubscriptionGate.shared
-        let gateWasActive = gate.isActive
+        let gateState = AIGateTestState()
         defer {
             defaults.set(savedChat, forKey: ChatViewConfig.enabledKey)
             restoreAISetting()
             for (key, value) in zip(progressKeys, savedProgress) { defaults.set(value, forKey: key) }
-            if gateWasActive { gate.openGate() } else { gate.closeGate() }
+            gateState.restore()
             DemoModeStore.shared._resetForTests()
         }
         defaults.set(chatView, forKey: ChatViewConfig.enabledKey)

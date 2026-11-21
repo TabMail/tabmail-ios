@@ -639,14 +639,14 @@ struct ChatSummaryQueueTests {
     // MARK: - 6. The switch
 
     /// Everything `ChatViewConfig.isActive` reads, saved and put back so no suite sees residue:
-    /// the user toggle, the AI setting (the AI choice and the opt-out) and the subscription gate.
+    /// the user toggle, the AI setting (the AI choice and the opt-out) and the subscription gate
+    /// (its open state, its checked bit and both values it stores).
     @MainActor
     struct SavedChatViewState {
         let defaults = UserDefaults.standard
         let toggle = UserDefaults.standard.object(forKey: ChatViewConfig.enabledKey)
         let restoreAISetting = AITestSetting.save()
-        let gateOpen = AISubscriptionGate.shared.isActive
-        let lastKnownActive = UserDefaults.standard.object(forKey: "ai_subscription_last_known_active")
+        let gateState = AIGateTestState()
 
         /// The toggle as given, AI on (the AI choice made, not opted out).
         func setChatView(on: Bool) {
@@ -656,8 +656,7 @@ struct ChatSummaryQueueTests {
         }
 
         func restore() {
-            if gateOpen { AISubscriptionGate.shared.openGate() } else { AISubscriptionGate.shared.closeGate() }
-            defaults.set(lastKnownActive, forKey: "ai_subscription_last_known_active")
+            gateState.restore()
             defaults.set(toggle, forKey: ChatViewConfig.enabledKey)
             restoreAISetting()
         }
