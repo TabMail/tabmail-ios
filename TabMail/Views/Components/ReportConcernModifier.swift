@@ -220,9 +220,10 @@ struct ReportConcernSheetModifier: ViewModifier {
     /// Called once the report is done: the sheet left with nothing sent (Cancel, a swipe down, or
     /// the sheet taken down before Report), a report not taken once its sheet has gone, or OK on
     /// "Report Submitted". A sent report does not call it once its caller has opened a later
-    /// report or its presentation is gone; a sheet that leaves with nothing sent always calls it.
-    /// A sheet that never had a window (one UIKit refused) has not left, and calls nothing
-    /// (`WindowProbe` reports no departure for it).
+    /// report or its presentation is gone. A sheet that leaves with nothing sent calls it only if
+    /// the presentation that was current while it was on screen still is: one that never had a
+    /// window, or one shown for a presentation its caller has retired since (the closed popover's
+    /// sheet SwiftUI presents again, which can be in a window for a moment), calls nothing.
     var onFinish: (() -> Void)?
     /// Set by a caller whose `isPresented` flag outlives the view this sheet is attached to (the
     /// notice's flag lives on its button, the sheet on the popover's content): the caller then
@@ -255,6 +256,10 @@ struct ReportConcernSheetModifier: ViewModifier {
 private final class ReportSheetLife {
     /// The sheet is in a window, as its probe last saw.
     var inWindow = false
+    /// The presentation that was current when the sheet was last put in a window; nil until it has
+    /// had one. Taken from the window, not from `onChange(of: isPresented)`, which does not reliably
+    /// fire inside a popover's content.
+    var shownFor: Int?
     /// The report this sheet sent, if any. It settles once the sheet has gone.
     var submission: ReportConcernSubmission?
 }
@@ -330,10 +335,10 @@ private struct ReportConcernSheet: View {
         // or taken down with the row or popover that presented it, when its onDismiss may not run.
         .background(WindowProbe(onWindow: { [life, presentation] in
             life.inWindow = true
+            life.shownFor = presentation.current
             noticeDebugLog("report sheet \(ObjectIdentifier(life))",
                            "in a window: current \(presentation.current), sent \(life.submission != nil)")
         }, onDetach: { [life, presentation, onFinish] in
-            // Only a sheet that was in a window gets here: one UIKit refused reports nothing.
             life.inWindow = false
             noticeDebugLog("report sheet \(ObjectIdentifier(life))",
                            "left its window: current \(presentation.current), sent \(life.submission != nil)")
@@ -343,11 +348,17 @@ private struct ReportConcernSheet: View {
                 guard !life.inWindow else { return }
                 if let submission = life.submission {
                     submission.sheetLeft()
-                } else {
+                } else if life.shownFor == presentation.current {
                     // Cancel, a swipe down, or a sheet closed before anything was sent.
                     noticeDebugLog("report sheet \(ObjectIdentifier(life))",
                                    "gone with nothing sent: finishes presentation \(presentation.current)")
                     onFinish?()
+                } else {
+                    // Shown for a presentation its caller has retired since (the closed popover's
+                    // sheet SwiftUI presents again), or never in a window: not the current report's
+                    // to end.
+                    noticeDebugLog("report sheet \(ObjectIdentifier(life))",
+                                   "gone with nothing sent, shown for \(String(describing: life.shownFor)): finishes nothing, current \(presentation.current)")
                 }
             }
         }))

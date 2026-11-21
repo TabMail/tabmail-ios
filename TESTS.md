@@ -1418,8 +1418,18 @@ happens to the view that asked for it, and a report it did not take says nothing
   `aClosedSheetsAnswerBeforeTheNextReport`, `aClosedSheetsAnswerDuringTheNextReport`,
   `aRemovedOwnersTakenAnswerConfirmsOnce`, `aRemovedNoticesTakenAnswerConfirmsOnce`,
   `anOldAnswerLeavesTheNextSendAlone`, `aSystemClosedPopoversAnswerNeverChangesTheNext`.
-- Only a sheet that was on screen leaves; a sheet UIKit refused reports no departure:
-  - `aWindowlessProbeReportsNothing`: a `WindowProbe.Probe` added to and removed from a superview
+- A sheet that leaves with nothing sent finishes its caller only for the presentation that was
+  current while it was on screen (round 4):
+  - `aSystemClosedPopoversAnswerNeverChangesTheNext` and
+    `aClosedPopoversSheetNeverClosesTheReopenedNotice`: the closed popover's sheet SwiftUI presents
+    again is in a window for a moment, shown for the presentation the reopen retired; when it leaves
+    it never closes the reopened notice.
+  - `aClosedPopoverDoesNotReopenTheSheet`, `aRemovedNoticesTakenAnswerConfirmsOnce` (final Cancel):
+    a sheet on screen for the current presentation still closes the notice on Cancel.
+- Superseded (round 3, flag deleted in round 4): only a sheet that was on screen leaves; a sheet
+  UIKit refused reports no departure:
+  - `aWindowlessProbeReportsNothing` (removed in round 4, with the probe's `attached` flag; it stayed
+    green with the flag removed): a `WindowProbe.Probe` added to and removed from a superview
     with no window reports neither a window nor a detach; one that gets a window and leaves it
     reports exactly one of each.
   - `aClosedPopoversSheetNeverClosesTheReopenedNotice`: as below; the refused sheet never closes

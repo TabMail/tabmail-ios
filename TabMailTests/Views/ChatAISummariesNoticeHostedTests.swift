@@ -24,9 +24,10 @@ import UIKit
 ///     report finishes once: on OK, or for a refused report once the sheet has left, never when
 ///     the sheet of a sent report leaves. An old answer never closes, changes or finishes a later
 ///     report.
-///  5. Only a sheet that was on screen leaves: a sheet SwiftUI presents again from a popover the
-///     system closed, which UIKit refuses, never had a window, so it reports no departure and never
-///     closes the reopened notice. The window probe reports a detach only after it reported a window.
+///  5. A sheet that leaves with nothing sent finishes its caller only for the presentation that was
+///     current while it was on screen: a sheet SwiftUI presents again from a popover the system
+///     closed, which can be in a window for a moment before UIKit refuses it, was shown for the
+///     presentation the reopen retired, so it never closes the reopened notice.
 @Suite("Chat AI summaries notice, hosted", .serialized, .processGlobalState)
 @MainActor
 struct ChatAISummariesNoticeHostedTests {
@@ -770,29 +771,6 @@ struct ChatAISummariesNoticeHostedTests {
         }
     }
 
-    /// UIKit calls `didMoveToWindow` with no window both when a view leaves its window and when it
-    /// is added to, or removed from, a superview that has none (as for a sheet UIKit refused). Only
-    /// the first is a departure.
-    @Test("A probe added to and removed from a superview with no window reports nothing; one that gets a window and leaves it reports one of each")
-    func aWindowlessProbeReportsNothing() async throws {
-        var windows = 0
-        var detaches = 0
-        let probe = WindowProbe.Probe()
-        probe.onWindow = { windows += 1 }
-        probe.onDetach = { detaches += 1 }
-        let windowless = UIView()
-        windowless.addSubview(probe)
-        #expect(probe.window == nil, "control: the superview has no window")
-        probe.removeFromSuperview()
-        #expect(windows == 0 && detaches == 0, "windowless: no window and no detach, got \(windows) and \(detaches)")
-        try await Self.hosting(Color.clear) { controller in
-            controller.view.addSubview(probe)
-            #expect(probe.window != nil, "control: the probe is in a window")
-            probe.removeFromSuperview()
-            #expect(windows == 1 && detaches == 1, "in a window, then out: one of each, got \(windows) and \(detaches)")
-        }
-    }
-
     @Test("A landing that could not present the notice leaves it for the next open; once shown it never opens again")
     func anUnpresentedNoticeIsNotUsedUp() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted view")
@@ -1256,9 +1234,10 @@ struct ChatAISummariesNoticeHostedTests {
     /// popover or the sheet runs, and the report's flag and presentation live on the button. The
     /// notice reopens with no sheet, and the next report's open retires the old presentation, so
     /// the old answer, before or after the next report starts sending, says "Report Submitted"
-    /// once over whatever is up, and its OK closes and changes nothing. The reopen also makes
-    /// SwiftUI present the old sheet again from the closed popover, which UIKit refuses; that sheet
-    /// never has a window, reports no departure, and does not close the reopened notice.
+    /// once over whatever is up, and its OK closes and changes nothing. SwiftUI also presents the
+    /// old sheet again from the closed popover, which UIKit refuses; that sheet can be in a window
+    /// for a moment, but it was shown for the retired presentation, so it does not close the
+    /// reopened notice when it leaves.
     @Test("A popover the system closed while its report sends: the old answer says so once and never closes or changes the next report")
     func aSystemClosedPopoversAnswerNeverChangesTheNext() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
@@ -1554,7 +1533,8 @@ struct ChatAISummariesNoticeHostedTests {
     /// and the user opens the notice again. The reopen retires the old presentation and clears the
     /// report flag; SwiftUI then presents the old sheet again from the closed popover, a fresh sheet
     /// that UIKit refuses ("whose view is not in the window hierarchy" in the test logs). That sheet
-    /// never has a window, so it reports no departure; the old popover's own sheet left before the
+    /// can be in a window for a moment first, but it was shown for the presentation the reopen
+    /// retired, so its departure finishes nothing; the old popover's own sheet left before the
     /// reopen. The reopened notice stays open, with nothing on it, an old refusal leaves it open
     /// too, and its own report still opens and finishes it on Cancel.
     @Test("A popover the system closed with its report sheet up, sent or not: the reopened notice stays open until its own report finishes it")

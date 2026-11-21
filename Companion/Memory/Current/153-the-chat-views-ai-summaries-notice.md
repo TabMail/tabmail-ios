@@ -33,7 +33,28 @@ and "Report a concern". The chat pill keeps its own "AI responses may contain er
   or finishes a later report (`ReportPresentation`), so its OK never closes a popover the user has
   reopened.
   Pinned by `reportSubmittedWaitsForTheSheetToLeave` (no alert until the sheet has gone, then once; finish once) and `submittedReportClosesTheSheet` (the popover stays under the alert until OK).
-- **A sheet UIKit refused reports nothing (#1113, round 3, current):** `WindowProbe` reports
+- **A sheet that leaves with nothing sent finishes only the presentation it was on screen for
+  (#1113, round 4, current):** when the sheet's `WindowProbe` reports a window, the sheet records
+  the presentation then current (`ReportSheetLife.shownFor = ReportPresentation.current`); when it
+  leaves with nothing sent, it finishes its caller only if that presentation is still current. A
+  sheet that never had a window has no `shownFor` and finishes nothing. Why round 3 was not
+  enough: the test logs of 2026-11-21 show that the closed popover's sheet SwiftUI presents again
+  IS in a window for a moment (`report sheet … in a window: current 1` with nothing presented from
+  the root, then `left its window: current 2` once the notice reopened, then UIKit's refusal), so
+  round 3's probe reported its departure and it closed the reopened notice
+  (`aSystemClosedPopoversAnswerNeverChangesTheNext` and
+  `aClosedPopoversSheetNeverClosesTheReopenedNotice`, red in two runs). The gate takes its
+  presentation from the window, not from `.onChange(of: isPresented)` (round 2's `asked`), which
+  does not reliably fire inside the popover's content; `openNotice` still advances the presentation
+  on every open. Round 3's `attached` flag on `WindowProbe.Probe` is deleted with its test
+  `aWindowlessProbeReportsNothing`: with the gate, a departure from a sheet that never had a window
+  finishes nothing anyway, and that test stayed green with the flag removed, so UIKit sent the probe
+  no nil-window call for a superview with no window. Pinned by
+  `aSystemClosedPopoversAnswerNeverChangesTheNext` and
+  `aClosedPopoversSheetNeverClosesTheReopenedNotice` (the gate), and by the Cancel tests
+  `aClosedPopoverDoesNotReopenTheSheet` and `aRemovedNoticesTakenAnswerConfirmsOnce` (a sheet on
+  screen for the current presentation still finishes its caller).
+- **SUPERSEDED by round 4 above. A sheet UIKit refused reports nothing (#1113, round 3):** `WindowProbe` reports
   `onDetach` only after it has reported a window (one `attached` flag on `WindowProbe.Probe`).
   Apple's `UIView.didMoveToWindow()` note: the window "may be nil … when the receiver has just been
   removed from its superview or when the receiver has just been added to a superview that is not
