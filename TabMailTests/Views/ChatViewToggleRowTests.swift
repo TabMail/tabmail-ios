@@ -12,15 +12,16 @@ import UIKit
 ///
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. With AI on, the switch can be used and flipping it stores the user's choice.
-///  2. With AI off, opted out or with no active plan, the switch is grayed out and the stored
-///     choice is kept as it was, so it comes back when AI does.
+///  2. With AI off, opted out, with no AI choice made yet or with no active plan, the switch is
+///     grayed out and the stored choice is kept as it was, so it comes back when AI does.
 @Suite("Chat View switch", .serialized, .processGlobalState)
 @MainActor
 struct ChatViewToggleRowTests {
 
-    /// AI on; AI off because the user opted out; AI off because there is no active plan (the
-    /// subscription gate is closed while the user still consents).
-    enum AIState: CaseIterable, Sendable { case on, optedOut, noPlan }
+    /// AI on; AI off because the user opted out; AI off because the AI choice is not made yet; AI
+    /// off because there is no active plan (the subscription gate is closed while the user still
+    /// consents).
+    enum AIState: CaseIterable, Sendable { case on, optedOut, noChoice, noPlan }
 
     @Test("The switch works while AI is on and stores the choice; with AI off it is grayed out and the choice is kept",
           arguments: AIState.allCases)
@@ -37,7 +38,7 @@ struct ChatViewToggleRowTests {
             if gateWasOpen { gate.openGate() } else { gate.closeGate() }
         }
         if state == .noPlan { gate.closeGate() } else { gate.openGate() }
-        AITestSetting.set(aiOff: state == .optedOut)
+        if state == .noChoice { AITestSetting.clear() } else { AITestSetting.set(aiOff: state == .optedOut) }
         // With AI off the stored choice is on, so the test sees it shown and kept.
         defaults.set(!aiOn, forKey: ChatViewConfig.enabledKey)
         #expect(gate.isActive == (state != .noPlan), "control: the plan state is set")

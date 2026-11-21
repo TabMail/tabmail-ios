@@ -74,13 +74,13 @@ final class TutorialCoordinator {
     /// last step's switch or any later change applies to the next run). Off, it is today's tutorial.
     private(set) var teachesChat = false
 
-    /// Whether a run starting now teaches in the chat view: the user's Chat View setting with AI
-    /// on, since the tutorial opens the AI gate itself and only an AI opt-out keeps it off.
+    /// Whether a run starting now teaches in the chat view: the user's Chat View setting with the
+    /// device's AI setting on (`AIService.isAIOff`), since the tutorial opens the AI gate itself.
+    /// Before the AI choice is made, as when opted out, the run teaches today's view.
     static var chatViewOnForTutorial: Bool {
         ChatViewConfig.isActive(
             enabledByUser: ChatViewConfig.isEnabledByUser,
-            aiOn: ChatViewConfig.isAIOn(
-                optedOut: AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey), subscribed: true))
+            aiOn: ChatViewConfig.isAIOn(aiOff: AIService.isAIOff, subscribed: true))
     }
 
     /// The flight question was sent: the chat card moves on to "Check the original".

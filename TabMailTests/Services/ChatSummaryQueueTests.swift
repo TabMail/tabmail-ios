@@ -690,6 +690,29 @@ struct ChatSummaryQueueTests {
         #expect(ChatViewConfig.isActive, "AI back on: the user's choice applies again")
     }
 
+    /// The device's one AI setting (`AIService.isAIOff`) decides: before the AI choice is made the
+    /// app shows the classic view, as for an opted-out user, and so does a tutorial started then.
+    @MainActor
+    @Test("The chat view stays off until the AI choice is made, and follows the choice once it is")
+    func chatViewWaitsForTheAIChoice() {
+        let saved = SavedChatViewState()
+        defer { saved.restore() }
+        saved.setChatView(on: true)
+        #expect(ChatViewConfig.isActive, "control: chosen, AI on, with a plan")
+
+        AITestSetting.clear()
+        #expect(!ChatViewConfig.isActive, "no AI choice yet: the classic view")
+        #expect(!TutorialCoordinator.chatViewOnForTutorial, "no AI choice yet: the tutorial teaches the classic view")
+
+        AITestSetting.set(aiOff: false)
+        #expect(ChatViewConfig.isActive, "AI on: the chat view")
+        #expect(TutorialCoordinator.chatViewOnForTutorial, "AI on: the tutorial teaches the chat view")
+
+        AITestSetting.set(aiOff: true)
+        #expect(!ChatViewConfig.isActive, "opted out: the classic view")
+        #expect(!TutorialCoordinator.chatViewOnForTutorial, "opted out: the tutorial teaches the classic view")
+    }
+
     @Test("The chat view is on only when chosen and with AI on")
     func activeMatrix() {
         for chosen in [false, true] {
@@ -697,9 +720,9 @@ struct ChatSummaryQueueTests {
                 #expect(ChatViewConfig.isActive(enabledByUser: chosen, aiOn: aiOn) == (chosen && aiOn))
             }
         }
-        for optedOut in [false, true] {
+        for aiOff in [false, true] {
             for subscribed in [false, true] {
-                #expect(ChatViewConfig.isAIOn(optedOut: optedOut, subscribed: subscribed) == (!optedOut && subscribed))
+                #expect(ChatViewConfig.isAIOn(aiOff: aiOff, subscribed: subscribed) == (!aiOff && subscribed))
             }
         }
     }

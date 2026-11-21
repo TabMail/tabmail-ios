@@ -699,15 +699,9 @@ struct AISettingAppliesToEveryRequestTests {
         // Display only: observes both values so the demo's AI section redraws; it records
         // through AIService.recordAIChoice.
         "TabMail/Views/Account/DemoAccountDashboardView.swift",
-        // The chat view. The chat screen only hides AI content, as the detail does. The chat
-        // view setting reads Opt Out of AI to choose between the chat and the detail and to
-        // gate the chat's summary requests; every request it leads to is refused at the send by
-        // AIService.isAIOff. The tutorial is scripted and sends nothing: its chat lesson follows
-        // Opt Out of AI alone. The DEBUG chat test scene seeds the opt-out, as screenshot mode does.
+        // The chat screen only hides AI content, as the detail does (`AIWorkingRule`); it opens
+        // through the chat view setting, which reads AIService.isAIOff.
         "TabMail/Views/Chat/ChatThreadView.swift",
-        "TabMail/Services/ChatViewConfig.swift",
-        "TabMail/Services/Tutorial/TutorialCoordinator.swift",
-        "TabMail/Views/Chat/ChatSwipeTestScene.swift",
     ]
 
     @Test("only the AI setting's own files name its keys; everything else reads the one predicate")

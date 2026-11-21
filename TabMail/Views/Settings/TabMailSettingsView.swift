@@ -640,14 +640,16 @@ struct TabMailSettingsView: View {
 }
 
 /// "Enable Chat View", in TabMail Settings and the tutorial's last step. Chat View
-/// needs AI: while AI is off the row is grayed out and the stored choice is kept for when AI
-/// comes back.
+/// needs AI: while AI is off (no AI choice yet, opted out, or no plan) the row is grayed out and
+/// the stored choice is kept for when AI comes back.
 struct ChatViewToggleRow: View {
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
+    /// The AI choice, observed with the opt-out (`AIService.isAIOff`).
+    @AppStorage(AIService.aiChoiceMadeKey, store: AIService.optOutStore) private var aiChoiceMade = false
     @AppStorage(ChatViewConfig.enabledKey) private var chatViewEnabled = true
 
     var body: some View {
-        let aiOn = ChatViewConfig.isAIOn(optedOut: optOutAllAI, subscribed: AISubscriptionGate.shared.isActive)
+        let aiOn = ChatViewConfig.isAIOn(aiOff: !aiChoiceMade || optOutAllAI, subscribed: AISubscriptionGate.shared.isActive)
         Toggle(isOn: $chatViewEnabled) {
             Label {
                 VStack(alignment: .leading, spacing: 2) {

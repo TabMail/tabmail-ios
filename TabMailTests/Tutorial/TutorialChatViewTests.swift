@@ -336,24 +336,25 @@ struct TutorialChatViewRunTests {
         Issue.record("the tutorial never reached \(step); it is at \(String(describing: TutorialCoordinator.shared.step))")
     }
 
-    /// Runs `body` with the Chat View setting and the AI opt-out as given, then puts both back.
+    /// Runs `body` with the Chat View setting and the AI setting as given (the AI choice made,
+    /// opted out or not), then puts both back.
     private func withSettings(chatView: Bool, optedOut: Bool = false, _ body: () async throws -> Void) async throws {
         let defaults = UserDefaults.standard
         let savedChat = defaults.object(forKey: ChatViewConfig.enabledKey)
-        let savedOptOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
+        let restoreAISetting = AITestSetting.save()
         let progressKeys = ["tutorial.version", "tutorial.completedLessons", "tutorial.discoveries"]
         let savedProgress = progressKeys.map { defaults.object(forKey: $0) }
         let gate = AISubscriptionGate.shared
         let gateWasActive = gate.isActive
         defer {
             defaults.set(savedChat, forKey: ChatViewConfig.enabledKey)
-            AIService.optOutStore.set(savedOptOut, forKey: AIService.optOutAllAIKey)
+            restoreAISetting()
             for (key, value) in zip(progressKeys, savedProgress) { defaults.set(value, forKey: key) }
             if gateWasActive { gate.openGate() } else { gate.closeGate() }
             DemoModeStore.shared._resetForTests()
         }
         defaults.set(chatView, forKey: ChatViewConfig.enabledKey)
-        AIService.optOutStore.set(optedOut, forKey: AIService.optOutAllAIKey)
+        AITestSetting.set(aiOff: optedOut)
         for key in progressKeys { defaults.removeObject(forKey: key) }
         DemoModeStore.shared._resetForTests()
         gate.closeGate()
