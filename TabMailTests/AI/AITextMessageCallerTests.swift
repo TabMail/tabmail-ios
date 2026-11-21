@@ -761,7 +761,8 @@ struct AITextMessageCallerTests {
             for _ in 0..<400 where calls.withLock({ $0 }) < 1 { try await Task.sleep(for: .milliseconds(5)) }
             #expect(calls.withLock { $0 } == 1, "control: the Recompute is waiting on its reply")
 
-            if closed { ComposeView.cardClosed(recompute: recompute) }
+            // The card closes on the main actor, as ComposeView does.
+            if closed { await MainActor.run { ComposeView.cardClosed(recompute: recompute) } }
             release.signal()
             _ = await recompute.value
 
