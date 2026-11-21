@@ -702,6 +702,9 @@ struct AISettingAppliesToEveryRequestTests {
         // The chat screen only hides AI content, as the detail does (`AIWorkingRule`); it opens
         // through the chat view setting, which reads AIService.isAIOff.
         "TabMail/Views/Chat/ChatThreadView.swift",
+        // The tutorial is a scripted demo and sends no AI request: whether it teaches the chat
+        // view follows Opt Out of AI alone, so a tour before the AI choice teaches it.
+        "TabMail/Services/Tutorial/TutorialCoordinator.swift",
     ]
 
     @Test("only the AI setting's own files name its keys; everything else reads the one predicate")

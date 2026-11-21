@@ -691,9 +691,11 @@ struct ChatSummaryQueueTests {
     }
 
     /// The device's one AI setting (`AIService.isAIOff`) decides: before the AI choice is made the
-    /// app shows the classic view, as for an opted-out user, and so does a tutorial started then.
+    /// app shows the classic view, as for an opted-out user. The tutorial is a scripted demo that
+    /// sends no AI request, so it follows Opt Out of AI alone: a tour before the choice teaches the
+    /// chat view.
     @MainActor
-    @Test("The chat view stays off until the AI choice is made, and follows the choice once it is")
+    @Test("The chat view stays off until the AI choice is made, and follows the choice once it is; the tutorial follows the opt-out alone")
     func chatViewWaitsForTheAIChoice() {
         let saved = SavedChatViewState()
         defer { saved.restore() }
@@ -702,7 +704,7 @@ struct ChatSummaryQueueTests {
 
         AITestSetting.clear()
         #expect(!ChatViewConfig.isActive, "no AI choice yet: the classic view")
-        #expect(!TutorialCoordinator.chatViewOnForTutorial, "no AI choice yet: the tutorial teaches the classic view")
+        #expect(TutorialCoordinator.chatViewOnForTutorial, "no AI choice yet: the scripted tutorial still teaches the chat view")
 
         AITestSetting.set(aiOff: false)
         #expect(ChatViewConfig.isActive, "AI on: the chat view")
