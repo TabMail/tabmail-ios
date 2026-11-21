@@ -160,6 +160,11 @@ final class ChatSwipeUITests: XCTestCase {
         let field = replyField(in: app)
         let newest = bubble(3, in: app)
         let before = restingMinY(of: newest)
+        // The marker reports the newest ROW's top, its sender line included, not the bubble's: read
+        // it at rest too, so the control compares a row's top with a row's top.
+        let rest = readDragMarker(in: app)
+        XCTAssertNotNil(rest, "control: the marker shows at rest")
+        guard let rest else { return }
         let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
         start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -40)),
                     withVelocity: .slow, thenHoldForDuration: 0.3)
@@ -167,7 +172,7 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertNotNil(marker, "control: the marker recorded one finished drag")
         guard let marker else { return }
         XCTAssertTrue(marker.hasBaseline, "control: the drag's start had the newest row's place")
-        XCTAssertEqual(marker.newestMinY, before, accuracy: 1, "control: the marker's newest row is the bubble read at rest")
+        XCTAssertEqual(marker.newestMinY, rest.newestMinY, accuracy: 1, "control: the marker's newest row is the row read at rest")
         XCTAssertLessThan(marker.move, 1, "the chat stayed through the swell and the settle: moved \(marker.move)")
         XCTAssertTrue(marker.heldAtSettle, "the freeze is still held through the cooldown after the settle")
         XCTAssertFalse(marker.frozen, "the freeze is released once the drag has settled")
