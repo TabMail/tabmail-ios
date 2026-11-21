@@ -577,9 +577,11 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             Self.isTextViews(other) && other is UILongPressGestureRecognizer
         }
 
-        /// The text the drag's first touch landed in, and where it was scrolled then.
+        /// The text the drag's first touch landed in, where it was scrolled then, and the drag's
+        /// sideways travel when the text last reached its end (nil while it can still scroll).
         private weak var text: UIScrollView?
         private var textStart: CGFloat = 0
+        private var handOff: CGFloat?
 
         /// Notes the text under a new drag's first touch.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
@@ -596,17 +598,36 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             text = Self.scrollingText(around: view)
             text?.bouncesVertically = false
             textStart = text?.contentOffset.y ?? 0
+            // A drag that starts with the text at its end is the field's from its start.
+            if let text, text.contentOffset.y >= Self.end(of: text) {
+                handOff = 0
+            } else {
+                handOff = nil
+            }
         }
 
         /// The field's share of `drag` (`ChatFieldDrag.fieldShare`): how far the text under it has
-        /// scrolled since the touch, up to its end, is the text's. Off the text, all of it.
+        /// scrolled since the touch, up to its end, is the text's, and so is the sideways travel
+        /// until the text reached its end. The hand-off is taken at the first sample with the text
+        /// at its end and dropped when the text scrolls back from it, so a drag that reverses into
+        /// the text and reaches the end again hands off afresh. Off the text, all of it.
         func share(_ drag: ChatHorizontalPan.Sample) -> ChatHorizontalPan.Sample {
             guard let text else { return drag }
-            let end = max(text.contentSize.height + text.adjustedContentInset.bottom - text.bounds.height,
-                          -text.adjustedContentInset.top)
+            let end = Self.end(of: text)
             let offset = text.contentOffset.y
+            if offset < end {
+                handOff = nil
+            } else if handOff == nil {
+                handOff = drag.travel.width
+            }
             return ChatFieldDrag.fieldShare(of: drag, textScrolled: min(offset, end) - textStart,
-                                            textAtEnd: offset >= end)
+                                            handOff: handOff)
+        }
+
+        /// The scroll position at which `text` shows its end (its top when it does not scroll).
+        static func end(of text: UIScrollView) -> CGFloat {
+            max(text.contentSize.height + text.adjustedContentInset.bottom - text.bounds.height,
+                -text.adjustedContentInset.top)
         }
 
         /// The scrolling text view (`UITextInput`) that `view` is or sits in.

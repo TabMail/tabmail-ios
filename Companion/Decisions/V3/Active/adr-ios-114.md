@@ -1045,7 +1045,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    notes the text under the drag's first touch and its scroll offset then, and hands on only the
    field's share of each sample (`ChatFieldPan.Coordinator.share`, `ChatFieldDrag.fieldShare`):
    the finger's travel less what the text scrolled, counted up to its end; short of the end, no
-   upward travel and no velocity, so a flick inside the text never opens the panel. UIKit cannot
+   upward travel and no velocity, so a flick inside the text never opens the panel. Both axes of
+   the share count from the hand-off, where the text reached its end (amended 2026-11-21): sideways
+   travel made while the text had the drag is not the field's, and a drag that reverses until the
+   text scrolls again drops the hand-off and takes a new one when the text is back at its end; the
+   field's segment keeps the more-up-than-sideways rule, and whether the pan begins at all is
+   still decided on the drag's first movement. UIKit cannot
    start a recognizer that failed earlier in the same touch, so waiting for the scroll could never
    hand the rest of a drag to the field; sharing the touch keeps one delivery and one release path.
    The collapsed reply editor's text never bounces vertically: the pan turns its vertical bounce off

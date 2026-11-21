@@ -107,14 +107,21 @@ enum ChatFieldDrag {
     /// The field's share of a drag that started in the focused field's text (mock v15 H2): while
     /// the text can still scroll it keeps the drag; once it has reached its end, the rest of the
     /// same drag is the field's, its swell, its open distance and its flick, as for a short draft.
-    /// `textScrolled` is how far the text has scrolled toward its end since the touch, counted only
-    /// up to its end; `textAtEnd` whether it is there (or past it, bouncing). Short of the end the
-    /// field gets no upward travel and no velocity, so a flick inside the text never opens the panel.
+    /// Both axes count from that hand-off. `textScrolled` is how far the text has scrolled toward
+    /// its end since the touch, counted only up to its end, so the field's upward travel starts
+    /// where the text reached it. `handOff` is the drag's sideways travel when the text reached its
+    /// end (0 for a drag that started there), nil while the text can still scroll: the sideways
+    /// travel made while the text had the drag is not the field's, so it never turns the field's
+    /// own upward segment sideways. Short of the end the field gets no travel and no velocity, so a
+    /// flick inside the text never opens the panel.
     static func fieldShare(of drag: ChatHorizontalPan.Sample, textScrolled: CGFloat,
-                           textAtEnd: Bool) -> ChatHorizontalPan.Sample {
+                           handOff: CGFloat?) -> ChatHorizontalPan.Sample {
         let up = drag.travel.height + textScrolled
-        return ChatHorizontalPan.Sample(travel: CGSize(width: drag.travel.width, height: textAtEnd ? up : max(0, up)),
-                                        velocity: textAtEnd ? drag.velocity : .zero)
+        guard let handOff else {
+            return ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: max(0, up)), velocity: .zero)
+        }
+        return ChatHorizontalPan.Sample(travel: CGSize(width: drag.travel.width - handOff, height: up),
+                                        velocity: drag.velocity)
     }
 
     /// Whether a let-go with this last sample (`ChatHorizontalPan.Sample`) opens the panel: its
