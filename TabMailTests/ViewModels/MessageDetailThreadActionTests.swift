@@ -1485,11 +1485,21 @@ struct MessageDetailThreadActionTests {
             snippet: "body", date: Self.seededDate, isRead: false, isFlagged: false, hasAttachments: false,
             isReplied: false, isForwarded: false, actionTag: ActionTag.reply.rawValue, summaryBlurb: nil)
         #expect(staged.headerId == opener.id, "control: the staged copy is the same email")
+        // The stored row carries the email's Message-ID, as its staged copy does: Undo checks the
+        // Message-ID it recorded (from the row the chat shows) against the stored row's.
+        let openerId = opener.id
+        let stagedRfc = staged.rfc822MessageId
+        try await pool.write { db in
+            guard var row = try MessageHeader.fetchOne(db, key: openerId) else { return }
+            row.rfc822MessageId = stagedRfc
+            try row.update(db)
+        }
         NSEDataBridge.latestStagedRows.withLock { $0 = [staged] }
         let stored = try await rows(pool, [opener.id])
         #expect(stored.count == 1)
         guard stored.count == 1 else { return }
         #expect(TagPair(of: stored[0]) == TagPair(nil), "control: the stored row has no tag")
+        #expect(stored[0].rfc822MessageId == staged.rfc822MessageId, "control: the stored row and its staged copy have one Message-ID")
         let vm = openChat(pool, focused: staged.toMessageHeader(), others: [])
         #expect(vm.chatRows.first.map { TagPair(of: $0) } == TagPair(.reply), "control: the chat shows the staged tag")
 
