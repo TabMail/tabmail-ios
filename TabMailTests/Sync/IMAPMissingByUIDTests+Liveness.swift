@@ -297,7 +297,8 @@ extension IMAPMissingByUIDTests {
         try await Self.withWorld("owed-over-age-slice", server: server, local: server) { w in
             try await w.dropLocal([12])
             try await w.markOwed()
-            let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() }, maxRequests: 3, listingRangeMessages: w.rangeMessages))
+            let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() },
+                                                       maxRequests: Self.newListingStartRequests + 3, listingRangeMessages: w.rangeMessages))
             let result = try #require(read.results.first)
             #expect(result.completedListing == nil && result.loaded.contains { $0.id == "12" },
                     "setup: a slice that loads the missing message and does not complete the listing")

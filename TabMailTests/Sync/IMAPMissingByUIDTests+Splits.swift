@@ -159,10 +159,6 @@ extension IMAPMissingByUIDTests {
     @Test("A folder whose stored message count is 0 while its UIDNEXT is known: its first listing range has the minimum width, never the whole folder, and no listing request answers more than about one range's messages")
     @MainActor
     func unknownCountListsInRangesOfTheMinimumWidth() async throws {
-        // Debug-gated diagnostics for one run (#1062): `TEST_RUNNER_TABMAIL_TEST_DEBUG_LOG=1`.
-        let debugLog = ProcessInfo.processInfo.environment["TABMAIL_TEST_DEBUG_LOG"] == "1"
-        if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true } }
-        defer { if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } } }
         let server = Array(1...5000)
         let messages = SyncConfig.catchUpListingRangeMessages
         try await Self.withWorld("count-zero", server: server, local: server, rangeMessages: messages) { w in
@@ -297,9 +293,9 @@ extension IMAPMissingByUIDTests {
             try await w.dropLocal(Self.carryMissing)
             try await w.markOwed()
             let clock = CatchUpTestClock()
-            // One request: the first range's listing FETCH; its proof and load
-            // are carried.
-            await w.slice(maxRequests: 1, clock: clock)
+            // One request after the listing's start: the first range's listing
+            // FETCH; its proof and load are carried.
+            await w.slice(maxRequests: Self.newListingStartRequests + 1, clock: clock)
             let carried = try #require(try w.catchUpState()?.listing?.carried, "setup: the range is carried")
             #expect(carried.missing.contains(UInt32(stale)), "setup: the carried range names \(stale)")
             var expected = server
@@ -656,7 +652,8 @@ extension IMAPMissingByUIDTests {
             #expect(expected != SyncConfig.catchUpListingMinRangeSpan && expected != SyncConfig.catchUpListingMaxRangeSpan,
                     "setup: the folder's width is neither clamp: \(expected)")
             let start = w.server.recordedCommands().count
-            await w.slice(maxRequests: 1, clock: CatchUpTestClock())
+            // A stored listing with no top starts as a new one does (`newListingStartRequests`).
+            await w.slice(maxRequests: Self.newListingStartRequests + 1, clock: CatchUpTestClock())
             let first = Self.listingRanges(w.server.recordedCommands().dropFirst(start)).first
             #expect(first == 1...expected, "#1062: sized from EXISTS and UIDNEXT: \(first.map { "\($0)" } ?? "none")")
         }

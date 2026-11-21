@@ -59,10 +59,10 @@ extension IMAPMissingByUIDTests {
             w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
             let start = w.server.recordedCommands().count
             // The slice holds the account's turn, as every production slice does
-            // (`runCatchUpRun`). Two requests: the listing and its proof; the
-            // loads are carried.
+            // (`runCatchUpRun`). Two requests after the listing's start: the
+            // listing and its proof; the loads are carried.
             async let sliced: Void = w.engine.oneSyncAtATime(accountId: accountId) {
-                await w.slice(maxRequests: 2, clock: clock)
+                await w.slice(maxRequests: Self.newListingStartRequests + 2, clock: clock)
             }
             var polls = 0
             while Self.listingRanges(w.server.recordedCommands().dropFirst(start)).isEmpty, polls < Self.carryPolls {
@@ -107,7 +107,7 @@ extension IMAPMissingByUIDTests {
             try await w.dropLocal(Self.carryMissing)
             try await w.markOwed()
             let clock = CatchUpTestClock()
-            await w.slice(maxRequests: 2, clock: clock)
+            await w.slice(maxRequests: Self.newListingStartRequests + 2, clock: clock)
             let carried = try #require(try w.catchUpState()?.listing?.carried, "setup: the range is carried")
             #expect(carried.proven && carried.missing == [UInt32(Self.carryMissing[0])],
                     "setup: proven, its load owed: \(carried.missing)")
@@ -137,7 +137,7 @@ extension IMAPMissingByUIDTests {
             if rising {
                 try await w.dropLocal([below])
                 try await w.markOwed()
-                await w.slice(maxRequests: 2, clock: clock)
+                await w.slice(maxRequests: Self.newListingStartRequests + 2, clock: clock)
                 let carried = try #require(try w.catchUpState()?.listing?.carried, "setup: the range is carried")
                 #expect(carried.missing == [UInt32(below)] && carried.loadsFrom == 2, "setup: \(below) carried, listed from 2")
                 // The walk's cursor moves past it: loads start above it now.
@@ -153,7 +153,7 @@ extension IMAPMissingByUIDTests {
                 try await w.dropLocal([below])
                 try await w.markOwed()
                 #expect(CatchUpWindowFloor.read(try w.folder().catchUpState) == nil, "setup: no load floor yet")
-                await w.slice(maxRequests: 1, clock: clock)
+                await w.slice(maxRequests: Self.newListingStartRequests + 1, clock: clock)
                 let carried = try #require(try w.catchUpState()?.listing?.carried, "setup: the range is carried")
                 #expect(carried.loadsFrom == nil && carried.candidates == [UInt32(gone)] && !carried.proven,
                         "setup: listed with no floor, its proof owed")
@@ -184,7 +184,7 @@ extension IMAPMissingByUIDTests {
             try await w.markOwed()
             let clock = CatchUpTestClock()
             let start = w.server.recordedCommands().count
-            await w.slice(maxRequests: 2, clock: clock)
+            await w.slice(maxRequests: Self.newListingStartRequests + 2, clock: clock)
             #expect(try w.catchUpState()?.listing?.carried?.missing == [UInt32(expunged)], "setup: its load is carried")
             let expected = server.filter { $0 != expunged }
             w.server.setMessages(expected.map(Self.message), in: Self.path)
@@ -269,14 +269,26 @@ extension IMAPMissingByUIDTests {
             try await w.markOwed()
             let clock = CatchUpTestClock()
             let start = w.server.recordedCommands().count
-            // The UIDNEXT read and the first range: the listing has its top.
-            await w.slice(maxRequests: 2, clock: clock)
+            // The listing's start (its UIDNEXT read) and the first range: the
+            // listing has its top.
+            await w.slice(maxRequests: Self.newListingStartRequests + 1, clock: clock)
             #expect(try w.catchUpState()?.listing != nil, "setup: the listing is in progress")
             let beforeArrivals = w.server.recordedCommands().count
             w.server.setMessages(w.server.messages(in: Self.path) + arrivals.map { Self.message($0) }, in: Self.path)
             let all = server + arrivals
-            let bound = Self.carryRequestsNeeded + 4
-            let slices = try await Self.slicesUntilRepaired(w, expected: all, maxRequests: 1, clock: clock, bound: 2 * bound)
+            // Every request of the carry repair, the arrivals' range (its listing
+            // FETCH and membership SEARCH), one call per load batch of the
+            // arrivals, and a slack of two calls: the call that finds the listing
+            // complete and one more range cut at the grown top.
+            let arrivalBatches = (arrivals.count + SyncConfig.catchUpLoadBatchSize - 1) / SyncConfig.catchUpLoadBatchSize
+            let bound = Self.carryRequestsNeeded + 2 + arrivalBatches + 2
+            var before = (held: try w.held().count, listing: try w.catchUpState()?.listing?.withoutWidthCap)
+            let slices = try await Self.slicesUntilRepaired(w, expected: all, maxRequests: 1, clock: clock, bound: 2 * bound) {
+                let after = (held: try w.held().count, listing: try w.catchUpState()?.listing?.withoutWidthCap)
+                #expect(after.held > before.held || after.listing != before.listing,
+                        "#1062: every call loads a message or moves the listing: \(String(describing: before.listing)) -> \(String(describing: after.listing))")
+                before = after
+            }
             #expect(slices <= bound, "#1062: the listing completes within \(bound) calls: \(slices)")
             try w.expectHeldExactly(all, "#1062 top grows")
             let commands = w.server.recordedCommands()
@@ -513,7 +525,7 @@ extension IMAPMissingByUIDTests {
             let clock = CatchUpTestClock()
             // The listing, its proof, the first batch and the SEARCH that finds
             // the unreadable UID still on the server: held, the rest carried.
-            await w.slice(maxRequests: 4, clock: clock)
+            await w.slice(maxRequests: Self.newListingStartRequests + 4, clock: clock)
             let first = try #require(try w.catchUpState()?.listing, "setup: the listing goes on")
             let holdStart = try #require(first.loadHeldSince, "setup: the unreadable UID is held")
             #expect(first.nextUid == unreadable && first.carried?.heldFloor == UInt32(unreadable),
@@ -565,7 +577,7 @@ extension IMAPMissingByUIDTests {
             try await w.markOwed()
             let clock = CatchUpTestClock()
             let start = w.server.recordedCommands().count
-            await w.slice(maxRequests: fails == .proof ? 1 : 2, clock: clock)
+            await w.slice(maxRequests: Self.newListingStartRequests + (fails == .proof ? 1 : 2), clock: clock)
             let carried = try #require(try w.catchUpState()?.listing?.carried, "setup: the range is carried")
             #expect(carried.proven == (fails == .load) && carried.missing == [UInt32(missing)], "setup: \(carried)")
             w.server.failNextCommand(containing: fails == .proof ? "SEARCH" : "ENVELOPE")
@@ -592,7 +604,7 @@ extension IMAPMissingByUIDTests {
             w.server.setMessages(server.filter { $0 != gone }.map(Self.message), in: Self.path)
             try await w.markOwed()
             let clock = CatchUpTestClock()
-            await w.slice(maxRequests: 1, clock: clock)
+            await w.slice(maxRequests: Self.newListingStartRequests + 1, clock: clock)
             let carried = try #require(try w.catchUpState()?.listing?.carried, "setup: the range is carried")
             #expect(carried.candidates == [UInt32(gone)] && carried.loadsFrom == nil, "setup: \(carried)")
             try await w.dropLocal([gone])

@@ -238,12 +238,12 @@ extension IMAPMissingByUIDTests {
             try await w.markOwed()
             let clock = CatchUpTestClock()
 
-            // Four requests: the listing FETCH (1:1000), the range's membership
-            // SEARCH, the first header batch (`SyncConfig.catchUpLoadBatchSize`
-            // UIDs from 5, UID 6 unanswered), the SEARCH that finds 6. The second
-            // batch cannot start.
+            // Four requests after the listing's start: the listing FETCH (1:1000),
+            // the range's membership SEARCH, the first header batch
+            // (`SyncConfig.catchUpLoadBatchSize` UIDs from 5, UID 6 unanswered),
+            // the SEARCH that finds 6. The second batch cannot start.
             let batchEnd = 5 + SyncConfig.catchUpLoadBatchSize - 1
-            await w.slice(maxRequests: 4, clock: clock)
+            await w.slice(maxRequests: Self.newListingStartRequests + 4, clock: clock)
             let held1 = Set(try w.held())
             #expect(Set([5] + Array(7...batchEnd)).isSubset(of: held1), "I4: the first batch's other messages load")
             #expect(held1.isDisjoint(with: (batchEnd + 1)...210), "I4: setup: the second batch did not start")
@@ -299,10 +299,11 @@ extension IMAPMissingByUIDTests {
             try await w.markOwed()
             let clock = CatchUpTestClock()
 
-            // Four requests: the listing FETCH, the range's membership SEARCH
-            // (211...1000 is unused UID space), the first header batch, the
-            // SEARCH that finds 6 still on the server. The hold starts here.
-            await w.slice(maxRequests: 4, clock: clock)
+            // Four requests after the listing's start: the listing FETCH, the
+            // range's membership SEARCH (211...1000 is unused UID space), the
+            // first header batch, the SEARCH that finds 6 still on the server.
+            // The hold starts here.
+            await w.slice(maxRequests: Self.newListingStartRequests + 4, clock: clock)
             let firstHold = try #require(try w.catchUpState()?.listing?.loadHeldSince, "#1062: setup: the first slice holds 6")
             #expect(try w.catchUpState()?.listing?.nextUid == unanswered, "#1062: setup: held at 6")
 
@@ -579,12 +580,6 @@ extension IMAPMissingByUIDTests {
           arguments: IMAPMissingByUIDTests.fuzzSeeds)
     @MainActor
     func seededSchedulesConverge(_ seed: UInt64) async throws {
-        // Debug-gated diagnostics for a replay: `TEST_RUNNER_TABMAIL_TEST_DEBUG_LOG=1`
-        // turns the app's debug logs on for this test, so a red seed shows its
-        // mechanism in the log. Off by default.
-        let debugLog = ProcessInfo.processInfo.environment["TABMAIL_TEST_DEBUG_LOG"] == "1"
-        if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true } }
-        defer { if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } } }
         // Acceptance (Testing Rule 11): this schedule rediscovers the removal of
         // the header load's epoch guard (`loadMissing`'s observed-epoch check:
         // the turnover arm loads a lost UID across the turnover) and the loss of

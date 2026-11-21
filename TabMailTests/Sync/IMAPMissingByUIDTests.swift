@@ -30,6 +30,12 @@ struct IMAPMissingByUIDTests {
     static let restReactionPolls = 500
     static let restCatchUpPasses = 40
     static let restBackfillPasses = 20
+    /// Requests a new listing spends before its first range (#1062): with no
+    /// change bookmark and no stored top, the listing's first call reads the
+    /// folder's UIDNEXT (`IMAPCatchUpState.Listing.top`). A setup that gives a
+    /// new listing's first call a request budget for named steps adds this, so
+    /// the budget still reaches those steps.
+    static let newListingStartRequests = 1
 
     static func message(_ uid: Int) -> FakeIMAPServer.Message {
         message(uid, date: TestFixtureDate.rfc2822(daysFromAnchor: -ageInDays - (uid % 7)))
@@ -682,13 +688,15 @@ struct IMAPMissingByUIDTests {
 
 extension IMAPMissingByUIDTests.World {
     /// Leave a listing in progress past the first range: the folder's check is
-    /// due (a lapse), and one slice of two requests (the first range's FETCH
-    /// and its membership SEARCH, for the unused UID space in it) lists that
-    /// range without completing the listing.
+    /// due (a lapse), and one slice of two requests after the listing's start
+    /// (`newListingStartRequests`; then the first range's FETCH and its
+    /// membership SEARCH, for the unused UID space in it) lists that range
+    /// without completing the listing.
     func makeListingInProgress() async throws {
         let folderId = folderId
         try await pool.write { db in try SyncEngine.markCatchUpLapse(folderId: folderId, db: db) }
-        let oneRange = CatchUpContext(deadline: .distantFuture, clock: { Date() }, maxRequests: 2, listingRangeMessages: rangeMessages)
+        let oneRange = CatchUpContext(deadline: .distantFuture, clock: { Date() },
+                                      maxRequests: IMAPMissingByUIDTests.newListingStartRequests + 2, listingRangeMessages: rangeMessages)
         await engine.runCatchUp(provider: provider, folderIds: [folderId], context: oneRange)
         let state = try #require(IMAPCatchUpState.decode(try folder().catchUpState))
         let listing = try #require(state.listing, "setup: a listing is in progress")

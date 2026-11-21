@@ -55,15 +55,23 @@ extension IMAPMissingByUIDTests {
     @Test("A sparse untracked folder on a CONDSTORE server without QRESYNC, listed again after each HIGHESTMODSEQ change: every repeat costs a few requests")
     @MainActor
     func condstoreRepeatListingStaysCheap() async throws {
-        // Debug-gated diagnostics for one run (#1062): `TEST_RUNNER_TABMAIL_TEST_DEBUG_LOG=1`.
-        let debugLog = ProcessInfo.processInfo.environment["TABMAIL_TEST_DEBUG_LOG"] == "1"
-        if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true } }
-        defer { if debugLog { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } } }
         let server = Self.sparseServer
         let condstore = FakeIMAPServer.defaultCapabilities + ["ENABLE", "CONDSTORE"]
         try await Self.withWorld("a1-condstore", capabilities: condstore, server: server, local: server,
                                  rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
             let ranges = (server.count + SyncConfig.catchUpListingRangeMessages - 1) / SyncConfig.catchUpListingRangeMessages
+            // The world's warm-up listing ran with no stored HIGHESTMODSEQ, so it
+            // recorded no completion stamp and the MODSEQ check has nothing to
+            // compare. The foreground sync stores the server's HIGHESTMODSEQ;
+            // the owed listing that follows records it as its stamp.
+            try await w.foregroundSync()
+            try await w.markOwed()
+            try await w.workerRun()
+            let warmServerModSeq = w.server.qresyncHighestModSeq(for: Self.path)
+            let warmStored = try w.folder().lastKnownHighestModSeq
+            let warmStamp = try IMAPCatchUpState.decode(w.folder().catchUpState)?.completionStamp
+            #expect(warmStamp == warmServerModSeq,
+                    "setup: the warm-up listing records the stored HIGHESTMODSEQ as its stamp: stamp \(String(describing: warmStamp)), stored \(String(describing: warmStored)), server \(warmServerModSeq)")
             for (repeatIndex, uid) in [10, 1_000_010, 1_999_910].enumerated() {
                 // Another client reads a message: HIGHESTMODSEQ moves.
                 w.server.setFlags(["\\Seen"], in: Self.path, uid: uid)
