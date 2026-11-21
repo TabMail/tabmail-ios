@@ -97,7 +97,11 @@ struct SyncTurnsForResetTests {
         for id in ids {
             let ran = Flag()
             let pass = Task { await engine.oneSyncAtATime(accountId: id) { await ran.set() } }
-            #expect(try await Self.waitFor(ran), "#1062: \(id)'s turn is free after the failed reset")
+            let freed = try await Self.waitFor(ran)
+            #expect(freed, "#1062: \(id)'s turn is free after the failed reset")
+            // A turn the reset leaked would hold the pass forever: the test fails
+            // above instead of waiting for it.
+            guard freed else { return }
             await pass.value
         }
     }

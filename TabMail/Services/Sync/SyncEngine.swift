@@ -36,8 +36,13 @@ actor SyncEngine {
     #if DEBUG
     /// Test-only seam (`setCatchUpSliceStartHookForTesting`): called with the
     /// folders each catch-up slice asks, as it starts, and awaited, so a test
-    /// can hold a slice inside its turn. Nil outside tests.
+    /// can tell which slice sent each request. Nil outside tests.
     var catchUpSliceStartHookForTesting: (@Sendable ([String]) async -> Void)?
+    /// Test-only seam (`setCatchUpAfterReadHookForTesting`): called with the
+    /// folders a catch-up slice read, once the provider has returned and before
+    /// anything is applied, and awaited, so a test can hold a slice that has
+    /// read the server inside its turn. Nil outside tests.
+    var catchUpAfterReadHookForTesting: (@Sendable ([String]) async -> Void)?
     #endif
 
     /// Generation counter per account — prevents stale task defer from clearing

@@ -68,11 +68,16 @@ struct CatchUpContext: Sendable {
     /// Whether the user's Email Index Limit (`StorageEstimator.budgetMB`) was a
     /// finite limit when the run began. The limit means old mail is not kept:
     /// the storage prune deletes the oldest rows once the store passes it
-    /// (ADR-IOS-006). So while it holds, a provider loads nothing the prune
-    /// removed: a UID-windowed provider loads nothing at or below the folder's
-    /// prune cutoff of its epoch (`CatchUpPruneCutoff`), and still reconciles
-    /// local rows below it; a date-windowed one lists no mail older than the
-    /// folder's oldest local row (ADR-IOS-107 decision 8).
+    /// (ADR-IOS-006). So while it holds, a UID-windowed provider loads nothing
+    /// at or below the folder's prune cutoff of its epoch (`CatchUpPruneCutoff`),
+    /// and still reconciles local rows below it; a date-windowed one lists no
+    /// mail older than the folder's oldest local row (ADR-IOS-107 decision 8).
+    /// Above the cutoff, mail a prune removed can load again ONCE, within the
+    /// limit and stamped: a gap a date-ordered prune left above a seeded cutoff,
+    /// or a deleted row that carried no epoch stamp (the floor rule,
+    /// ADR-IOS-006).
+    /// *Superseded (#1062):* "a provider loads nothing the prune removed",
+    /// which the cutoff cannot promise for those two cases.
     /// *Superseded (#1062):* "a provider lists no mail older than the folder's
     /// oldest local row, and so loads none back", for every provider.
     var storageLimitInForce = false
@@ -195,8 +200,11 @@ struct CatchUpCompletedListing: Sendable, Equatable {
     /// The folder's lapse count (`CatchUpLapse.countKey`) when the listing started.
     let lapseCountAtStart: Int
     /// Every missing message in the listed range was loaded or proven gone:
-    /// none was passed over by the hold bound, and there was a range to list
-    /// (an IMAP listing with no load floor and no local row is not clean).
+    /// none was passed over by the hold bound. An IMAP listing with no load
+    /// floor of the folder's epoch and no local row read nothing from the
+    /// server and is not clean; one whose mailbox the server reports empty is.
+    /// *Superseded (#1062):* "and there was a range to list", which read as if
+    /// an empty mailbox could never complete clean.
     let clean: Bool
 }
 

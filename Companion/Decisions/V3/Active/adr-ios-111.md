@@ -1025,9 +1025,12 @@ The self-heal pass an unproven move owes a folder (`healFoldersAfterAnUnprovenMo
 `selfHealRecentMessages(forceSingleFolder:)`, the 90-day date reach) is deleted. The mark
 (`FolderChangeState.selfHealOwed`, `selfHealLapse`) is now settled by the IMAP catch-up (ADR-IOS-107,
 amendment 2026-11-20): a CLEAN completed listing that started after the mark loads every missing UID
-in the held range by UID and calls `markListingDue`, so the next scheduled full sync lists the folder
+at or above its load floor by UID (the held range's start; under a storage limit, above the prune
+cutoff of the folder's epoch, ADR-IOS-006 floor rule; *superseded 2026-11-21:* "in the held range")
+and calls `markListingDue`, so the next scheduled full sync lists the folder
 and `commitChangeBaseline` tracks it again. An unclean completion (a UID passed over at the hold
-bound, a listing whose first UIDNEXT read reported none (`topUnknown`, 2026-11-20), or loads skipped as an over-age read in any slice of the listing) keeps the folder owed and
+bound, a listing whose first UIDNEXT read reported none (`topUnknown`, 2026-11-20), loads skipped as an over-age read in any slice of the listing, or nothing to check: no load floor of
+the folder's epoch and no local row, so the listing read nothing from the server, 2026-11-21) keeps the folder owed and
 re-marks nothing: an owed folder counts as untracked in the catch-up plan even with a bookmark, so it
 is relisted at least daily, plus when its change counter (HIGHESTMODSEQ) moves past the stamp the
 unclean listing still records. A clean completion that started before the mark re-marks the lapse once

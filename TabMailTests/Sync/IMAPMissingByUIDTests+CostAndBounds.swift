@@ -698,6 +698,33 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    @Test("Under a storage limit, a folder whose first local UID is 1 and that has no window floor gets the seed it computes, 0: it is written, so when UID 1 later goes missing no second seed bars it and the catch-up loads it")
+    @MainActor
+    func computedZeroSeedIsWritten() async throws {
+        let server = Array(1...40)
+        try await Self.withWorld("prune-seed-zero", server: server, local: server) { w in
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = NULL WHERE id = ?", arguments: [folderId])
+            }
+            _ = try await Self.runUnderTheLimit(w)
+            let seeded = try w.folder().catchUpState
+            #expect(CatchUpPruneCutoff.read(seeded, epoch: Self.epoch) == 0,
+                    "#1062: one below the first local UID 1, so 0, is written as the folder's cutoff: \(String(describing: seeded))")
+            #expect(CatchUpWindowFloor.read(seeded, epoch: Self.epoch) == nil, "setup: no window floor lowered the seed")
+
+            // UID 1 goes missing locally; the next owed listing loads it, since
+            // the folder already has its cutoff and gets no second seed above it.
+            try await w.dropLocal([1])
+            try await w.markOwed()
+            let loads = try await Self.runUnderTheLimit(w)
+            #expect(loads.contains { Self.uidSet($0).contains(1) }, "#1062: UID 1, above the cutoff 0, is loaded: \(loads)")
+            try w.expectHeldExactly(server, "#1062: the folder holds all its mail again")
+            #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == 0,
+                    "#1062: no second seed replaced the cutoff")
+        }
+    }
+
     @Test("Under a storage limit, a folder whose one-time seed cannot be written is left out of the slice, so nothing pruned before the cutoff existed loads; the next run seeds it and still loads nothing pruned")
     @MainActor
     func failedSeedLeavesTheFolderOutOfTheSlice() async throws {

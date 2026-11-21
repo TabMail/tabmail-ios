@@ -34,6 +34,23 @@ final class CatchUpSliceLog: Sendable {
     }
 }
 
+/// A call's clock whose deadline passes right after the folder is admitted:
+/// the first read (the admission check, `IMAPProvider.catchUp`) is before the
+/// deadline, every later read past it, so the call stops on time before its
+/// first request.
+final class AdmittedThenExpiredClock: Sendable {
+    private let reads = Mutex(0)
+    let start: Date
+    var deadline: Date { start.addingTimeInterval(1) }
+
+    init(start: Date) { self.start = start }
+
+    func now() -> Date {
+        let read = reads.withLock { $0 += 1; return $0 }
+        return read == 1 ? start : deadline.addingTimeInterval(1)
+    }
+}
+
 /// The clock of a run whose request the server holds until it times out. It
 /// stands still while the server answers (each read moves it a microsecond,
 /// so the times it hands out still order the folders' attempts), so a slow
@@ -959,7 +976,13 @@ extension IMAPMissingByUIDTests {
         case refusedListing
         /// The budget runs out before the header load of a missing message.
         case budgetBeforeHeaderLoad
-        /// The budget runs out before the SEARCH a carried range owes.
+        /// The call's time runs out before the SEARCH a carried range owes: the
+        /// range was carried, as production saves it, by a call whose budget
+        /// stopped before the SEARCH for a header record that could not be read
+        /// (proven, the SEARCH owed), and the next call's deadline passes once
+        /// the folder is admitted (`AdmittedThenExpiredClock`).
+        /// *Superseded (#1062):* the carry was written by hand, unproven and
+        /// owing the SEARCH, which no call saves.
         case budgetBeforeOwedSearch
         /// The budget runs out before the SEARCH for a header record that
         /// could not be read.
@@ -1003,10 +1026,18 @@ extension IMAPMissingByUIDTests {
                 try await w.dropLocal([Suite.siteMissing])
                 try await Suite.startSiteListing(w)
             case .budgetBeforeOwedSearch:
-                try await w.dropLocal([Suite.siteMissing])
-                try await Suite.writeCarriedListing(
-                    w, nextUid: Suite.siteRange.lowerBound, top: Suite.siteServer.last, heldSince: nil,
-                    carried: Suite.siteCarry(unanswered: [UInt32(Suite.siteMissing)], proven: false))
+                // The carry production saves: a call stopped by its budget
+                // before the SEARCH for the unreadable header record.
+                try await Suite.makeSiteMissingUnreadable(w)
+                try await Suite.startSiteListing(w)
+                let saving = CatchUpContext(deadline: .distantFuture, clock: { Date() },
+                                            maxRequests: UntimedStop.budgetBeforeUnreadableSearch.budget,
+                                            listingRangeMessages: w.rangeMessages)
+                await AccountManager.shared.clearRecentlyCompletedForTesting()
+                await w.engine.runCatchUp(provider: w.provider, folderIds: [w.folderId], context: saving)
+                let saved = try w.catchUpState()?.listing
+                #expect(saved?.carried == Suite.siteCarry(unanswered: [UInt32(Suite.siteMissing)]) && saved?.nextUid == Suite.siteMissing,
+                        "setup: the call saved the range proven, its SEARCH owed: \(String(describing: saved))")
             case .refusedOwedSearch, .oversizedOwedSearch:
                 try await w.dropLocal([Suite.siteMissing])
                 try await Suite.writeCarriedListing(
@@ -1077,8 +1108,8 @@ extension IMAPMissingByUIDTests {
                 return Suite.passOverCallRequests
             // The listing FETCH and the membership proof.
             case .budgetBeforeHeaderLoad: return 2
-            // The carried range's membership proof.
-            case .budgetBeforeOwedSearch: return 1
+            // Plenty: the call's time, not its count, stops it.
+            case .budgetBeforeOwedSearch: return Suite.passOverCallRequests
             // The listing FETCH, the membership proof and the header load.
             case .budgetBeforeUnreadableSearch: return 3
             }
@@ -1100,7 +1131,10 @@ extension IMAPMissingByUIDTests {
                 return (1, nil, Suite.siteRange.lowerBound, nil)
             case .budgetBeforeHeaderLoad:
                 return (budget, nil, Suite.siteMissing, Suite.siteCarry(missing: [missing]))
-            case .budgetBeforeOwedSearch, .budgetBeforeUnreadableSearch:
+            // Stopped by time before any request.
+            case .budgetBeforeOwedSearch:
+                return (0, nil, Suite.siteMissing, Suite.siteCarry(unanswered: [missing]))
+            case .budgetBeforeUnreadableSearch:
                 return (budget, nil, Suite.siteMissing, Suite.siteCarry(unanswered: [missing]))
             // The SELECT alone: the listing the call started stays at UID 1,
             // where a new listing starts (`IMAPProvider.catchUpPlan`).
@@ -1142,8 +1176,13 @@ extension IMAPMissingByUIDTests {
             let clock = CatchUpTestClock()
             let budget = stop.budget
             func context() -> CatchUpContext {
-                CatchUpContext(deadline: .distantFuture, clock: { clock.now }, maxRequests: budget,
-                               listingRangeMessages: w.rangeMessages)
+                if stop == .budgetBeforeOwedSearch {
+                    let expiring = AdmittedThenExpiredClock(start: clock.now)
+                    return CatchUpContext(deadline: expiring.deadline, clock: { expiring.now() }, maxRequests: budget,
+                                          listingRangeMessages: w.rangeMessages)
+                }
+                return CatchUpContext(deadline: .distantFuture, clock: { clock.now }, maxRequests: budget,
+                                      listingRangeMessages: w.rangeMessages)
             }
             // The provider's own result, read without an apply.
             let malformedBefore = w.server.malformedAnswersSent()

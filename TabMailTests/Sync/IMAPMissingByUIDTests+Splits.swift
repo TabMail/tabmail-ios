@@ -577,8 +577,12 @@ extension IMAPMissingByUIDTests {
             try await w.makeFullSyncDue()
             let start = w.server.recordedCommands().count
             try await w.foregroundSync()
+            // The window listing asks the newest messages by sequence number
+            // (`selection.latest`): a plain FETCH with the ENVELOPE, sent to
+            // this folder; no catch-up or UID request stands in for it.
             let windowFetches = Self.requests(to: Self.path, w.server, from: start).map { $0.command }.filter {
-                $0.uppercased().hasPrefix("UID FETCH")
+                let command = $0.uppercased()
+                return command.hasPrefix("FETCH ") && command.contains("ENVELOPE")
             }
             #expect(!windowFetches.isEmpty, "setup: the window listing of the folder ran")
             let raw = try w.folder().catchUpState

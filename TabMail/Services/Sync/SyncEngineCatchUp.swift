@@ -345,10 +345,22 @@ extension SyncEngine {
     /// Test-only seam: install `catchUpSliceStartHookForTesting`, called with
     /// the folders a slice of `runCatchUpRun` asks, as the slice starts (inside
     /// the account's turn, before its first request), so a test can tell which
-    /// slice sent each request, or hold the slice inside its turn (the hook is
-    /// awaited). Compiled out of Release.
+    /// slice sent each request (the hook is awaited). Compiled out of Release.
+    /// *Superseded (#1062):* "or hold the slice inside its turn": a slice held
+    /// there had read and written nothing; `catchUpAfterReadHookForTesting`
+    /// holds one whose read is done.
     func setCatchUpSliceStartHookForTesting(_ hook: (@Sendable ([String]) async -> Void)?) {
         catchUpSliceStartHookForTesting = hook
+    }
+
+    /// Test-only seam: install `catchUpAfterReadHookForTesting`, called with the
+    /// folders a slice (`runCatchUp`) read, once the provider has returned and
+    /// before the slice applies anything (inside the account's turn when the
+    /// slice runs in `runCatchUpRun`), so a test can hold a slice whose read is
+    /// done and whose writes are not (the hook is awaited). Compiled out of
+    /// Release.
+    func setCatchUpAfterReadHookForTesting(_ hook: (@Sendable ([String]) async -> Void)?) {
+        catchUpAfterReadHookForTesting = hook
     }
     #endif
 
@@ -389,8 +401,9 @@ extension SyncEngine {
     /// folder with a known epoch, local rows and no cutoff in that epoch gets ONE:
     /// the lower of its first local UID and its window floor in the CURRENT epoch
     /// (`CatchUpWindowFloor`; with none, the first local UID alone), minus one, so
-    /// nothing pruned there loads again and an unreadable lowest window UID still
-    /// can. From then on only the prune moves it. Called by a slice in its turn,
+    /// nothing at or below it loads again and an unreadable lowest window UID
+    /// still can (*superseded (#1062):* "so nothing pruned there loads again"; see
+    /// the gaps below). From then on only the prune moves it. Called by a slice in its turn,
     /// once the slice is admitted with budget and before the provider reads, so
     /// the slice's own read already sees it. A folder whose turnover is pending is
     /// left alone. This is an inference: a date-ordered prune can leave gaps
@@ -499,6 +512,9 @@ extension SyncEngine {
             uniquingKeysWith: { first, _ in first })
         let results = await provider.catchUp(
             folders: folders, localRows: SyncEngineCatchUpRowReader(pool: dbPool), context: context)
+        #if DEBUG
+        await catchUpAfterReadHookForTesting?(results.map(\.folderId))
+        #endif
         let windowMode = provider.staleWindowMode
         var slice = CatchUpSliceResult()
         for result in results {
@@ -569,7 +585,7 @@ extension SyncEngine {
             // Logged here, outside the write (no logDebug inside a write context).
             if let completed = result.completedListing, !completed.clean || latch.loadsSkipped,
                DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): listing completed unclean (passed over, top unknown (topUnknown), or skipped loads); an owed folder stays owed")
+                BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): listing completed unclean (passed over, top unknown (topUnknown), nothing to check (no load floor of the epoch and no local row), or skipped loads); an owed folder stays owed")
             }
             if !removedIds.isEmpty { removeHeadersFromFTS(removedIds) }
             if updatedFlags > 0 || !removedIds.isEmpty {
