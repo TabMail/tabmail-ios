@@ -155,6 +155,15 @@ The owner's rulings of 2026-11-09:
        slice in which no applied result made progress (`CatchUpFolderResult.madeProgress`, set below
        the boundary: the listing moved or completed, or something loaded or applies), so a folder
        whose requests keep failing is tried again at the next cycle, never at network rate.
+       *Superseded in place (2026-11-21, #1062):* "Either stops after a slice in which no applied result
+       made progress": a background run also takes another slice when the slice left a folder out (the
+       second amendment below), and a foreground cycle takes ONE slice whatever that slice made.
+       - *Clarified 2026-11-21 (#1062): who can be asked again in the same run.* The restrictions below
+         (never asked again in the run, at most one more slice per folder) apply to a folder whose request
+         TIMED OUT. A healthy folder is asked in every slice of the run that still has work for it, so it
+         can be asked in several slices. A folder whose listing range got an answer too large or
+         undecodable ends its call with the width cap written but nothing in flight, so it stays in the
+         run: a later slice of the same run may ask it again, and that retry is cut by the cap.
        - *Amended 2026-11-21 (#1062): a folder whose request may still be in flight is left out of the
          rest of the run.* A folder result can report that a request of its call may still be in flight
          (`CatchUpFolderResult.requestMayBeInFlight`, provider-neutral; IMAP sets it when any catch-up
@@ -201,7 +210,11 @@ The owner's rulings of 2026-11-09:
          added none ends the run; the deadline still ends it. So the run ends once only left-out folders
          have work. Connections are per folder (`IMAPProvider.withFolderConnection`, one pinned connection
          per folder path, exclusive checkout), so the other folders' requests never wait behind the late
-         answer. Rejected: going on while the set is not empty, which keeps taking slices to the deadline
+         answer. *Superseded in place (2026-11-21, #1062):* "never wait": the pool holds a bounded
+         number of folder connections (`maxFolderConnections`), and when every one is in use another
+         folder's checkout waits for any folder's slot to free (`IMAPProvider.createFolderConnection`'s
+         capacity wait), so a request can wait across folder paths; it never waits for a late answer,
+         which is never read. Rejected: going on while the set is not empty, which keeps taking slices to the deadline
          once only left-out folders have work. `runCatchUpRun`'s returned Bool is unchanged: it still
          counts a left-out folder's applied progress, so the foreground worker's next cycle can come at
          once; pacing across runs is #1133's.
@@ -1269,7 +1282,10 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     asks a folder again after its request timed out, and goes on with its other folders (see the
     2026-11-21 amendments under *How many slices*). Only a timeout reports it: an answer too large or
     undecodable caps the width and ends the call the same way, but nothing of it is outstanding, so it
-    reports no request in flight. The folder's next call, in a later run, asks at most the capped width. A one-UID
+    reports no request in flight. The folder's next call, in a later run, asks at most the capped width.
+    *Qualified in place (2026-11-21, #1062):* "in a later run" holds after a timeout; after an answer too
+    large or undecodable the folder stays in the run, so its next call may be a later slice of the same
+    run, cut by the same cap. A one-UID
     range that fails stays unconfirmed. Other callers that reach the folder soon after (the worker's next
     cycle, the walk) log in again on the same link: the connection layer's issue, #1133, open. Why:
     with the shrink factor at 2 the cap (half the width, rounded down) was never wider than the stored
@@ -1373,9 +1389,34 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     which waits for Wi-Fi under Wi-Fi-only. After the walk starts, the walk-cursor rule stands. No
     migration (the state column is opaque JSON). *Replaces:* the lowest held UID as the floor, which
     let infinite-scroll rows pull it down over old mail.
+  - *Window floor, current (2026-11-21, #1062).* The window merge records the floor as the lowest UID
+    the window listing NAMED: the UIDs it mapped to headers and the UIDs it listed but could not map
+    (`coverage.unmaterialisedIds`, a record whose header did not read). It records it only when the
+    folder's UIDVALIDITY is known for that listing (`sourceBoundEpoch`); with no known epoch it writes no
+    floor, because a floor kept under the folder's state could otherwise outlive a renumbering it never
+    saw. Why: a window whose lowest UID failed to map recorded the next mapped UID as the floor, so once
+    that record read again, no catch-up loaded it (it was below the floor) and no window listing reached
+    it again (the window had moved on); the message stayed missing. The lapse check on a gap still uses
+    the mapped UIDs. No migration. *Superseded (2026-11-21):* "the lowest UID a window listing of the
+    folder reached" read as the lowest MAPPED UID, written whatever the epoch.
   - *Storage limit.* The load floor is the lowest held UID, and the prune deletes lowest UIDs first on
     IMAP (ADR-IOS-006 current note), so nothing pruned is listed for load or fetched again. The insert's
     date skip is deleted. *Replaces:* the date skip in `insertCatchUpLoads`.
+  - *Storage limit, prune cutoff (2026-11-21, #1062).* "The load floor is the lowest held UID ... so
+    nothing pruned is listed for load" fails once a row below the pruned range is held again: infinite
+    scroll caches rows far below the window, the lowest held UID drops below the pruned range, and the
+    next catch-up loaded the pruned mail back, so the prune and the catch-up undid each other. The prune
+    now records the highest UID it deleted, with the folder's UIDVALIDITY, under `pruneCutoff` in the
+    folder's `catchUpState` JSON (`CatchUpPruneCutoff`, `{uid, epoch}`; written in the prune's own write
+    transaction by `SyncEngine.recordCatchUpPruneCutoff`, only when the account's prune order is by UID
+    and the epoch is known; within one epoch the higher UID is kept, another epoch replaces it). Under a
+    storage limit the load floor is at least the cutoff plus one, read only when its epoch matches the
+    listing's; a cutoff of another epoch counts for nothing. The catch-up apply carries it across its own
+    state writes, as it carries `windowFloor`; a turnover or a Settings reset clears it with the state.
+    The scan floor (flags, removals) is unchanged, so a scrolled row below the cutoff still gets its flag
+    updates and removals. No migration (opaque JSON key, ignored by the state decoder).
+    *Superseded in part (2026-11-21):* "so nothing pruned is listed for load or fetched again" with the
+    lowest held UID as the only guard.
   - *Header batches.* `SyncConfig.catchUpLoadBatchSize` (20) UIDs per FETCH. A record the client cannot
     read fails only that UID (held like an unanswered one, logged when debug logging is on); a batch that
     fails as a whole stops the loads there and the next slice asks it again. No split, no retry within
@@ -1385,4 +1426,6 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
 passedOver, unclean completion, re-arm lapse, selfHealOwed, selfHealLapse, markListingDue, slow link,
 budget stop, SEARCH failure, date self-heal removed, range sized by EXISTS and UIDNEXT, sparse folder,
 unsolicited FETCH, walk not started, UID-ordered prune, header batch size, width cap, widthCap,
-widthCapThrough, timed-out width, cap growth, cap dropped at the maximum span, clean-only settle, daily relisting of owed folders, storage-limit floor after the walk, request in flight, requestMayBeInFlight, folder left out of the run, held connection, one more slice per left-out folder, every timeout ends the call, pass-over ends the call, per-folder connection, #1133)
+widthCapThrough, timed-out width, cap growth, cap dropped at the maximum span, clean-only settle, daily relisting of owed folders, storage-limit floor after the walk, request in flight, requestMayBeInFlight, folder left out of the run, held connection, one more slice per left-out folder, every timeout ends the call, pass-over ends the call, per-folder connection, #1133,
+window floor named UIDs, unmaterialised UID, known epoch, prune cutoff, pruneCutoff, scroll page after a prune,
+pool capacity wait, healthy folder asked in several slices)
