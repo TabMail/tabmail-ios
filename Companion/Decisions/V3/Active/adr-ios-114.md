@@ -304,8 +304,10 @@ same AI result, kept as long as the email itself is shown.
      change the platform keeps the offset plus the top inset, which moves a bottom landing past the
      bottom by the fill. Main-thread stalls only widen the gap between the landing and that pass:
      3 ms in a two-email chat, 150 to 310 ms in 40-email chats behind stalls of a quarter to most of
-     a second. The signed-in and ready AI Reply states add no update of their own; amended
-     2026-11-20, mechanism measured 2026-11-21). **Amended 2026-11-18:** the landing first ended on
+     a second. The signed-in and ready AI Reply states add no update of their own: the AI
+     Suggestion appears only once the thread and accounts have loaded (decision 16), never in the
+     first pass, and a later arrival is a content size change, which re-issues the landing;
+     amended 2026-11-20, mechanism measured 2026-11-21). **Amended 2026-11-18:** the landing first ended on
      a scroll of any kind; "any kind" dropped the pin on the chat's own animated or settling re-pin
      scroll, so a late height (the AI Suggestion, the reply field's measured height) left the chat
      short of the bottom. The landing now ends only on the user's scroll (`tracking`,
@@ -333,8 +335,8 @@ same AI result, kept as long as the email itself is shown.
      check passes either way (a later platform update sometimes clamps the offset back), and a real
      top bar that shrinks keeps the bottom by itself (memory 036). The fix rests on the debug-gated
      geometry log: without the re-issue the chat showed 488 and 386 points past its bottom, and with
-     it the landing came back 2 ms after the jump. The owner's phone smoke before the chat view
-     merges to main is the check.
+     it the landing came back 2 ms after the jump. A phone check before the chat view merges to
+     main is the check.
 
    **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
    In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible
