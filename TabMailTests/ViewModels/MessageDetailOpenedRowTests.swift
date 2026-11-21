@@ -38,9 +38,13 @@ struct MessageDetailOpenedRowTests {
     final class Violations {
         private(set) var found: [String] = []
         private(set) var checks = 0
+        /// Rows that are not the opened email and must stay in the chat's rows, once each,
+        /// wherever the opened email is published: leaving the rows is for the opened email only.
+        private let kept: [String]
 
         /// Checks the property at every publication of `vm`'s screen fields from now on.
-        init(_ vm: MessageDetailViewModel) {
+        init(_ vm: MessageDetailViewModel, keeping kept: [String] = []) {
+            self.kept = kept
             let previous = vm._publicationHook
             vm._publicationHook = { [weak self, weak vm] field in
                 previous?(field)
@@ -64,6 +68,11 @@ struct MessageDetailOpenedRowTests {
             if field == .message,
                (vm.earlierMessages + vm.laterMessages).contains(where: { $0.id == openedId }) {
                 found.append("after \(field): the email screen lists the opened email \(openedId) in its thread")
+            }
+            if field == .message {
+                for id in kept where id != openedId && rows.filter({ $0 == id }).count != 1 {
+                    found.append("after \(field): the row \(id) is not in the chat's rows exactly once: \(rows)")
+                }
             }
         }
     }
@@ -150,25 +159,31 @@ struct MessageDetailOpenedRowTests {
     }
 
     @MainActor
-    @Test("the chat never lists the opened email twice when it becomes the opened one as one of its copies")
+    @Test("the chat never lists the opened email twice when it becomes the opened one as one of its copies, and keeps every other row")
     func copyThatBecomesTheOpenedOneIsListedOnce() async throws {
         let (pool, dir, previous) = try makePool()
         defer { cleanUp(pool, dir, previous) }
         let gmailId = "opened-\(UUID().uuidString)"
         let rfc = "<\(gmailId)@example.com>"
-        // One Gmail email under two labels, and a reply to it.
+        // One Gmail email under two labels, and a reply to it, also under two labels. The reply's
+        // All Mail copy is a few seconds older only so that the chat shows its Inbox copy and
+        // hides this one.
         let inboxCopy = header(gmailId, folder: "INBOX", rfc: rfc, minutesAgo: 30)
         let allMailCopy = header(gmailId, folder: "Archive", rfc: rfc, minutesAgo: 30)
-        let reply = header("reply-\(UUID().uuidString)", folder: "INBOX", rfc: "<reply-\(gmailId)@example.com>",
-                           inReplyTo: rfc, minutesAgo: 10)
-        try insert([inboxCopy, allMailCopy, reply], into: pool)
+        let replyId = "reply-\(UUID().uuidString)"
+        let replyRfc = "<reply-\(gmailId)@example.com>"
+        let reply = header(replyId, folder: "INBOX", rfc: replyRfc, inReplyTo: rfc, minutesAgo: 10)
+        let replyAllMailCopy = header(replyId, folder: "Archive", rfc: replyRfc, inReplyTo: rfc, minutesAgo: 10.1)
+        try insert([inboxCopy, allMailCopy, reply, replyAllMailCopy], into: pool)
 
         let vm = try await openWithThread(inboxCopy, pool: pool)
         defer { vm.cancelBodyPollForTesting() }
         #expect(vm.threadMessages.map(\.id) == [reply.id], "precondition: the chat shows the reply")
-        #expect(vm.threadCopies.map(\.id) == [allMailCopy.id], "precondition: the All Mail copy is a hidden copy")
+        #expect(Set(vm.threadCopies.map(\.id)) == [allMailCopy.id, replyAllMailCopy.id],
+                "precondition: both All Mail copies are hidden copies")
 
-        let violations = Violations(vm)
+        // The reply and its other copy are not the opened email: they stay in the rows.
+        let violations = Violations(vm, keeping: [reply.id, replyAllMailCopy.id])
         try await removeInboxCopy(inboxCopy, from: pool)
         await vm.refetchBody()
         try await waitUntil { vm.displayTurnIsIdleForTesting }
@@ -176,8 +191,8 @@ struct MessageDetailOpenedRowTests {
         #expect(vm.message?.id == allMailCopy.id, "precondition: the open re-resolved onto the All Mail copy")
         #expect(violations.checks > 0, "control: the publications were checked")
         #expect(violations.found.isEmpty, "\(violations.found)")
-        #expect(vm.chatRows.map(\.id).sorted() == [allMailCopy.id, reply.id].sorted(),
-                "a whole-chat action takes the opened email and the reply, each once")
+        #expect(vm.chatRows.map(\.id).sorted() == [allMailCopy.id, reply.id, replyAllMailCopy.id].sorted(),
+                "a whole-chat action takes the opened email and both copies of the reply, each once")
     }
 
     @MainActor
