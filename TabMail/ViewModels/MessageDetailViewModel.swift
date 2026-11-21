@@ -24,6 +24,10 @@ final class MessageDetailViewModel {
     private(set) var messageId: String
     private(set) var message: MessageHeader? {
         didSet {
+            if message?.id != oldValue?.id {
+                dropOpenedFromThreadRows()
+                if oldValue != nil, message != nil { reloadThread() }
+            }
             #if DEBUG
             recordPublicationForTesting(.message)
             #endif
@@ -57,6 +61,32 @@ final class MessageDetailViewModel {
     /// a Message-ID (ADR-IOS-068 D4).
     var chatRows: [MessageHeader] {
         (message.map { [$0] } ?? []) + threadMessages + threadCopies
+    }
+
+    /// The opened email is never also a thread row or copy, and the rows are the thread of
+    /// the email that is opened now. Both hold through the `message` setter, whatever writes
+    /// it: when the opened id changes, the new id leaves `threadCopies` and `threadMessages`
+    /// at once (copies first, so every publication of `threadMessages` already sees rows
+    /// without it), and when one opened email is replaced by another the setter queues the
+    /// serialized thread reload (`reloadThread`), which rebuilds the rows from the new one in
+    /// its display turn. A thread load never returns the email it starts from
+    /// (`ThreadDetection.related`), so the email opened before comes back with that reload as a
+    /// row or a copy whenever the load still finds it in the thread. The earlier/later split
+    /// is relative to the opened email, so it is recomputed for every new one.
+    private func dropOpenedFromThreadRows() {
+        guard let openedId = message?.id else { return }
+        if threadCopies.contains(where: { $0.id == openedId }) {
+            threadCopies.removeAll { $0.id == openedId }
+        }
+        if threadMessages.contains(where: { $0.id == openedId }) {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ThreadDebug] opened email \(openedId.prefix(40)) left the thread rows")
+            }
+            threadMessages.removeAll { $0.id == openedId }
+        }
+        // The split is relative to the opened email, so it follows every new one, also one that
+        // was a hidden copy or no row at all (a row on the same second moves to its other side).
+        recomputeThreadSplit()
     }
 
     /// Guards against concurrent/duplicate `loadBody()` calls.
@@ -139,6 +169,14 @@ final class MessageDetailViewModel {
     /// Same class as the ungated seams above: no input reaches the network, no
     /// production caller sets it.
     @ObservationIgnored var _displayReadHook: (@MainActor (DisplayReadPoint) async -> Void)?
+    /// Test seam: called synchronously each time a thread scan is asked for, with the id of
+    /// the opened email it starts from.
+    @ObservationIgnored var _threadScanRequestHook: (@MainActor (String) -> Void)?
+    /// Test seams: thread scans asked for while `_threadScanRequestHook` was set, and how many
+    /// of them have ended (read and published, or skipped for a newer one). A test waits, with
+    /// its own deadline, until the two match.
+    @ObservationIgnored private(set) var threadScansAskedForTesting = 0
+    @ObservationIgnored private(set) var threadScansEndedForTesting = 0
 
     /// A screen field a display publication assigns.
     enum DisplayField { case message, messageBody, threadMessages }
@@ -2717,7 +2755,7 @@ final class MessageDetailViewModel {
             BackgroundSyncLogger.logDebug("[ThreadDebug] Finding related for: id=\(msg.id.prefix(40)) rfc822=\(msg.rfc822MessageId ?? "nil") inReplyTo=\(msg.inReplyTo ?? "nil") threadId=\(msg.threadId ?? "nil") computedThreadId=\(msg.computedThreadId) references=\(refsStr) folder=\(msg.folderPath)")
         }
         let pool = dbPool
-        Task { await self.inDisplayTurn {
+        let scan = Task { await self.inDisplayTurn {
             // A newer scan is queued behind this one and reads later: skip.
             guard generation == self.threadLoadGeneration, let msg = self.message else { return }
             // Probe the DB for *any* messages that could plausibly be thread-related,
@@ -2852,5 +2890,21 @@ final class MessageDetailViewModel {
                 }
             }
         } }
+        noteThreadScanRequestForTesting(scan, anchor: msg.id)
+    }
+
+    /// Test seam: counts each thread scan asked for and when it ends, so a test can see which
+    /// write asked for one and wait until every scan it asked for has ended. No-op outside DEBUG.
+    private func noteThreadScanRequestForTesting(_ scan: Task<Void, Never>, anchor: String) {
+        #if DEBUG
+        // Only while a test listens, so a debug build of the app starts no extra tasks.
+        guard let hook = _threadScanRequestHook else { return }
+        threadScansAskedForTesting += 1
+        Task { [weak self] in
+            await scan.value
+            self?.threadScansEndedForTesting += 1
+        }
+        hook(anchor)
+        #endif
     }
 }
