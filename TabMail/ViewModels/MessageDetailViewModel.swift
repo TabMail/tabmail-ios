@@ -24,7 +24,10 @@ final class MessageDetailViewModel {
     private(set) var messageId: String
     private(set) var message: MessageHeader? {
         didSet {
-            if message?.id != oldValue?.id { dropOpenedFromThreadRows() }
+            if message?.id != oldValue?.id {
+                dropOpenedFromThreadRows()
+                if oldValue != nil, message != nil { reloadThread() }
+            }
             #if DEBUG
             recordPublicationForTesting(.message)
             #endif
@@ -60,16 +63,15 @@ final class MessageDetailViewModel {
         (message.map { [$0] } ?? []) + threadMessages + threadCopies
     }
 
-    /// The opened email is never also a thread row. A thread load leaves it out
-    /// (`ThreadDetection.related` never returns the email it starts from), but another
-    /// email can become the opened one after the load: a re-resolve finds the email at
-    /// another address (`refetchBody`, `loadBody`, the poll's header recovery), for
-    /// example the All Mail copy of a Gmail email whose Inbox label was removed. That
-    /// row is already one of the rows the load published, so it leaves them the moment
-    /// it is opened: otherwise the email screen shows it twice and a whole-chat action
-    /// lists it twice (`chatRows`). The next thread load, which starts from the new
-    /// opened email, rebuilds the rows. Copies first, so every publication of
-    /// `threadMessages` already sees rows without the opened email.
+    /// The opened email is never also a thread row or copy, and the rows are the thread of
+    /// the email that is opened now. Both hold through the `message` setter, whatever writes
+    /// it: when the opened id changes, the new id leaves `threadCopies` and `threadMessages`
+    /// at once (copies first, so every publication of `threadMessages` already sees rows
+    /// without it), and when one opened email is replaced by another the setter queues the
+    /// serialized thread reload (`reloadThread`), which rebuilds the rows from the new one in
+    /// its display turn. A thread load never returns the email it starts from
+    /// (`ThreadDetection.related`), so a copy of the email opened before that is still stored
+    /// comes back with that reload as a row or a copy.
     private func dropOpenedFromThreadRows() {
         guard let openedId = message?.id else { return }
         if threadCopies.contains(where: { $0.id == openedId }) {
