@@ -9,9 +9,10 @@ import Foundation
 /// live in the App Group suite so both processes read the same values. AI is on only when the
 /// choice has been made and AI is not opted out; a missing value never turns AI on.
 ///
-/// This is the only file that names the two keys. Every other reader goes through
-/// `AIService.isAIOff` (app) or `NSEState.isAIDisabled` (extension), both of which call
-/// `isDisabled(in:)`.
+/// This is the only file that names the two keys and the only place that knows the rule. Every
+/// other reader goes through `AIService.isAIOff` (app) or `NSEState.isAIDisabled` (extension),
+/// both of which call `isDisabled(in:)`. A view that observes the two values itself (to repaint
+/// when either changes) passes them to `isDisabled(choiceMade:optedOut:)`.
 enum AIConsentPolicy {
     /// Set to true once the person has answered the AI choice, either way.
     static let completedChoiceKey = "hasSeenAIConsent"
@@ -20,7 +21,13 @@ enum AIConsentPolicy {
 
     /// Whether AI is off: the choice is not made yet, or AI is opted out.
     static func isDisabled(in defaults: UserDefaults) -> Bool {
-        !defaults.bool(forKey: completedChoiceKey) || defaults.bool(forKey: optOutKey)
+        isDisabled(choiceMade: defaults.bool(forKey: completedChoiceKey), optedOut: defaults.bool(forKey: optOutKey))
+    }
+
+    /// The rule itself, on values already read: AI is off unless the choice is made and AI is not
+    /// opted out.
+    static func isDisabled(choiceMade: Bool, optedOut: Bool) -> Bool {
+        !choiceMade || optedOut
     }
 
     /// Records the AI choice. The opt-out is written before the choice, so a "no" is never

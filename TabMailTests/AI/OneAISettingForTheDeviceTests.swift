@@ -312,7 +312,7 @@ struct OneAISettingForTheDeviceTests {
         #expect(dashboard.filter { $0 == "AIService.recordAIChoice(aiEnabled: false, resume: {})" }.count == 1)
         let sheet = try #require(dashboard.firstIndex(of: "AIConsentView { aiEnabled in"))
         #expect(dashboard[sheet + 1] == "AIService.recordAIChoice(aiEnabled: aiEnabled, resume: {})")
-        #expect(dashboard.contains("if aiChoiceMade && !aiOptedOut {"))
+        #expect(dashboard.contains("if !AIConsentPolicy.isDisabled(choiceMade: aiChoiceMade, optedOut: aiOptedOut) {"))
         #expect(!dashboard.contains { $0.contains("store.aiEnabled") })
     }
 }

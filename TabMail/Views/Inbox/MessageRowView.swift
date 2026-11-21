@@ -40,7 +40,8 @@ struct MessageRowView: View {
         ChatViewConfig.followingTutorial(ChatViewConfig.isActive(
             enabledByUser: chatViewEnabled,
             aiOn: !DemoModeStore.shared.hidesAIContent
-                && ChatViewConfig.isAIOn(aiOff: !aiChoiceMade || optOutAllAI, subscribed: AISubscriptionGate.shared.isActive)))
+                && ChatViewConfig.isAIOn(aiOff: AIConsentPolicy.isDisabled(choiceMade: aiChoiceMade, optedOut: optOutAllAI),
+                                         subscribed: AISubscriptionGate.shared.isActive)))
     }
 
     /// Effective sender (or recipient) display:

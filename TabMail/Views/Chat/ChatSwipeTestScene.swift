@@ -214,8 +214,9 @@ struct ChatSwipeTestScene: View {
     /// `TutorialChatViewRunTests` starts one.
     private func seedTutorial() async throws {
         UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
-        // The run teaches the chat view only with the AI choice made, AI on.
-        AIService.recordAIChoice(aiEnabled: true, resume: {})
+        // A first-launch tour starts before the AI choice: the fixture clears it (another mode may
+        // have recorded one on an earlier launch) and runs that tour, which teaches the chat view.
+        AIConsentPolicy.clearChoice(in: AIService.optOutStore)
         let coordinator = TutorialCoordinator.shared
         await coordinator.start(.reuseReply, hasTabMailSession: false)
         try await DemoModeService.shared.completeSetup()

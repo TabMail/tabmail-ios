@@ -72,7 +72,7 @@ struct DemoAccountDashboardView: View {
 
             // AI status toggle
             Section {
-                if aiChoiceMade && !aiOptedOut {
+                if !AIConsentPolicy.isDisabled(choiceMade: aiChoiceMade, optedOut: aiOptedOut) {
                     LabeledContent("AI features") {
                         Text("Enabled")
                             .foregroundStyle(.green)

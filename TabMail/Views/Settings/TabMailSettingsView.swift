@@ -652,7 +652,8 @@ struct ChatViewToggleRow: View {
 
     var body: some View {
         let aiOn = ChatViewConfig.followingTutorial(
-            ChatViewConfig.isAIOn(aiOff: !aiChoiceMade || optOutAllAI, subscribed: AISubscriptionGate.shared.isActive))
+            ChatViewConfig.isAIOn(aiOff: AIConsentPolicy.isDisabled(choiceMade: aiChoiceMade, optedOut: optOutAllAI),
+                                  subscribed: AISubscriptionGate.shared.isActive))
         Toggle(isOn: $chatViewEnabled) {
             Label {
                 VStack(alignment: .leading, spacing: 2) {
