@@ -264,6 +264,11 @@ extension IMAPProvider {
         let timeout = context.requestTimeoutSeconds
         let path = folder.path
         var completed = false
+        // A request of this call timed out (#1062): it may still hold the
+        // folder's connection until its late answer, so the call reports it as in
+        // flight (`CatchUpFolderResult.requestMayBeInFlight`) and the run never
+        // asks this folder again.
+        var requestTimedOut = false
 
         // The UID range listed (#1062). Its lower bound is where the range the
         // device holds the folder in starts (the older-mail walk's, as the change
@@ -422,6 +427,7 @@ extension IMAPProvider {
                             try await self.getUidNextWithEpoch(folder: path)
                         }
                     } catch {
+                        if error is TimeoutError { requestTimedOut = true }
                         if DebugModeManager.isLoggingEnabled() {
                             BackgroundSyncLogger.logDebug("[CatchUp] \(path): UIDNEXT read failed (\(error)) — stopping this folder for the pass")
                         }
@@ -431,7 +437,7 @@ extension IMAPProvider {
                         if DebugModeManager.isLoggingEnabled() {
                             BackgroundSyncLogger.logDebug("[CatchUp] \(path): SELECT reported UIDVALIDITY \(status.observedEpoch.map(String.init) ?? "none"), folder holds \(epoch) — applying nothing")
                         }
-                        return CatchUpFolderResult(folderId: folder.id, epoch: status.observedEpoch)
+                        return Self.otherNumbering(folderId: folder.id, epoch: status.observedEpoch, requestTimedOut: requestTimedOut)
                     }
                     // A SELECT without UIDNEXT did not say where the folder ends
                     // (MIS-IOS-004): no top is stored, this call lists only up to
@@ -478,17 +484,34 @@ extension IMAPProvider {
                     // `SyncConfig.catchUpWidthCapShrinkFactor`, and the folder stops
                     // for this call: the timed-out request still holds the folder's
                     // connection until its late answer, so no retry in the same call
-                    // could work. Only the cap is stored, so the call is no progress
-                    // (a cap-only change, see `madeProgress` below) and the run does
-                    // not ask again at once. The listing keeps its place, and the
-                    // next call asks from there at most the capped width. A range of
-                    // one UID that fails stays unconfirmed: the listing never moves
-                    // past it, and the next call asks it again.
+                    // could work. A timeout is reported as a request that may still
+                    // be in flight (`CatchUpFolderResult.requestMayBeInFlight`): the
+                    // run never asks this folder again after its request timed out,
+                    // whatever progress the call made, and goes on with its other
+                    // folders (`SyncEngine.runCatchUpRun`). The state the call saved
+                    // (a listing that moved, a top it learned) is kept. The cap write
+                    // itself is no progress: a call that changed nothing else returns
+                    // false (a cap-only change, see `madeProgress` below), while one
+                    // that started the listing or answered an earlier range made
+                    // progress. The listing keeps its place, and the folder's next
+                    // call asks from there at most the capped width. A range of one
+                    // UID that fails stays unconfirmed: the listing never moves past
+                    // it, and the next call asks it again. Another caller (the
+                    // worker's next cycle, the walk) can still reach the folder while
+                    // the late answer is outstanding: that is the connection's own
+                    // issue (#1133), open.
                     // *Superseded (#1062):* "is cut by the walk's own rule
                     // (`UIDWalkCursor.halves`) to the half next to where the listing
                     // stands in its direction of travel (upward: the lower half). Its
                     // width is stored": the cap alone set the next range, and the
                     // stored half width made a timeout count as progress.
+                    // *Superseded (#1062):* "Only the cap is stored, so the call is no
+                    // progress (a cap-only change, see `madeProgress` below) and the
+                    // run does not ask again at once": a call that starts a listing,
+                    // or answers a range before the one that times out, made
+                    // progress, and another folder's progress kept the run going, so
+                    // the run asked again at once on the held connection.
+                    if error is TimeoutError { requestTimedOut = true }
                     if UIDWalkCursor.failureCallsForSmallerRange(error) {
                         let cap = max(1, (hi - lo + 1) / SyncConfig.catchUpWidthCapShrinkFactor)
                         listing.widthCap = cap
@@ -510,7 +533,7 @@ extension IMAPProvider {
                     if DebugModeManager.isLoggingEnabled() {
                         BackgroundSyncLogger.logDebug("[CatchUp] \(path): SELECT reported UIDVALIDITY \(listed.uidValidity), folder holds \(epoch) — applying nothing")
                     }
-                    return CatchUpFolderResult(folderId: folder.id, epoch: listed.uidValidity == 0 ? nil : listed.uidValidity)
+                    return Self.otherNumbering(folderId: folder.id, epoch: listed.uidValidity == 0 ? nil : listed.uidValidity, requestTimedOut: requestTimedOut)
                 }
                 if bookmarkUpper == nil, let next = listed.uidNext {
                     // The top this listing last learned (`Listing.top`).
@@ -607,6 +630,7 @@ extension IMAPProvider {
                         try await self.searchMembership(folder: path, uids: toConfirm, range: loadRange)
                     }
                 } catch {
+                    if error is TimeoutError { requestTimedOut = true }
                     if DebugModeManager.isLoggingEnabled() {
                         BackgroundSyncLogger.logDebug("[CatchUp] \(path) \(lo):\(hi): membership proof failed (\(error)) — unresolved")
                     }
@@ -614,7 +638,7 @@ extension IMAPProvider {
                 }
                 if let confirmed {
                     guard confirmed.uidValidity == epoch else {
-                        return CatchUpFolderResult(folderId: folder.id, epoch: confirmed.uidValidity == 0 ? nil : confirmed.uidValidity)
+                        return Self.otherNumbering(folderId: folder.id, epoch: confirmed.uidValidity == 0 ? nil : confirmed.uidValidity, requestTimedOut: requestTimedOut)
                     }
                     result.removedIds += candidates.filter { !confirmed.found.contains($0) }.map(String.init)
                     omitted = confirmed.found.filter { !listedUids.contains($0) && !localUids.contains($0) && loadRange?.contains(Int($0)) == true }.sorted()
@@ -627,8 +651,9 @@ extension IMAPProvider {
             let load = proofStopped
                 ? MissingLoad(stoppedAt: UInt32(lo))
                 : await loadMissing(missing, owedSearch: owedSearch, path: path, epoch: epoch, context: context)
+            if load.timedOut { requestTimedOut = true }
             if let observed = load.otherEpoch {
-                return CatchUpFolderResult(folderId: folder.id, epoch: observed == 0 ? nil : observed)
+                return Self.otherNumbering(folderId: folder.id, epoch: observed == 0 ? nil : observed, requestTimedOut: requestTimedOut)
             }
             result.loaded += load.loaded
             // A UID the server holds that did not load; one omitted from the FETCH
@@ -719,7 +744,9 @@ extension IMAPProvider {
         // whose request failed before anything moved is no progress, so the
         // worker does not list it again at once. The width cap a timeout sets
         // is no progress either: it only narrows the next try, and it is all a
-        // timeout stores (#1062).
+        // timeout stores (#1062). A timeout is reported on its own
+        // (`requestMayBeInFlight`): progress or not, the run asks this folder
+        // nothing more.
         let madeProgress = completed || listing.withoutWidthCap != state?.listing?.withoutWidthCap
             || !result.flagUpdates.isEmpty || !result.removedIds.isEmpty || !result.loaded.isEmpty
         // No growth of the cap on a call that moved nothing (#1062).
@@ -741,9 +768,19 @@ extension IMAPProvider {
                 lapseCountAtStart: listing.lapseCountAtStart ?? 0, clean: listing.passedOver != true && listing.topUnknown != true && state?.skippedLoads != true)
         }
         result.madeProgress = madeProgress
+        result.requestMayBeInFlight = requestTimedOut
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CatchUp] \(path): flags=\(result.flagUpdates.count) removed=\(result.removedIds.count) loaded=\(result.loaded.count) \(completed ? "listing complete" : "resumes at UID \(listing.nextUid)")")
         }
+        return result
+    }
+
+    /// A call that saw another numbering: nothing of it applies (the apply
+    /// reacts to the observed `epoch`), and a request that timed out earlier in
+    /// the call is still reported in flight (`CatchUpFolderResult.requestMayBeInFlight`, #1062).
+    nonisolated static func otherNumbering(folderId: String, epoch: UInt32?, requestTimedOut: Bool) -> CatchUpFolderResult {
+        var result = CatchUpFolderResult(folderId: folderId, epoch: epoch)
+        result.requestMayBeInFlight = requestTimedOut
         return result
     }
 
@@ -778,6 +815,9 @@ extension IMAPProvider {
         var notAsked: [UInt32] = []
         /// Unanswered UIDs whose SEARCH was not asked or failed (a stop).
         var owedSearch: [UInt32] = []
+        /// The failed request that stopped the loads timed out (#1062): it may
+        /// still hold the folder's connection (`CatchUpFolderResult.requestMayBeInFlight`).
+        var timedOut = false
     }
 
     /// The carried part of a range (`Listing.carried`): every UID it names,
@@ -848,38 +888,43 @@ extension IMAPProvider {
         let timeout = context.requestTimeoutSeconds
         let size = SyncConfig.catchUpLoadBatchSize
         // A stop: the budget ran out (`budgetStoppedAt`) or a request failed
-        // (`stoppedAt`); `owed` still needs its SEARCH, `rest` was not fetched.
-        func stopped(budget: Bool, owed: [UInt32], rest: [UInt32]) -> MissingLoad {
+        // (`stoppedAt`; `timedOut` when it timed out); `owed` still needs its
+        // SEARCH, `rest` was not fetched.
+        func stopped(budget: Bool, owed: [UInt32], rest: [UInt32], timedOut: Bool = false) -> MissingLoad {
             var stop = load
             let first = (owed + rest).min()
             if budget { stop.budgetStoppedAt = first } else { stop.stoppedAt = first }
             stop.owedSearch = owed
             stop.notAsked = rest
+            stop.timedOut = timedOut
             return stop
         }
         // The SEARCH that decides unanswered UIDs: gone is done, still there is
-        // held. Nil when it was not asked (budget) or failed; `failed` tells which.
-        func searchUnanswered(_ unanswered: [UInt32]) async -> (present: UIDExistenceResult?, failed: Bool) {
+        // held. Nil when it was not asked (budget) or failed; `failed` tells which,
+        // and `timedOut` whether the failure was a timeout.
+        func searchUnanswered(_ unanswered: [UInt32]) async -> (present: UIDExistenceResult?, failed: Bool, timedOut: Bool) {
             guard context.hasBudget(cost: 1) else {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[CatchUp] \(path): budget spent before the SEARCH for \(unanswered.count) unanswered UID(s) — carried")
                 }
-                return (nil, false)
+                return (nil, false, false)
             }
             do {
                 return (try await withTimeout(seconds: timeout) {
                     try await self.searchExistingUIDs(folder: path, uids: unanswered)
-                }, false)
+                }, false, false)
             } catch {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[CatchUp] \(path): SEARCH for \(unanswered.count) unanswered UID(s) failed (\(error)) — resuming at \(unanswered[0])")
                 }
-                return (nil, true)
+                return (nil, true, error is TimeoutError)
             }
         }
         if !owedSearch.isEmpty {
             let asked = await searchUnanswered(owedSearch)
-            guard let present = asked.present else { return stopped(budget: !asked.failed, owed: owedSearch, rest: missing) }
+            guard let present = asked.present else {
+                return stopped(budget: !asked.failed, owed: owedSearch, rest: missing, timedOut: asked.timedOut)
+            }
             guard present.uidValidity == epoch else {
                 load.otherEpoch = present.uidValidity
                 return load
@@ -904,7 +949,7 @@ extension IMAPProvider {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[CatchUp] \(path): load of \(batch.count) missing UID(s) failed (\(error)) — resuming at \(batch[0])")
                 }
-                return stopped(budget: false, owed: [], rest: batch + after)
+                return stopped(budget: false, owed: [], rest: batch + after, timedOut: error is TimeoutError)
             }
             guard fetched.observedEpoch == epoch else {
                 load.otherEpoch = fetched.observedEpoch ?? 0
@@ -927,7 +972,9 @@ extension IMAPProvider {
             let unanswered = batch.filter { !answeredUids.contains($0) }
             guard !unanswered.isEmpty else { continue }
             let asked = await searchUnanswered(unanswered)
-            guard let present = asked.present else { return stopped(budget: !asked.failed, owed: unanswered, rest: after) }
+            guard let present = asked.present else {
+                return stopped(budget: !asked.failed, owed: unanswered, rest: after, timedOut: asked.timedOut)
+            }
             guard present.uidValidity == epoch else {
                 load.otherEpoch = present.uidValidity
                 return load

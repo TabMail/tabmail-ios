@@ -155,6 +155,23 @@ The owner's rulings of 2026-11-09:
        slice in which no applied result made progress (`CatchUpFolderResult.madeProgress`, set below
        the boundary: the listing moved or completed, or something loaded or applies), so a folder
        whose requests keep failing is tried again at the next cycle, never at network rate.
+       - *Amended 2026-11-21 (#1062): a folder whose request may still be in flight is left out of the
+         rest of the run.* A folder result can report that a request of its call may still be in flight
+         (`CatchUpFolderResult.requestMayBeInFlight`, provider-neutral; IMAP sets it when any catch-up
+         request of the call times out (the UIDNEXT read, a listing range, a membership proof, an
+         unanswered UID's SEARCH, a header load), because the abandoned request holds the folder's
+         connection until its late answer; Gmail and Outlook requests hold no folder connection and leave
+         it false). The run never asks that folder again: `runCatchUpRun` keeps the folder ids in a set
+         in its own memory (gone when the run ends, never persisted, no timer), and later slices do not
+         pass them to `runCatchUp`. Only the progress of folders not in the set decides another slice, so a slice
+         whose only progress came from such a folder ends the run. `madeProgress` is unchanged, and
+         the state that folder's call saved is kept. `runCatchUpRun` still returns true when any applied
+         result made progress, that folder's included (the worker's `caughtUp`). Why: a second request
+         to the folder in the same run waits behind the late answer or forces a new session, and a
+         second timeout there halves the width cap for a reason unrelated to width; the other folders'
+         connections are free, so their work goes on. The worker's next cycle and the walk can still
+         reach the folder while the late answer is outstanding: that is the connection layer's issue,
+         #1133, open.
      - **The worker's cycle.** `runBackfill` returns true when the walk did work or the catch-up made
        progress, so the foreground worker keeps cycling (the profile's active delay between cycles:
        3 s, or 0.5 s on power) until the listing completes; then a cycle does no work and, with the
@@ -1199,12 +1216,23 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     and the folder stops for the rest of the call. The stored width (`Listing.rangeWidth`) is left as it
     was: only a range that answers sets it, from that range's own count. The listing keeps its place, and
     the next call asks from there at most the capped width (the cap is applied where the next range is
-    cut). The call is no progress (a cap-only change), so a background run does not ask again at once on
-    the connection the timed-out request still holds: the folder is tried again at the next cycle. A
-    one-UID range that fails stays unconfirmed. Why: with the shrink factor at 2 the cap (half the width,
-    rounded down) was never wider than the stored lower half (rounded up), so the stored half width never
-    set a range; its only effect was that a timeout changed the listing and so counted as progress, against
-    the rule that a request that failed before anything moved is no progress.
+    cut). The cap write is no progress: a call that changed nothing else (a cap-only change) is no
+    progress, while a call that started the listing, learned its top or answered an earlier range made
+    progress and keeps what it saved. Whatever progress it made, the call reports the folder's request
+    as possibly in flight (`CatchUpFolderResult.requestMayBeInFlight`): the run never asks a folder again
+    after its request timed out, and goes on with its other folders (see the 2026-11-21 amendment under
+    *How many slices*). The folder's next call, in a later run, asks at most the capped width. A one-UID
+    range that fails stays unconfirmed. Other callers that reach the folder while the late answer is
+    outstanding (the worker's next cycle, the walk) are the connection layer's issue, #1133, open. Why:
+    with the shrink factor at 2 the cap (half the width, rounded down) was never wider than the stored
+    lower half (rounded up), so the stored half width never set a range; its only effect was that a
+    timeout changed the listing and so counted as progress, against the rule that a request that failed
+    before anything moved is no progress.
+    *Superseded (2026-11-21, same review train):* "The call is no progress (a cap-only change), so a
+    background run does not ask again at once on the connection the timed-out request still holds: the
+    folder is tried again at the next cycle." A call that starts a listing, or answers a range before the
+    one that times out, made progress, and the run's progress counted every folder, so the run asked the
+    folder again at once on the held connection.
   - *Width cap, current (d1 2026-11-20).* A range that times out sets the cap
     (`IMAPCatchUpState.Listing.widthCap`) to its width divided by `SyncConfig.catchUpWidthCapShrinkFactor`;
     each range that answers multiplies it by `SyncConfig.catchUpWidthCapGrowthFactor` (2026-11-20: kept only
@@ -1212,7 +1240,9 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     `catchUpListingMaxRangeSpan` it is dropped. No range-scoped end (`widthCapThrough` removed). Why: the
     cap below only ever shrank, so about 20 timeouts unrelated to range size left a sparse folder at
     one-UID ranges over millions of UIDs. A cap-only change is still no progress. 2026-11-21: the cap is
-    all a timeout stores, so a timeout is no progress (*Timeout, current (2026-11-21)* above).
+    all a timeout stores, so the timeout's own write is no progress (*Timeout, current (2026-11-21)*
+    above). *Superseded (2026-11-21, same review train):* "so a timeout is no progress": a call that
+    moved its listing before the timeout still made progress.
   - *Width cap after a timeout, superseded by the d1 entry above.* A range that times out also stores a
     width cap (`IMAPCatchUpState.Listing.widthCap`, the stored half width) together with the upper end
     of the range that timed out (`widthCapThrough`); repeated timeouts before the listing moves past
@@ -1282,4 +1312,4 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
 passedOver, unclean completion, re-arm lapse, selfHealOwed, selfHealLapse, markListingDue, slow link,
 budget stop, SEARCH failure, date self-heal removed, range sized by EXISTS and UIDNEXT, sparse folder,
 unsolicited FETCH, walk not started, UID-ordered prune, header batch size, width cap, widthCap,
-widthCapThrough, timed-out width, cap growth, clean-only settle, daily relisting of owed folders, storage-limit floor after the walk)
+widthCapThrough, timed-out width, cap growth, cap dropped at the maximum span, clean-only settle, daily relisting of owed folders, storage-limit floor after the walk, request in flight, requestMayBeInFlight, folder left out of the run, held connection, #1133)

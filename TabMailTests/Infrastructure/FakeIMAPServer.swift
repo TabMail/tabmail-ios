@@ -173,6 +173,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         var commandLog: [String] = []
         /// The same commands, by connection (its fd), in order.
         var commandLogByConnection: [Int32: [String]] = [:]
+        /// Parallel to `commandLog`: the mailbox the command's connection had
+        /// selected when the command arrived (nil: none).
+        var commandMailboxLog: [String?] = []
         var injectedFailureCountdowns: [String: [InjectedFailure]] = [:]
         var consumedInjectedFailureCount = 0
         /// `setStatusStaleUntilNoop`: each connection's STATUS answers as of its
@@ -841,6 +844,13 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     func recordedCommands() -> [String] {
         withState { $0.commandLog }
+    }
+
+    /// `recordedCommands()`, each with the mailbox its connection had selected
+    /// when it arrived (nil: none); a SELECT or EXAMINE carries the mailbox
+    /// selected before it. Lets a test tell which folder a request went to.
+    func recordedCommandsWithMailbox() -> [(command: String, mailbox: String?)] {
+        withState { state in zip(state.commandLog, state.commandMailboxLog).map { (command: $0, mailbox: $1) } }
     }
 
     /// Two-tier fuzzer (Testing Rule 11), tier-1 invariant (d) — number of
@@ -2168,8 +2178,10 @@ final class FakeIMAPServer: @unchecked Sendable {
                     // here). Lets a test assert the "teardown sends DONE
                     // for an active IDLE session" invariant (the
                     // markDirty-IDLE fix's pin).
+                    let mailboxAtDone = selectedMailbox
                     let doneDelay = withState { state -> Double? in
                         state.commandLog.append("DONE")
+                        state.commandMailboxLog.append(mailboxAtDone)
                         _ = state.idlingFds.remove(fd)
                         return state.idleDoneReplyDelays.isEmpty ? nil : state.idleDoneReplyDelays.removeFirst()
                     }
@@ -2191,8 +2203,10 @@ final class FakeIMAPServer: @unchecked Sendable {
                 let command = parts[1].uppercased()
                 let args = parts.count > 2 ? parts[2] : ""
                 let recordedCommand = ([command] + (args.isEmpty ? [] : [args])).joined(separator: " ")
+                let mailboxAtCommand = selectedMailbox
                 let matchedFailure: InjectedFailure? = withState { state -> InjectedFailure? in
                     state.commandLog.append(recordedCommand)
+                    state.commandMailboxLog.append(mailboxAtCommand)
                     state.commandLogByConnection[fd, default: []].append(recordedCommand)
                     let upper = recordedCommand.uppercased()
                     guard let key = state.injectedFailureCountdowns.keys.sorted().first(where: {

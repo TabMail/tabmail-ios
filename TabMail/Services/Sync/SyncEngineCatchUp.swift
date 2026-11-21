@@ -45,6 +45,19 @@ enum CatchUpApplyOutcome: Sendable, Equatable {
     case turnover(accountId: String, folderPath: String, stored: UInt32, observed: UInt32)
 }
 
+/// What one catch-up slice did (`SyncEngine.runCatchUp`), by folder id.
+struct CatchUpSliceResult: Sendable, Equatable {
+    /// The folders whose applied result made progress
+    /// (`CatchUpFolderResult.madeProgress`).
+    var progressedFolderIds: Set<String> = []
+    /// The folders whose call left a request that may still be in flight
+    /// (`CatchUpFolderResult.requestMayBeInFlight`, #1062), whether or not the
+    /// result was applied: the request may still hold that folder's connection.
+    var inFlightFolderIds: Set<String> = []
+    /// An applied folder result made progress.
+    var progressed: Bool { !progressedFolderIds.isEmpty }
+}
+
 /// `CatchUpLocalRowReader` over the sync database: ids and the two flags, never
 /// content (ADR-004). Every query is bounded by a range, an id list or a limit.
 struct SyncEngineCatchUpRowReader: CatchUpLocalRowReader {
@@ -205,9 +218,21 @@ extension SyncEngine {
     /// A foreground cycle (`run.deadline == nil`) runs one slice; the background
     /// processing job runs slices until its deadline. Either stops after a slice
     /// that made no progress, so a folder whose requests keep failing is retried at
-    /// the next cycle, not at network rate. Generic: a provider without catch-up
-    /// returns nothing, and the run stops after one slice. True when a slice made
-    /// progress (the worker's `didWork`).
+    /// the next cycle, not at network rate. The run never asks a folder again after
+    /// its call left a request that may still be in flight
+    /// (`CatchUpFolderResult.requestMayBeInFlight`, #1062; IMAP: a request that
+    /// timed out), whatever progress that call made: the request may still hold
+    /// the folder's connection until its late answer. Later slices of the run
+    /// leave the folder out and go on with the others, and only the progress of
+    /// folders still asked decides whether the run takes another slice, so a slice
+    /// whose only progress came from such a folder ends the run. The set lives in
+    /// this run's memory alone. The state the folder's call saved is kept, and its
+    /// next call, in a later run, asks at most the capped width. Other callers that
+    /// reach the folder meanwhile (the worker's next cycle, the walk) are the
+    /// connection's own issue (#1133), open. Generic: a provider without catch-up
+    /// returns nothing, and the run stops after one slice. True when a slice's
+    /// applied result made progress, a folder left out afterwards included (the
+    /// worker's `didWork`).
     ///
     /// The request rate: a slice sends at most `run.sliceMaxRequests`, and opens a
     /// window of `run.intervalSeconds` (real time) in `catchUpSliceWindowEnds`; no
@@ -220,7 +245,11 @@ extension SyncEngine {
         let provider = queue.provider
         let accountId = account.id
         var madeProgress = false
+        // The folders whose request may still be in flight (#1062): never asked
+        // again in this run. In memory only, gone when the run ends.
+        var inFlight = Set<String>()
         runLoop: while !Task.isCancelled {
+            let leftOut = inFlight
             let slice: CatchUpSliceOutcome = await oneSyncAtATime(accountId: accountId) {
                 if let end = self.catchUpSliceWindowEnds[accountId], end > Date() {
                     // No slice can start before the run's deadline: the run ends
@@ -234,24 +263,29 @@ extension SyncEngine {
                 self.catchUpSliceWindowEnds[accountId] = Date().addingTimeInterval(run.intervalSeconds)
                 let folderIds: [String]
                 do {
-                    folderIds = try await self.syncableFolderIds(accountId: accountId)
+                    folderIds = try await self.syncableFolderIds(accountId: accountId).filter { !leftOut.contains($0) }
                 } catch {
                     BackgroundSyncLogger.logDebug("[CatchUp] folder read failed: \(error)")
-                    return .ran(progressed: false)
+                    return .ran(CatchUpSliceResult())
                 }
-                let progressed = (try? await queue.execute(priority: .headerFetch) {
+                let ran = (try? await queue.execute(priority: .headerFetch) {
                     await self.runCatchUp(provider: provider, folderIds: folderIds, context: context)
-                }) ?? false
-                return .ran(progressed: progressed)
+                }) ?? CatchUpSliceResult()
+                return .ran(ran)
             }
             switch slice {
             case .windowOpen(until: let end):
                 try? await Task.sleep(for: .seconds(max(0, end.timeIntervalSinceNow)))
             case .runOver:
                 break runLoop
-            case .ran(let progressed):
-                madeProgress = madeProgress || progressed
-                guard progressed, run.deadline != nil else { break runLoop }
+            case .ran(let ran):
+                madeProgress = madeProgress || ran.progressed
+                // A request that may still be in flight holds its folder's
+                // connection: the folder is left out of the rest of the run, and
+                // its progress does not keep the run going (#1062).
+                inFlight.formUnion(ran.inFlightFolderIds)
+                let progressedStillAsked = !ran.progressedFolderIds.subtracting(inFlight).isEmpty
+                guard progressedStillAsked, run.deadline != nil else { break runLoop }
             }
         }
         return madeProgress
@@ -264,8 +298,9 @@ extension SyncEngine {
         /// The run's deadline has passed, or the account's open window ends at
         /// or after it.
         case runOver
-        /// A slice ran; whether an applied result made progress.
-        case ran(progressed: Bool)
+        /// A slice ran: the folders whose applied result made progress, and
+        /// those whose request may still be in flight.
+        case ran(CatchUpSliceResult)
     }
 
     /// The account's syncable folders as they are now (`syncableFoldersInOrder`,
@@ -286,12 +321,16 @@ extension SyncEngine {
     /// here so the provider sees their latest STATUS values and epochs. Never
     /// throws: a failure costs this slice. `context` comes from the run's snapshot
     /// (`CatchUpRun`): the network state and whether a storage limit is in force
-    /// were read once, when the run started. True when a folder's applied result
-    /// made progress (`CatchUpFolderResult.madeProgress`).
+    /// were read once, when the run started. Returns, by folder id, the folders
+    /// whose applied result made progress (`CatchUpFolderResult.madeProgress`)
+    /// and those whose call left a request that may still be in flight, applied
+    /// or not (`CatchUpFolderResult.requestMayBeInFlight`, #1062).
+    /// *Superseded (#1062):* "True when a folder's applied result made progress":
+    /// a Bool, which could not say which folder's request may still be in flight.
     /// *Superseded (#766):* "The full sync's catch-up step [...] `context` defaults
     /// to the production snapshot taken right now".
     @discardableResult
-    func runCatchUp(provider: any EmailProvider, folderIds: [String], context: CatchUpContext) async -> Bool {
+    func runCatchUp(provider: any EmailProvider, folderIds: [String], context: CatchUpContext) async -> CatchUpSliceResult {
         let ids = folderIds
         let folders: [Folder]
         do {
@@ -300,9 +339,9 @@ extension SyncEngine {
             folders = ids.compactMap { byId[$0] }
         } catch {
             BackgroundSyncLogger.logDebug("[CatchUp] folder read failed: \(error)")
-            return false
+            return CatchUpSliceResult()
         }
-        guard !folders.isEmpty else { return false }
+        guard !folders.isEmpty else { return CatchUpSliceResult() }
 
         // Just before the provider reads: every value it returns was read after
         // this, so an action that completed at or after it may be newer than
@@ -317,14 +356,16 @@ extension SyncEngine {
         let results = await provider.catchUp(
             folders: folders, localRows: SyncEngineCatchUpRowReader(pool: dbPool), context: context)
         let windowMode = provider.staleWindowMode
-        var madeProgress = false
+        var slice = CatchUpSliceResult()
         for result in results {
             let outcome = await applyCatchUpResult(
                 result, windowMode: windowMode, readStartedAt: readStartedAt,
                 selfHealOwedAtRead: owedAtRead[result.folderId])
-            if result.madeProgress, case .applied = outcome { madeProgress = true }
+            if result.madeProgress, case .applied = outcome { slice.progressedFolderIds.insert(result.folderId) }
+            // Whatever the apply did: the request may still hold the connection.
+            if result.requestMayBeInFlight { slice.inFlightFolderIds.insert(result.folderId) }
         }
-        return madeProgress
+        return slice
     }
 
     /// Apply one folder's catch-up result: first the messages the provider loaded

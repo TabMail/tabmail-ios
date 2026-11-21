@@ -150,8 +150,19 @@ struct CatchUpFolderResult: Sendable {
     /// still held). The backfill worker
     /// runs another slice only after one in which an applied result made progress,
     /// so a folder whose requests keep failing is tried again at the worker's next
-    /// cycle, never at network rate (#766).
+    /// cycle, never at network rate (#766). The progress of a folder whose call
+    /// left a request in flight (`requestMayBeInFlight`) does not count toward
+    /// another slice (#1062).
     var madeProgress = false
+    /// A request of this call may still be in flight (#1062): the provider
+    /// stopped waiting for it, but it can hold the folder's connection until its
+    /// late answer, so another request to the folder now would wait behind it or
+    /// force a new session. The backfill worker's run never asks this folder again,
+    /// whatever progress the call made, and goes on with its other folders
+    /// (`SyncEngine.runCatchUpRun`). Independent of `madeProgress`: the state the
+    /// call saved (a listing that moved, a top it learned) is kept as it is. A
+    /// provider whose abandoned requests hold no folder connection leaves it false.
+    var requestMayBeInFlight = false
     /// Set only in the call in which a listing of the folder completed (#1062):
     /// the lapse count it started at, and whether it was clean. The apply clears
     /// a folder's owed check with it. A provider may leave it nil.
