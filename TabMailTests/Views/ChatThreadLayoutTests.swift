@@ -227,8 +227,11 @@ struct ChatThreadLayoutTests {
                 // VoiceOver offers an element's actions only while that element has its focus: some
                 // element VoiceOver can focus (the reply field's text field) carries it. SwiftUI may
                 // also put it on a wrapper node that is no element; that one alone would not do.
-                let carrier = try #require(carriers.first { $0.isAccessibilityElement },
-                    "an element VoiceOver can focus carries the action; carriers: \(carriers.map(describe))")
+                // Plain values only inside the macro: closures in its arguments do not compile.
+                let focusable = carriers.first(where: { $0.isAccessibilityElement })
+                let carrierList = carriers.map { describe($0) }.joined(separator: "; ")
+                let carrier = try #require(focusable,
+                    "an element VoiceOver can focus carries the action; carriers: \(carrierList)")
                 #expect(HostedAccessibility.identifier(of: carrier) != id, "not the field's container")
                 #expect(Self.frame(of: "chatClose", in: controller.view) == nil, "control: the panel starts closed")
                 // Run it as VoiceOver's actions rotor does (the text field has no identifier to
