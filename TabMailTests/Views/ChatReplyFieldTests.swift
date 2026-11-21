@@ -883,12 +883,12 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldDragGesture", in: chat) == 0)
         #expect(Self.count("@State private var fieldDragProgress = ChatFieldDrag.Progress()", in: chat) == 1)
         #expect(Self.count("@State private var fieldSwell", in: chat) == 0)
-        let moved = try Self.body(of: "private func fieldDragMoved(_ translation: CGSize) {", in: chat)
-        #expect(Self.count("fieldDragProgress = ChatFieldDrag.progress(translation: translation) }", in: moved) == 1)
+        let moved = try Self.body(of: "private func fieldDragMoved(_ drag: ChatHorizontalPan.Sample) {", in: chat)
+        #expect(Self.count("fieldDragProgress = ChatFieldDrag.progress(translation: drag.travel) }", in: moved) == 1)
         #expect(Self.count("chatExpanded", in: moved) == 0, "a move only swells the field")
         // A cancelled drag resets too, so the field never stays swollen; only a finished drag opens.
-        let ended = try Self.body(of: "private func fieldDragEnded(_ translation: CGSize, velocity: CGSize, finished: Bool) {", in: chat)
-        #expect(Self.count("let opens = finished && ChatFieldDrag.opens( translation: translation, predictedEndTranslation: ChatFieldDrag.predictedEnd(translation: translation, velocity: velocity))", in: ended) == 1)
+        let ended = try Self.body(of: "private func fieldDragEnded(_ drag: ChatHorizontalPan.Sample, finished: Bool) {", in: chat)
+        #expect(Self.count("let opens = finished && ChatFieldDrag.opens( translation: drag.travel, predictedEndTranslation: ChatFieldDrag.predictedEnd(translation: drag.travel, velocity: drag.velocity))", in: ended) == 1)
         #expect(Self.count("withAnimation(Self.pillSpring) { fieldDragProgress = ChatFieldDrag.Progress() if opens { chatExpanded = true } }", in: ended) == 1)
         // The freeze, under its own id, from the gesture state, so a cancelled drag releases.
         #expect(Self.count(".onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }", in: chat) == 1)
@@ -899,8 +899,14 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: Self.fieldDragSettle + ChatViewLayout.freezeCooldown)", in: changed) == 1)
         #expect(Self.count("ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)", in: chat) == 1, "and if the chat goes away")
         // Never in the tutorial, whose steps open the chat themselves, nor over the open panel.
-        #expect(Self.count(".gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning, changed: fieldDragMoved, ended: fieldDragEnded))", in: chat) == 1)
+        #expect(Self.count(".gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning, moved: fieldDragMoved, ended: fieldDragEnded))", in: chat) == 1)
         #expect(Self.count("simultaneousGesture", in: chat) == 0)
+        // One bridge for every chat pan: the field's drag reads the swipes' sample and outcome, with
+        // no delivery of its own.
+        let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
+        #expect(Self.count("ChatHorizontalPan.deliver(recognizer, moved: moved, ended: ended)", in: swipe) == 1)
+        #expect(Self.count("static func deliver(", in: swipe) == 2, "the bridge's, and the swipe's sideways reading of it")
+        #expect(Self.count("recognizer.translation(in:", in: swipe) == 1, "one place samples a pan")
         // VoiceOver opens the panel with a named action on the text field it focuses, offered only
         // while the panel is closed, never on the field's container.
         #expect(ChatViewConfig.showChatActionName == "Show TabMail chat")

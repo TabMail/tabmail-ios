@@ -410,14 +410,37 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
         if finished(recognizer.state) != nil { ChatSwipeHold.shared.release(id, after: ChatViewLayout.swipeSettleHold) }
     }
 
-    /// Hands a pan's event on: its horizontal travel while it moves; its velocity, and whether the
-    /// user finished it, once it ends.
+    /// The swipe's reading of a pan's event (`deliver(_:moved:ended:)`): its horizontal travel
+    /// while it moves; its horizontal velocity, and whether the user finished it, once it ends.
     static func deliver(_ recognizer: UIPanGestureRecognizer, changed: (CGFloat) -> Void,
                         ended: (CGFloat, Bool) -> Void) {
+        deliver(recognizer, moved: { changed($0.travel.width) }, ended: { ended($0.velocity.width, $1) })
+    }
+
+    /// One reading of a pan, both axes, in its own view: its travel since it began and its velocity
+    /// (points per second).
+    struct Sample: Equatable {
+        var travel: CGSize
+        var velocity: CGSize
+    }
+
+    /// The pan's reading now.
+    static func sample(_ recognizer: UIPanGestureRecognizer) -> Sample {
+        let travel = recognizer.translation(in: recognizer.view)
+        let velocity = recognizer.velocity(in: recognizer.view)
+        return Sample(travel: CGSize(width: travel.x, height: travel.y),
+                      velocity: CGSize(width: velocity.x, height: velocity.y))
+    }
+
+    /// Hands a pan's event on, for every pan the chat builds here (the swipes, the reply field's
+    /// drag up, `ChatFieldPan`): its sample while it moves; once it ends, its last sample and one
+    /// outcome, whether the user finished it (`finished`). What a pan does with them is its caller's.
+    static func deliver(_ recognizer: UIPanGestureRecognizer, moved: (Sample) -> Void,
+                        ended: (Sample, Bool) -> Void) {
         if let finished = finished(recognizer.state) {
-            ended(recognizer.velocity(in: recognizer.view).x, finished)
+            ended(sample(recognizer), finished)
         } else if recognizer.state == .began || recognizer.state == .changed {
-            changed(recognizer.translation(in: recognizer.view).x)
+            moved(sample(recognizer))
         }
     }
 
@@ -491,11 +514,11 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
     /// Off over the open panel and in the tutorial. Turning it off mid-drag cancels the drag, which
     /// ends as an interrupted one.
     let isEnabled: Bool
-    /// The drag's travel since it began.
-    let changed: (CGSize) -> Void
+    /// The drag's travel since it began (`ChatHorizontalPan.Sample`).
+    let moved: (ChatHorizontalPan.Sample) -> Void
     /// The drag's travel and its velocity at the let-go, and whether the user finished it (false
     /// when the system cancelled or failed it).
-    let ended: (CGSize, CGSize, Bool) -> Void
+    let ended: (ChatHorizontalPan.Sample, Bool) -> Void
 
     func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
         Coordinator()
@@ -519,31 +542,16 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         recognizer.isEnabled = isEnabled
     }
 
+    /// The swipes' delivery (`ChatHorizontalPan.deliver`), both axes.
     func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
-        Self.deliver(recognizer, changed: changed, ended: ended)
-    }
-
-    /// Hands a pan's event on: its travel while it moves; its travel, its velocity, and whether the
-    /// user finished it, once it ends (`ChatHorizontalPan.finished`).
-    static func deliver(_ recognizer: UIPanGestureRecognizer, changed: (CGSize) -> Void,
-                        ended: (CGSize, CGSize, Bool) -> Void) {
-        let travel = size(recognizer.translation(in: recognizer.view))
-        if let finished = ChatHorizontalPan.finished(recognizer.state) {
-            ended(travel, size(recognizer.velocity(in: recognizer.view)), finished)
-        } else if recognizer.state == .began || recognizer.state == .changed {
-            changed(travel)
-        }
-    }
-
-    static func size(_ point: CGPoint) -> CGSize {
-        CGSize(width: point.x, height: point.y)
+        ChatHorizontalPan.deliver(recognizer, moved: moved, ended: ended)
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         /// Only a first movement more up than sideways starts the drag.
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
             guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
-            return ChatFieldDrag.begins(translation: ChatFieldPan.size(pan.translation(in: pan.view)))
+            return ChatFieldDrag.begins(translation: ChatHorizontalPan.sample(pan).travel)
         }
 
         /// The drag runs alone, as a swipe does: once it has the finger, nothing else acts on it.

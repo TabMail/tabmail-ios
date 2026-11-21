@@ -1029,7 +1029,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (`fieldDragProgress.isDragging`): the drag's start queues the bar's geometry action and the
    `onChange` that sets the settle token together, and SwiftUI runs deferred actions in an
    unspecified order." The drag is a UIKit pan (`ChatFieldPan`, amended 2026-11-21), the
-   swipes' pan bridge (`ChatHorizontalPan`) turned vertical: it starts only on a first movement more
+   swipes' pan bridge (`ChatHorizontalPan`) turned vertical: it builds its pan with
+   `ChatHorizontalPan.makePan` and takes its events through the same delivery
+   (`ChatHorizontalPan.deliver(_:moved:ended:)`: one two-axis `Sample` while it moves, then its last
+   sample and one outcome, finished or not), while its own rules (when it begins, what it waits
+   for) stay in its delegate and what it does with a sample stays in `ChatThreadView`. It starts only on a first movement more
    up than sideways (`ChatFieldDrag.begins`), and once it starts it cancels the touch for the views
    under it (`cancelsTouchesInView`), so a drag, short or long, never ends as a tap that focuses the
    field; a tap never starts it and focuses the field as before. The field's text view goes first

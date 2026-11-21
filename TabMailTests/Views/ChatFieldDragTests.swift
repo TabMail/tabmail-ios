@@ -194,29 +194,52 @@ struct ChatFieldDragTests {
         #expect(!coordinator.gestureRecognizer(pan, shouldBeRequiredToFailBy: plainTap))
     }
 
-    @Test("The pan's events swell the field by the travel; the let-go hands on travel, speed and whether it finished")
+    @Test("The swipes' bridge hands the field both axes: a sample while it moves, and one outcome with its last sample at the let-go")
     @MainActor
     func deliveredPan() {
         let pan = MovedPan()
-        var moves: [CGSize] = []
-        var ends: [(CGSize, CGSize, Bool)] = []
+        var moves: [ChatHorizontalPan.Sample] = []
+        var ends: [(ChatHorizontalPan.Sample, Bool)] = []
         func send(_ state: UIGestureRecognizer.State, travel: CGPoint, speed: CGPoint = .zero) {
             pan.event = state
             pan.travel = travel
             pan.speed = speed
-            ChatFieldPan.deliver(pan, changed: { moves.append($0) }, ended: { ends.append(($0, $1, $2)) })
+            ChatHorizontalPan.deliver(pan, moved: { moves.append($0) }, ended: { ends.append(($0, $1)) })
         }
         send(.possible, travel: CGPoint(x: 0, y: -50))
         #expect(moves.isEmpty && ends.isEmpty, "not a drag yet")
-        send(.began, travel: CGPoint(x: 1, y: -12))
+        send(.began, travel: CGPoint(x: 1, y: -12), speed: CGPoint(x: 4, y: -90))
         send(.changed, travel: CGPoint(x: 2, y: -30))
-        #expect(moves == [CGSize(width: 1, height: -12), CGSize(width: 2, height: -30)])
+        #expect(moves == [.init(travel: CGSize(width: 1, height: -12), velocity: CGSize(width: 4, height: -90)),
+                          .init(travel: CGSize(width: 2, height: -30), velocity: .zero)])
+        #expect(ends.isEmpty, "nothing ends while it moves")
         send(.ended, travel: CGPoint(x: 2, y: -40), speed: CGPoint(x: 0, y: -300))
         send(.cancelled, travel: CGPoint(x: 0, y: -70))
-        #expect(ends.count == 2)
-        guard ends.count == 2 else { return }
-        #expect(ends[0].0 == CGSize(width: 2, height: -40) && ends[0].1 == CGSize(width: 0, height: -300) && ends[0].2)
-        #expect(ends[1].0 == CGSize(width: 0, height: -70) && !ends[1].2, "a cancelled drag is not finished, so it never opens")
+        send(.failed, travel: CGPoint(x: 0, y: -80))
+        #expect(moves.count == 2, "an ending is never also a move")
+        #expect(ends.count == 3)
+        guard ends.count == 3 else { return }
+        #expect(ends[0].0 == .init(travel: CGSize(width: 2, height: -40), velocity: CGSize(width: 0, height: -300)) && ends[0].1)
+        #expect(ends[1].0.travel == CGSize(width: 0, height: -70) && !ends[1].1, "a cancelled drag is not finished, so it never opens")
+        #expect(!ends[2].1, "nor a failed one")
+    }
+
+    @Test("The swipe reads the same bridge sideways: its travel while it moves, its sideways speed at the let-go")
+    @MainActor
+    func swipeReadsTheBridgeSideways() {
+        let pan = MovedPan()
+        var moves: [CGFloat] = []
+        var ends: [(CGFloat, Bool)] = []
+        pan.event = .changed
+        pan.travel = CGPoint(x: -40, y: -7)
+        ChatHorizontalPan.deliver(pan, changed: { moves.append($0) }, ended: { ends.append(($0, $1)) })
+        pan.event = .ended
+        pan.speed = CGPoint(x: -250, y: 900)
+        ChatHorizontalPan.deliver(pan, changed: { moves.append($0) }, ended: { ends.append(($0, $1)) })
+        #expect(moves == [-40])
+        #expect(ends.count == 1)
+        guard ends.count == 1 else { return }
+        #expect(ends[0].0 == -250 && ends[0].1)
     }
 
     /// The project root: this file is TabMailTests/Views/ChatFieldDragTests.swift.

@@ -932,7 +932,7 @@ struct ChatThreadView: View {
             // focuses the field (`ChatFieldPan`). Not in the tutorial, whose steps open the chat
             // themselves.
             .gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning,
-                                  changed: fieldDragMoved, ended: fieldDragEnded))
+                                  moved: fieldDragMoved, ended: fieldDragEnded))
             .onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }
             // Debug UI tests only: what the drag did to the chat (`ChatFieldDragMarker`).
             .modifier(ChatFieldDragMarker.Field(dragging: fieldDragProgress.isDragging))
@@ -967,17 +967,17 @@ struct ChatThreadView: View {
     }
 
     /// The drag up on the collapsed field moved (`ChatFieldPan`): the field swells under the finger.
-    private func fieldDragMoved(_ translation: CGSize) {
-        fieldDragProgress = ChatFieldDrag.progress(translation: translation)
+    private func fieldDragMoved(_ drag: ChatHorizontalPan.Sample) {
+        fieldDragProgress = ChatFieldDrag.progress(translation: drag.travel)
     }
 
     /// The drag up on the collapsed field let go, or was cancelled (`ChatFieldPan`): the swell
     /// springs back with the pill's spring however it ended, and a finished drag whose swell, or a
     /// flick's predicted swell, reaches the open distance opens the panel in the same transaction.
-    private func fieldDragEnded(_ translation: CGSize, velocity: CGSize, finished: Bool) {
+    private func fieldDragEnded(_ drag: ChatHorizontalPan.Sample, finished: Bool) {
         let opens = finished && ChatFieldDrag.opens(
-            translation: translation,
-            predictedEndTranslation: ChatFieldDrag.predictedEnd(translation: translation, velocity: velocity))
+            translation: drag.travel,
+            predictedEndTranslation: ChatFieldDrag.predictedEnd(translation: drag.travel, velocity: drag.velocity))
         withAnimation(Self.pillSpring) {
             fieldDragProgress = ChatFieldDrag.Progress()
             if opens { chatExpanded = true }
