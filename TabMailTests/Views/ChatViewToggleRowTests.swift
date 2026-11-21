@@ -14,6 +14,9 @@ import UIKit
 ///  1. With AI on, the switch can be used and flipping it stores the user's choice.
 ///  2. With AI off, opted out, with no AI choice made yet or with no active plan, the switch is
 ///     grayed out and the stored choice is kept as it was, so it comes back when AI does.
+///  3. An inbox row (`MessageRowView`) on screen follows the same AI state: with Chat View on, AI
+///     on and an active plan it shows the email's text message, and once the device opts out of
+///     AI the same row shows the snippet, without being built again.
 @Suite("Chat View switch", .serialized, .processGlobalState)
 @MainActor
 struct ChatViewToggleRowTests {
@@ -58,6 +61,71 @@ struct ChatViewToggleRowTests {
             try await Task.sleep(for: .milliseconds(100))
             #expect(defaults.object(forKey: ChatViewConfig.enabledKey) as? Bool == true,
                     "AI off leaves the stored choice as it was")
+        }
+    }
+
+    // Chat View on, the AI choice made with AI on, and an active plan: a row on screen shows the
+    // email's text message. Opting out of AI on this device is the only change (the choice stays
+    // made, the plan stays active, Chat View stays on), so the same mounted row must repaint to
+    // the snippet.
+    @Test("A row on screen shows the text message while AI is on and the snippet once the device opts out")
+    func rowFollowsTheOptOut() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted row")
+        let defaults = UserDefaults.standard
+        let savedChoice = defaults.object(forKey: ChatViewConfig.enabledKey)
+        let restoreAISetting = AITestSetting.save()
+        let gate = AISubscriptionGate.shared
+        let gateWasOpen = gate.isActive
+        defer {
+            defaults.set(savedChoice, forKey: ChatViewConfig.enabledKey)
+            restoreAISetting()
+            if gateWasOpen { gate.openGate() } else { gate.closeGate() }
+        }
+        defaults.set(true, forKey: ChatViewConfig.enabledKey)
+        AITestSetting.set(aiOff: false)
+        gate.openGate()
+        #expect(gate.isActive, "control: an active plan")
+        #expect(!AIService.isAIOff, "control: the AI choice is made, with AI on")
+        #expect(!DemoModeStore.shared.hidesAIContent, "control: no demo hides AI")
+        #expect(!TutorialCoordinator.shared.isRunning, "control: no tutorial run decides the view")
+
+        let textMessage = "See you at noon"
+        let snippet = "Lunch moves to noon on Friday, details below"
+        var header = MessageHeader(
+            messageId: "1", subject: "Plans", from: "Alex", fromAddress: "alex@example.com",
+            to: "me@example.com", date: Date(), snippet: snippet, folderId: "acc1:INBOX",
+            accountId: "acc1", folderPath: "INBOX", isInInbox: true)
+        header.summaryTextMessage = textMessage
+        let row = MessageSnapshot(from: header)
+        let chatLine = row.preview(chatViewActive: true)
+        let classicLine = row.preview(chatViewActive: false)
+        #expect(chatLine == textMessage, "control: the chat-style line is the text message")
+        #expect(classicLine == snippet, "control: the classic line is the snippet")
+
+        try await HostedAccessibility.withAutomation {
+            let window = try Self.host(MessageRowView(message: row))
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+            let rowShows = { (line: String) in HostedAccessibility.labels(in: window).contains(line) }
+
+            let chatRow = await Self.waitUntil(seconds: 8) { rowShows(textMessage) }
+            let beforeLabels = HostedAccessibility.labels(in: window)
+            #expect(chatRow, "AI on: the row shows the text message: \(beforeLabels)")
+            let beforeShowsSnippet = rowShows(snippet)
+            #expect(!beforeShowsSnippet, "AI on: the row does not show the snippet")
+
+            AITestSetting.set(aiOff: true)
+            #expect(AIService.isAIOff, "control: the device opted out")
+            #expect(gate.isActive, "control: the plan is still active")
+            #expect(ChatViewConfig.isEnabledByUser, "control: Chat View is still on")
+
+            let classicRow = await Self.waitUntil(seconds: 8) { rowShows(snippet) }
+            let afterLabels = HostedAccessibility.labels(in: window)
+            #expect(classicRow, "opted out: the same row shows the snippet: \(afterLabels)")
+            let afterShowsText = rowShows(textMessage)
+            #expect(!afterShowsText, "opted out: the row no longer shows the text message")
         }
     }
 
