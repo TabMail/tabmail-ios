@@ -119,9 +119,11 @@ actor UIDWalkCursor {
     }
 
     /// The two halves a failed range is retried as, together exactly the range;
-    /// nil for a range of one UID, which cannot be split (#1006). The one
-    /// splitting rule for UID ranges: the walk's retries and the catch-up's
-    /// listing ranges (#1062) both cut here.
+    /// nil for a range of one UID, which cannot be split (#1006). The walk's
+    /// retries cut here. A catch-up listing range that times out lowers the
+    /// listing's width cap instead (`IMAPCatchUpState.Listing.widthCap`, #1062).
+    /// *Superseded (#1062):* "The one splitting rule for UID ranges: the walk's
+    /// retries and the catch-up's listing ranges both cut here."
     nonisolated static func halves(from: Int, to: Int) -> (lower: (from: Int, to: Int), upper: (from: Int, to: Int))? {
         guard to > from else { return nil }
         let mid = from + (to - from) / 2

@@ -1190,13 +1190,29 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     where the listing stands first ..., the other next", a retry of both halves inside the same call,
     which could not work while the timed-out request still held the folder's connection. *Replaces:* the width recomputed from each SELECT's EXISTS and UIDNEXT, and a
     listing failure that ended the folder's pass with no split.
+    *Superseded in part (2026-11-21):* the cut to a half and the stored half width ("is cut by the walk's
+    one splitting rule ... That half's width is stored in the listing ... the next call asks from there
+    with the stored width"); see *Timeout, current (2026-11-21)* below.
+  - *Timeout, current (2026-11-21).* A listing range that times out, or whose answer is too large or
+    undecodable (`UIDWalkCursor.failureCallsForSmallerRange`), stores ONLY the width cap
+    (`IMAPCatchUpState.Listing.widthCap`: its width divided by `SyncConfig.catchUpWidthCapShrinkFactor`),
+    and the folder stops for the rest of the call. The stored width (`Listing.rangeWidth`) is left as it
+    was: only a range that answers sets it, from that range's own count. The listing keeps its place, and
+    the next call asks from there at most the capped width (the cap is applied where the next range is
+    cut). The call is no progress (a cap-only change), so a background run does not ask again at once on
+    the connection the timed-out request still holds: the folder is tried again at the next cycle. A
+    one-UID range that fails stays unconfirmed. Why: with the shrink factor at 2 the cap (half the width,
+    rounded down) was never wider than the stored lower half (rounded up), so the stored half width never
+    set a range; its only effect was that a timeout changed the listing and so counted as progress, against
+    the rule that a request that failed before anything moved is no progress.
   - *Width cap, current (d1 2026-11-20).* A range that times out sets the cap
     (`IMAPCatchUpState.Listing.widthCap`) to its width divided by `SyncConfig.catchUpWidthCapShrinkFactor`;
     each range that answers multiplies it by `SyncConfig.catchUpWidthCapGrowthFactor` (2026-11-20: kept only
     when the call makes progress; a call that moves nothing restores the cap it started with), and at
     `catchUpListingMaxRangeSpan` it is dropped. No range-scoped end (`widthCapThrough` removed). Why: the
     cap below only ever shrank, so about 20 timeouts unrelated to range size left a sparse folder at
-    one-UID ranges over millions of UIDs. A cap-only change is still no progress.
+    one-UID ranges over millions of UIDs. A cap-only change is still no progress. 2026-11-21: the cap is
+    all a timeout stores, so a timeout is no progress (*Timeout, current (2026-11-21)* above).
   - *Width cap after a timeout, superseded by the d1 entry above.* A range that times out also stores a
     width cap (`IMAPCatchUpState.Listing.widthCap`, the stored half width) together with the upper end
     of the range that timed out (`widthCapThrough`); repeated timeouts before the listing moves past

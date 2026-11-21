@@ -838,19 +838,21 @@ enum SyncConfig {
     /// (`IMAPProvider.listingRangeSpan`), each later one from the previous
     /// range's own count (`IMAPProvider.nextListingRangeSpan`), so a listing
     /// costs about EXISTS / this many ranges however sparse or bunched the UID
-    /// space is (#1062). A listing range that times out is halved by the walk's
-    /// rule (`UIDWalkCursor.halves`) and the next call asks the half. About 50 bytes per
+    /// space is (#1062). A listing range that times out caps the next ranges at
+    /// its width divided by `catchUpWidthCapShrinkFactor`. About 50 bytes per
     /// message on the wire, so a range stays far inside the request timeout even
     /// on a slow link.
     /// *Superseded (#1062):* `catchUpListingRangeSpan = 1000`, a fixed width in
     /// UIDs, which made a listing's cost grow with UIDNEXT, not with the folder.
+    /// *Superseded (#1062):* "is halved by the walk's rule (`UIDWalkCursor.halves`)
+    /// and the next call asks the half": the cap alone sets the next width.
     static let catchUpListingRangeMessages = 1000
     /// Narrowest IMAP listing range, in UIDs, whatever the folder's density.
     static let catchUpListingMinRangeSpan = 1000
     /// Widest IMAP listing range, in UIDs: a range that held few messages makes
     /// the next one wider, never wider than this, so a dense stretch after a
     /// sparse one is reached by a bounded range (a range that still times out
-    /// is halved).
+    /// lowers the width cap).
     static let catchUpListingMaxRangeSpan = 10_000_000
     /// A catch-up listing range that times out caps the next ranges at its
     /// width divided by this (#1062).

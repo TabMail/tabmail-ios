@@ -635,6 +635,34 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    @Test("A range that times out at its stored width, which could still be halved, is no progress: the slice reports none, so the run does not ask again at once on the connection the timed-out request still holds; the listing stays at its UID, and the next call asks the capped width from there")
+    @MainActor
+    func timedOutRangeThatCouldHalveIsNoProgress() async throws {
+        let server = Array(1...20)
+        try await Self.withWorld("halvable-timeout", server: server, local: server) { w in
+            let width = 5
+            try await Self.setListing(w, nextUid: 7, rangeWidth: width, top: server.last)
+            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: Self.slowAnswerSeconds)
+            let start = w.server.recordedCommands().count
+            // One slice of this folder, as the background run takes it: the run
+            // takes another only after a slice that made progress.
+            await AccountManager.shared.clearRecentlyCompletedForTesting()
+            let progressed = await w.engine.runCatchUp(provider: w.provider, folderIds: [w.folderId], context: CatchUpContext(
+                deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages,
+                requestTimeoutSeconds: Self.scaledTimeout))
+            #expect(Self.listingRanges(w.server.recordedCommands().dropFirst(start)) == [7...(6 + width)],
+                    "setup: one range at the stored width was asked, and it timed out")
+            #expect(!progressed, "#1062: a timed-out range is no progress, even one that could still be halved, so the run does not ask again at once on the connection the timed-out request still holds")
+            #expect(try w.catchUpState()?.listing?.nextUid == 7, "#1062: the listing stays at the UID whose range timed out")
+            // Let the late answer free the connection, as the slice window does.
+            try await Task.sleep(for: .seconds(Self.slowAnswerSeconds))
+            w.server.slowListingFetch(in: Self.path, overRecords: 0, seconds: nil)
+            let capped = width / SyncConfig.catchUpWidthCapShrinkFactor
+            #expect(try await Self.nextRange(w, CatchUpTestClock()) == 7...(6 + capped),
+                    "#1062: the next call asks the timed-out width divided by the shrink factor, from the same UID")
+        }
+    }
+
     @Test("A stored listing written before the width field: the first range is sized from the folder's EXISTS and UIDNEXT")
     @MainActor
     func listingWithoutStoredWidthSizesFromTheFolder() async throws {

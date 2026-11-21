@@ -61,10 +61,15 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
         /// completion is not clean.
         var passedOver: Bool?
         /// The width in UIDs of this listing's next range (#1062): set after
-        /// every range from that range's own count, and halved when a range
-        /// times out, so the next call goes on from the same place with the
-        /// smaller width. Absent (a listing written before it existed, or a new
-        /// one): sized from the folder's EXISTS and UIDNEXT.
+        /// every range that answers, from that range's own count. A range that
+        /// times out leaves it as it is: the smaller width is the cap's
+        /// (`widthCap`), and the next range is never wider than the cap. Absent
+        /// (a listing written before it existed, or a new one): sized from the
+        /// folder's EXISTS and UIDNEXT.
+        /// *Superseded (#1062):* "and halved when a range times out, so the next
+        /// call goes on from the same place with the smaller width": the cap
+        /// already gave the next range its width, and the halved width only made
+        /// a timeout count as progress.
         var rangeWidth: Int?
         /// The widest range this listing may ask (#1062): a range that times
         /// out sets it to its width divided by
@@ -468,24 +473,28 @@ extension IMAPProvider {
                         try await self.listFlagsInUIDRange(folder: path, from: lo, to: hi)
                     }
                 } catch {
-                    // A range too slow or too large to answer is cut by the walk's
-                    // own rule (`UIDWalkCursor.halves`) to the half next to where the
-                    // listing stands in its direction of travel (upward: the lower
-                    // half). Its width is stored and the folder stops for this call:
-                    // the timed-out request still holds the folder's connection until
-                    // its late answer, so no retry in the same call could work. The
-                    // listing keeps its place, and the next call asks from there with
-                    // the smaller width. A range of one UID that fails stays
-                    // unconfirmed: the listing never moves past it, and the next call
-                    // asks it again.
+                    // A range too slow or too large to answer caps the width
+                    // (`Listing.widthCap`) at its own width divided by
+                    // `SyncConfig.catchUpWidthCapShrinkFactor`, and the folder stops
+                    // for this call: the timed-out request still holds the folder's
+                    // connection until its late answer, so no retry in the same call
+                    // could work. Only the cap is stored, so the call is no progress
+                    // (a cap-only change, see `madeProgress` below) and the run does
+                    // not ask again at once. The listing keeps its place, and the
+                    // next call asks from there at most the capped width. A range of
+                    // one UID that fails stays unconfirmed: the listing never moves
+                    // past it, and the next call asks it again.
+                    // *Superseded (#1062):* "is cut by the walk's own rule
+                    // (`UIDWalkCursor.halves`) to the half next to where the listing
+                    // stands in its direction of travel (upward: the lower half). Its
+                    // width is stored": the cap alone set the next range, and the
+                    // stored half width made a timeout count as progress.
                     if UIDWalkCursor.failureCallsForSmallerRange(error) {
-                        let halves = UIDWalkCursor.halves(from: lo, to: hi)
-                        let halved = halves.map { $0.lower.to - $0.lower.from + 1 } ?? 1
-                        listing.rangeWidth = halved
-                        listing.widthCap = max(1, (hi - lo + 1) / SyncConfig.catchUpWidthCapShrinkFactor)
+                        let cap = max(1, (hi - lo + 1) / SyncConfig.catchUpWidthCapShrinkFactor)
+                        listing.widthCap = cap
                         capBeforeGrowth = nil
                         if DebugModeManager.isLoggingEnabled() {
-                            BackgroundSyncLogger.logDebug("[CatchUp] \(path) \(lo):\(hi): listing failed (\(error)) — next call asks \(listing.rangeWidth ?? 1) UID(s) from here")
+                            BackgroundSyncLogger.logDebug("[CatchUp] \(path) \(lo):\(hi): listing failed (\(error)) — next call asks at most \(cap) UID(s) from here")
                         }
                         break rangeLoop
                     }
@@ -709,7 +718,8 @@ extension IMAPProvider {
         // Progress: the listing moved or completed, or something applies. A range
         // whose request failed before anything moved is no progress, so the
         // worker does not list it again at once. The width cap a timeout sets
-        // is no progress either: it only narrows the next try (#1062).
+        // is no progress either: it only narrows the next try, and it is all a
+        // timeout stores (#1062).
         let madeProgress = completed || listing.withoutWidthCap != state?.listing?.withoutWidthCap
             || !result.flagUpdates.isEmpty || !result.removedIds.isEmpty || !result.loaded.isEmpty
         // No growth of the cap on a call that moved nothing (#1062).
