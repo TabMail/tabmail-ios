@@ -19,3 +19,5 @@ Three traps, each of which cost a build cycle:
 3. **SwiftUI's elements do not declare `UIAccessibilityIdentification`**, so `element as? UIAccessibilityIdentification` is nil for them although they answer `accessibilityIdentifier`: ask by selector (`HostedAccessibility.identifier(of:)`).
 
 The model-entry-point pattern above stays right where a press would reach a live service: the reply field's agent route would call the live backend client, so only its routing is tested.
+
+A PRESENTED card's content is not reliably readable: the hosted harness sometimes leaves a presented compose card's bubble and editor out of the accessibility tree, so check presented content in XCUITest instead (ADR-IOS-114 decision 16).

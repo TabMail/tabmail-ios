@@ -163,12 +163,6 @@ struct ChatSuggestionBubbleTests {
         try await withChat { chat in
             let ghost = try #require(Self.ghost(in: chat.view))
             #expect(chat.controller.presentedViewController == nil, "control: nothing open yet")
-            // The row's reply changes under the ghost with no refresh yet: the ghost still shows the
-            // reply the user taps.
-            try await chat.pool.write { db in
-                try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
-                               arguments: ["Hello Sam,\n\nA different reply.", chat.email.id])
-            }
             #expect(ghost.accessibilityLabel == "\(ChatSuggestionConfig.label): Yes, Tuesday works for me.",
                     "the ghost still reads as one element: \(String(describing: ghost.accessibilityLabel))")
             #expect(ghost.accessibilityActivate(), "the ghost takes a tap")

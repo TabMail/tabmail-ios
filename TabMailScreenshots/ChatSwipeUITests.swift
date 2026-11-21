@@ -402,6 +402,10 @@ final class ChatSwipeUITests: XCTestCase {
             self.add(shot)
         }
         let ghost = app.descendants(matching: .any)["chat.aiSuggestion"].firstMatch
+        XCTAssertTrue(ghost.waitForExistence(timeout: 10), "control: the ghost shows")
+        // The row's reply changes under the ghost with no refresh: the card must still open with
+        // the reply the user taps, never the row's later text.
+        app.buttons["Rewrite the AI Suggestion"].tap()
         for pass in 1...Self.cardOpenPasses {
             XCTAssertTrue(ghost.waitForExistence(timeout: 10), "control: the ghost shows (pass \(pass))")
             ghost.tap()
@@ -415,6 +419,8 @@ final class ChatSwipeUITests: XCTestCase {
             XCTAssertTrue(body.isHittable, "the card's body is on screen (pass \(pass))")
             XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
                 Self.savedDraftWords, Self.savedDraftWords)).firstMatch.exists, "never the saved draft's words (pass \(pass))")
+            XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
+                Self.rewrittenWords, Self.rewrittenWords)).firstMatch.exists, "never the row's rewritten reply (pass \(pass))")
             if pass < Self.cardOpenPasses {
                 closeCard(in: app, saving: false)
                 continue
@@ -432,12 +438,13 @@ final class ChatSwipeUITests: XCTestCase {
             closeCard(in: app, saving: true)
         }
         // Back on the fixture's list, which reads Drafts again: the saved draft keeps its words and
-        // was never saved over, and the card saved one draft of its own.
-        app.navigationBars.buttons["Fixture list"].firstMatch.tap()
+        // was never saved over, and the card saved one draft of its own, holding the suggestion.
+        dragFromEdge(atY: app.frame.height / 2, in: app)
+        XCTAssertTrue(wentBack(app), "an edge drag goes back to the fixture list")
         let marker = app.staticTexts["fixture.savedDraft"]
         XCTAssertTrue(marker.waitForExistence(timeout: 10))
         let after = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@",
-            "Saved draft kept: yes; separate replies: 1"), object: marker)
+            "Saved draft kept: yes; separate replies: 1; holding the suggestion: 1"), object: marker)
         XCTAssertEqual(XCTWaiter.wait(for: [after], timeout: 5), .completed, "the saved draft stays in Drafts: \(marker.label)")
     }
 
@@ -449,11 +456,13 @@ final class ChatSwipeUITests: XCTestCase {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test", "--chat-swipe-saved-draft"]
+        // Every run proves the card asks for no Contacts access, even on a simulator that answered.
+        app.resetAuthorizationStatus(for: .contacts)
         app.launch()
         XCTAssertTrue(app.staticTexts["Chat swipe fixture"].waitForExistence(timeout: 20))
         let marker = app.staticTexts["fixture.savedDraft"]
         XCTAssertTrue(marker.waitForExistence(timeout: 5), "control: the fixture shows what Drafts holds")
-        XCTAssertEqual(marker.label, "Saved draft kept: yes; separate replies: 0", "control: the reply draft is saved")
+        XCTAssertEqual(marker.label, "Saved draft kept: yes; separate replies: 0; holding the suggestion: 0", "control: the reply draft is saved")
         app.buttons["Open chat"].tap()
         XCTAssertTrue(subject(in: app).waitForExistence(timeout: 10))
         XCTAssertTrue(bubble(3, in: app).waitForExistence(timeout: 10))
@@ -476,6 +485,8 @@ final class ChatSwipeUITests: XCTestCase {
     private static let savedDraftWords = "My own words, not sent yet"
     /// The full reply's closing line, which the card's suggestion box shows and the ghost does not.
     private static let cardOnlyText = "Thanks."
+    /// The fixture's quiet rewrite of the row's reply (`ChatSwipeTestScene.rewrittenReply`).
+    private static let rewrittenWords = "A rewritten reply."
 
     func testOpenActionsTapOnAnotherBubbleClosesAndDropsTheKeyboard() {
         let app = launchIntoChat()

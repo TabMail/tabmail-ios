@@ -913,7 +913,7 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      tree, so the card's body content is checked only in XCUITest
      (`ChatSwipeUITests.testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody`).
      The owner ruling that the bubble must never animate in while the compose card slides in is
-     still unmet after the revert; it is tracked by the chat-view coordinator.
+     still unmet after the revert; it remains open.
    Tests: `ChatSuggestionBubbleTests` (the ghost, its tap opening the card, the in-place rewrite,
    no "AI Reply" string), `ChatSwipeUITests.testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody`
    (the card's body, Use Suggestion, the saved draft left in Drafts), `ChatThreadViewLifecycleTests.suggestionSitsAtTheSentPosition` and
