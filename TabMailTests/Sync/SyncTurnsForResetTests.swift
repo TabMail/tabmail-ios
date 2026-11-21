@@ -46,7 +46,7 @@ struct SyncTurnsForResetTests {
     /// Polls until `account` has `count` waiters; false at the bound.
     static func waitForWaiters(_ engine: SyncEngine, _ account: String, count: Int) async throws -> Bool {
         for _ in 0..<polls {
-            if await engine.syncPassWaiterCount(accountId: account) == count { return true }
+            if await engine.syncPassWaiterCountForTesting(accountId: account) == count { return true }
             try await Task.sleep(for: .milliseconds(10))
         }
         return false

@@ -478,7 +478,7 @@ extension IMAPProvider {
                     break rangeLoop
                 }
 
-                let listed: (flags: [UInt32: (isRead: Bool, isFlagged: Bool, isDeleted: Bool)], uidValidity: UInt32, uidNext: UInt32?, exists: Int)
+                let listed: (flags: [UInt32: (isRead: Bool, isFlagged: Bool, isDeleted: Bool)], uidValidity: UInt32, uidNext: UInt32?)
                 let local: [CatchUpLocalRow]
                 do {
                     local = try await localRows.rows(folderId: folder.id, numericIdsFrom: lo, through: hi)

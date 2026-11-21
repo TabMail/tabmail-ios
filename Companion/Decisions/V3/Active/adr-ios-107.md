@@ -163,8 +163,9 @@ The owner's rulings of 2026-11-09:
          connection until its late answer; Gmail and Outlook requests hold no folder connection and leave
          it false). The run never asks that folder again: `runCatchUpRun` keeps the folder ids in a set
          in its own memory (gone when the run ends, never persisted, no timer), and later slices do not
-         pass them to `runCatchUp`. Only the progress of folders not in the set decides another slice, so a slice
-         whose only progress came from such a folder ends the run. `madeProgress` is unchanged, and
+         pass them to `runCatchUp`. (*Superseded by the next amendment:* "Only the progress of folders not in
+         the set decides another slice, so a slice whose only progress came from such a folder ends the run.")
+         `madeProgress` is unchanged, and
          the state that folder's call saved is kept. `runCatchUpRun` still returns true when any applied
          result made progress, that folder's included (the worker's `caughtUp`). Why: a second request
          to the folder in the same run waits behind the late answer or forces a new session, and a
@@ -176,9 +177,11 @@ The owner's rulings of 2026-11-09:
          spends its slice (the slice, `catchUpSliceSeconds` 2 s, is shorter than one request's timeout,
          `catchUpRequestTimeoutSeconds` 3 s), so when the timed-out folder came first in its slice the
          other folders made no progress in it, and the rule above ended the run with their work
-         outstanding. The run now takes another slice when a folder not in the set made progress, OR when
-         the slice added a folder to the set. The left-out folder's own progress never counts, and a
-         foreground cycle still runs one slice. Bound: the set only grows, a folder in it is never passed to
+         outstanding. The run now takes another slice when any folder the slice asked made progress, OR when
+         the slice added a folder to the set. A slice asks only folders outside the set, so a slice whose only
+         progress came from a folder it left out goes on because it added that folder; a folder already in
+         the set is never asked, so it can never keep the run going. A foreground cycle still runs one
+         slice. Bound: the set only grows, a folder in it is never passed to
          a slice again, and a folder joins it once, so the second condition adds at most one slice per
          folder to the run (at most as many as the account has catch-up folders); each such slice keeps its
          own window (`catchUpSliceIntervalSeconds`) and its own request cap (`catchUpSliceMaxRequests`).
@@ -194,6 +197,11 @@ The owner's rulings of 2026-11-09:
          once; pacing across runs is #1133's.
          *Superseded (2026-11-21):* "Only the progress of folders not in the set decides another slice, so
          a slice whose only progress came from such a folder ends the run."
+         *Superseded (2026-11-21):* "The run now takes another slice when a folder not in the set made
+         progress, OR when the slice added a folder to the set. The left-out folder's own progress never
+         counts": the code subtracted the set from the slice's progressed folders, which never changed a
+         decision, because a progressed folder the slice left out is one the slice added. The guard now
+         reads the slice's progressed folders whole; the behaviour is the same.
      - **The worker's cycle.** `runBackfill` returns true when the walk did work or the catch-up made
        progress, so the foreground worker keeps cycling (the profile's active delay between cycles:
        3 s, or 0.5 s on power) until the listing completes; then a cycle does no work and, with the

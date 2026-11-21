@@ -7455,19 +7455,20 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// it cannot say which message it describes — so this THROWS rather than
     /// returning a listing with a hole in it, which the caller would read as a
     /// removal (the `liveSourceUIDs` rule). A UID absent from the result is only a
-    /// CANDIDATE removal: the caller still confirms it with
-    /// `searchExistingUIDs(folder:uids:)`, because a short FETCH is a real server
+    /// CANDIDATE removal: the caller still proves it with the range's membership
+    /// search, `searchMembership(folder:uids:range:)`, because a short FETCH is a real server
     /// shape (`[IMAP-FETCH-GAP]`, MIS-IOS-002).
+    /// In the catch-up, `searchExistingUIDs(folder:uids:)` only asks again for
+    /// the UIDs a header load left unanswered.
     ///
     /// Each UID also carries whether the server flags it `\Deleted` (such a
     /// message is not shown, ADR-IOS-111 item 3), and the answer carries the
     /// UIDNEXT of the same SELECT (nil when not reported): the catch-up's upper
-    /// bound for a folder with no change bookmark (#1062). It also carries that
-    /// SELECT's EXISTS, which with UIDNEXT sizes the next range.
+    /// bound for a folder with no change bookmark (#1062).
     func listFlagsInUIDRange(
         folder: String, from: Int, to: Int
-    ) async throws -> (flags: [UInt32: (isRead: Bool, isFlagged: Bool, isDeleted: Bool)], uidValidity: UInt32, uidNext: UInt32?, exists: Int) {
-        guard from >= 1, to >= from else { return ([:], 0, nil, 0) }
+    ) async throws -> (flags: [UInt32: (isRead: Bool, isFlagged: Bool, isDeleted: Bool)], uidValidity: UInt32, uidNext: UInt32?) {
+        guard from >= 1, to >= from else { return ([:], 0, nil) }
         try Task.checkCancellation()
         return try await withFolderConnection(folder: folder) { server in
             let selection = try await selectMailboxTracked(server, folder: folder)
@@ -7484,7 +7485,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 flags[uid.value] = (info.flags.contains(.seen), info.flags.contains(.flagged), info.flags.contains(.deleted))
             }
             let uidNext = selection.uidNext.value
-            return (flags, selection.uidValidity.value, uidNext != 0 ? uidNext : nil, selection.messageCount)
+            return (flags, selection.uidValidity.value, uidNext != 0 ? uidNext : nil)
         }
     }
 

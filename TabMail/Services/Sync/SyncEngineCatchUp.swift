@@ -224,11 +224,11 @@ extension SyncEngine {
     /// timed out), whatever progress that call made: the request may still hold
     /// the folder's connection until its late answer. Later slices of the run
     /// leave the folder out and go on with the others: the run takes another
-    /// slice when a folder still asked made progress, or when the slice left a
-    /// folder out that was not left out before (at most one slice per folder per
-    /// run, each with its window and request cap). The left-out folder's own
-    /// progress never keeps the run going, so the run ends once only left-out
-    /// folders have work. The set lives in this run's memory alone. The state the
+    /// slice when any folder the slice asked made progress, or when the slice
+    /// added a folder to the left-out set (at most one slice per folder per run,
+    /// each with its window and request cap). A left-out folder is never asked
+    /// again, so the run ends once only left-out folders have work. The set lives
+    /// in this run's memory alone. The state the
     /// folder's call saved is kept, and its
     /// next call, in a later run, asks at most the capped width. Other callers that
     /// reach the folder meanwhile (the worker's next cycle, the walk) are the
@@ -241,6 +241,11 @@ extension SyncEngine {
     /// from such a folder ends the run": a timeout spends its slice, so the run
     /// ended whenever the timed-out folder came first in it, and the other folders
     /// waited for the next run.
+    /// *Superseded (#1062):* "the run takes another slice when a folder still
+    /// asked made progress, or when the slice left a folder out that was not left
+    /// out before. The left-out folder's own progress never keeps the run going":
+    /// a slice asks only folders outside the set, so a progressed folder it left
+    /// out is one it added, and that distinction never decided anything.
     ///
     /// The request rate: a slice sends at most `run.sliceMaxRequests`, and opens a
     /// window of `run.intervalSeconds` (real time) in `catchUpSliceWindowEnds`; no
@@ -289,11 +294,13 @@ extension SyncEngine {
             case .ran(let ran):
                 madeProgress = madeProgress || ran.progressed
                 // A request that may still be in flight holds its folder's
-                // connection: the folder is left out of the rest of the run, and
-                // its progress does not keep the run going (#1062). A slice that
-                // added a folder to the set takes another slice, so the folders
-                // still asked go on even when the left-out folder's call was the
-                // slice's only progress (a timeout spends its slice). The set only
+                // connection: the folder is left out of the rest of the run
+                // (#1062). The run takes another slice when any folder the slice
+                // asked made progress, or when the slice added a folder to the
+                // set. The slice asks only folders outside the set, so a slice
+                // whose only progress came from a folder it left out goes on
+                // because it added that folder (a timeout spends its slice, and
+                // the folders still asked go on in the next one). The set only
                 // grows and its folders are never asked again, so that adds at
                 // most one slice per folder to the run, each with its own window
                 // and request cap. A slice with no folder left to ask, or whose
@@ -301,10 +308,13 @@ extension SyncEngine {
                 // *Superseded (#1062):* the run took another slice only when a
                 // folder still asked progressed, so it ended whenever the
                 // timed-out folder came first in its slice.
+                // *Superseded (#1062):* "its progress does not keep the run
+                // going", with the set subtracted from the slice's progressed
+                // folders: that never decided anything, since a progressed folder
+                // the slice left out is one it added.
                 let addedInFlight = !ran.inFlightFolderIds.isSubset(of: inFlight)
                 inFlight.formUnion(ran.inFlightFolderIds)
-                let progressedStillAsked = !ran.progressedFolderIds.subtracting(inFlight).isEmpty
-                guard progressedStillAsked || addedInFlight, run.deadline != nil else { break runLoop }
+                guard !ran.progressedFolderIds.isEmpty || addedInFlight, run.deadline != nil else { break runLoop }
             }
         }
         return madeProgress

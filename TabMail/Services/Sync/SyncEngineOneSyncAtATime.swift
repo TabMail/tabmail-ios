@@ -68,11 +68,13 @@ extension SyncEngine {
         try await dbPool.read { db in try Account.fetchOne(db, key: accountId) }
     }
 
-    /// How many passes wait for the account's turn now (tests: to know a
-    /// caller is queued before acting).
-    func syncPassWaiterCount(accountId: String) -> Int {
+    #if DEBUG
+    /// Test-only seam: how many passes wait for the account's turn now, so a
+    /// test knows a caller is queued before acting. Compiled out of Release.
+    func syncPassWaiterCountForTesting(accountId: String) -> Int {
         syncPassWaiters[accountId]?.count ?? 0
     }
+    #endif
 
     /// Ends a pass: the oldest waiter takes the turn, or the account is free.
     private func handOverSyncPass(accountId: String) {
