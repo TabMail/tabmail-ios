@@ -15,7 +15,8 @@ import Testing
 /// range is held locally exactly once, under the server's UID. Driven end to end
 /// against `FakeIMAPServer` (wire oracle on). Every message is dated two years
 /// ago: UID and date are decorrelated, so no date reach may be what finds it.
-@Suite("IMAP missing messages are found by UID", .serialized, .processGlobalState)
+@Suite("IMAP missing messages are found by UID", .serialized, .processGlobalState,
+       .timeLimit(IMAPMissingByUIDTests.testTimeLimit))
 struct IMAPMissingByUIDTests {
 
     static let epoch = 31
@@ -43,6 +44,10 @@ struct IMAPMissingByUIDTests {
     /// busy simulator, which leaves a listing unfinished that the test assumed
     /// complete.
     static let untimedRequestTimeout: TimeInterval = 60
+
+    /// The wall limit of each test (and each test case): a wait that is never
+    /// resumed fails its test instead of hanging the run.
+    static let testTimeLimit: TimeLimitTrait.Duration = .minutes(5)
 
     static func message(_ uid: Int) -> FakeIMAPServer.Message {
         message(uid, date: TestFixtureDate.rfc2822(daysFromAnchor: -ageInDays - (uid % 7)))
@@ -339,6 +344,10 @@ struct IMAPMissingByUIDTests {
         // completes without them, and a second listing (the folder being owed
         // a check marked after the first one started) loads them and asks
         // the timed-out ranges again at full width.
+        // The body queue is process-wide: an earlier suite's items whose
+        // account has no work queue stay pending forever and would keep
+        // `awaitDrain` waiting. Each world starts from an empty queue.
+        await BackfillBodyQueue.shared.emptyForTesting()
         try await world.workerRun(requestTimeout: untimedRequestTimeout)
         #expect(try world.catchUpState()?.listing == nil,
                 "\(name): setup: the setup catch-up run completed the folder's listing")
