@@ -163,6 +163,22 @@ enum ChatSuggestionConfig {
     static let label = "AI Suggestion"
     /// The line under the ghost.
     static let statusLine = "\(label) · Tap to use"
+    /// The line under the working bubble while the suggestion is written.
+    static let writingLine = "\(label) · Writing"
+    /// The working bubble growing into the ghost, the re-pin scroll in the same transaction.
+    static let fillDuration: Double = 0.3
+    /// Under Reduce Motion the ghost fades in over this as it replaces the working bubble, the only
+    /// motion of the fill (the row's height changes at once). No other insertion fades.
+    static let ghostFadeDuration: Double = 0.2
+    /// The working bubble's dots: each pulses between this opacity and full over the period, the
+    /// next one this much later.
+    static let dotDimOpacity: Double = 0.3
+    static let dotPulsePeriod: Double = 1.2
+    static let dotStagger: Double = 0.2
+    static let dotSize: CGFloat = 6
+    static let dotSpacing: CGFloat = 4
+    /// The dots' frame cap, as the app's other AI indicators (`aiWorkingShimmer`).
+    static let dotFrameInterval: Double = 1.0 / 30
     /// Changes a reply can ask for, shown one at a time as the field's "e.g." line, picked again
     /// each time a chat opens. Content changes only: the text version is already short, so no
     /// style tweaks ("make it shorter").

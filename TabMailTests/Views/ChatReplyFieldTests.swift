@@ -82,6 +82,139 @@ struct ChatReplyFieldTests {
         #expect(ChatReplyField.suggestionText(newest: missingText, usersTurn: false, onlyTo: nil) == nil)
     }
 
+    private static func phase(_ email: MessageHeader, usersTurn: Bool = false, onlyTo: [ChatThread.Person]? = nil,
+                              aiOn: Bool = true, subscribed: Bool = true) -> ChatSuggestionPhase? {
+        ChatReplyField.suggestionPhase(newest: email, usersTurn: usersTurn, onlyTo: onlyTo,
+                                       aiSourceEnabled: aiOn, subscribed: subscribed)
+    }
+
+    @Test("Writing is the inbox row's AI-is-working rule on the newest email: each case")
+    func suggestionPhaseWritingRule() {
+        // Case 1: tagged with no reply processed.
+        var tagged = Self.header("r1")
+        tagged.actionTag = .reply
+        #expect(Self.phase(tagged) == .writing, "tagged with no reply: Writing")
+        // Case 2: untagged in the Inbox with an AI source on.
+        let untagged = Self.header("r2")
+        #expect(untagged.actionTag == nil && untagged.isInInbox)
+        #expect(Self.phase(untagged) == .writing, "untagged in the Inbox with AI on: Writing")
+        #expect(Self.phase(untagged, aiOn: false) == nil, "untagged in the Inbox with AI off: nothing")
+        var elsewhere = Self.header("r3")
+        elsewhere.isInInbox = false
+        #expect(Self.phase(elsewhere) == nil, "untagged and not in the Inbox: nothing")
+        // Filtered: the empty-reply sentinel makes the reply processed.
+        var filtered = Self.header("r4", reply: "")
+        filtered.actionTag = ActionTag.none
+        #expect(Self.phase(filtered) == nil, "filtered: no reply will come, no Writing")
+        // The same predicate the inbox row reads.
+        #expect(AIWorkingRule.isWorking(tagged: true, replyProcessed: false, inInbox: false, aiSourceEnabled: false, subscribed: true))
+        #expect(AIWorkingRule.isWorking(tagged: false, replyProcessed: false, inInbox: true, aiSourceEnabled: true, subscribed: false))
+        #expect(!AIWorkingRule.isWorking(tagged: true, replyProcessed: true, inInbox: true, aiSourceEnabled: true, subscribed: true))
+        #expect(!AIWorkingRule.anyAISourceEnabled(demoHidesAI: true, optedOutAllAI: false, deviceSyncAuto: false, subscribed: true))
+        #expect(!AIWorkingRule.anyAISourceEnabled(demoHidesAI: false, optedOutAllAI: true, deviceSyncAuto: false, subscribed: true))
+        #expect(AIWorkingRule.anyAISourceEnabled(demoHidesAI: false, optedOutAllAI: true, deviceSyncAuto: true, subscribed: true))
+        #expect(!AIWorkingRule.anyAISourceEnabled(demoHidesAI: false, optedOutAllAI: false, deviceSyncAuto: false, subscribed: false))
+        #expect(AIWorkingRule.anyAISourceEnabled(demoHidesAI: false, optedOutAllAI: false, deviceSyncAuto: false, subscribed: true),
+                "the ordinary user: not in a demo, not opted out, Device Sync auto off, subscribed")
+    }
+
+    @Test("The inbox row's thread forms: shimmer while any tagged member awaits its reply, spinner while not every Inbox member is tagged")
+    func rowThreadFormRules() {
+        // Shimmer, thread form: the row passes replyProcessed = !anyMemberStillProcessingReply.
+        for (anyMemberStillProcessingReply, expected) in [(true, true), (false, false)] {
+            #expect(AIWorkingRule.writesReply(tagged: true, replyProcessed: !anyMemberStillProcessingReply, subscribed: true) == expected,
+                    "thread with a member awaiting its reply: \(anyMemberStillProcessingReply)")
+        }
+        #expect(!AIWorkingRule.writesReply(tagged: false, replyProcessed: false, subscribed: true), "untagged thread: no shimmer")
+        #expect(!AIWorkingRule.writesReply(tagged: true, replyProcessed: false, subscribed: false), "not subscribed: no shimmer")
+        // Spinner, thread form: the row passes tagged = allMembersTagged.
+        for (allMembersTagged, expected) in [(true, false), (false, true)] {
+            #expect(AIWorkingRule.classifies(tagged: allMembersTagged, inInbox: true, aiSourceEnabled: true) == expected,
+                    "every Inbox member tagged: \(allMembersTagged)")
+        }
+        #expect(!AIWorkingRule.classifies(tagged: false, inInbox: false, aiSourceEnabled: true), "outside the Inbox: no spinner")
+        #expect(!AIWorkingRule.classifies(tagged: false, inInbox: true, aiSourceEnabled: false), "no AI source: no spinner")
+        // A demo with AI declined hides every AI source, so a seeded untagged row shows no spinner.
+        let demoSource = AIWorkingRule.anyAISourceEnabled(demoHidesAI: true, optedOutAllAI: false, deviceSyncAuto: false, subscribed: true)
+        #expect(!AIWorkingRule.classifies(tagged: false, inInbox: true, aiSourceEnabled: demoSource))
+    }
+
+    @Test("The inbox row reads the one AI-working rule with the thread-form inputs")
+    func rowWorkingRuleWiring() throws {
+        let text = try Self.source("TabMail/Views/Inbox/MessageRowView.swift")
+        #expect(Self.count("AIWorkingRule.anyAISourceEnabled( demoHidesAI: DemoModeStore.shared.hidesAIContent, optedOutAllAI: optOutAllAI, deviceSyncAuto: DeviceSyncService.shared.isAutoEnabled, subscribed: AISubscriptionGate.shared.isActive)", in: text) == 1,
+                "the row's AI source is the shared rule, demo included")
+        #expect(Self.count("AIWorkingRule.classifies(tagged: effectiveTag != nil, inInbox: message.isInInbox, aiSourceEnabled: anyAISourceEnabled)", in: text) == 1,
+                "the single row's spinner")
+        #expect(Self.count("let replyProcessed = threadInfo.map { !$0.anyMemberStillProcessingReply } ?? message.isReplyProcessed", in: text) == 1,
+                "a thread is processed only when no member still awaits its reply")
+        #expect(Self.count("AIWorkingRule.writesReply(tagged: effectiveTag != nil, replyProcessed: replyProcessed, subscribed: AISubscriptionGate.shared.isActive)", in: text) == 1,
+                "the shimmer")
+        #expect(Self.count("AIWorkingRule.classifies(tagged: threadInfo.allMembersTagged, inInbox: message.isInInbox, aiSourceEnabled: anyAISourceEnabled)", in: text) == 1,
+                "the thread spinner")
+        #expect(Self.count("AIWorkingRule.", in: text) == 4, "no inline copy of the rule")
+    }
+
+    @Test("The AI Suggestion's row is the working bubble while the reply is written, then the ghost")
+    func suggestionPhaseWritingThenReady() {
+        var email = Self.header("w1")
+        email.actionTag = .reply
+        #expect(Self.phase(email) == .writing, "tagged with no reply yet: Writing")
+        email.cachedReply = "Hi Alex,\n\nTuesday works."
+        email.replyTextMessage = "Tuesday works"
+        #expect(Self.phase(email) == .ready("Tuesday works"), "the stored reply fills it in")
+
+        // Nothing where the user cannot use a suggestion.
+        var writing = Self.header("w4")
+        writing.actionTag = .reply
+        #expect(Self.phase(writing, usersTurn: true) == nil, "the user's turn")
+        #expect(Self.phase(writing, onlyTo: [Self.david]) == nil, "only some people chosen")
+        #expect(Self.phase(writing, aiOn: false, subscribed: false) == nil, "no plan")
+        var noReply = Self.header("w5", fromAddress: "noreply@example.com")
+        noReply.actionTag = .reply
+        #expect(Self.phase(noReply) == nil, "a no-reply sender")
+    }
+
+    @Test("A new email above a ready ghost puts the row back to Writing, tagged or not yet; only Writing to ready fills in")
+    func suggestionPhaseNewEmailResetsToWriting() {
+        var first = Self.header("n1", minutesAgo: 5, reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        first.actionTag = .reply
+        let shown = Self.phase(first)
+        #expect(shown == .ready("Tuesday works"))
+
+        // The usual arrival: staged before it is tagged.
+        var second = Self.header("n2", inReplyTo: first.rfc822MessageId)
+        let untaggedArrival = Self.phase(second)
+        #expect(untaggedArrival == .writing, "an untagged arrival: Writing at once, no blank row")
+        #expect(!ChatSuggestionPhase.fills(from: shown, to: untaggedArrival), "back to Writing at once, no fill")
+
+        second.actionTag = .reply
+        let afterArrival = Self.phase(second)
+        #expect(afterArrival == .writing, "tagged, still writing")
+        #expect(!ChatSuggestionPhase.fills(from: untaggedArrival, to: afterArrival), "the tag changes nothing")
+
+        second.cachedReply = "Hi Alex,\n\nSee you then."
+        second.replyTextMessage = "See you then"
+        let ready = Self.phase(second)
+        #expect(ready == .ready("See you then"))
+        #expect(ChatSuggestionPhase.fills(from: afterArrival, to: ready), "the working bubble grows into the ghost")
+
+        #expect(!ChatSuggestionPhase.fills(from: nil, to: ready), "a ghost with no working bubble before it shows at once")
+        #expect(!ChatSuggestionPhase.fills(from: .ready("Tuesday works"), to: ready), "a rewrite in place")
+        #expect(!ChatSuggestionPhase.fills(from: .writing, to: nil), "the row going away")
+    }
+
+    @Test("The working bubble's dots pulse between the dim opacity and full")
+    func workingDots() {
+        let period = ChatSuggestionConfig.dotPulsePeriod
+        #expect(abs(ChatSuggestionWorkingBubble.dotOpacity(at: 0) - ChatSuggestionConfig.dotDimOpacity) < 0.0001)
+        #expect(abs(ChatSuggestionWorkingBubble.dotOpacity(at: period / 2) - 1) < 0.0001)
+        #expect(abs(ChatSuggestionWorkingBubble.dotOpacity(at: -period / 4) - ChatSuggestionWorkingBubble.dotOpacity(at: period * 3 / 4)) < 0.0001,
+                "a staggered dot before zero is in range")
+        #expect(ChatSuggestionConfig.writingLine == "AI Suggestion · Writing")
+        #expect(ChatSuggestionWorkingBubble.bubbleId != ChatSuggestionBubble.bubbleId, "its own identifier")
+    }
+
     @Test("The placeholder offers a reply only when the sender takes replies")
     func placeholder() {
         #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).placeholder == "Reply or ask anything")
@@ -415,7 +548,9 @@ struct ChatReplyFieldTests {
         #expect(Self.count("let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty", in: text) == 1)
         #expect(Self.count("guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking, context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }", in: text) == 1,
                 "no suggestion before the thread and accounts load, or while the agent works")
-        #expect(Self.count("ChatReplyField.suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)", in: text) == 1)
+        #expect(Self.count("ChatReplyField.suggestionPhase(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only, aiSourceEnabled: aiSourceEnabled, subscribed: subscribed)", in: text) == 1)
+        #expect(Self.count("let aiSourceEnabled = AIWorkingRule.anyAISourceEnabled( demoHidesAI: DemoModeStore.shared.hidesAIContent, optedOutAllAI: optOutAllAI, deviceSyncAuto: DeviceSyncService.shared.isAutoEnabled, subscribed: subscribed)", in: text) == 1,
+                "the chat reads the inbox row's AI-source rule")
         #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1,
                 "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
@@ -430,11 +565,36 @@ struct ChatReplyFieldTests {
                 "a failed send's Retry and Delete act on its own row")
     }
 
+    @Test("The working bubble grows into the ghost with its re-pin in one animation; every other change shows at once")
+    func suggestionFillWiring() throws {
+        let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        #expect(Self.count(".onChange(of: suggestion, initial: true) { old, new in showSuggestion(new, from: old, proxy: proxy) }", in: text) == 1)
+        let show = try Self.body(of: "private func showSuggestion(_ new: ChatSuggestionPhase?, from old: ChatSuggestionPhase?, proxy: ScrollViewProxy) {", in: text)
+        // Only Writing to ready animates; anything else holds the working bubble only while Writing.
+        #expect(show.hasPrefix(" guard ChatSuggestionPhase.fills(from: old, to: new) else { suggestionGrowPending = new == .writing ghostFadesIn = false return }"),
+                "every other change, opening on a ready suggestion included, shows at once with no working bubble")
+        // The grow and its re-pin in one transaction; under Reduce Motion no height animation, a fade.
+        #expect(Self.count("ghostFadesIn = reduceMotion", in: show) == 1)
+        #expect(Self.count("withAnimation(reduceMotion ? nil : .easeInOut(duration: ChatSuggestionConfig.fillDuration)) { suggestionGrowPending = false if let target = scrollTarget { proxy.scrollTo(target.id, anchor: target.anchor) } }", in: show) == 1)
+        #expect(Self.count("suggestionGrowPending = ", in: text) == 3 && Self.count("ghostFadesIn = ", in: text) == 3, "declared, then written only by showSuggestion")
+        // The row: the ghost whenever ready and no grow is pending; its fade only on the fill; it
+        // leaves with its transaction. The suggestion block is the last row, after the emails.
+        #expect(Self.count("if !suggestionGrowPending, case .ready(let text) = suggestion {", in: text) == 1)
+        #expect(Self.count(".transition(.asymmetric( insertion: ghostFadesIn ? .opacity.animation(.easeInOut(duration: ChatSuggestionConfig.ghostFadeDuration)) : .opacity, removal: .opacity))", in: text) == 1)
+        #expect(Self.count(".animation(.easeInOut(duration: ChatSuggestionConfig.ghostFadeDuration))", in: text) == 1)
+        let rows = try #require(text.range(of: "ForEach(thread.items) { item in"))
+        let unsent = try #require(text.range(of: "ForEach(unsentReplies) { reply in"))
+        let ghost = try #require(text.range(of: "if let newest = thread.newest, let suggestion {"))
+        let bottom = try #require(text.range(of: "Color.clear.frame(height: ChatViewLayout.pillGap).id(Self.bottomId)"))
+        #expect(rows.upperBound < unsent.lowerBound && unsent.upperBound < ghost.lowerBound && ghost.upperBound < bottom.lowerBound,
+                "the AI Suggestion is the last chat row")
+    }
+
     @Test("The ghost is dashed on a faded fill and captioned in one button; the e.g. line hides while dictating; compose's stored edits refresh the chat")
     func suggestionLookWiring() throws {
         let bubble = try Self.source("TabMail/Views/Chat/ChatBubbleView.swift")
         let ghost = try #require(bubble.range(of: "struct ChatSuggestionBubble: View {")
-            .flatMap { start in bubble[start.lowerBound...].range(of: "struct ChatUnsentReplyBubble").map { String(bubble[start.lowerBound..<$0.lowerBound]) } })
+            .flatMap { start in bubble[start.lowerBound...].range(of: "struct ChatSuggestionWorkingBubble").map { String(bubble[start.lowerBound..<$0.lowerBound]) } })
         #expect(Self.count(".stroke(Palette.chatSuggestionStroke, style: StrokeStyle( lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))", in: ghost) == 1, "a dashed outline")
         #expect(Self.count(".fill(Palette.chatSuggestionFill)", in: ghost) == 1, "on a faded fill")
         #expect(Self.count(".foregroundStyle(Palette.chatSuggestionText)", in: ghost) == 1, "dark-blue text")
@@ -446,6 +606,16 @@ struct ChatReplyFieldTests {
         #expect(button.upperBound <= caption.lowerBound && caption.upperBound <= style.lowerBound)
         #expect(Self.count("if pulses { TutorialPulseRing(", in: ghost) == 1, "the tutorial rings it")
         #expect(ChatViewLayout.suggestionDash.count == 2 && ChatViewLayout.suggestionDash.allSatisfy { $0 > 0 }, "the dash is a dash")
+        // The working bubble: the ghost's dashed bubble on its fill, with capped pulsing dots and the Writing line.
+        let working = try #require(bubble.range(of: "struct ChatSuggestionWorkingBubble: View {")
+            .flatMap { start in bubble[start.lowerBound...].range(of: "struct ChatUnsentReplyBubble").map { String(bubble[start.lowerBound..<$0.lowerBound]) } })
+        #expect(Self.count(".stroke(Palette.chatSuggestionStroke, style: StrokeStyle( lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))", in: working) == 1, "the ghost's dashed outline")
+        #expect(Self.count(".fill(Palette.chatSuggestionFill)", in: working) == 1, "on the ghost's fill")
+        #expect(Self.count("TimelineView(.animation(minimumInterval: ChatSuggestionConfig.dotFrameInterval))", in: working) == 1, "dots capped like the other AI indicators")
+        #expect(ChatSuggestionConfig.dotFrameInterval >= 1.0 / 30)
+        #expect(Self.count("ForEach(0..<3, id: \\.self)", in: working) == 1, "three dots")
+        #expect(Self.count("Text(ChatSuggestionConfig.writingLine)", in: working) == 1 && Self.count(".accessibilityIdentifier(Self.bubbleId)", in: working) == 1)
+        #expect(Self.count("Button(", in: working) == 0, "nothing to tap")
 
         let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
         #expect(Self.count("hasTabMailSession && inputText.isEmpty && !isDictating", in: field) == 1,
@@ -783,7 +953,7 @@ struct ChatReplyFieldTests {
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(Self.count("onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
+        #expect(Self.count("onlyTo: replyTarget.only, tutorialMove: tutorialMove(thread),", in: chat) == 1, "the field knows the people chosen")
         // Both reply cards open through the one helper, read as the card opens: Reply All exactly
         // when the reply goes to everyone, and the recipients with it.
         #expect(Self.count("agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))", in: chat) == 1,
