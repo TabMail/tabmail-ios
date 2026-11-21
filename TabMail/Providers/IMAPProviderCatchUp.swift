@@ -265,9 +265,11 @@ extension IMAPProvider {
         let path = folder.path
         var completed = false
         // A request of this call timed out (#1062): the timeout cancelled it,
-        // and SwiftMail closes the session of a cancelled command at once (its
-        // late answer is never read; the pool keeps the connection, and its next
-        // command reconnects), so another request to the folder now would first
+        // and SwiftMail closes the session of a cancelled command that was on
+        // the wire at once (its late answer is never read; the pool keeps the
+        // connection, and its next command reconnects; a request still waiting
+        // for its connection sent nothing and is left out the same way), so
+        // another request to the folder now would first
         // reconnect and log in again on the link that just timed out, and a
         // second timeout there would cap the width for a reason that is not the
         // range's size. So the call asks the folder nothing more (every timeout
@@ -285,15 +287,14 @@ extension IMAPProvider {
 
         // The UID range listed (#1062). Its lower bound is where the range the
         // device holds the folder in starts (the older-mail walk's, as the change
-        // reader takes it); under a storage limit, loads start at the higher of
-        // that and the first local UID, so pruned mail is not loaded again (the
-        // prune deletes lowest UIDs first, so the first local UID is where kept
-        // mail ends, ADR-IOS-006) and rows infinite scroll cached below the walk's
-        // cursor never pull the floor down. A server
+        // reader takes it); under a storage limit, loads start above the prune
+        // cutoff too (THE FLOOR RULE below), so pruned mail is not loaded again,
+        // and rows infinite scroll cached below the walk's cursor never pull the
+        // floor down. A server
         // UID in the range that no local row holds is MISSING and is loaded, from
         // `loadsFrom` up. Before the walk has started, loads start at the lowest
-        // UID a window listing of the folder reached (`CatchUpWindowFloor`; under
-        // a storage limit, the higher of that and the first local UID): new mail
+        // UID a window listing of the folder named (`CatchUpWindowFloor`; under
+        // a storage limit, above the prune cutoff too): new mail
         // beyond the window is a scan's to load, and a scan never waits for the
         // walk's download gates (#1063), while older mail is the walk's, which
         // waits for them. Rows infinite scroll wrote far below the window never
@@ -320,35 +321,33 @@ extension IMAPProvider {
             }
             return attempted(folder, state: state, listing: listing, epoch: epoch, context: context)
         }
-        let floorBeforePrune: Int?
-        if let heldFrom {
-            // Under a storage limit the higher of the walk's start and the first
-            // local UID: rows infinite scroll cached below the cursor never pull
-            // the floor down, and nothing the prune removed loads again (#1062).
-            floorBeforePrune = context.storageLimitInForce ? max(heldFrom, firstLocal ?? heldFrom) : heldFrom
-        } else if let windowFloor = CatchUpWindowFloor.read(folder.catchUpState) {
-            floorBeforePrune = context.storageLimitInForce ? max(windowFloor, firstLocal ?? windowFloor) : windowFloor
-        } else {
-            floorBeforePrune = nil
-        }
-        // Under a storage limit, and above where the prune reached in this epoch
-        // (`CatchUpPruneCutoff`): once infinite scroll caches a row below the
-        // pruned UIDs, the first local UID no longer marks where kept mail ends,
-        // and the pruned UIDs between that row and the kept ones would load again.
-        // The scan floor below still reaches the cached row, so its flags and
-        // removals are still checked (#1062).
-        // *Superseded (#1062):* "the first local UID is where kept mail ends",
-        // so a scroll page after the walk completed reopened the pruned range.
+        // THE FLOOR RULE (#1062). Loads start at the held range's start: the
+        // walk's start once it has started, else the lowest UID a window listing
+        // named in this epoch (`CatchUpWindowFloor`; none: nothing loads). Under a
+        // storage limit, at least one past the prune cutoff of this epoch
+        // (`CatchUpPruneCutoff`), the only record of what was pruned; nothing
+        // else raises it. The first local UID is no evidence of what was pruned:
+        // a scroll page cached below the pruned UIDs sits below it, and so does an
+        // unreadable window UID the window floor names.
+        // *Superseded (#1062):* "under a storage limit, the higher of that and the
+        // first local UID", which reopened the pruned range once a scroll page was
+        // cached below it and kept an unreadable lowest window UID from loading.
+        let floorBeforePrune: Int? = heldFrom ?? CatchUpWindowFloor.read(folder.catchUpState, epoch: Int(epoch))
         let loadsFrom = floorBeforePrune.map { floor in
             guard context.storageLimitInForce,
                   let pruned = CatchUpPruneCutoff.read(folder.catchUpState, epoch: Int(epoch)) else { return floor }
             return max(floor, pruned + 1)
         }
-        // The scan floor is the earlier of the first local row and the load floor:
-        // cached rows below an unfinished walk's cursor (infinite scroll writes them
-        // without moving it) still get their flags and expunges reconciled.
-        // `loadsFrom` stays only the boundary below which nothing is loaded.
-        let lower = [loadsFrom, firstLocal].compactMap { $0 }.min()
+        // The scan floor is the earlier of the first local row and the held
+        // range's start BEFORE the cutoff: cached rows below an unfinished walk's
+        // cursor or below the pruned UIDs (infinite scroll writes them without
+        // moving either) still get their flags and expunges reconciled, also when
+        // no row is local when the call starts. `loadsFrom` stays only the
+        // boundary below which nothing is loaded.
+        // *Superseded (#1062):* "the earlier of the first local row and the load
+        // floor", which let the cutoff raise the scan floor of a folder with no
+        // local row.
+        let lower = [floorBeforePrune, firstLocal].compactMap { $0 }.min()
         let bookmarkUpper = bookmark.flatMap { $0.uidValidity == epoch ? Int($0.uidNext) - 1 : nil }
         // A listing whose first UIDNEXT read reported none keeps that answer for
         // all its calls: it lists up to the last local UID and never reads

@@ -378,6 +378,56 @@ extension SyncEngine {
         return syncable + owed.map(\.id)
     }
 
+    /// The one-time prune cutoff of a folder that has none (`CatchUpPruneCutoff`,
+    /// #1062). Released versions pruned without recording a cutoff, so a folder
+    /// pruned there holds rows whose lowest UID is where its kept mail ends, and
+    /// nothing records it. Under a storage limit, for a UID-windowed provider, a
+    /// folder with a known epoch, local rows and no cutoff in that epoch gets ONE:
+    /// the lower of its first local UID and its window floor in the epoch
+    /// (`CatchUpWindowFloor`), minus one, so nothing pruned there loads again and
+    /// an unreadable lowest window UID still can. From then on only the prune
+    /// moves it. Called by a slice in its turn, before the provider reads, so the
+    /// slice's own read already sees it. A folder whose turnover is pending is
+    /// left alone. A failure is logged and seeds nothing; the next slice tries.
+    func seedCatchUpPruneCutoffs(folderIds: [String]) async {
+        do {
+            let unseeded = try await dbPool.read { db in
+                try folderIds.filter { try Self.catchUpPruneCutoffSeed(folderId: $0, db: db) != nil }
+            }
+            guard !unseeded.isEmpty else { return }
+            try await dbPool.write { db in
+                for folderId in unseeded {
+                    guard let seed = try Self.catchUpPruneCutoffSeed(folderId: folderId, db: db) else { continue }
+                    try Self.recordCatchUpPruneCutoff(folderId: folderId, highest: seed.uid, epoch: seed.epoch, db: db)
+                    if DebugModeManager.isLoggingEnabled() {
+                        BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): prune cutoff seeded at \(seed.uid) (epoch \(seed.epoch))")
+                    }
+                }
+            }
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[CatchUp] prune cutoff seed failed (\(error)) — the next slice tries again")
+            }
+        }
+    }
+
+    /// The cutoff `seedCatchUpPruneCutoffs` writes for the folder now, or nil
+    /// when it writes none (a cutoff in the epoch exists, the epoch is unknown, a
+    /// turnover is pending, or no row is local).
+    nonisolated static func catchUpPruneCutoffSeed(folderId: String, db: Database) throws -> (uid: Int, epoch: Int)? {
+        guard let folder = try Folder.fetchOne(db, key: folderId),
+              folder.uidValidityResetPendingAt == nil,
+              let epoch = knownUidValidity(folder.lastKnownUidValidity),
+              CatchUpPruneCutoff.read(folder.catchUpState, epoch: epoch) == nil,
+              let firstLocal = try Int.fetchOne(db, sql: """
+                  SELECT MIN(CAST(messageId AS INTEGER)) FROM messageHeader
+                  WHERE folderId = ? AND CAST(messageId AS INTEGER) >= 1
+                  """, arguments: [folderId])
+        else { return nil }
+        let windowFloor = CatchUpWindowFloor.read(folder.catchUpState, epoch: epoch) ?? firstLocal
+        return (min(firstLocal, windowFloor) - 1, epoch)
+    }
+
     /// One slice of the catch-up. `folderIds` are the syncable folders, re-read
     /// here so the provider sees their latest STATUS values and epochs. Never
     /// throws: a failure costs this slice. `context` comes from the run's snapshot
@@ -393,6 +443,9 @@ extension SyncEngine {
     @discardableResult
     func runCatchUp(provider: any EmailProvider, folderIds: [String], context: CatchUpContext) async -> CatchUpSliceResult {
         let ids = folderIds
+        if context.storageLimitInForce, provider.staleWindowMode == .uid {
+            await seedCatchUpPruneCutoffs(folderIds: ids)
+        }
         let folders: [Folder]
         do {
             let rows = try await dbPool.read { db in try Folder.filter(keys: ids).fetchAll(db) }
@@ -515,8 +568,11 @@ extension SyncEngine {
     /// transaction, so a turnover between the read and the insert refuses, which
     /// is not landed (C3, #1062). Under a storage limit the provider loads
     /// nothing below where kept mail ends, measured in its own sync order (IMAP:
-    /// the lowest held UID, which the UID-ordered prune keeps a clean floor), so
-    /// this insert keeps every load.
+    /// above the prune cutoff, `CatchUpPruneCutoff`, the only record of what was
+    /// pruned), so this insert keeps every load.
+    /// *Superseded (#1062, in place):* "IMAP: the lowest held UID, which the
+    /// UID-ordered prune keeps a clean floor": a cached scroll page sits below
+    /// the pruned UIDs, so the lowest held UID is no such floor.
     /// *Superseded (#1062):* "a loaded message dated older than the folder's
     /// oldest kept row (`date`, the prune's own order) is not inserted and counts
     /// as done" — on IMAP that date skip downloaded every pruned hole again at
@@ -673,24 +729,24 @@ extension SyncEngine {
         // result carries the count it read, and writing it back would lose the
         // newer mark for good. CASE evaluates lazily: the JSON functions only
         // see valid JSON objects.
-        // The window floor (`CatchUpWindowFloor`) is the window merge's, never the
-        // provider's: read before the write and carried into the new state, so a
-        // catch-up's state write never drops or moves it.
-        let windowFloor = try Int.fetchOne(db, sql: """
-            SELECT CASE WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object'
-                THEN json_extract(catchUpState, '$.' || ?) END FROM folder WHERE id = ?
-            """, arguments: [CatchUpWindowFloor.key, folder.id])
-        // The prune cutoff (`CatchUpPruneCutoff`) is the prune's, carried the same
-        // way, with the epoch it was recorded in.
-        let pruneCutoff = try Row.fetchOne(db, sql: """
-            SELECT json_extract(catchUpState, '$.' || :key || '.uid') AS uid,
-                   json_extract(catchUpState, '$.' || :key || '.epoch') AS epoch
-            FROM folder WHERE id = :id AND json_valid(catchUpState) AND json_type(catchUpState) = 'object'
-            """, arguments: ["key": CatchUpPruneCutoff.key, "id": folder.id])
-            .flatMap { row -> (uid: Int, epoch: Int)? in
-                guard let uid = row["uid"] as Int?, let epoch = row["epoch"] as Int? else { return nil }
-                return (uid, epoch)
-            }
+        // The window floor (`CatchUpWindowFloor`) is the window merge's and the
+        // prune cutoff (`CatchUpPruneCutoff`) the prune's, never the provider's:
+        // each is read before the write and carried into the new state with the
+        // epoch it was stored under (never rebound to another), so a catch-up's
+        // state write never drops or moves them.
+        func storedEpochValue(_ key: String) throws -> (uid: Int, epoch: Int)? {
+            try Row.fetchOne(db, sql: """
+                SELECT json_extract(catchUpState, '$.' || :key || '.uid') AS uid,
+                       json_extract(catchUpState, '$.' || :key || '.epoch') AS epoch
+                FROM folder WHERE id = :id AND json_valid(catchUpState) AND json_type(catchUpState) = 'object'
+                """, arguments: ["key": key, "id": folder.id])
+                .flatMap { row -> (uid: Int, epoch: Int)? in
+                    guard let uid = row["uid"] as Int?, let epoch = row["epoch"] as Int? else { return nil }
+                    return (uid, epoch)
+                }
+        }
+        let windowFloor = try storedEpochValue(CatchUpWindowFloor.key)
+        let pruneCutoff = try storedEpochValue(CatchUpPruneCutoff.key)
         try db.execute(sql: """
             UPDATE folder SET catchUpState = CASE
                 WHEN :new IS NOT NULL AND json_valid(:new) AND json_type(:new) = 'object'
@@ -713,7 +769,7 @@ extension SyncEngine {
                 """, arguments: [CatchUpSkippedLoads.key, folder.id])
         }
         if let windowFloor {
-            try Self.recordCatchUpWindowFloor(folderId: folder.id, lowest: windowFloor, db: db)
+            try Self.recordCatchUpWindowFloor(folderId: folder.id, lowest: windowFloor.uid, epoch: windowFloor.epoch, db: db)
         }
         if let pruneCutoff {
             try Self.recordCatchUpPruneCutoff(folderId: folder.id, highest: pruneCutoff.uid, epoch: pruneCutoff.epoch, db: db)
@@ -743,7 +799,10 @@ extension SyncEngine {
         // A clean owed listing that started before the mark may have passed the
         // message the move left: the lapse is re-marked once, so the next listing
         // starts after the mark and can settle it. An unclean completion re-marks
-        // nothing; it waits for the daily check.
+        // nothing itself; the folder stays owed and is listed again at the daily
+        // check, or sooner when its HIGHESTMODSEQ moves or a mark lands during the
+        // read (`markedDuringRead`, above).
+        // *Superseded (#1062, in place):* "it waits for the daily check".
         let completedUnsettled = changeState.selfHealDue && clean && !startedAfterMark
         if markedDuringRead || completedUnsettled {
             // A mark landed while this read ran, or the owed listing completed

@@ -163,9 +163,11 @@ struct CatchUpFolderResult: Sendable {
     var madeProgress = false
     /// A request of this call may still be in flight (#1062): the provider
     /// stopped waiting for it, and abandoning it ended the folder's session
-    /// (IMAP: the cancelled command closes its connection's session at once),
-    /// so another request to the folder now would first open a new session on
-    /// the link that just timed out. The backfill worker's run never asks this
+    /// (IMAP: a cancelled command that was on the wire closes its connection's
+    /// session at once), so another request to the folder now would first open
+    /// a new session on the link that just timed out. A timeout can also fire
+    /// while the request still waits for a connection (the folder's, or pool
+    /// capacity), before any command is sent; it is reported the same way. The backfill worker's run never asks this
     /// folder again, whatever progress the call made, and goes on with its other
     /// folders (`SyncEngine.runCatchUpRun`). Independent of `madeProgress`: the
     /// state the call saved (a listing that moved, a top it learned) is kept as
@@ -224,40 +226,59 @@ enum CatchUpSkippedLoads {
     static let key = "skippedLoads"
 }
 
-/// The lowest id a window listing of the folder has reached, for a provider that
-/// windows by UID (#1062). The full sync's window merge
-/// (`SyncEngine.recordCatchUpWindowFloor`) keeps it under `key` in the folder's
-/// catch-up state JSON, as the lowest value any window listing in the folder's
-/// current epoch reached; the catch-up apply carries it across its own state
-/// writes, and a turnover clears it with the state. Rows other paths write
-/// (infinite scroll pages by date) never move it. Before the older-mail walk
-/// starts, a catch-up loads missing mail only from here up: new mail beyond the
-/// window is the catch-up's, older mail is the walk's.
+/// The lowest id a window listing of the folder has named, with the epoch it
+/// belongs to, for a provider that windows by UID (#1062). The full sync's window
+/// merge (`SyncEngine.recordCatchUpWindowFloor`) keeps it under `key` in the
+/// folder's catch-up state JSON, only under a known epoch: the lowest value any
+/// window listing named in that epoch (a value of another epoch is replaced).
+/// The catch-up apply carries it across its own state writes, and a turnover
+/// clears it with the state. Rows other paths write (infinite scroll pages by
+/// date) never move it. Before the older-mail walk starts, a catch-up loads
+/// missing mail only from here up: new mail beyond the window is the catch-up's,
+/// older mail is the walk's. Read only when its epoch is the folder's, so a floor
+/// never outlives a renumbering it was not learned under.
+/// *Superseded (#1062):* a bare number with no epoch, which a path that clears
+/// the folder's epoch but keeps its state could carry into the next numbering.
 enum CatchUpWindowFloor {
-    /// The key of the floor in a state's JSON object.
+    /// The key of the floor in a state's JSON object: an object holding `uid`
+    /// and `epoch`.
     static let key = "windowFloor"
 
-    /// The floor recorded in `state`, or nil when none is (no window listing
-    /// recorded one yet, or the state is not a JSON object).
-    static func read(_ state: String?) -> Int? {
+    /// The floor recorded in `state` for `epoch`, or nil when none is (no window
+    /// listing recorded one in that epoch, or the state is not a JSON object).
+    static func read(_ state: String?, epoch: Int) -> Int? {
+        CatchUpEpochValue.read(state, key: key, epoch: epoch)
+    }
+}
+
+/// A UID stored with the epoch it was learned under, as an object `{uid, epoch}`
+/// under one key of a folder's catch-up state JSON (#1062): the shape of every
+/// floor and cutoff the catch-up keeps. A value of another epoch reads as absent.
+enum CatchUpEpochValue {
+    static func read(_ state: String?, key: String, epoch: Int) -> Int? {
         guard let data = state?.data(using: .utf8),
-              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
-        return (object[key] as? NSNumber)?.intValue
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let value = object[key] as? [String: Any],
+              (value["epoch"] as? NSNumber)?.intValue == epoch else { return nil }
+        return (value["uid"] as? NSNumber)?.intValue
     }
 }
 
 /// The highest id the storage prune removed from the folder, with the epoch it
-/// belongs to, for a provider that windows by UID (#1062). The prune
-/// (`SyncEngine.runPruneIfOverBudget`) deletes such a folder lowest UID first
-/// and records it under `key` in the folder's catch-up state JSON, in the
-/// transaction that deletes the rows: the highest value pruned in the folder's
-/// current epoch (a value of another epoch is replaced). The catch-up apply
-/// carries it across its own state writes, and a turnover clears it with the
-/// state. Under a storage limit a catch-up loads nothing at or below it, even
-/// when a row another path wrote (an infinite scroll page by date) sits below
-/// it: the first local UID alone no longer marks where kept mail ends once such
-/// a row is cached, and the pruned UIDs between it and the kept rows would load
-/// again. Read only when its epoch is the folder's.
+/// belongs to, for a provider that windows by UID (#1062). It is the ONLY record
+/// of what was pruned. The prune (`SyncEngine.runPruneIfOverBudget`) deletes such
+/// a folder lowest UID first and records it under `key` in the folder's catch-up
+/// state JSON, in the transaction that deletes the rows, from the rows that
+/// transaction deleted and that belonged to the folder in its current epoch: the
+/// highest value pruned in that epoch (a value of another epoch is replaced).
+/// Once, under a storage limit, a folder with local rows and no cutoff in its
+/// epoch gets one from the catch-up slice (`SyncEngine.seedCatchUpPruneCutoffs`):
+/// released versions pruned without recording it. The catch-up apply carries it
+/// across its own state writes, and a turnover clears it with the state. Under a
+/// storage limit a catch-up loads nothing at or below it; the first local UID is
+/// no evidence of what was pruned (a cached scroll page sits below the pruned
+/// UIDs, an unreadable window UID below the first local one). Read only when its
+/// epoch is the folder's.
 enum CatchUpPruneCutoff {
     /// The key of the cutoff in a state's JSON object: an object holding `uid`
     /// and `epoch`.
@@ -266,11 +287,7 @@ enum CatchUpPruneCutoff {
     /// The cutoff recorded in `state` for `epoch`, or nil when none is (nothing
     /// pruned yet, one of another epoch, or the state is not a JSON object).
     static func read(_ state: String?, epoch: Int) -> Int? {
-        guard let data = state?.data(using: .utf8),
-              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let cutoff = object[key] as? [String: Any],
-              (cutoff["epoch"] as? NSNumber)?.intValue == epoch else { return nil }
-        return (cutoff["uid"] as? NSNumber)?.intValue
+        CatchUpEpochValue.read(state, key: key, epoch: epoch)
     }
 }
 

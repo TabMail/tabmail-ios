@@ -318,20 +318,18 @@ extension SyncEngine {
             """, arguments: [CatchUpLapse.countKey, CatchUpLapse.countKey, folderId])
     }
 
-    /// Record that a window listing of the folder reached UID `lowest`
-    /// (`CatchUpWindowFloor`, #1062): the folder's floor becomes the lower of the
-    /// one it holds and `lowest`. A NULL state, or one that is not a JSON object,
-    /// becomes an object holding only the floor (which a provider reads as "never
-    /// listed"). Called only for a provider that windows by UID, in the window
-    /// merge's own transaction, after the listing's epoch is proven.
-    nonisolated static func recordCatchUpWindowFloor(folderId: String, lowest: Int, db: Database) throws {
-        try db.execute(sql: """
-            UPDATE folder SET catchUpState = CASE
-                WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object' THEN json_set(
-                    catchUpState, '$.' || :key, MIN(COALESCE(json_extract(catchUpState, '$.' || :key), :lowest), :lowest))
-                ELSE json_object(:key, :lowest) END
-            WHERE id = :id
-            """, arguments: ["key": CatchUpWindowFloor.key, "lowest": lowest, "id": folderId])
+    /// Record that a window listing of the folder named UID `lowest` in epoch
+    /// `epoch` (`CatchUpWindowFloor`, #1062): the floor becomes the lower of the
+    /// one it holds for that epoch and `lowest`; one held for another epoch is
+    /// replaced. A NULL state, or one that is not a JSON object, becomes an object
+    /// holding only the floor (which a provider reads as "never listed"). Called
+    /// only for a provider that windows by UID, in the window merge's own
+    /// transaction, with the listing's proven epoch, and by the catch-up apply to
+    /// carry the floor across its state write.
+    /// *Superseded (#1062):* the floor stored as a bare number, with no epoch.
+    nonisolated static func recordCatchUpWindowFloor(folderId: String, lowest: Int, epoch: Int, db: Database) throws {
+        try recordCatchUpEpochValue(
+            key: CatchUpWindowFloor.key, folderId: folderId, uid: lowest, epoch: epoch, keep: "MIN", db: db)
     }
 
     /// Record that the storage prune removed the folder's rows up to UID
@@ -340,19 +338,31 @@ extension SyncEngine {
     /// held for another epoch is replaced. A NULL state, or one that is not a
     /// JSON object, becomes an object holding only the cutoff (which a provider
     /// reads as "never listed"). Called in the transaction that deletes the rows,
-    /// and by the catch-up apply to carry the cutoff across its state write.
+    /// by the catch-up slice's one-time seed, and by the catch-up apply to carry
+    /// the cutoff across its state write.
     nonisolated static func recordCatchUpPruneCutoff(folderId: String, highest: Int, epoch: Int, db: Database) throws {
+        try recordCatchUpEpochValue(
+            key: CatchUpPruneCutoff.key, folderId: folderId, uid: highest, epoch: epoch, keep: "MAX", db: db)
+    }
+
+    /// Writes `{uid, epoch}` under `key` of the folder's catch-up state
+    /// (`CatchUpEpochValue`): within the same epoch the `keep` (MIN or MAX) of the
+    /// stored and new UID, otherwise the new value. `keep` is one of two fixed
+    /// SQL function names, never caller data.
+    private nonisolated static func recordCatchUpEpochValue(
+        key: String, folderId: String, uid: Int, epoch: Int, keep: StaticString, db: Database
+    ) throws {
         try db.execute(sql: """
             UPDATE folder SET catchUpState = CASE
                 WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object' THEN json_set(
                     catchUpState, '$.' || :key, json_object(
                         'uid', CASE WHEN json_extract(catchUpState, '$.' || :key || '.epoch') = :epoch
-                            THEN MAX(COALESCE(json_extract(catchUpState, '$.' || :key || '.uid'), :highest), :highest)
-                            ELSE :highest END,
+                            THEN \(keep)(COALESCE(json_extract(catchUpState, '$.' || :key || '.uid'), :uid), :uid)
+                            ELSE :uid END,
                         'epoch', :epoch))
-                ELSE json_object(:key, json_object('uid', :highest, 'epoch', :epoch)) END
+                ELSE json_object(:key, json_object('uid', :uid, 'epoch', :epoch)) END
             WHERE id = :id
-            """, arguments: ["key": CatchUpPruneCutoff.key, "highest": highest, "epoch": epoch, "id": folderId])
+            """, arguments: ["key": key, "uid": uid, "epoch": epoch, "id": folderId])
     }
 
     /// One record in one folder. Returns false when a shield kept the change back.

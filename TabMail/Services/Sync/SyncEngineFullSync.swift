@@ -1499,13 +1499,16 @@ extension SyncEngine {
                 // lowest UID, and a catch-up before the walk would never load it
                 // once it reads. Only under a known epoch for this response: a
                 // floor from UIDs of unknown numbering could outlive an epoch
-                // change (ADR-IOS-061), so none is written.
+                // change (ADR-IOS-061), so none is written. Stored with that epoch
+                // and read only under it, so a path that clears the folder's epoch
+                // but keeps its state never carries it into another numbering.
                 // *Superseded (#1062):* the floor was the lowest UID of the read
-                // headers, written whatever the response's epoch.
+                // headers, written whatever the response's epoch, with no epoch.
                 let namedUids = messages.compactMap { Int($0.messageId) }
                     + coverage.unmaterialisedIds.compactMap { Int($0) }
-                if sourceBoundEpoch != nil, let lowestNamed = namedUids.min() {
-                    try Self.recordCatchUpWindowFloor(folderId: folderId, lowest: lowestNamed, db: db)
+                if let sourceBoundEpoch, let lowestNamed = namedUids.min() {
+                    try Self.recordCatchUpWindowFloor(
+                        folderId: folderId, lowest: lowestNamed, epoch: sourceBoundEpoch, db: db)
                 }
             }
             // Load pending operation message IDs to avoid undoing optimistic UI.

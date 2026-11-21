@@ -125,27 +125,44 @@ extension SyncEngine {
                     var chunkIds: [String] = []
                     do {
                         try dbPool.write { db in
-                            var highestPrunedUid: Int?
-                            for msg in batch {
-                                guard StorageEstimator.isOverBudget() else { break }
-                                chunkIds.append(msg.id)
-                                try msg.delete(db)
-                                headersRemoved += 1
-                                if let uid = Int(msg.messageId) { highestPrunedUid = max(highestPrunedUid ?? uid, uid) }
-                            }
                             // A folder pruned lowest UID first records where the
                             // prune reached, with the folder's epoch, in this same
                             // transaction (`CatchUpPruneCutoff`, #1062): under a
                             // storage limit the catch-up loads nothing at or below
-                            // it, even after another path caches a lower row. An
-                            // unknown epoch records nothing, so no cutoff outlives
-                            // an epoch change (ADR-IOS-061).
-                            if pruneOrder[account.id] == .uid, let highestPrunedUid,
-                               let epoch = try Self.knownUidValidity(
-                                   Int.fetchOne(db, sql: "SELECT lastKnownUidValidity FROM folder WHERE id = ?",
-                                                arguments: [folder.id])) {
+                            // it, even after another path caches a lower row. Only
+                            // rows THIS transaction deleted count, re-read here
+                            // (the batch was selected before it): still in this
+                            // folder under the same UID, and stamped with the
+                            // folder's epoch both when selected and now, so a row
+                            // a reset or a turnover removed meanwhile, a row an
+                            // optimistic move brought in under its source UID
+                            // (stamp cleared), or a row of another numbering never
+                            // moves it. An unknown epoch records nothing, so no
+                            // cutoff outlives an epoch change (ADR-IOS-061).
+                            var cutoffEpoch: Int?
+                            if pruneOrder[account.id] == .uid {
+                                cutoffEpoch = Self.knownUidValidity(try Int.fetchOne(
+                                    db, sql: "SELECT lastKnownUidValidity FROM folder WHERE id = ?",
+                                    arguments: [folder.id]))
+                            }
+                            var highestPrunedUid: Int?
+                            for msg in batch {
+                                guard StorageEstimator.isOverBudget() else { break }
+                                chunkIds.append(msg.id)
+                                var current: MessageHeader?
+                                if cutoffEpoch != nil { current = try MessageHeader.fetchOne(db, key: msg.id) }
+                                let deleted = try msg.delete(db)
+                                headersRemoved += 1
+                                if deleted, let cutoffEpoch, let current,
+                                   current.folderId == folder.id, current.messageId == msg.messageId,
+                                   current.observedUidValidity == cutoffEpoch, msg.observedUidValidity == cutoffEpoch,
+                                   let uid = Int(current.messageId) {
+                                    highestPrunedUid = max(highestPrunedUid ?? uid, uid)
+                                }
+                            }
+                            if let cutoffEpoch, let highestPrunedUid {
                                 try Self.recordCatchUpPruneCutoff(
-                                    folderId: folder.id, highest: highestPrunedUid, epoch: epoch, db: db)
+                                    folderId: folder.id, highest: highestPrunedUid, epoch: cutoffEpoch, db: db)
                             }
                         }
                     } catch {
