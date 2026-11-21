@@ -385,6 +385,53 @@ struct FolderResetGenerationTests {
         await finish(env)
     }
 
+    /// One sweep on a stable folder (its reset ran before the sweep, so nothing refuses the move),
+    /// archived to the fake server; returns whether the archived copy is read (`\Seen`) there. The
+    /// sweep reads Mark as Read on Archive as the Settings action does, once at its start, and
+    /// `afterRead` runs between its read and its mark-read and move.
+    private func sweepStableFolder(_ env: Env, afterRead: () async -> Void = {}) async throws -> Bool {
+        try await runReset(env)
+        try await expectReseated(env)
+        env.server.expectMutation(rfc822MessageId: Self.replacementRfc)
+        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
+        let swept = await SettingsView.archiveOldMessages(
+            inboxFolderIds: [env.inboxFolderId], archiveCutoff: Date().addingTimeInterval(3600),
+            marksRead: marksRead, afterRead: afterRead)
+        #expect(swept == 1, "fixture: the sweep did not read the old row")
+        try await drainToWire(env)
+        #expect(env.server.wrongMessageViolations().isEmpty)
+        let archived = env.server.snapshotMessagesWithFlags(in: "Archive")
+        #expect(archived.count == 1, "control: the swept email is not in Archive on the server")
+        let seen = archived.map { $0.flags.contains("\\Seen") }
+        return seen == [true]
+    }
+
+    @Test("""
+    "Archive old messages" marks read as Mark as Read on Archive stood when the sweep started: \
+    flipping it once the sweep has read its rows leaves the archived email's read flag on the \
+    wire as captured, and the next sweep uses the new value
+    """, arguments: [true, false])
+    func archiveOldSweepUsesTheSettingCapturedAtItsStart(onAtStart: Bool) async throws {
+        UserDefaults.standard.set(onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+        let first = try makeEnv(accountId: "frg-sweep-flip-\(onAtStart)", shownHasRfc: false)
+        let firstRead = try await sweepStableFolder(first, afterRead: {
+            UserDefaults.standard.set(!onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        })
+        let flipped = AccountManager.markReadOnArchiveDeleteEnabled
+        #expect(flipped == !onAtStart, "control: the setting flipped during the sweep")
+        #expect(firstRead == onAtStart, "the archived email's read flag follows the value captured at the start")
+        await finish(first)
+
+        // `finish` removes the setting; the next sweep starts with the flipped value.
+        UserDefaults.standard.set(!onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+        let next = try makeEnv(accountId: "frg-sweep-next-\(onAtStart)", shownHasRfc: false)
+        let nextRead = try await sweepStableFolder(next)
+        #expect(nextRead == !onAtStart, "the next sweep uses the new value")
+        await finish(next)
+    }
+
     @Test("The sweep reports nil, not 0, when it finds no old row, so Settings keeps its archive prompt")
     func archiveOldSweepWithNothingToArchiveReportsNil() async throws {
         let env = try makeEnv(accountId: "frg-sweep-none")

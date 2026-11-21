@@ -20,7 +20,9 @@ import Testing
 ///     A tap outside the keyboard dismisses it in the chat and its Reply to sheet.
 ///  4. The inbox row shows the text message only with the chat view on; else the snippet.
 ///  5. An email the body writer confirms empty is done: its bubble says so, never "Summarizing".
-@Suite("Chat thread context", .serialized)
+///
+/// `.processGlobalState`: several tests swap `AppDatabase.shared`.
+@Suite("Chat thread context", .serialized, .processGlobalState)
 struct ChatThreadContextTests {
 
     private static func ics(method: String = "REQUEST", start: Bool = true) -> String {
