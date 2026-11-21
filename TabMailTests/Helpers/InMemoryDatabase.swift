@@ -60,6 +60,18 @@ enum TestDatabase {
         return folder
     }
 
+    /// Insert `record` with only the columns the table has at this (older) schema, so a
+    /// migration test can seed a database stopped before a later migration added columns.
+    static func insertAtOldSchema<R: EncodableRecord & TableRecord>(_ record: R, _ db: Database) throws {
+        let table = R.databaseTableName
+        let columns = Set(try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))").map { $0["name"] as String })
+        let values = try record.databaseDictionary.filter { columns.contains($0.key) }
+        let names = values.keys.sorted()
+        try db.execute(
+            sql: "INSERT INTO \(table) (\(names.map { "\"\($0)\"" }.joined(separator: ", "))) VALUES (\(names.map { _ in "?" }.joined(separator: ", ")))",
+            arguments: StatementArguments(names.map { values[$0]! }))
+    }
+
     /// Insert a test message header and return it.
     @discardableResult
     static func insertMessageHeader(

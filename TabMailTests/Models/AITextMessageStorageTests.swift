@@ -202,17 +202,6 @@ struct AITextMessageStorageTests {
         return (pool, dir)
     }
 
-    /// Insert `record` with only the columns the table has at this (older) schema.
-    private static func insertAtOldSchema<R: EncodableRecord & TableRecord>(_ record: R, _ db: Database) throws {
-        let table = R.databaseTableName
-        let columns = Set(try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))").map { $0["name"] as String })
-        let values = try record.databaseDictionary.filter { columns.contains($0.key) }
-        let names = values.keys.sorted()
-        try db.execute(
-            sql: "INSERT INTO \(table) (\(names.map { "\"\($0)\"" }.joined(separator: ", "))) VALUES (\(names.map { _ in "?" }.joined(separator: ", ")))",
-            arguments: StatementArguments(names.map { values[$0]! }))
-    }
-
     private static func header(_ uid: String, folder: String, rfc: String) -> MessageHeader {
         var header = MessageHeader(
             messageId: uid, subject: "Plans", from: "Sender", fromAddress: "sender@example.com",
@@ -239,10 +228,10 @@ struct AITextMessageStorageTests {
         try pool.write { db in
             var account = Account(emailAddress: "acc1@example.com", displayName: "A", provider: .imap)
             account.id = "acc1"
-            try Self.insertAtOldSchema(account, db)
-            try Self.insertAtOldSchema(Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1"), db)
-            try Self.insertAtOldSchema(Self.header("1", folder: "INBOX", rfc: "plans@example.com"), db)
-            try Self.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:plans@example.com", rfc: "plans@example.com", daysAgo: 0), db)
+            try TestDatabase.insertAtOldSchema(account, db)
+            try TestDatabase.insertAtOldSchema(Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1"), db)
+            try TestDatabase.insertAtOldSchema(Self.header("1", folder: "INBOX", rfc: "plans@example.com"), db)
+            try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:plans@example.com", rfc: "plans@example.com", daysAgo: 0), db)
         }
 
         try AppDatabase.runMigrations(on: pool)
@@ -270,12 +259,12 @@ struct AITextMessageStorageTests {
             try account.insert(db)
             try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
             try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1").insert(db)
-            try Self.header("1", folder: "INBOX", rfc: "stayed@example.com").insert(db)
-            try Self.header("2", folder: "Archive", rfc: "moved@example.com").insert(db)
+            try TestDatabase.insertAtOldSchema(Self.header("1", folder: "INBOX", rfc: "stayed@example.com"), db)
+            try TestDatabase.insertAtOldSchema(Self.header("2", folder: "Archive", rfc: "moved@example.com"), db)
             // Written by an older extension, without the Message-ID.
-            try Self.cacheEntry("acc1:INBOX:stayed@example.com", rfc: nil, daysAgo: aged).insert(db)
-            try Self.cacheEntry("acc1:INBOX:moved@example.com", rfc: nil, daysAgo: aged).insert(db)
-            try Self.cacheEntry("acc1:INBOX:gone@example.com", rfc: nil, daysAgo: aged).insert(db)
+            try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:stayed@example.com", rfc: nil, daysAgo: aged), db)
+            try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:moved@example.com", rfc: nil, daysAgo: aged), db)
+            try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:gone@example.com", rfc: nil, daysAgo: aged), db)
         }
 
         try AppDatabase.runMigrations(on: pool)
@@ -326,16 +315,16 @@ struct AITextMessageStorageTests {
             try account.insert(db)
             try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
             for i in 1...headers {
-                try Self.header("\(i)", folder: "INBOX", rfc: "m\(i)@example.com").insert(db)
+                try TestDatabase.insertAtOldSchema(Self.header("\(i)", folder: "INBOX", rfc: "m\(i)@example.com"), db)
             }
             // The first `withoutId` entries were written by an older extension, without the
             // Message-ID; the rest carry it.
             for i in 1...entries {
-                try Self.cacheEntry("acc1:INBOX:m\(i)@example.com", rfc: i <= withoutId ? nil : "m\(i)@example.com", daysAgo: 0).insert(db)
+                try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:m\(i)@example.com", rfc: i <= withoutId ? nil : "m\(i)@example.com", daysAgo: 0), db)
             }
             // Entries without a Message-ID whose email is not on the device.
             for i in 1...gone {
-                try Self.cacheEntry("acc1:INBOX:gone\(i)@example.com", rfc: nil, daysAgo: 0).insert(db)
+                try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:gone\(i)@example.com", rfc: nil, daysAgo: 0), db)
             }
         }
         // Planned on the writer, the connection the migration runs on, right after its ANALYZE

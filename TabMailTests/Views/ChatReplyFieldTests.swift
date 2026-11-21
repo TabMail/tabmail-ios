@@ -707,7 +707,8 @@ struct ChatReplyFieldTests {
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(Self.count("onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
+        // The field itself; the suggestion's rule takes them too (`shownSuggestion`, pinned above).
+        #expect(Self.count("clearCount: fieldClearCount, onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
         // Both reply cards open through the one helper, read as the card opens: Reply All exactly
         // when the reply goes to everyone, and the recipients with it.
         #expect(Self.count("agentCompose = req", in: chat) == 1,

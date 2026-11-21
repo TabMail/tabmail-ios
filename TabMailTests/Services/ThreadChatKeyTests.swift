@@ -129,7 +129,7 @@ struct ThreadChatKeyTests {
         ]
         try pool.write { db in
             try Self.insertAccount(db)
-            for header in headers { try header.insert(db) }
+            for header in headers { try TestDatabase.insertAtOldSchema(header, db) }
             for (index, header) in headers.enumerated() {
                 try Self.turn("m\(index)", session: "msg:\(header.accountId):\(header.stableId)", minutesAgo: 5).insert(db)
             }
@@ -159,8 +159,9 @@ struct ThreadChatKeyTests {
                 try Self.insertAccount(db)
                 for i in 1...headers {
                     let numeric = i % 4 != 0
-                    try Self.header(numeric ? "\(i)" : "api-\(i)", folder: i % 3 == 0 ? "Archive" : "INBOX",
-                                    rfc: "m\(i)@example.com", thread: "t-\(i / 3)", minutesAgo: i).insert(db)
+                    try TestDatabase.insertAtOldSchema(
+                        Self.header(numeric ? "\(i)" : "api-\(i)", folder: i % 3 == 0 ? "Archive" : "INBOX",
+                                    rfc: "m\(i)@example.com", thread: "t-\(i / 3)", minutesAgo: i), db)
                 }
                 for s in 1...sessions {
                     let i = s * (headers / sessions)
