@@ -389,10 +389,14 @@ final class ChatSwipeUITests: XCTestCase {
 
     /// With a reply draft already saved for the email, a tap on the ghost opens the compose card
     /// with its body: the full suggestion (text only the card shows, never the ghost's), never the
-    /// saved draft's words. Opened, checked and closed three times, since a missing body is
-    /// intermittent. On the third open Use Suggestion puts the suggestion in the body, and Close then
-    /// Save leaves the saved draft as it was, beside one draft of the card's own. A screenshot is
-    /// attached when the test ends, pass or fail, and one more just before the tap on Use Suggestion.
+    /// saved draft's words. Opened, checked and closed three times. While tabmail-ios#1124 is open
+    /// the suggestion box is missing from accessibility every time, deterministically: the compose
+    /// scroll view's class swap happens at its first layout update, before the suggestion arrives
+    /// from `loadDraftOrPrepopulate`'s database reads. That is why the expected failure is strict.
+    /// Only when Use Suggestion can be found does the third open tap it, put the suggestion in the
+    /// body, and Close then Save, leaving the saved draft as it was beside one draft of the card's
+    /// own; otherwise every close discards. A screenshot is attached when the test ends, pass or
+    /// fail, and one more just before any tap on Use Suggestion.
     func testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody() {
         let app = launchIntoChatFromSavedDraftFixture()
         addTeardownBlock {
@@ -413,8 +417,11 @@ final class ChatSwipeUITests: XCTestCase {
             XCTAssertTrue(app.buttons["Close"].firstMatch.waitForExistence(timeout: 10), "the card opens (pass \(pass))")
             XCTAssertTrue(app.buttons["Send"].firstMatch.exists, "the card shows Send (pass \(pass))")
             let use = app.buttons["Use Suggestion"]
-            // The suggestion box, Dismiss and Use Suggestion: the only checks the class swap hides.
+            // The suggestion box, Dismiss and Use Suggestion: the checks the class swap hides.
             // Once tabmail-ios#1124 is fixed they pass, and the strict expectation turns this red.
+            // The helper stops at the first failure; an expected one must not end the test, so the
+            // later passes, the discard path, the drag back and the Drafts marker still run.
+            continueAfterFailure = true
             XCTExpectFailure("tabmail-ios#1124: the compose scroll view's class swap hides the AI Suggestion box from accessibility", strict: true) {
                 XCTAssertTrue(use.waitForExistence(timeout: 10), "the card opens and shows Use Suggestion (pass \(pass))")
                 XCTAssertTrue(app.buttons["Dismiss"].exists, "the card shows Dismiss (pass \(pass))")
@@ -423,6 +430,10 @@ final class ChatSwipeUITests: XCTestCase {
                     Self.cardOnlyText, Self.cardOnlyText)).firstMatch
                 XCTAssertTrue(box.exists, "the card shows its suggestion box (pass \(pass))")
             }
+            continueAfterFailure = false
+            // While tabmail-ios#1124 hides the box these two cannot fail: those words could only
+            // appear inside the box. The invariant that the card never shows them rests on the hosted
+            // seam test (ComposeSuggestionPersistTests.cardShowsTheTappedSuggestionNotTheRowsLaterReply).
             XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
                 Self.savedDraftWords, Self.savedDraftWords)).firstMatch.exists, "never the saved draft's words (pass \(pass))")
             XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
