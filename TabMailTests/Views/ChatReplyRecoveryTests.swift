@@ -382,7 +382,7 @@ struct ChatReplyRecoveryTests {
                 try await Self.waitUntil { backend.bodies.count == 1 && ActiveAgentTracker.shared.anyWorking }
                 #expect(backend.bodies.count == 1 && ActiveAgentTracker.shared.anyWorking,
                         "control: the request is out and the agent is working")
-                func carrier() -> NSObject? {
+                @MainActor func carrier() -> NSObject? {
                     HostedAccessibility.elements(under: chat.view).first {
                         $0.isAccessibilityElement && HostedAccessibility.identifier(of: $0) != ChatThreadView.replyPillId
                             && ($0.accessibilityCustomActions?.contains { $0.name == name } ?? false)
