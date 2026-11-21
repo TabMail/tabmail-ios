@@ -52,7 +52,9 @@ struct CatchUpSliceResult: Sendable, Equatable {
     var progressedFolderIds: Set<String> = []
     /// The folders whose call left a request that may still be in flight
     /// (`CatchUpFolderResult.requestMayBeInFlight`, #1062), whether or not the
-    /// result was applied: the request may still hold that folder's connection.
+    /// result was applied: abandoning the request ended that folder's session,
+    /// whatever the apply did.
+    /// *Superseded (#1062):* "the request may still hold that folder's connection".
     var inFlightFolderIds: Set<String> = []
     /// An applied folder result made progress.
     var progressed: Bool { !progressedFolderIds.isEmpty }
@@ -221,8 +223,11 @@ extension SyncEngine {
     /// the next cycle, not at network rate. The run never asks a folder again after
     /// its call left a request that may still be in flight
     /// (`CatchUpFolderResult.requestMayBeInFlight`, #1062; IMAP: a request that
-    /// timed out), whatever progress that call made: the request may still hold
-    /// the folder's connection until its late answer. Later slices of the run
+    /// timed out), whatever progress that call made: abandoning the request
+    /// ended the folder's session (a cancelled IMAP command closes it at once),
+    /// so another request to the folder in this run would first log in again on
+    /// the link that just timed out, and a second timeout there would cap the
+    /// width for a reason that is not the range's size. Later slices of the run
     /// leave the folder out and go on with the others: the run takes another
     /// slice when any folder the slice asked made progress, or when the slice
     /// added a folder to the left-out set (at most one slice per folder per run,
@@ -236,6 +241,9 @@ extension SyncEngine {
     /// returns nothing, and the run stops after one slice. True when a slice's
     /// applied result made progress, a folder left out afterwards included (the
     /// worker's `didWork`).
+    /// *Superseded (#1062):* "the request may still hold the folder's connection
+    /// until its late answer": nothing waits for the late answer, which is never
+    /// read.
     /// *Superseded (#1062):* "only the progress of folders still asked decides
     /// whether the run takes another slice, so a slice whose only progress came
     /// from such a folder ends the run": a timeout spends its slice, so the run
@@ -293,8 +301,8 @@ extension SyncEngine {
                 break runLoop
             case .ran(let ran):
                 madeProgress = madeProgress || ran.progressed
-                // A request that may still be in flight holds its folder's
-                // connection: the folder is left out of the rest of the run
+                // Abandoning a request that may still be in flight ended its
+                // folder's session: the folder is left out of the rest of the run
                 // (#1062). The run takes another slice when any folder the slice
                 // asked made progress, or when the slice added a folder to the
                 // set. The slice asks only folders outside the set, so a slice
@@ -305,6 +313,8 @@ extension SyncEngine {
                 // most one slice per folder to the run, each with its own window
                 // and request cap. A slice with no folder left to ask, or whose
                 // folders made no progress and added none, ends the run.
+                // *Superseded (#1062):* "holds its folder's connection": a
+                // cancelled request closes its session at once.
                 // *Superseded (#1062):* the run took another slice only when a
                 // folder still asked progressed, so it ended whenever the
                 // timed-out folder came first in its slice.
@@ -391,7 +401,8 @@ extension SyncEngine {
                 result, windowMode: windowMode, readStartedAt: readStartedAt,
                 selfHealOwedAtRead: owedAtRead[result.folderId])
             if result.madeProgress, case .applied = outcome { slice.progressedFolderIds.insert(result.folderId) }
-            // Whatever the apply did: the request may still hold the connection.
+            // Whatever the apply did: abandoning the request ended the folder's
+            // session. *Superseded (#1062):* "the request may still hold the connection".
             if result.requestMayBeInFlight { slice.inFlightFolderIds.insert(result.folderId) }
         }
         return slice

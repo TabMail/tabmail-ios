@@ -110,13 +110,17 @@ extension IMAPMissingByUIDTests {
                 sourceLocation: sourceLocation)
     }
 
-    /// Once the run has returned, answer the request it held past its timeout
-    /// (`release`) and wait for that late answer: a UIDNEXT read of the test's
-    /// own needs the connection of `mailbox`, so it returns only once the
-    /// connection is free again. The release, not a sleep, frees it. Then no
-    /// request of the run goes to `mailbox` after the one that timed out
-    /// (`timedOut`): a request the run had queued behind the held one would go
-    /// out now. Nothing is timed.
+    /// Once the run has returned, let the request it gave up answer (`release`)
+    /// and read the UIDNEXT of `mailbox` through the provider, as the folder's
+    /// next caller would: the timeout closed the held request's session, so the
+    /// read logs in again and is answered, and the folder is not left blocked.
+    /// Then no request of the run went to `mailbox` after the one that timed
+    /// out (`timedOut`); the read's own selection is left out (`asking`).
+    /// Nothing is timed.
+    /// *Superseded (#1062):* "wait for that late answer: a UIDNEXT read of the
+    /// test's own needs the connection of `mailbox`, so it returns only once
+    /// the connection is free again. The release, not a sleep, frees it": the
+    /// timeout freed the connection, and the late answer is never read.
     @MainActor
     static func answerAfterTheRun(_ w: World, mailbox: String = path, timedOut: Int, release: () -> Void,
                                   sourceLocation: SourceLocation = #_sourceLocation) async throws {
@@ -124,7 +128,7 @@ extension IMAPMissingByUIDTests {
         _ = try await w.provider.getUidNextWithEpoch(folder: mailbox)
         let afterAnswer = asking(requests(to: mailbox, w.server, from: timedOut + 1))
         #expect(afterAnswer.isEmpty,
-                "#1062: no request of the run went to \(mailbox) once the late answer freed its connection: \(afterAnswer)",
+                "#1062: no request of the run went to \(mailbox) after the one that timed out: \(afterAnswer)",
                 sourceLocation: sourceLocation)
     }
 
@@ -598,10 +602,13 @@ extension IMAPMissingByUIDTests {
         return (slice, budget - context.requestsLeft)
     }
 
-    /// Answer the request a test held past its timeout, and wait for that late
-    /// answer: a UIDNEXT read of the test's own needs the folder's connection,
-    /// which the late request holds until it is answered, so the read returns
-    /// only once the connection is free again. Nothing is timed.
+    /// Let the request a test held past its timeout answer, and read the
+    /// folder's UIDNEXT through the provider, as its next caller would: the
+    /// timeout closed the held request's session, so the read logs in again
+    /// and is answered, and the folder is not left blocked. Nothing is timed.
+    /// *Superseded (#1062):* "and wait for that late answer: a UIDNEXT read of
+    /// the test's own needs the folder's connection, which the late request
+    /// holds until it is answered": the late answer is never read.
     @MainActor
     static func answerHeldRequest(_ w: World, holding fragment: String) async throws {
         w.server.releaseHeldCommand(containing: fragment)
@@ -623,13 +630,15 @@ extension IMAPMissingByUIDTests {
     /// test clock, which stands still), and whose request containing `fragment`
     /// is held unanswered, so it always times out. The call is charged exactly
     /// `charged` requests (the range's own, up to the one that timed out),
-    /// sends the folder nothing after it, before or after its late answer,
-    /// keeps the width cap, reports the folder in flight, and saves the range
-    /// as passed over. The budget is far from spent (no deadline, the clock
-    /// stands still, `passOverCallRequests`) and the range is not the
-    /// listing's last unless the test says so, so only the end of the call
-    /// stops a further request. The late answer is waited for before the
-    /// caller counts anything again.
+    /// sends the folder nothing after it, before or after the held request is
+    /// let go, keeps the width cap, reports the folder in flight, and saves
+    /// the range as passed over. The budget is far from spent (no deadline,
+    /// the clock stands still, `passOverCallRequests`) and the range is not
+    /// the listing's last unless the test says so, so only the end of the call
+    /// stops a further request. The held request is let go and the folder read
+    /// again (`answerHeldRequest`) before the caller counts anything again.
+    /// *Superseded (#1062):* "before or after its late answer" and "The late
+    /// answer is waited for": the late answer is never read.
     @MainActor
     static func expectPassOverEndsTheCall(_ w: World, range: ClosedRange<Int>, timingOut fragment: String, charged: Int,
                                           clock: CatchUpTestClock,
@@ -654,7 +663,7 @@ extension IMAPMissingByUIDTests {
         #expect(after.isEmpty, "#1062: after a timeout past the hold bound the folder gets no further request in that call: \(after)",
                 sourceLocation: sourceLocation)
         let afterAnswer = asking(requests(to: path, w.server, from: start).filter { $0.index > timedOut.index })
-        #expect(afterAnswer.isEmpty, "#1062: no request of the call went out once the late answer freed the connection: \(afterAnswer)",
+        #expect(afterAnswer.isEmpty, "#1062: no request of the call went out after the held request was let go: \(afterAnswer)",
                 sourceLocation: sourceLocation)
         #expect(call.slice.inFlightFolderIds == [w.folderId],
                 "#1062: the timed-out request is reported in flight: \(call.slice.inFlightFolderIds)", sourceLocation: sourceLocation)
@@ -669,8 +678,9 @@ extension IMAPMissingByUIDTests {
                 "#1062: the listing is saved past the passed-over range: \(listing)", sourceLocation: sourceLocation)
     }
 
-    /// The folder's next call, once the late answer is in: it goes on from
-    /// past the passed-over `range`.
+    /// The folder's next call, after the held request was let go: it goes on
+    /// from past the passed-over `range`.
+    /// *Superseded (#1062):* "once the late answer is in".
     @MainActor
     static func expectNextCallGoesOnPast(_ w: World, _ range: ClosedRange<Int>, clock: CatchUpTestClock,
                                          sourceLocation: SourceLocation = #_sourceLocation) async throws {

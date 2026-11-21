@@ -264,12 +264,19 @@ extension IMAPProvider {
         let timeout = context.requestTimeoutSeconds
         let path = folder.path
         var completed = false
-        // A request of this call timed out (#1062): it may still hold the
-        // folder's connection until its late answer, so the call asks the folder
-        // nothing more (every timeout ends the range loop, a pass-over past the
-        // hold bound included), reports it as in flight
-        // (`CatchUpFolderResult.requestMayBeInFlight`), and the run never asks
-        // this folder again.
+        // A request of this call timed out (#1062): the timeout cancelled it,
+        // and SwiftMail closes the session of a cancelled command at once (its
+        // late answer is never read; the pool keeps the connection, and its next
+        // command reconnects), so another request to the folder now would first
+        // reconnect and log in again on the link that just timed out, and a
+        // second timeout there would cap the width for a reason that is not the
+        // range's size. So the call asks the folder nothing more (every timeout
+        // ends the range loop, a pass-over past the hold bound included),
+        // reports it as in flight (`CatchUpFolderResult.requestMayBeInFlight`),
+        // and the run never asks this folder again.
+        // *Superseded (#1062):* "it may still hold the folder's connection until
+        // its late answer": a cancelled request closes its session at once, and
+        // the pool keeps the connection free for the next request.
         // *Superseded (#1062):* "so the call reports it as in flight [...] and
         // the run never asks this folder again": a proof or load timeout past
         // the hold bound passed the range over and listed the next one in the
@@ -489,14 +496,15 @@ extension IMAPProvider {
                     // A range too slow or too large to answer caps the width
                     // (`Listing.widthCap`) at its own width divided by
                     // `SyncConfig.catchUpWidthCapShrinkFactor`, and the folder stops
-                    // for this call: the timed-out request still holds the folder's
-                    // connection until its late answer, so no retry in the same call
-                    // could work. A timeout is reported as a request that may still
-                    // be in flight (`CatchUpFolderResult.requestMayBeInFlight`): the
-                    // run never asks this folder again after its request timed out,
-                    // whatever progress the call made, and goes on with its other
-                    // folders (`SyncEngine.runCatchUpRun`). The state the call saved
-                    // (a listing that moved, a top it learned) is kept. The cap write
+                    // for this call: a timeout closed the folder connection's
+                    // session, so a retry in the same call would first reconnect and
+                    // log in again on the link that just timed out. A timeout is
+                    // reported as a request that may still be in flight
+                    // (`CatchUpFolderResult.requestMayBeInFlight`): the run never asks
+                    // this folder again after its request timed out, whatever
+                    // progress the call made, and goes on with its other folders
+                    // (`SyncEngine.runCatchUpRun`). The state the call saved (a
+                    // listing that moved, a top it learned) is kept. The cap write
                     // itself is no progress: a call that changed nothing else returns
                     // false (a cap-only change, see `madeProgress` below), while one
                     // that started the listing or answered an earlier range made
@@ -504,9 +512,14 @@ extension IMAPProvider {
                     // call asks from there at most the capped width. A range of one
                     // UID that fails stays unconfirmed: the listing never moves past
                     // it, and the next call asks it again. Another caller (the
-                    // worker's next cycle, the walk) can still reach the folder while
-                    // the late answer is outstanding: that is the connection's own
-                    // issue (#1133), open.
+                    // worker's next cycle, the walk) can still reach the folder soon
+                    // after, and log in again on the same link: that is the
+                    // connection's own issue (#1133), open.
+                    // *Superseded (#1062):* "the timed-out request still holds the
+                    // folder's connection until its late answer, so no retry in the
+                    // same call could work" and "while the late answer is
+                    // outstanding": a timed-out request closes its session at once,
+                    // and nothing waits for its late answer.
                     // *Superseded (#1062):* "is cut by the walk's own rule
                     // (`UIDWalkCursor.halves`) to the half next to where the listing
                     // stands in its direction of travel (upward: the lower half). Its
@@ -746,13 +759,17 @@ extension IMAPProvider {
             }
             listing.loadHeldSince = nil
             listing.nextUid = hi + 1
-            // A request of this range that timed out may still hold the
-            // folder's connection (`requestMayBeInFlight`): past the hold bound
+            // A request of this range that timed out closed the folder
+            // connection's session (`requestMayBeInFlight`): past the hold bound
             // the range is passed over and saved as above, and the folder stops
-            // for this call instead of listing the next range (#1062). Only this
-            // range's own request can have timed out here: every earlier timeout
-            // ended the call. If this range was the listing's last, its next
-            // call completes it at once, with no request, as not clean.
+            // for this call instead of listing the next range, whose request would
+            // first reconnect and log in again on the link that just timed out
+            // (#1062). Only this range's own request can have timed out here:
+            // every earlier timeout ended the call. If this range was the
+            // listing's last, its next call completes it at once, with no
+            // request, as not clean.
+            // *Superseded (#1062):* "may still hold the folder's connection": a
+            // timed-out request closes its session at once.
             if requestTimedOut { break rangeLoop }
         }
 
@@ -822,8 +839,9 @@ extension IMAPProvider {
         var notAsked: [UInt32] = []
         /// Unanswered UIDs whose SEARCH was not asked or failed (a stop).
         var owedSearch: [UInt32] = []
-        /// The failed request that stopped the loads timed out (#1062): it may
-        /// still hold the folder's connection (`CatchUpFolderResult.requestMayBeInFlight`).
+        /// The failed request that stopped the loads timed out (#1062): it closed
+        /// the folder connection's session (`CatchUpFolderResult.requestMayBeInFlight`).
+        /// *Superseded (#1062):* "it may still hold the folder's connection".
         var timedOut = false
     }
 

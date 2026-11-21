@@ -160,13 +160,19 @@ struct CatchUpFolderResult: Sendable {
     /// asked go on.
     var madeProgress = false
     /// A request of this call may still be in flight (#1062): the provider
-    /// stopped waiting for it, but it can hold the folder's connection until its
-    /// late answer, so another request to the folder now would wait behind it or
-    /// force a new session. The backfill worker's run never asks this folder again,
-    /// whatever progress the call made, and goes on with its other folders
-    /// (`SyncEngine.runCatchUpRun`). Independent of `madeProgress`: the state the
-    /// call saved (a listing that moved, a top it learned) is kept as it is. A
-    /// provider whose abandoned requests hold no folder connection leaves it false.
+    /// stopped waiting for it, and abandoning it ended the folder's session
+    /// (IMAP: the cancelled command closes its connection's session at once),
+    /// so another request to the folder now would first open a new session on
+    /// the link that just timed out. The backfill worker's run never asks this
+    /// folder again, whatever progress the call made, and goes on with its other
+    /// folders (`SyncEngine.runCatchUpRun`). Independent of `madeProgress`: the
+    /// state the call saved (a listing that moved, a top it learned) is kept as
+    /// it is. A provider with no per-folder session for an abandoned request to
+    /// end leaves it false.
+    /// *Superseded (#1062):* "it can hold the folder's connection until its late
+    /// answer, so another request to the folder now would wait behind it or
+    /// force a new session" and "a provider whose abandoned requests hold no
+    /// folder connection": nothing waits for the late answer.
     var requestMayBeInFlight = false
     /// Set only in the call in which a listing of the folder completed (#1062):
     /// the lapse count it started at, and whether it was clean. The apply clears

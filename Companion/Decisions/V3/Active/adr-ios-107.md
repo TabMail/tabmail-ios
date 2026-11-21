@@ -159,20 +159,30 @@ The owner's rulings of 2026-11-09:
          rest of the run.* A folder result can report that a request of its call may still be in flight
          (`CatchUpFolderResult.requestMayBeInFlight`, provider-neutral; IMAP sets it when any catch-up
          request of the call times out (the UIDNEXT read, a listing range, a membership proof, an
-         unanswered UID's SEARCH, a header load), because the abandoned request holds the folder's
-         connection until its late answer; Gmail and Outlook requests hold no folder connection and leave
-         it false). The run never asks that folder again: `runCatchUpRun` keeps the folder ids in a set
+         unanswered UID's SEARCH, a header load), because the timeout cancelled the request, and SwiftMail
+         closes the session of a cancelled command at once (no LOGOUT; the late answer is never read; the
+         pool keeps the connection, released as healthy, and its next command reconnects and logs in
+         again); Gmail and Outlook requests have no per-folder session to end and leave it false). The
+         run never asks that folder again: `runCatchUpRun` keeps the folder ids in a set
          in its own memory (gone when the run ends, never persisted, no timer), and later slices do not
          pass them to `runCatchUp`. (*Superseded by the next amendment:* "Only the progress of folders not in
          the set decides another slice, so a slice whose only progress came from such a folder ends the run.")
          `madeProgress` is unchanged, and
          the state that folder's call saved is kept. `runCatchUpRun` still returns true when any applied
          result made progress, that folder's included (the worker's `caughtUp`). Why: a second request
-         to the folder in the same run waits behind the late answer or forces a new session, and a
-         second timeout there halves the width cap for a reason unrelated to width; the other folders'
-         connections are free, so their work goes on. The worker's next cycle and the walk can still
-         reach the folder while the late answer is outstanding: that is the connection layer's issue,
-         #1133, open.
+         to the folder in the same run first reconnects and logs in again on the link that just timed
+         out, and a second timeout there halves the width cap for a reason unrelated to width; the other
+         folders' connections are untouched, so their work goes on. The worker's next cycle and the walk
+         can still reach the folder soon after, and log in again on the same link: that is the
+         connection layer's issue, #1133, open.
+         *Superseded (2026-11-21):* "because the abandoned request holds the folder's connection until
+         its late answer; Gmail and Outlook requests hold no folder connection", "Why: a second request
+         to the folder in the same run waits behind the late answer or forces a new session" and "while
+         the late answer is outstanding". Read against SwiftMail (the pinned revision): a timed-out
+         catch-up request's cancellation closes its connection's socket at once and settles the command
+         with `CancellationError`; `IMAPProvider.withFolderConnection` then releases the connection as
+         healthy (`pooledConnectionUnusable`), so nothing waits for the late answer and nothing keeps the
+         folder blocked; only the new session's login is left. The rule is unchanged.
        - *Amended 2026-11-21 (#1062): the slice that leaves a folder out takes one more slice.* A timeout
          spends its slice (the slice, `catchUpSliceSeconds` 2 s, is shorter than one request's timeout,
          `catchUpRequestTimeoutSeconds` 3 s), so when the timed-out folder came first in its slice the
@@ -1227,8 +1237,9 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     (`UIDWalkCursor.halves`, #1006) to the half next to where the listing stands in
     its direction of travel (the listing runs upward, so the LOWER half; the walk runs downward). That
     half's width is stored in the listing (`IMAPCatchUpState.Listing.rangeWidth`, an optional JSON field,
-    no migration) and the folder stops for the rest of the call: the timed-out request still holds the
-    folder's connection until its late answer, so no retry in the same call. The listing keeps its place
+    no migration) and the folder stops for the rest of the call: a timeout closed the folder
+    connection's session, so a retry in the same call would first log in again on the link that just
+    timed out. The listing keeps its place
     (decision 8); the next call asks from there with the stored width, and every answered range
     re-sizes it from its own count, so the next range need not be the other half. A one-UID range that
     fails stays unconfirmed: the listing never moves past it and the next call asks it again. With no
@@ -1240,6 +1251,11 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     *Superseded in part (2026-11-21):* the cut to a half and the stored half width ("is cut by the walk's
     one splitting rule ... That half's width is stored in the listing ... the next call asks from there
     with the stored width"); see *Timeout, current (2026-11-21)* below.
+    *Superseded (2026-11-21):* the reason "the timed-out request still holds the folder's connection
+    until its late answer, so no retry in the same call" (and "while the timed-out request still held
+    the folder's connection" in the 2026-11-20 note above): a timeout closes the folder connection's
+    session at once, and nothing waits for the late answer (see the 2026-11-21 in-flight amendment under
+    *How many slices*).
   - *Timeout, current (2026-11-21).* A listing range that times out, or whose answer is too large or
     undecodable (`UIDWalkCursor.failureCallsForSmallerRange`), stores ONLY the width cap
     (`IMAPCatchUpState.Listing.widthCap`: its width divided by `SyncConfig.catchUpWidthCapShrinkFactor`),
@@ -1254,8 +1270,8 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     2026-11-21 amendments under *How many slices*). Only a timeout reports it: an answer too large or
     undecodable caps the width and ends the call the same way, but nothing of it is outstanding, so it
     reports no request in flight. The folder's next call, in a later run, asks at most the capped width. A one-UID
-    range that fails stays unconfirmed. Other callers that reach the folder while the late answer is
-    outstanding (the worker's next cycle, the walk) are the connection layer's issue, #1133, open. Why:
+    range that fails stays unconfirmed. Other callers that reach the folder soon after (the worker's next
+    cycle, the walk) log in again on the same link: the connection layer's issue, #1133, open. Why:
     with the shrink factor at 2 the cap (half the width, rounded down) was never wider than the stored
     lower half (rounded up), so the stored half width never set a range; its only effect was that a
     timeout changed the listing and so counted as progress, against the rule that a request that failed
@@ -1267,6 +1283,8 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     folder again at once on the held connection.
     *Superseded (2026-11-21):* "Whatever progress it made, the call reports the folder's request as
     possibly in flight": it read as if a too-large or undecodable answer reported one too.
+    *Superseded (2026-11-21):* "Other callers that reach the folder while the late answer is
+    outstanding": a timeout closes the session at once, so no late answer is outstanding for them.
   - *Every timeout ends the call (2026-11-21, #1062).* Any catch-up request of a call that times out (the
     UIDNEXT read, a listing range, a membership proof, a header load, an unanswered UID's SEARCH) ends the
     folder's call, including a proof, load or SEARCH timeout on a range whose hold is past
@@ -1278,9 +1296,13 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     the next call does exactly that from `nextUid`, as after a budget stop, with the stored width, cap and
     top unchanged and a fresh hold for any UID it holds. `passedOver` stays in the listing, so whichever
     call completes it completes it unclean (an owed folder stays owed); if the passed-over range was the
-    listing's last, the next call completes it at once, with no request. Why: the timed-out request may
-    still hold the folder's connection, and with budget left (a slice whose clock has not run out, or no
-    deadline) the next range's request would wait behind it or reach the next range after its late answer.
+    listing's last, the next call completes it at once, with no request. Why: the timeout closed the
+    folder connection's session, and with budget left (a slice whose clock has not run out, or no
+    deadline) the next range's request would first log in again on the link that just timed out, and a
+    timeout of its listing would cap the width for a reason that is not the range's size.
+    *Superseded (2026-11-21):* the reason "the timed-out request may still hold the folder's connection
+    [...] the next range's request would wait behind it or reach the next range after its late answer":
+    a timeout closes the session at once, and its late answer is never read.
     *Superseded (2026-11-21):* past the hold bound, a proof, load or SEARCH timeout passed the range over
     and the same call listed the next range; only a slice's time budget, shorter than one timeout, usually
     stopped it.
