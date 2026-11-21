@@ -833,8 +833,10 @@ struct ChatThreadView: View {
         NSLog("[cvwb] working bubble fills, re-pin=%d reduceMotion=%d", scrollTarget != nil ? 1 : 0, reduceMotion ? 1 : 0)
         #endif
         ghostFadesIn = reduceMotion
-        // At rebase onto the reply field's arrival change (its own re-pin inside `withAnimation`
-        // for an arriving email), fold both re-pins into one helper and re-check this fill.
+        // An arriving email in a landed chat is not a fill: the ghost's swap back to the working
+        // bubble cross-fades inside the arrival's rise (at once under Reduce Motion), and this function only sets its flags
+        // (`suggestionGrowPending`, `ghostFadesIn`) in the guard above. The two re-pins fire on different triggers (the newest email's id
+        // for the arrival, Writing to ready here), so they stay separate.
         withAnimation(reduceMotion ? nil : .easeInOut(duration: ChatSuggestionConfig.fillDuration)) {
             suggestionGrowPending = false
             if let target = scrollTarget { proxy.scrollTo(target.id, anchor: target.anchor) }

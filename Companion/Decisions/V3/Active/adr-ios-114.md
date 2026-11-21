@@ -973,6 +973,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    bubble before it still shows at once: the working bubble is held only while a grow is pending, so
    opening on a ready suggestion never shows it, and the ghost's removal always follows its
    transaction. The dots cap at 30 fps. The arrival rise of the new email is not built here (it is decision 21).
+   On an arrival in a landed chat (decision 21) the swap back to Writing rides the arrival's rise
+   (at once under Reduce Motion); the fill and its re-pin stay their own, on Writing to ready.
 
    **Writing rule (2026-11-20):** Writing shows when the newest email meets the inbox row's one shared
    predicate, `AIWorkingRule` (tagged with no reply processed, or untagged in the Inbox with an AI
@@ -1018,7 +1020,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    after the field (`.padding(.top, -fieldDragProgress.swell)`), so the field's glass grows upward
    while its measured height, the bar, its inset and the chat stay put; the two paddings read the
    same gesture state and spring back in the same reset transaction, so they cancel through the
-   settle too. *Superseded 2026-11-21 (the compensation below needed three fixes and was deleted
+   settle too. While the field is dragged up, its swollen glass grows over the "Replying only to" line or
+   the no-reply notice above it, and the bar, the chat and its inset stay still, as designed. *Superseded 2026-11-21 (the compensation below needed three fixes and was deleted
    for the padding above):* "from the drag's start until its swell has settled
    (`ChatThreadView.fieldDragSettle`, the pill spring's own `settlingDuration`, so the two cannot
    drift apart) the bar keeps its resting height, so the chat does not move during the swell or the
