@@ -425,7 +425,8 @@ struct ComposeSendReplyTargetTests {
         let snapshot = PendingSendService.ReopenSnapshot(
             id: "outbox-undo-1",
             authority: PendingSendService.RetainedDraftAuthority(
-                draftId: draftId, accountId: "acc1", instanceEpoch: "E1"))
+                draftId: draftId, accountId: "acc1", instanceEpoch: "E1"),
+            returnedToDrafts: true)
         let reopened = UndoReopenCompose.composeView(for: snapshot)
 
         // The user taps Send again. `ComposeView.send` captures the VIEW's mode into
@@ -476,7 +477,8 @@ struct ComposeSendReplyTargetTests {
         let snapshot = PendingSendService.ReopenSnapshot(
             id: "outbox-undo-reply-all",
             authority: PendingSendService.RetainedDraftAuthority(
-                draftId: draftId, accountId: "acc1", instanceEpoch: "E1"))
+                draftId: draftId, accountId: "acc1", instanceEpoch: "E1"),
+            returnedToDrafts: true)
         let reopened = UndoReopenCompose.composeView(for: snapshot)
         #expect(!reopened.isForward)
 
