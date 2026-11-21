@@ -24,6 +24,7 @@ final class MessageDetailViewModel {
     private(set) var messageId: String
     private(set) var message: MessageHeader? {
         didSet {
+            if message?.id != oldValue?.id { dropOpenedFromThreadRows() }
             #if DEBUG
             recordPublicationForTesting(.message)
             #endif
@@ -57,6 +58,30 @@ final class MessageDetailViewModel {
     /// a Message-ID (ADR-IOS-068 D4).
     var chatRows: [MessageHeader] {
         (message.map { [$0] } ?? []) + threadMessages + threadCopies
+    }
+
+    /// The opened email is never also a thread row. A thread load leaves it out
+    /// (`ThreadDetection.related` never returns the email it starts from), but another
+    /// email can become the opened one after the load: a re-resolve finds the email at
+    /// another address (`refetchBody`, `loadBody`, the poll's header recovery), for
+    /// example the All Mail copy of a Gmail email whose Inbox label was removed. That
+    /// row is already one of the rows the load published, so it leaves them the moment
+    /// it is opened: otherwise the email screen shows it twice and a whole-chat action
+    /// lists it twice (`chatRows`). The next thread load, which starts from the new
+    /// opened email, rebuilds the rows. Copies first, so every publication of
+    /// `threadMessages` already sees rows without the opened email.
+    private func dropOpenedFromThreadRows() {
+        guard let openedId = message?.id else { return }
+        if threadCopies.contains(where: { $0.id == openedId }) {
+            threadCopies.removeAll { $0.id == openedId }
+        }
+        if threadMessages.contains(where: { $0.id == openedId }) {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ThreadDebug] opened email \(openedId.prefix(40)) left the thread rows")
+            }
+            threadMessages.removeAll { $0.id == openedId }
+            recomputeThreadSplit()
+        }
     }
 
     /// Guards against concurrent/duplicate `loadBody()` calls.
