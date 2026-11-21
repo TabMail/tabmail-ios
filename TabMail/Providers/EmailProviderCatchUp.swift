@@ -244,6 +244,34 @@ enum CatchUpWindowFloor {
     }
 }
 
+/// The highest id the storage prune removed from the folder, with the epoch it
+/// belongs to, for a provider that windows by UID (#1062). The prune
+/// (`SyncEngine.runPruneIfOverBudget`) deletes such a folder lowest UID first
+/// and records it under `key` in the folder's catch-up state JSON, in the
+/// transaction that deletes the rows: the highest value pruned in the folder's
+/// current epoch (a value of another epoch is replaced). The catch-up apply
+/// carries it across its own state writes, and a turnover clears it with the
+/// state. Under a storage limit a catch-up loads nothing at or below it, even
+/// when a row another path wrote (an infinite scroll page by date) sits below
+/// it: the first local UID alone no longer marks where kept mail ends once such
+/// a row is cached, and the pruned UIDs between it and the kept rows would load
+/// again. Read only when its epoch is the folder's.
+enum CatchUpPruneCutoff {
+    /// The key of the cutoff in a state's JSON object: an object holding `uid`
+    /// and `epoch`.
+    static let key = "pruneCutoff"
+
+    /// The cutoff recorded in `state` for `epoch`, or nil when none is (nothing
+    /// pruned yet, one of another epoch, or the state is not a JSON object).
+    static func read(_ state: String?, epoch: Int) -> Int? {
+        guard let data = state?.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let cutoff = object[key] as? [String: Any],
+              (cutoff["epoch"] as? NSNumber)?.intValue == epoch else { return nil }
+        return (cutoff["uid"] as? NSNumber)?.intValue
+    }
+}
+
 /// The time rules every provider's catch-up shares: when a folder's full check is
 /// due, and the order folders are worked in.
 enum CatchUpSchedule {

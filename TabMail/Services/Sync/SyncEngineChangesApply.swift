@@ -334,6 +334,27 @@ extension SyncEngine {
             """, arguments: ["key": CatchUpWindowFloor.key, "lowest": lowest, "id": folderId])
     }
 
+    /// Record that the storage prune removed the folder's rows up to UID
+    /// `highest` in epoch `epoch` (`CatchUpPruneCutoff`, #1062): the cutoff
+    /// becomes the higher of the one it holds for that epoch and `highest`; one
+    /// held for another epoch is replaced. A NULL state, or one that is not a
+    /// JSON object, becomes an object holding only the cutoff (which a provider
+    /// reads as "never listed"). Called in the transaction that deletes the rows,
+    /// and by the catch-up apply to carry the cutoff across its state write.
+    nonisolated static func recordCatchUpPruneCutoff(folderId: String, highest: Int, epoch: Int, db: Database) throws {
+        try db.execute(sql: """
+            UPDATE folder SET catchUpState = CASE
+                WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object' THEN json_set(
+                    catchUpState, '$.' || :key, json_object(
+                        'uid', CASE WHEN json_extract(catchUpState, '$.' || :key || '.epoch') = :epoch
+                            THEN MAX(COALESCE(json_extract(catchUpState, '$.' || :key || '.uid'), :highest), :highest)
+                            ELSE :highest END,
+                        'epoch', :epoch))
+                ELSE json_object(:key, json_object('uid', :highest, 'epoch', :epoch)) END
+            WHERE id = :id
+            """, arguments: ["key": CatchUpPruneCutoff.key, "highest": highest, "epoch": epoch, "id": folderId])
+    }
+
     /// One record in one folder. Returns false when a shield kept the change back.
     private nonisolated static func applyChangeRecord(
         _ record: ChangeRecord, folder: Folder, addressEpoch: Int?, heldRangeApplies: Bool,

@@ -658,6 +658,17 @@ extension SyncEngine {
             SELECT CASE WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object'
                 THEN json_extract(catchUpState, '$.' || ?) END FROM folder WHERE id = ?
             """, arguments: [CatchUpWindowFloor.key, folder.id])
+        // The prune cutoff (`CatchUpPruneCutoff`) is the prune's, carried the same
+        // way, with the epoch it was recorded in.
+        let pruneCutoff = try Row.fetchOne(db, sql: """
+            SELECT json_extract(catchUpState, '$.' || :key || '.uid') AS uid,
+                   json_extract(catchUpState, '$.' || :key || '.epoch') AS epoch
+            FROM folder WHERE id = :id AND json_valid(catchUpState) AND json_type(catchUpState) = 'object'
+            """, arguments: ["key": CatchUpPruneCutoff.key, "id": folder.id])
+            .flatMap { row -> (uid: Int, epoch: Int)? in
+                guard let uid = row["uid"] as Int?, let epoch = row["epoch"] as Int? else { return nil }
+                return (uid, epoch)
+            }
         try db.execute(sql: """
             UPDATE folder SET catchUpState = CASE
                 WHEN :new IS NOT NULL AND json_valid(:new) AND json_type(:new) = 'object'
@@ -681,6 +692,9 @@ extension SyncEngine {
         }
         if let windowFloor {
             try Self.recordCatchUpWindowFloor(folderId: folder.id, lowest: windowFloor, db: db)
+        }
+        if let pruneCutoff {
+            try Self.recordCatchUpPruneCutoff(folderId: folder.id, highest: pruneCutoff.uid, epoch: pruneCutoff.epoch, db: db)
         }
 
         // A folder owed a check after a move retired without proof

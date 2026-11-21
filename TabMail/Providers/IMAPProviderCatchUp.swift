@@ -320,16 +320,29 @@ extension IMAPProvider {
             }
             return attempted(folder, state: state, listing: listing, epoch: epoch, context: context)
         }
-        let loadsFrom: Int?
+        let floorBeforePrune: Int?
         if let heldFrom {
             // Under a storage limit the higher of the walk's start and the first
             // local UID: rows infinite scroll cached below the cursor never pull
             // the floor down, and nothing the prune removed loads again (#1062).
-            loadsFrom = context.storageLimitInForce ? max(heldFrom, firstLocal ?? heldFrom) : heldFrom
+            floorBeforePrune = context.storageLimitInForce ? max(heldFrom, firstLocal ?? heldFrom) : heldFrom
         } else if let windowFloor = CatchUpWindowFloor.read(folder.catchUpState) {
-            loadsFrom = context.storageLimitInForce ? max(windowFloor, firstLocal ?? windowFloor) : windowFloor
+            floorBeforePrune = context.storageLimitInForce ? max(windowFloor, firstLocal ?? windowFloor) : windowFloor
         } else {
-            loadsFrom = nil
+            floorBeforePrune = nil
+        }
+        // Under a storage limit, and above where the prune reached in this epoch
+        // (`CatchUpPruneCutoff`): once infinite scroll caches a row below the
+        // pruned UIDs, the first local UID no longer marks where kept mail ends,
+        // and the pruned UIDs between that row and the kept ones would load again.
+        // The scan floor below still reaches the cached row, so its flags and
+        // removals are still checked (#1062).
+        // *Superseded (#1062):* "the first local UID is where kept mail ends",
+        // so a scroll page after the walk completed reopened the pruned range.
+        let loadsFrom = floorBeforePrune.map { floor in
+            guard context.storageLimitInForce,
+                  let pruned = CatchUpPruneCutoff.read(folder.catchUpState, epoch: Int(epoch)) else { return floor }
+            return max(floor, pruned + 1)
         }
         // The scan floor is the earlier of the first local row and the load floor:
         // cached rows below an unfinished walk's cursor (infinite scroll writes them

@@ -125,11 +125,27 @@ extension SyncEngine {
                     var chunkIds: [String] = []
                     do {
                         try dbPool.write { db in
+                            var highestPrunedUid: Int?
                             for msg in batch {
                                 guard StorageEstimator.isOverBudget() else { break }
                                 chunkIds.append(msg.id)
                                 try msg.delete(db)
                                 headersRemoved += 1
+                                if let uid = Int(msg.messageId) { highestPrunedUid = max(highestPrunedUid ?? uid, uid) }
+                            }
+                            // A folder pruned lowest UID first records where the
+                            // prune reached, with the folder's epoch, in this same
+                            // transaction (`CatchUpPruneCutoff`, #1062): under a
+                            // storage limit the catch-up loads nothing at or below
+                            // it, even after another path caches a lower row. An
+                            // unknown epoch records nothing, so no cutoff outlives
+                            // an epoch change (ADR-IOS-061).
+                            if pruneOrder[account.id] == .uid, let highestPrunedUid,
+                               let epoch = try Self.knownUidValidity(
+                                   Int.fetchOne(db, sql: "SELECT lastKnownUidValidity FROM folder WHERE id = ?",
+                                                arguments: [folder.id])) {
+                                try Self.recordCatchUpPruneCutoff(
+                                    folderId: folder.id, highest: highestPrunedUid, epoch: epoch, db: db)
                             }
                         }
                     } catch {
