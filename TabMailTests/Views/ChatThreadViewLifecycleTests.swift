@@ -32,9 +32,8 @@ import UIKit
 ///     the outbox (offline it may stay there for long) and once it is sent, until an email from
 ///     someone else arrives; that email's own AI Reply then shows. (The Sending bubble itself:
 ///     `ChatSendingBubbleTests`.)
-///  8. A chat that lands at the bottom under a tall top bar is still at the bottom once the bar
-///     shrinks and settles, the device's order; and one landed at the bottom stays there while
-///     its bottom inset grows and shrinks.
+///  8. A chat that lands at the bottom while its top bar is still tall never shows past its bottom
+///     once the bar settles shorter: not for two frames in a row, and not once settled.
 ///
 /// What was asked is read back from the summary queue; which rows are on screen is read from the
 /// bubbles' accessibility frames (each email has its own subject).
@@ -272,105 +271,83 @@ struct ChatThreadViewLifecycleTests {
         return try #require(last, sourceLocation: sourceLocation)[1]
     }
 
-    /// Where email `index`'s bubble sits in what the user sees (the scroll view less its insets),
-    /// on screen: its top's distance below the visible top, and its middle's below the visible middle.
-    private static func placement(of index: Int, in scroll: UIScrollView) throws -> (top: CGFloat, middle: CGFloat) {
-        let root = try #require(scroll.window?.rootViewController?.view, "the hosting controller's view")
-        let visible = scroll.convert(scroll.bounds, to: nil).inset(by: scroll.adjustedContentInset)
-        let bubble = try #require(bubbleFrames(in: root).first { $0.index == index }?.frame, "email \(index)'s bubble")
-        return (bubble.minY - visible.minY, bubble.midY - visible.midY)
-    }
+    /// Counts, once the chat has landed at its bottom, the frames it shows past that bottom, read
+    /// from a display link on the main run loop. Frames, not time: a stalled main thread draws no
+    /// frame, so a stall can neither hide an offset left past the bottom nor stretch a correction
+    /// made in the next update.
+    @MainActor
+    final class PastTheBottomFrames: NSObject {
+        private var scroll: (@MainActor () -> UIScrollView?)?
+        private var link: CADisplayLink?
+        private var run = 0
+        /// The top inset as the chat landed at its bottom; nil until it has.
+        private(set) var insetAtLanding: CGFloat?
+        /// Frames read since the chat landed at its bottom.
+        private(set) var frames = 0
+        /// The most frames in a row the chat showed past its bottom.
+        private(set) var longestRun = 0
+        var started: Bool { scroll != nil }
 
-    // The held landing follows the settled inset (ADR-IOS-114 decision 9). Once the chat has
-    // settled, a bottom landing cannot show that here: under `defaultScrollAnchor(.bottom)` an
-    // inset change keeps the bottom by itself, so the distance from the bottom never moves. The
-    // Unread line's landing (anchor top) and the opened email's (anchor center) are placements
-    // the platform does not keep, so they move unless the landing is issued again.
+        /// `landedUnder` is the top inset when the caller has already seen the landing, so a
+        /// change made right after it counts from the first frame.
+        func start(on scroll: @escaping @MainActor () -> UIScrollView?, landedUnder inset: CGFloat? = nil) {
+            self.scroll = scroll
+            insetAtLanding = inset
+            let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+            link.add(to: .main, forMode: .common)
+            self.link = link
+        }
 
-    /// The device's order: the top bar is tall as the chat lands and then settles shorter. The
-    /// header's own height is driven (`ChatHeaderTestSeam`): the root controller's
-    /// `additionalSafeAreaInsets.top` grows this scroll view's inset but never shrinks it back
-    /// (memory 036).
-    @Test("A chat that opens at the Unread line under a tall top bar keeps the line at the top once the bar shrinks")
-    func topInsetChangeKeepsTheUnreadLine() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
-        let seam = ChatHeaderTestSeam.shared
-        defer { seam.extraHeight = 0 }
-        let firstUnread = 20
-        // About what the settling top bar takes off after its first pass.
-        let shrink: CGFloat = 400
-        // Tall before the chat opens, so the landing happens under the tall inset.
-        seam.extraHeight = shrink
-        _ = try await open(unreadFrom: firstUnread, openedIndex: Self.length - 1, highlights: false, landsAway: true) { scroll in
-            let lineTop: @MainActor (UIScrollView) throws -> CGFloat = { try Self.placement(of: firstUnread, in: $0).top }
-            let landed = try await Self.settled(scroll, edge: \.top, inset: { _ in true }, measure: lineTop)
-            let tallInset = scroll.adjustedContentInset.top
-            try #require(tallInset > shrink, "control: the chat lands under the tall bar, got inset \(tallInset)")
-            // The Unread line sits just above the first unread email's bubble.
-            try #require(landed >= 0 && landed < shrink / 4, "control: the chat lands at the Unread line, got \(landed)")
-            // The landing is still held: nothing has scrolled by hand or by offset.
-            #expect(!scroll.isDragging && !scroll.isDecelerating && !scroll.isTracking, "control: no scroll began")
-            let contentHeight = scroll.contentSize.height
-            let containerHeight = scroll.bounds.height
+        func stop() {
+            link?.invalidate()
+            link = nil
+        }
 
-            seam.extraHeight = 0
-            let target = tallInset - shrink
-            let shrunk = try await Self.settled(scroll, edge: \.top, inset: { abs($0 - target) < 1 }, measure: lineTop)
-            #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
-                    "control: only the inset changed")
-            #expect(abs(shrunk - landed) < 2, "the Unread line stays at the top once the bar shrinks, moved \(shrunk - landed)")
+        @objc private func tick(_ link: CADisplayLink) {
+            guard let scroll = scroll?() else { return }
+            let below = ChatThreadViewLifecycleTests.below(scroll)
+            if insetAtLanding == nil {
+                guard scroll.contentSize.height > scroll.bounds.height, abs(below) < 2 else { return }
+                insetAtLanding = scroll.adjustedContentInset.top
+            }
+            frames += 1
+            run = below < -2 ? run + 1 : 0
+            longestRun = max(longestRun, run)
         }
     }
 
-    @Test("A chat opened at an email keeps it in the middle while its bottom inset grows and shrinks")
-    func bottomInsetChangeKeepsTheOpenedEmail() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
-        let target = 20
-        // About a keyboard's height, as when the reply field is focused before any scroll.
-        let growth: CGFloat = 300
-        _ = try await open(unreadFrom: nil, openedIndex: target, highlights: true, landsAway: true) { scroll in
-            let controller = try #require(scroll.window?.rootViewController, "the hosting controller")
-            defer { controller.additionalSafeAreaInsets = .zero }
-            let middle: @MainActor (UIScrollView) throws -> CGFloat = { try Self.placement(of: target, in: $0).middle }
-            let landed = try await Self.settled(scroll, edge: \.bottom, inset: { _ in true }, measure: middle)
-            let settledInset = scroll.adjustedContentInset.bottom
-            try #require(abs(landed) < scroll.bounds.height / 4, "control: the chat lands with the opened email in the middle, got \(landed)")
-            // The landing is still held: nothing has scrolled by hand or by offset.
-            #expect(!scroll.isDragging && !scroll.isDecelerating && !scroll.isTracking, "control: no scroll began")
-            let contentHeight = scroll.contentSize.height
-            let containerHeight = scroll.bounds.height
+    // Issue #1122. On a top inset change the platform keeps the offset plus the top inset, so a
+    // top bar that settles shorter after a bottom landing moves the offset past the bottom by the
+    // shrink, until the landing is issued again (in the next update) or a later platform update
+    // happens to clamp it (or never). A check of the settled position cannot tell the two apart;
+    // the frames in between can (memory 036).
 
-            controller.additionalSafeAreaInsets = UIEdgeInsets(top: 0, left: 0, bottom: growth, right: 0)
-            let grown = try await Self.settled(scroll, edge: \.bottom, inset: { $0 > settledInset + growth / 2 }, measure: middle)
-            #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
-                    "control: only the inset changed")
-            #expect(abs(grown - landed) < 2, "the opened email stays in the middle after the inset grows, moved \(grown - landed)")
-
-            controller.additionalSafeAreaInsets = .zero
-            let shrunk = try await Self.settled(scroll, edge: \.bottom, inset: { abs($0 - settledInset) < 1 }, measure: middle)
-            #expect(scroll.contentSize.height == contentHeight && scroll.bounds.height == containerHeight,
-                    "control: only the inset changed")
-            #expect(abs(shrunk - landed) < 2, "the opened email stays in the middle after the inset shrinks, moved \(shrunk - landed)")
-        }
-    }
-
-    /// The device's order for a bottom landing (issue #1122): the top bar is tall in the chat's
-    /// first pass and drops in the next, before the chat has settled.
-    @Test("A chat whose top bar drops right after its first landing ends at the bottom")
-    func topBarDroppingRightAfterTheLandingKeepsTheBottom() async throws {
+    /// The device's order, driven: the top bar is made taller through the header's own height
+    /// (`ChatHeaderTestSeam`; the root controller's `additionalSafeAreaInsets.top` grows this
+    /// scroll view's inset but never shrinks it back, memory 036) and drops in the frame after the
+    /// chat first lands at the bottom under it.
+    @Test("A chat whose top bar drops right after its bottom landing never shows past its bottom")
+    func topBarDroppingRightAfterTheLandingNeverShowsPastTheBottom() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
         let seam = ChatHeaderTestSeam.shared
         defer { seam.extraHeight = 0 }
         let shrink: CGFloat = 400
         seam.extraHeight = shrink
+        let frames = PastTheBottomFrames()
+        defer { frames.stop() }
         let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false, then: { scroll in
-            try #require(seam.extraHeight == 0, "control: the chat first landed at the bottom under the tall bar, which then dropped")
+            try #require(seam.extraHeight == 0 && frames.started,
+                         "control: the chat first landed at the bottom under the tall bar, which then dropped")
             let settledBelow = try await Self.settled(scroll, edge: \.top, inset: { $0 < shrink }, measure: { Self.below($0) })
+            frames.stop()
+            #expect(frames.frames > 10, "control: frames were read from the drop until the chat settled, got \(frames.frames)")
+            #expect(frames.longestRun <= 1, "past the bottom for \(frames.longestRun) frames in a row after the bar dropped")
             #expect(abs(settledBelow) < 2, "at the bottom once the bar has dropped, got \(settledBelow) below the screen")
         }, firstPass: { scroll in
             // The first pass with the chat loaded and at its bottom under the tall bar drops it.
             guard scroll.contentSize.height > scroll.bounds.height, scroll.adjustedContentInset.top > shrink,
                   abs(Self.below(scroll)) < 2 else { return false }
+            frames.start(on: { [weak scroll] in scroll }, landedUnder: scroll.adjustedContentInset.top)
             seam.extraHeight = 0
             return true
         })
@@ -736,17 +713,26 @@ struct ChatThreadViewLifecycleTests {
         let belowScreen: CGFloat
     }
 
+    /// What the frames showed from the chat's bottom landing until it settled.
+    private struct BottomFrames {
+        let frames: Int
+        let longestRunPastTheBottom: Int
+        let insetAtLanding: CGFloat?
+        let settledInset: CGFloat
+    }
+
     private static func textViews(_ view: UIView) -> [UITextView] {
         ((view as? UITextView).map { [$0] } ?? []) + view.subviews.flatMap { textViews($0) }
     }
 
     /// Opens the all-read thread, signed in, with `ready` as the newest email's AI Reply, and reads
-    /// the bottom once the scroll and the field have not moved for a while.
-    private func bottom(ready: String) async throws -> Bottom {
+    /// the bottom once the scroll and the field have not moved for a while, with every frame
+    /// from the bottom landing on.
+    private func bottom(ready: String) async throws -> (settled: Bottom, frames: BottomFrames) {
         try await HostedAccessibility.withAutomation { try await bottomWithAutomation(ready: ready) }
     }
 
-    private func bottomWithAutomation(ready: String) async throws -> Bottom {
+    private func bottomWithAutomation(ready: String) async throws -> (settled: Bottom, frames: BottomFrames) {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         let queue = ActiveAIQueue.shared
@@ -769,7 +755,13 @@ struct ChatThreadViewLifecycleTests {
         }.environment(\.hasTabMailSession, true))
         window.rootViewController = controller
         window.makeKeyAndVisible()
+        let chatScroll: @MainActor () -> UIScrollView? = { [weak controller] in
+            controller.flatMap { Self.scrollViews($0.view).max(by: { $0.contentSize.height < $1.contentSize.height }) }
+        }
+        let recorder = PastTheBottomFrames()
+        recorder.start(on: chatScroll)
         defer {
+            recorder.stop()
             window.isHidden = true
             window.rootViewController = nil
             ChatPillState.shared.removeAllSessions()
@@ -779,7 +771,7 @@ struct ChatThreadViewLifecycleTests {
         var stableFor = 0
         for _ in 0..<120 where stableFor < 6 {
             try await Task.sleep(for: .milliseconds(100))
-            guard let scroll = Self.scrollViews(controller.view).max(by: { $0.contentSize.height < $1.contentSize.height }),
+            guard let scroll = chatScroll(),
                   let field = Self.textViews(controller.view).first(where: { $0.text == ready }),
                   let newestBubble = Self.bubbleFrames(in: controller.view).first(where: { $0.index == Self.length - 1 }) else {
                 stableFor = 0
@@ -792,16 +784,34 @@ struct ChatThreadViewLifecycleTests {
             stableFor = now == last ? stableFor + 1 : 0
             last = now
         }
+        recorder.stop()
         await queue.clearForTesting()
         await queue.setDispatchSuppressedForTesting(false)
         try #require(stableFor >= 6, "the chat and its field settle, got \(String(describing: last))")
-        return try #require(last)
+        let settled = try #require(last)
+        let settledInset = try #require(chatScroll(), "the chat's scroll view").adjustedContentInset.top
+        return (settled, BottomFrames(frames: recorder.frames, longestRunPastTheBottom: recorder.longestRun,
+                                      insetAtLanding: recorder.insetAtLanding, settledInset: settledInset))
+    }
+
+    /// The device's own order, undriven (issue #1122): the chat lands at its bottom under the top
+    /// bar's first, taller layout, and the bar settles shorter after the landing.
+    @Test("A chat that lands at the bottom under its first, taller top bar never shows past its bottom once the bar settles")
+    func firstTallerTopBarNeverShowsPastTheBottom() async throws {
+        let opened = try await bottom(ready: "Sounds good.")
+        let landedUnder = try #require(opened.frames.insetAtLanding, "control: frames saw the chat land at its bottom")
+        #expect(landedUnder - opened.frames.settledInset > 100,
+                "control: the top bar settled shorter after the landing, from \(landedUnder) to \(opened.frames.settledInset)")
+        #expect(opened.frames.frames > 10, "control: frames were read from the landing until the chat settled, got \(opened.frames.frames)")
+        #expect(opened.frames.longestRunPastTheBottom <= 1,
+                "past the bottom for \(opened.frames.longestRunPastTheBottom) frames in a row as the bar settled")
+        #expect(abs(opened.settled.belowScreen) < 2, "at the bottom once settled, got \(opened.settled.belowScreen)")
     }
 
     @Test("At the bottom, the newest bubble stays above the reply field, a six-line ready AI Reply included")
     func newestBubbleClearsATallField() async throws {
-        let short = try await bottom(ready: "Sounds good.")
-        let long = try await bottom(ready: "Thanks for sending the detailed schedule, I can attend the planning session on Tuesday afternoon and will bring the updated budget numbers, the contractor estimates and the notes from our last discussion. I will also check the two open questions with the team beforehand and send the revised agenda by Monday so everyone has time to review it.")
+        let short = try await bottom(ready: "Sounds good.").settled
+        let long = try await bottom(ready: "Thanks for sending the detailed schedule, I can attend the planning session on Tuesday afternoon and will bring the updated budget numbers, the contractor estimates and the notes from our last discussion. I will also check the two open questions with the team beforehand and send the revised agenda by Monday so everyone has time to review it.").settled
         #expect(abs(short.belowScreen) < 2 && abs(long.belowScreen) < 2,
                 "both open at the bottom: \(short.belowScreen), \(long.belowScreen)")
         // What the user sees: the newest bubble ends above the field's text in both chats. The text

@@ -318,8 +318,10 @@ struct ChatThreadView: View {
                 }
                 // The first scroll can be dropped while the screen is still settling (memory 036),
                 // late content (attachment chips, a summary) changes the heights, and the top bar
-                // settles its inset after the first pass: the landing is issued again on every
-                // container, content or inset change until a scroll begins.
+                // settles shorter after the first pass. On a top inset change the platform keeps the
+                // offset plus the top inset, which moves a bottom landing past the bottom by the
+                // shrink (memory 036): the landing is issued again on every container, content or
+                // inset change until a scroll begins.
                 .onScrollGeometryChange(for: [CGFloat].self) { geo in
                     [geo.containerSize.height, geo.contentSize.height, geo.contentInsets.top, geo.contentInsets.bottom]
                 } action: { _, _ in

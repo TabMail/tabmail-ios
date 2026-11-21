@@ -296,9 +296,11 @@ same AI result, kept as long as the email itself is shown.
      builds. In a plain stack `onAppear` fires for every row at once, which is why the per-row ask
      uses `onScrollVisibilityChange` (`onGeometryChange` with `ChatRowVisibility` since 2026-11-16).
    - `defaultScrollAnchor(.bottom)` opens at the newest email. The landing `scrollTo` is issued once
-     the thread is loaded, and again on every container, content or inset change until a scroll of
-     any kind begins (memory 036: a first scroll can be dropped while the screen settles; the top
-     bar settles its inset after the first pass, amended 2026-11-20). The first
+     the thread is loaded, and again on every container size, content size or inset change until
+     a scroll of any kind begins (memory 036: a first scroll can be dropped while the screen
+     settles; the top bar settles shorter after the first pass, and on a top inset change the
+     platform keeps the offset plus the top inset, which moves a bottom landing past the bottom by
+     the shrink; amended 2026-11-20, mechanism measured 2026-11-21). The first
      scroll records the members' unread state itself (`noteMembers`) before choosing where to land:
      SwiftUI runs the thread-loaded and members changes in either order, and the screen tests caught
      the chat opening at the bottom with the Unread line missing.
@@ -313,15 +315,14 @@ same AI result, kept as long as the email itself is shown.
      (`aBodyThatLandsWhileTheChatIsNotLookingShowsItsSummary`, 2026-11-15) an email whose body lands
      while the chat is on screen, after a background return that cancelled and rebuilt the queue,
      while another screen covers the chat, or across a relaunch shows its summary once the chat is
-     shown again; and (2026-11-21) the held landing follows the settled inset:
-     `topInsetChangeKeepsTheUnreadLine` (a chat that lands at the Unread line under a tall top bar
-     keeps the line at the top once the bar alone shrinks; the bar's height is driven through the
-     DEBUG-only `ChatHeaderTestSeam`, memory 036), `bottomInsetChangeKeepsTheOpenedEmail` (a chat
-     opened at an email keeps it in the middle while its bottom inset alone grows and shrinks), and
-     `topBarDroppingRightAfterTheLandingKeepsTheBottom` (the device's order for a bottom landing:
-     the bar is tall in the first pass and drops in the next). A bottom landing cannot show a
-     settled inset change: `defaultScrollAnchor(.bottom)` keeps the bottom by itself, so the first
-     two tests use landings the platform does not keep (memory 036).
+     shown again; and (2026-11-21) a chat that lands at the bottom while its top bar is still tall
+     never shows past its bottom once the bar settles shorter:
+     `firstTallerTopBarNeverShowsPastTheBottom` (the device's own order, undriven) and
+     `topBarDroppingRightAfterTheLandingNeverShowsPastTheBottom` (the bar's height driven through
+     the DEBUG-only `ChatHeaderTestSeam` and dropped right after the landing). Both count display
+     frames from the landing on, and allow no two frames in a row past the bottom. They do not
+     check the settled position: without the re-issue a later platform update clamps the offset
+     back, sometimes, so a settled check passes either way (memory 036).
 
    **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
    In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible
