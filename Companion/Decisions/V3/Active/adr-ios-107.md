@@ -1316,8 +1316,9 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     the next call does exactly that from `nextUid`, as after a budget stop, with the stored width, cap and
     top unchanged and a fresh hold for any UID it holds. `passedOver` stays in the listing, so whichever
     call completes it completes it unclean (an owed folder stays owed); if the passed-over range was the
-    listing's last, the next call completes it at once, with no request. Why: the timeout closed the
-    folder connection's session, and with budget left (a slice whose clock has not run out, or no
+    listing's last, the next call completes it at once, with no request. Why: a timeout on the wire closed the
+    folder connection's session (a timeout while the request still waited for its connection sent
+    nothing, and is treated the same way), and with budget left (a slice whose clock has not run out, or no
     deadline) the next range's request would first log in again on the link that just timed out, and a
     timeout of its listing would cap the width for a reason that is not the range's size.
     *Superseded (2026-11-21):* the reason "the timed-out request may still hold the folder's connection
@@ -1411,9 +1412,20 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
     (`SyncEngine.seedCatchUpPruneCutoffs`): the lower of its first local UID and its window floor, minus
     one; the window-floor term keeps an unreadable lowest window UID loadable. (7) The catch-up apply
     carries both keys with their own epochs; a turnover and a Settings reset clear them with the state.
-    No migration. Why: each round of review found another case where a floor inferred from local rows was
-    wrong (an unreadable window UID, a cached scroll page, a floor kept across a renumbering by the
-    walk's empty-folder recovery, which clears the folder's epoch and keeps its state).
+    No migration. (8) The cutoff is one number per epoch: under a limit everything at or below it is
+    pruned territory, including a UID that was never local (unreadable when its window was listed),
+    because the UID-ordered prune would have deleted that UID first; scroll and search reach it like any
+    pruned mail. (9) The seed is an inference: a date-ordered prune can leave gaps above it, a scroll
+    page cached before the seed lowers it, and a deleted row with no epoch stamp (cached before stamping
+    existed, an optimistic move, an unproven merge) never raises the cutoff; the catch-up loads such
+    mail again at most once, within the limit, as rows stamped with the epoch, which the next UID-ordered
+    prune counts. (10) The walk's empty-folder recovery clears the folder's epoch but keeps its state, so
+    both keys survive it; they are inert there, because they are read only in their own epoch and a
+    write in a new epoch replaces them. Why: a floor inferred from local rows was wrong in three cases:
+    an unreadable window UID below the first local one, a cached scroll page below the pruned UIDs, and a
+    floor kept across a renumbering by the walk's empty-folder recovery.
+    *Superseded (2026-11-21):* "a turnover and a Settings reset clear them with the state" read as every
+    path that detects a renumbering: (10) above is the exception.
     *Superseded (2026-11-21):* the window floor as a bare number with no epoch; "under a storage limit,
     the higher of that and the lowest held UID" in *Load floor before the walk starts, current
     (2026-11-20)* above and "The load floor is the lowest held UID" in *Storage limit* below.

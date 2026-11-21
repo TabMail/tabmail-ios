@@ -13,7 +13,9 @@
 > "its lowest held UID is a clean floor, and the IMAP catch-up loads only above the higher of it and
 > the walk's start" and "the catch-up downloads them once (they sit above the lowest held UID)": a
 > released store's date-holes above the seeded cutoff are downloaded once, as before; holes below it
-> are not.
+> are not. Under a limit everything at or below the cutoff counts as pruned, including a UID that was
+> never local; scroll and search reach it. A deleted row with no epoch stamp does not raise the cutoff,
+> so the catch-up may download it once more, stamped; the next prune counts it.
 >
 > **Current note (2026-11-20, #1062).** The prune deletes each folder oldest-first in that folder's
 > SYNC ORDER, the fetch's ordering dimension (ADR-IOS-042): an IMAP folder loses its LOWEST UIDs
