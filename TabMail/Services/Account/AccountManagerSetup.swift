@@ -685,6 +685,14 @@ extension AccountManager {
 
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
 
+        // An agent compose card still waiting for its screen can no longer open right: the email
+        // it answers is gone, or the chat that asked can never show again. End those requests
+        // (their tools report the removal) and refuse later ones. Not awaited, so this actor
+        // still reaches disconnectAccount's tombstone without suspending.
+        Task { @MainActor in
+            AgentToolRouter.shared.endComposeRequests(ofRemovedAccount: acctId)
+        }
+
         // This actor enters disconnectAccount synchronously: it tombstones the
         // account, removes every runtime route, invalidates OAuth/queue state,
         // and deletes credentials before that method reaches its first await.
