@@ -220,14 +220,15 @@ extension IMAPProvider {
         let bookmark = IMAPChangeCursor.decode(folder.changeCursor)
         let plan = Self.catchUpPlan(
             state: state, freshModSeq: folder.lastKnownHighestModSeq,
-            now: context.clock(), rawLapseCount: CatchUpLapse.read(folder.catchUpState),
+            now: context.clock(),
             // Tracked: a bookmark held AND not owed a check. An owed folder can
             // regain a bookmark from a change pass, and a tracked folder gets no
             // daily check, so an owed folder whose listing completed unclean would
             // never be listed again (#1062). Not `FolderChangeState.tracking`: that
             // flag is off for a bookmarked folder before its baseline commits and
             // can be left on with no bookmark (ADR-IOS-111 decision 4).
-            isTracked: bookmark != nil && !FolderChangeState(raw: folder.changeState).selfHealDue)
+            isTracked: bookmark != nil && !FolderChangeState(raw: folder.changeState).selfHealDue,
+            rawLapseCount: CatchUpLapse.read(folder.catchUpState))
         guard case .list(var listing) = plan else { return nil }
 
         var result = CatchUpFolderResult(folderId: folder.id, epoch: epoch)
