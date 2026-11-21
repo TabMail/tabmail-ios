@@ -172,7 +172,10 @@ struct ComposeSuggestionPersistTests {
     @Test("A card opened with a suggestion shows that one, never the email row's later reply")
     func cardShowsTheTappedSuggestionNotTheRowsLaterReply() throws {
         let tapped = ReplyResult(body: Self.cardSuggestion, textMessage: "Yes, Tuesday works for me.")
-        let later = ReplyResult(body: Self.laterRowReply, textMessage: nil)
+        // A whole stored value (text version and change command too), so a body-only read of the row fails.
+        let later = ReplyResult(
+            body: Self.laterRowReply, textMessage: "Thursday works better for me.",
+            changeCommand: "Make it Thursday instead.")
         var rowRead = false
         let shown = ComposeDraftGuards.suggestionToShow(
             given: tapped, isReply: true,
@@ -183,7 +186,14 @@ struct ComposeSuggestionPersistTests {
             messageBody: "", showingSuggestion: true, currentSuggestion: shown?.body))
         #expect(accepted.messageBody == Self.cardSuggestion, "Use Suggestion uses the tapped suggestion")
 
-        // Control: with nothing handed in, a reply reads the row; a new message never does.
+        // A card that is not a reply (an agent's new email or forward) still shows the value handed in,
+        // and never reads a row.
+        #expect(ComposeDraftGuards.suggestionToShow(
+            given: tapped, isReply: false, freshSuggestion: { rowRead = true; return later }) == tapped,
+                "a new email or forward shows the suggestion it was handed")
+        #expect(!rowRead, "a card that is not a reply never consults a row")
+
+        // Control: with nothing handed in, a reply reads the row's whole value; a new message never does.
         #expect(ComposeDraftGuards.suggestionToShow(
             given: nil, isReply: true, freshSuggestion: { later }) == later)
         #expect(ComposeDraftGuards.suggestionToShow(
