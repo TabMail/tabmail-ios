@@ -389,8 +389,17 @@ final class ChatSwipeUITests: XCTestCase {
 
     /// With a reply draft already saved for the email, a tap on the ghost opens a card that shows
     /// its body and the AI Suggestion, and Use Suggestion puts the suggestion in the body. A
-    /// screenshot of the card is attached whatever the outcome.
+    /// screenshot is attached when the test ends, pass or fail, and one more just before the tap
+    /// on Use Suggestion once the card shows it.
     func testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody() {
+        // The card's recipient field may ask for contacts access: allow it and go on.
+        addUIInterruptionMonitor(withDescription: "Contacts access") { alert in
+            for title in ["Allow", "Allow Full Access", "OK"] where alert.buttons[title].exists {
+                alert.buttons[title].tap()
+                return true
+            }
+            return false
+        }
         let app = launchIntoChat(savedDraft: true)
         addTeardownBlock {
             let shot = XCTAttachment(screenshot: app.screenshot())
@@ -404,12 +413,17 @@ final class ChatSwipeUITests: XCTestCase {
         let use = app.buttons["Use Suggestion"]
         XCTAssertTrue(use.waitForExistence(timeout: 10), "the card shows Use Suggestion")
         XCTAssertTrue(use.isHittable, "Use Suggestion can be tapped")
+        // The full reply's closing line: only the card shows it, never the ghost's text message.
         let body = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
-            Self.suggestion, Self.suggestion)).firstMatch
-        XCTAssertTrue(body.waitForExistence(timeout: 5), "the card's body area shows the suggestion")
+            Self.cardOnlyText, Self.cardOnlyText)).firstMatch
+        XCTAssertTrue(body.waitForExistence(timeout: 5), "the card's body area shows the full suggestion")
         XCTAssertTrue(body.isHittable, "the card's body area is on screen")
         XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
             Self.savedDraftWords, Self.savedDraftWords)).firstMatch.exists, "never the saved draft's words")
+        let before = XCTAttachment(screenshot: app.screenshot())
+        before.name = "saved-draft-ghost-card-before-use"
+        before.lifetime = .keepAlways
+        add(before)
         use.tap()
         let editor = app.textViews.matching(NSPredicate(format: "value CONTAINS %@", Self.suggestion)).firstMatch
         XCTAssertTrue(editor.waitForExistence(timeout: 5), "Use Suggestion puts the suggestion in the body")
@@ -419,6 +433,8 @@ final class ChatSwipeUITests: XCTestCase {
     /// The fixture's AI Suggestion and saved draft (`ChatSwipeTestScene`).
     private static let suggestion = "Sounds good, see you Tuesday."
     private static let savedDraftWords = "My own words, not sent yet"
+    /// The full reply's closing line, which the card's suggestion box shows and the ghost does not.
+    private static let cardOnlyText = "Thanks."
 
     func testOpenActionsTapOnAnotherBubbleClosesAndDropsTheKeyboard() {
         let app = launchIntoChat()

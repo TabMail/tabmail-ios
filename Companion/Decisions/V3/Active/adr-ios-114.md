@@ -907,8 +907,7 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      full-screen cover's transition was still running (`isBeingPresented` and a transition
      coordinator were both still set), so it was not a "presentation finished" signal. The saved-draft
      test's missing card body, which motivated the hold, was not a timing issue either: with the
-     bubble inserted only after the signal, the card's scroll content (bubble, editor, quoted
-     original) was still absent from the hosted view tree. The question moved to a UI test in the
+     bubble inserted only after the signal, the card's scroll content (bubble and editor) was still absent from the hosted view tree. The question moved to a UI test in the
      running app (`ChatSwipeUITests`).
    Tests: `ChatSuggestionBubbleTests` (the ghost, its tap opening the card, the in-place rewrite,
    no "AI Reply" string), `ChatThreadViewLifecycleTests.suggestionSitsAtTheSentPosition` and
