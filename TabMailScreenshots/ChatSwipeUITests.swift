@@ -254,6 +254,37 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(typedField(containing: Self.shortQuestion, in: short).exists, "and the words rode along")
     }
 
+    /// The focused field with words: a press held until the text view's own long press takes it
+    /// (the loupe, caret placement), then moved up past the open distance, stays the text's. The
+    /// field's drag waits for the text view's long presses, so the panel stays shut and the field
+    /// keeps its focus and its words. Without that wait the drag would take the moving finger and
+    /// open the panel.
+    func testLongPressThenDragUpInTheFocusedFieldStaysTheTexts() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        field.tap()
+        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.shortQuestion)
+        let typed = typedField(containing: Self.shortQuestion, in: app)
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
+        let onTheWords = typed.coordinate(withNormalizedOffset: CGVector(dx: Self.onTheWordsDx, dy: 0.5))
+        onTheWords.press(forDuration: Self.textLongPressHold,
+                         thenDragTo: onTheWords.withOffset(CGVector(dx: 0, dy: -Self.pastTheOpenDistance)))
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2),
+                       "the held press stayed the text's; the panel stays shut")
+        XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
+        XCTAssertTrue(typedField(containing: Self.shortQuestion, in: app).exists, "and its words")
+    }
+
+    /// Longer than UIKit's long press (half a second), so the text view's own long press has begun
+    /// before the finger moves.
+    private static let textLongPressHold: TimeInterval = 1.0
+    /// Into the field from its leading edge, on the short question's words.
+    private static let onTheWordsDx: CGFloat = 0.1
+    /// Well past the app's open distance (`ChatViewLayout.fieldDragOpenDistance`, 60 pt), as the
+    /// drags that open the panel go.
+    private static let pastTheOpenDistance: CGFloat = 200
+
     /// More lines than the field's six, so its text scrolls; the caret ends on the last line, at the
     /// left, away from where the drag starts.
     private static let overflowingLineCount = 9
