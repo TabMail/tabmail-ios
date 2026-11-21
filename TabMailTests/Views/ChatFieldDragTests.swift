@@ -70,7 +70,8 @@ struct ChatFieldDragTests {
         // overlay above the field leaves the field's touches to the field and its drag.
         #expect(!chat.contains(".popoverTip("), "no popover tip on the field")
         #expect(chat.contains("TipView(ChatFieldDragTip(), arrowEdge: .bottom)"))
-        #expect(chat.contains(".alignmentGuide(.top) { $0[.bottom] }"), "the tip sits above the field, pushing no layout")
+        #expect(chat.contains(".frame(height: 0)\n                    .overlay(alignment: .bottom) {\n                        TipView(ChatFieldDragTip(), arrowEdge: .bottom)"),
+                "the tip hangs above the field from a zero-height anchor, pushing no layout")
         // The same drag that would open without the tip opens with it.
         let drag = CGSize(width: 0, height: -open)
         #expect(ChatFieldDrag.opens(translation: drag, predictedEndTranslation: drag))

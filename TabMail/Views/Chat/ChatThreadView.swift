@@ -945,11 +945,17 @@ struct ChatThreadView: View {
         // no layout and takes no touch from the field, "Replying only to" or the no-reply notice, so
         // the first tap focuses the field and the first drag opens the panel. Not over the tutorial
         // or the panel.
+        // The tip hangs by its bottom from a zero-height anchor on the stack's top edge, so it
+        // grows upward from there whatever its height. A custom top alignment guide on the TipView
+        // itself did not take: the tip was drawn from the stack's top down, over the field.
         .overlay(alignment: .top) {
             if !chatExpanded && !TutorialCoordinator.shared.isRunning {
-                TipView(ChatFieldDragTip(), arrowEdge: .bottom)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .alignmentGuide(.top) { $0[.bottom] }
+                Color.clear
+                    .frame(height: 0)
+                    .overlay(alignment: .bottom) {
+                        TipView(ChatFieldDragTip(), arrowEdge: .bottom)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
             }
         }
         .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)

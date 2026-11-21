@@ -190,6 +190,7 @@ final class ChatSwipeUITests: XCTestCase {
         let tip = app.staticTexts[Self.fieldDragTipText].firstMatch
         XCTAssertTrue(tip.waitForExistence(timeout: 5), "the tip shows above the field")
         XCTAssertLessThanOrEqual(tip.frame.maxY, replyField(in: app).frame.minY + 1, "control: the tip is above the field")
+        XCTAssertGreaterThanOrEqual(tip.frame.minY, app.frame.minY, "the tip is on screen")
         dragFieldOpen(in: app)
         app.terminate()
 

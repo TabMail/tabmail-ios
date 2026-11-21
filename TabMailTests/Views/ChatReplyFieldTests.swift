@@ -850,10 +850,10 @@ struct ChatReplyFieldTests {
         // Inline above the field (its arrow points down at it), never a popover, never over the
         // open panel or the tutorial.
         #expect(Self.count(".popoverTip(", in: chat) == 0)
-        #expect(Self.count(".overlay(alignment: .top) { if !chatExpanded && !TutorialCoordinator.shared.isRunning { TipView(ChatFieldDragTip(), arrowEdge: .bottom)", in: chat) == 1)
+        #expect(Self.count(".overlay(alignment: .top) { if !chatExpanded && !TutorialCoordinator.shared.isRunning { Color.clear .frame(height: 0) .overlay(alignment: .bottom) { TipView(ChatFieldDragTip(), arrowEdge: .bottom)", in: chat) == 1)
         // On the whole stack, the one the side inset pads, so it sits above "Replying only to" and
-        // the no-reply notice rather than over them.
-        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) .alignmentGuide(.top) { $0[.bottom] } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
+        // the no-reply notice rather than over them: hung by its bottom from the stack's top edge.
+        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
         // A tap on the field focuses it, a drag starts, or the panel opens: each ends the tip for good.
         #expect(Self.count(".onChange(of: chatInputFocused) { _, focused in if focused { ChatFieldDragTip.close() } }", in: chat) == 1)
         #expect(Self.count(".onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close() } }", in: chat) == 1)
