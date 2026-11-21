@@ -263,7 +263,7 @@ struct ChatSummaryQueueTests {
 
         await queue.enqueueChatSummaries([msg], requestBodies: { _ in })
         try await writePeerSummary(msg.id, pool: pool)
-        await queue.finishInFlightForTesting(twin)
+        await queue.finishInFlightWithNotificationsOffForTesting(twin)
 
         #expect(await chatSummaryQueued(queue, msg.id),
                 "nothing asks for the text message, so the open chat shows Summarizing for good")
@@ -279,7 +279,7 @@ struct ChatSummaryQueueTests {
         await queue.setDispatchSuppressedForTesting(true)
         let twin = try await ordinaryTwinInFlight(msg, queue: queue)
         try await writePeerSummary(msg.id, pool: pool)
-        await queue.finishInFlightForTesting(twin)
+        await queue.finishInFlightWithNotificationsOffForTesting(twin)
         #expect(!(await chatSummaryQueued(queue, msg.id)), "control: no chat offer was made yet")
 
         await queue.enqueueChatSummaries([msg], requestBodies: { _ in })
@@ -298,7 +298,7 @@ struct ChatSummaryQueueTests {
         let twin = try await ordinaryTwinInFlight(msg, queue: queue)
 
         await queue.enqueueChatSummaries([msg], requestBodies: { _ in })
-        await queue.finishInFlightForTesting(twin)   // no summary written: it runs again
+        await queue.finishInFlightWithNotificationsOffForTesting(twin)   // no summary written: it runs again
 
         let summaries = await queue.queuedJobsForTesting.filter { $0.headerId == msg.id && $0.jobType == .summary }
         #expect(summaries.count == 1)
@@ -321,7 +321,7 @@ struct ChatSummaryQueueTests {
         // After recovery an ordinary pass runs the same summary; the chat asked before recovery.
         let next = try await ordinaryTwinInFlight(msg, queue: queue)
         try await writePeerSummary(msg.id, pool: pool)
-        await queue.finishInFlightForTesting(next)
+        await queue.finishInFlightWithNotificationsOffForTesting(next)
         #expect(!(await chatSummaryQueued(queue, msg.id)),
                 "recovery resets the queue: a request made before it is not acted on after it (the shown chat asks again once the queue is rebuilt)")
     }

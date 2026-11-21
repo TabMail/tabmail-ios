@@ -276,7 +276,7 @@ extension ChatThreadViewLifecycleTests {
             let summarize: @MainActor () async -> Void = {
                 for job in await queue.takePendingIntoFlightForTesting() {
                     await queue.executeWholeJobForTesting(job, aiService: service)
-                    await queue.finishInFlightForTesting(job)
+                    await queue.finishInFlightWithNotificationsOffForTesting(job)
                 }
             }
             try await body(view, newest, summarize, close)
