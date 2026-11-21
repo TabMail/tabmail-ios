@@ -313,7 +313,9 @@ same AI result, kept as long as the email itself is shown.
      (`aBodyThatLandsWhileTheChatIsNotLookingShowsItsSummary`, 2026-11-15) an email whose body lands
      while the chat is on screen, after a background return that cancelled and rebuilt the queue,
      while another screen covers the chat, or across a relaunch shows its summary once the chat is
-     shown again.
+     shown again; and (`topInsetChangeKeepsTheBottom`, `bottomInsetChangeKeepsTheBottom`,
+     2026-11-20) a chat landed at the bottom stays there while its top or bottom inset alone grows
+     and shrinks.
 
    **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
    In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible
