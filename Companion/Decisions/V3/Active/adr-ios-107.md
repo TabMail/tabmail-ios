@@ -1113,9 +1113,9 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
   UIDNEXT - 1", set per call from its first listed range.
 - **Stored top, current (2026-11-20).** `IMAPCatchUpState.Listing.top`, in the epoch-tagged state: the
   last UIDNEXT - 1 the listing's SELECTs reported, at least the last local UID, raised by every later
-  listed SELECT. A listing's first call with none stored reads the folder's UIDNEXT (one request,
-  UIDVALIDITY checked) before its first range; every range is cut at the top. Only that first call
-  ever reads UIDNEXT. When it reports none (a nonconforming server; MIS-IOS-004), no top is stored and
+  listed SELECT. UIDNEXT is read at most once per listing, by a call with no bookmark, no stored top
+  and no recorded `topUnknown` (one request, UIDVALIDITY checked, before its first range); every
+  range is cut at the top. When it reports none (a nonconforming server; MIS-IOS-004), no top is stored and
   the listing records `Listing.topUnknown`: every call of it lists up to the last local UID with no
   further UIDNEXT read (so a slice of one request still lists ranges), flags and removals are reconciled
   as before, an empty folder completes, and the listing completes only as not clean, so an owed folder

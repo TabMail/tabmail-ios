@@ -347,8 +347,12 @@ extension IMAPMissingByUIDTests {
             clock.advance(by: Self.pastTheNextCheck)
             let start = w.server.recordedCommands().count
             await w.slice(clock: clock)
-            let commands = Array(w.server.recordedCommands().dropFirst(start))
-            #expect(commands.contains { $0.uppercased().contains("SELECT") }, "setup: the UIDNEXT read was sent")
+            let commands = Array(w.server.recordedCommands().dropFirst(start)).map { $0.uppercased() }
+            let firstSelect = commands.firstIndex { $0.contains("SELECT") }
+            let firstUid = commands.firstIndex { $0.contains("UID ") }
+            #expect(firstSelect != nil && firstUid.map { firstSelect! < $0 } != false,
+                    "#1062: the call's first request is the UIDNEXT-only read, before any UID command")
+            #expect(try w.catchUpState()?.listing == nil, "#1062: the listing completed, with no top stored")
             let asked = Self.listingRanges(commands)
             #expect(asked.contains { $0.upperBound == highest }, "#1062: a listing range was sent, up to the highest local UID: \(asked)")
             let folderId = w.folderId
@@ -358,6 +362,25 @@ extension IMAPMissingByUIDTests {
             }
             #expect(isRead == true, "#1062: the flag change is applied under an unknown top")
             try w.expectHeldExactly(server.filter { $0 != expunged }, "#1062: the removal is applied under an unknown top")
+        }
+    }
+
+    @Test("A server whose SELECT omits UIDNEXT, a folder with a load floor and no local rows: the listing completes in one call, sends no range and leaves the folder owed")
+    @MainActor
+    func unknownTopWithNoLocalRowsCompletesAtOnce() async throws {
+        let server = Array(1...40)
+        try await Self.withWorld("no-uidnext-empty", server: server, local: server) { w in
+            try await w.dropLocal(server)
+            try await w.markOwed()
+            w.server.suppressSelectUidNext(for: Self.path)
+            defer { w.server.restoreSelectUidNext(for: Self.path) }
+            let clock = CatchUpTestClock()
+            let start = w.server.recordedCommands().count
+            await w.slice(clock: clock)
+            let asked = Self.listingRanges(Array(w.server.recordedCommands().dropFirst(start)))
+            #expect(asked.isEmpty, "#1062: no range is listed with no local rows and an unknown top: \(asked)")
+            #expect(try w.catchUpState()?.listing == nil, "#1062: the listing completed in one call")
+            #expect((try w.changeState()).selfHealDue, "#1062: the folder stays owed")
         }
     }
 

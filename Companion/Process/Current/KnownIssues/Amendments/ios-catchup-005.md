@@ -18,7 +18,7 @@ unknown (MIS-IOS-004: "could not determine" is not an answer): no top is stored,
 that listing lists only up to the last local UID, with no further UIDNEXT read. Flags and removals of held mail are reconciled as before, and an
 empty folder completes. Mail above the last local UID is not looked for. The listing can complete
 only as not clean (`Listing.topUnknown`), so a folder owed a check stays owed and is listed again
-at the daily check, never sooner; nothing settles on an unknown top. A later range SELECT that does
+at least daily, plus when its change counter moves; nothing settles on an unknown top. A later range SELECT that does
 report UIDNEXT stores it as the top and the listing goes on to it, still not clean; one without
 UIDNEXT keeps the top already learned.
 
