@@ -379,6 +379,11 @@ extension SyncEngine {
                 && !(result.flagUpdates.isEmpty && result.loaded.isEmpty) && DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): read began \(Int(readAge)) s ago — \(result.flagUpdates.count) read/flag update(s) not applied; of \(result.loaded.count) load(s), \(latch.loadsSkipped ? "those after the over-age latch set were dropped" : "none was dropped")")
             }
+            // Logged here, outside the write (no logDebug inside a write context).
+            if let completed = result.completedListing, !completed.clean || latch.loadsSkipped,
+               DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): listing completed unclean (passed over or skipped loads); an owed folder stays owed")
+            }
             if !removedIds.isEmpty { removeHeadersFromFTS(removedIds) }
             if updatedFlags > 0 || !removedIds.isEmpty {
                 await UnreadCountManager.shared.requestRecount(folderId: folderId)
@@ -609,7 +614,7 @@ extension SyncEngine {
         // loaded or proven gone. A listing that passed anything over, or whose
         // loads this apply skipped as an over-age read, is unclean: the folder
         // stays owed and is listed again at the daily full check (an owed folder
-        // gets it even with a bookmark, `IMAPProvider.catchUpPlan`), never sooner.
+        // gets it even with a bookmark, in the provider's catch-up plan), never sooner.
         let clean = result.completedListing.map { $0.clean && !skippedLoads } ?? false
         let startedAfterMark = result.completedListing.map {
             $0.lapseCountAtStart >= (changeState.selfHealLapse ?? 0)
@@ -620,9 +625,6 @@ extension SyncEngine {
         // starts after the mark and can settle it. An unclean completion re-marks
         // nothing; it waits for the daily check.
         let completedUnsettled = changeState.selfHealDue && clean && !startedAfterMark
-        if changeState.selfHealDue, result.completedListing != nil, !clean, DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[CatchUp] \(folder.id): owed listing completed unclean (passed over or skipped loads); still owed, relisted at the daily check")
-        }
         if markedDuringRead || completedUnsettled {
             // A mark landed while this read ran, or the owed listing completed
             // unsettled. The listing the result carries may have begun before

@@ -87,12 +87,44 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    /// The folder's stored HIGHESTMODSEQ as a foreground sync's listing stores it
+    /// (`writeListingCounters`): a catch-up listing takes its stamp from this field.
+    @MainActor
+    static func storeServerModSeq(_ w: World) async throws {
+        let folderId = w.folderId, modSeq = w.server.qresyncHighestModSeq(for: Self.path)
+        try await w.pool.write { db in
+            try db.execute(sql: "UPDATE folder SET lastKnownHighestModSeq = ? WHERE id = ?", arguments: [modSeq, folderId])
+        }
+    }
+
+    @Test("On a server without CONDSTORE an owed folder is listed once, settles on a clean finish, and is not listed again on the next run")
+    @MainActor
+    func owedFolderWithoutCondstoreSettlesOnce() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-no-condstore", capabilities: FakeIMAPServer.defaultCapabilities, server: server, local: server) { w in
+            try await w.dropLocal([12])
+            try await w.markOwed()
+            let clock = CatchUpTestClock()
+            await w.slice(clock: clock)
+            #expect(try w.catchUpState()?.listing == nil && (try w.held()).contains(12), "setup: one clean listing loaded the missing message")
+            #expect(!(try w.changeState()).selfHealDue, "#1062: a clean finish settles the mark without CONDSTORE")
+            for _ in 0..<3 {
+                clock.advance(by: Self.pastTheHold)
+                let start = w.server.recordedCommands().count
+                await w.slice(clock: clock)
+                let ranges = Self.listingRanges(w.server.recordedCommands().dropFirst(start))
+                #expect(ranges.isEmpty, "#1062: no relisting on the next run without CONDSTORE: \(ranges)")
+            }
+        }
+    }
+
     @Test("An owed listing whose loads the apply skips as an over-age read completes unclean: the mark stays")
     @MainActor
     func overAgeSkippedLoadsDoNotSettle() async throws {
         let server = Array(1...20) + Array(1001...1060)
         try await Self.withWorld("owed-over-age", server: server, local: server) { w in
             try await w.dropLocal([12])
+            try await Self.storeServerModSeq(w)
             try await w.markOwed()
             let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages))
             let result = try #require(read.results.first)
@@ -238,6 +270,7 @@ extension IMAPMissingByUIDTests {
             w.server.setMessages(messages, in: Self.path)
             w.server.suppressFetchInternalDate(in: Self.path, uids: [12])
             try await w.dropLocal([12])
+            try await Self.storeServerModSeq(w)
             try await w.markOwed()
             let clock = CatchUpTestClock()
             await w.slice(clock: clock)
@@ -327,6 +360,7 @@ extension IMAPMissingByUIDTests {
             w.server.setMessages(messages, in: Self.path)
             w.server.suppressFetchInternalDate(in: Self.path, uids: [12])
             try await w.dropLocal([12])
+            try await Self.storeServerModSeq(w)
             try await w.markOwed()
             let clock = CatchUpTestClock()
             await w.slice(clock: clock)
