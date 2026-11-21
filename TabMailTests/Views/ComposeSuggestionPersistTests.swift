@@ -138,6 +138,102 @@ struct ComposeSuggestionPersistTests {
         #expect(acceptedTwice == acceptedOnce)
     }
 
+    // MARK: - The chat's AI Suggestion card (ADR-IOS-114 decision 16)
+    //
+    // The card's suggestion box and its buttons are out of the accessibility tree in the
+    // running app (tabmail-ios#1124), so a tap on Use Suggestion cannot be driven: these tests
+    // drive the transitions the card runs instead (memory 128).
+
+    private static let cardSuggestion = "Hello Sam,\n\nYes, Tuesday works for me.\n\nThanks."
+    private static let laterRowReply = "A rewritten reply."
+    private static let savedDraftWords = "My own words, not sent yet"
+
+    @Test("Use Suggestion fills the card's empty body with the suggestion, and the box goes")
+    func useSuggestionFillsTheBody() throws {
+        let accepted = ComposeDraftGuards.acceptingVisibleSuggestion(.init(
+            messageBody: "", showingSuggestion: true, currentSuggestion: Self.cardSuggestion))
+        #expect(accepted.messageBody == Self.cardSuggestion)
+        #expect(accepted.showingSuggestion == false)
+
+        // The Use Suggestion button runs this one transition.
+        let bubble = try functionBody(
+            "private func suggestionBubble(text: String) -> some View {",
+            before: "// MARK: - Recompute reply", in: composeSource())
+        let label = try #require(bubble.range(of: "Text(\"Use Suggestion\")"))
+        let accept = try #require(bubble.range(of: "acceptVisibleSuggestionIfOffered()"))
+        #expect(accept.lowerBound < label.lowerBound, "the Use Suggestion button's action accepts the suggestion")
+    }
+
+    @Test("A card opened with a suggestion shows that one, never the email row's later reply")
+    func cardShowsTheTappedSuggestionNotTheRowsLaterReply() throws {
+        var rowRead = false
+        let shown = ComposeDraftGuards.suggestionToShow(
+            suggestedBody: Self.cardSuggestion, isReply: true,
+            freshCachedReply: { rowRead = true; return Self.laterRowReply })
+        #expect(shown == Self.cardSuggestion)
+        #expect(!rowRead, "the row is not consulted when the card was handed a suggestion")
+        let accepted = ComposeDraftGuards.acceptingVisibleSuggestion(.init(
+            messageBody: "", showingSuggestion: true, currentSuggestion: shown))
+        #expect(accepted.messageBody == Self.cardSuggestion, "Use Suggestion uses the tapped suggestion")
+
+        // Control: with nothing handed in, a reply reads the row; a new message never does.
+        #expect(ComposeDraftGuards.suggestionToShow(
+            suggestedBody: nil, isReply: true, freshCachedReply: { Self.laterRowReply }) == Self.laterRowReply)
+        #expect(ComposeDraftGuards.suggestionToShow(
+            suggestedBody: "", isReply: false, freshCachedReply: { Self.laterRowReply }) == nil)
+
+        let prepopulate = try functionBody(
+            "private func prepopulate() {",
+            before: "private func carryForwardAttachments", in: composeSource())
+        #expect(prepopulate.contains("ComposeDraftGuards.suggestionToShow("),
+                "prepopulate takes its suggestion from the decision")
+    }
+
+    @Test("Use Suggestion then Save writes the card's own draft with the suggestion; the saved reply draft is untouched")
+    func cardSaveWritesItsOwnDraftAndLeavesTheSavedOneAlone() async throws {
+        let db = try TestDatabase.make()
+        let account = try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let email = try TestDatabase.insertMessageHeader(db, messageId: "1", rfc822MessageId: "<card-1@example.com>")
+        let parent = "\(email.accountId):\(email.stableId)"
+        let savedKey = Draft.draftKey(replyTo: parent, isForward: false, newId: nil)
+        let earlier = Date().addingTimeInterval(-3600).timeIntervalSince1970
+        let saved = ComposeDraftGuards.draftToSave(
+            existing: nil, id: savedKey, accountId: account.id,
+            recipients: (["sender@example.com"], [], []), subject: "Re: Test Subject",
+            body: Self.savedDraftWords, replyTo: email, isForward: false, isReplyAll: false,
+            attachmentsDirName: nil, now: earlier)
+        try await db.write { try saved.insert($0) }
+
+        // The ghost's card, as the chat opens it, then Use Suggestion, then Save.
+        let card = ChatReadyReply(
+            message: email, compose: ChatReplyCompose(isReplyAll: false, to: ["sender@example.com"], cc: [], bcc: []))
+        let accepted = ComposeDraftGuards.acceptingVisibleSuggestion(.init(
+            messageBody: "", showingSuggestion: true, currentSuggestion: Self.cardSuggestion))
+        let existing = try await db.read { try Draft.fetchOne($0, key: card.draftId) }
+        let row = ComposeDraftGuards.draftToSave(
+            existing: existing, id: card.draftId, accountId: account.id,
+            recipients: (card.compose.to, card.compose.cc, card.compose.bcc), subject: "Re: Test Subject",
+            body: accepted.messageBody, replyTo: email, isForward: false, isReplyAll: false,
+            attachmentsDirName: nil, now: Date().timeIntervalSince1970)
+        try await db.write { try row.save($0) }
+
+        let drafts = try await db.read { try Draft.fetchAll($0) }
+        let own = drafts.filter { $0.id.hasPrefix(Draft.separateReplyPrefix) }
+        #expect(own.count == 1, "the card saved one draft of its own: \(drafts.map(\.id))")
+        #expect(own.first?.body.contains(Self.cardSuggestion) == true, "holding the suggestion")
+        let kept = try #require(drafts.first { $0.id == savedKey }, "the saved reply draft is still there")
+        #expect(kept.body == Self.savedDraftWords, "never saved over")
+        #expect(kept.updatedAt == earlier, "never touched")
+
+        let save = try functionBody(
+            "private func saveDraftAndDismiss() async {",
+            before: "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
+            in: composeSource())
+        #expect(save.contains("ComposeDraftGuards.draftToSave("), "Save persists the row the decision builds")
+        #expect(save.contains("body: capBody,"), "with the body Save captured")
+    }
+
     // MARK: - Send tap with an empty body (#384)
 
     private func tap(
