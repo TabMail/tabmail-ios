@@ -183,6 +183,12 @@ final class MessageDetailViewModel {
     /// Test seam: called synchronously on every assignment of a `DisplayField`,
     /// with the new value already in place, so a test sees every publication.
     @ObservationIgnored var _publicationHook: (@MainActor (DisplayField) -> Void)?
+    /// Test seam: called synchronously right after a whole-chat action read its rows
+    /// (`recordChatMove`, after `lookupChatRows`), so a test can land a write between that
+    /// read and the rest of the action. No production caller sets it.
+    @ObservationIgnored var _chatRowsReadHook: (@MainActor () -> Void)?
+    /// The row changes held back while the screen is frozen, waiting for the release to replay them.
+    var pendingRefreshIdsForTesting: Set<String> { pendingRefreshIds }
     /// How many times each field was assigned since init.
     @ObservationIgnored private(set) var publicationCountForTesting: [DisplayField: Int] = [:]
     /// How many times a display reader read again because a local change or an
@@ -2323,17 +2329,37 @@ final class MessageDetailViewModel {
     /// when nothing moved, so the chat stays open. A row whose folder role cannot be read (no
     /// Folder row) may be a sent copy or a draft, so it stays; if the roles cannot be read at all,
     /// nothing moves.
+    ///
+    /// The undo entry records each row's folder as shown (the visible location is the undo source)
+    /// and its action tag and sort order as stored (or staged, for an email not stored yet), with a
+    /// pending tag intent on top (`AccountManager.overlayAdjustedSnapshot`), read when the action
+    /// starts and before this action's own overlay writes in `recordMove`. The overlay is taken
+    /// before the rows are read, so a pending tag whose write lands and whose overlay entry retires
+    /// during that read is in the row or in the overlay. The chat's rows can hold an older tag (a
+    /// row change waits for its display turn or for a freeze to end, or its writer posts no per-row
+    /// change, and a hidden copy is not refreshed), and Undo writes the recorded tag back. A row
+    /// neither stored nor staged is not taken: there is no row to move or restore
+    /// (`AccountManager.move` drops it too).
     private func recordChatMove(
         _ members: [MessageHeader], source: ChatMoveSource, roleMove: Bool,
         destination: (_ accountId: String) -> Folder?
     ) -> Set<String> {
-        guard let roles = lookupFolderRoles(Set(members.map(\.folderId))) else { return [] }
+        let overlay = manager.snapshotOverlay()
+        guard let stored = lookupChatRows(members) else { return [] }
+        #if DEBUG
+        _chatRowsReadHook?()
+        #endif
         let groups: [MoveGroup] = UndoableAction.byAccount(members).compactMap { share in
             guard let accountId = share.first?.accountId, let folder = destination(accountId) else { return nil }
-            let movable = share.filter { member in
-                guard let role = roles[member.folderId] else { return false }
-                return role != .sent && role != .drafts && source.takes(role: role, folderId: member.folderId)
-                    && member.folderPath != folder.path
+            let movable: [MessageHeader] = share.compactMap { member in
+                guard let row = stored.rows[member.id], let role = stored.roles[member.folderId],
+                      role != .sent, role != .drafts, source.takes(role: role, folderId: member.folderId),
+                      member.folderPath != folder.path else { return nil }
+                let current = manager.overlayAdjustedSnapshot(row, in: overlay)
+                var recorded = member
+                recorded.actionTag = current.actionTag
+                recorded.tagSortOrder = current.tagSortOrder
+                return recorded
             }
             guard !movable.isEmpty else { return nil }
             if roleMove, folder.role == .trash {
@@ -2435,6 +2461,26 @@ final class MessageDetailViewModel {
         try? dbPool.read { db in
             Dictionary(try Folder.fetchAll(db, keys: Array(folderIds)).map { ($0.id, $0.role) }) { first, _ in first }
         }
+    }
+
+    /// For a whole-chat action, in one read: the roles of the rows' folders (a folder with no Folder
+    /// row has none) and the rows as stored. An id the store does not hold yet is taken from the
+    /// staged rows, with the projection the move's resolver uses (`AccountManager.stagedHeadersForAction`); an id neither
+    /// stored nor staged is absent. Nil when the read fails. The staged rows are read first: a merge
+    /// stores a row before a later merge drops it from the staged rows, so a row stored during the
+    /// read is in one of the two.
+    private func lookupChatRows(
+        _ members: [MessageHeader]
+    ) -> (roles: [String: FolderRole], rows: [String: MessageHeader])? {
+        let folderIds = Array(Set(members.map(\.folderId)))
+        let ids = members.map(\.id)
+        let staged = AccountManager.stagedHeadersForAction(ids: ids)
+        guard let read = try? dbPool.read({ db -> (roles: [String: FolderRole], rows: [String: MessageHeader]) in
+            let roles = Dictionary(try Folder.fetchAll(db, keys: folderIds).map { ($0.id, $0.role) }) { first, _ in first }
+            let rows = Dictionary(try MessageHeader.fetchAll(db, keys: ids).map { ($0.id, $0) }) { first, _ in first }
+            return (roles: roles, rows: rows)
+        }) else { return nil }
+        return (roles: read.roles, rows: read.rows.merging(staged) { stored, _ in stored })
     }
 
     /// Whether ordinary Archive/Move controls must be inert for this row.

@@ -840,7 +840,13 @@ actor AccountManager {
     nonisolated func snapshotOverlayMutation(
         forCurrentHeaderId id: String
     ) -> (id: String, mutation: PendingMutation)? {
-        let snapshot = snapshotOverlay()
+        snapshotOverlayMutation(forCurrentHeaderId: id, in: snapshotOverlay())
+    }
+
+    /// The same lookup in an overlay snapshot the caller took earlier.
+    nonisolated func snapshotOverlayMutation(
+        forCurrentHeaderId id: String, in snapshot: [String: PendingMutation]
+    ) -> (id: String, mutation: PendingMutation)? {
         if let mutation = snapshot[id] { return (id, mutation) }
         for predecessorId in MessageHeaderRekey.predecessorHeaderIds(leadingTo: id) {
             if let mutation = snapshot[predecessorId] {
@@ -863,8 +869,19 @@ actor AccountManager {
     /// the SAME coalesced entry this reads. Calling it after would capture this
     /// action's own not-yet-committed mutation as if it were pre-existing state.
     nonisolated func overlayAdjustedSnapshot(_ header: MessageHeader) -> MessageHeader {
+        overlayAdjustedSnapshot(header, in: snapshotOverlay())
+    }
+
+    /// The same adjustment from an overlay snapshot the caller took earlier.
+    /// A caller that reads the stored row itself takes the snapshot BEFORE that
+    /// read: a pending tag whose write commits and whose overlay entry retires
+    /// between the two is then in one of them, never in neither
+    /// (`MessageDetailViewModel.recordChatMove`).
+    nonisolated func overlayAdjustedSnapshot(
+        _ header: MessageHeader, in snapshot: [String: PendingMutation]
+    ) -> MessageHeader {
         guard let m = snapshotOverlayMutation(
-            forCurrentHeaderId: header.id)?.mutation
+            forCurrentHeaderId: header.id, in: snapshot)?.mutation
         else { return header }
         var h = header
         if let isRead = m.isRead { h.isRead = isRead }
@@ -886,12 +903,14 @@ actor AccountManager {
         // ⚠️ THIS FUNCTION IS NOT THE ONLY FEEDER OF `UndoMember`, and reading
         // it as one is what left the sibling half open for a day. It covers the
         // six `InboxViewModel` pushes (via `overlayAdjustedForUndo`) and
-        // `SettingsView`'s. The three `MessageDetailViewModel` pushes —
-        // `archiveMessage` / `deleteMessage` / `moveMessage` — do NOT call it:
-        // that view model holds `MessageHeader`s in `message` / `threadMessages`
-        // and hands those values straight to `UndoableAction(messages:)`, so the
-        // pairing there is enforced at ITS four writers instead (`applyOverlay`
-        // ×2, `updateThreadMessageFolder`, `applyManualTag`). Fixing one place
+        // `SettingsView`'s, and the tag pair of `MessageDetailViewModel`'s
+        // whole-chat actions (`recordChatMove`, on the stored or staged row,
+        // with an overlay snapshot taken before that read). That view
+        // model's single-email pushes — `archiveMessage` / `deleteMessage` /
+        // `moveMessage` — do NOT call it: they hand the `MessageHeader`s held in
+        // `message` / `threadMessages` straight to `UndoableAction(messages:)`,
+        // so the pairing there is enforced at ITS four writers instead
+        // (`applyOverlay` ×2, `updateThreadMessageFolder`, `applyManualTag`). Fixing one place
         // does not close the class; the class is "every `actionTag` write on a
         // value that can reach `UndoMember.init(header:)`".
         if let actionTag = m.actionTag {

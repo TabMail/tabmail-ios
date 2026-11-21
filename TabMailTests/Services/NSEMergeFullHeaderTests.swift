@@ -26,9 +26,12 @@ struct NSEMergeFullHeaderTests {
 
     // MARK: - Helpers
 
+    /// The staged date: one day before the run, never a fixed calendar day.
+    private static let stagedDate = Date().addingTimeInterval(-86_400).timeIntervalSince1970
+
     private func makeDB() throws -> DatabaseQueue {
         let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db, id: "acc1", email: "user@gmail.com")
+        try TestDatabase.insertAccount(db, id: "acc1", email: "user@example.com")
         try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
         return db
     }
@@ -36,13 +39,13 @@ struct NSEMergeFullHeaderTests {
     private func staged(
         messageId: String = "msg-1",
         provider: String = "gmail",
-        rfc822: String? = "rfc@x.com",
-        to: String = "\"Bob\" <bob@x.com>, eve@x.com",
-        cc: String = "cc@x.com",
-        bcc: String = "bcc@x.com",
-        replyTo: String? = "reply@x.com",
-        inReplyTo: String? = "parent@x.com",
-        references: [String] = ["root@x.com", "parent@x.com"],
+        rfc822: String? = "rfc@example.com",
+        to: String = "\"Bob\" <bob@example.com>, eve@example.com",
+        cc: String = "cc@example.com",
+        bcc: String = "bcc@example.com",
+        replyTo: String? = "reply@example.com",
+        inReplyTo: String? = "parent@example.com",
+        references: [String] = ["root@example.com", "parent@example.com"],
         isRead: Bool = true,
         isFlagged: Bool = true,
         hasAttachments: Bool = true,
@@ -54,12 +57,17 @@ struct NSEMergeFullHeaderTests {
         htmlContent: String? = nil,
         textContent: String? = nil,
         summaryBlurb: String? = nil,
+        summaryTodos: String? = nil,
+        reminderDate: String? = nil,
+        reminderTime: String? = nil,
+        reminderContent: String? = nil,
+        summaryTextMessage: String? = nil,
         providerDate: Double? = nil
     ) -> NSEDataBridge.StagedMessage {
         var row = NSEDataBridge.StagedMessage(
             id: "acc1:\(messageId)",
             accountId: "acc1",
-            accountEmail: "user@gmail.com",
+            accountEmail: "user@example.com",
             provider: provider,
             messageId: messageId,
             rfc822MessageId: rfc822,
@@ -67,9 +75,9 @@ struct NSEMergeFullHeaderTests {
             folderPath: "INBOX",
             subject: "Subject under test",
             senderName: "Alice",
-            senderEmail: "alice@x.com",
+            senderEmail: "alice@example.com",
             snippet: "snippet preview",
-            date: 1_710_000_000,
+            date: Self.stagedDate,
             to: to, cc: cc, bcc: bcc, replyTo: replyTo,
             inReplyTo: inReplyTo,
             references: references,
@@ -79,15 +87,26 @@ struct NSEMergeFullHeaderTests {
             isReplied: isReplied,
             isForwarded: isForwarded,
             providerLabels: providerLabels,
-            summaryBlurb: summaryBlurb, summaryTodos: nil, actionTag: actionTag,
-            reminderDate: nil, reminderTime: nil, reminderContent: nil,
+            summaryBlurb: summaryBlurb, summaryTodos: summaryTodos, actionTag: actionTag,
+            reminderDate: reminderDate, reminderTime: reminderTime, reminderContent: reminderContent,
             processedAt: Date().timeIntervalSince1970,
             aiCompleted: aiCompleted, notified: false,
             htmlContent: htmlContent, textContent: textContent, attachmentsJSON: nil,
             icsText: nil, hasUnresolvedCIDs: false
         )
         row.providerDate = providerDate
+        row.summaryTextMessage = summaryTextMessage
         return row
+    }
+
+    /// A staged row whose extension AI is complete: a body, every summary field and a Reply tag.
+    private func stagedWithEveryAIField() -> NSEDataBridge.StagedMessage {
+        staged(
+            actionTag: "reply", aiCompleted: true,
+            htmlContent: "<p>the body</p>", textContent: "the body", summaryBlurb: "a summary",
+            summaryTodos: "a todo", reminderDate: "2099-01-02", reminderTime: "09:00",
+            reminderContent: "a reminder", summaryTextMessage: "a text message"
+        )
     }
 
     // MARK: - providerDate (Gmail's internalDate) carry
@@ -106,7 +125,7 @@ struct NSEMergeFullHeaderTests {
         let (_, idWithKey) = try insert(withKey, into: db)
         let headerWithKey = try #require(try db.read { try MessageHeader.fetchOne($0, key: idWithKey) })
         #expect(abs(headerWithKey.providerDate.timeIntervalSince1970 - internalDate) < 1)
-        #expect(abs(headerWithKey.date.timeIntervalSince1970 - 1_710_000_000) < 1)
+        #expect(abs(headerWithKey.date.timeIntervalSince1970 - Self.stagedDate) < 1)
 
         let withoutKey = staged(messageId: "gm-2", providerDate: nil)
         let (_, idWithoutKey) = try insert(withoutKey, into: db)
@@ -134,17 +153,14 @@ struct NSEMergeFullHeaderTests {
 
     /// Phase 1 of the two-phase merge inserts a HEADER-ONLY row
     /// (`headerOnly: true`): the message goes inbox-visible on a lightweight
-    /// write (snippet present), but the multi-MB body blob and the AI fields are
-    /// deferred to phase 2 — off the visibility critical path. The default
+    /// write (snippet present), but the multi-MB body blob and the AI fields
+    /// are deferred to phase 2 — off the visibility critical path. The default
     /// (`headerOnly: false`) writes them, as the new-header fallback still must.
-    @Test("headerOnly=true defers body blob + AI fields; default writes them")
+    @Test("headerOnly=true defers body blob + AI fields; default writes them all")
     func headerOnlyDefersBodyAndAI() throws {
         // Phase 1 — headerOnly: true.
         let dbA = try makeDB()
-        let msgA = staged(
-            actionTag: "reply", aiCompleted: true,
-            htmlContent: "<p>the body</p>", textContent: "the body", summaryBlurb: "a summary"
-        )
+        let msgA = stagedWithEveryAIField()
         var ftsA: [NSEDataBridge.NSEFTSBodyItem] = []
         try dbA.write { db in
             _ = try NSEDataBridge.insertNewHeaderFromStaging(msgA, db: db, ftsBatch: &ftsA, headerOnly: true)
@@ -159,6 +175,11 @@ struct NSEMergeFullHeaderTests {
         // See NSEDataBridge.stagedDisplaySnippet.
         #expect(headerA?.snippet == "the body")          // visible: snippet present
         #expect(headerA?.summaryBlurb == nil)            // AI deferred to phase 2
+        #expect(headerA?.summaryTodos == nil)
+        #expect(headerA?.reminderDate == nil)
+        #expect(headerA?.reminderTime == nil)
+        #expect(headerA?.reminderContent == nil)
+        #expect(headerA?.summaryTextMessage == nil)
         #expect(headerA?.actionTag == nil)               // AI deferred to phase 2
         let bodyCountA = try dbA.read {
             try MessageBody.filter(Column("id") == hidA).fetchCount($0)
@@ -169,10 +190,7 @@ struct NSEMergeFullHeaderTests {
 
         // Default (headerOnly: false) — body + AI written (new-header fallback path).
         let dbB = try makeDB()
-        let msgB = staged(
-            actionTag: "reply", aiCompleted: true,
-            htmlContent: "<p>the body</p>", textContent: "the body", summaryBlurb: "a summary"
-        )
+        let msgB = stagedWithEveryAIField()
         var ftsB: [NSEDataBridge.NSEFTSBodyItem] = []
         try dbB.write { db in
             _ = try NSEDataBridge.insertNewHeaderFromStaging(msgB, db: db, ftsBatch: &ftsB)
@@ -182,7 +200,13 @@ struct NSEMergeFullHeaderTests {
         )
         let headerB = try dbB.read { try MessageHeader.fetchOne($0, key: hidB) }
         #expect(headerB?.summaryBlurb == "a summary")
+        #expect(headerB?.summaryTodos == "a todo")
+        #expect(headerB?.reminderDate == "2099-01-02")
+        #expect(headerB?.reminderTime == "09:00")
+        #expect(headerB?.reminderContent == "a reminder")
+        #expect(headerB?.summaryTextMessage == "a text message")
         #expect(headerB?.actionTag?.rawValue == "reply")
+        #expect(headerB?.tagSortOrder == ActionTag.reply.sortOrder)
         let bodyCountB = try dbB.read {
             try MessageBody.filter(Column("id") == hidB).fetchCount($0)
         }
@@ -202,15 +226,15 @@ struct NSEMergeFullHeaderTests {
         }
 
         // Recipient fields — NOT empty (the 2026-04-19 bug).
-        #expect(header.to == "\"Bob\" <bob@x.com>, eve@x.com")
-        #expect(header.cc == "cc@x.com")
-        #expect(header.bcc == "bcc@x.com")
-        #expect(header.replyTo == "reply@x.com")
+        #expect(header.to == "\"Bob\" <bob@example.com>, eve@example.com")
+        #expect(header.cc == "cc@example.com")
+        #expect(header.bcc == "bcc@example.com")
+        #expect(header.replyTo == "reply@example.com")
 
         // Threading fields — present.
-        #expect(header.inReplyTo == "parent@x.com")
-        #expect(header.references == ["root@x.com", "parent@x.com"])
-        #expect(header.rfc822MessageId == "rfc@x.com")
+        #expect(header.inReplyTo == "parent@example.com")
+        #expect(header.references == ["root@example.com", "parent@example.com"])
+        #expect(header.rfc822MessageId == "rfc@example.com")
 
         // Flags — NOT defaulted to false.
         #expect(header.isRead)
@@ -220,7 +244,7 @@ struct NSEMergeFullHeaderTests {
         // Core identity.
         #expect(header.subject == "Subject under test")
         #expect(header.from == "Alice")
-        #expect(header.fromAddress == "alice@x.com")
+        #expect(header.fromAddress == "alice@example.com")
         #expect(header.accountId == "acc1")
         #expect(header.folderPath == "INBOX")
         #expect(header.isInInbox)
@@ -243,7 +267,7 @@ struct NSEMergeFullHeaderTests {
                 WHERE messageHeaderId = ?
                 """, arguments: [headerId])
         }.map { $0["referencedRfc822Id"] as String }
-        #expect(Set(refs) == Set(["parent@x.com", "root@x.com"]))
+        #expect(Set(refs) == Set(["parent@example.com", "root@example.com"]))
         // All three rows present (inReplyTo + references), matching sync.
         #expect(refs.count == 3)
     }
@@ -263,7 +287,7 @@ struct NSEMergeFullHeaderTests {
     @Test("inReplyTo alone (no references) inserts one junction row")
     func inReplyToOnly() throws {
         let db = try makeDB()
-        let msg = staged(inReplyTo: "parent@x.com", references: [])
+        let msg = staged(inReplyTo: "parent@example.com", references: [])
         let (_, headerId) = try insert(msg, into: db)
 
         let refs = try db.read { db in
@@ -271,7 +295,7 @@ struct NSEMergeFullHeaderTests {
                 SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ?
                 """, arguments: [headerId])
         }.map { $0["referencedRfc822Id"] as String }
-        #expect(refs == ["parent@x.com"])
+        #expect(refs == ["parent@example.com"])
     }
 
     // MARK: - MessageUserLabel junction + filtering

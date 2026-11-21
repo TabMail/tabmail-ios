@@ -344,6 +344,22 @@ extension AccountManager {
         return ids.compactMap { byId[$0] }
     }
 
+    /// The headers synthesized from `NSEDataBridge.latestStagedRows` for the given
+    /// ids, keyed by header id (the caller lets a stored row win over these), with
+    /// the same projection `resolveHeadersForAction` uses for a staged row.
+    /// Synchronous, for a MainActor reader that reads the store itself
+    /// (`MessageDetailViewModel.lookupChatRows`).
+    nonisolated static func stagedHeadersForAction(ids: [String]) -> [String: MessageHeader] {
+        guard !ids.isEmpty else { return [:] }
+        let idSet = Set(ids)
+        let staged = NSEDataBridge.latestStagedRows.withLock { rows in
+            rows.filter { idSet.contains($0.headerId) }
+        }
+        var byId: [String: MessageHeader] = [:]
+        for row in staged { byId[row.headerId] = row.toMessageHeader() }
+        return byId
+    }
+
     /// Singular convenience over `resolveHeadersForAction(ids:)` for single-message actions.
     func resolveHeaderForAction(id: String) async -> MessageHeader? {
         await resolveHeadersForAction(ids: [id]).first

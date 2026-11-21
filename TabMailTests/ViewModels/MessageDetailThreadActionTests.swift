@@ -790,4 +790,677 @@ struct MessageDetailThreadActionTests {
         #expect(Set(reads.flatMap(\.messageIds)) == Set([a.messageId, b.messageId]),
                 "the already-unread email gets no op")
     }
+
+    // MARK: - The tag a whole-chat action records
+
+    private typealias Gate = MessageDetailDisplayOrderTests.Gate
+    private typealias Flag = MessageDetailDisplayOrderTests.Flag
+
+    /// An action tag with its sort order, as a row stores them and an undo member records them.
+    private struct TagPair: Equatable, CustomStringConvertible {
+        let tag: ActionTag?
+        let sortOrder: Int
+        init(_ tag: ActionTag?) {
+            self.tag = tag
+            sortOrder = tag?.sortOrder ?? 99
+        }
+        init(of header: MessageHeader) {
+            tag = header.actionTag
+            sortOrder = header.tagSortOrder
+        }
+        init(tag: ActionTag?, sortOrder: Int) {
+            self.tag = tag
+            self.sortOrder = sortOrder
+        }
+        var description: String { "(\(tag?.rawValue ?? "nil"), \(sortOrder))" }
+    }
+
+    /// Waits until `condition` holds or the deadline passes; the caller expects the condition after.
+    @MainActor
+    private func waitUntil(seconds: Double = 3, _ condition: () -> Bool) async {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition() && Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    /// An Inbox row (not stored) with Message-ID `rfc`, tagged `tag`.
+    private func inboxRow(messageId: String, rfc: String, tag: ActionTag?) -> MessageHeader {
+        var row = MessageHeader(
+            messageId: messageId, subject: "Test",
+            from: "sender@example.com", fromAddress: "sender@example.com",
+            to: "me@example.com", date: Self.seededDate, snippet: "body",
+            folderId: "acc1:\(Self.inboxPath)", accountId: "acc1",
+            folderPath: Self.inboxPath, isInInbox: true
+        )
+        row.headerComplete = true
+        row.rfc822MessageId = rfc
+        row.setActionTag(tag)
+        return row
+    }
+
+    /// Opens a chat on `labeled` (a Projects copy) whose hidden Inbox copy carries the same
+    /// Message-ID, through the real thread load, and waits until the load published it. With
+    /// `withMember`, the labeled copy references `member`, an Inbox email the chat shows. Both Inbox
+    /// rows start tagged `tag`.
+    @MainActor
+    private func openChatWithHiddenInboxCopy(
+        _ pool: DatabasePool, tag: ActionTag?, withMember: Bool = false
+    ) async throws -> (vm: MessageDetailViewModel, copy: MessageHeader, member: MessageHeader?) {
+        let rfc = "<hidden-copy@example.com>"
+        let memberRfc = "<chat-member@example.com>"
+        let member = withMember ? inboxRow(messageId: "member-1", rfc: memberRfc, tag: tag) : nil
+        if let member { try await insertCopy(pool, member) }
+        var labeled = try insertHeader(pool, messageId: "labeled-1", folderPath: Self.projectsPath)
+        labeled.rfc822MessageId = rfc
+        if withMember { labeled.referencesJSON = MessageHeader.encodeReferences([memberRfc]) }
+        let labeledRow = labeled
+        try await pool.write { db in try labeledRow.update(db) }
+        let copy = inboxRow(messageId: "inbox-1", rfc: rfc, tag: tag)
+        try await insertCopy(pool, copy)
+        let vm = MessageDetailViewModel(messageId: labeled.id, dbPool: pool, fetchBodyOverride: { _ in },
+                                        observeNotifications: true)
+        vm._testSeedMessage(labeled)
+        vm.reloadThread()
+        let copyId = copy.id
+        let memberId = member?.id
+        await waitUntil {
+            vm.hasLoadedThread && vm.displayTurnIsIdleForTesting
+                && vm.threadCopies.contains(where: { $0.id == copyId })
+                && (memberId.map { id in vm.threadMessages.contains(where: { $0.id == id }) } ?? true)
+        }
+        return (vm, copy, member)
+    }
+
+    /// Whether the chat loaded the hidden copy (only) and shows the member.
+    @MainActor
+    private func chatLoaded(_ vm: MessageDetailViewModel, copy copyId: String, member memberId: String) -> Bool {
+        vm.threadCopies.map(\.id) == [copyId] && vm.threadMessages.map(\.id) == [memberId]
+    }
+
+    /// Stores a row, as a sync insert does.
+    private func insertCopy(_ pool: DatabasePool, _ row: MessageHeader) async throws {
+        try await pool.write { db in try row.insert(db) }
+    }
+
+    /// Stores each row's tag with its sort order in one write, as a tag writer does. With `post`,
+    /// posts each row's change; `post: false` is a writer that posts no per-row change (a bulk
+    /// write past the per-row post limit).
+    @MainActor
+    private func writeTags(_ pool: DatabasePool, _ tags: [String: ActionTag?], post: Bool = true) async throws {
+        try await pool.write { db in
+            for (id, tag) in tags {
+                guard var row = try MessageHeader.fetchOne(db, key: id) else { continue }
+                row.setActionTag(tag)
+                try row.update(db)
+            }
+        }
+        guard post else { return }
+        for id in tags.keys { NotificationCenter.default.post(name: .messageDataDidChange, object: id) }
+    }
+
+    /// The tag pair the chat holds for `id`, on the email it shows or on a hidden copy.
+    @MainActor
+    private func heldTag(_ vm: MessageDetailViewModel, _ id: String) -> TagPair? {
+        (vm.threadMessages + vm.threadCopies).first(where: { $0.id == id }).map { TagPair(of: $0) }
+    }
+
+    /// The tag pair the last action recorded for `id`, in its snapshot and in the undo member that
+    /// Undo restores from.
+    @MainActor
+    private func recordedTag(_ id: String) -> (snapshot: TagPair?, member: TagPair?) {
+        let entry = UndoService.shared.undoStack.last
+        let row = entry?.messages.first(where: { $0.id == id })
+        let member = entry?.commands.flatMap(\.members).first(where: { $0.originalHeaderId == id })
+        return (row.map { TagPair(of: $0) },
+                member.map { TagPair(tag: $0.sourceActionTag, sortOrder: $0.sourceTagSortOrder) })
+    }
+
+    /// Archives every row the chat loaded and expects it to take exactly `ids` and to record
+    /// `pair` for each.
+    @MainActor
+    private func expectArchiveRecords(_ vm: MessageDetailViewModel, _ ids: [String], _ pair: TagPair,
+                                      sourceLocation: SourceLocation = #_sourceLocation) {
+        #expect(vm.archiveChat(vm.chatRows) == Set(ids), "Archive takes the chat's Inbox rows", sourceLocation: sourceLocation)
+        for id in ids {
+            let recorded = recordedTag(id)
+            #expect(recorded.snapshot == pair, "the undo snapshot of \(id) holds \(pair), not \(String(describing: recorded.snapshot))",
+                    sourceLocation: sourceLocation)
+            #expect(recorded.member == pair, "the undo member of \(id) holds \(pair), not \(String(describing: recorded.member))",
+                    sourceLocation: sourceLocation)
+        }
+    }
+
+    /// Expects the action to have landed (each row stored in `movedTo`, its tag cleared as it left
+    /// the Inbox), undoes it, and expects each row back in the Inbox with `pair`.
+    @MainActor
+    private func expectUndoRestores(_ pool: DatabasePool, _ ids: [String], _ pair: TagPair,
+                                    movedTo movedPath: String = archivePath,
+                                    sourceLocation: SourceLocation = #_sourceLocation) async throws {
+        try await settle(pool, ids: ids, in: movedPath)
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let moved = try await rows(pool, ids)
+        #expect(moved.count == ids.count, sourceLocation: sourceLocation)
+        for row in moved {
+            #expect(row.folderPath == movedPath, "control: the action moved \(row.id)", sourceLocation: sourceLocation)
+            #expect(TagPair(of: row) == TagPair(nil), "control: \(row.id) left the Inbox with its tag cleared",
+                    sourceLocation: sourceLocation)
+        }
+        await UndoService.shared.undo()
+        try await settle(pool, ids: ids, in: Self.inboxPath)
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let restored = try await rows(pool, ids)
+        #expect(restored.count == ids.count, sourceLocation: sourceLocation)
+        for row in restored {
+            #expect(row.folderPath == Self.inboxPath, "control: Undo put \(row.id) back", sourceLocation: sourceLocation)
+            #expect(TagPair(of: row) == pair, "Undo restores \(pair) on \(row.id), not \(TagPair(of: row))",
+                    sourceLocation: sourceLocation)
+        }
+    }
+
+    @Test("The tag written last to a chat's hidden Inbox copy and to the email it shows is the one a whole-chat Archive records and its Undo restores")
+    @MainActor
+    func archiveUndoKeepsTheLatestTag() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let (vm, copy, member) = try await openChatWithHiddenInboxCopy(pool, tag: .archive, withMember: true)
+        guard let member, chatLoaded(vm, copy: copy.id, member: member.id) else {
+            Issue.record("control: the load published the hidden Inbox copy and the shown email"); return
+        }
+        let ids = [copy.id, member.id]
+        #expect(heldTag(vm, copy.id) == TagPair(.archive), "control: the older pair")
+
+        try await writeTags(pool, [copy.id: .reply, member.id: .reply])
+        // The shown email's row change reaches the chat while it stays open; the hidden copy is
+        // not refreshed and still holds the older tag.
+        await waitUntil { heldTag(vm, member.id) == TagPair(.reply) && vm.displayTurnIsIdleForTesting }
+        #expect(heldTag(vm, member.id) == TagPair(.reply), "control: the chat shows the latest tag")
+        #expect(heldTag(vm, copy.id) == TagPair(.archive), "control: the hidden copy holds the older tag")
+
+        expectArchiveRecords(vm, ids, TagPair(.reply))
+        try await expectUndoRestores(pool, ids, TagPair(.reply))
+    }
+
+    @Test("A tag written while a chat swipe holds the screen still is the one a whole-chat Archive records and its Undo restores")
+    @MainActor
+    func archiveDuringASwipeRecordsTheLatestTag() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        let holdId = "latest-tag-swipe"
+        defer { ChatSwipeHold.shared.releaseNow(holdId) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let (vm, copy, member) = try await openChatWithHiddenInboxCopy(pool, tag: .archive, withMember: true)
+        guard let member, chatLoaded(vm, copy: copy.id, member: member.id) else {
+            Issue.record("control: the load published the hidden Inbox copy and the shown email"); return
+        }
+        let ids = [copy.id, member.id]
+
+        // A swipe takes the finger: row changes wait until it lets go and settles.
+        ChatSwipeHold.shared.begin(holdId)
+        #expect(PreviewFreezeGate.shared.isFrozen, "control: the swipe holds the screen still")
+        try await writeTags(pool, [copy.id: .reply, member.id: .reply])
+        // Both row changes reached the chat and were held back by the swipe.
+        await waitUntil { Set(ids).isSubset(of: vm.pendingRefreshIdsForTesting) }
+        #expect(Set(ids).isSubset(of: vm.pendingRefreshIdsForTesting), "control: the swipe holds both row changes")
+        #expect(ids.allSatisfy { heldTag(vm, $0) == TagPair(.archive) }, "control: the chat still holds the older tag")
+
+        // The swipe's Archive, before it lets go.
+        expectArchiveRecords(vm, ids, TagPair(.reply))
+
+        ChatSwipeHold.shared.release(holdId, after: .zero)
+        await waitUntil { !PreviewFreezeGate.shared.isFrozen && vm.pendingRefreshIdsForTesting.isEmpty }
+        #expect(!PreviewFreezeGate.shared.isFrozen, "control: the swipe let go")
+        #expect(vm.pendingRefreshIdsForTesting.isEmpty, "control: the held row changes were replayed")
+        try await expectUndoRestores(pool, ids, TagPair(.reply))
+    }
+
+    @Test("A tag written while its row change waits behind a held display turn is the one a whole-chat Archive records and its Undo restores")
+    @MainActor
+    func archiveWhileARefreshWaitsRecordsTheLatestTag() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let (vm, copy, member) = try await openChatWithHiddenInboxCopy(pool, tag: .archive, withMember: true)
+        guard let member, chatLoaded(vm, copy: copy.id, member: member.id) else {
+            Issue.record("control: the load published the hidden Inbox copy and the shown email"); return
+        }
+        let ids = [copy.id, member.id]
+
+        // A thread load reads the rows, still tagged Archive, and is held before it publishes.
+        let gate = Gate()
+        defer { gate.open() }
+        vm._displayReadHook = { point in
+            if point == .threadScan, !gate.reached { await gate.hold() }
+        }
+        vm.reloadThread()
+        await waitUntil { gate.reached }
+        guard gate.reached else { Issue.record("control: the load read the rows and is held"); return }
+
+        // The newer tags are stored; their row changes wait behind the held load.
+        try await writeTags(pool, [copy.id: .reply, member.id: .reply])
+        await waitUntil { vm.displayTurnWaitersForTesting >= 2 }
+        #expect(vm.displayTurnWaitersForTesting >= 2, "control: both row changes wait behind the held load")
+        #expect(ids.allSatisfy { heldTag(vm, $0) == TagPair(.archive) }, "control: the chat still holds the older tag")
+
+        expectArchiveRecords(vm, ids, TagPair(.reply))
+
+        gate.open()
+        await waitUntil { gate.passed && vm.displayTurnIsIdleForTesting }
+        #expect(vm.displayTurnIsIdleForTesting)
+        try await expectUndoRestores(pool, ids, TagPair(.reply))
+    }
+
+    @Test("A tag written with no per-row change posted is the one a whole-chat Archive records and its Undo restores")
+    @MainActor
+    func archiveAfterAnUnpostedTagWriteRecordsTheStoredTag() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let (vm, copy, member) = try await openChatWithHiddenInboxCopy(pool, tag: .reply, withMember: true)
+        guard let member, chatLoaded(vm, copy: copy.id, member: member.id) else {
+            Issue.record("control: the load published the hidden Inbox copy and the shown email"); return
+        }
+        let ids = [copy.id, member.id]
+
+        try await writeTags(pool, [copy.id: ActionTag.none, member.id: ActionTag.none], post: false)
+        #expect(ids.allSatisfy { heldTag(vm, $0) == TagPair(.reply) }, "control: nothing told the chat")
+
+        expectArchiveRecords(vm, ids, TagPair(ActionTag.none))
+        try await expectUndoRestores(pool, ids, TagPair(ActionTag.none))
+    }
+
+    @Test("A whole-chat Archive records a pending tag change on top of the stored tag, and not its own tag clear")
+    @MainActor
+    func archiveRecordsAPendingTagChange() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let (vm, copy, member) = try await openChatWithHiddenInboxCopy(pool, tag: .archive, withMember: true)
+        guard let member, chatLoaded(vm, copy: copy.id, member: member.id) else {
+            Issue.record("control: the load published the hidden Inbox copy and the shown email"); return
+        }
+
+        // A retag of the copy is pending: its intent is registered, its write has not landed.
+        AccountManager.shared.registerMutation(id: copy.id, mutation: .init(actionTag: .some(.delete)))
+
+        #expect(vm.archiveChat(vm.chatRows) == [copy.id, member.id], "Archive takes the chat's Inbox rows")
+        #expect(recordedTag(copy.id).member == TagPair(.delete), "the pending tag is the one Undo restores")
+        #expect(recordedTag(copy.id).snapshot == TagPair(.delete))
+        #expect(recordedTag(member.id).member == TagPair(.archive), "a row with nothing pending records its stored tag")
+        #expect(recordedTag(member.id).snapshot == TagPair(.archive))
+        try await settle(pool, ids: [copy.id, member.id], in: Self.archivePath)
+    }
+
+    @Test("A whole-chat Archive leaves out a row the store no longer holds, and records no undo for it")
+    @MainActor
+    func archiveLeavesOutARowNoLongerStored() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let (vm, copy, member) = try await openChatWithHiddenInboxCopy(pool, tag: .archive, withMember: true)
+        guard let member, chatLoaded(vm, copy: copy.id, member: member.id) else {
+            Issue.record("control: the load published the hidden Inbox copy and the shown email"); return
+        }
+        let copyId = copy.id
+        // The copy's row goes (another device removed it), and the chat still holds it.
+        try await pool.write { db in _ = try MessageHeader.deleteOne(db, key: copyId) }
+        #expect(vm.chatRows.contains(where: { $0.id == copyId }), "control: the chat still holds the copy")
+
+        #expect(vm.archiveChat(vm.chatRows) == [member.id], "Archive takes only the stored row")
+        let entry = UndoService.shared.undoStack.last
+        #expect(entry?.messages.map(\.id) == [member.id], "the undo snapshot names only the stored row")
+        #expect(entry?.commands.flatMap(\.members).map(\.originalHeaderId) == [member.id],
+                "the undo members name only the stored row")
+        try await settle(pool, ids: [member.id], in: Self.archivePath)
+    }
+
+
+    @Test("A whole-chat Archive records a pending tag clear on top of the stored tag, and its Undo restores no tag")
+    @MainActor
+    func archiveRecordsAPendingTagClear() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let (vm, copy, member) = try await openChatWithHiddenInboxCopy(pool, tag: .reply, withMember: true)
+        guard let member, chatLoaded(vm, copy: copy.id, member: member.id) else {
+            Issue.record("control: the load published the hidden Inbox copy and the shown email"); return
+        }
+        let ids = [copy.id, member.id]
+
+        // A tag clear of both rows is pending: its intent is registered, its write has not landed.
+        for id in ids {
+            AccountManager.shared.registerMutation(id: id, mutation: .init(actionTag: .some(nil)))
+        }
+        #expect(ids.allSatisfy { heldTag(vm, $0) == TagPair(.reply) }, "control: the chat holds the stored tag")
+
+        expectArchiveRecords(vm, ids, TagPair(nil))
+        try await expectUndoRestores(pool, ids, TagPair(nil))
+    }
+
+    @Test("A tag whose write lands while a whole-chat Archive reads its rows is the one the Archive records and its Undo restores")
+    @MainActor
+    func archiveRecordsATagThatLandsDuringItsRead() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let (vm, copy, member) = try await openChatWithHiddenInboxCopy(pool, tag: .archive, withMember: true)
+        guard let member, chatLoaded(vm, copy: copy.id, member: member.id) else {
+            Issue.record("control: the load published the hidden Inbox copy and the shown email"); return
+        }
+        let ids = [copy.id, member.id]
+
+        // A retag of both rows is pending when the Archive starts.
+        for id in ids {
+            AccountManager.shared.registerMutation(id: id, mutation: .init(actionTag: .some(.reply)))
+        }
+        // Right after the Archive read the rows, the retag's write lands and its overlay entry
+        // retires, as the write queue does on another thread.
+        let landed = Flag()
+        vm._chatRowsReadHook = {
+            guard !landed.on else { return }
+            landed.on = true
+            do {
+                try pool.writeWithoutTransaction { db in
+                    for id in ids {
+                        guard var row = try MessageHeader.fetchOne(db, key: id) else { continue }
+                        row.setActionTag(.reply)
+                        try row.update(db)
+                    }
+                }
+            } catch {
+                Issue.record("the retag's write failed: \(error)")
+            }
+            AccountManager.shared.removeOverlayEntries(ids: ids)
+        }
+
+        expectArchiveRecords(vm, ids, TagPair(.reply))
+        #expect(landed.on, "control: the retag landed between the Archive's read and its record")
+        try await expectUndoRestores(pool, ids, TagPair(.reply))
+    }
+
+    enum WholeChatAction: String, CaseIterable, Sendable {
+        case trash, move
+    }
+
+    @Test("A whole-chat Trash or Move records every row's stored tag, the opened email's included, and its Undo restores it",
+          arguments: WholeChatAction.allCases)
+    @MainActor
+    func trashAndMoveRecordTheStoredTagOnEveryRow(action: WholeChatAction) async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let opener = try insertHeader(pool, messageId: "every-row-opener-\(action.rawValue)")
+        let member = try insertHeader(pool, messageId: "every-row-member-\(action.rawValue)")
+        let ids = [opener.id, member.id]
+        try await writeTags(pool, [opener.id: .archive, member.id: .archive], post: false)
+        var shownOpener = opener
+        shownOpener.setActionTag(.archive)
+        var shownMember = member
+        shownMember.setActionTag(.archive)
+        let vm = openChat(pool, focused: shownOpener, others: [shownMember])
+
+        // A newer tag is stored and nothing tells the chat.
+        try await writeTags(pool, [opener.id: .reply, member.id: .reply], post: false)
+        #expect(ids.allSatisfy { id in vm.chatRows.first(where: { $0.id == id }).map { TagPair(of: $0) } == TagPair(.archive) },
+                "control: the chat holds the older tag")
+
+        let movedPath: String
+        switch action {
+        case .trash:
+            movedPath = Self.trashPath
+            #expect(vm.deleteChat(vm.chatRows) == Set(ids), "Trash takes every row")
+        case .move:
+            movedPath = Self.clientsPath
+            #expect(vm.moveChat(vm.chatRows, toFolderPath: Self.clientsPath) == Set(ids),
+                    "Move takes the rows in the opened folder")
+        }
+        for id in ids {
+            let recorded = recordedTag(id)
+            #expect(recorded.snapshot == TagPair(.reply), "the undo snapshot of \(id) holds the stored tag")
+            #expect(recorded.member == TagPair(.reply), "the undo member of \(id) holds the stored tag")
+        }
+        try await expectUndoRestores(pool, ids, TagPair(.reply), movedTo: movedPath)
+    }
+
+    @Test("A whole-chat Archive records each row's folder as the chat holds it, while its tag is the stored one, and its Undo returns the row there with that tag")
+    @MainActor
+    func archiveRecordsTheFolderTheChatHolds() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let opener = try insertHeader(pool, messageId: "held-folder-opener")
+        let member = try insertHeader(pool, messageId: "held-folder-member")
+        let vm = openChat(pool, focused: opener, others: [member])
+
+        // The member's stored row is rewritten in place, under the same id, in another folder and
+        // with a tag, as a move's local write does before its row is re-keyed.
+        let memberId = member.id
+        try await pool.write { db in
+            guard var row = try MessageHeader.fetchOne(db, key: memberId) else { return }
+            row.folderPath = Self.clientsPath
+            row.folderId = "acc1:\(Self.clientsPath)"
+            row.isInInbox = false
+            row.setActionTag(.reply)
+            try row.update(db)
+        }
+        #expect(vm.chatRows.first(where: { $0.id == memberId })?.folderPath == Self.inboxPath,
+                "control: the chat holds the member in the Inbox")
+
+        #expect(vm.archiveChat(vm.chatRows) == [opener.id, memberId], "Archive takes the chat's Inbox rows")
+        let entry = UndoService.shared.undoStack.last
+        let snapshot = entry?.messages.first(where: { $0.id == memberId })
+        let undoMember = entry?.commands.flatMap(\.members).first(where: { $0.originalHeaderId == memberId })
+        #expect(snapshot?.folderPath == Self.inboxPath, "the undo snapshot holds the folder the chat shows")
+        #expect(snapshot?.folderId == "acc1:\(Self.inboxPath)")
+        #expect(snapshot?.isInInbox == true, "the undo snapshot holds the Inbox flag the chat shows")
+        #expect(undoMember?.sourceFolderPath == Self.inboxPath, "Undo puts it back where the chat showed it")
+        #expect(undoMember?.sourceIsInInbox == true, "Undo puts it back as Inbox mail")
+        #expect(recordedTag(memberId).member == TagPair(.reply), "control: the tag is the stored one")
+
+        // Undo returns the member, as stored, to the folder the chat showed, with its tag pair.
+        let ids = [opener.id, memberId]
+        try await settle(pool, ids: ids, in: Self.archivePath)
+        await AccountManager.shared.awaitWriteQueueDrain()
+        await UndoService.shared.undo()
+        try await settle(pool, ids: ids, in: Self.inboxPath)
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let restored = try await rows(pool, [memberId])
+        #expect(restored.count == 1)
+        guard restored.count == 1 else { return }
+        #expect(restored[0].folderPath == Self.inboxPath, "Undo returns the member to the folder the chat showed, not \(restored[0].folderPath)")
+        #expect(restored[0].isInInbox, "Undo returns the member as Inbox mail")
+        #expect(TagPair(of: restored[0]) == TagPair(.reply), "Undo restores the member's tag pair, not \(TagPair(of: restored[0]))")
+    }
+
+    @Test("A whole-chat Archive takes a chat's email that a notification opened while it is still staged, and its Undo restores it")
+    @MainActor
+    func archiveTakesAStagedOpener() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        defer { NSEDataBridge.latestStagedRows.withLock { $0 = [] } }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        // The opened email is staged only: a notification opened it before it was stored.
+        let staged = StagedInboxRow(
+            accountId: "acc1", folderPath: Self.inboxPath, messageId: "staged-opener",
+            rfc822MessageId: "<staged-opener@example.com>", threadId: nil, inReplyTo: nil, references: [],
+            subject: "Test", senderName: "Sender", senderAddress: "sender@example.com", to: "me@example.com",
+            snippet: "body", date: Self.seededDate, isRead: false, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false, actionTag: ActionTag.reply.rawValue, summaryBlurb: nil)
+        NSEDataBridge.latestStagedRows.withLock { $0 = [staged] }
+        let opener = staged.toMessageHeader()
+        let member = try insertHeader(pool, messageId: "staged-member")
+        try await writeTags(pool, [member.id: .reply], post: false)
+        // The chat shows an older tag on both: the staged and stored tag is newer.
+        var shownOpener = opener
+        shownOpener.setActionTag(.archive)
+        var shownMember = member
+        shownMember.setActionTag(.archive)
+        let vm = openChat(pool, focused: shownOpener, others: [shownMember])
+        let ids = [opener.id, member.id]
+        #expect(try await rows(pool, [opener.id]).isEmpty, "control: the opened email is not stored")
+        #expect(ids.allSatisfy { id in vm.chatRows.first(where: { $0.id == id }).map { TagPair(of: $0) } == TagPair(.archive) },
+                "control: the chat shows the older tag")
+
+        // The staged email is stored once the Archive has read its rows, as the move's own merge
+        // of the staged rows stores it before it moves it.
+        let merged = Flag()
+        vm._chatRowsReadHook = {
+            guard !merged.on else { return }
+            merged.on = true
+            do {
+                try pool.writeWithoutTransaction { db in try opener.insert(db) }
+            } catch {
+                Issue.record("the merge's insert failed: \(error)")
+            }
+            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+        }
+
+        expectArchiveRecords(vm, ids, TagPair(.reply))
+        #expect(merged.on, "control: the email was still staged when the Archive read its rows")
+        try await expectUndoRestores(pool, ids, TagPair(.reply))
+    }
+
+    @Test("An email both stored and still staged, with different tags, is recorded with its stored tag by a whole-chat Archive, and its Undo restores it")
+    @MainActor
+    func archiveTakesTheStoredRowOverItsStagedCopy() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        defer { NSEDataBridge.latestStagedRows.withLock { $0 = [] } }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        // The stored row is tagged Reply; its staged copy (not yet unstaged) still says Archive,
+        // and the chat shows Delete.
+        let opener = try insertHeader(pool, messageId: "stored-and-staged")
+        try await writeTags(pool, [opener.id: .reply], post: false)
+        let staged = StagedInboxRow(
+            accountId: "acc1", folderPath: Self.inboxPath, messageId: "stored-and-staged",
+            rfc822MessageId: "<stored-and-staged@example.com>", threadId: nil, inReplyTo: nil, references: [],
+            subject: "Test", senderName: "Sender", senderAddress: "sender@example.com", to: "me@example.com",
+            snippet: "body", date: Self.seededDate, isRead: false, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false, actionTag: ActionTag.archive.rawValue, summaryBlurb: nil)
+        #expect(staged.headerId == opener.id, "control: the staged copy is the same email")
+        NSEDataBridge.latestStagedRows.withLock { $0 = [staged] }
+        var shown = opener
+        shown.setActionTag(.delete)
+        let vm = openChat(pool, focused: shown, others: [])
+
+        expectArchiveRecords(vm, [opener.id], TagPair(.reply))
+        try await expectUndoRestores(pool, [opener.id], TagPair(.reply))
+    }
+
+    @Test("When the chat's rows cannot be read, a whole-chat action moves nothing and records no Undo")
+    @MainActor
+    func unreadableRowsMoveNothing() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+
+        let inbox = try insertHeader(pool, messageId: "unreadable-rows-inbox")
+        let filed = try insertHeader(pool, messageId: "unreadable-rows-filed", folderPath: Self.projectsPath, isRead: true)
+        let chat = [inbox, filed]
+        let ids = chat.map(\.id)
+        let before = try await folders(pool, ids)
+        // A staged email the chat also shows: it could be taken without the store.
+        let staged = StagedInboxRow(
+            accountId: "acc1", folderPath: Self.inboxPath, messageId: "unreadable-rows-staged",
+            rfc822MessageId: "<unreadable-rows-staged@example.com>", threadId: nil, inReplyTo: nil, references: [],
+            subject: "Test", senderName: "Sender", senderAddress: "sender@example.com", to: "me@example.com",
+            snippet: "body", date: Self.seededDate, isRead: false, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false, actionTag: nil, summaryBlurb: nil)
+        NSEDataBridge.latestStagedRows.withLock { $0 = [staged] }
+        defer { NSEDataBridge.latestStagedRows.withLock { $0 = [] } }
+        let stagedRow = staged.toMessageHeader()
+        let shown = chat + [stagedRow]
+        let vm = openChat(pool, focused: inbox, others: [filed, stagedRow])
+
+        // Every email read fails, as it does on a database error, while the folder roles read.
+        try await pool.write { try $0.execute(sql: "ALTER TABLE messageHeader RENAME TO messageHeaderUnreadable") }
+        #expect(vm.chatHasInboxCopy, "control: the folder roles still read")
+        #expect(vm.archiveChat(shown).isEmpty)
+        #expect(vm.deleteChat(shown).isEmpty)
+        #expect(vm.moveChat(shown, toFolderPath: Self.clientsPath).isEmpty)
+        #expect(UndoService.shared.undoStack.isEmpty, "nothing to undo")
+        #expect(shown.allSatisfy { AccountManager.shared.snapshotOverlay()[$0.id] == nil }, "no email is shown moved")
+        try await pool.write { try $0.execute(sql: "ALTER TABLE messageHeaderUnreadable RENAME TO messageHeader") }
+        #expect(try await folders(pool, ids) == before, "every email is where it was")
+        #expect(try await opsInDrainOrder(pool).isEmpty, "no work is queued")
+
+        // Control: with the rows readable again and nothing staged, the same Delete takes the chat.
+        NSEDataBridge.latestStagedRows.withLock { $0 = [] }
+        #expect(vm.deleteChat(chat) == Set(ids), "control: a readable chat moves")
+        var deleted = before
+        deleted[inbox.id] = Self.trashPath
+        deleted[filed.id] = Self.trashPath
+        try await settle(pool, deleted)
+    }
+
+
+    @Test("A whole-chat Archive across two accounts records each row's stored tag, and one Undo restores each")
+    @MainActor
+    func archiveRecordsTheStoredTagInEveryAccount() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+        try await addRenamedAccount(pool)
+
+        let opener = try insertHeader(pool, messageId: "tag-two-acc-own")
+        let other = try insertHeader(pool, messageId: "tag-two-acc-other", accountId: "acc2")
+        try await writeTags(pool, [opener.id: .archive, other.id: .archive], post: false)
+        var shownOpener = opener
+        shownOpener.setActionTag(.archive)
+        var shownOther = other
+        shownOther.setActionTag(.archive)
+        let vm = openChat(pool, focused: shownOpener, others: [shownOther])
+
+        // Each account's row gets its own newer tag, and nothing tells the chat.
+        try await writeTags(pool, [opener.id: .reply, other.id: .delete], post: false)
+        let expected = [opener.id: TagPair(.reply), other.id: TagPair(.delete)]
+
+        #expect(vm.archiveChat(vm.chatRows) == [opener.id, other.id], "Archive takes the Inbox row in each account")
+        #expect(UndoService.shared.undoStack.count == 1, "one Undo entry for both accounts")
+        for (id, pair) in expected {
+            #expect(recordedTag(id).snapshot == pair, "the undo snapshot of \(id) holds \(pair)")
+            #expect(recordedTag(id).member == pair, "the undo member of \(id) holds \(pair)")
+        }
+
+        let archived = [opener.id: Self.archivePath, other.id: Self.otherArchivePath]
+        try await settle(pool, archived)
+        await AccountManager.shared.awaitWriteQueueDrain()
+        #expect(try await folders(pool, [opener.id, other.id]) == archived, "control: each went to its own Archive")
+        await UndoService.shared.undo()
+        try await settle(pool, [opener.id: Self.inboxPath, other.id: Self.inboxPath])
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let restored = try await rows(pool, [opener.id, other.id])
+        #expect(restored.count == 2)
+        for row in restored {
+            #expect(row.folderPath == Self.inboxPath, "control: Undo put \(row.id) back")
+            #expect(TagPair(of: row) == expected[row.id], "Undo restores \(row.id)'s own newer tag, not \(TagPair(of: row))")
+        }
+    }
 }
