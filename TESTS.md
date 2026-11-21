@@ -1398,8 +1398,10 @@ The same suite pins that a report the backend took says "Report Submitted" exact
 happens to the view that asked for it, and a report it did not take says nothing (#1113):
 - `aScrolledRowKeepsItsReport`: a lazy list's reporting row scrolls away and back while the report
   sends; the sheet stays, and the answer shows the confirmation once, alone.
-- `aRemovedRowsTakenReportConfirmsOnce`: a sync removes the reporting row from its `List` while the
-  report sends; the sheet goes with the row, and the answer still shows the confirmation once.
+- `aRemovedRowsTakenReportConfirmsOnce`: a sync removes the reporting row while the report sends;
+  the sheet goes with the row, and the answer still shows the confirmation once, alone, with
+  nothing after OK. The rows sit in a `VStack`, not a `List`: a row removed from a `List` kept its
+  sheet up, so the test never reached its case.
 - `aSystemClosedPopoversReportConfirmsOnlyWhenTaken`: the system closes the notice's popover and its
   sheet while the report sends; a taken report shows the confirmation once, a refused one nothing.
 - `reportSubmittedWaitsForTheSheetToLeave`: drives `ReportConcernSubmission` directly in a key
@@ -1416,3 +1418,12 @@ happens to the view that asked for it, and a report it did not take says nothing
   `aClosedSheetsAnswerBeforeTheNextReport`, `aClosedSheetsAnswerDuringTheNextReport`,
   `aRemovedOwnersTakenAnswerConfirmsOnce`, `aRemovedNoticesTakenAnswerConfirmsOnce`,
   `anOldAnswerLeavesTheNextSendAlone`, `aSystemClosedPopoversAnswerNeverChangesTheNext`.
+- A sheet that leaves with nothing sent finishes its caller only for a report the caller asked for
+  and still shows:
+  - `aRetiredPresentationsSheetFinishesNothing`: with a presentation the test owns, a sheet up for
+    a presentation retired before it showed, or retired while it is up, finishes nothing on
+    Cancel; the next sheet the caller asks for finishes once on Cancel.
+  - `aClosedPopoversSheetNeverClosesTheReopenedNotice`: the system closes the notice's popover
+    with its sheet up, before or after Report, and the notice is reopened. SwiftUI then presents
+    the old sheet again from the closed popover, which UIKit refuses; the reopened notice stays
+    open with nothing on it (and after an old refusal), and its own report's Cancel closes it.

@@ -33,6 +33,19 @@ and "Report a concern". The chat pill keeps its own "AI responses may contain er
   or finishes a later report (`ReportPresentation`), so its OK never closes a popover the user has
   reopened.
   Pinned by `reportSubmittedWaitsForTheSheetToLeave` (no alert until the sheet has gone, then once; finish once) and `submittedReportClosesTheSheet` (the popover stays under the alert until OK).
+- **A sheet that leaves with nothing sent (#1113, round 2):** it finishes the caller (closes the
+  popover) only if it was in a window for a report the caller asked for (`ReportPresentation.open`)
+  and still shows. Once the system has closed the popover with its sheet up, the next change of
+  the report flag (the notice reopening clears it) makes SwiftUI present that sheet again from the
+  closed popover: a fresh sheet, which UIKit refuses ("whose view is not in the window hierarchy").
+  Before this rule that sheet's probe finished the caller and closed the reopened notice about
+  150 ms after it opened. The reopen retires the old report (`ReportPresentation.next`), so that
+  sheet, and the old sheet's own late departure, finish nothing. Debug builds log each report
+  sheet's window attach, detach and decision as `[AINotice … report sheet …` lines. Pinned by
+  `aRetiredPresentationsSheetFinishesNothing` and `aClosedPopoversSheetNeverClosesTheReopenedNotice`.
+- **List rows:** a sheet presented from a SwiftUI `List` row stays up when the row is removed
+  (still up five seconds later in both logged test runs), so a report sheet from a removed list row carries on as if the row
+  were there; a row in a `VStack` takes its sheet with it.
 - **Report:** "Report a concern" opens the shared report sheet (`reportConcernSheet`, extracted from
   the long-press `ReportConcernModifier`) with type `.summary` and every summary in the chat, the
   emails and the replies still sending or not sent, newest first

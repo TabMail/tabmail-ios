@@ -24,6 +24,9 @@ import UIKit
 ///     report finishes once: on OK, or for a refused report once the sheet has left, never when
 ///     the sheet of a sent report leaves. An old answer never closes, changes or finishes a later
 ///     report.
+///  5. A sheet that leaves with nothing sent finishes its caller only for a presentation the caller
+///     asked a sheet for and still shows: a sheet SwiftUI presents again from a popover the system
+///     closed, or one whose presentation the caller retired, never closes the reopened notice.
 @Suite("Chat AI summaries notice, hosted", .serialized, .processGlobalState)
 @MainActor
 struct ChatAISummariesNoticeHostedTests {
@@ -1230,7 +1233,9 @@ struct ChatAISummariesNoticeHostedTests {
     /// popover or the sheet runs, and the report's flag and presentation live on the button. The
     /// notice reopens with no sheet, and the next report's open retires the old presentation, so
     /// the old answer, before or after the next report starts sending, says "Report Submitted"
-    /// once over whatever is up, and its OK closes and changes nothing.
+    /// once over whatever is up, and its OK closes and changes nothing. The reopen also makes
+    /// SwiftUI present the old sheet again from the closed popover, which UIKit refuses; that sheet
+    /// belongs to the retired presentation and does not close the reopened notice.
     @Test("A popover the system closed while its report sends: the old answer says so once and never closes or changes the next report")
     func aSystemClosedPopoversAnswerNeverChangesTheNext() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
@@ -1437,18 +1442,26 @@ struct ChatAISummariesNoticeHostedTests {
         var ids = [0, 1, 2]
     }
 
-    /// A list whose row 0 reports, as a long-press caller's row does: its sheet is open from the start.
-    private struct ReportingList: View {
+    /// Rows whose row 0 reports, as a long-press caller's row does: its sheet is open from the
+    /// start. A `VStack` in a `ScrollView`, not a `List`: a row removed from a `List` kept its sheet
+    /// up (still presented five seconds later, in both logged runs), so the removal never took the sheet
+    /// down and the test never reached its case. In a stack the removed row's view goes, with the
+    /// sheet it presents, as `OwnerSwitch`'s removed owner does.
+    private struct ReportingRows: View {
         let rows: ListRows
         let send: ReportConcernSend
         let seen: Seen
 
         var body: some View {
-            List(rows.ids, id: \.self) { id in
-                if id == 0 {
-                    ReportingRow(send: send, seen: seen)
-                } else {
-                    Text("Row \(id)")
+            ScrollView {
+                VStack {
+                    ForEach(rows.ids, id: \.self) { id in
+                        if id == 0 {
+                            ReportingRow(send: send, seen: seen)
+                        } else {
+                            Text("Row \(id)").frame(maxWidth: .infinity, minHeight: 60)
+                        }
+                    }
                 }
             }
         }
@@ -1460,7 +1473,7 @@ struct ChatAISummariesNoticeHostedTests {
         let held = HeldSend()
         let rows = ListRows()
         try await HostedAccessibility.withAutomation {
-            try await Self.hosting(ReportingList(rows: rows, send: held.send, seen: Seen())) { controller in
+            try await Self.hosting(ReportingRows(rows: rows, send: held.send, seen: Seen())) { controller in
                 try await Self.waitUntil { Self.sheetIsUp(controller) }
                 try await Self.pressReport(in: controller, held: held)
                 rows.ids = [1, 2]  // a sync removes the reported row while the report sends
@@ -1469,7 +1482,7 @@ struct ChatAISummariesNoticeHostedTests {
                         "control: the sheet went with its row: \(String(describing: Self.topPresented(controller)))")
                 held.release(1, true)
                 let alert = try await Self.waitForConfirmation(in: controller, "removed row")
-                #expect(controller.presentedViewController === alert, "removed row: Report Submitted alone, from the list")
+                #expect(controller.presentedViewController === alert, "removed row: Report Submitted alone, from the rows")
                 try await Self.dismissConfirmation(alert, in: controller, "removed row")
                 #expect(controller.presentedViewController == nil, "removed row: nothing is presented after OK")
                 #expect(held.started == 1, "control: one report sent")
@@ -1507,6 +1520,109 @@ struct ChatAISummariesNoticeHostedTests {
                     }
                     #expect(controller.presentedViewController == nil,
                             "\(accepted ? "taken, after OK" : "not taken"): nothing is presented")
+                }
+            }
+        }
+    }
+
+    // MARK: - A sheet the caller did not ask for, or has retired
+
+    /// A caller that holds the presentation, as the notice does, so the test can retire it.
+    private struct RetiringCallerHost: View {
+        @Bindable var state: SheetState
+        let presentation: ReportPresentation
+        let finishes: Finishes
+
+        var body: some View {
+            Color.clear.reportConcernSheet(isPresented: $state.open, contentType: .suggestedReply,
+                                           content: { "pressed reply" }, send: { _, _, _, _ in false },
+                                           onFinish: { [finishes] in finishes.count += 1 },
+                                           presentation: presentation)
+        }
+    }
+
+    /// A sheet that leaves with nothing sent finishes its caller only for a presentation the caller
+    /// asked a sheet for and still shows. Driven directly, so the result does not depend on when
+    /// SwiftUI and UIKit put up or refuse a sheet: a sheet up for a presentation the caller had
+    /// already retired (as the sheet SwiftUI presents again from a popover the system closed, once
+    /// the notice has opened afresh), and a sheet whose presentation the caller retires while it is
+    /// up (as when the notice opens afresh before the old sheet's departure has been handled). Each
+    /// leaves by Cancel; then the caller asks for the next sheet, whose Cancel finishes it once.
+    @Test("A sheet for a presentation the caller retired, before or while it shows, finishes nothing when it leaves; the next sheet asked for finishes once")
+    func aRetiredPresentationsSheetFinishesNothing() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        for retired in ["beforeItShows", "whileItShows"] {
+            let state = SheetState()
+            let presentation = ReportPresentation()
+            let finishes = Finishes()
+            if retired == "beforeItShows" { presentation.next() }
+            try await HostedAccessibility.withAutomation {
+                try await Self.hosting(RetiringCallerHost(state: state, presentation: presentation,
+                                                          finishes: finishes)) { controller in
+                    try await Self.waitUntil { Self.sheetIsUp(controller) }
+                    #expect(Self.sheetIsUp(controller), "\(retired): control: the sheet is up")
+                    if retired == "whileItShows" { presentation.next() }
+                    // Waits until the sheet has gone and its departure has been handled.
+                    try await Self.cancelShowsNothing(in: controller)
+                    #expect(finishes.count == 0, "\(retired): the sheet leaving finishes nothing, got \(finishes.count)")
+                    state.open = true
+                    try await Self.waitUntil { Self.sheetIsUp(controller) }
+                    #expect(Self.sheetIsUp(controller), "\(retired): control: the next sheet is up")
+                    try await Self.cancelShowsNothing(in: controller)
+                    #expect(finishes.count == 1, "\(retired): the next sheet's Cancel finishes it once, got \(finishes.count)")
+                }
+            }
+        }
+    }
+
+    /// The system closes the notice's popover with its report sheet up, before or after Report,
+    /// and the user opens the notice again. The reopen retires the old presentation and clears the
+    /// report flag; SwiftUI then presents the old sheet again from the closed popover, a fresh sheet
+    /// that UIKit refuses ("whose view is not in the window hierarchy" in the test logs). Neither
+    /// that sheet nor the old popover's own sheet, however late its departure is handled, belongs
+    /// to a presentation the notice still shows: the reopened notice stays open, with nothing on it,
+    /// an old refusal leaves it open too, and its own report still opens and finishes it on Cancel.
+    @Test("A popover the system closed with its report sheet up, sent or not: the reopened notice stays open until its own report finishes it")
+    func aClosedPopoversSheetNeverClosesTheReopenedNotice() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted view")
+        for sent in [false, true] {
+            let held = HeldSend()
+            try await HostedAccessibility.withAutomation {
+                let button = AISummariesNoticeButton(landed: false, reportContent: { "Summary" }, firstOpen: Self.freshFirstOpen(),
+                                                     tipsAllowed: { true }, send: held.send)
+                try await Self.hosting(button) { controller in
+                    try await Self.openReport(in: controller)
+                    if sent { try await Self.pressReport(in: controller, held: held) }
+                    // Close only once the popover and its sheet have finished presenting.
+                    try await Self.waitUntil { Self.presentationSettled(controller) }
+                    #expect(Self.presentationSettled(controller), "sent \(sent): control: the popover and its sheet are on screen")
+                    // The system closes the popover and its sheet at once; the button stays mounted.
+                    controller.dismiss(animated: false)
+                    try await Self.waitUntil { controller.presentedViewController == nil }
+                    #expect(controller.presentedViewController == nil, "sent \(sent): control: the popover and its sheet closed")
+                    let glyph = try #require(Self.element(AISummariesNotice.accessibilityLabel, in: controller.view))
+                    #expect(glyph.accessibilityActivate())
+                    try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.title) }
+                    let notice = try #require(controller.presentedViewController, "sent \(sent): control: the reopened notice")
+                    try await Task.sleep(for: Self.quietPeriod)
+                    #expect(controller.presentedViewController === notice && notice.presentedViewController == nil,
+                            "sent \(sent): the reopened notice stays open, with nothing on it: \(String(describing: Self.topPresented(controller)))")
+                    if sent {
+                        held.release(1, false)
+                        try await Self.waitUntil { held.answered == 1 }
+                        #expect(held.answered == 1, "control: the old answer landed")
+                        try await Self.expectNoConfirmation(in: controller, "the old refusal")
+                        #expect(controller.presentedViewController === notice && notice.presentedViewController == nil,
+                                "the old refusal leaves the reopened notice open: \(String(describing: Self.topPresented(controller)))")
+                    }
+                    let report = try #require(Self.element(AISummariesNotice.reportTitle, in: notice.view),
+                                              "sent \(sent): the reopened notice offers its report")
+                    #expect(report.accessibilityActivate())
+                    try await Self.waitUntil { Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice) }
+                    #expect(Self.presentedLabels(controller).contains(AISummariesNotice.reportNotice),
+                            "sent \(sent): control: the reopened notice's own report sheet")
+                    // Its own Cancel closes the sheet and the notice: nothing is presented after.
+                    try await Self.cancelShowsNothing(in: controller)
                 }
             }
         }

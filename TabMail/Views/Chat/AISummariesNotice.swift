@@ -145,7 +145,9 @@ struct AISummariesNoticeButton: View {
     /// Opens the notice afresh. A report from an earlier popover is over: the system may have
     /// closed that popover with its sheet still up, so nothing cleared the flag or ended the
     /// presentation. Retire it, so a late answer cannot close or finish this one, and start with no
-    /// sheet up. A late answer the backend took still says "Report Submitted", once.
+    /// sheet up. A late answer the backend took still says "Report Submitted", once. Clearing the
+    /// flag can make SwiftUI ask the closed popover for its sheet again, which UIKit refuses; that
+    /// sheet shows for the retired presentation, so it finishes nothing either.
     private func openNotice() {
         reportPresentation.next()
         showsReport = false
@@ -204,9 +206,10 @@ private struct AISummariesNoticePopover: View {
     }
 }
 
-/// Debug-only trace of the notice's presentations, with what each key window has presented.
+/// Debug-only trace of the notice's presentations and of the report sheet's window probe
+/// (`ReportConcernSheet`), with what each key window has presented.
 /// `@autoclosure`: a release build never builds the tag or the message, nor reads what they read.
-@MainActor private func noticeDebugLog(_ tag: @autoclosure () -> String, _ message: @autoclosure () -> String) {
+@MainActor func noticeDebugLog(_ tag: @autoclosure () -> String, _ message: @autoclosure () -> String) {
     #if DEBUG
     let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
     let presented = windows.compactMap { window -> String? in
