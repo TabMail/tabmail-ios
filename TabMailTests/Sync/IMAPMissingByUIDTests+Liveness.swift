@@ -105,6 +105,87 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    @Test("A multi-slice owed listing: an earlier slice applied over-age, a later slice in time; the mark stays and the message loads at the daily check")
+    @MainActor
+    func overAgeEarlierSliceKeepsTheListingUnclean() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-over-age-slice", server: server, local: server) { w in
+            try await w.dropLocal([12])
+            try await w.markOwed()
+            let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() }, maxRequests: 3, listingRangeMessages: w.rangeMessages))
+            let result = try #require(read.results.first)
+            #expect(result.completedListing == nil && result.loaded.contains { $0.id == "12" },
+                    "setup: a slice that loads the missing message and does not complete the listing")
+            let overAge = CatchUpWallClock.now().addingTimeInterval(-SyncConfig.catchUpCompletionLogRetentionSeconds - 60)
+            _ = await w.engine.applyCatchUpResult(
+                result, windowMode: .uid, readStartedAt: overAge, selfHealOwedAtRead: read.owedAtRead)
+            #expect(!(try w.held()).contains(12), "setup: the over-age apply skipped the load")
+            let clock = CatchUpTestClock()
+            for _ in 0..<10 where try w.catchUpState()?.listing != nil { await w.slice(clock: clock) }
+            #expect(try w.catchUpState()?.listing == nil, "setup: a later in-time slice completed the listing")
+            #expect((try w.changeState()).selfHealDue, "#1062: skipped loads in an earlier slice keep the listing unclean")
+            clock.advance(by: Self.pastTheNextCheck)
+            for _ in 0..<10 where !(try w.held()).contains(12) { await w.slice(clock: clock) }
+            #expect((try w.held()).contains(12), "#1062: the daily check lists and loads the message")
+        }
+    }
+
+    @Test("An unclean owed listing that started before the mark completes: the mark stays and the lapse is not marked again")
+    @MainActor
+    func uncleanListingStartedBeforeTheMarkKeepsTheMark() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-unclean-before-mark", server: server, local: server) { w in
+            var messages = server.map(Self.message)
+            messages[14] = Self.message(15, date: "not a date")
+            w.server.setMessages(messages, in: Self.path)
+            w.server.suppressFetchInternalDate(in: Self.path, uids: [15])
+            try await w.dropLocal([15])
+            let folderId = w.folderId
+            try await w.pool.write { db in try SyncEngine.markCatchUpLapse(folderId: folderId, db: db) }
+            let clock = CatchUpTestClock()
+            await w.slice(maxRequests: 1, clock: clock)
+            #expect(try w.catchUpState()?.listing != nil, "setup: a listing is in progress")
+            try await w.markOwed()
+            let lapseAtMark = try w.catchUpState()?.lapseCount
+            #expect((try w.catchUpState()?.listing?.lapseCountAtStart ?? 0) < (lapseAtMark ?? 0), "setup: the listing started before the mark")
+            await w.slice(clock: clock)
+            clock.advance(by: Self.pastTheHold)
+            for _ in 0..<5 where try w.catchUpState()?.listing != nil { await w.slice(clock: clock) }
+            #expect(try w.catchUpState()?.listing == nil, "setup: the listing completed after the hold bound")
+            #expect((try w.changeState()).selfHealDue, "#1062: an unclean completion keeps the mark")
+            #expect(try w.catchUpState()?.lapseCount == lapseAtMark, "#1062: an unclean completion marks the lapse nothing more")
+        }
+    }
+
+    @Test("An owed folder whose listing completed unclean, with no server changes, is not listed again before the daily check")
+    @MainActor
+    func uncleanOwedFolderWaitsForTheDailyCheck() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-unclean-modseq", server: server, local: server) { w in
+            var messages = server.map(Self.message)
+            messages[11] = Self.message(12, date: "not a date")
+            w.server.setMessages(messages, in: Self.path)
+            w.server.suppressFetchInternalDate(in: Self.path, uids: [12])
+            try await w.dropLocal([12])
+            try await w.markOwed()
+            let clock = CatchUpTestClock()
+            await w.slice(clock: clock)
+            clock.advance(by: Self.pastTheHold)
+            await w.slice(clock: clock)
+            #expect(try w.catchUpState()?.listing == nil, "setup: the listing completed unclean")
+            #expect(try w.catchUpState()?.completionStamp != nil, "#1062: an unclean completion still records its change-counter stamp")
+            var relistings = 0
+            for _ in 0..<5 {
+                clock.advance(by: Self.pastTheHold)
+                let start = w.server.recordedCommands().count
+                await w.slice(clock: clock)
+                if !Self.listingRanges(w.server.recordedCommands().dropFirst(start)).isEmpty { relistings += 1 }
+            }
+            #expect(relistings == 0, "#1062: with the change counter unmoved, no relisting before the daily check (\(relistings))")
+            #expect((try w.changeState()).selfHealDue, "#1062: still owed")
+        }
+    }
+
     @Test("An owed mark made on a floor-only state (the window merge wrote only the floor) is settled by the first listing that starts after it")
     @MainActor
     func floorOnlyStateMarkSettlesInOneListing() async throws {

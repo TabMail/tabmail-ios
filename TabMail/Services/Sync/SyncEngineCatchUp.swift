@@ -340,7 +340,9 @@ extension SyncEngine {
     /// newer action stands on (`catchUpReadPredatesAction`), and every load of an
     /// over-age read (`catchUpReadIsOverAge`), is not inserted. That is not a
     /// failure: the state is written, and the message, if the server still lists
-    /// it in the folder, is missing again at the next listing.
+    /// it in the folder, is missing again at the next listing. Over-age is decided
+    /// ONCE, here, before the insert, and the same verdict reaches the transaction
+    /// (#1062): an over-age read inserts nothing and its listing is unclean.
     @discardableResult
     func applyCatchUpResult(
         _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date,
@@ -350,17 +352,18 @@ extension SyncEngine {
         if !result.loadFailures.isEmpty && DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loadFailures.count) missing id(s) did not load: \(result.loadFailures.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", "))")
         }
-        if !result.loaded.isEmpty, !(await insertCatchUpLoads(result, readStartedAt: readStartedAt)) {
+        let appliedAt = CatchUpWallClock.now()
+        let readIsOverAge = Self.catchUpReadIsOverAge(readStartedAt: readStartedAt, now: appliedAt)
+        if !result.loaded.isEmpty, !readIsOverAge, !(await insertCatchUpLoads(result, readStartedAt: readStartedAt)) {
             BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): \(result.loaded.count) loaded message(s) did not all land — nothing written, the listing stays where it was")
             return .skipped
         }
 
         let outcome: CatchUpApplyOutcome
-        let appliedAt = CatchUpWallClock.now()
         do {
             outcome = try await dbPool.write { db in
                 try Self.applyCatchUpTransaction(
-                    result, windowMode: windowMode, readStartedAt: readStartedAt, now: appliedAt,
+                    result, windowMode: windowMode, readStartedAt: readStartedAt, readIsOverAge: readIsOverAge,
                     selfHealOwedAtRead: selfHealOwedAtRead, db: db)
             }
         } catch {
@@ -371,7 +374,7 @@ extension SyncEngine {
         switch outcome {
         case .applied(let updatedFlags, let removedIds):
             let readAge = appliedAt.timeIntervalSince(readStartedAt)
-            if Self.catchUpReadIsOverAge(readStartedAt: readStartedAt, now: appliedAt)
+            if readIsOverAge
                 && !(result.flagUpdates.isEmpty && result.loaded.isEmpty) && DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[CatchUp] \(folderId): read began \(Int(readAge)) s ago — \(result.flagUpdates.count) read/flag update(s) and \(result.loaded.count) load(s) not applied")
             }
@@ -490,11 +493,12 @@ extension SyncEngine {
 
     /// The transaction itself. Everything it decides on is read INSIDE it: the folder
     /// row (quarantine, epoch), the pending operations and the recent completions.
-    /// `now` is the wall clock (`CatchUpWallClock`) at the apply.
+    /// `readIsOverAge`: the caller's one over-age verdict (`catchUpReadIsOverAge`),
+    /// the same one that kept the loads out of the insert (#1062).
     /// `selfHealOwedAtRead`: the folder's `FolderChangeState.selfHealOwed` when
     /// the read began (nil: not known, nothing is re-marked).
     nonisolated static func applyCatchUpTransaction(
-        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date, now: Date,
+        _ result: CatchUpFolderResult, windowMode: StaleWindowMode, readStartedAt: Date, readIsOverAge: Bool,
         selfHealOwedAtRead: Int? = nil, db: Database
     ) throws -> CatchUpApplyOutcome {
         guard let folder = try Folder.fetchOne(db, key: result.folderId),
@@ -523,7 +527,6 @@ extension SyncEngine {
         // the completion log's retention may predate an entry already dropped, so
         // it applies no read or flag update at all; its removals and state still
         // apply, so the listing moves on.
-        let readIsOverAge = catchUpReadIsOverAge(readStartedAt: readStartedAt, now: now)
 
         var updatedFlags = 0
         for update in result.flagUpdates where !readIsOverAge {
@@ -576,6 +579,17 @@ extension SyncEngine {
                 ELSE :new END
             WHERE id = :id
             """, arguments: ["new": result.newState, "key": CatchUpLapse.countKey, "id": folder.id])
+        // Loads this apply skipped as an over-age read make the listing unclean
+        // in its SAVED state, as a passed-over UID does (#1062): the state moves
+        // the listing past them, so a later slice that completes it must not
+        // settle the owed mark.
+        let skippedLoads = readIsOverAge && !result.loaded.isEmpty
+        if skippedLoads {
+            try db.execute(sql: """
+                UPDATE folder SET catchUpState = json_set(catchUpState, '$.listing.passedOver', json('true'))
+                WHERE id = ? AND json_valid(catchUpState) AND json_type(catchUpState, '$.listing') = 'object'
+                """, arguments: [folder.id])
+        }
         if let windowFloor {
             try Self.recordCatchUpWindowFloor(folderId: folder.id, lowest: windowFloor, db: db)
         }
@@ -593,7 +607,6 @@ extension SyncEngine {
         // loads this apply skipped as an over-age read, is unclean: the folder
         // stays owed and is listed again at the daily full check (an owed folder
         // gets it even with a bookmark, `IMAPProvider.catchUpPlan`), never sooner.
-        let skippedLoads = readIsOverAge && !result.loaded.isEmpty
         let clean = result.completedListing.map { $0.clean && !skippedLoads } ?? false
         let startedAfterMark = result.completedListing.map {
             $0.lapseCountAtStart >= (changeState.selfHealLapse ?? 0)

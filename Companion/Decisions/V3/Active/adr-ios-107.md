@@ -1128,7 +1128,7 @@ Operative rules (`IMAPProviderCatchUp.swift`, `SyncEngineCatchUp.swift`):
   listing that started at or after the mark (`lapseCountAtStart >= selfHealLapse`). Unclean: anything
   passed over (held, unanswered, a range moved past after its membership SEARCH kept failing), or loads
   the apply skipped as an over-age read. An unclean completion keeps the folder owed and re-marks
-  nothing: it is listed again at the daily full check, never hourly (amended d2 2026-11-20; the d1 rule
+  nothing: it is listed again at least daily, plus when its change counter moves past the stamp the unclean listing still records; over-age skipped loads in ANY slice mark the saved listing unclean, and over-age is decided once before the insert (amended d2 2026-11-20; the d1 rule
   "settled by any completion, passed-over UIDs on the re-read list" is superseded: it recorded only the
   lowest held UID per range and settled with mail on no retry path). An owed folder gets the daily and
   MODSEQ checks even when it holds a bookmark (the plan's `isTracked` = bookmark held AND not owed),

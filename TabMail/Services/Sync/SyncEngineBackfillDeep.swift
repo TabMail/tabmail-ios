@@ -147,9 +147,8 @@ extension SyncEngine {
     /// `catchUpReadStartedAt` is set only by the catch-up's direct load
     /// (`SyncEngine.applyCatchUpResult`): when the read that listed `headers`
     /// began, on `CatchUpWallClock`. Each chunk then skips a message the user's
-    /// own action stands on (`catchUpReadPredatesAction`), and inserts nothing
-    /// for a read as old as the completion log's retention
-    /// (`catchUpReadIsOverAge`). A skipped message is not a failure and marks
+    /// own action stands on (`catchUpReadPredatesAction`). An over-age read never
+    /// gets here: the caller decides that once and inserts nothing (#1062). A skipped message is not a failure and marks
     /// nothing: the folder still lacks it, so the next listing finds it missing
     /// again if the server still lists it there.
     func insertBackfillBatch(
@@ -237,8 +236,7 @@ extension SyncEngine {
                         // (Memory 127).
                         let catchUpShield = catchUpReadStartedAt.map { readStartedAt in
                             (readStartedAt: readStartedAt,
-                             recentlyCompleted: AccountManager.shared.liveRecentlyCompleted(),
-                             overAge: SyncEngine.catchUpReadIsOverAge(readStartedAt: readStartedAt, now: CatchUpWallClock.now()))
+                             recentlyCompleted: AccountManager.shared.liveRecentlyCompleted())
                         }
 
                         // Existence check: the same predicate the IMAP UID walk
@@ -291,7 +289,6 @@ extension SyncEngine {
                             // keeps the two in step.
                             if existingIds.contains(info.messageId) { continue }
                             if let catchUpShield {
-                                if catchUpShield.overAge { continue }
                                 if SyncEngine.catchUpReadPredatesAction(
                                     accountId: accountId, messageId: info.messageId,
                                     rfc822MessageId: info.rfc822MessageId,
