@@ -296,8 +296,16 @@ same AI result, kept as long as the email itself is shown.
      builds. In a plain stack `onAppear` fires for every row at once, which is why the per-row ask
      uses `onScrollVisibilityChange` (`onGeometryChange` with `ChatRowVisibility` since 2026-11-16).
    - `defaultScrollAnchor(.bottom)` opens at the newest email. The landing `scrollTo` is issued once
-     the thread is loaded, and again on every container or content size change until a scroll of
-     any kind begins (memory 036: a first scroll can be dropped while the screen settles). The first
+     the thread is loaded, and again on every container size, content size or inset change until
+     a scroll of any kind begins (memory 036: a first scroll can be dropped while the screen
+     settles; and the first pass shows the opened email alone, which `defaultScrollAnchor(.bottom)`
+     sits at the bottom with a top inset filling the rest of the screen. That fill goes in the next
+     layout pass after the landing scroll, and on that inset change the platform keeps the offset
+     plus the top inset, which moves a bottom landing past the bottom by the fill. Main-thread
+     stalls only widen the gap between the landing and that pass: 3 ms in a two-email chat, 150 to
+     310 ms in 40-email chats behind stalls of a quarter to most of a second. The signed-in and
+     ready AI Reply states add no update of their own; amended 2026-11-20, mechanism measured
+     2026-11-21). The first
      scroll records the members' unread state itself (`noteMembers`) before choosing where to land:
      SwiftUI runs the thread-loaded and members changes in either order, and the screen tests caught
      the chat opening at the bottom with the Unread line missing.
@@ -313,6 +321,16 @@ same AI result, kept as long as the email itself is shown.
      while the chat is on screen, after a background return that cancelled and rebuilt the queue,
      while another screen covers the chat, or across a relaunch shows its summary once the chat is
      shown again.
+   - No automated test fails without the landing's re-issue on the insets (2026-11-21). A hosted
+     test that held the chat's thread lookup until a display frame showed the first pass's fill saw
+     the fill go in the same frame as the landing, with or without the re-issue, in every run:
+     nothing there stalls the main thread between the landing and the next layout pass, and a test
+     can make such a stall only by blocking the main thread, so that test was dropped. A settled
+     check passes either way (a later platform update sometimes clamps the offset back), and a real
+     top bar that shrinks keeps the bottom by itself (memory 036). The fix rests on the debug-gated
+     geometry log: without the re-issue the chat showed 488 and 386 points past its bottom, and with
+     it the landing came back 2 ms after the jump. The owner's phone smoke before the chat view
+     merges to main is the check.
 
    **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
    In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible

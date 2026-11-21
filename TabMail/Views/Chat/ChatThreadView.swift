@@ -317,10 +317,14 @@ struct ChatThreadView: View {
                     proxy.scrollTo(target.id, anchor: target.anchor)
                 }
                 // The first scroll can be dropped while the screen is still settling (memory 036),
-                // and late content (attachment chips, a summary) changes the heights: the landing
-                // is issued again on every size change until a scroll begins.
+                // and late content (attachment chips, a summary) changes the heights. The first
+                // pass shows the opened email alone, which `defaultScrollAnchor(.bottom)` sits at
+                // the bottom with a top inset filling the rest; that fill goes a pass or more after
+                // the thread lands, and on that inset change the platform keeps the offset plus the
+                // top inset, which moves a bottom landing past the bottom by the fill (memory 036).
+                // So the landing is issued again on every size or inset change until a scroll begins.
                 .onScrollGeometryChange(for: [CGFloat].self) { geo in
-                    [geo.containerSize.height, geo.contentSize.height]
+                    [geo.containerSize.height, geo.contentSize.height, geo.contentInsets.top, geo.contentInsets.bottom]
                 } action: { _, _ in
                     guard let target = scrollTarget else { return }
                     proxy.scrollTo(target.id, anchor: target.anchor)
