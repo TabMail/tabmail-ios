@@ -641,6 +641,39 @@ struct TutorialChatViewRunTests {
         }
     }
 
+    // A first-launch tour starts before the AI choice and teaches the chat view, so its sample email
+    // opens as a chat: a real open (`MessageOpenView`, routed as its body routes it) made during the
+    // run goes to the chat. The same open made once the run has ended, still before the choice, goes
+    // to today's detail: outside a tour, AI is off until the choice is made.
+    @Test("Before the AI choice, the tour opens its sample email as a chat; after the tour, still before the choice, a fresh open is today's detail")
+    func openBeforeTheAIChoice() async throws {
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        try await withSettings(chatView: true, aiChoiceMade: false) {
+            let coordinator = TutorialCoordinator.shared
+            let database = PrioritizedDatabase(pool: fixture.0)
+            #expect(AIService.isAIOff, "control: no AI choice yet, so AI is off")
+            var priyaId: String?
+            try await whileRunning(.reuseReply) {
+                #expect(coordinator.teachesChat, "control: the run teaches the chat view")
+                let found = try await fixture.0.read { db in
+                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                        && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+                }
+                let priya = try #require(found, "the demo seed has Priya's email")
+                priyaId = priya.id
+                let route = MessageOpenView(messageId: priya.id).route(pool: database)
+                #expect(route == .chat, "the tour opens its sample email as a chat before the AI choice")
+            }
+            #expect(!coordinator.isRunning, "control: the run ended")
+            #expect(ChatViewConfig.isEnabledByUser, "control: Chat View is still on")
+            #expect(AIService.isAIOff, "control: still no AI choice")
+            let id = try #require(priyaId, "the run found Priya's email")
+            let after = MessageOpenView(messageId: id).route(pool: database)
+            #expect(after == .detail, "outside the tour, before the AI choice, an open is today's detail")
+        }
+    }
+
     // A run that teaches today's view (Chat View off when it started) keeps today's view on every
     // surface until it ends, even when every live value says chat: Chat View turned on, the AI
     // choice made with AI on, and a plan. The rows show the snippet and the switch stays grayed out
