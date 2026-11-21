@@ -362,14 +362,6 @@ struct TutorialChatViewRunTests {
         try await body()
     }
 
-    private func start(_ lesson: TutorialLesson) async throws {
-        let coordinator = TutorialCoordinator.shared
-        try #require(!coordinator.isRunning)
-        await coordinator.start(lesson, hasTabMailSession: false)
-        try await DemoModeService.shared.completeSetup()
-        coordinator.seedingFinished()
-    }
-
     @Test("With Chat View on, the run teaches in the chat view from its start to the switch, whatever the setting does meanwhile")
     func chatViewRun() async throws {
         let fixture = try install()
@@ -377,115 +369,116 @@ struct TutorialChatViewRunTests {
         try await withSettings(chatView: true) {
             let coordinator = TutorialCoordinator.shared
             let pool = fixture.0
-            try await start(.reuseReply)
-            #expect(coordinator.teachesChat)
-            #expect(coordinator.step == .replyToPriya)
-            #expect(ChatViewConfig.opensInChat, "the run's chats open as chats")
-            // The setting changes mid-run: the run keeps what it started with.
-            UserDefaults.standard.set(false, forKey: ChatViewConfig.enabledKey)
-            #expect(coordinator.teachesChat)
-            #expect(ChatViewConfig.opensInChat)
-            #expect(!TutorialCoordinator.chatViewOnForTutorial, "the next run would not")
+            try await whileRunning(.reuseReply) {
+                #expect(coordinator.teachesChat)
+                #expect(coordinator.step == .replyToPriya)
+                #expect(ChatViewConfig.opensInChat, "the run's chats open as chats")
+                // The setting changes mid-run: the run keeps what it started with.
+                UserDefaults.standard.set(false, forKey: ChatViewConfig.enabledKey)
+                #expect(coordinator.teachesChat)
+                #expect(ChatViewConfig.opensInChat)
+                #expect(!TutorialCoordinator.chatViewOnForTutorial, "the next run would not")
 
-            // Part 2: the AI Suggestion waits in Priya's chat; the inbox chat has nothing to send.
-            #expect(coordinator.fieldMove(inPracticeChat: true) == .tapSuggestion)
-            #expect(coordinator.fieldMove(inPracticeChat: false) == nil)
-            #expect(coordinator.chatPrompt == nil)
-            // The edit keeps the reply a yes.
-            #expect(coordinator.composeEditPrompt == TutorialCoordinator.chatViewEditPrompt)
-            var edited: String?
-            await coordinator.runPracticeReplyEdit { edited = $0 }
-            #expect(edited == TutorialChatScript.shorterReply)
+                // Part 2: the AI Suggestion waits in Priya's chat; the inbox chat has nothing to send.
+                #expect(coordinator.fieldMove(inPracticeChat: true) == .tapSuggestion)
+                #expect(coordinator.fieldMove(inPracticeChat: false) == nil)
+                #expect(coordinator.chatPrompt == nil)
+                // The edit keeps the reply a yes.
+                #expect(coordinator.composeEditPrompt == TutorialCoordinator.chatViewEditPrompt)
+                var edited: String?
+                await coordinator.runPracticeReplyEdit { edited = $0 }
+                #expect(edited == TutorialChatScript.shorterReply)
 
-            // The practice reply goes out, as compose sends it.
-            let reply = TutorialChatScript.shorterReply
-            coordinator.practiceReplyAuthored(reply)
-            try await Task.sleep(for: .seconds(1))
-            let draftId = "tutorial-practice-\(UUID().uuidString)"
-            try await pool.write { db in
-                var draft = Draft(
-                    id: draftId, accountId: DemoSeed.demoAccountId,
-                    toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
-                    subject: "Re: Engineering offsite", body: reply, replyToId: nil,
-                    isForward: false, editHistoryJSON: nil,
-                    createdAt: Date().timeIntervalSince1970,
-                    updatedAt: Date().timeIntervalSince1970)
-                draft.instanceEpoch = "E1"
-                try draft.insert(db)
-            }
-            let account = try #require(try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) })
-            let priya = try #require(try await pool.read { db in
-                try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
-                    && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
-            })
-            // Linked to Priya's email, as compose links a reply.
-            let queued = try await AccountManager.shared.queueSend(
-                draft: DraftMessage(to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply,
-                                    inReplyTo: priya.rfc822MessageId),
-                from: account, replyToHeaderId: priya.id, draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
-            try await waitFor(.makeTemplate)
-
-            // Its Sent copy joins Priya's chat as the user's own bubble, with its own words: the
-            // tutorial makes no AI call, so nothing else would ever write its text message.
-            var sentCopy: MessageHeader?
-            for _ in 0..<80 {
-                sentCopy = try await pool.read { db in
-                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
-                        && Column("messageId") == "sent-\(queued.outboxId)").fetchOne(db)
+                // The practice reply goes out, as compose sends it.
+                let reply = TutorialChatScript.shorterReply
+                coordinator.practiceReplyAuthored(reply)
+                try await Task.sleep(for: .seconds(1))
+                let draftId = "tutorial-practice-\(UUID().uuidString)"
+                try await pool.write { db in
+                    var draft = Draft(
+                        id: draftId, accountId: DemoSeed.demoAccountId,
+                        toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                        subject: "Re: Engineering offsite", body: reply, replyToId: nil,
+                        isForward: false, editHistoryJSON: nil,
+                        createdAt: Date().timeIntervalSince1970,
+                        updatedAt: Date().timeIntervalSince1970)
+                    draft.instanceEpoch = "E1"
+                    try draft.insert(db)
                 }
-                if sentCopy?.summaryTextMessage != nil { break }
-                try await Task.sleep(for: .milliseconds(100))
+                let account = try #require(try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) })
+                let priya = try #require(try await pool.read { db in
+                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                        && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+                })
+                // Linked to Priya's email, as compose links a reply.
+                let queued = try await AccountManager.shared.queueSend(
+                    draft: DraftMessage(to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply,
+                                        inReplyTo: priya.rfc822MessageId),
+                    from: account, replyToHeaderId: priya.id, draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
+                try await waitFor(.makeTemplate)
+
+                // Its Sent copy joins Priya's chat as the user's own bubble, with its own words: the
+                // tutorial makes no AI call, so nothing else would ever write its text message.
+                var sentCopy: MessageHeader?
+                for _ in 0..<80 {
+                    sentCopy = try await pool.read { db in
+                        try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                            && Column("messageId") == "sent-\(queued.outboxId)").fetchOne(db)
+                    }
+                    if sentCopy?.summaryTextMessage != nil { break }
+                    try await Task.sleep(for: .milliseconds(100))
+                }
+                let sent = try #require(sentCopy, "the demo provider files the Sent copy")
+                #expect(sent.summaryTextMessage == reply)
+                let related = try ThreadDetection.findRelatedMessages(for: priya, in: pool)
+                #expect(related.contains { $0.id == sent.id }, "the sent reply is in Priya's chat")
+                let chat = ChatThread(
+                    members: [priya] + related, replyAddresses: { [$0.fromAddress] },
+                    ownAddresses: [DemoSeed.demoEmail.lowercased()], draftFolderIds: [],
+                    sentFolderIds: [sent.folderId], unreadAtOpen: [], preferredId: priya.id)
+                let bubble = try #require(chat.items.first { $0.id == sent.id })
+                #expect(bubble.isOwn)
+                #expect(bubble.textMessage == reply, "its own words, never Summarizing")
+
+                // The request in the same field, then Create.
+                #expect(coordinator.fieldMove(inPracticeChat: true) == .ask(.saveReplyAsTemplate))
+                #expect(coordinator.chatPrompt == nil, "the request is in Priya's field, not the inbox chat")
+                #expect(coordinator.highlightsTemplateCreate)
+                _ = await TutorialChatScript.answer(
+                    .saveReplyAsTemplate, practiceReply: coordinator.practiceReplyText,
+                    invocation: ToolInvocation(uiSink: AcceptingSink()))
+                try await waitFor(.reuseReplyDone)
+                let templateId = try #require(coordinator.savedTemplateId)
+                let template = try #require(PromptStore.shared.templates.first { $0.id == templateId })
+                #expect(template.name == TutorialChatScript.chatViewTemplateName)
+                #expect(template.exampleReply == reply)
+                #expect(coordinator.highlightsChatClose, "the chat's sheet closes onto the card")
+
+                // Part 3: the answer opens Jordan's chat at his email.
+                coordinator.nextLesson()
+                #expect(coordinator.chatPrompt == .flights)
+                coordinator.chatPromptSent(.flights)
+                coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
+                #expect(coordinator.step == .askAnythingDone)
+                coordinator.showMoreToAsk()
+                coordinator.chatPromptSent(.whatCanYouDo)
+
+                // The switch step, then the recap.
+                #expect(!coordinator.highlightsChatViewSwitch)
+                coordinator.finishChatViewSwitch()
+                #expect(coordinator.step == .moreToAsk, "Finish on the switch counts only at the switch")
+                coordinator.showRecap()
+                #expect(coordinator.step == .chatViewSwitch)
+                #expect(coordinator.highlightsChatViewSwitch)
+                coordinator.showRecap()
+                #expect(coordinator.step == .chatViewSwitch, "the recap's Finish runs once")
+                coordinator.finishChatViewSwitch()
+                #expect(coordinator.step == .finished)
+
+                await coordinator.end()
+                #expect(!coordinator.teachesChat, "an ended run teaches nothing")
+                #expect(!coordinator.highlightsChatViewSwitch)
             }
-            let sent = try #require(sentCopy, "the demo provider files the Sent copy")
-            #expect(sent.summaryTextMessage == reply)
-            let related = try ThreadDetection.findRelatedMessages(for: priya, in: pool)
-            #expect(related.contains { $0.id == sent.id }, "the sent reply is in Priya's chat")
-            let chat = ChatThread(
-                members: [priya] + related, replyAddresses: { [$0.fromAddress] },
-                ownAddresses: [DemoSeed.demoEmail.lowercased()], draftFolderIds: [],
-                sentFolderIds: [sent.folderId], unreadAtOpen: [], preferredId: priya.id)
-            let bubble = try #require(chat.items.first { $0.id == sent.id })
-            #expect(bubble.isOwn)
-            #expect(bubble.textMessage == reply, "its own words, never Summarizing")
-
-            // The request in the same field, then Create.
-            #expect(coordinator.fieldMove(inPracticeChat: true) == .ask(.saveReplyAsTemplate))
-            #expect(coordinator.chatPrompt == nil, "the request is in Priya's field, not the inbox chat")
-            #expect(coordinator.highlightsTemplateCreate)
-            _ = await TutorialChatScript.answer(
-                .saveReplyAsTemplate, practiceReply: coordinator.practiceReplyText,
-                invocation: ToolInvocation(uiSink: AcceptingSink()))
-            try await waitFor(.reuseReplyDone)
-            let templateId = try #require(coordinator.savedTemplateId)
-            let template = try #require(PromptStore.shared.templates.first { $0.id == templateId })
-            #expect(template.name == TutorialChatScript.chatViewTemplateName)
-            #expect(template.exampleReply == reply)
-            #expect(coordinator.highlightsChatClose, "the chat's sheet closes onto the card")
-
-            // Part 3: the answer opens Jordan's chat at his email.
-            coordinator.nextLesson()
-            #expect(coordinator.chatPrompt == .flights)
-            coordinator.chatPromptSent(.flights)
-            coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
-            #expect(coordinator.step == .askAnythingDone)
-            coordinator.showMoreToAsk()
-            coordinator.chatPromptSent(.whatCanYouDo)
-
-            // The switch step, then the recap.
-            #expect(!coordinator.highlightsChatViewSwitch)
-            coordinator.finishChatViewSwitch()
-            #expect(coordinator.step == .moreToAsk, "Finish on the switch counts only at the switch")
-            coordinator.showRecap()
-            #expect(coordinator.step == .chatViewSwitch)
-            #expect(coordinator.highlightsChatViewSwitch)
-            coordinator.showRecap()
-            #expect(coordinator.step == .chatViewSwitch, "the recap's Finish runs once")
-            coordinator.finishChatViewSwitch()
-            #expect(coordinator.step == .finished)
-
-            await coordinator.end()
-            #expect(!coordinator.teachesChat, "an ended run teaches nothing")
-            #expect(!coordinator.highlightsChatViewSwitch)
         }
     }
 
@@ -806,62 +799,58 @@ struct TutorialChatViewRunTests {
         defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
         try await withSettings(chatView: true) {
             let coordinator = TutorialCoordinator.shared
-            try await start(.reuseReply)
-            #expect(coordinator.step == .replyToPriya)
-            let priya = try #require(try await fixture.0.read { db in
-                try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
-                    && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
-            })
-            // The run ends on every way out, so a failure here leaves no live run for the next test.
-            do { try await HostedAccessibility.withAutomation {
-                let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-                let window = UIWindow(windowScene: scene)
-                let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) })
-                window.rootViewController = controller
-                window.makeKeyAndVisible()
-                defer {
-                    window.isHidden = true
-                    window.rootViewController = nil
-                }
-                @MainActor func coach() -> CGRect? {
-                    HostedAccessibility.elements(under: controller.view)
-                        .first { HostedAccessibility.identifier(of: $0) == "tutorial-coach" }?.accessibilityFrame
-                }
-                // The top of the first bubble: Priya's chat is short, so it sits at the bottom (its
-                // default anchor) and SwiftUI fills the space above it into the safe area. The room
-                // the card takes is therefore not readable from the scroll view here; what is
-                // readable, and what the bar must keep, is that nothing it holds covers a bubble.
-                @MainActor func firstBubbleTop() -> CGFloat? {
-                    HostedAccessibility.elements(under: controller.view)
-                        .filter { $0.accessibilityLabel?.contains(" said: ") == true }
-                        .map(\.accessibilityFrame.minY).min()
-                }
-                @MainActor func subject() -> CGRect? {
-                    HostedAccessibility.elements(under: controller.view)
-                        .first { $0.accessibilityLabel == priya.subject && $0.accessibilityHint == nil }?.accessibilityFrame
-                }
-                for _ in 0..<80 where coach() == nil || firstBubbleTop() == nil { try await Task.sleep(for: .milliseconds(100)) }
-                try await Task.sleep(for: .milliseconds(500))
-                let card = try #require(coach(), "the coach card shows: \(HostedAccessibility.identifiers(in: controller.view))")
-                #expect(card.height > 0)
-                let withCard = try #require(firstBubbleTop(), "Priya's bubbles show")
-                #expect(withCard >= card.maxY - 0.5, "the first bubble \(withCard) sits below the card \(card)")
+            try await whileRunning(.reuseReply) {
+                #expect(coordinator.step == .replyToPriya)
+                let priya = try #require(try await fixture.0.read { db in
+                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                        && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+                })
+                try await HostedAccessibility.withAutomation {
+                    let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+                    let window = UIWindow(windowScene: scene)
+                    let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) })
+                    window.rootViewController = controller
+                    window.makeKeyAndVisible()
+                    defer {
+                        window.isHidden = true
+                        window.rootViewController = nil
+                    }
+                    @MainActor func coach() -> CGRect? {
+                        HostedAccessibility.elements(under: controller.view)
+                            .first { HostedAccessibility.identifier(of: $0) == "tutorial-coach" }?.accessibilityFrame
+                    }
+                    // The top of the first bubble: Priya's chat is short, so it sits at the bottom (its
+                    // default anchor) and SwiftUI fills the space above it into the safe area. The room
+                    // the card takes is therefore not readable from the scroll view here; what is
+                    // readable, and what the bar must keep, is that nothing it holds covers a bubble.
+                    @MainActor func firstBubbleTop() -> CGFloat? {
+                        HostedAccessibility.elements(under: controller.view)
+                            .filter { $0.accessibilityLabel?.contains(" said: ") == true }
+                            .map(\.accessibilityFrame.minY).min()
+                    }
+                    @MainActor func subject() -> CGRect? {
+                        HostedAccessibility.elements(under: controller.view)
+                            .first { $0.accessibilityLabel == priya.subject && $0.accessibilityHint == nil }?.accessibilityFrame
+                    }
+                    for _ in 0..<80 where coach() == nil || firstBubbleTop() == nil { try await Task.sleep(for: .milliseconds(100)) }
+                    try await Task.sleep(for: .milliseconds(500))
+                    let card = try #require(coach(), "the coach card shows: \(HostedAccessibility.identifiers(in: controller.view))")
+                    #expect(card.height > 0)
+                    let withCard = try #require(firstBubbleTop(), "Priya's bubbles show")
+                    #expect(withCard >= card.maxY - 0.5, "the first bubble \(withCard) sits below the card \(card)")
 
-                // Part 3 starts in the inbox: Priya's chat holds no card for it. The demo, and so the
-                // chat, stays.
-                coordinator.nextLesson()
-                #expect(coordinator.step != .replyToPriya, "control: the run moved on")
-                for _ in 0..<80 where coach() != nil { try await Task.sleep(for: .milliseconds(100)) }
-                try await Task.sleep(for: .milliseconds(500))
-                #expect(coach() == nil, "the card goes once the run moves on")
-                let line = try #require(subject(), "the subject line shows: \(HostedAccessibility.labels(in: controller.view).prefix(20))")
-                let without = try #require(firstBubbleTop())
-                #expect(without >= line.maxY - 0.5, "the first bubble \(without) sits below the subject \(line)")
-            } } catch {
-                await coordinator.end()
-                throw error
+                    // Part 3 starts in the inbox: Priya's chat holds no card for it. The demo, and so the
+                    // chat, stays.
+                    coordinator.nextLesson()
+                    #expect(coordinator.step != .replyToPriya, "control: the run moved on")
+                    for _ in 0..<80 where coach() != nil { try await Task.sleep(for: .milliseconds(100)) }
+                    try await Task.sleep(for: .milliseconds(500))
+                    #expect(coach() == nil, "the card goes once the run moves on")
+                    let line = try #require(subject(), "the subject line shows: \(HostedAccessibility.labels(in: controller.view).prefix(20))")
+                    let without = try #require(firstBubbleTop())
+                    #expect(without >= line.maxY - 0.5, "the first bubble \(without) sits below the subject \(line)")
+                }
             }
-            await coordinator.end()
         }
     }
 
@@ -873,16 +862,16 @@ struct TutorialChatViewRunTests {
             try await withSettings(chatView: chatView, optedOut: optedOut) {
                 let coordinator = TutorialCoordinator.shared
                 #expect(!TutorialCoordinator.chatViewOnForTutorial)
-                try await start(.askAnything)
-                #expect(!coordinator.teachesChat)
-                #expect(!ChatViewConfig.opensInChat, "the run's emails open in today's view")
-                #expect(coordinator.fieldMove(inPracticeChat: true) == nil)
-                coordinator.chatPromptSent(.flights)
-                coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
-                coordinator.showMoreToAsk()
-                coordinator.showRecap()
-                #expect(coordinator.step == .finished, "no switch step in today's run")
-                await coordinator.end()
+                try await whileRunning(.askAnything) {
+                    #expect(!coordinator.teachesChat)
+                    #expect(!ChatViewConfig.opensInChat, "the run's emails open in today's view")
+                    #expect(coordinator.fieldMove(inPracticeChat: true) == nil)
+                    coordinator.chatPromptSent(.flights)
+                    coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
+                    coordinator.showMoreToAsk()
+                    coordinator.showRecap()
+                    #expect(coordinator.step == .finished, "no switch step in today's run")
+                }
             }
         }
     }
