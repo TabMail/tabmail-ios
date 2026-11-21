@@ -1004,17 +1004,33 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// Wait at the armed gate `key`, if any, until released or the server stops.
     private func passHeldGate(_ key: String) {
         let upperKey = key.uppercased()
-        let armed: Bool = withState { state in
-            guard state.heldGates[upperKey] == false else { return false }
-            state.heldGates[upperKey] = true
-            state.holdsStarted += 1
-            return true
-        }
-        guard armed else { return }
-        while !withState({ $0.heldGateReleased.contains(upperKey) || $0.heldGatesAbandoned }) { usleep(2_000) }
+        guard let claimed = claimHeldGate(where: { $0 == upperKey }) else { return }
+        waitAtHeldGate(claimed)
+    }
+
+    /// Claims the first armed, unclaimed gate whose key `matches`, counting it
+    /// in `holdsStarted`: the one claim path of every hold (a named gate and a
+    /// command-fragment hold alike), so `holdsStarted()` and
+    /// `heldRequestsInProgress()` count every held request.
+    private func claimHeldGate(where matches: (String) -> Bool) -> String? {
         withState { state in
-            state.heldGates[upperKey] = nil
-            state.heldGateReleased.remove(upperKey)
+            guard let key = state.heldGates.keys.sorted().first(where: {
+                matches($0) && state.heldGates[$0] == false
+            }) else { return nil }
+            state.heldGates[key] = true
+            state.holdsStarted += 1
+            return key
+        }
+    }
+
+    /// Waits at the claimed gate `key` until released or the server stops, then
+    /// frees it and counts it in `holdsFinished`: the one release path of every
+    /// hold.
+    private func waitAtHeldGate(_ key: String) {
+        while !withState({ $0.heldGateReleased.contains(key) || $0.heldGatesAbandoned }) { usleep(2_000) }
+        withState { state in
+            state.heldGates[key] = nil
+            state.heldGateReleased.remove(key)
             state.holdsFinished += 1
         }
     }
@@ -2367,20 +2383,9 @@ final class FakeIMAPServer: @unchecked Sendable {
                     return state.stalls[key]?.removeFirst()
                 }
                 if let stallSeconds { usleep(UInt32(stallSeconds * 1_000_000)) }
-                let heldGate: String? = withState { state in
-                    let upper = recordedCommand.uppercased()
-                    guard let key = state.heldGates.keys.sorted().first(where: {
-                        upper.contains($0) && state.heldGates[$0] == false
-                    }) else { return nil }
-                    state.heldGates[key] = true
-                    return key
-                }
-                if let heldGate {
-                    while !withState({ $0.heldGateReleased.contains(heldGate) || $0.heldGatesAbandoned }) { usleep(2_000) }
-                    withState { state in
-                        state.heldGates[heldGate] = nil
-                        state.heldGateReleased.remove(heldGate)
-                    }
+                let upperCommand = recordedCommand.uppercased()
+                if let heldGate = claimHeldGate(where: { upperCommand.contains($0) }) {
+                    waitAtHeldGate(heldGate)
                 }
                 let watchedSeconds: Double? = withState { state in
                     let upper = recordedCommand.uppercased()

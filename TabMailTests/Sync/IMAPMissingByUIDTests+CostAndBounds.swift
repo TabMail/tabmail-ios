@@ -137,7 +137,7 @@ extension IMAPMissingByUIDTests {
             // The rows came from a window listing, which records how far down it reached.
             try await w.makeFullSyncDue()
             try await w.foregroundSync()
-            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState) == 1, "setup: the window listing recorded its floor")
+            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == 1, "setup: the window listing recorded its floor")
             w.server.setMessages(all.map(Self.message), in: Self.path)
             try await w.makeFullSyncDue()
             try await w.foregroundSync()
@@ -490,6 +490,104 @@ extension IMAPMissingByUIDTests {
             try w.expectHeldExactly([scrolled] + (sameEpoch ? [] : between) + kept,
                                     sameEpoch ? "#1062: nothing at or below the cutoff loads, the cached row is kept"
                                               : "#1062: a cutoff of another epoch is not read: the missing mail above the first local UID loads")
+            #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == (sameEpoch ? cutoff : scrolled - 1),
+                    sameEpoch ? "#1062: the catch-up carries the cutoff under its epoch"
+                              : "#1062: the other epoch's cutoff is never rebound; the folder gets its one-time cutoff in this epoch, below its first local UID")
+        }
+    }
+
+    @Test("With no storage limit a prune cutoff loads nothing differently: the missing mail at or below it loads, and no cutoff is seeded")
+    @MainActor
+    func pruneCutoffCountsOnlyUnderALimit() async throws {
+        let scrolled = 5, cutoff = 20
+        let server = Array(1...40)
+        try await Self.withWorld("prune-no-limit", server: server, local: server) { w in
+            try await w.dropLocal(server.filter { $0 != scrolled && $0 <= cutoff })
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: cutoff, epoch: Self.epoch, db: db)
+            }
+            try await w.markOwed()
+            try await w.workerRun()
+            try w.expectHeldExactly(server, "#1062: with no limit the cutoff is not a floor: everything missing loads")
+        }
+    }
+
+    @Test("A folder pruned before the cutoff existed (no cutoff stored): under a storage limit the catch-up seeds ONE cutoff below the first local UID, so nothing pruned loads, and a scroll page cached lower later does not move it; with no limit nothing is seeded and the missing mail loads",
+          arguments: [true, false])
+    @MainActor
+    func legacyPruneIsSeededOnceUnderALimit(limit: Bool) async throws {
+        let server = Array(1...40)
+        let pruned = Array(1...20), kept = Array(21...40)
+        try await Self.withWorld("prune-seed-\(limit)", server: server, local: server) { w in
+            try await w.dropLocal(pruned)
+            #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == nil, "setup: no cutoff stored")
+            try await w.markOwed()
+            guard limit else {
+                try await w.workerRun()
+                try w.expectHeldExactly(server, "#1062 control: with no limit the missing mail loads")
+                #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == nil,
+                        "#1062 control: with no limit no cutoff is seeded")
+                return
+            }
+            var loads = try await Self.runUnderTheLimit(w)
+            var reloaded = pruned.filter { uid in loads.contains { Self.uidSet($0).contains(uid) } }
+            #expect(reloaded.isEmpty, "#1062: nothing pruned before the cutoff existed is downloaded again: \(reloaded)")
+            try w.expectHeldExactly(kept, "#1062: the held rows are the kept ones")
+            #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == kept[0] - 1,
+                    "#1062: the one-time cutoff is one below the first local UID, in the folder's epoch")
+
+            // A scroll page caches a low pruned row; the seed is not taken again.
+            try await Self.cacheScrolledRows(w, [pruned[1]])
+            try await w.markOwed()
+            loads = try await Self.runUnderTheLimit(w)
+            reloaded = pruned.filter { uid in loads.contains { Self.uidSet($0).contains(uid) } }
+            #expect(reloaded.isEmpty, "#1062: a later scroll page does not reopen the pruned range: \(reloaded)")
+            try w.expectHeldExactly([pruned[1]] + kept, "#1062: only the cached row and the kept rows are held")
+            #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == kept[0] - 1,
+                    "#1062: the cutoff is seeded once and never re-derived from a lower first local UID")
+        }
+    }
+
+    @Test("The prune records a cutoff only for a UID prune order, and only from rows it deleted that carry the folder's epoch: a date-order prune records none; rows of no known numbering (one an optimistic move brought in under its source UID, one written before the stamp) never move it",
+          arguments: [true, false])
+    @MainActor
+    func pruneCutoffComesOnlyFromFolderNativeRowsInUIDOrder(uidOrder: Bool) async throws {
+        let count = 120
+        let server = Array(1...count)
+        let stamped = Array(1...3)
+        try await Self.withWorld("prune-native-\(uidOrder)", server: server, local: server) { w in
+            let folderId = w.folderId
+            if uidOrder {
+                // Only the three lowest rows carry the folder's epoch.
+                try await w.pool.write { db in
+                    try db.execute(sql: """
+                        UPDATE messageHeader SET observedUidValidity = NULL
+                        WHERE folderId = ? AND CAST(messageId AS INTEGER) > ?
+                        """, arguments: [folderId, stamped.count])
+                }
+            }
+            let savedBudget = UserDefaults.standard.object(forKey: StorageEstimator.storageBudgetKey)
+            defer { UserDefaults.standard.set(savedBudget, forKey: StorageEstimator.storageBudgetKey) }
+            StorageEstimator.budgetMB = 1
+            let appSupport = try #require(FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
+            try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+            let padding = appSupport.appendingPathComponent("prune-test-padding-\(UUID().uuidString)")
+            try Data(count: 2 * 1024 * 1024).write(to: padding)
+            defer { try? FileManager.default.removeItem(at: padding) }
+            try #require(StorageEstimator.isOverBudget(), "setup: the store is over the limit, so the prune runs")
+            SyncEngine.runPruneIfOverBudget(dbPool: AppDatabase.backgroundPool, pruneOrder: [w.accountId: uidOrder ? .uid : .date])
+            let held = try w.held()
+            try #require(held.count < count, "setup: the prune deleted rows: \(held.count) of \(count) kept")
+            let cutoff = CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch)
+            if uidOrder {
+                try #require(!held.contains { stamped.contains($0) } && held.first.map { $0 > stamped.count + 1 } == true,
+                             "setup: the prune deleted the stamped rows and unstamped ones above them")
+                #expect(cutoff == stamped.last,
+                        "#1062: only deleted rows carrying the folder's epoch move the cutoff: \(String(describing: cutoff))")
+            } else {
+                #expect(cutoff == nil, "#1062: a date-order prune records no cutoff: \(String(describing: cutoff))")
+            }
         }
     }
 

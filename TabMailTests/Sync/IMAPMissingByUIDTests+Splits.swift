@@ -67,14 +67,23 @@ extension IMAPMissingByUIDTests {
         repeat {
             let runSizesBefore = w.server.listingFetchSizes(in: path).count
             try await w.workerRun(deadlineIn: slowLinkDeadline, requestTimeout: heldRequestTimeout, sliceSeconds: heldRunSliceSeconds)
-            // The run gave its held FETCH up: let it answer. The answer reaches
-            // no client (the timeout closed that session), and the next run asks
-            // on a new one.
+            // The run gave its held FETCH up: let it answer, and join the
+            // server's handler of it before reading what the run asked. The
+            // answer reaches no client (the timeout closed that session), and
+            // the next run asks on a new one.
+            let inProgress = w.server.heldRequestsInProgress()
             w.server.releaseListingFetches(in: path)
+            if inProgress > 0 {
+                #expect(try await joinHeldHandlers(w.server, below: inProgress), "setup: the released listing FETCH's handler went on")
+            }
             runs += 1
-            let timeoutsInRun = w.server.listingFetchSizes(in: path).dropFirst(runSizesBefore).filter { $0 > overRecords }.count
-            #expect(timeoutsInRun <= 1,
-                    "#1062: a run asks the folder nothing after its listing request timed out: \(timeoutsInRun) listing timeouts in run \(runs)")
+            // Nothing after the run's held (timed-out) listing request: not a
+            // wider one, and not a smaller retry that answers either.
+            let runSizes = Array(w.server.listingFetchSizes(in: path).dropFirst(runSizesBefore))
+            if let timedOutAt = runSizes.firstIndex(where: { $0 > overRecords }) {
+                #expect(timedOutAt == runSizes.count - 1,
+                        "#1062: a run asks the folder nothing after its listing request timed out: run \(runs) listed \(runSizes)")
+            }
         } while try w.catchUpState()?.listing != nil && runs < runBound
         // The cost below then counts every listing request of the repair: none
         // is left for a later run on a link without the delay.
@@ -394,7 +403,7 @@ extension IMAPMissingByUIDTests {
         try await Self.withWorld("floor-scroll", server: server, local: window, walkStarted: false) { w in
             try await w.makeFullSyncDue()
             try await w.foregroundSync()
-            let floor = try #require(CatchUpWindowFloor.read(try w.folder().catchUpState), "setup: the window listing recorded its floor")
+            let floor = try #require(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch), "setup: the window listing recorded its floor")
             #expect(floor == window[0], "setup: the floor is where the window listing reached")
             // Infinite scroll writes old rows without moving the walk.
             try FolderEpochTestFixture.insertHeaders(accountId: w.accountId, path: Self.path, uids: scrolled, pool: w.pool)
@@ -428,15 +437,15 @@ extension IMAPMissingByUIDTests {
         let server = Array(1...20)
         try await Self.withWorld("floor-books", server: server, local: server, walkStarted: false) { w in
             let folderId = w.folderId
-            func floor() throws -> Int? { CatchUpWindowFloor.read(try w.folder().catchUpState) }
+            func floor() throws -> Int? { CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) }
             try await w.makeFullSyncDue()
             try await w.foregroundSync()
             #expect(try floor() == 1, "setup: the window listing recorded its floor")
 
             // A later listing that reached higher never raises it.
-            try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 9, db: db) }
+            try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 9, epoch: Self.epoch, db: db) }
             #expect(try floor() == 1, "#1062: the floor is the lowest any window listing reached")
-            try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 0, db: db) }
+            try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 0, epoch: Self.epoch, db: db) }
             #expect(try floor() == 0, "#1062: a listing that reached lower lowers it")
 
             // The catch-up rewrites the folder's state; the floor survives it.
@@ -451,20 +460,21 @@ extension IMAPMissingByUIDTests {
             for raw in [nil, "not json", "[1, 2]"] as [String?] {
                 try await w.pool.write { db in
                     try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [raw, folderId])
-                    try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 4, db: db)
+                    try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 4, epoch: Self.epoch, db: db)
                 }
                 #expect(try floor() == 4, "#1062: a state \(raw ?? "NULL") becomes an object holding the floor")
             }
         }
     }
 
-    @Test("Before the older-mail walk starts, a window listing whose lowest UID's header record cannot be read: once that record reads, the next catch-up loads the message, and the window floor is that UID")
+    @Test("Before the older-mail walk starts, a window listing whose lowest UID's header record cannot be read: once that record reads, the next catch-up loads the message (under a storage limit too), and the window floor is that UID",
+          arguments: [false, true])
     @MainActor
-    func unreadableLowestWindowUIDIsLoadedOnceItReads() async throws {
+    func unreadableLowestWindowUIDIsLoadedOnceItReads(limit: Bool) async throws {
         let server = Array(1...200)
         let window = Array((server.count - SyncConfig.syncMessageLimit + 1)...server.count)
         let lowest = window[0]
-        try await Self.withWorld("floor-unreadable", server: server, local: Array(window.dropFirst()), walkStarted: false) { w in
+        try await Self.withWorld("floor-unreadable-\(limit)", server: server, local: Array(window.dropFirst()), walkStarted: false) { w in
             // The window's lowest message has a header record the client cannot read.
             var messages = server.map { Self.message($0) }
             let index = try #require(server.firstIndex(of: lowest))
@@ -479,10 +489,24 @@ extension IMAPMissingByUIDTests {
             w.server.setMessages(server.map { Self.message($0) }, in: Self.path)
             w.server.suppressFetchInternalDate(in: Self.path, uids: [])
             try await w.markOwed()
-            try await w.workerRun()
+            let start = w.server.recordedCommands().count
+            if limit {
+                _ = try await Self.runUnderTheLimit(w)
+            } else {
+                try await w.workerRun()
+            }
+            let loads = Self.requests(to: Self.path, w.server, from: start).map { $0.command }.filter {
+                $0.uppercased().hasPrefix("UID FETCH") && $0.uppercased().contains("ENVELOPE")
+            }
+            #expect(loads.contains { Self.uidSet($0).contains(lowest) },
+                    "#1062: the catch-up's header load of the folder asks the recovered UID: \(loads)")
             try w.expectHeldExactly(window, "#1062: the window's lowest message, unreadable when the window listed it, is loaded once it reads")
-            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState) == lowest,
+            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == lowest,
                     "#1062: the window floor is the lowest UID the window named, read or not")
+            if limit {
+                #expect(CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch) == lowest - 1,
+                        "#1062: the one-time cutoff of a folder nothing recorded a prune for is below the window floor, so the unreadable UID stays loadable")
+            }
             let folder = try w.folder()
             #expect(!folder.backfillComplete && folder.backfillUidCursor == nil, "setup: the walk has still not started")
         }
@@ -493,7 +517,7 @@ extension IMAPMissingByUIDTests {
     func windowFloorNeedsAKnownEpoch() async throws {
         let server = Array(1...20)
         try await Self.withWorld("floor-epoch", server: server, local: server, walkStarted: false) { w in
-            func floor() throws -> Int? { CatchUpWindowFloor.read(try w.folder().catchUpState) }
+            func floor() throws -> Int? { CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) }
             #expect(try floor() == nil, "setup: no window listing has recorded a floor")
             w.server.suppressSelectUidValidity(for: Self.path)
             try await w.makeFullSyncDue()
@@ -506,7 +530,62 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    @Test("Under a storage limit before the walk starts, loads start at the higher of the window floor and the lowest held UID; with no limit, at the window floor",
+    @Test("Before the walk starts, a window floor recorded under another UIDVALIDITY is ignored, not rebound: nothing loads until a window listing of the current epoch records one; the catch-up's state write keeps the old floor's own epoch")
+    @MainActor
+    func windowFloorOfAnotherEpochIsIgnored() async throws {
+        let server = Array(1...20)
+        let local = Array(11...20)
+        try await Self.withWorld("floor-other-epoch", server: server, local: local, walkStarted: false) { w in
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, epoch: Self.epoch + 1, db: db)
+            }
+            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == nil,
+                    "setup: the folder holds a floor of another epoch only")
+            try await w.markOwed()
+            let start = w.server.recordedCommands().count
+            try await w.workerRun()
+            let loads = Self.headerFetches(w.server.recordedCommands().dropFirst(start))
+            #expect(loads.isEmpty, "#1062: a floor of another epoch counts for nothing: nothing loads: \(loads)")
+            try w.expectHeldExactly(local, "#1062: nothing below the held rows loads before a floor of this epoch")
+            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == nil
+                        && CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch + 1) == 1,
+                    "#1062: the catch-up's state write carries the old floor under its own epoch, never rebound to the current one")
+
+            // Control: a floor of the current epoch loads the rest.
+            try await w.pool.write { db in
+                try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, epoch: Self.epoch, db: db)
+            }
+            try await w.markOwed()
+            try await w.workerRun()
+            try w.expectHeldExactly(server, "#1062 control: a floor of this epoch loads the missing mail from it")
+        }
+    }
+
+    @Test("Under a storage limit with the walk complete and no local row, the scan starts at the walk's start, not above the prune cutoff, while loads start above the cutoff")
+    @MainActor
+    func scanFloorIsNotRaisedByTheCutoff() async throws {
+        let server = Array(1...40)
+        let cutoff = 20
+        try await Self.withWorld("scan-floor-cutoff", server: server, local: server) { w in
+            try await w.dropLocal(server)
+            let folderId = w.folderId
+            try await w.pool.write { db in
+                try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: cutoff, epoch: Self.epoch, db: db)
+            }
+            try await w.markOwed()
+            let start = w.server.recordedCommands().count
+            let loads = try await Self.runUnderTheLimit(w)
+            let ranges = Self.listingRanges(Self.requests(to: Self.path, w.server, from: start).map { $0.command })
+            #expect(ranges.first?.lowerBound == 1,
+                    "#1062: the scan starts at the walk's start, below the cutoff, so a row cached there meanwhile is still reconciled: \(ranges)")
+            let below = Array(1...cutoff).filter { uid in loads.contains { Self.uidSet($0).contains(uid) } }
+            #expect(below.isEmpty, "#1062: nothing at or below the cutoff loads: \(below)")
+            try w.expectHeldExactly(Array((cutoff + 1)...40), "#1062: the mail above the cutoff loads")
+        }
+    }
+
+    @Test("Under a storage limit before the walk starts, loads start above the prune cutoff when it is higher than the window floor; with no limit, at the window floor",
           arguments: [true, false])
     @MainActor
     func storageLimitTakesTheHigherFloorBeforeTheWalk(limit: Bool) async throws {
@@ -515,10 +594,15 @@ extension IMAPMissingByUIDTests {
         try await Self.withWorld("floor-limit-\(limit)", server: server, local: window, walkStarted: false) { w in
             try await w.makeFullSyncDue()
             try await w.foregroundSync()
-            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState) == window[0], "setup: the floor is where the window reached")
-            // The prune took the window's lowest rows: the lowest held UID is now above the floor.
+            #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == window[0], "setup: the floor is where the window reached")
+            // The prune took the window's lowest rows and recorded where it reached.
             let pruned = Array(window.prefix(10))
             try await w.dropLocal(pruned)
+            let folderId = w.folderId
+            let cutoff = try #require(pruned.last)
+            try await w.pool.write { db in
+                try SyncEngine.recordCatchUpPruneCutoff(folderId: folderId, highest: cutoff, epoch: Self.epoch, db: db)
+            }
             try await w.markOwed()
             let start = w.server.recordedCommands().count
             var run = SyncEngine.CatchUpRun(
@@ -533,7 +617,7 @@ extension IMAPMissingByUIDTests {
             }
             let reloaded = pruned.filter { uid in headerFetches.contains { Self.uidSet($0).contains(uid) } }
             if limit {
-                #expect(reloaded.isEmpty, "#1062: under a limit nothing below the lowest held UID is loaded: \(reloaded)")
+                #expect(reloaded.isEmpty, "#1062: under a limit nothing at or below the prune cutoff is loaded: \(reloaded)")
                 try w.expectHeldExactly(Array(window.dropFirst(10)), "#1062 limit")
             } else {
                 #expect(Set(reloaded) == Set(pruned), "#1062 control: with no limit the floor is the window's: \(reloaded)")

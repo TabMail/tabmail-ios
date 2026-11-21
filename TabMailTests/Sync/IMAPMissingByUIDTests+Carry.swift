@@ -19,10 +19,17 @@ extension IMAPMissingByUIDTests {
         commands.filter { $0.uppercased().contains("FETCH") && $0.uppercased().contains("ENVELOPE") }
     }
 
-    /// Polls for a held listing, or for a reset waiting for the slice's turn;
-    /// reaching the bound is a setup failure.
-    /// *Superseded (#1062):* "for a slow answer to arrive".
-    static let carryPolls = 300
+    /// The request timeout of the slice a Settings-reset test holds: far longer
+    /// than any step of the reset handshake can take, so the held listing is
+    /// answered once released, never timed out, and the slice carries its
+    /// range. The bound matters only on failure.
+    static let resetHandshakeRequestTimeout: TimeInterval = 60
+    /// How long a step of that handshake (the held listing, the reset waiting
+    /// for the slice's turn) may take to happen before the test fails; every
+    /// wait ends as soon as its step happens.
+    /// *Superseded (#1062):* 300 polls 10 ms apart, about 3 s, the production
+    /// request timeout the held listing could reach first.
+    static let resetHandshakeStepBound: TimeInterval = 30
 
     /// Slices of `maxRequests` until the folder holds `expected` and its listing
     /// is done, at most `bound`; returns how many ran. `between` runs after each.
@@ -62,16 +69,20 @@ extension IMAPMissingByUIDTests {
             w.server.holdListingFetches(in: Self.path, overRecords: 0)
             // The slice holds the account's turn, as every production slice does
             // (`runCatchUpRun`). Two requests after the listing's start: the
-            // listing and its proof; the loads are carried.
-            async let sliced: Void = w.engine.oneSyncAtATime(accountId: accountId) {
-                await w.slice(maxRequests: Self.newListingStartRequests + 2, clock: clock)
+            // listing and its proof; the loads are carried. Its requests outlast
+            // the handshake (`resetHandshakeRequestTimeout`), so the held listing
+            // is answered, not timed out. What the slice left is read inside its
+            // turn, before the reset can run.
+            async let sliced: IMAPCatchUpState.CarriedRange? = w.engine.oneSyncAtATime(accountId: accountId) {
+                await w.slice(maxRequests: Self.newListingStartRequests + 2, clock: clock,
+                              requestTimeout: Self.resetHandshakeRequestTimeout)
+                return try? w.catchUpState()?.listing?.carried
             }
-            var polls = 0
-            while w.server.heldListingFetchCount(in: Self.path) == 0, polls < Self.carryPolls {
+            var deadline = Date().addingTimeInterval(Self.resetHandshakeStepBound)
+            while w.server.heldListingFetchCount(in: Self.path) == 0, Date() < deadline {
                 try await Task.sleep(for: .milliseconds(10))
-                polls += 1
             }
-            #expect(polls < Self.carryPolls, "setup: the slice's listing is held")
+            #expect(w.server.heldListingFetchCount(in: Self.path) > 0, "setup: the slice's listing is held")
             // The Settings reset, through the production entry point the Settings
             // view calls; it waits for the slice's turn.
             let engine = w.engine
@@ -81,19 +92,20 @@ extension IMAPMissingByUIDTests {
                 case .wipeLocalIndex: try await engine.wipeLocalIndex()
                 }
             }
-            polls = 0
-            while await engine.syncPassWaiterCountForTesting(accountId: accountId) == 0, polls < Self.carryPolls {
+            deadline = Date().addingTimeInterval(Self.resetHandshakeStepBound)
+            while await engine.syncPassWaiterCountForTesting(accountId: accountId) == 0, Date() < deadline {
                 try await Task.sleep(for: .milliseconds(10))
-                polls += 1
             }
-            #expect(polls < Self.carryPolls, "setup: the reset waits for the slice's turn")
+            #expect(await engine.syncPassWaiterCountForTesting(accountId: accountId) > 0,
+                    "setup: the reset waits for the slice's turn")
             w.server.stopHoldingListingFetches(in: Self.path)
-            await sliced
+            let carriedBeforeTheReset = await sliced
+            #expect(carriedBeforeTheReset != nil, "setup: the slice carried its range before the reset ran")
             try await resetting.value
             // Then a window listing records a floor again, as the next full sync
             // does, so a kept carry would load.
             try await pool.write { db in
-                try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, db: db)
+                try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, epoch: Self.epoch, db: db)
             }
             let heldAfterReset = try w.held()
             #expect(heldAfterReset.isEmpty, "#1062: no pre-reset pick is inserted after the reset: \(heldAfterReset)")
@@ -165,12 +177,12 @@ extension IMAPMissingByUIDTests {
                 w.server.setMessages(server.filter { $0 != gone }.map(Self.message), in: Self.path)
                 try await w.dropLocal([below])
                 try await w.markOwed()
-                #expect(CatchUpWindowFloor.read(try w.folder().catchUpState) == nil, "setup: no load floor yet")
+                #expect(CatchUpWindowFloor.read(try w.folder().catchUpState, epoch: Self.epoch) == nil, "setup: no load floor yet")
                 await w.slice(maxRequests: Self.newListingStartRequests + 1, clock: clock)
                 let carried = try #require(try w.catchUpState()?.listing?.carried, "setup: the range is carried")
                 #expect(carried.loadsFrom == nil && carried.candidates == [UInt32(gone)] && !carried.proven,
                         "setup: listed with no floor, its proof owed")
-                try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, db: db) }
+                try await w.pool.write { db in try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, epoch: Self.epoch, db: db) }
                 expected = server.filter { $0 != gone && $0 != below }
             }
             let start = w.server.recordedCommands().count

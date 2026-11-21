@@ -389,7 +389,7 @@ extension IMAPMissingByUIDTests {
             let folderId = w.folderId
             try await w.pool.write { db in
                 try db.execute(sql: "UPDATE folder SET catchUpState = NULL WHERE id = ?", arguments: [folderId])
-                try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, db: db)
+                try SyncEngine.recordCatchUpWindowFloor(folderId: folderId, lowest: 1, epoch: Self.epoch, db: db)
             }
             #expect(IMAPCatchUpState.decode(try w.folder().catchUpState) == nil, "setup: the state is floor-only")
             try await w.markOwed()

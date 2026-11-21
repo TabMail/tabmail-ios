@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -11,26 +12,25 @@ import Testing
 /// (`SyncEngine.setCatchUpSliceStartHookForTesting`): the number of commands
 /// the server had recorded when each started, and the folders it asked. A
 /// recorded command belongs to the last slice that started at or before it.
-final class CatchUpSliceLog: @unchecked Sendable {
-    private let lock = NSLock()
-    private var starts: [(commandIndex: Int, folderIds: [String])] = []
+final class CatchUpSliceLog: Sendable {
+    private let starts = Mutex<[(commandIndex: Int, folderIds: [String])]>([])
 
     func append(commandIndex: Int, folderIds: [String]) {
-        lock.withLock { starts.append((commandIndex, folderIds)) }
+        starts.withLock { $0.append((commandIndex, folderIds)) }
     }
 
     /// How many slices started.
-    var count: Int { lock.withLock { starts.count } }
+    var count: Int { starts.withLock { $0.count } }
 
     /// The slice that sent the recorded command at `index`: nil for a command
     /// recorded before the first slice started.
     func slice(of index: Int) -> Int? {
-        lock.withLock { starts.lastIndex { $0.commandIndex <= index } }
+        starts.withLock { $0.lastIndex { $0.commandIndex <= index } }
     }
 
     /// The recorded-command index at which slice `slice` started; nil past the last.
     func start(of slice: Int) -> Int? {
-        lock.withLock { slice < starts.count ? starts[slice].commandIndex : nil }
+        starts.withLock { slice < $0.count ? $0[slice].commandIndex : nil }
     }
 }
 
@@ -41,10 +41,12 @@ final class CatchUpSliceLog: @unchecked Sendable {
 /// server starts holding another request (`FakeIMAPServer.holdsStarted`), so
 /// the slice that sent the held request is spent by it, as a timeout spends its
 /// slice in production. The wall clock plays no part in admission.
-final class HoldAdmissionClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var current = Date()
-    private var holdsSeen: Int
+final class HoldAdmissionClock: Sendable {
+    private struct Reading {
+        var current: Date
+        var holdsSeen: Int
+    }
+    private let reading: Mutex<Reading>
     private let server: FakeIMAPServer
     private let step: TimeInterval
     static let tick: TimeInterval = 0.000_001
@@ -52,18 +54,19 @@ final class HoldAdmissionClock: @unchecked Sendable {
     init(server: FakeIMAPServer, step: TimeInterval) {
         self.server = server
         self.step = step
-        holdsSeen = server.holdsStarted()
+        reading = Mutex(Reading(current: Date(), holdsSeen: server.holdsStarted()))
     }
 
     func now() -> Date {
         let holds = server.holdsStarted()
-        return lock.withLock {
-            if holds > holdsSeen {
-                current = current.addingTimeInterval(step * Double(holds - holdsSeen))
-                holdsSeen = holds
+        let step = self.step
+        return reading.withLock { reading in
+            if holds > reading.holdsSeen {
+                reading.current = reading.current.addingTimeInterval(step * Double(holds - reading.holdsSeen))
+                reading.holdsSeen = holds
             }
-            current = current.addingTimeInterval(Self.tick)
-            return current
+            reading.current = reading.current.addingTimeInterval(Self.tick)
+            return reading.current
         }
     }
 }
@@ -184,11 +187,17 @@ extension IMAPMissingByUIDTests {
         #expect(healthySlices.count == healthyAsked.count && healthySlices.allSatisfy { $0 > timedOutSlice },
                 "#1062: the healthy folder is asked after the timeout only in later slices: \(healthySlices), the timeout's \(timedOutSlice)",
                 sourceLocation: sourceLocation)
+        // Listing work only (its UID FETCH and UID SEARCH): a SELECT, NOOP or
+        // LOGOUT is no witness that a slice worked the folder.
+        let healthyWorkSlices = healthyAsked.filter { isListingWork($0.command) }.compactMap { slices.slice(of: $0.index) }
+        #expect(Set(healthyWorkSlices).count >= 2,
+                "#1062: the healthy folder's listing work goes on in several slices after the timeout: \(healthyWorkSlices)",
+                sourceLocation: sourceLocation)
         let state = try #require(try healthyState(w), "#1062: the healthy folder's state is stored", sourceLocation: sourceLocation)
         #expect(state.listing == nil && state.lastCompletedAt != nil,
                 "#1062: the healthy folder's listing completed in the same run, its completion stamped",
                 sourceLocation: sourceLocation)
-        let lastHealthySlice = healthySlices.max() ?? timedOutSlice
+        let lastHealthySlice = healthyWorkSlices.max() ?? timedOutSlice
         #expect(slicesAfter(lastHealthySlice, slices) <= 1,
                 "#1062: the run ends once only the left-out folder has work: \(slicesAfter(lastHealthySlice, slices)) slices after the healthy folder's last request",
                 sourceLocation: sourceLocation)
@@ -730,6 +739,13 @@ extension IMAPMissingByUIDTests {
     /// Of `requests`, the commands that ask the folder something: all but a
     /// selection of it (SELECT, EXAMINE) or a liveness check (NOOP), which the
     /// test's own UIDNEXT read sends.
+    /// Whether `command` is catch-up work on the selected folder (a listing or
+    /// load `UID FETCH`, a proof `UID SEARCH`), not a selection or liveness check.
+    static func isListingWork(_ command: String) -> Bool {
+        let upper = command.uppercased()
+        return upper.hasPrefix("UID FETCH") || upper.hasPrefix("UID SEARCH")
+    }
+
     static func asking(_ requests: [(index: Int, command: String)]) -> [String] {
         requests.map { $0.command }.filter { command in
             let verb = command.split(separator: " ").first.map { $0.uppercased() } ?? ""
@@ -1145,22 +1161,33 @@ extension IMAPMissingByUIDTests {
         }
     }
 
-    @Test("A folder's listing request is answered as too large to read: the answer leaves nothing in flight, so the same run asks that folder again, at the capped width from the same UID, while a healthy folder of the account goes on and completes its listing")
+    @Test("A folder's listing request is answered as too large to read, or as undecodable: the answer leaves nothing in flight, so a later slice of the same run asks that folder again, at the capped width from the same UID, while a healthy folder of the account goes on and completes its listing",
+          arguments: [FailingReply.overLimit, .undecodable])
     @MainActor
-    func answeredOversizedListingKeepsTheFolderInTheRun() async throws {
-        try await Self.withWorld("in-run-oversized", server: Self.siteServer, local: Self.siteServer) { w in
+    func answeredMalformedListingKeepsTheFolderInTheRun(_ reply: FailingReply) async throws {
+        try await Self.withWorld("in-run-malformed-\(reply)", server: Self.siteServer, local: Self.siteServer) { w in
             try await Self.startHealthyListing(w)
             try await Self.startSiteListing(w)
-            w.server.answerNextCommandOverLimit(containing: Self.siteRangeFetch)
+            let malformedBefore = w.server.malformedAnswersSent()
+            Self.arm(reply, w.server, containing: Self.siteRangeFetch)
             let start = w.server.recordedCommands().count
             let run = try await Self.inFlightRun(w)
-            let ranges = Self.listingRanges(Self.requests(to: Self.path, w.server, from: start).map { $0.command })
-            #expect(ranges.first == Self.siteRange, "setup: the folder's first range was asked, and answered as too large: \(ranges)")
+            #expect(w.server.malformedAnswersSent() == malformedBefore + 1,
+                    "setup: \(reply): one request got the malformed reply, which the client's parser fails on")
+            let listed = Self.requests(to: Self.path, w.server, from: start).filter { !Self.listingRanges([$0.command]).isEmpty }
+            let failed = try #require(listed.first, "setup: \(reply): the folder's first range was asked")
+            #expect(failed.command.uppercased().hasPrefix("UID FETCH") && Self.listingRanges([failed.command]) == [Self.siteRange],
+                    "setup: \(reply): the malformed reply answered the folder's own listing FETCH of the site range: \(failed.command)")
+            let retry = try #require(listed.dropFirst().first, "#1062: \(reply): the same run asks the folder again")
             let capped = max(1, Self.siteWidth / SyncConfig.catchUpWidthCapShrinkFactor)
-            #expect(ranges.dropFirst().first == Self.siteRange.lowerBound...(Self.siteRange.lowerBound + capped - 1),
-                    "#1062: the same run asks the folder again, at the capped width from the same UID: \(ranges)")
-            #expect(try Self.healthyState(w)?.listing == nil, "#1062: the healthy folder's listing completed in the same run")
-            #expect(run.didWork, "setup: the run made progress")
+            #expect(Self.listingRanges([retry.command]) == [Self.siteRange.lowerBound...(Self.siteRange.lowerBound + capped - 1)],
+                    "#1062: \(reply): the retry asks the capped width from the same UID: \(retry.command)")
+            let failedSlice = try #require(run.slices.slice(of: failed.index), "setup: \(reply): a slice sent the failed request")
+            let retrySlice = try #require(run.slices.slice(of: retry.index), "setup: \(reply): a slice sent the retry")
+            #expect(retrySlice > failedSlice,
+                    "#1062: \(reply): the failure ended the call; a later slice of the same run retries: \(failedSlice) then \(retrySlice)")
+            #expect(try Self.healthyState(w)?.listing == nil, "#1062: \(reply): the healthy folder's listing completed in the same run")
+            #expect(run.didWork, "setup: \(reply): the run made progress")
         }
     }
 
@@ -1203,6 +1230,14 @@ extension IMAPMissingByUIDTests {
             let retried = asked.filter { $0.index >= nextSliceStart && isTheFailingRequest($0.command) }
             #expect(!retried.isEmpty,
                     "#1062: \(stop): nothing is in flight after an answered request, so a later slice of the same run asks it again: \(asked.map { $0.command })")
+            // A selection alone is no witness of a retried UIDNEXT read: the
+            // retry learned the top, so a listing range, which is cut at the
+            // top, follows it in the later slices.
+            if verb == "SELECT" {
+                let laterRanges = Self.listingRanges(asked.filter { $0.index >= nextSliceStart }.map { $0.command })
+                #expect(!laterRanges.isEmpty,
+                        "#1062: \(stop): the retried UIDNEXT read learned the top, and the folder's listing goes on from it: \(asked.map { $0.command })")
+            }
             let healthy = try #require(try Self.healthyState(w), "#1062: \(stop): the healthy folder's state is stored")
             #expect(healthy.listing == nil && healthy.lastCompletedAt != nil,
                     "#1062: \(stop): the healthy folder's listing completed in the same run, its completion stamped")
