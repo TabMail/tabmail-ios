@@ -18,8 +18,8 @@ import SwiftUI
 /// the subject. "Move the tutorial on" moves the run to Part 3 at once, which takes the card away
 /// while the chat stays open: it sits in a strip under the whole navigation stack, outside the
 /// chat's region, so it is on screen with the chat and no earlier gesture can reach it. With
-/// `--chat-swipe-signed-in` the scene has a TabMail session; with `--chat-swipe-open-panel-later` a
-/// strip opens the chat's panel a moment after its tap.
+/// `--chat-swipe-signed-in` the scene has a TabMail session; with `--chat-swipe-open-panel-under-drag`
+/// a strip arms the chat's panel to open under the next drag held on the field.
 struct ChatSwipeTestScene: View {
     @State private var ready = false
     @State private var status = "Preparing fixture"
@@ -74,11 +74,11 @@ struct ChatSwipeTestScene: View {
     /// `--chat-swipe-signed-in`: the scene runs with a TabMail session, so the open panel shows its
     /// editor (signed out it shows the sign-in bar instead) and the field its signed-in hint.
     private let signedIn = ProcessInfo.processInfo.arguments.contains("--chat-swipe-signed-in")
-    /// `--chat-swipe-open-panel-later`: a strip under the whole navigation stack holds "Open the
-    /// panel soon", which simulates the panel's expansion `panelOpenDelay` after the tap
-    /// (`openPanelSoon`), so a drag the test is still holding is cut off by it.
-    private let openPanelLater = ProcessInfo.processInfo.arguments.contains("--chat-swipe-open-panel-later")
-    static let panelOpenDelay: Duration = .seconds(2)
+    /// `--chat-swipe-open-panel-under-drag`: a strip under the whole navigation stack holds "Open
+    /// the panel under the next drag", which arms the panel's expansion to run the moment the next
+    /// drag held on the field has swollen it past the open distance (`openPanelUnderTheNextDrag`),
+    /// so that drag, still held, is cut off by it.
+    private let openPanelUnderDrag = ProcessInfo.processInfo.arguments.contains("--chat-swipe-open-panel-under-drag")
 
     var body: some View {
         Group {
@@ -120,11 +120,11 @@ struct ChatSwipeTestScene: View {
                         Button("Release the AI Suggestion") { Task { await Self.writeSuggestion() } }
                             .padding()
                     }
-                } else if openPanelLater {
+                } else if openPanelUnderDrag {
                     // Below the whole stack, like the other strips, so the reply bar ends above it.
                     VStack(spacing: 0) {
                         NavigationStack { list }
-                        Button("Open the panel soon") { Task { await Self.openPanelSoon() } }
+                        Button("Open the panel under the next drag") { Self.openPanelUnderTheNextDrag() }
                             .padding()
                     }
                 } else if Self.savedDraft {
@@ -218,14 +218,17 @@ struct ChatSwipeTestScene: View {
         NotificationCenter.default.post(name: .messageDataDidChange, object: id)
     }
 
-    /// Simulates the panel's expansion that interrupts a held drag: after `panelOpenDelay` it posts
-    /// `.openMessageWithChat`, the notification a tap on the inbox's agent toast posts, so the chat expands
-    /// its panel through that path. It is not an agent's answer, which opens the panel directly
-    /// (`ChatThreadView.agentAnswered`); either way the panel opening turns the field's pan off.
-    private static func openPanelSoon() async {
-        try? await Task.sleep(for: panelOpenDelay)
-        NotificationCenter.default.post(name: .openMessageWithChat, object: nil,
-                                        userInfo: ["messageId": headerId(count - 1)])
+    /// Simulates the panel's expansion that interrupts a held drag: once the next drag held on the
+    /// field has swollen it past the open distance (seen by the drag marker's probe, not after a
+    /// set time), it posts `.openMessageWithChat`, the notification a tap on the inbox's agent toast
+    /// posts, so the chat expands its panel through that path. It is not an agent's answer, which
+    /// opens the panel directly (`ChatThreadView.agentAnswered`); either way the panel opening turns
+    /// the field's pan off.
+    private static func openPanelUnderTheNextDrag() {
+        let id = headerId(count - 1)
+        ChatFieldDragMarker.Probe.shared.openUnderTheNextDrag {
+            NotificationCenter.default.post(name: .openMessageWithChat, object: nil, userInfo: ["messageId": id])
+        }
     }
 
     /// Rewrites the newest row's reply with no `.messageDataDidChange`: the open chat is not told,

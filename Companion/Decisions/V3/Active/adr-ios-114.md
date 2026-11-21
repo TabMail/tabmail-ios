@@ -1114,8 +1114,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    field's drag), `testDragUpOnAShortFocusedDraftOpensThePanelWithIt`
    (signed in through the fixture's `--chat-swipe-signed-in`: the panel's editor holds the draft),
    `testDragCutOffByThePanelOpeningSettlesAndTheNextDragWorks` (the fixture's
-   `--chat-swipe-open-panel-later` opens the panel under a held drag, which turns the pan off: the
-   freeze is released, the field is back at rest, the next drag opens),
+   `--chat-swipe-open-panel-under-drag` opens the panel the moment the debug marker sees the held
+   drag swollen past the open distance, which turns the pan off: the marker records the opening and
+   then the cut, in that order, so the drag ended with the finger still down; the freeze is
+   released, the field is back at rest, the next drag opens),
    `testOpenActionsDragUpOnTheReplyFieldOnlyCloses` and the two back swipes that start on the field
    (`testNothingOpenRightDragOnTheReplyFieldGoesBack`, `testNothingOpenEdgeDragOnTheReplyFieldGoesBack`).
    `testDraggedOpenPanelClosesOnCloseAndOnTheDim` taps the dim halfway between the nav bar's bottom

@@ -14,16 +14,16 @@ import SwiftUI
 ///
 /// The label reads `drags=<n> watching=<0|1> base=<0|1> at=<points> move=<points> held=<0|1>
 /// frozen=<0|1> tip=<top>:<bottom>|none room=<top>:<bottom>|none field=<points> rise=<points>
-/// dims=<n> over=<points>`: `base` once the drag's start had the newest row's place,
+/// dims=<n> over=<points> events=<event>,…|none`: `base` once the drag's start had the newest row's place,
 /// `at` the newest row's last reported top, `held` whether the freeze was still held halfway
 /// through the cooldown after the settle (`heldAtSettle`), `frozen` whether it is held now, `tip`
 /// the field's drag tip's whole card while it shows (XCUITest sees only its words), `room` the space
 /// it must fit in, both in the chat's space; `field` the top of the field's glass on screen, swell
 /// included (the open panel's top while it is open), `rise` how far that top rose above where it
 /// was at the last drag's start while the finger moved (the swell XCUITest cannot see), `dims`
-/// how many taps the open panel's dim has taken, and `over` how far the text under the last drag
-/// went past its end while the drag moved (its scroll position as the field's pan read it; 0 if it
-/// never did).
+/// how many taps the open panel's dim has taken, `over` how far the text under the last drag went
+/// past its end while the drag moved (its scroll position as the field's pan read it; 0 if it never
+/// did), and `events` what happened to the last drag, in order (`Probe.events`).
 enum ChatFieldDragMarker {
     static let identifier = "chatFieldDragMarker"
 
@@ -100,6 +100,15 @@ enum ChatFieldDragMarker {
         #endif
     }
 
+    /// The drag on the field ended: let go (`finished`) or cut off while the finger was still down
+    /// (debug builds only; nothing in release).
+    @MainActor
+    static func dragEnded(finished: Bool) {
+        #if DEBUG
+        if Probe.isActive { Probe.shared.dragEnded(finished: finished) }
+        #endif
+    }
+
     /// On the field's drag tip: reports where its whole card is while it shows, and the room it
     /// must fit in (the header's bottom and the field stack's top), all in the chat's space
     /// (`ChatSwipeOpen.space`), so the test compares them in one space in any orientation.
@@ -171,10 +180,33 @@ enum ChatFieldDragMarker {
             pastEnd = max(pastEnd, points)
         }
 
+        /// What happened to the last drag, in order: `open` when the armed opening ran under it,
+        /// then `end` when it was let go or `cut` when it was cut off with the finger still down.
+        private(set) var events: [String] = []
+        /// Armed by the swipe fixture (`openUnderTheNextDrag`): opens the panel the moment a drag
+        /// held on the field has swollen it past the open distance, then disarms.
+        @ObservationIgnored private var opensUnderTheDrag: (@MainActor @Sendable () -> Void)?
+
+        /// The next drag on the field that swells it past the open distance runs `open` while the
+        /// finger is still down, as the panel opening under a held drag does.
+        func openUnderTheNextDrag(_ open: @escaping @MainActor @Sendable () -> Void) {
+            opensUnderTheDrag = open
+        }
+
+        func dragEnded(finished: Bool) {
+            events.append(finished ? "end" : "cut")
+        }
+
         func glassMoved(to minY: CGFloat) {
             glassTop = minY
             guard dragging, let glassRest else { return }
             rise = max(rise, glassRest - minY)
+            if rise >= ChatViewLayout.fieldDragOpenDistance, let open = opensUnderTheDrag {
+                opensUnderTheDrag = nil
+                events.append("open")
+                // After this geometry callback, not inside it.
+                Task { @MainActor in open() }
+            }
         }
 
         func newestMoved(to minY: CGFloat) {
@@ -195,6 +227,7 @@ enum ChatFieldDragMarker {
                 glassRest = glassTop
                 rise = 0
                 pastEnd = 0
+                events = []
                 return
             }
             let token = UUID()
@@ -214,7 +247,7 @@ enum ChatFieldDragMarker {
             let at = String(format: "%.1f", newestMinY ?? -1)
             let tip = tipFrame.map { String(format: "%.1f:%.1f", $0.minY, $0.maxY) } ?? "none"
             let room = tipRoom.map { String(format: "%.1f", $0) }.joined(separator: ":")
-            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(String(format: "%.1f", pastEnd))"
+            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(String(format: "%.1f", pastEnd)) events=\(events.isEmpty ? "none" : events.joined(separator: ","))"
         }
     }
 

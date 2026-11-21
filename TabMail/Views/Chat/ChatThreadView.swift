@@ -997,6 +997,8 @@ struct ChatThreadView: View {
     /// springs back with the pill's spring however it ended, and a finished drag whose swell, or a
     /// flick's predicted swell, reaches the open distance opens the panel in the same transaction.
     private func fieldDragEnded(_ drag: ChatHorizontalPan.Sample, finished: Bool) {
+        // Debug UI tests only: a let-go or a cut-off (`ChatFieldDragMarker`).
+        ChatFieldDragMarker.dragEnded(finished: finished)
         let opens = finished && ChatFieldDrag.opens(letGo: drag)
         withAnimation(Self.pillSpring) {
             fieldDragProgress = ChatFieldDrag.Progress()
