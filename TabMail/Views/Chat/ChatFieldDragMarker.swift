@@ -14,7 +14,8 @@ import SwiftUI
 ///
 /// The label reads `drags=<n> watching=<0|1> base=<0|1> at=<points> move=<points> held=<0|1>
 /// frozen=<0|1> tip=<top>:<bottom>|none room=<top>:<bottom>|none field=<points> rise=<points>
-/// dims=<n> over=<points> events=<event>,…|none`: `base` once the drag's start had the newest row's place,
+/// dims=<n> over=<points> events=<event>,…|none wait=<0|1>`: `base` once the drag's start had the
+/// newest row's place,
 /// `at` the newest row's last reported top, `held` whether the freeze was still held halfway
 /// through the cooldown after the settle (`heldAtSettle`), `frozen` whether it is held now, `tip`
 /// the field's drag tip's whole card while it shows (XCUITest sees only its words), `room` the space
@@ -23,7 +24,8 @@ import SwiftUI
 /// was at the last drag's start while the finger moved (the swell XCUITest cannot see), `dims`
 /// how many taps the open panel's dim has taken, `over` how far the text under the last drag went
 /// past its end while the drag moved (its scroll position as the field's pan read it; 0 if it never
-/// did), and `events` what happened to the last drag, in order (`Probe.events`).
+/// did), `events` what happened to the last drag, in order (`Probe.events`), and `wait` whether the
+/// drag tip is waiting for room (`TipWait`).
 enum ChatFieldDragMarker {
     static let identifier = "chatFieldDragMarker"
 
@@ -136,6 +138,24 @@ enum ChatFieldDragMarker {
         }
     }
 
+    /// On the drag tip's empty stand-in, the child `ViewThatFits` picks when the tip's whole card
+    /// has no room: reports that the tip is waiting for room while it shows.
+    struct TipWait: ViewModifier {
+        func body(content: Content) -> some View {
+            #if DEBUG
+            if Probe.isActive {
+                content
+                    .onAppear { Probe.shared.tipWaiting = true }
+                    .onDisappear { Probe.shared.tipWaiting = false }
+            } else {
+                content
+            }
+            #else
+            content
+            #endif
+        }
+    }
+
     #if DEBUG
     @MainActor @Observable
     final class Probe {
@@ -161,6 +181,9 @@ enum ChatFieldDragMarker {
         /// lays out empty). With the room it must fit in, top and bottom.
         private(set) var tipFrame: CGRect?
         var tipRoom: [CGFloat] = []
+        /// Whether the tip's empty stand-in shows: the tip is eligible but its whole card has no
+        /// room (a tip TipKit does not show lays out empty and fits, so it never picks the stand-in).
+        var tipWaiting = false
 
         func tipMoved(to frame: CGRect?) {
             tipFrame = frame.flatMap { $0.height >= 1 ? $0 : nil }
@@ -247,7 +270,7 @@ enum ChatFieldDragMarker {
             let at = String(format: "%.1f", newestMinY ?? -1)
             let tip = tipFrame.map { String(format: "%.1f:%.1f", $0.minY, $0.maxY) } ?? "none"
             let room = tipRoom.map { String(format: "%.1f", $0) }.joined(separator: ":")
-            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(String(format: "%.1f", pastEnd)) events=\(events.isEmpty ? "none" : events.joined(separator: ","))"
+            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(String(format: "%.1f", pastEnd)) events=\(events.isEmpty ? "none" : events.joined(separator: ",")) wait=\(tipWaiting ? 1 : 0)"
         }
     }
 

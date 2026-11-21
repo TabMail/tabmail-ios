@@ -971,6 +971,8 @@ struct ChatThreadView: View {
                                 // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop))
                             Color.clear.frame(height: 0)
+                                // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`).
+                                .modifier(ChatFieldDragMarker.TipWait())
                         }
                         .frame(height: tipRoom, alignment: .bottom)
                     }

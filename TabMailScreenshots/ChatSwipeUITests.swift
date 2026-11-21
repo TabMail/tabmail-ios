@@ -316,30 +316,57 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(markerReads(focused: true, in: fresh), "the first tap focused the field")
     }
 
-    /// Landscape at a large text size, where the card may not fit above the field: it is either
-    /// wholly between the header and the field or not shown, never cut off above the screen. Turned
-    /// upright, with room, it shows: waiting for room kept its one showing.
-    func testFieldDragTipCardIsWholeOrWaitsForRoom() {
+    /// The card's geometry, with the tip forced on: landscape at a large text size, where the card
+    /// may not fit above the field, it is either wholly between the header and the field or waiting
+    /// for room (the marker's `wait`), never cut off above the screen; the read waits until one of
+    /// the two holds. Turned upright, the whole card shows. (Whether waiting keeps the tip's one
+    /// showing is the app's own TipKit rules' to say, so
+    /// `testFieldDragTipWaitingForRoomKeepsItsOneShowing` checks it without the forcing.)
+    func testFieldDragTipCardIsWholeOrWaitsForRoom() throws {
         XCUIDevice.shared.orientation = .landscapeLeft
         addTeardownBlock { XCUIDevice.shared.orientation = .portrait }
         let app = launchIntoChat(fieldDragTip: true, textSize: Self.largeTextSize)
-        let landscape = settledDragMarker(in: app)
-        XCTAssertNotNil(landscape, "control: the marker shows")
-        if let card = landscape?.tip {
-            assertTipCardFits((card: card, room: landscape?.room), "in landscape the card that shows is whole")
+        let landscape = try XCTUnwrap(decidedTipMarker(in: app), "control: the card either shows or waits for room")
+        if let card = landscape.tip {
+            assertTipCardFits((card: card, room: landscape.room), "in landscape the card that shows is whole")
+        } else {
+            XCTAssertEqual(landscape.tipWaiting, true, "in landscape a card that does not show is waiting for room")
         }
-        XCTContext.runActivity(named: landscape?.tip == nil ? "landscape: the tip waited for room" : "landscape: the tip fit") { _ in }
+        XCTContext.runActivity(named: landscape.tip == nil ? "landscape: the tip waited for room" : "landscape: the tip fit") { _ in }
         XCUIDevice.shared.orientation = .portrait
         XCTAssertTrue(app.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: 5),
                       "with room the tip shows")
         assertTipCardFits(shownTipCard(in: app), "upright, the whole card is between the header and the field")
     }
 
-    /// A short drag that opens nothing still ends the tip, for the rest of the launch.
+    /// The app's own tip rules, nothing forced, on a fresh datastore of the test's own: landscape at
+    /// the largest text size the whole card has no room, so the tip waits (the marker's `wait`) and
+    /// shows no card. Relaunched upright at the default size on the same datastore, it shows,
+    /// whole: waiting for room did not spend its one showing.
+    func testFieldDragTipWaitingForRoomKeepsItsOneShowing() throws {
+        XCUIDevice.shared.orientation = .landscapeLeft
+        addTeardownBlock { XCUIDevice.shared.orientation = .portrait }
+        let app = launchIntoChat(textSize: Self.largestTextSize, tipStore: .fresh)
+        let landscape = try XCTUnwrap(decidedTipMarker(in: app), "control: the tip's place is decided")
+        XCTAssertEqual(landscape.tipWaiting, true, "control: the tip is eligible and its whole card has no room, so it waits")
+        XCTAssertNil(landscape.tip, "no card shows without room")
+        XCTAssertFalse(app.staticTexts[Self.fieldDragTipText].exists, "and none of its words")
+        app.terminate()
+
+        XCUIDevice.shared.orientation = .portrait
+        let upright = launchIntoChat(tipStore: .kept)
+        XCTAssertTrue(upright.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: 5),
+                      "with room, on the same datastore, the tip shows: waiting kept its one showing")
+        assertTipCardFits(shownTipCard(in: upright), "the whole card is between the header and the field")
+    }
+
+    /// The app's own tip rules on a fresh datastore of the test's own: a short drag that opens
+    /// nothing ends the tip, and it stays gone when the chat is opened again and after a relaunch on
+    /// the same datastore.
     func testFieldDragTipStaysGoneAfterAShortDrag() {
-        let app = launchIntoChat(fieldDragTip: true)
+        let app = launchIntoChat(tipStore: .fresh)
         let tip = app.staticTexts[Self.fieldDragTipText].firstMatch
-        XCTAssertTrue(tip.waitForExistence(timeout: 5), "control: the tip shows")
+        XCTAssertTrue(tip.waitForExistence(timeout: 5), "control: on a fresh datastore the tip shows")
         let field = replyField(in: app)
         let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
         start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -25)),
@@ -347,24 +374,65 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "control: the short drag opened nothing")
         XCTAssertTrue(tip.waitForNonExistence(timeout: 3), "the drag ended the tip")
         XCTAssertFalse(tip.waitForExistence(timeout: Self.tipStaysGoneWait), "and it stays gone")
+        assertTipStaysGoneOnTheNextPresentations(of: app)
     }
 
-    /// A tap that focuses the field ends the tip, and it does not come back.
+    /// The app's own tip rules on a fresh datastore of the test's own: a tap that focuses the field
+    /// ends the tip, and it stays gone when the chat is opened again and after a relaunch on the
+    /// same datastore.
     func testFieldDragTipStaysGoneAfterATap() {
-        let app = launchIntoChat(fieldDragTip: true)
+        let app = launchIntoChat(tipStore: .fresh)
         let tip = app.staticTexts[Self.fieldDragTipText].firstMatch
-        XCTAssertTrue(tip.waitForExistence(timeout: 5), "control: the tip shows")
+        XCTAssertTrue(tip.waitForExistence(timeout: 5), "control: on a fresh datastore the tip shows")
         replyField(in: app).tap()
         XCTAssertTrue(markerReads(focused: true, in: app), "control: the tap focused the field")
         XCTAssertTrue(tip.waitForNonExistence(timeout: 3), "the tap ended the tip")
         XCTAssertFalse(tip.waitForExistence(timeout: Self.tipStaysGoneWait), "and the tip stays gone")
+        assertTipStaysGoneOnTheNextPresentations(of: app)
+    }
+
+    /// The ended tip stays gone when the chat is opened again in the same launch, and in a relaunch
+    /// on the same datastore.
+    private func assertTipStaysGoneOnTheNextPresentations(of app: XCUIApplication,
+                                                          file: StaticString = #filePath, line: UInt = #line) {
+        dragFromEdge(atY: bubble(3, in: app).frame.midY, in: app)
+        XCTAssertTrue(wentBack(app), "control: back at the list", file: file, line: line)
+        app.buttons["Open chat"].tap()
+        XCTAssertTrue(bubble(3, in: app).waitForExistence(timeout: 10), "control: the chat is open again", file: file, line: line)
+        XCTAssertFalse(app.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: Self.tipStaysGoneWait),
+                       "the ended tip stays gone in the chat opened again", file: file, line: line)
+        app.terminate()
+
+        let relaunched = launchIntoChat(tipStore: .kept)
+        XCTAssertFalse(relaunched.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: Self.tipStaysGoneWait),
+                       "and after a relaunch on the same datastore", file: file, line: line)
     }
 
     /// An accessibility text size: the card grows tall enough that it may not fit in landscape,
     /// yet it fits upright.
     private static let largeTextSize = "UICTContentSizeCategoryAccessibilityXL"
+    /// The largest accessibility text size: in landscape the card has no room above the field.
+    private static let largestTextSize = "UICTContentSizeCategoryAccessibilityXXXL"
     /// How long a gone tip is watched for coming back.
     private static let tipStaysGoneWait: TimeInterval = 2
+
+    /// The marker once the tip's place is decided and holds across two reads a moment apart: its
+    /// whole card shows, or it waits for room. A tip TipKit has not yet made available lays out
+    /// empty, so neither holds until TipKit has decided. Nil if neither holds within the poll limit.
+    private func decidedTipMarker(in app: XCUIApplication) -> DragMarker? {
+        let deadline = Date().addingTimeInterval(Self.dragMarkerPollLimit)
+        var last: DragMarker?
+        repeat {
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.restReadInterval))
+            let now = readDragMarker(in: app)
+            if let now, now.tip != nil || now.tipWaiting == true,
+               let last, Self.sameSpan(now.tip, last.tip), now.tipWaiting == last.tipWaiting {
+                return now
+            }
+            last = now
+        } while Date() < deadline
+        return nil
+    }
 
     /// The marker's tip card once it shows, with its room.
     private func shownTipCard(in app: XCUIApplication) -> (card: (CGFloat, CGFloat)?, room: (CGFloat, CGFloat)?) {
@@ -1223,12 +1291,18 @@ final class ChatSwipeUITests: XCTestCase {
     /// the coach card.
     private enum Host { case stack, sheet, split, tutorialCard }
 
+    /// The TipKit datastore of the tip tests' own, under the app's own tip rules (nothing forced):
+    /// emptied at this launch, or kept from the launch before.
+    private enum TipStore { case fresh, kept }
+    /// The name of that datastore, the same across a test's launches.
+    private static let tipStoreName = "chat-field-drag-tip-ui-test"
+
     private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false,
                                 lateSuggestion: Bool = false, unread: Bool = false,
                                 suggestionOnJump: Bool = false, writing: Bool = false,
                                 readyAtOpen: Bool = false, fieldDragTip: Bool = false,
                                 textSize: String? = nil, signedIn: Bool = false,
-                                openPanelUnderDrag: Bool = false) -> XCUIApplication {
+                                openPanelUnderDrag: Bool = false, tipStore: TipStore? = nil) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
@@ -1245,6 +1319,10 @@ final class ChatSwipeUITests: XCTestCase {
             + (textSize.map { ["-UIPreferredContentSizeCategoryName", $0] } ?? [])
             + (signedIn ? ["--chat-swipe-signed-in"] : [])
             + (openPanelUnderDrag ? ["--chat-swipe-open-panel-under-drag"] : [])
+        if let tipStore {
+            app.launchArguments += ["--chat-field-drag-tip-store", Self.tipStoreName]
+            if tipStore == .fresh { app.launchArguments.append("--chat-field-drag-tip-fresh") }
+        }
         app.launch()
         switch host {
         case .stack, .tutorialCard:
@@ -1334,6 +1412,9 @@ final class ChatSwipeUITests: XCTestCase {
         /// What happened to the last drag, in order (`open`, then `end` or `cut`); nil when the
         /// marker does not say.
         let events: [String]?
+        /// Whether the drag tip is waiting for room (eligible, its whole card has none); nil when
+        /// the marker does not say.
+        let tipWaiting: Bool?
     }
 
     /// `<top>:<bottom>`, or nil for "none".
@@ -1360,7 +1441,8 @@ final class ChatSwipeUITests: XCTestCase {
                           rise: CGFloat(fields["rise"].flatMap(Double.init) ?? 0),
                           dims: fields["dims"].flatMap(Int.init) ?? 0,
                           textPastEnd: fields["over"].flatMap(Double.init).map { CGFloat($0) },
-                          events: fields["events"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) })
+                          events: fields["events"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) },
+                          tipWaiting: fields["wait"].map { $0 == "1" })
     }
 
     /// The marker once it has seen `drags` drags and stopped watching the last one.

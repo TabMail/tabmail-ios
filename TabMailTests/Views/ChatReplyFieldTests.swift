@@ -855,7 +855,7 @@ struct ChatReplyFieldTests {
         // the no-reply notice rather than over them: hung by its bottom from the stack's top edge.
         // Only while the whole card fits between the header and the stack: otherwise nothing, so
         // the tip waits for room and keeps its one showing.
-        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop)) Color.clear.frame(height: 0) } .frame(height: tipRoom, alignment: .bottom) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
+        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop)) Color.clear.frame(height: 0) // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipWait()) } .frame(height: tipRoom, alignment: .bottom) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
         let room = try Self.body(of: "private var tipRoom: CGFloat {", in: chat)
         #expect(Self.count("let room = pillTop - headerBottom return room.isFinite ? max(0, room) : 0", in: room) == 1,
                 "the measured space between the header's bottom and the stack's top; none until measured")

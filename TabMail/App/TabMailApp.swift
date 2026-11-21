@@ -171,9 +171,15 @@ struct TabMailApp: App {
 
         // Configure TipKit for onboarding hints
         #if DEBUG
-        let showsFieldDragTip = ProcessInfo.processInfo.arguments.contains("--chat-field-drag-tip")
+        let arguments = ProcessInfo.processInfo.arguments
+        let showsFieldDragTip = arguments.contains("--chat-field-drag-tip")
+        let fieldDragTipStore = arguments.firstIndex(of: "--chat-field-drag-tip-store")
+            .flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil }
+        let freshFieldDragTipStore = arguments.contains("--chat-field-drag-tip-fresh")
         #else
         let showsFieldDragTip = false
+        let fieldDragTipStore: String? = nil
+        let freshFieldDragTipStore = false
         #endif
         if showsFieldDragTip {
             // Debug UI tests only: a fresh datastore with the chat field's drag tip forced on, so
@@ -184,6 +190,20 @@ struct TabMailApp: App {
                 .displayFrequency(.immediate),
                 .datastoreLocation(.applicationDefault)
             ])
+        } else if let fieldDragTipStore {
+            // Debug UI tests only: the app's own tip pacing and rules, nothing forced, on a datastore
+            // of the test's own that outlives a relaunch (emptied first when the test asks), so a
+            // test can follow the drag tip's one showing from launch to launch. The swipe fixture
+            // has no RootView to open the onboarding gate, so it is opened here, as for a user past
+            // onboarding.
+            let store = FileManager.default.temporaryDirectory.appendingPathComponent(fieldDragTipStore, isDirectory: true)
+            if freshFieldDragTipStore { try? FileManager.default.removeItem(at: store) }
+            try? FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
+            try? Tips.configure([
+                .displayFrequency(.daily),
+                .datastoreLocation(.url(store))
+            ])
+            OnboardingTipGate.onboardingComplete = true
         } else if ScreenshotMode.isActive || ScreenshotMode.isSplashMode {
             // Suppress all tips in screenshot mode
             try? Tips.configure([

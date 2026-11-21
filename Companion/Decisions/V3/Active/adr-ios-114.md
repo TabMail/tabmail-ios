@@ -1152,9 +1152,17 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `ChatReplyFieldTests.fieldDragTip`, `ChatFieldDragTests.firstDragWithTheTipOpens`,
    `ChatSwipeUITests.testFieldDragTipShowsAndLeavesTheFieldItsTouches` (launched with
    `--chat-field-drag-tip`, which resets the TipKit datastore and forces the tip on),
-   `testFieldDragTipCardIsWholeOrWaitsForRoom` (landscape at a large text size, then upright; the
-   whole card read from the debug marker `ChatFieldDragMarker.TipCard`),
-   `testFieldDragTipStaysGoneAfterAShortDrag` and `testFieldDragTipStaysGoneAfterATap`.
+   `testFieldDragTipCardIsWholeOrWaitsForRoom` (forced on, for the card's geometry: landscape at a
+   large text size, read once the card shows or waits, then upright; the whole card read from the
+   debug marker `ChatFieldDragMarker.TipCard`, the waiting from `ChatFieldDragMarker.TipWait` on the
+   empty stand-in). The tip's lifecycle is tested under the app's own TipKit rules, nothing forced,
+   on a datastore of the test's own that a relaunch keeps (`--chat-field-drag-tip-store`, emptied
+   first with `--chat-field-drag-tip-fresh`; amended 2026-11-21, since forcing the tip on bypasses
+   its eligibility and brings it back after it is ended):
+   `testFieldDragTipWaitingForRoomKeepsItsOneShowing` (landscape at the largest text size the tip
+   waits and shows no card; relaunched upright on the same datastore it shows whole),
+   `testFieldDragTipStaysGoneAfterAShortDrag` and `testFieldDragTipStaysGoneAfterATap` (ended, it
+   stays gone in the chat opened again and after a relaunch on the same datastore).
 
 21. **A new email rises into the open chat (amendment 2026-11-20).** When the newest email changes
    after the chat has landed (`ChatArrival.isArrival`), the new bubble rises from behind the reply
