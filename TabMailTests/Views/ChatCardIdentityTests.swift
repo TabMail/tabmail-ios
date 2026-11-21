@@ -12,7 +12,8 @@ import Testing
 /// THE SYSTEM PROPERTY pinned here: the card marks read only the email the bubble showed. On IMAP
 /// a UIDVALIDITY reset can put a different email at the same address before the detail resolves
 /// it; the card passes the bubble's Message-ID with the address, so the detail marks nothing read
-/// then. The unchanged email is still marked read (the control).
+/// then. The unchanged email is still marked read (the control). The same holds for a chat opened
+/// from search on an email with no Message-ID: it carries the address epoch search found.
 ///
 /// The account is Gmail: the witness check is the same for every provider, and a Gmail read's queued
 /// operation fails at once here, where an IMAP one would try to connect and hold the shared write
@@ -111,6 +112,58 @@ struct ChatCardIdentityTests {
         let after = try await pool.read { db in try MessageHeader.fetchOne(db, key: seated.id) }
         #expect(after?.rfc822MessageId == seated.rfc822MessageId)
         #expect(after?.isRead == !reseated)
+    }
+
+    // MARK: - A chat opened from search on a row with no Message-ID
+
+    /// The same property for the chat itself, opened from search as `MessageOpenView` opens it for
+    /// a row with no Message-ID: the address and the epoch search found it under. The chat's own
+    /// view model is the one its init builds (read before the view is installed, so the State's
+    /// initial value), and its open marks read through `markReadOnOpenIfNeeded`, as `noteMembers`
+    /// does for the opened email.
+    @Test("A chat opened from search on an address re-seated under a new epoch marks nothing read; an unchanged one is marked read",
+          arguments: [false, true])
+    func searchChatMarksOnlyTheEmailSearchFound(reseated: Bool) async throws {
+        let (pool, inbox, dir, previous) = try makeDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir); clearShared() }
+        clearShared()
+        var found = header(rfc: "<unused@example.com>", inbox: inbox)
+        found.rfc822MessageId = nil
+        let searchedEpoch = try #require(found.observedUidValidity)
+        let shown = found
+        try await pool.write { db in try shown.insert(db) }
+        var seated = shown
+        if reseated {
+            // A UIDVALIDITY reset puts another email without a Message-ID at the same address.
+            seated.subject = "Another email"
+            seated.observedUidValidity = searchedEpoch + 1
+        }
+        let atAddress = seated
+        if reseated {
+            #expect(atAddress.id == shown.id, "the replacement sits at the same address")
+            try await pool.write { db in
+                try shown.delete(db)
+                try atAddress.insert(db)
+            }
+        }
+        // Hold the write queue so a registered read is still observable below.
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        await AccountManager.shared.enqueueWrite {
+            var it = gateStream.makeAsyncIterator()
+            _ = await it.next()
+        }
+        let chat = ChatThreadView(messageId: shown.id, expectedObservedUidValidity: searchedEpoch)
+        await chat.viewModel.markReadOnOpenIfNeeded()
+        let registered = intentCycles()
+        let expected: [String] = reseated ? [] : [shown.id]
+        #expect(registered == expected, "a read is registered only for the email search found")
+        gate.finish()
+        await drainWriteQueue()
+        let after = try await pool.read { db in try MessageHeader.fetchOne(db, key: atAddress.id) }
+        let afterSubject = after?.subject
+        let afterRead = after?.isRead
+        #expect(afterSubject == atAddress.subject, "control: the row at the address is the one the test put there")
+        #expect(afterRead == !reseated)
     }
 
     @Test("The chat's card passes the bubble's Message-ID with its address")

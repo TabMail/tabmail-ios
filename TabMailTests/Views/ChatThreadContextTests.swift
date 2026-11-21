@@ -369,6 +369,52 @@ struct ChatThreadContextTests {
         }
     }
 
+    /// A search result for a row with no Message-ID carries the address epoch it found the row
+    /// under (`provenObservedUidValidity`). After a UIDVALIDITY reset re-seats the address under a
+    /// new epoch, the row there is not the draft searched for: it must not open in the draft editor.
+    @Test("A draft found without a Message-ID opens in the draft editor only while its address keeps the epoch search found")
+    func draftWithoutMessageIdFollowsTheSearchEpoch() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        _ = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "acc1", path: "Drafts", role: .drafts, pool: pool)
+        let searchedEpoch = 7
+        var draft = Self.header("draft", folder: "Drafts")
+        draft.folderId = MessageIdentity.folderId(accountId: "acc1", folderPath: "Drafts")
+        draft.rfc822MessageId = nil
+        draft.observedUidValidity = searchedEpoch
+        let found = draft
+        try await pool.write { db in try found.insert(db) }
+        let foundId = found.id
+        let database = PrioritizedDatabase(pool: pool)
+
+        let fetched = try await pool.read { db in try MessageHeader.fetchOne(db, key: foundId) }
+        let stored = try #require(fetched)
+        for chat in [true, false] {
+            let kept = MessageOpenView.route(
+                messageId: foundId, expectedObservedUidValidity: searchedEpoch, opensInChat: chat, pool: database)
+            #expect(kept == .draftEditor(stored), "control: the address still holds the epoch search found (chat view \(chat))")
+        }
+
+        // A UIDVALIDITY reset re-seats the address: the row there now carries a new epoch.
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET observedUidValidity = ? WHERE id = ?",
+                           arguments: [searchedEpoch + 1, foundId])
+        }
+        for chat in [true, false] {
+            let other: MessageOpenView.Route = chat ? .chat : .detail
+            let reseated = MessageOpenView.route(
+                messageId: foundId, expectedObservedUidValidity: searchedEpoch, opensInChat: chat, pool: database)
+            #expect(reseated == other,
+                    "a row re-seated under a new epoch is left to the chat or the detail, which refuse it (chat view \(chat))")
+            let unwitnessed = MessageOpenView.route(messageId: foundId, opensInChat: chat, pool: database)
+            #expect(unwitnessed != other, "control: an open with no witness still goes to the draft editor (chat view \(chat))")
+        }
+    }
+
     @Test("Every open path goes through MessageOpenView, which decides the draft editor once")
     func everyOpenPathRoutesDrafts() throws {
         let root = URL(fileURLWithPath: #filePath)
