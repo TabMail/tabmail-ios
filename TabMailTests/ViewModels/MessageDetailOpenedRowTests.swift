@@ -23,8 +23,9 @@ import Testing
 /// already published. Every writer of the opened email reaches it: pull-to-refresh, the
 /// open's own resolve, and the body poll's header recovery after the open lost the header.
 ///
-/// And when one opened email is replaced by another, the thread is reloaded, so a copy of
-/// the email opened before that is still stored comes back to the chat's rows.
+/// And when one opened email is replaced by another, the thread is reloaded, so the email
+/// opened before comes back to the chat's rows while the thread still holds it, also when the
+/// replacement lands under a preview freeze; and the earlier/later split follows the new one.
 ///
 /// `.serialized`, `.processGlobalState`: the view model observes process-wide
 /// notifications and the test installs the shared `AppDatabase`.
@@ -78,10 +79,8 @@ struct MessageDetailOpenedRowTests {
                (vm.earlierMessages + vm.laterMessages).contains(where: { $0.id == openedId }) {
                 found.append("after \(field): the email screen lists the opened email \(openedId) in its thread")
             }
-            if field == .message {
-                for id in kept where id != openedId && rows.filter({ $0 == id }).count != 1 {
-                    found.append("after \(field): the row \(id) is not in the chat's rows exactly once: \(rows)")
-                }
+            for id in kept where id != openedId && rows.filter({ $0 == id }).count != 1 {
+                found.append("after \(field): the row \(id) is not in the chat's rows exactly once: \(rows)")
             }
         }
     }
@@ -141,10 +140,18 @@ struct MessageDetailOpenedRowTests {
         }
     }
 
+
+    /// A wait that ran out: the test fails here instead of asserting on a state it never reached.
+    struct TimedOut: Error, CustomStringConvertible {
+        let what: String
+        var description: String { "timed out waiting for \(what)" }
+    }
+
     @MainActor
-    private func waitUntil(seconds: Double = 3, _ condition: () -> Bool) async throws {
+    private func waitUntil(_ what: String, seconds: Double = 3, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)
-        while !condition() && Date() < deadline {
+        while !condition() {
+            guard Date() < deadline else { throw TimedOut(what: what) }
             try await Task.sleep(for: .milliseconds(20))
         }
     }
@@ -157,22 +164,74 @@ struct MessageDetailOpenedRowTests {
         }
     }
 
-    /// Every display read point a reader reached, in order, without holding any of them.
+    /// In order: each publication of the opened email, each thread scan asked for (with the
+    /// opened email it starts from), and each display read point a reader reached.
     @MainActor
-    final class ReadPoints {
-        private(set) var reached: [MessageDetailViewModel.DisplayReadPoint] = []
+    final class Timeline {
+        enum Event: Equatable {
+            case opened(String?)
+            case scanAsked(String)
+            case read(MessageDetailViewModel.DisplayReadPoint)
+        }
+
+        /// One change of the opened id, and whether a thread scan from the new one was asked
+        /// for at that very change, before anything else happened.
+        struct Change {
+            let from: String?
+            let to: String?
+            let index: Int
+            let scanAskedAtOnce: Bool
+        }
+
+        private(set) var events: [Event] = []
+        private let openedAtStart: String?
 
         init(_ vm: MessageDetailViewModel) {
-            let previous = vm._displayReadHook
+            openedAtStart = vm.message?.id
+            let previousPublication = vm._publicationHook
+            vm._publicationHook = { [weak self, weak vm] field in
+                previousPublication?(field)
+                guard let self, let vm, field == .message else { return }
+                self.events.append(.opened(vm.message?.id))
+            }
+            let previousRequest = vm._threadScanRequestHook
+            vm._threadScanRequestHook = { [weak self] anchor in
+                previousRequest?(anchor)
+                self?.events.append(.scanAsked(anchor))
+            }
+            let previousRead = vm._displayReadHook
             vm._displayReadHook = { [weak self] point in
-                await previous?(point)
-                self?.reached.append(point)
+                await previousRead?(point)
+                self?.events.append(.read(point))
             }
         }
 
-        /// Thread scans that read the store since this was installed (a scan skipped because a
-        /// newer one was queued reads nothing and is not counted).
-        var scans: Int { reached.filter { $0 == .threadScan }.count }
+        var changes: [Change] {
+            var result: [Change] = []
+            var current = openedAtStart
+            for (i, event) in events.enumerated() {
+                guard case .opened(let id) = event, id != current else { continue }
+                let askedAtOnce = id.map { i > 0 && events[i - 1] == .scanAsked($0) } ?? false
+                result.append(Change(from: current, to: id, index: i, scanAskedAtOnce: askedAtOnce))
+                current = id
+            }
+            return result
+        }
+
+        /// Changes from one opened email to another.
+        var replacements: [Change] { changes.filter { $0.from != nil && $0.to != nil } }
+        /// Changes from no opened email to one.
+        var firstOpens: [Change] { changes.filter { $0.from == nil && $0.to != nil } }
+
+        /// Thread scans that read the store after the event at `index`.
+        func scansRead(after index: Int) -> Int {
+            events.suffix(from: min(index + 1, events.count)).filter { $0 == .read(.threadScan) }.count
+        }
+
+        func reached(_ point: MessageDetailViewModel.DisplayReadPoint) -> Bool { events.contains(.read(point)) }
+        func scansAsked(after index: Int) -> Int {
+            events.suffix(from: min(index + 1, events.count)).filter { if case .scanAsked = $0 { return true } else { return false } }.count
+        }
     }
 
     /// Holds a server fetch until `open()`.
@@ -194,11 +253,38 @@ struct MessageDetailOpenedRowTests {
         }
     }
 
-    /// Waits until `scans` thread scans have read the store and no reader runs or waits for a
-    /// display turn, so every scan a writer queued has published.
+    /// Awaits every thread scan asked for since the timeline was installed (each has read and
+    /// published, or was skipped for a newer one), then checks no display reader runs or waits.
     @MainActor
-    private func waitForScans(_ points: ReadPoints, atLeast scans: Int, _ vm: MessageDetailViewModel, seconds: Double = 5) async throws {
-        try await waitUntil(seconds: seconds) { points.scans >= scans && vm.displayTurnIsIdleForTesting }
+    private func settle(_ vm: MessageDetailViewModel) async {
+        await vm.settleThreadScansForTesting()
+        #expect(vm.displayTurnIsIdleForTesting, "control: every display reader has finished")
+    }
+
+    /// Every one of `ids` still stored is the opened email or exactly one row, so a whole-chat
+    /// action takes it once.
+    @MainActor
+    private func expectEveryStoredCopyListedOnce(
+        _ vm: MessageDetailViewModel, among ids: [String], pool: DatabasePool
+    ) async throws {
+        let stored = try await pool.read { db in try MessageHeader.filter(keys: ids).fetchAll(db).map(\.id) }
+        #expect(!stored.isEmpty, "control: the fixture's emails are stored")
+        let rows = vm.chatRows.map(\.id)
+        for id in stored {
+            #expect(rows.filter { $0 == id }.count == 1, "the stored email \(id) is the opened email or exactly one row: \(rows)")
+        }
+    }
+
+    /// A replacement of one opened email by another asked for a thread scan at once, and a scan
+    /// read the store after it.
+    @MainActor
+    private func expectReloadAfterEveryReplacement(_ timeline: Timeline) {
+        let replacements = timeline.replacements
+        #expect(!replacements.isEmpty, "control: one opened email replaced another")
+        for change in replacements {
+            #expect(change.scanAskedAtOnce, "replacing \(change.from ?? "nil") with \(change.to ?? "nil") reloads the thread")
+            #expect(timeline.scansRead(after: change.index) >= 1, "a thread scan read the store after the replacement")
+        }
     }
 
     /// One Gmail email under two labels (the opened Inbox copy and its All Mail copy) and a
@@ -226,7 +312,7 @@ struct MessageDetailOpenedRowTests {
             observeNotifications: true)
         vm._testSeedMessage(opened)
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: Self.testPostSentinel)
-        try await waitUntil { vm.hasLoadedThread && vm.displayTurnIsIdleForTesting }
+        try await waitUntil("the thread to load") { vm.hasLoadedThread && vm.displayTurnIsIdleForTesting }
         return vm
     }
 
@@ -256,18 +342,19 @@ struct MessageDetailOpenedRowTests {
 
         // The reply and its other copy are not the opened email: they stay in the rows.
         let violations = Violations(vm, keeping: [reply.id, replyAllMailCopy.id])
-        let points = ReadPoints(vm)
+        let timeline = Timeline(vm)
         try await removeInboxCopy(inboxCopy, from: pool)
         await vm.refetchBody()
-        // Two scans: the reload the re-point queues, and the refresh's own after its fetch.
-        try await waitForScans(points, atLeast: 2, vm)
+        await settle(vm)
 
         #expect(vm.message?.id == allMailCopy.id, "precondition: the open re-resolved onto the All Mail copy")
-        #expect(points.scans == 2, "the re-point reloads the thread once, and the refresh scans once after its fetch")
+        expectReloadAfterEveryReplacement(timeline)
         #expect(violations.checks > 0, "control: the publications were checked")
         #expect(violations.found.isEmpty, "\(violations.found)")
         #expect(vm.chatRows.map(\.id).sorted() == [allMailCopy.id, reply.id, replyAllMailCopy.id].sorted(),
                 "a whole-chat action takes the opened email and both copies of the reply, each once")
+        try await expectEveryStoredCopyListedOnce(
+            vm, among: [inboxCopy.id, allMailCopy.id, reply.id, replyAllMailCopy.id], pool: pool)
     }
 
     @MainActor
@@ -292,18 +379,19 @@ struct MessageDetailOpenedRowTests {
                 "precondition: the screen shows the All Mail copy as a thread message")
 
         let violations = Violations(vm, keeping: [later.id])
-        let points = ReadPoints(vm)
+        let timeline = Timeline(vm)
         try await removeInboxCopy(inboxCopy, from: pool)
         await vm.refetchBody()
-        try await waitForScans(points, atLeast: 2, vm)
+        await settle(vm)
 
         #expect(vm.message?.id == allMailCopy.id, "precondition: the open re-resolved onto the All Mail copy")
-        #expect(points.scans == 2, "the re-point reloads the thread once, and the refresh scans once after its fetch")
+        expectReloadAfterEveryReplacement(timeline)
         #expect(violations.checks > 0, "control: the publications were checked")
         #expect(violations.found.isEmpty, "\(violations.found)")
         #expect(vm.threadMessages.map(\.id) == [later.id])
         #expect((vm.earlierMessages + vm.laterMessages).map(\.id) == [later.id],
                 "the screen shows the later email once and the opened email only as the opened one")
+        try await expectEveryStoredCopyListedOnce(vm, among: [inboxCopy.id, allMailCopy.id, later.id], pool: pool)
     }
 
     @MainActor
@@ -319,25 +407,26 @@ struct MessageDetailOpenedRowTests {
         #expect(vm.threadCopies.map(\.id) == [allMailCopy.id], "precondition: the All Mail copy is a hidden copy")
 
         let violations = Violations(vm, keeping: [reply.id])
-        let points = ReadPoints(vm)
+        let timeline = Timeline(vm)
         // The Inbox label goes before the open reads: its resolve finds the All Mail copy.
         try await removeInboxCopy(inboxCopy, from: pool)
         await vm.loadBody()
-        // The reload the re-point queues, and the open's own scan after its fetch.
-        try await waitForScans(points, atLeast: 2, vm)
+        await settle(vm)
 
-        #expect(points.reached.contains(.openResolve), "control: the open's resolve ran")
-        #expect(violations.openedAtPublication.first == allMailCopy.id,
+        #expect(timeline.reached(.openResolve), "control: the open's resolve ran")
+        #expect(timeline.changes.first.map { $0.from == inboxCopy.id && $0.to == allMailCopy.id } == true,
                 "control: the open's resolve replaced the opened Inbox copy with the All Mail copy")
         #expect(vm.message?.id == allMailCopy.id)
+        expectReloadAfterEveryReplacement(timeline)
         #expect(violations.checks > 0, "control: the publications were checked")
         #expect(violations.found.isEmpty, "\(violations.found)")
         #expect(vm.chatRows.map(\.id).sorted() == [allMailCopy.id, reply.id].sorted(),
                 "a whole-chat action takes the opened email and the reply, each once")
+        try await expectEveryStoredCopyListedOnce(vm, among: [inboxCopy.id, allMailCopy.id, reply.id], pool: pool)
     }
 
     @MainActor
-    @Test("the chat never lists the opened email twice when a copy becomes the opened one after the opened email was lost, and that starts no extra scan")
+    @Test("the chat never lists the opened email twice when a copy becomes the opened one after the opened email was lost, and that asks for no extra scan")
     func copyRecoveredAfterTheOpenedOneWasLostIsListedOnce() async throws {
         let (pool, dir, previous) = try makePool()
         defer { cleanUp(pool, dir, previous) }
@@ -361,27 +450,65 @@ struct MessageDetailOpenedRowTests {
         #expect(vm.threadCopies.map(\.id) == [allMailCopy.id], "precondition: the All Mail copy is a hidden copy")
 
         let violations = Violations(vm, keeping: [reply.id])
-        let points = ReadPoints(vm)
+        let timeline = Timeline(vm)
         await vm.loadBody()
-        // The poll's first server fetch comes after its 2s tick; its publish queues one scan.
-        try await waitUntil(seconds: 8) {
+        // The poll's first server fetch comes after its 2s tick; it publishes the body and the
+        // header and asks for its scan in one display turn.
+        try await waitUntil("the poll to recover the All Mail copy and its body", seconds: 8) {
             vm.message?.id == allMailCopy.id && vm.messageBody != nil
-                && points.scans >= 1 && vm.displayTurnIsIdleForTesting
         }
-        // Long enough for a scan queued by any earlier write to have read.
-        try await Task.sleep(for: .milliseconds(300))
-        try await waitUntil { vm.displayTurnIsIdleForTesting }
+        await settle(vm)
 
-        #expect(points.reached.contains(.openReread), "control: the open read the header back after its fetch")
-        #expect(violations.openedAtPublication.contains(where: { $0 == nil }),
-                "control: the open published no opened email when the header was gone")
-        #expect(violations.openedAtPublication.last == allMailCopy.id, "control: the poll recovered the All Mail copy")
+        #expect(timeline.reached(.openReread), "control: the open read the header back after its fetch")
+        #expect(timeline.changes.map(\.to) == [nil, allMailCopy.id],
+                "control: the open published no opened email, then the poll recovered the All Mail copy")
+        #expect(timeline.replacements.isEmpty, "control: no opened email replaced another")
+        let firstOpens = timeline.firstOpens
+        #expect(firstOpens.count == 1, "control: the recovery opened the All Mail copy where none was opened")
+        for change in firstOpens {
+            #expect(!change.scanAskedAtOnce, "opening an email where none was opened asks for no extra scan")
+        }
         #expect(vm.messageBody != nil, "control: the poll fetched the body")
         #expect(violations.checks > 0, "control: the publications were checked")
         #expect(violations.found.isEmpty, "\(violations.found)")
-        #expect(points.scans == 1, "opening an email where none was opened starts no extra scan")
         #expect(vm.chatRows.map(\.id).sorted() == [allMailCopy.id, reply.id].sorted(),
                 "a whole-chat action takes the opened email and the reply, each once")
+        try await expectEveryStoredCopyListedOnce(vm, among: [inboxCopy.id, allMailCopy.id, reply.id], pool: pool)
+    }
+
+    /// The Inbox copy is on screen from the notification's snapshot but not stored yet; the All
+    /// Mail copy and a reply are stored. The open's resolve misses the Inbox copy and finds the
+    /// All Mail copy; the Inbox copy is stored right after that read, so both copies are live
+    /// when the open publishes. The open's server fetch is held, so its own scan cannot run.
+    @MainActor
+    private func openOntoAnotherCopyWhileTheFirstIsStored(
+        pool: DatabasePool, gate: FetchGate
+    ) async throws -> (vm: MessageDetailViewModel, inboxCopy: MessageHeader, allMailCopy: MessageHeader, reply: MessageHeader) {
+        let gmailId = "opened-\(UUID().uuidString)"
+        let rfc = "<\(gmailId)@example.com>"
+        let inboxCopy = header(gmailId, folder: "INBOX", rfc: rfc, minutesAgo: 30)
+        let allMailCopy = header(gmailId, folder: "Archive", rfc: rfc, minutesAgo: 30)
+        let reply = header("reply-\(UUID().uuidString)", folder: "INBOX", rfc: "<reply-\(gmailId)@example.com>",
+                           inReplyTo: rfc, minutesAgo: 10)
+        try insert([allMailCopy, reply], into: pool)
+
+        let vm = try await openWithThread(inboxCopy, pool: pool, fetchBody: { msg in
+            await gate.hold()
+            try await Self.storeBody(msg, in: pool)
+        })
+        #expect(vm.threadMessages.map(\.id) == [reply.id], "precondition: the chat shows the reply")
+        #expect(vm.threadCopies.map(\.id) == [allMailCopy.id], "precondition: the All Mail copy is a hidden copy")
+
+        let storedInboxCopy = inboxCopy
+        vm._displayReadHook = { point in
+            guard point == .openResolve else { return }
+            do {
+                try await pool.write { db in try storedInboxCopy.insert(db, onConflict: .ignore) }
+            } catch {
+                Issue.record("storing the Inbox copy failed: \(error)")
+            }
+        }
+        return (vm, inboxCopy, allMailCopy, reply)
     }
 
     @MainActor
@@ -389,58 +516,131 @@ struct MessageDetailOpenedRowTests {
     func previousCopyComesBackAfterTheOpenedOneIsReplaced() async throws {
         let (pool, dir, previous) = try makePool()
         defer { cleanUp(pool, dir, previous) }
-        let gmailId = "opened-\(UUID().uuidString)"
-        let rfc = "<\(gmailId)@example.com>"
-        // The Inbox copy is on screen from the notification's snapshot but not stored yet; the
-        // All Mail copy and a reply are stored.
-        let inboxCopy = header(gmailId, folder: "INBOX", rfc: rfc, minutesAgo: 30)
-        let allMailCopy = header(gmailId, folder: "Archive", rfc: rfc, minutesAgo: 30)
-        let reply = header("reply-\(UUID().uuidString)", folder: "INBOX", rfc: "<reply-\(gmailId)@example.com>",
-                           inReplyTo: rfc, minutesAgo: 10)
-        try insert([allMailCopy, reply], into: pool)
-
         let gate = FetchGate()
-        let vm = try await openWithThread(inboxCopy, pool: pool, fetchBody: { msg in
-            await gate.hold()
-            try await Self.storeBody(msg, in: pool)
-        })
+        let (vm, inboxCopy, allMailCopy, reply) = try await openOntoAnotherCopyWhileTheFirstIsStored(pool: pool, gate: gate)
         defer { vm.cancelBodyPollForTesting() }
-        #expect(vm.threadMessages.map(\.id) == [reply.id], "precondition: the chat shows the reply")
-        #expect(vm.threadCopies.map(\.id) == [allMailCopy.id], "precondition: the All Mail copy is a hidden copy")
+        let ids = [inboxCopy.id, allMailCopy.id, reply.id]
 
-        // The open's resolve misses the Inbox copy and finds the All Mail copy; the Inbox copy is
-        // stored right after that read, so both copies are live when the open publishes.
-        vm._displayReadHook = { point in
-            guard point == .openResolve else { return }
-            do {
-                try await pool.write { db in try inboxCopy.insert(db, onConflict: .ignore) }
-            } catch {
-                Issue.record("storing the Inbox copy failed: \(error)")
-            }
-        }
         let violations = Violations(vm, keeping: [reply.id])
-        let points = ReadPoints(vm)
+        let timeline = Timeline(vm)
         let load = Task { await vm.loadBody() }
-
-        // Only the reload can scan while the open's fetch is held.
-        try await waitUntil { gate.reached }
-        try await waitForScans(points, atLeast: 1, vm)
-        #expect(gate.reached, "control: the open is fetching the body")
-        #expect(vm.message?.id == allMailCopy.id, "control: the open replaced the Inbox copy with the All Mail copy")
-        #expect(points.scans == 1, "the replacement reloaded the thread")
-        #expect(violations.found.isEmpty, "\(violations.found)")
-        let rows = vm.chatRows.map(\.id)
-        #expect(rows.sorted() == [allMailCopy.id, inboxCopy.id, reply.id].sorted(),
-                "a whole-chat action takes every stored copy, the Inbox copy included: \(rows)")
-        #expect(Set(rows).count == rows.count, "each row once: \(rows)")
-
+        // The held fetch is released and the open joined on every way out, so no task outlives
+        // the fixture.
+        do {
+            try await waitUntil("the open to reach its server fetch") { gate.reached }
+            // Only the reload can scan while the open's fetch is held.
+            await settle(vm)
+            #expect(vm.message?.id == allMailCopy.id, "control: the open replaced the Inbox copy with the All Mail copy")
+            expectReloadAfterEveryReplacement(timeline)
+            #expect(violations.found.isEmpty, "\(violations.found)")
+            let rows = vm.chatRows.map(\.id)
+            #expect(rows.sorted() == ids.sorted(),
+                    "a whole-chat action takes every stored copy, the Inbox copy included: \(rows)")
+            try await expectEveryStoredCopyListedOnce(vm, among: ids, pool: pool)
+        } catch {
+            gate.open()
+            await load.value
+            throw error
+        }
         gate.open()
         await load.value
-        try await waitForScans(points, atLeast: 2, vm)
+        await settle(vm)
         #expect(violations.found.isEmpty, "\(violations.found)")
         let finalRows = vm.chatRows.map(\.id)
-        #expect(finalRows.sorted() == [allMailCopy.id, inboxCopy.id, reply.id].sorted(),
-                "the open's own scan keeps every stored copy: \(finalRows)")
-        #expect(Set(finalRows).count == finalRows.count, "each row once: \(finalRows)")
+        #expect(finalRows.sorted() == ids.sorted(), "the open's own scan keeps every stored copy: \(finalRows)")
+        try await expectEveryStoredCopyListedOnce(vm, among: ids, pool: pool)
+    }
+
+    @MainActor
+    @Test("when another copy replaces the opened email during a preview, the copy opened before comes back to the chat's rows when the preview ends")
+    func previousCopyComesBackAfterAReplacementDuringAPreview() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer {
+            PreviewFreezeGate.shared.end()
+            cleanUp(pool, dir, previous)
+        }
+        let gate = FetchGate()
+        let (vm, inboxCopy, allMailCopy, reply) = try await openOntoAnotherCopyWhileTheFirstIsStored(pool: pool, gate: gate)
+        defer { vm.cancelBodyPollForTesting() }
+        let ids = [inboxCopy.id, allMailCopy.id, reply.id]
+
+        let violations = Violations(vm, keeping: [reply.id])
+        let timeline = Timeline(vm)
+        PreviewFreezeGate.shared.begin()
+        let load = Task { await vm.loadBody() }
+        do {
+            try await waitUntil("the open to reach its server fetch") { gate.reached }
+            await settle(vm)
+            #expect(vm.message?.id == allMailCopy.id, "control: the open replaced the Inbox copy during the preview")
+            let replacement = timeline.replacements.first
+            #expect(replacement != nil, "control: one opened email replaced another")
+            #expect(replacement.map { timeline.scansRead(after: $0.index) } == 0,
+                    "control: nothing reloads the thread while the preview is shown")
+            #expect(!vm.chatRows.contains(where: { $0.id == inboxCopy.id }),
+                    "control: the copy opened before is not back yet")
+
+            PreviewFreezeGate.shared.end()
+            // The release replays the reload the replacement asked for.
+            try await waitUntil("the preview's end to reload the thread") {
+                replacement.map { timeline.scansAsked(after: $0.index) } ?? 0 >= 1
+            }
+            await settle(vm)
+            #expect(replacement.map { timeline.scansRead(after: $0.index) } ?? 0 >= 1,
+                    "a thread scan read the store after the preview ended")
+            #expect(violations.found.isEmpty, "\(violations.found)")
+            let rows = vm.chatRows.map(\.id)
+            #expect(rows.sorted() == ids.sorted(),
+                    "a whole-chat action takes every stored copy, the Inbox copy included: \(rows)")
+            try await expectEveryStoredCopyListedOnce(vm, among: ids, pool: pool)
+        } catch {
+            PreviewFreezeGate.shared.end()
+            gate.open()
+            await load.value
+            throw error
+        }
+        gate.open()
+        await load.value
+        await settle(vm)
+        #expect(violations.found.isEmpty, "\(violations.found)")
+        try await expectEveryStoredCopyListedOnce(vm, among: ids, pool: pool)
+    }
+
+    @MainActor
+    @Test("when a hidden copy becomes the opened email, a thread email on the same second moves to its side of the new opened one")
+    func splitFollowsTheNewOpenedEmail() async throws {
+        let (pool, dir, previous) = try makePool()
+        defer { cleanUp(pool, dir, previous) }
+        let gmailId = "opened-\(UUID().uuidString)"
+        let rfc = "<\(gmailId)@example.com>"
+        // Three emails on the same second, so only the id orders them. The ids are
+        // `<account>:<folder>:<provider id>`: the All Mail copy ("Archive:opened-…") sorts before
+        // the reply ("INBOX:a-…"), which sorts before the Inbox copy ("INBOX:opened-…").
+        let inboxCopy = header(gmailId, folder: "INBOX", rfc: rfc, minutesAgo: 30)
+        var allMailCopy = header(gmailId, folder: "Archive", rfc: rfc, minutesAgo: 30)
+        var sameSecond = header("a-\(UUID().uuidString)", folder: "INBOX", rfc: "<reply-\(gmailId)@example.com>",
+                                inReplyTo: rfc, minutesAgo: 30)
+        allMailCopy.date = inboxCopy.date
+        sameSecond.date = inboxCopy.date
+        #expect(allMailCopy.id < sameSecond.id && sameSecond.id < inboxCopy.id, "precondition: the ids order the three")
+        try insert([inboxCopy, allMailCopy, sameSecond], into: pool)
+
+        let vm = try await openWithThread(inboxCopy, pool: pool)
+        defer { vm.cancelBodyPollForTesting() }
+        #expect(vm.threadCopies.map(\.id) == [allMailCopy.id], "precondition: the All Mail copy is a hidden copy")
+        #expect(vm.earlierMessages.map(\.id) == [sameSecond.id] && vm.laterMessages.isEmpty,
+                "precondition: the same-second email shows before the Inbox copy")
+
+        let violations = Violations(vm, keeping: [sameSecond.id])
+        let timeline = Timeline(vm)
+        try await removeInboxCopy(inboxCopy, from: pool)
+        await vm.refetchBody()
+        await settle(vm)
+
+        #expect(vm.message?.id == allMailCopy.id, "precondition: the open re-resolved onto the All Mail copy")
+        expectReloadAfterEveryReplacement(timeline)
+        #expect(violations.found.isEmpty, "\(violations.found)")
+        #expect(vm.threadMessages.map(\.id) == [sameSecond.id], "control: the thread rows did not change")
+        #expect(vm.earlierMessages.isEmpty, "the same-second email no longer shows before the opened email")
+        #expect(vm.laterMessages.map(\.id) == [sameSecond.id], "the same-second email shows after the All Mail copy")
     }
 }

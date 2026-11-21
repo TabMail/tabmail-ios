@@ -231,13 +231,14 @@ same AI result, kept as long as the email itself is shown.
    *Amended 2026-11-21 (#1000, #1001):* the opened email is never also one of the rows, and the
    rows are the thread of the email opened now. Both hold through the `message` setter, for every
    writer of it: when the opened id changes, the new id leaves `threadCopies` and `threadMessages`
-   (and the earlier/later split) at once (`MessageDetailViewModel.dropOpenedFromThreadRows`), and
+   at once and the earlier/later split is recomputed against it
+   (`MessageDetailViewModel.dropOpenedFromThreadRows`), and
    when one opened email is replaced by another the setter queues the serialized thread reload
    (`reloadThread`, FIFO behind the writer's display turn, preview-freeze buffered), which rebuilds
    the rows from the new opened email. So the email screen never shows the opened email twice,
-   `chatRows` never lists a row twice, and a copy of the email opened before that is still stored
-   (another Gmail label's copy, which shares its provider id) is a row or a copy again after that
-   reload, so a whole-chat action takes it. Tests: `MessageDetailOpenedRowTests`.
+   `chatRows` never lists a row twice, and the email opened before (another Gmail label's copy,
+   which shares its provider id) is a row or a copy again after that reload whenever the thread
+   load still finds it, so a whole-chat action takes it. Tests: `MessageDetailOpenedRowTests`.
    **What the chat asks for, and where it opens (decided 2026-11-09).** In the decision's words: "Just walk back
    from the recent thing until you walk through the whole thread with some cap. We already have a
    cap somewhere; it's probably good enough. If we scroll further up, we could see more summarizing

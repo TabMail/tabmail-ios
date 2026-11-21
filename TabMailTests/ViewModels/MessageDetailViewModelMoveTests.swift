@@ -516,7 +516,7 @@ struct MessageDetailMarkReadOnArchiveDeleteTests {
         try await pool.read { db in try PendingOperation.order(Column("createdAt").asc).fetchAll(db) }
     }
 
-    @Test("detail archive of an unread message: the on-screen focused row AND its thread card both show read immediately, and the durable end state is read + archived with the read op recorded before the move")
+    @Test("detail archive of an unread message: the on-screen focused row shows read immediately, and the durable end state is read + archived with the read op recorded before the move")
     @MainActor
     func detailArchiveMarksUnreadRead() async throws {
         let (pool, dir, previous) = try makeEnv()
@@ -527,15 +527,13 @@ struct MessageDetailMarkReadOnArchiveDeleteTests {
         let focused = try insertUnreadHeader(pool, messageId: "detail-archive-unread")
         let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
         vm._testSeedMessage(focused)
-        vm.threadMessages = [focused]
 
         #expect(vm.message?.isRead == false, "fixture must start unread or this test is vacuous")
         #expect(vm.archiveMessage(focused) == true)
 
-        // The VISIBLE state, immediately — the card stays on screen after an
+        // The VISIBLE state, immediately — the email stays on screen after an
         // archive, so it must not keep showing an unread dot.
         #expect(vm.message?.isRead == true, "the focused row must show read at once")
-        #expect(vm.threadMessages.first?.isRead == true, "the still-visible thread card must show read at once")
 
         try await settleMove(pool, id: focused.id, to: Self.archivePath)
 
@@ -587,11 +585,9 @@ struct MessageDetailMarkReadOnArchiveDeleteTests {
         let focused = try insertUnreadHeader(pool, messageId: "detail-archive-off")
         let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
         vm._testSeedMessage(focused)
-        vm.threadMessages = [focused]
 
         #expect(vm.archiveMessage(focused) == true)
         #expect(vm.message?.isRead == false, "with the setting OFF nothing flips the on-screen read state")
-        #expect(vm.threadMessages.first?.isRead == false)
 
         try await settleMove(pool, id: focused.id, to: Self.archivePath)
 
@@ -601,6 +597,41 @@ struct MessageDetailMarkReadOnArchiveDeleteTests {
 
         let ops = try await opsInDrainOrder(pool)
         #expect(ops.map(\.type) == [.move], "no read op at all: \(ops.map(\.type.rawValue))")
+    }
+
+    @Test("detail archive of an unread thread card: the card shows read at once with the setting ON and stays unread with it OFF, the opened email is untouched, and the durable end state matches", arguments: [true, false])
+    @MainActor
+    func detailArchiveOfAThreadCard(settingOn: Bool) async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir); clearOverlay() }
+        clearOverlay()
+        UserDefaults.standard.set(settingOn, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        // The opened email and a different email of its thread, shown as a card.
+        let focused = try insertUnreadHeader(pool, messageId: "detail-card-focused-\(settingOn)")
+        let card = try insertUnreadHeader(pool, messageId: "detail-card-\(settingOn)")
+        let vm = MessageDetailViewModel(messageId: focused.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(focused)
+        vm.threadMessages = [card]
+
+        #expect(vm.threadMessages.first?.isRead == false, "fixture must start unread or this test is vacuous")
+        #expect(vm.archiveMessage(card) == true)
+
+        // The card stays on screen after an archive, so with the setting ON it must not keep
+        // showing an unread dot, and with it OFF nothing flips.
+        #expect(vm.threadMessages.first?.isRead == settingOn, "the still-visible thread card")
+        #expect(vm.message?.isRead == false, "the opened email is not the archived one")
+
+        try await settleMove(pool, id: card.id, to: Self.archivePath)
+
+        let final = try await pool.read { db in try MessageHeader.fetchOne(db, key: card.id) }
+        #expect(final?.isRead == settingOn)
+        #expect(final?.folderPath == Self.archivePath)
+
+        let ops = try await opsInDrainOrder(pool)
+        let expected: [OperationType] = settingOn ? [.markRead, .move] : [.move]
+        #expect(ops.map(\.type) == expected,
+                "read intent before the move, and none with the setting OFF: \(ops.map(\.type.rawValue))")
     }
 
     /// SCOPE ANCHOR. Filing a message into a folder the user picked is not
