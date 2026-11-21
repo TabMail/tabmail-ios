@@ -5,6 +5,15 @@
 import GRDB
 import SwiftUI
 
+#if DEBUG
+extension Notification.Name {
+    /// Test seam only: a scroll phase delivered to the open chat as if its scroll view reported it.
+    static let chatScrollPhaseForTesting = Notification.Name("chatScrollPhaseForTesting")
+    /// Test fixture only: the jump button was tapped (its animated scroll starts now).
+    static let chatJumpTappedForTesting = Notification.Name("chatJumpTappedForTesting")
+}
+#endif
+
 extension ChatViewConfig {
     /// Whether an open goes to the chat now. Demo mode with AI declined counts as AI off. A
     /// tutorial run follows what it teaches, decided when it started (`teachesChat`).
@@ -53,8 +62,10 @@ struct ChatThreadView: View {
     @State private var pillHeight = ChatViewLayout.pillStartHeight
     @State private var chatInputFocused = false
     @State private var chatWorking = false
-    /// The ready AI Reply's compose card: the email it answers, and how it opens.
+    /// The ready AI Suggestion's compose card: the email it answers, and how it opens.
     @State private var readyReply: ChatReadyReply?
+    /// The field's "e.g." example, picked once as the chat opens.
+    @State private var example = ChatSuggestionConfig.randomExample()
     @State private var agentCompose: ChatAgentCard?
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet.
@@ -200,7 +211,7 @@ struct ChatThreadView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 // Forward the newest email, in today's forward compose. The tutorial's mail
-                // actions are off (owner 2026-10-21).
+                // actions are off.
                 Button {
                     guard TutorialCoordinator.shared.admits(.other) else { return }
                     forwardMessage = thread.newest
@@ -218,6 +229,9 @@ struct ChatThreadView: View {
             TutorialCoordinator.shared.messageOpened(accountId: opened.accountId, messageId: opened.messageId)
         }
         .onAppear {
+            #if DEBUG
+            NSLog("[cv9diag] onAppear didInitialScroll=%d", didInitialScroll ? 1 : 0)
+            #endif
             viewModel.isViewVisible = true
             isOnScreen = true
             Task { await viewModel.loadBody() }
@@ -258,10 +272,14 @@ struct ChatThreadView: View {
             .presentationDragIndicator(.visible)
         }
         .fullScreenCover(item: $readyReply) { ready in
-            // Today's reply compose, with the AI Reply in its suggestion box: Reply All, or a reply
-            // to only the people chosen in Reply to.
+            let _ = ChatThreadView.logReadyCard(ready)
+            // Today's Reply All compose, with the AI Suggestion in its box: the full reply of the
+            // row the ghost showed, read with it, so the card holds the reply that was tapped. It
+            // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
+            // suggestion through the outbox.
             ready.compose.composeView(
-                replyTo: ready.message, onAgentOutcome: { outcome in composeEnded(outcome, replyTo: ready.message) })
+                replyTo: ready.message, suggestedBody: ready.message.cachedReply, draftId: ready.draftId,
+                onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
         .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
@@ -297,14 +315,34 @@ struct ChatThreadView: View {
                         ForEach(unsentReplies) { reply in
                             ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })
                         }
+                        // The ready AI Suggestion, where the reply lands once sent.
+                        if let newest = thread.newest, let text = suggestionText(on: newest, thread: thread) {
+                            let move = tutorialMove(thread)
+                            ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) {
+                                openSuggestion(on: newest, tutorialMove: move)
+                            }
+                        }
                         Color.clear.frame(height: pillHeight + ChatViewLayout.pillGap).id(Self.bottomId)
                     }
                     .padding(.top, 8)
                 }
-                // Any scroll (a hand, the jump button, an animated scroll) ends the landing.
-                .onScrollPhaseChange { _, phase in
-                    if phase != .idle { scrollTarget = nil }
+                // Only the user's hand ends the landing. A programmatic scroll that animates (a
+                // late height arriving inside an animated transaction) or its settling is not the
+                // user: the chat stays pinned while the ghost and the field's height arrive.
+                .onScrollPhaseChange { old, phase in
+                    #if DEBUG
+                    NSLog("[cv9diag] real phase %@ -> %@", String(describing: old), String(describing: phase))
+                    #endif
+                    endLanding(on: phase)
                 }
+                #if DEBUG
+                // Test seam: tests cannot make a hand scroll or a programmatic animation phase on
+                // demand, so they post one here. Production never posts it.
+                .onReceive(NotificationCenter.default.publisher(for: .chatScrollPhaseForTesting)) { note in
+                    NSLog("[cv9diag] seam received object=%@", String(describing: note.object))
+                    if let phase = note.object as? ScrollPhase { endLanding(on: phase) }
+                }
+                #endif
                 .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
                 .onScrollGeometryChange(for: Bool.self) { geo in
@@ -313,6 +351,9 @@ struct ChatThreadView: View {
                     withAnimation(.easeInOut(duration: 0.2)) { showsJumpButton = isAbove }
                 }
                 .onChange(of: scrollTarget) { _, target in
+                    #if DEBUG
+                    NSLog("[cv9diag] scrollTarget -> %@", String(describing: target?.id))
+                    #endif
                     guard let target else { return }
                     proxy.scrollTo(target.id, anchor: target.anchor)
                 }
@@ -322,16 +363,29 @@ struct ChatThreadView: View {
                 // the bottom with a top inset filling the rest; that fill goes a pass or more after
                 // the thread lands, and on that inset change the platform keeps the offset plus the
                 // top inset, which moves a bottom landing past the bottom by the fill (memory 036).
-                // So the landing is issued again on every size or inset change until a scroll begins.
+                // So the landing is issued again on every size or inset change until the user's
+                // scroll (`endLanding`) or a jump-button tap ends it.
                 .onScrollGeometryChange(for: [CGFloat].self) { geo in
                     [geo.containerSize.height, geo.contentSize.height, geo.contentInsets.top, geo.contentInsets.bottom]
-                } action: { _, _ in
+                } action: { old, new in
+                    #if DEBUG
+                    NSLog("[cv9diag] size %@ -> %@ target=%@", String(describing: old), String(describing: new), String(describing: scrollTarget?.id))
+                    #endif
                     guard let target = scrollTarget else { return }
                     proxy.scrollTo(target.id, anchor: target.anchor)
                 }
                 .overlay(alignment: .bottomTrailing) {
                     if showsJumpButton {
-                        jumpButton { withAnimation { proxy.scrollTo(Self.bottomId, anchor: .bottom) } }
+                        jumpButton {
+                            // The user's tap ends the landing: its animated scroll is not a hand
+                            // scroll, and a held target would pull the chat back on the next height.
+                            scrollTarget = nil
+                            withAnimation { proxy.scrollTo(Self.bottomId, anchor: .bottom) }
+                            #if DEBUG
+                            NSLog("[cv9diag] jump tapped")
+                            NotificationCenter.default.post(name: .chatJumpTappedForTesting, object: nil)
+                            #endif
+                        }
                     }
                 }
                 // Swiping left anywhere between the header and the pill slides the whole chat. With
@@ -452,8 +506,21 @@ struct ChatThreadView: View {
         let anchor: UnitPoint
     }
 
-    /// Where the open lands (`scrollOnceLoaded`). Held until a scroll of any kind begins, so the
-    /// landing is issued again while the screen settles; then the user's scroll owns the screen.
+    /// Whether a scroll phase is the user's own scroll, the only thing that ends the landing's pin.
+    static func userTookOver(_ phase: ScrollPhase) -> Bool {
+        phase == .tracking || phase == .interacting
+    }
+
+    /// A scroll phase began: the user's own scroll ends the landing.
+    private func endLanding(on phase: ScrollPhase) {
+        #if DEBUG
+        NSLog("[cv9diag] endLanding phase=%@ target=%@ ends=%d", String(describing: phase), String(describing: scrollTarget?.id), Self.userTookOver(phase) ? 1 : 0)
+        #endif
+        if Self.userTookOver(phase) { scrollTarget = nil }
+    }
+
+    /// Where the open lands (`scrollOnceLoaded`). Held until the user's scroll (`userTookOver`) or a
+    /// jump-button tap, so the landing is issued again while the screen settles; then the user owns it.
     @State private var scrollTarget: ScrollTarget?
 
     /// Reads every other copy the thread loaded of an email the chat shows, the first time it
@@ -493,6 +560,9 @@ struct ChatThreadView: View {
         // be missing and the chat opens at the bottom.
         noteMembers()
         didInitialScroll = true
+        #if DEBUG
+        NSLog("[cv9diag] scrollOnceLoaded landing")
+        #endif
         let thread = thread
         if highlightsOpenedMessage, let opened = viewModel.message,
            let item = thread.items.first(where: { ChatThread.copyKey($0.header) == ChatThread.copyKey(opened) }) {
@@ -509,7 +579,7 @@ struct ChatThreadView: View {
         }
     }
 
-    // MARK: - Summaries (owner 2026-11-09)
+    // MARK: - Summaries
 
     /// What the summary observation follows: the chat's emails, once the open has landed, while the
     /// chat is on screen. A change restarts it, and its first value checks every row in scope again.
@@ -665,11 +735,51 @@ struct ChatThreadView: View {
     /// The reply field's container, as tests find it.
     static let replyPillId = "chatReplyPill"
 
+    /// The ready AI Suggestion's text on the newest email. None on the user's turn (their email is
+    /// the newest, or a reply of theirs is still in the outbox below it), and none while the reply
+    /// goes only to people chosen in Reply to: the suggestion was written for everyone, and the
+    /// field has the agent write one for the people chosen. None until the thread and its accounts
+    /// have loaded (the newest email and the Reply All audience, without the user's own address,
+    /// are known only then), and none while the agent works on a request from the field (it may
+    /// open its own compose card).
+    private func suggestionText(on newest: MessageHeader, thread: ChatThread) -> String? {
+        // `isLoaded` is also set when the context read failed: the email's own account, read,
+        // is the proof the audience can leave the user out.
+        guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking,
+              context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }
+        let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty
+        return ChatReplyField.suggestionText(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only)
+    }
+
+    /// The tutorial's move in this chat, if it holds the practice email.
+    private func tutorialMove(_ thread: ChatThread) -> TutorialCoordinator.FieldMove? {
+        TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)
+    }
+
+    /// Debug-gated: each build of the ready card's content, with the draft it names.
+    static func logReadyCard(_ ready: ChatReadyReply) {
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) cachedReplyLen=\(ready.message.cachedReply?.count ?? -1)")
+        }
+    }
+
+    /// A tap on the AI Suggestion: the Reply All compose card with it written out (the suggestion
+    /// shows only while the reply goes to everyone). In the tutorial only the step that asks for it
+    /// opens the card.
+    private func openSuggestion(on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {
+        if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion {
+            _ = TutorialCoordinator.shared.admits(.other)
+            return
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Chat] openSuggestion message=\(newest.id) alreadyOpen=\(readyReply != nil)")
+        }
+        readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
+            replyAllTo: newest, accounts: context.accounts))
+    }
+
     private func pill(on newest: MessageHeader) -> some View {
         let isOwn = thread.items.last?.isOwn ?? false
-        // The user's turn: their email is the newest, or a reply of theirs is still in the outbox
-        // below it. No AI Reply is offered on the user's turn.
-        let usersTurn = isOwn || !unsentReplies.isEmpty
         let isNoReply = !isOwn && EmailFilter.isNoReply(newest.fromAddress)
         return VStack(spacing: 8) {
             if let only = replyTarget.only, !chatExpanded {
@@ -689,15 +799,11 @@ struct ChatThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    readyText: ChatReplyField.readyText(newest: newest, isOwn: usersTurn),
+                    example: example,
                     isNoReply: isNoReply,
                     clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
-                    tutorialMove: TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)),
-                onSendReadyReply: {
-                    readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
-                        replyTo: newest, target: replyTarget, accounts: context.accounts))
-                },
+                    tutorialMove: tutorialMove(thread)),
                 onFieldSend: { _ in fieldComposeOpened = false })
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)

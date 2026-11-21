@@ -296,16 +296,22 @@ same AI result, kept as long as the email itself is shown.
      builds. In a plain stack `onAppear` fires for every row at once, which is why the per-row ask
      uses `onScrollVisibilityChange` (`onGeometryChange` with `ChatRowVisibility` since 2026-11-16).
    - `defaultScrollAnchor(.bottom)` opens at the newest email. The landing `scrollTo` is issued once
-     the thread is loaded, and again on every container size, content size or inset change until
-     a scroll of any kind begins (memory 036: a first scroll can be dropped while the screen
-     settles; and the first pass shows the opened email alone, which `defaultScrollAnchor(.bottom)`
-     sits at the bottom with a top inset filling the rest of the screen. That fill goes in the next
-     layout pass after the landing scroll, and on that inset change the platform keeps the offset
-     plus the top inset, which moves a bottom landing past the bottom by the fill. Main-thread
-     stalls only widen the gap between the landing and that pass: 3 ms in a two-email chat, 150 to
-     310 ms in 40-email chats behind stalls of a quarter to most of a second. The signed-in and
-     ready AI Reply states add no update of their own; amended 2026-11-20, mechanism measured
-     2026-11-21). The first
+     the thread is loaded, and again on every container size, content size or scroll inset change
+     until the user's scroll or a jump-button tap (memory 036: a first scroll can be dropped while
+     the screen settles; and the first pass shows the opened email alone, which
+     `defaultScrollAnchor(.bottom)` sits at the bottom with a top inset filling the rest of the
+     screen. That fill goes in the next layout pass after the landing scroll, and on that inset
+     change the platform keeps the offset plus the top inset, which moves a bottom landing past the
+     bottom by the fill. Main-thread stalls only widen the gap between the landing and that pass:
+     3 ms in a two-email chat, 150 to 310 ms in 40-email chats behind stalls of a quarter to most of
+     a second. The signed-in and ready AI Reply states add no update of their own: the AI
+     Suggestion appears only once the thread and accounts have loaded (decision 16), never in the
+     first pass, and a later arrival is a content size change, which re-issues the landing;
+     amended 2026-11-20, mechanism measured 2026-11-21). **Amended 2026-11-18:** the landing first ended on
+     a scroll of any kind; "any kind" dropped the pin on the chat's own animated or settling re-pin
+     scroll, so a late height (the AI Suggestion, the reply field's measured height) left the chat
+     short of the bottom. The landing now ends only on the user's scroll (`tracking`,
+     `interacting`; `ChatThreadView.userTookOver`) or a jump-button tap. The first
      scroll records the members' unread state itself (`noteMembers`) before choosing where to land:
      SwiftUI runs the thread-loaded and members changes in either order, and the screen tests caught
      the chat opening at the bottom with the Unread line missing.
@@ -329,8 +335,8 @@ same AI result, kept as long as the email itself is shown.
      check passes either way (a later platform update sometimes clamps the offset back), and a real
      top bar that shrinks keeps the bottom by itself (memory 036). The fix rests on the debug-gated
      geometry log: without the re-issue the chat showed 488 and 386 points past its bottom, and with
-     it the landing came back 2 ms after the jump. The owner's phone smoke before the chat view
-     merges to main is the check.
+     it the landing came back 2 ms after the jump. A phone check before the chat view merges to
+     main is the check.
 
    **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
    In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible
@@ -878,6 +884,70 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    clearing the subject and its gap at sampled scroll positions),
    `TutorialChatViewRunTests.chatCardHoldsItsRoom` (no bubble under the coach card in the bar, nor under the subject once it goes) and
    `ChatReplyFieldTests.messagesLayout` (the top bar, never a plain top inset).
+
+16. **The AI Suggestion as a ghost bubble (amendment 2026-11-18; supersedes the parts of decisions
+   10 and 13 that put the ready reply in the field).** The ready reply no longer sits in the reply
+   field. It shows as a ghost of the user's next message, where the reply lands once sent (after the
+   last email and any outbox bubble): `ChatSuggestionBubble`, drawn as a filled bubble, not a clear one: a dashed 1.5 pt accent outline (75% light, 85% dark) on a faded accent fill (14%
+   light, 22% dark) with dark-blue text (`Palette.chatSuggestionStroke`, `chatSuggestionFill`,
+   `chatSuggestionText`; `ChatViewLayout.suggestionStrokeWidth`, `suggestionDash`), with "AI
+   Suggestion · Tap to use" under it. The name is "AI Suggestion", the one compose's suggestion box
+   uses (`ChatSuggestionConfig.label`); "AI Reply" is gone from the chat view's strings. Its text is
+   the reply's text message, read from the email's row (`ChatReplyField.suggestionText`), so a new
+   text message there rewrites the ghost in place, with no second copy. None shows on the user's
+   turn, for a no-reply sender, or while the reply goes only to people chosen in Reply to (the
+   suggestion was written for everyone; the field has the agent write one for them).
+   - **Tap** (the bubble or its caption, one button): opens today's Reply All compose card with the
+     full reply in its suggestion box, as Send did (`ChatThreadView.openSuggestion`,
+     `ChatReplyCompose.make(replyAllTo:)`); Send there sends and the Sent bubble replaces the ghost,
+     and the field's words stay (the card is not a send from the field); Close goes back with the
+     ghost still there. An edit or a Recompute in the card that is stored on the row posts
+     `.messageDataDidChange`, so the ghost under the card follows it. How a thread reload
+     is ordered against such a refresh (a reload that read its rows before the change and finishes
+     after it puts the older row back, #992) is not decided here: it is superseded by "one display
+     read at a time", fixed on its own. The card saves to a draft of its own
+     (`Draft.separateReplyKey`, the parent in its tail as a reply key's): the chat ignores saved
+     drafts, so a reply draft already saved for the email stays as it is in Drafts, never opened,
+     saved over or deleted by the card; each card has its own key, so two cards' drafts never
+     overwrite each other. The ghost shows only once the thread and the email's own account have
+     loaded, and not while the agent works on a request from the field. In the tutorial only the step that asks for it
+     (`FieldMove.tapSuggestion`, ringed by `TutorialPulseRing`) opens the card; elsewhere the
+     locked notice shows.
+   - **The field** holds only the user's words (`ChatFieldFill`: `shown`, `emptiedOn` and
+     `ChatReplyField.route` removed): "Reply or ask anything", and under the empty field an "e.g."
+     line with one change from `ChatSuggestionConfig.replyExamples`, picked at random once per chat
+     open (`ChatThreadView.example`). A tap puts the change in the field (`DynamicIslandChat.putExample`)
+     and never sends it. Every Send from the field goes to the agent. When the compose prompt
+     returns its own suggested change with each draft, the line will show that one while a
+     suggestion shows; until then it always shows the config example.
+   - **Tried and reverted (2026-11-20): holding the card's bubble until the card is on screen.**
+     Following an owner ruling that the bubble must never animate in while the compose card slides
+     in, ComposeView briefly held the bubble's insertion until a zero-size child controller saw
+     `viewDidAppear`. It was reverted. In the hosted chat test that "appeared" signal fired while the
+     full-screen cover's transition was still running (`isBeingPresented` and a transition
+     coordinator were both still set), so it was not a "presentation finished" signal. The saved-draft
+     test's missing card body, which motivated the hold, was not a timing issue either: with the
+     bubble inserted only after the signal, the card's scroll content (bubble and editor) was still absent from the hosted view tree. The question moved to a UI test in the
+     running app (`ChatSwipeUITests`).
+     The hosted harness intermittently leaves the card's bubble and editor out of the accessibility
+     tree, so the card's body content is checked only in XCUITest
+     (`ChatSwipeUITests.testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody`).
+     **Superseded 2026-11-21:** the text above is not a harness limit. The cause is the compose
+     scroll view's class swap (`DisableAutoScrollToVisible`'s `object_setClass`), tabmail-ios#1124,
+     and it hides the AI Suggestion box, Dismiss and Use Suggestion from accessibility in the running
+     app too. Until #1124 is fixed the UI test holds those queries under a strict
+     `XCTExpectFailure`, and the card's transitions are pinned by hosted model-entry-point tests
+     (`ComposeSuggestionPersistTests.useSuggestionFillsTheBody`,
+     `cardShowsTheTappedSuggestionNotTheRowsLaterReply`,
+     `cardSaveWritesItsOwnDraftAndLeavesTheSavedOneAlone`).
+     The owner ruling that the bubble must never animate in while the compose card slides in is
+     still unmet after the revert; it remains open.
+   Tests: `ChatSuggestionBubbleTests` (the ghost, its tap opening the card, the in-place rewrite,
+   no "AI Reply" string), `ChatSwipeUITests.testSavedDraftGhostCardShowsTheSuggestionAndUseSuggestionFillsTheBody`
+   (the card's body, Use Suggestion, the saved draft left in Drafts), `ChatThreadViewLifecycleTests.suggestionSitsAtTheSentPosition` and
+   `sentReplyTakesTheTurn`, `ChatReplyFieldRuntimeTests.exampleLinePutsTheChange` and
+   `suggestionNeverEntersTheField`, `ChatReplyFieldTests.suggestionText` and `exampleFromConfig`,
+   `TutorialChatViewTests.fieldText`.
 
 ## The longer index line (routed 2026-11-09)
 

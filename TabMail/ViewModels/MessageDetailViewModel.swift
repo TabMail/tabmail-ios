@@ -2094,7 +2094,7 @@ final class MessageDetailViewModel {
     /// own id and never by Message-ID (ADR-IOS-068 D4), in whichever account: the rows `source`
     /// takes, except sent copies and drafts, which stay where they are, and rows already in their
     /// destination. A copy filed elsewhere (a Gmail label, an IMAP folder) stays where it is unless
-    /// `source` takes it. Each email goes to `destination` in its own account (owner 2026-11-06);
+    /// `source` takes it. Each email goes to `destination` in its own account;
     /// an account without one keeps its emails where they are. The move is one action with one
     /// undo entry; Undo puts each email back in its own folder. Returns the ids it moved: empty
     /// when nothing moved, so the chat stays open. A row whose folder role cannot be read (no

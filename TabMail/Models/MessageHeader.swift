@@ -177,7 +177,7 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     // AI-generated reply cache (matches TB's reply: IDB prefix)
     var cachedReply: String?
     /// `cachedReply` as a short text message from the user to the most recent sender, from the
-    /// same reply result; the chat view's AI Reply. Nil when `cachedReply` came without one (a
+    /// same reply result; the chat view's AI Suggestion ghost. Nil when `cachedReply` came without one (a
     /// peer, the filtered sentinel) or was edited by the user since.
     var replyTextMessage: String?
 

@@ -171,7 +171,7 @@ enum DemoSeed {
         var reminderDaysAhead: Int? = nil
         var reminderTime: String? = nil        // "HH:MM" 24-hour, optional
         var reminderContent: String? = nil
-        /// The chat view's bubble (`summaryTextMessage`) and AI Reply (`replyTextMessage`).
+        /// The chat view's bubble (`summaryTextMessage`) and AI Suggestion (`replyTextMessage`).
         var textMessage: String? = nil
         var replyTextMessage: String? = nil
         var cc: String = ""

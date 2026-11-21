@@ -19,3 +19,7 @@ Three traps, each of which cost a build cycle:
 3. **SwiftUI's elements do not declare `UIAccessibilityIdentification`**, so `element as? UIAccessibilityIdentification` is nil for them although they answer `accessibilityIdentifier`: ask by selector (`HostedAccessibility.identifier(of:)`).
 
 The model-entry-point pattern above stays right where a press would reach a live service: the reply field's agent route would call the live backend client, so only its routing is tested.
+
+A PRESENTED card's content is not reliably readable: the hosted harness sometimes leaves a presented compose card's bubble and editor out of the accessibility tree, so check presented content in XCUITest instead (ADR-IOS-114 decision 16).
+
+**Superseded 2026-11-21:** the line above is not a harness limit. The cause is the compose scroll view's class swap (`DisableAutoScrollToVisible`'s `object_setClass`), tabmail-ios#1124, which hides the card's AI Suggestion box and its buttons from accessibility in the running app too, so XCUITest cannot check them either until #1124 is fixed; drive the card's model entry points (`ComposeDraftGuards.acceptingVisibleSuggestion`, `suggestionToShow`, `draftToSave`) instead (ADR-IOS-114 decision 16).
