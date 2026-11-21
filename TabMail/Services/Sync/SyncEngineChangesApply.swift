@@ -115,6 +115,13 @@ extension SyncEngine {
             recentlyCompleted: recentlyCompleted, db: db)
         result.removedIds += removal.deleted
         result.wroteRows = !removal.deleted.isEmpty
+        if DebugModeManager.isLoggingEnabled() {
+            for id in changes.removals {
+                let action = removal.protectedMessageIds.contains(id) ? "skip (removal kept back)"
+                    : removal.deleted.contains(where: { $0 == id || $0.hasSuffix(":" + id) }) ? "remove" : "skip (removal, no row)"
+                traceChangeEvent(action, messageId: id, folder: folder)
+            }
+        }
         declined.formUnion(removal.protectedMessageIds)
         settled.formUnion(Set(changes.removals).subtracting(removal.protectedMessageIds))
         if folder.role == .drafts, !removal.deleted.isEmpty {
@@ -361,28 +368,47 @@ extension SyncEngine {
                 if DebugModeManager.isLoggingEnabled() {
                     print("[Sync] change apply: \(existing.id) does not own \(folder.path)/\(record.messageId); read again")
                 }
+                traceChangeEvent("skip (row does not own the address)", messageId: record.messageId, folder: folder,
+                                 date: existing.providerDate, heldRangeApplies: heldRangeApplies)
                 return false
             }
-            return try mergeChangeRecord(
+            let merged = try mergeChangeRecord(
                 record, into: &existing, folder: folder, addressEpoch: addressEpoch,
                 snapshot: snapshot, recentlyCompleted: recentlyCompleted, result: &result, db: db)
+            traceChangeEvent(merged ? "update" : "update (a change kept back)", messageId: record.messageId, folder: folder,
+                             date: existing.providerDate, heldRangeApplies: heldRangeApplies)
+            return merged
         }
         // A partial record for a message this folder does not hold: nothing to update.
-        guard let info = record.header else { return true }
+        guard let info = record.header else {
+            traceChangeEvent("skip (partial record, no row)", messageId: record.messageId, folder: folder,
+                             heldRangeApplies: heldRangeApplies)
+            return true
+        }
         // A baseline lists the folder as it is: a message older than the held
         // range, or any message before the folder has one, is not inserted (the
         // window listing sets the range, the backfill takes older mail). Not for
         // a record answering a listed id: that message's place is put back
         // wherever its date falls (`heldRangeApplies` is false for it).
         if heldRangeApplies {
-            guard let heldSince = folder.oldestSyncedDate, info.providerOrderDate >= heldSince else { return true }
+            guard let heldSince = folder.oldestSyncedDate, info.providerOrderDate >= heldSince else {
+                traceChangeEvent("skip (baseline record outside the held range)", messageId: record.messageId, folder: folder,
+                                 date: info.providerOrderDate, heldRangeApplies: heldRangeApplies)
+                return true
+            }
         }
         // A record without the read state or the flag would store a default for
         // the one it leaves out: the message is listed instead and read again in
         // full, and the full record inserts it.
-        guard record.carriesReadAndFlag else { return false }
+        guard record.carriesReadAndFlag else {
+            traceChangeEvent("skip (no read state or flag; read again)", messageId: record.messageId, folder: folder,
+                             date: info.providerOrderDate, heldRangeApplies: heldRangeApplies)
+            return false
+        }
         if snapshot.destructive.containsAnyKey(messageId: info.messageId, rfc822MessageId: rfc822) {
             // A pending destructive op owns this identity.
+            traceChangeEvent("skip (pending destructive op)", messageId: record.messageId, folder: folder,
+                             date: info.providerOrderDate, heldRangeApplies: heldRangeApplies)
             return false
         }
         if snapshot.tag.containsAnyKey(messageId: info.messageId, rfc822MessageId: rfc822)
@@ -390,16 +416,50 @@ extension SyncEngine {
             // The user's pending tag change owns this message's tag: no row is
             // inserted or taken back (cache restoration and ReplyDetect would
             // write a tag of their own); it is read again once the op drains.
+            traceChangeEvent("skip (pending tag op)", messageId: record.messageId, folder: folder,
+                             date: info.providerOrderDate, heldRangeApplies: heldRangeApplies)
             return false
         }
         if recentlyCompleted[info.messageId] != nil {
             // The queue completed an op on this message within the TTL, so the
             // server state just read may be stale. 🚨 NOT removable: it is what
             // stops a just-completed message from reappearing in its source.
+            traceChangeEvent("skip (op just completed)", messageId: record.messageId, folder: folder,
+                             date: info.providerOrderDate, heldRangeApplies: heldRangeApplies)
             return false
         }
-        return try insertChangeRecord(
+        let inserted = try insertChangeRecord(
             info, record: record, folder: folder, addressEpoch: addressEpoch, snapshot: snapshot, result: &result, db: db)
+        traceChangeEvent(inserted ? "insert" : "skip (insert refused)", messageId: record.messageId, folder: folder,
+                         date: info.providerOrderDate, heldRangeApplies: heldRangeApplies)
+        return inserted
+    }
+
+    /// Debug-gated diagnostic (#1062): one line per message the change apply
+    /// decides on: the time, the folder, the message id, the action (insert,
+    /// update, remove or skip, with why), the message's date against the
+    /// folder's held range (`overAge`: dated before it) and whether the
+    /// held-range rule applied to the record, and the folder's change and
+    /// catch-up state as this transaction read them (its owed older-mail
+    /// checks, tracking, re-read list and lapse count). A console `print`
+    /// under the gate: it runs inside the folder's write transaction (rule 12
+    /// addendum). No decision reads it.
+    private nonisolated static func traceChangeEvent(
+        _ action: String, messageId: String, folder: Folder, date: Date? = nil, heldRangeApplies: Bool? = nil
+    ) {
+        if DebugModeManager.isLoggingEnabled() {
+            let millis = Int((Date().timeIntervalSince1970 * 1000).rounded())
+            let heldSince = folder.oldestSyncedDate
+            var overAge = "unknown"
+            if let date, let heldSince { overAge = date < heldSince ? "yes" : "no" }
+            if heldSince == nil { overAge = "no held range" }
+            let dated = date.map { "\($0)" } ?? "unknown"
+            let held = heldSince.map { "\($0)" } ?? "none"
+            let applies = heldRangeApplies.map { $0 ? "yes" : "no" } ?? "n/a"
+            let changeState = folder.changeState ?? "nil"
+            let catchUpState = folder.catchUpState ?? "nil"
+            print("[ChangeApplyTrace] t=\(millis) folder=\(folder.path) id=\(messageId) action=\(action) dated=\(dated) heldSince=\(held) overAge=\(overAge) heldRangeApplies=\(applies) changeState=\(changeState) catchUpState=\(catchUpState)")
+        }
     }
 
     /// The existing-row merge: PRESENT fields only; flags and the server tag
