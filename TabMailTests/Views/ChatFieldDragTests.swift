@@ -202,41 +202,137 @@ struct ChatFieldDragTests {
         }
     }
 
-    @Test("The pan reads the field's share from the text under the drag's first touch, its scroll since then up to its end")
+    // The real pan's coordinator on a real text view, sample by sample, with the text's scroll
+    // position set as the text's own scroll would leave it. The draft is 300 tall in a 100 box, so
+    // its end is at 200; each drag starts with the text halfway (100), so the touch-down offset is
+    // not zero and the text has 100 of room left.
+    @Test("The pan reads the field's share from the text under the drag's first touch: from where it was then, up to its end")
     @MainActor
     func panSharesWithTheTextUnderTheTouch() {
         let coordinator = ChatFieldPan.Coordinator()
-        let text = UITextView(frame: CGRect(origin: .zero, size: Self.textBox))
-        text.contentSize = Self.textContent
-        text.contentOffset = .zero
-        let inner = UIView()
-        text.addSubview(inner)
-        let end = Self.textContent.height - Self.textBox.height
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        let start = end / 2
+        let room = end - start
 
+        text.contentOffset = CGPoint(x: 0, y: start)
         coordinator.touchDown(on: inner)
-        text.contentOffset = CGPoint(x: 0, y: end / 2)
-        let inside = coordinator.share(Self.upward(-end / 2, -900))
-        let none = Self.upward(0, 0)
-        #expect(inside == none, "the text had room: none of it is the field's")
-        text.contentOffset = CGPoint(x: 0, y: end + Self.bounce)
-        let past = coordinator.share(Self.upward(-end - 70, -300))
-        let rest = Self.upward(-70, -300)
-        #expect(past == rest,
-                "past the end the rest is the field's; the text's bounce is not counted as the text's")
+        text.contentOffset = CGPoint(x: 0, y: start + room / 2)
+        let inside = coordinator.share(Self.sample(0, -room / 2, speed: -900))
+        #expect(inside == Self.sample(0, 0), "half its room scrolled: none of it is the field's")
+        text.contentOffset = CGPoint(x: 0, y: end)
+        let past = coordinator.share(Self.sample(0, -room - 70, speed: -300))
+        #expect(past == Self.sample(0, -70, speed: -300),
+                "70 past the end is the field's, counted from where the touch found the text, not from its top")
+        let opens = ChatFieldDrag.opens(letGo: past)
+        #expect(opens, "and it opens the panel")
+        // The overshot offset a bounce would leave is still only the text's end.
+        text.contentOffset = CGPoint(x: 0, y: end + Self.overshoot)
+        let overshot = coordinator.share(Self.sample(0, -room - 70, speed: -300))
+        #expect(overshot == Self.sample(0, -70, speed: -300), "the text's scroll counts only up to its end")
+
+        // A drag that starts with the text at its end: the whole drag, both axes, is the field's.
+        text.contentOffset = CGPoint(x: 0, y: end)
+        coordinator.touchDown(on: inner)
+        let fromTheEnd = coordinator.share(Self.sample(10, -70, speed: -300))
+        #expect(fromTheEnd == Self.sample(10, -70, speed: -300), "the text has no room: the drag is the field's from its start")
 
         coordinator.touchDown(on: UIView())
-        let off = coordinator.share(Self.upward(-70, -300))
-        #expect(off == rest, "off the text, the whole drag is the field's")
+        let off = coordinator.share(Self.sample(10, -70, speed: -300))
+        #expect(off == Self.sample(10, -70, speed: -300), "off the text, the whole drag is the field's")
     }
 
-    private static func upward(_ travel: CGFloat, _ velocity: CGFloat) -> ChatHorizontalPan.Sample {
-        ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: travel), velocity: CGSize(width: 0, height: velocity))
+    @Test("A drag that crosses the text's end, goes back into the text and reaches the end again hands off afresh")
+    @MainActor
+    func handOffClearsOnAReversal() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        text.contentOffset = CGPoint(x: 0, y: end / 2)
+        coordinator.touchDown(on: inner)
+
+        // Up past the end: 30 of it is the field's.
+        text.contentOffset = CGPoint(x: 0, y: end)
+        let crossed = coordinator.share(Self.sample(0, -130))
+        #expect(crossed == Self.sample(0, -30), "control: past the end the field has the rest")
+        // Back down into the text, 80 sideways on the way: the text scrolls back 20.
+        text.contentOffset = CGPoint(x: 0, y: end - 20)
+        let back = coordinator.share(Self.sample(80, -80, speed: 400))
+        #expect(back == Self.sample(0, 0), "the text has the drag again: nothing, no speed, is the field's")
+        // Up to the end again, then 65 straight up.
+        text.contentOffset = CGPoint(x: 0, y: end)
+        let again = coordinator.share(Self.sample(80, -100))
+        #expect(again == Self.sample(0, 0), "at the end again: the field's share starts here")
+        let up = coordinator.share(Self.sample(80, -165))
+        #expect(up == Self.sample(0, -65), "the sideways travel made in the text is not the field's")
+        let opens = ChatFieldDrag.opens(letGo: up)
+        #expect(opens, "65 straight up past the end opens the panel")
     }
 
-    /// A text view's box and its longer content, and how far it bounces past its end.
+    @Test("Sideways travel made while the text scrolled does not turn the field's straight pull sideways")
+    @MainActor
+    func diagonalThenStraightUp() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        for (pastTheEnd, opens) in [(CGFloat(65), true), (CGFloat(55), false)] {
+            text.contentOffset = CGPoint(x: 0, y: end / 2)
+            coordinator.touchDown(on: inner)
+            // 75 sideways and 100 up, more up than sideways, scroll the text to its end.
+            text.contentOffset = CGPoint(x: 0, y: end)
+            let atTheEnd = coordinator.share(Self.sample(75, -100))
+            #expect(atTheEnd == Self.sample(0, 0), "control: the text took the drag to its end")
+            let pulled = coordinator.share(Self.sample(75, -100 - pastTheEnd))
+            #expect(pulled == Self.sample(0, -pastTheEnd), "\(pastTheEnd) straight up past the end")
+            let opened = ChatFieldDrag.opens(letGo: pulled)
+            #expect(opened == opens, "\(pastTheEnd) past the end against the open distance")
+        }
+    }
+
+    @Test("The text under the drag's first touch never bounces vertically")
+    @MainActor
+    func textUnderTheTouchDoesNotBounce() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        #expect(text.bouncesVertically, "control: a text view bounces by default")
+        coordinator.touchDown(on: inner)
+        #expect(!text.bouncesVertically, "from the touch's start, before it moves")
+        text.contentOffset = CGPoint(x: 0, y: Self.textEnd)
+        let during = coordinator.share(Self.sample(0, -250))
+        let rest = Self.sample(0, -50)
+        #expect(during == rest, "control: the drag went 50 past the text's end")
+        #expect(!text.bouncesVertically, "and not turned back on during the drag")
+    }
+
+    private static func sample(_ x: CGFloat, _ y: CGFloat, speed: CGFloat = 0) -> ChatHorizontalPan.Sample {
+        ChatHorizontalPan.Sample(travel: CGSize(width: x, height: y), velocity: CGSize(width: 0, height: speed))
+    }
+
+    /// A text view whose content height the test fixes, as a long draft's layout makes it.
+    private final class LongText: UITextView {
+        var fixedContent = CGSize.zero
+        override var contentSize: CGSize {
+            get { fixedContent }
+            set {}
+        }
+    }
+
+    /// A long draft's text view and a view inside it, where a touch lands.
+    @MainActor
+    private static func longDraft() -> (LongText, UIView) {
+        let text = LongText(frame: CGRect(origin: .zero, size: textBox))
+        text.fixedContent = textContent
+        let inner = UIView()
+        text.addSubview(inner)
+        return (text, inner)
+    }
+
+    /// A text view's box and its longer content, where its end is, and an offset past it as a
+    /// bounce would leave it.
     private static let textBox = CGSize(width: 100, height: 100)
     private static let textContent = CGSize(width: 100, height: 300)
-    private static let bounce: CGFloat = 15
+    private static let textEnd = textContent.height - textBox.height
+    private static let overshoot: CGFloat = 15
 
     /// A pan whose travel and speed the test sets, as UIKit reports them to the delegate and the
     /// action.
@@ -309,6 +405,17 @@ struct ChatFieldDragTests {
                 "the text's long press never waits for the drag (it could not begin until the finger lifts)")
         #expect(!coordinator.gestureRecognizer(pan, shouldRequireFailureOf: tap), "the drag never waits for a tap")
         #expect(!coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: tap), "the drag runs alone")
+        // Only the text's own scroll runs beside the drag, not every pan inside the text view: a
+        // pan on a view inside it (as a selection handle's) or a second pan on the text view itself
+        // keeps the order it has without the drag.
+        let handlePan = UIPanGestureRecognizer()
+        inner.addGestureRecognizer(handlePan)
+        let otherTextPan = UIPanGestureRecognizer()
+        text.addGestureRecognizer(otherTextPan)
+        #expect(!coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: handlePan),
+                "a pan inside the text that is not its scroll does not run beside the drag")
+        #expect(!coordinator.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: otherTextPan),
+                "nor a pan on the text view other than its scroll")
 
         // Off the text view, nothing changes: the chat's scroll and other controls keep their order.
         let scroll = UIScrollView()
