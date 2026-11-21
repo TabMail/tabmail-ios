@@ -350,10 +350,15 @@ struct IMAPMissingByUIDTests {
         // from an empty queue. Its downloads are then held for the world: a
         // batch download sends a header FETCH byte-identical to a catch-up
         // header load, and its body FETCHes would land in the windows these
-        // tests read, which assert exactly what the catch-up sends.
+        // tests read, which assert exactly what the catch-up sends. At the
+        // end the world's items are dropped before downloads are allowed
+        // again, so none of them is dispatched after its account is gone.
         await BackfillBodyQueue.shared.emptyForTesting()
         await BackfillBodyQueue.shared.setDispatchSuppressedForTesting(true)
-        defer { await BackfillBodyQueue.shared.setDispatchSuppressedForTesting(false) }
+        defer {
+            await BackfillBodyQueue.shared.emptyForTesting()
+            await BackfillBodyQueue.shared.setDispatchSuppressedForTesting(false)
+        }
         try await world.workerRun(requestTimeout: untimedRequestTimeout)
         #expect(try world.catchUpState()?.listing == nil,
                 "\(name): setup: the setup catch-up run completed the folder's listing")
