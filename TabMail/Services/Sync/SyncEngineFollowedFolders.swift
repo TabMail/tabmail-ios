@@ -76,6 +76,10 @@ extension SyncEngine {
     /// empty check, so a folder handed over after it starts a new task.
     private func runAccessCatchUps(accountId: String) async {
         while !Task.isCancelled, let folderIds = accessCatchUpPending.removeValue(forKey: accountId), !folderIds.isEmpty {
+            // The run's settings and deadline are taken first, when the batch is
+            // taken, and the run reads only this snapshot.
+            var run = CatchUpRun.snapshot(deadline: Date().addingTimeInterval(SyncConfig.accessCatchUpRunSeconds))
+            run.accessedFolderIds = folderIds
             let account: Account?
             do {
                 account = try await dbPool.read { db in try Account.fetchOne(db, key: accountId) }
@@ -86,8 +90,6 @@ extension SyncEngine {
                 continue
             }
             guard let account else { break }
-            var run = CatchUpRun.snapshot(deadline: Date().addingTimeInterval(SyncConfig.accessCatchUpRunSeconds))
-            run.accessedFolderIds = folderIds
             let progressed = await runCatchUpRun(account: account, run: run)
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[Follow] access catch-up for \(folderIds.sorted()): progressed=\(progressed)")

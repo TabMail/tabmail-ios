@@ -203,13 +203,15 @@ extension IMAPProvider {
     /// - `counters`: the folder's stored counters now (`Folder.totalCount`,
     ///   `Folder.lastKnownUidNext`), a new listing's `firstCounters` (#1109).
     /// - `accessed`: a user action just landed in the folder
-    ///   (`CatchUpContext.accessedFolderIds`, #1109). An untracked folder with no
-    ///   MODSEQ pair to compare (a server or session without CONDSTORE, or a last
-    ///   completed listing that started with no MODSEQ) has no cheap check, so it
-    ///   is listed at that access when its counters differ from the last
-    ///   completed listing's, or that listing completed longer ago than
-    ///   `SyncConfig.catchUpAccessCheckAgeSeconds`. With a MODSEQ pair, the cheap
-    ///   check already lists a folder that changed; a tracked folder's changes
+    ///   (`CatchUpContext.accessedFolderIds`, #1109). An untracked folder is
+    ///   listed at that access when its counters differ from those its last
+    ///   completed listing started from, with or without MODSEQ: a server with
+    ///   CONDSTORE alone need not move HIGHESTMODSEQ on an expunge, so equal
+    ///   MODSEQ never vetoes a moved count. With no MODSEQ pair to compare (a
+    ///   server or session without CONDSTORE, or a last completed listing that
+    ///   started with no MODSEQ) there is no cheap check for a flag change, so
+    ///   it is also listed when that listing completed longer ago than
+    ///   `SyncConfig.catchUpAccessCheckAgeSeconds`. A tracked folder's changes
     ///   come through its change read.
     nonisolated static func catchUpPlan(
         state: IMAPCatchUpState?, freshModSeq: Int?, now: Date, isTracked: Bool = false,
@@ -225,10 +227,10 @@ extension IMAPProvider {
                 lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.catchUpFullCheckIntervalSeconds)
                 || state?.lapsedSinceLastListing == true
         let modSeqComparable = freshModSeq != nil && state?.completionStamp != nil
-        let accessCheckDue = accessed && !isTracked && !modSeqComparable
+        let accessCheckDue = accessed && !isTracked
             && (state?.completionCounters != counters
-                || CatchUpSchedule.fullCheckDue(
-                    lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.catchUpAccessCheckAgeSeconds))
+                || (!modSeqComparable && CatchUpSchedule.fullCheckDue(
+                    lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.catchUpAccessCheckAgeSeconds)))
         if let listing = state?.listing { return .list(listing) }
         if modSeqChanged || fullCheckDue || accessCheckDue {
             return .list(IMAPCatchUpState.Listing(

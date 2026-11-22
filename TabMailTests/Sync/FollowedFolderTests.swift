@@ -74,7 +74,7 @@ struct FollowedFolderMarkTests {
         #expect(order == ["INBOX", "Starred", "Sent", "Projects"])
     }
 
-    @Test("IMAP with no MODSEQ pair to compare: an access lists an untracked folder when its counters moved since its last completed listing started, or that listing is older than the access age; nothing else does")
+    @Test("IMAP: an access lists an untracked folder when its counters moved since its last completed listing started (with or without MODSEQ), or, with no MODSEQ pair to compare, when that listing is older than the access age; nothing else does")
     func accessCheckPlan() {
         typealias P = IMAPProvider
         typealias Counters = IMAPCatchUpState.Counters
@@ -100,13 +100,23 @@ struct FollowedFolderMarkTests {
         #expect(P.catchUpPlan(state: state(old, counters), freshModSeq: nil, now: now, counters: counters, accessed: true) == list(counters))
         // A listing completed with no counters recorded is listed at the first access.
         #expect(P.catchUpPlan(state: state(recent, nil), freshModSeq: nil, now: now, counters: counters, accessed: true) == list(counters))
-        // With a MODSEQ pair the MODSEQ check decides: unchanged lists nothing, whatever the counters.
-        #expect(P.catchUpPlan(state: state(recent, counters, stamp: 9), freshModSeq: 9, now: now, counters: fewer, accessed: true) == .none)
-        // A MODSEQ now, but none when the last completed listing started: no pair, so the counters decide.
+        // With an equal MODSEQ pair, moved counters still list: a server with
+        // CONDSTORE alone need not move HIGHESTMODSEQ on an expunge.
+        let pairMoved = P.catchUpPlan(state: state(recent, counters, stamp: 9), freshModSeq: 9, now: now, counters: fewer, accessed: true)
+        #expect(pairMoved == .list(.init(firstStamp: 9, firstCounters: fewer, nextUid: 1)))
+        // With a MODSEQ pair and nothing moved, the age does not list it: the MODSEQ check covers a flag change.
+        let pairOld = P.catchUpPlan(state: state(old, counters, stamp: 9), freshModSeq: 9, now: now, counters: counters, accessed: true)
+        #expect(pairOld == .none)
+        // A MODSEQ now, but none when the last completed listing started: no pair, so the counters and the age decide.
         let noPair = P.catchUpPlan(state: state(recent, counters), freshModSeq: 9, now: now, counters: fewer, accessed: true)
         #expect(noPair == .list(.init(firstStamp: 9, firstCounters: fewer, nextUid: 1)))
         let noPairUnmoved = P.catchUpPlan(state: state(recent, counters), freshModSeq: 9, now: now, counters: counters, accessed: true)
         #expect(noPairUnmoved == .none)
+        let noPairOld = P.catchUpPlan(state: state(old, counters), freshModSeq: 9, now: now, counters: counters, accessed: true)
+        #expect(noPairOld == .list(.init(firstStamp: 9, firstCounters: counters, nextUid: 1)))
+        // A stamp from the last completed listing, but no MODSEQ now: no pair either.
+        let noFreshOld = P.catchUpPlan(state: state(old, counters, stamp: 9), freshModSeq: nil, now: now, counters: counters, accessed: true)
+        #expect(noFreshOld == list(counters))
         // A tracked folder's changes come through its change read.
         #expect(P.catchUpPlan(state: state(recent, counters), freshModSeq: nil, now: now, isTracked: true, counters: fewer, accessed: true) == .none)
         // A first listing records the counters it starts from.
@@ -228,10 +238,17 @@ struct FollowedFolderIMAPTests {
 
         /// Every command the server has seen that changes a mailbox.
         func mutatingCommands() -> [String] {
-            server.recordedCommands().filter { command in
-                let upper = command.uppercased()
-                return ["STORE ", "EXPUNGE", "COPY ", "MOVE ", "APPEND "].contains { upper.contains($0) }
-            }
+            server.recordedCommands().filter(Self.isMutating)
+        }
+
+        /// The commands that change a mailbox, sent while `mailbox` was selected.
+        func mutatingCommands(in mailbox: String) -> [String] {
+            server.recordedCommandsWithMailbox().filter { $0.mailbox == mailbox }.map(\.command).filter(Self.isMutating)
+        }
+
+        static func isMutating(_ command: String) -> Bool {
+            let upper = command.uppercased()
+            return ["STORE ", "EXPUNGE", "COPY ", "MOVE ", "APPEND "].contains { upper.contains($0) }
         }
 
         func account() throws -> Account {
@@ -503,26 +520,32 @@ struct FollowedFolderIMAPTests {
         }
     }
 
-    @Test("An access that comes while the account's access run is going is taken by its next run")
+    @Test("Accesses that come while the account's access run is going are taken together by its next run; no second run starts beside it")
     @MainActor
     func aSecondAccessDuringARunIsTakenByTheNext() async throws {
         try await Self.withWorld("second-access", .plain) { w in
-            let engine = AccountManager.shared.syncEngine
+            let engine = await AccountManager.shared.syncEngine
             let accountId = w.accountId
             let folderId = w.folderId
             let inboxId = w.inboxId
             let handedOver = HeldWorkFlag()
             await w.watchSlices { folderIds in
-                // While the open's run is in its first slice, a drained action lands in the Inbox.
+                // While the open's run is in its first slice, two more accesses
+                // come: a drained action lands in the Inbox, then the folder is
+                // opened again.
                 guard folderIds == [folderId], !handedOver.set() else { return }
                 await engine.startAccessCatchUp(accountId: accountId, folderIds: [inboxId])
+                await engine.startAccessCatchUp(accountId: accountId, folderIds: [folderId])
             }
             try await w.open()
 
             let asked = w.recorder.all.map(\.folderIds)
-            #expect(handedOver.isSet, "setup: the Inbox was handed over during the run")
+            let both: Set<String> = [folderId, inboxId]
+            let tookBoth = asked.contains { Set($0) == both }
+            #expect(handedOver.isSet, "setup: two accesses were handed over during the run")
             #expect(asked.first == [folderId], "the open's run asked the opened folder: \(asked)")
-            #expect(asked.contains([inboxId]), "the next run asked the Inbox handed over meanwhile: \(asked)")
+            #expect(tookBoth, "the next run took both accesses together: \(asked)")
+            #expect(!asked.contains([inboxId]), "no run asked the Inbox alone beside the one going: \(asked)")
         }
     }
 
@@ -614,6 +637,52 @@ struct FollowedFolderIMAPTests {
             #expect(localInbox == 0, "the moved message has left the device's Inbox")
             try w.expectFollowed([w.folderId, w.inboxId], "move in")
             try w.expectReconciled("move in")
+
+            // Against the scenario itself, not the server's current state: the
+            // folder holds what the other client left plus the moved message,
+            // which kept its state (unread, not flagged), and the move sent
+            // nothing while the folder was selected.
+            let t = Self.self
+            let scenario = Set(t.serverUIDs).subtracting(t.deleted).subtracting(t.movedAway)
+            let expected = scenario.union(landed).sorted()
+            let heldUIDs = try w.local().keys.sorted()
+            #expect(w.serverHeld() == expected, "move in: the server holds what the other client left and the moved message")
+            #expect(heldUIDs == expected, "move in: so does the device")
+            if let landedUID = landed.first {
+                let landedFlags = w.server.flags(in: Self.path, uid: landedUID)
+                #expect(!landedFlags.contains("\\Seen") && !landedFlags.contains("\\Flagged"),
+                        "move in: the moved message kept its state: \(landedFlags)")
+            }
+            let changedInFolder = w.mutatingCommands(in: Self.path)
+            #expect(changedInFolder.isEmpty, "move in: nothing was changed in the folder itself: \(changedInFolder)")
+        }
+    }
+
+    @Test("A move out of a folder that is not followed reconciles the rest of it, and follows it",
+          arguments: Server.allCases)
+    @MainActor
+    func movingOutOfTheFolderReconcilesIt(server: Server) async throws {
+        try await Self.withWorld("move-out", server) { w in
+            w.changeBelowTheNewest()
+            // One of the folder's newest messages, which its own listing covers.
+            let movedUID = 100
+            let moving = try w.row(uid: movedUID, in: w.folderId)
+            let rfc = "<followed-\(movedUID)@example.com>"
+            w.server.expectMutation(rfc822MessageId: rfc)
+
+            await AccountManager.shared.move([moving], to: "INBOX")
+            try await w.drain()
+            await w.settle()
+
+            let landed = w.server.uids(in: "INBOX", rfc822MessageId: rfc)
+            #expect(landed.count == 1, "setup: the move landed in the server's Inbox: \(landed)")
+            try w.expectFollowed([w.folderId], "move out")
+            try w.expectReconciled("move out")
+            let t = Self.self
+            let expected = Set(t.serverUIDs).subtracting(t.deleted).subtracting(t.movedAway).subtracting([movedUID]).sorted()
+            let heldUIDs = try w.local().keys.sorted()
+            #expect(w.serverHeld() == expected, "move out: the server holds what the other client left, less the moved message")
+            #expect(heldUIDs == expected, "move out: so does the device")
         }
     }
 
@@ -637,7 +706,7 @@ struct FollowedFolderIMAPTests {
                     try await Task.sleep(for: .milliseconds(50))
                 }
                 if !recorder.all.isEmpty { _ = sliceBeforeBody.set() }
-            })
+            }, accessesFolder: true)
             await detail.loadBody()
             #expect(detail.message?.id == opened.id, "setup: the message opened")
             #expect(bodyRequested.isSet, "setup: the open requested the message's body")
@@ -690,9 +759,12 @@ struct FollowedFolderOutlookTests {
         _ = await engine.runCatchUpRun(account: account, run: run)
     }
 
-    static func readUntilTracking(_ w: R.World, _ path: String) async throws {
+    /// The engine's own change read (`readAndApplyChanges`, the request the
+    /// full sync builds), pass by pass, until `path` is tracked, or `passes` passes.
+    static func readUntilTracking(_ w: R.World, _ engine: SyncEngine, _ path: String) async throws {
         for _ in 0..<passes {
-            try await w.read()
+            let account = try w.account()
+            _ = try await engine.readAndApplyChanges(account: account, provider: w.provider, scope: .all)
             if try w.cursor(path)?.phase == .tracking { return }
         }
     }
@@ -723,12 +795,15 @@ struct FollowedFolderOutlookTests {
             let marked = try await w.pool.write { db in try SyncEngine.markFollowed(folderIds: [customId], db: db) }
             #expect(marked == [customId], "setup: the folder is followed now")
             // Followed, but the change read has not baselined it: the catch-up does not list it yet.
+            let projectsRequestsBefore = w.server.requestCount(containing: Self.projects)
             try await Self.catchUpOnce(w, engine)
+            let projectsRequestsGated = w.server.requestCount(containing: Self.projects) - projectsRequestsBefore
             let gated = ExchangeCatchUpState.decode(try w.folder(Self.projects).catchUpState)
+            #expect(projectsRequestsGated == 0, "the catch-up sends nothing for a followed folder before its baseline")
             #expect(gated?.listing == nil && gated?.lastCompletedAt == nil,
                     "the catch-up does not list a followed folder before its baseline")
             #expect(try w.rowIds(in: Self.projects) == ["p-keep", "p-gone", "p-read"], "nor remove anything from it")
-            try await Self.readUntilTracking(w, Self.projects)
+            try await Self.readUntilTracking(w, engine, Self.projects)
             #expect(try w.cursor(Self.projects)?.phase == .tracking, "the change read baselined the followed folder")
             #expect(try w.rowIds(in: Self.projects) == ["p-keep", "p-gone", "p-read"], "a baseline removes nothing")
 

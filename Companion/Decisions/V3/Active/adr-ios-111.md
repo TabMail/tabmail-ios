@@ -1254,7 +1254,10 @@ on the re-drive.
      (`MessageDetailViewModel.loadBody`): started when the body load ends, whichever way it ends, on a
      detached task, so the open never waits for it and the folder's catch-up requests never queue ahead
      of the message's body request on a provider's shared request slots (Graph's per-mailbox
-     `HTTPConcurrencyGate`).
+     `HTTPConcurrencyGate`). A body still queued ends the load by handing it to the body poll, so the
+     access starts then (a limit below). The view model's production init turns the access on
+     (`accessesFolder`, fenced in `ListingRouteFenceTests`); its test init leaves it off unless a test
+     asks, because the access writes through the shared engine and database, not a test's own pool.
    The trigger is not `syncFolderMessages`, the place the issue first proposed: that route also serves
    the post-send Sent listing and step 6 of the epoch rebuild, which are not user actions in the folder.
 3. **The access catch-up run** (`SyncEngine.startAccessCatchUp`): one per account, detached; folders that
@@ -1265,15 +1268,19 @@ on the re-drive.
    still needs then is the backfill worker's, whose catch-up checks every followed folder.
    `CatchUpContext.accessedFolderIds` tells the provider which folders an action reached (provider-neutral).
    `SyncEngine.remove(accountId:)` cancels the run.
-4. **IMAP with no mod-sequences** (`IMAPProvider.catchUpPlan`, `counters:`, `accessed:`). Such a folder has
-   no cheap check, so the daily full check alone would leave an accessed folder stale for up to a day. An
-   accessed, untracked folder with no MODSEQ pair to compare (no fresh MODSEQ from the server or session,
-   or a last completed listing that started with none, so no `completionStamp`) is listed when its stored counters (`totalCount`,
-   the listing's EXISTS, and `lastKnownUidNext`) differ from those its last completed listing started
-   from (`IMAPCatchUpState.completionCounters`, taken from `Listing.firstCounters` before the first range,
-   as `firstStamp` is; inside the opaque state, no column), or when that listing completed longer ago than
-   `SyncConfig.catchUpAccessCheckAgeSeconds` (1 h: a flag change moves no counter). With MODSEQ the MODSEQ
-   check already lists a folder that changed, and a tracked folder's changes come through its change read.
+4. **IMAP access check** (`IMAPProvider.catchUpPlan`, `counters:`, `accessed:`). An untracked folder with no
+   mod-sequences has no cheap check, so the daily full check alone would leave an accessed folder stale for
+   up to a day. An accessed, untracked folder is listed when its stored counters (`totalCount`, the
+   listing's EXISTS, and `lastKnownUidNext`) differ from those its last completed listing started from
+   (`IMAPCatchUpState.completionCounters`, taken from `Listing.firstCounters` before the first range, as
+   `firstStamp` is; inside the opaque state, no column), with or without MODSEQ: a server with CONDSTORE
+   alone need not move HIGHESTMODSEQ on an expunge, so an equal MODSEQ never vetoes a moved count. With no
+   MODSEQ pair to compare (no fresh MODSEQ from the server or session, or a last completed listing that
+   started with none, so no `completionStamp`) it is also listed when that listing completed longer ago
+   than `SyncConfig.catchUpAccessCheckAgeSeconds` (1 h: a flag change moves no counter). With a pair, the
+   MODSEQ check already lists a folder whose flags changed, and a tracked folder's changes come through
+   its change read. *(Amended in review the same day: the first form vetoed moved counters when a pair
+   existed.)*
 5. **Outlook keeps its catch-up gate**: a followed folder is synced, so its change read baselines it first,
    and only then does the catch-up list it. Gmail's change read already covers every label; a followed
    label gains the catch-up.
@@ -1313,25 +1320,39 @@ Limits (each recovers through the ordinary schedule, because the folder is follo
   completed listing waits for the next access after that hour, or the daily check, and so does a message
   open or a move's source whose counters did not move; a tracked folder's changes wait for its next change
   read; a listing that throws ends that run.
-- Rare timing windows where one action's mark is missed (an app kill or a replay between a drained
-  action's commit and its mark; a message load cancelled during its first read): the next action in the
-  folder marks it (#1263).
+- A message whose body is still queued (the poll path: a background body queue, cancelled reads, an
+  address the provider is blocking) starts its access when the load hands over to the poll, so the poll's
+  next read (every 2 s) can wait behind at most one catch-up request on the folder's connection or
+  request slot. The direct body load, the common open, is first.
+- Rare timing windows where one action's mark is missed (an app kill between a drained action's commit
+  and its mark, which also spans the post-drain listings; a retirement replay committed while offline,
+  whose drain stops at the connectivity check before the mark; a message load cancelled during its first
+  read): the next action in the folder marks it (#1263).
+- Following widens two existing limits to followed folders: a Gmail label's re-read overflow cut in a
+  syncable label drops the retry for a label set the catch-up never replaces (#1268); Outlook reads
+  tracking folders before baselines every pass, so with many synced folders a new followed folder can
+  wait long for its baseline, and its catch-up stays gated meanwhile (#1269).
 - Pre-existing, not changed here: an IMAP folder the reader can no longer track keeps its bookmark on
   purpose, so the catch-up plan counts it as tracked and it gets neither the daily nor the access check
   (#1264).
 
-Tests: `FollowedFolderTests` (`FollowedFolderMarkTests`: the mark, the order, the access plan, including a
-folder with no MODSEQ pair to compare; `FollowedFolderIMAPTests`: the wire oracle for opening the folder,
-a move into it and opening one of its messages, on a server with no mod-sequences and on a QRESYNC server,
-each run asking only the accessed folders and a quiet re-open listing nothing, the message's body
-requested before any catch-up slice, a second access during a run taken by the next run, an open while
-offline that still follows the folder, and a completion that keeps the counters its listing started from
-across slices; `FollowedFolderOutlookTests`: the gated access writes no listing, then the baseline, then
-the listing), `ReleaseBoundaryRecheckTests.applyOverflowInAFollowedFolderArmsTheCatchUp` (the first ids
-are kept), `FolderIsFollowedMigrationTests`, `ListingRouteFenceTests.followMarkHasOneWriter` (every
-production mention of the mark).
+Tests: `FollowedFolderTests` (`FollowedFolderMarkTests`: the mark, the order, the access plan: moved
+counters list with or without a MODSEQ pair, the age rule only without one, including a missing fresh
+MODSEQ; `FollowedFolderIMAPTests`: the wire oracle for opening the folder, a move into it and a move out
+of it (a folder already followed and checked), and opening one of its messages, on a server with no
+mod-sequences and on a QRESYNC server, each against the scenario's expected server and device state with
+no mutating command in the followed folder but the action's own, each run asking only the accessed
+folders and a quiet re-open listing nothing, the message's body requested before any catch-up slice, a
+second access during a run taken by the next run (and never asked alone), an open while offline that
+still follows the folder, and a completion that keeps the counters its listing started from across
+slices; `FollowedFolderOutlookTests`: through the production change read, the gated access sends no
+request for the folder and writes no listing, then the baseline, then the listing),
+`ReleaseBoundaryRecheckTests.applyOverflowInAFollowedFolderArmsTheCatchUp` (the first ids are kept),
+`FolderIsFollowedMigrationTests`, `ListingRouteFenceTests.followMarkHasOneWriter` (every production
+mention of the mark, and the detail view model's production init turning the access on).
 
 Keywords: isFollowed, followed folder, follow mark, markFollowed, followedColumn, folderAccessed,
 followFolders, startAccessCatchUp, access catch-up run, accessedFolderIds, accessCatchUpRunSeconds,
 catchUpAccessCheckAgeSeconds, completionCounters, firstCounters, Counters, syncable set, isSyncable,
-custom non-favourite folder, sync on demand, v112_addFolderIsFollowed, #1109.
+custom non-favourite folder, sync on demand, v112_addFolderIsFollowed, accessesFolder, body poll, #1109,
+#1263, #1264, #1268, #1269.

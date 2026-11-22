@@ -110,6 +110,11 @@ struct ListingRouteFenceTests {
         ], "no production code sets the record's mark or writes the column by name: \(mentions)")
         let follow = try #require(sources.first { $0.path == followFile }?.text)
         #expect(!follow.contains("set(to: false)"), "the mark is never cleared")
+        // A message open in the app is a folder access: the production init of
+        // the detail view model turns it on; only its test init leaves it off.
+        let detailAccess = Self.hits("self.accessesFolder = true", in: sources)
+        #expect(detailAccess == ["TabMail/ViewModels/MessageDetailViewModel.swift": 1],
+                "the app's message open accesses its folder: \(detailAccess)")
     }
 
     @Test("Every on-demand listing goes through syncFolderMessages (folder open, after a send, after a move, epoch-rebuild step 6)")
