@@ -609,7 +609,8 @@ struct ChatComposeRoutingTests {
                 try await Self.toggle(["alex@example.com", "sam@example.com"], in: screens)
                 #expect(Self.replyingOnlyTo(in: screens.view) != nil, "control: the chat replies only to David: \(HostedAccessibility.labels(in: screens.view).prefix(16))")
                 let request = try await Self.askHeld(in: screens, backend: backend)
-                #expect(request.fieldReply == ChatFieldReply(emailKey: ChatThread.copyKey(screens.email), onlyTo: ["david@example.com"]),
+                #expect(request.fieldReply.map { ChatThread.copyKey($0.email) } == ChatThread.copyKey(screens.email)
+                            && request.fieldReply?.onlyTo == ["david@example.com"],
                         "control: the request carries the choice made when it was sent: \(String(describing: request.fieldReply))")
                 let asked = ComposeOrigin(sessionKey: screens.threadKey, screen: .chat, fromAccountId: Self.account)
                 #expect(request.origin == asked,
@@ -637,7 +638,8 @@ struct ChatComposeRoutingTests {
                 let router = AgentToolRouter.shared
                 #expect(Self.replyingOnlyTo(in: screens.view) == nil, "control: nobody is chosen: \(HostedAccessibility.labels(in: screens.view).prefix(16))")
                 let request = try await Self.askHeld(in: screens, backend: backend)
-                #expect(request.fieldReply == ChatFieldReply(emailKey: ChatThread.copyKey(screens.email), onlyTo: nil),
+                #expect(request.fieldReply.map { ChatThread.copyKey($0.email) } == ChatThread.copyKey(screens.email)
+                            && request.fieldReply?.onlyTo == nil,
                         "control: the request names nobody: \(String(describing: request.fieldReply))")
 
                 router.composePresentationDidEnd()
@@ -952,8 +954,9 @@ struct ChatComposeRoutingTests {
                             "control: the email screen's pill offers Retry: \(HostedAccessibility.identifiers(in: screens.view))")
                     try await Self.waitUntil { router.composeQueueDepth == 1 }
                     let request = try #require(router.firstQueuedRequestForTesting, "control: the recovered turn asked for a reply")
-                    let chosen = ChatFieldReply(emailKey: ChatThread.copyKey(screens.email), onlyTo: ["david@example.com"])
-                    #expect(request.fieldReply == chosen, "the reply keeps the choice made when it was sent: \(String(describing: request.fieldReply))")
+                    #expect(request.fieldReply.map { ChatThread.copyKey($0.email) } == ChatThread.copyKey(screens.email)
+                                && request.fieldReply?.onlyTo == ["david@example.com"],
+                            "the reply keeps the choice made when it was sent: \(String(describing: request.fieldReply))")
                     let asked = ComposeOrigin(sessionKey: screens.threadKey, screen: .chat, fromAccountId: Self.account)
                     #expect(request.origin == asked, "the recovered field reply belongs to the chat view: \(request.origin)")
 
@@ -1027,35 +1030,52 @@ struct ChatComposeRoutingTests {
     }
 
     @Test("A narrowed field reply's card is a plain reply with a draft of its own, naming its email; every other reply keeps the usual draft")
-    func narrowedReplyHasADraftOfItsOwn() {
-        let email = Self.groupEmail("draft-key")
-        var me = Account(emailAddress: Self.me, displayName: "Me", provider: .gmail)
-        me.id = Self.account
-        let accounts = [me]
-        func card(_ field: ChatFieldReply?) -> ChatAgentCard {
-            let request = AgentToolRouter.ComposeRequest(
-                mode: .reply, replyTo: email, to: ["alex@example.com", "david@example.com"], cc: ["sam@example.com"], bcc: [],
-                subject: nil, body: "Friday works",
-                origin: ComposeOrigin(sessionKey: ChatThreadKey.key(for: email), screen: .chat, fromAccountId: Self.account),
-                isReplyAll: true, fieldReply: field)
-            return ChatAgentCard(request: request, reply: ChatReplyCompose.make(agent: request, accounts: accounts))
+    func narrowedReplyHasADraftOfItsOwn() async throws {
+        // The reply tool builds the card into its request (`ComposeRequest.composeView`, the one
+        // presenter), so the request it queues is what every screen opens.
+        let db = try TestDatabase.make()
+        let translator = MockChatIdTranslator()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let email = try TestDatabase.insertMessageHeader(
+            db, messageId: "draft-key", subject: "Plans", to: "test@example.com, david@example.com")
+        await translator.seed(email.id, as: 1)
+        let asked = ComposeOrigin(sessionKey: ChatThreadKey.key(for: email), screen: .chat)
+        let host = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [asked.sessionKey])
+        func card(_ field: ChatFieldReply?) async -> AgentToolRouter.ComposeRequest? {
+            let router = AgentToolRouter()
+            let tool = EmailReplyTool(context: ToolContext(db: db, translator: translator, router: router))
+            let invocation = ToolInvocation(fieldReply: field, composeOrigin: asked)
+            let task = Task { @MainActor in
+                try await tool.execute(arguments: ["unique_id": .int(1), "body": .string("Friday works")], invocation: invocation)
+            }
+            var taken: AgentToolRouter.ComposeRequest?
+            let deadline = Date().addingTimeInterval(5)
+            while taken == nil, Date() < deadline {
+                taken = router.takeCompose(for: host)
+                if taken == nil { await Task.yield() }
+            }
+            taken?.onOutcome(.cancelled)
+            if taken == nil { task.cancel() }
+            _ = try? await task.value
+            return taken
         }
-        let key = ChatThread.copyKey(email)
-        let narrowed = card(ChatFieldReply(emailKey: key, onlyTo: ["david@example.com"]))
-        let narrowedReply = narrowed.reply
-        #expect(narrowedReply == ChatReplyCompose(isReplyAll: false, to: ["david@example.com"], cc: [], bcc: []),
-                "a plain reply to David alone: \(narrowedReply)")
+
+        let narrowed = try #require(await card(ChatFieldReply(email: email, onlyTo: ["david@example.com"])),
+                                    "control: the narrowed reply's card opened")
+        #expect(!narrowed.isReplyAll && narrowed.to == ["david@example.com"] && narrowed.cc.isEmpty && narrowed.bcc.isEmpty,
+                "a plain reply to David alone: \(narrowed.to) \(narrowed.cc) \(narrowed.bcc)")
         let draftId = narrowed.draftId ?? ""
         #expect(draftId.hasPrefix(Draft.separateReplyPrefix), "a draft of its own: \(draftId)")
         let named = Draft.replyKeyTail(draftKey: draftId, isForward: false).map(String.init)
         #expect(named == "\(email.accountId):\(email.stableId)", "naming the email it answers")
-        let again = card(ChatFieldReply(emailKey: key, onlyTo: ["david@example.com"])).draftId
-        #expect(again != narrowed.draftId, "each card its own draft")
+        let again = await card(ChatFieldReply(email: email, onlyTo: ["david@example.com"]))
+        #expect(again != nil && again?.draftId != narrowed.draftId, "each card its own draft")
 
-        let everyone = card(ChatFieldReply(emailKey: key, onlyTo: nil)).draftId
-        #expect(everyone == nil, "a field reply to everyone keeps the reply's usual draft")
-        let asked = card(nil).draftId
-        #expect(asked == nil, "a reply asked in the chat's sheet keeps the reply's usual draft")
+        let everyone = try #require(await card(ChatFieldReply(email: email, onlyTo: nil)), "control: the reply to everyone opened")
+        #expect(everyone.draftId == nil, "a field reply to everyone keeps the reply's usual draft")
+        let sheet = try #require(await card(nil), "control: the sheet's reply opened")
+        #expect(sheet.draftId == nil, "a reply asked in the chat's sheet keeps the reply's usual draft")
     }
 
     // MARK: - 9. The inbox says from its navigation whether it shows

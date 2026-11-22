@@ -31,6 +31,7 @@ struct AITextMessageCallerTests {
     static let summaryText = "Can you send the \u{201C}final\u{201D} budget? \u{FF02}Thanks\u{FF02}"
     static let replyBody = "None"
     static let replyText = "None from me, thanks"
+    static let replyCommand = "ask for more time"
     /// The text message the backend writes when asked for the user's voice (`is_sent_by_user`).
     static let ownSummaryText = "Can you send me the \u{201C}final\u{201D} budget?"
     static let peerBlurb = "Peer summary of the plans."
@@ -69,7 +70,8 @@ struct AITextMessageCallerTests {
                     object = ["action": "reply"]
                 default:
                     object = ["subject": "Re: Plans", "body": AITextMessageCallerTests.replyBody,
-                              "text_message": AITextMessageCallerTests.replyText]
+                              "text_message": AITextMessageCallerTests.replyText,
+                              "change_command": AITextMessageCallerTests.replyCommand]
                 }
                 let assistant = String(decoding: (try? JSONSerialization.data(withJSONObject: object)) ?? Data(), as: UTF8.self)
                 let final = (try? JSONSerialization.data(withJSONObject: ["assistant": assistant])) ?? Data()
@@ -229,9 +231,11 @@ struct AITextMessageCallerTests {
             let row = try fixture.row()
             #expect(row?.cachedReply == Self.replyBody)
             #expect(row?.replyTextMessage == Self.replyText)
+            #expect(row?.replyChangeCommand == Self.replyCommand)
             let cache = try fixture.cache()
             #expect(cache?.cachedReply == Self.replyBody)
             #expect(cache?.replyTextMessage == Self.replyText)
+            #expect(cache?.replyChangeCommand == Self.replyCommand)
         }
     }
 
@@ -404,9 +408,11 @@ struct AITextMessageCallerTests {
             #expect(row?.summaryTextMessage == Self.summaryText)
             #expect(row?.cachedReply == Self.replyBody)
             #expect(row?.replyTextMessage == Self.replyText)
+            #expect(row?.replyChangeCommand == Self.replyCommand)
             let cache = try fixture.cache()
             #expect(cache?.summaryTextMessage == Self.summaryText)
             #expect(cache?.replyTextMessage == Self.replyText)
+            #expect(cache?.replyChangeCommand == Self.replyCommand)
             #expect(Set(backend.prompts) == ["system_prompt_summary", "system_prompt_action", "system_prompt_compose"])
         }
     }
@@ -475,9 +481,11 @@ struct AITextMessageCallerTests {
             #expect(backend.prompts == ["system_prompt_compose"])
             #expect(cache?.cachedReply == Self.replyBody)
             #expect(cache?.replyTextMessage == Self.replyText)
+            #expect(cache?.replyChangeCommand == Self.replyCommand)
             let row = try fixture.row()
             #expect(row?.cachedReply == Self.replyBody)
             #expect(row?.replyTextMessage == Self.replyText)
+            #expect(row?.replyChangeCommand == Self.replyCommand)
             #expect(row?.summaryBlurb == "An earlier summary.")
         }
     }
@@ -596,11 +604,166 @@ struct AITextMessageCallerTests {
                 for: fixture.header, account: fixture.account, kbText: "", compositionPrompt: "",
                 aiService: backend.service, dbPool: AppDatabase.dbPool)
 
-            #expect(suggestion == Self.replyBody)
+            #expect(suggestion?.body == Self.replyBody)
             #expect(backend.prompts == ["system_prompt_compose"])
             let row = try fixture.row()
             #expect(row?.cachedReply == Self.replyBody)
             #expect(row?.replyTextMessage == Self.replyText)
+            #expect(row?.replyChangeCommand == Self.replyCommand)
+        }
+    }
+
+    /// THE SYSTEM PROPERTY: the stored AI Suggestion is the email's own account's Reply All draft.
+    /// A card whose From was changed to another account recomputes a reply for that card alone: the
+    /// card gets it, and the stored suggestion (header and cache) stays as it was. Control: the same
+    /// recompute from the email's own account stores it.
+    @Test("A recompute from another sender stays in its card; from the email's own account it is stored",
+          arguments: [true, false])
+    func composeRecomputeFromAnotherSender(otherSender: Bool) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(replyTextMessage: "Earlier text")
+            let other = try FolderEpochTestFixture.makeAccount(id: "acc2", provider: .imap, pool: fixture.pool)
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+            let before = try #require(try fixture.row())
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: fixture.header, account: otherSender ? other : fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            #expect(backend.prompts == ["system_prompt_compose"], "the reply is asked for once")
+            #expect(suggestion?.body == Self.replyBody, "the card gets the recomputed reply")
+            let row = try #require(try fixture.row())
+            if otherSender {
+                #expect(row.suggestion == before.suggestion, "another sender's reply is never stored as the email's suggestion")
+                #expect(row.cachedReply == before.cachedReply && row.replyTextMessage == "Earlier text")
+                #expect(try fixture.cache()?.cachedReply == nil, "nor in the cache")
+            } else {
+                #expect(row.cachedReply == Self.replyBody)
+                #expect(row.replyTextMessage == Self.replyText)
+                #expect(row.replyChangeCommand == Self.replyCommand)
+                #expect(try fixture.cache()?.cachedReply == Self.replyBody, "control: stored in the cache too")
+            }
+        }
+    }
+
+    /// The bug this guards: a card's Recompute, then Discard while it waits, then a reopened card's
+    /// Recompute that finishes first. The first card's late write landed last, and the AI
+    /// Suggestion showed the superseded reply.
+    /// THE SYSTEM PROPERTY: a recompute stores its reply only over the suggestion it started from,
+    /// so a superseded one never lands over a newer one.
+    @Test("A superseded recompute that finishes last never replaces the newer suggestion")
+    func supersededRecomputeLosesToTheNewer() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(replyTextMessage: "Earlier text")
+            defer { fixture.close() }
+            let release = DispatchSemaphore(value: 0)
+            let calls = Mutex(0)
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/completions/chat", method: "POST") { _ in
+                let call = calls.withLock { value -> Int in value += 1; return value }
+                let object: [String: Any] = call == 1
+                    ? ["subject": "Re: Plans", "body": "First recompute", "text_message": "First text"]
+                    : ["subject": "Re: Plans", "body": "Second recompute", "text_message": "Second text"]
+                let assistant = String(decoding: (try? JSONSerialization.data(withJSONObject: object)) ?? Data(), as: UTF8.self)
+                let final = (try? JSONSerialization.data(withJSONObject: ["assistant": assistant])) ?? Data()
+                let answer = FakeHTTP.CannedResponse.bytes(
+                    Data(("event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n").utf8),
+                    contentType: "text/event-stream")
+                // The first card's request waits, parked off the loader so the second card's
+                // request is served meanwhile, until the second card's reply is stored.
+                guard call == 1 else { return answer }
+                return .parked {
+                    _ = release.wait(timeout: .now() + 10)
+                    return answer
+                }
+            }
+            let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+            let header = fixture.header
+            let account = fixture.account
+
+            // Card 1: Recompute, then Discard while it waits (its request is already out).
+            let first = Task {
+                await ComposeView.recomputedReply(
+                    for: header, account: account, kbText: "", compositionPrompt: "",
+                    aiService: service, dbPool: AppDatabase.dbPool)
+            }
+            for _ in 0..<400 where calls.withLock({ $0 }) < 1 { try await Task.sleep(for: .milliseconds(5)) }
+            #expect(calls.withLock { $0 } == 1, "control: the first recompute is waiting on its reply")
+
+            // Card 2, reopened: Recompute finishes first.
+            let second = await ComposeView.recomputedReply(
+                for: header, account: account, kbText: "", compositionPrompt: "",
+                aiService: service, dbPool: AppDatabase.dbPool)
+            #expect(second?.body == "Second recompute")
+            release.signal()
+            _ = await first.value
+
+            let row = try #require(try fixture.row())
+            #expect(row.cachedReply == "Second recompute", "the newer recompute's reply stays")
+            #expect(row.replyTextMessage == "Second text")
+            #expect(ChatReplyField.shown(newest: row, usersTurn: false, onlyTo: nil)?.textMessage == "Second text",
+                    "the ghost shows the second recompute")
+        }
+    }
+
+    /// THE SYSTEM PROPERTY: closing a card ends its Recompute still waiting for its reply: the reply
+    /// that comes back afterwards is stored nowhere and shown nowhere. Control: with the card open,
+    /// the same held reply is stored. The task is shaped as `ComposeView.recomputeReply` builds it,
+    /// and closed through the card's own close step (`ComposeView.cardClosed`, what its disappear runs).
+    @Test("Closing the card while its Recompute waits stores nothing; left open, the reply is stored",
+          arguments: [true, false])
+    func cardCloseEndsTheRecompute(closed: Bool) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(replyTextMessage: "Earlier text")
+            defer { fixture.close() }
+            let release = DispatchSemaphore(value: 0)
+            let calls = Mutex(0)
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/completions/chat", method: "POST") { _ in
+                calls.withLock { $0 += 1 }
+                let object: [String: Any] = ["subject": "Re: Plans", "body": "Recomputed", "text_message": "Recomputed text"]
+                let assistant = String(decoding: (try? JSONSerialization.data(withJSONObject: object)) ?? Data(), as: UTF8.self)
+                let final = (try? JSONSerialization.data(withJSONObject: ["assistant": assistant])) ?? Data()
+                let answer = FakeHTTP.CannedResponse.bytes(
+                    Data(("event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n").utf8),
+                    contentType: "text/event-stream")
+                return .parked {
+                    _ = release.wait(timeout: .now() + 10)
+                    return answer
+                }
+            }
+            let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+            let header = fixture.header
+            let account = fixture.account
+            let shown = Mutex<ReplyResult?>(nil)
+            // As the card's Recompute: the result is shown only while the card is still open.
+            let recompute = Task {
+                if let result = await ComposeView.recomputedReply(
+                    for: header, account: account, kbText: "", compositionPrompt: "",
+                    aiService: service, dbPool: AppDatabase.dbPool) {
+                    guard !Task.isCancelled else { return }
+                    shown.withLock { $0 = result }
+                }
+            }
+            for _ in 0..<400 where calls.withLock({ $0 }) < 1 { try await Task.sleep(for: .milliseconds(5)) }
+            #expect(calls.withLock { $0 } == 1, "control: the Recompute is waiting on its reply")
+
+            // The card closes on the main actor, as ComposeView does.
+            if closed { await MainActor.run { ComposeView.cardClosed(recompute: recompute) } }
+            release.signal()
+            _ = await recompute.value
+
+            let row = try #require(try fixture.row())
+            if closed {
+                #expect(row.cachedReply == nil && row.replyTextMessage == "Earlier text", "a closed card's Recompute stores nothing")
+                #expect(shown.withLock { $0 } == nil, "and shows nothing")
+            } else {
+                #expect(row.cachedReply == "Recomputed" && row.replyTextMessage == "Recomputed text", "control: stored")
+                #expect(shown.withLock { $0 }?.body == "Recomputed", "control: shown in the card")
+            }
         }
     }
 
@@ -642,7 +805,7 @@ struct AITextMessageCallerTests {
                 for: fixture.header, account: fixture.account, kbText: "", compositionPrompt: "",
                 aiService: backend.service, dbPool: AppDatabase.dbPool)
 
-            #expect(suggestion == Self.replyBody)
+            #expect(suggestion?.body == Self.replyBody)
             let messages = backend.http.recordedCalls().compactMap { call -> String? in
                 let json = call.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
                 // The prompt's variables are fields of the message itself.
@@ -678,7 +841,7 @@ struct AITextMessageCallerTests {
                 for: original, account: fixture.account, kbText: "", compositionPrompt: "",
                 aiService: backend.service, dbPool: AppDatabase.dbPool)
 
-            #expect(suggestion == Self.replyBody, "compose still shows the reply to the email on screen")
+            #expect(suggestion == nil, "the AI is never asked about, or shown a reply for, another email")
             let row = try #require(try fixture.row())
             #expect(row.rfc822MessageId == "different@example.com")
             #expect(row.cachedReply == "The other email's reply")

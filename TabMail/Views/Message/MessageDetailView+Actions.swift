@@ -91,40 +91,4 @@ extension MessageDetailView {
             prefillCc: recipients.cc.isEmpty ? nil : recipients.cc
         )
     }
-
-    @ViewBuilder
-    func composeViewForAgentRequest(_ req: AgentToolRouter.ComposeRequest) -> some View {
-        switch req.mode {
-        case .compose:
-            ComposeView(
-                suggestedBody: req.body,
-                account: fromAccount(of: req),
-                prefillTo: req.to,
-                prefillCc: req.cc,
-                prefillBcc: req.bcc,
-                prefillSubject: req.subject,
-                onAgentOutcome: req.onOutcome
-            )
-        case .reply:
-            ComposeView(
-                replyTo: req.replyTo,
-                suggestedBody: req.body,
-                isReplyAll: req.isReplyAll,
-                prefillTo: req.to.isEmpty ? nil : req.to,
-                prefillCc: req.cc.isEmpty ? nil : req.cc,
-                prefillBcc: req.bcc.isEmpty ? nil : req.bcc,
-                onAgentOutcome: req.onOutcome
-            )
-        case .forward:
-            ComposeView(
-                replyTo: req.replyTo,
-                suggestedBody: req.body,
-                isForward: true,
-                prefillTo: req.to,
-                prefillCc: req.cc,
-                prefillBcc: req.bcc,
-                onAgentOutcome: req.onOutcome
-            )
-        }
-    }
 }

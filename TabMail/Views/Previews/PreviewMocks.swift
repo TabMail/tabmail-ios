@@ -122,13 +122,13 @@ enum PreviewMocks {
             // cachedReply populated on every row (even archive-tagged) so no
             // row shows the reply-loading shimmer. The shimmer is intended for
             // rows where AI hasn't finished yet, which isn't a useful preview state.
-            h.cachedReply = [
+            _ = h.replaceSuggestion(with: ReplyResult(body: [
                 "Thanks for sharing — I'll review the action items and follow up by EOW.",
                 "Agreed, let's push by a week. I'll update the tracker.",
                 "Thanks for the heads-up — archiving.",
                 "Sounds great! 7pm Friday works.",
                 "Thanks, archiving for later reading.",
-            ][i]
+            ][i], textMessage: nil), ifStill: nil)
             headers.append(h)
         }
 

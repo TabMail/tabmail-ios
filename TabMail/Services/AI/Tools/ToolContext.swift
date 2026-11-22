@@ -65,10 +65,6 @@ struct ToolContext: Sendable {
     /// Test-only device zone. `nil` in production: `deviceZone` is the device's zone.
     private let deviceZoneOverride: TimeZone?
 
-    /// The AI service a compose tool's content generation calls (`EmailComposeTool.runComposeEdit`).
-    /// Production: `AIService.shared`. Tests pass one on a fake backend to see every model call.
-    let aiService: AIService
-
     /// The device's time zone, as a calendar write tool snapshots it once, as the first step of
     /// its operation (root rule "snapshot settings at operation start", #753): the card, the
     /// queued arguments and the result all use that one value, never the device's zone read again
@@ -82,7 +78,6 @@ struct ToolContext: Sendable {
         self.translator = ChatIdTranslator.shared
         self.routerOverride = nil
         self.deviceZoneOverride = nil
-        self.aiService = .shared
     }
 
     /// Test injection: provide custom DB, translator, and (optionally) router and device zone.
@@ -92,13 +87,11 @@ struct ToolContext: Sendable {
         db: any DatabaseReader & Sendable,
         translator: any ChatIdTranslating,
         router: AgentToolRouter? = nil,
-        deviceZone: TimeZone? = nil,
-        aiService: AIService = .shared
+        deviceZone: TimeZone? = nil
     ) {
         self.db = db
         self.translator = translator
         self.routerOverride = router
         self.deviceZoneOverride = deviceZone
-        self.aiService = aiService
     }
 }

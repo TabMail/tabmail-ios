@@ -12,9 +12,13 @@ import GRDB
 struct EmailForwardTool: AgentTool, Sendable {
     let name = "email_forward"
     private let ctx: ToolContext
+    /// The compose edit a request runs (`EmailReplyTool.ComposeEdit`); tests answer it as the
+    /// backend would.
+    private let composeEdit: EmailReplyTool.ComposeEdit
 
-    init(context: ToolContext? = nil) {
+    init(context: ToolContext? = nil, composeEdit: EmailReplyTool.ComposeEdit? = nil) {
         self.ctx = context ?? ToolContext()
+        self.composeEdit = composeEdit ?? EmailReplyTool.chatComposeEdit
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
@@ -23,6 +27,8 @@ struct EmailForwardTool: AgentTool, Sendable {
 
     /// `invocation.composeOrigin`: the chat that asked, where the forward's compose card opens
     /// (ADR-IOS-053 Phase 2). Without one no screen can open it, so the tool fails fast.
+    /// `invocation.fieldWordsKey`: the request was sent from the chat's reply field; a sent card
+    /// completes that send in `ChatFieldWords` (ADR-IOS-117).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         // Parse unique_id (numeric ID from ChatIdTranslator)
         let numericId: Int
@@ -91,13 +97,14 @@ struct EmailForwardTool: AgentTool, Sendable {
         var generatedBody: String? = explicitBody
         if let composeRequest {
             let wrappedRequest = "Forward email with subject \"\(header.subject)\" to recipients: \(recipientsFormatted). Content request: \(composeRequest)"
+            // The related email's body for context, through the one identity-checked read: another
+            // email seated at its address since it was read refuses the request.
+            guard let relatedBodyText = try await ctx.db.read({ db in
+                try ComposeEditContext.relatedBodyText(of: header, db: db)
+            }) else {
+                return ComposeOutcome.failed("the email changed since it was read; nothing was done").describeForLLM
+            }
             do {
-                // Get related email body text for context
-                let relatedBodyText: String? = try? await ctx.db.read { db in
-                    guard let messageBody = try MessageBody.fetchOne(db, key: header.id),
-                          let html = messageBody.htmlContent, !html.isEmpty else { return nil }
-                    return EmailFilter.htmlToPlainText(html)
-                }
                 let result = try await EmailComposeTool.runComposeEdit(
                     to: to,
                     cc: cc,
@@ -108,7 +115,7 @@ struct EmailForwardTool: AgentTool, Sendable {
                     relatedHeader: header,
                     relatedBodyText: relatedBodyText,
                     db: ctx.db,
-                    ai: ctx.aiService
+                    composeEdit: composeEdit
                 )
                 generatedSubject = result.subject
                 generatedBody = result.body ?? generatedBody
@@ -135,7 +142,7 @@ struct EmailForwardTool: AgentTool, Sendable {
         }
 
         // Suspend until the user sends, dismisses, or Stop cancels the task.
-        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome { onOutcome, state in
+        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome(fieldWordsKey: invocation.fieldWordsKey) { onOutcome, state in
             AgentToolRouter.ComposeRequest(
                 mode: .forward,
                 replyTo: header,

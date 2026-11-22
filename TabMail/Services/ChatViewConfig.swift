@@ -119,6 +119,11 @@ enum ChatSuggestionConfig {
     static let label = "AI Suggestion"
     /// The line under the ghost.
     static let statusLine = "\(label) · Tap to use"
+    /// What a reply request typed or said in the field does while the AI Suggestion shows: it is
+    /// a compose edit of the suggestion (`EmailReplyTool`), and then either the ghost shows the
+    /// edit in place (true; a tap on it opens the compose card) or the compose card opens with
+    /// the edited email (false). The one place this choice is made.
+    static let fieldEditRewritesInPlace = true
     /// The line under the working bubble while the suggestion is written.
     static let writingLine = "\(label) · Writing"
     /// The working bubble growing into the ghost, the re-pin scroll in the same transaction.

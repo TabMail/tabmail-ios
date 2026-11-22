@@ -13,9 +13,13 @@ import GRDB
 struct EmailComposeTool: AgentTool, Sendable {
     let name = "email_compose"
     private let ctx: ToolContext
+    /// The compose edit a request runs (`EmailReplyTool.ComposeEdit`); tests answer it as the
+    /// backend would.
+    private let composeEdit: EmailReplyTool.ComposeEdit
 
-    init(context: ToolContext? = nil) {
+    init(context: ToolContext? = nil, composeEdit: EmailReplyTool.ComposeEdit? = nil) {
         self.ctx = context ?? ToolContext()
+        self.composeEdit = composeEdit ?? EmailReplyTool.chatComposeEdit
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
@@ -24,6 +28,8 @@ struct EmailComposeTool: AgentTool, Sendable {
 
     /// `invocation.composeOrigin`: the chat that asked, where the compose card opens
     /// (ADR-IOS-053 Phase 2). Without one no screen can open it, so the tool fails fast.
+    /// `invocation.fieldWordsKey`: the request was sent from the chat's reply field; a sent card
+    /// completes that send in `ChatFieldWords` (ADR-IOS-117).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         // Parse recipients
         let to = Self.parseStringArray(arguments["to"]) ?? Self.parseStringArray(arguments["recipients"]) ?? []
@@ -77,7 +83,7 @@ struct EmailComposeTool: AgentTool, Sendable {
                     request: composeRequest,
                     mode: "edit_new",
                     db: ctx.db,
-                    ai: ctx.aiService
+                    composeEdit: composeEdit
                 )
                 generatedSubject = result.subject ?? generatedSubject
                 generatedBody = result.body ?? generatedBody
@@ -88,7 +94,7 @@ struct EmailComposeTool: AgentTool, Sendable {
         }
 
         // Suspend until the user sends, dismisses, or Stop cancels the task.
-        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome { onOutcome, state in
+        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome(fieldWordsKey: invocation.fieldWordsKey) { onOutcome, state in
             AgentToolRouter.ComposeRequest(
                 mode: .compose,
                 replyTo: nil,
@@ -107,16 +113,11 @@ struct EmailComposeTool: AgentTool, Sendable {
 
     // MARK: - Compose Edit (TB Parity)
 
-    /// Per-task replacement for the backend edit call: receives the edit context and
-    /// instruction `runComposeEdit` built. `@TaskLocal`, so a test's override reaches only
-    /// the tool calls made inside its own `withValue` scope.
-    @TaskLocal static var inlineEditOverride: (@Sendable (ComposeEditContext, String) async throws -> InlineEditResult)?
-
     /// Shared compose edit flow matching TB's `runComposeEdit()`.
     /// Resolves account/prompts, builds `ComposeEditContext`, and calls `performInlineEdit()`.
-    /// Used by email_compose (mode "edit_new"), email_reply (mode "edit_reply"),
-    /// and email_forward (mode "edit_forward") tools for full TB parity. `ai`: the tool's
-    /// `ToolContext.aiService`, which makes the model call.
+    /// Used by the email_compose (mode "edit_new") and email_forward (mode "edit_forward") tools
+    /// for full TB parity. email_reply (mode "edit_reply") builds the same context with
+    /// `ComposeEditContext.make`, as the compose card does.
     static func runComposeEdit(
         to: [String],
         cc: [String],
@@ -127,7 +128,7 @@ struct EmailComposeTool: AgentTool, Sendable {
         relatedHeader: MessageHeader? = nil,
         relatedBodyText: String? = nil,
         db: (any DatabaseReader & Sendable)? = nil,
-        ai: AIService
+        composeEdit: EmailReplyTool.ComposeEdit
     ) async throws -> InlineEditResult {
         let dbReader = db ?? AppDatabase.rawPool
         // Get sender info from primary account (matching TB's user identity
@@ -214,16 +215,7 @@ struct EmailComposeTool: AgentTool, Sendable {
 
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] runComposeEdit: mode=\(mode) to=\(to.count) cc=\(cc.count) request=\(request.prefix(80))") }
 
-        if let inlineEditOverride {
-            return try await inlineEditOverride(context, request)
-        }
-        return try await ai.performInlineEdit(
-            currentSubject: subject ?? "",
-            currentBody: body ?? "",
-            context: context,
-            instruction: request,
-            chatHistory: []
-        )
+        return try await composeEdit(context, subject ?? "", body ?? "", request)
     }
 
     // MARK: - Helpers

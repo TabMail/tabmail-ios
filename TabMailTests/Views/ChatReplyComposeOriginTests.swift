@@ -228,7 +228,7 @@ struct ChatReplyComposeOriginTests {
     /// The request as the reply field sends it about `email` in `chat`: who was chosen in Reply to
     /// when sent.
     private static func field(_ email: MessageHeader, onlyTo: [String]?, in chat: Chat) -> ToolInvocation {
-        ToolInvocation(fieldReply: ChatFieldReply(emailKey: ChatThread.copyKey(email), onlyTo: onlyTo), composeOrigin: chat.asked)
+        ToolInvocation(fieldReply: ChatFieldReply(email: email, onlyTo: onlyTo), composeOrigin: chat.asked)
     }
 
     /// A request asked in `chat`'s open sheet: no field choice.

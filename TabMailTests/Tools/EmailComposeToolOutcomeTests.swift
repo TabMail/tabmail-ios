@@ -51,6 +51,46 @@ struct EmailComposeToolOutcomeTests {
         return router.takeCompose(for: ComposeTestOrigin.inboxHost)
     }
 
+    /// THE SYSTEM PROPERTY: an agent's new email with a compose request is written by the model as a
+    /// new email (`edit_new`), and its card opens with exactly the model's subject and body; a failed
+    /// or malformed edit opens the card with the agent's own words, never part of an edit.
+    /// Through the request path, the model answered by the compose edit the tool is given.
+    @Test("A new email's compose request opens its card with the model's draft; a failed edit keeps the agent's words",
+          arguments: [true, false])
+    func composeRequestOpensTheModelsDraft(editSucceeds: Bool) async throws {
+        let (_, db, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        let ctx = ToolContext(db: db, translator: MockChatIdTranslator(), router: router)
+        let modes = Mutex<[String]>([])
+        let body = "Hi Pat,\n\nAre you free on Friday?\n\nAlex"
+        let tool = EmailComposeTool(context: ctx, composeEdit: { context, _, _, _ in
+            modes.withLock { $0.append(context.mode) }
+            guard editSucceeds else { throw InlineEditFailure(message: "The edit could not be read. Please try again.") }
+            return try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+                response: "Done.", subject: "Friday", body: body, textMessage: "Free on Friday?", changeCommand: "")))
+        })
+        let task = Task { @MainActor in
+            try await tool.execute(arguments: [
+                "to": .array([.string("pat@example.com")]),
+                "subject": .string("Agent subject"),
+                "body": .string("Agent body"),
+                "request": .string("ask Pat about Friday"),
+            ], invocation: ComposeTestOrigin.invocation)
+        }
+        let card = await waitForPendingCompose(on: router)
+        card?.onOutcome(.cancelled)
+        _ = try await task.value
+
+        #expect(modes.withLock { $0 } == ["edit_new"], "the model is asked once, for a new email")
+        let opened = try #require(card, "the card opens")
+        #expect(opened.mode == .compose && opened.to == ["pat@example.com"])
+        if editSucceeds {
+            #expect(opened.subject == "Friday" && opened.body == body, "the card holds the model's draft")
+        } else {
+            #expect(opened.subject == "Agent subject" && opened.body == "Agent body", "the agent's own words, unchanged")
+        }
+    }
+
     @Test("Tool name is email_compose")
     func toolName() throws {
         let (ctx, _, _) = try makeContext()
@@ -208,7 +248,7 @@ struct EmailComposeToolOutcomeTests {
 /// no compose origin (a non-interactive caller, or the compose editor's own chat) make no model call
 /// for the email's words, queue no card, and return the no-screen failure the model reads, even
 /// when asked to write the words (`request`). Each tool's model calls go to a fake backend through
-/// its `ToolContext.aiService`, which counts them; the control shows the same arguments with an
+/// the compose edit it is given (`composeEdit`, the production call on that backend), which counts them; the control shows the same arguments with an
 /// origin make exactly one call, so a count of zero is the tool's own choice. The compose editor's
 /// case runs its real inline-edit request with a fake tool call answered by the registered tool.
 @Suite("Compose tools with no screen write nothing", .serialized, .processGlobalState)
@@ -263,6 +303,17 @@ struct ComposeToolGenerationBoundaryTests {
             AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
         }
 
+        /// The compose edit the tools here run: the production call (`performInlineEdit`, as
+        /// `EmailReplyTool.chatComposeEdit` makes it) on this backend's service, so every model
+        /// call a tool makes for its words is recorded here.
+        var composeEdit: EmailReplyTool.ComposeEdit {
+            let service = service
+            return { context, subject, body, request in
+                try await service.performInlineEdit(
+                    currentSubject: subject, currentBody: body, context: context, instruction: request, chatHistory: [])
+            }
+        }
+
         var bodies: [String] { record.bodies.withLock { $0 } }
 
         /// The model calls that wrote an email's words for a tool: they carry the tool's request.
@@ -291,16 +342,16 @@ struct ComposeToolGenerationBoundaryTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db, messageId: "msgG\(kind.rawValue)", subject: "Plans")
         await translator.seed(header.id, as: 30)
-        let ctx = ToolContext(db: db, translator: translator, router: router, aiService: backend.service)
+        let ctx = ToolContext(db: db, translator: translator, router: router)
         switch kind {
         case .compose:
-            return (EmailComposeTool(context: ctx), [
+            return (EmailComposeTool(context: ctx, composeEdit: backend.composeEdit), [
                 "to": .array([.string("sam@example.com")]), "subject": .string("Friday"), "request": .string(Backend.writeRequest),
             ])
         case .reply:
-            return (EmailReplyTool(context: ctx), ["unique_id": .int(30), "request": .string(Backend.writeRequest)])
+            return (EmailReplyTool(context: ctx, composeEdit: backend.composeEdit), ["unique_id": .int(30), "request": .string(Backend.writeRequest)])
         case .forward:
-            return (EmailForwardTool(context: ctx), [
+            return (EmailForwardTool(context: ctx, composeEdit: backend.composeEdit), [
                 "unique_id": .int(30), "to": .array([.string("sam@example.com")]), "request": .string(Backend.writeRequest),
             ])
         }

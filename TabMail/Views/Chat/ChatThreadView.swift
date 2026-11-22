@@ -83,12 +83,10 @@ struct ChatThreadView: View {
     @State private var readyReply: ChatReadyReply?
     /// The field's "e.g." example, picked once as the chat opens.
     @State private var example = ChatSuggestionConfig.randomExample()
-    @State private var agentCompose: ChatAgentCard?
+    @State private var agentCompose: AgentToolRouter.ComposeRequest?
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet.
     @State private var fieldComposeOpened = false
-    /// Bumps to empty the field.
-    @State private var fieldClearCount = 0
     /// The chat's replies still in the outbox (`ChatUnsentReply`), read from the database.
     @State private var unsentReplies: [ChatUnsentReply] = []
     /// Who the next reply goes to; Reply All until changed in Reply to.
@@ -303,7 +301,7 @@ struct ChatThreadView: View {
             // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
             // suggestion through the outbox.
             ready.compose.composeView(
-                replyTo: ready.message, suggestedBody: ready.message.cachedReply, draftId: ready.draftId,
+                replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
                 onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
@@ -325,7 +323,8 @@ struct ChatThreadView: View {
     @ViewBuilder
     private func chatContent(_ thread: ChatThread) -> some View {
         let offersArchive = viewModel.chatHasInboxCopy
-        let suggestion = thread.newest.flatMap { suggestionPhase(on: $0, thread: thread) }
+        let shown = thread.newest.flatMap { shownSuggestion(on: $0, thread: thread) }
+        let suggestion = thread.newest.flatMap { suggestionPhase(on: $0, shown: shown, thread: thread) }
         ZStack(alignment: .bottom) {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -346,8 +345,9 @@ struct ChatThreadView: View {
                         if let newest = thread.newest, let suggestion {
                             if !suggestionGrowPending, case .ready(let text) = suggestion {
                                 let move = tutorialMove(thread)
+                                // A tap opens the suggestion this ghost shows (`shown`: `.ready` comes only from it).
                                 ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) {
-                                    openSuggestion(on: newest, tutorialMove: move)
+                                    if let shown { openSuggestion(shown, on: newest, tutorialMove: move) }
                                 }
                                 .transition(.asymmetric(
                                     insertion: ghostFadesIn
@@ -798,14 +798,33 @@ struct ChatThreadView: View {
         }
     }
 
-    /// The AI Suggestion's row on the newest email (`ChatReplyField.suggestionPhase`). None on the user's turn (their email is
+    /// The ready AI Suggestion on the newest email, as one value (`ChatReplyField.shown`). None on the user's turn (their email is
     /// the newest, or a reply of theirs is still in the outbox below it), and none while the reply
     /// goes only to people chosen in Reply to: the suggestion was written for everyone, and the
     /// field has the agent write one for the people chosen. None until the thread and its accounts
     /// have loaded (the newest email and the Reply All audience, without the user's own address,
     /// are known only then), and none while the agent works on a request from the field (it may
-    /// open its own compose card).
-    private func suggestionPhase(on newest: MessageHeader, thread: ChatThread) -> ChatSuggestionPhase? {
+    /// open its own compose card), or while a compose card is open: one that became ready meanwhile
+    /// shows when the card closes without sending.
+    private func shownSuggestion(on newest: MessageHeader, thread: ChatThread) -> ReplyResult? {
+        // `isLoaded` is also set when the context read failed: the email's own account, read,
+        // is the proof the audience can leave the user out.
+        guard viewModel.hasLoadedThread, context.isLoaded,
+              context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }
+        let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty
+        let cardOpen = readyReply != nil || agentCompose != nil || forwardMessage != nil
+        return ChatReplyField.shown(
+            newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only,
+            writing: chatWorking, cardOpen: cardOpen)
+    }
+
+    /// The AI Suggestion's row on the newest email: the ghost of the suggestion the chat shows
+    /// (`shown`, from `shownSuggestion`), else the working bubble while the AI writes it
+    /// (`ChatReplyField.suggestionPhase`, the inbox row's rule). No working bubble on the user's
+    /// turn, while the reply goes only to people chosen in Reply to, before the thread and its
+    /// accounts have loaded, or while the agent works on a request from the field.
+    private func suggestionPhase(on newest: MessageHeader, shown: ReplyResult?, thread: ChatThread) -> ChatSuggestionPhase? {
+        if let text = shown?.textMessage { return .ready(text) }
         // `isLoaded` is also set when the context read failed: the email's own account, read,
         // is the proof the audience can leave the user out.
         guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking,
@@ -827,14 +846,14 @@ struct ChatThreadView: View {
     /// Debug-gated: each build of the ready card's content, with the draft it names.
     static func logReadyCard(_ ready: ChatReadyReply) {
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) cachedReplyLen=\(ready.message.cachedReply?.count ?? -1)")
+            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) suggestionLen=\(ready.suggestion.body.count)")
         }
     }
 
     /// A tap on the AI Suggestion: the Reply All compose card with it written out (the suggestion
     /// shows only while the reply goes to everyone). In the tutorial only the step that asks for it
     /// opens the card.
-    private func openSuggestion(on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {
+    private func openSuggestion(_ shown: ReplyResult, on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {
         if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion {
             _ = TutorialCoordinator.shared.admits(.other)
             return
@@ -842,13 +861,13 @@ struct ChatThreadView: View {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[Chat] openSuggestion message=\(newest.id) alreadyOpen=\(readyReply != nil)")
         }
-        readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
-            replyAllTo: newest, accounts: context.accounts))
+        readyReply = ChatReadyReply(message: newest, suggestion: shown, accounts: context.accounts)
     }
 
     private func pill(on newest: MessageHeader) -> some View {
         let isOwn = thread.items.last?.isOwn ?? false
         let isNoReply = !isOwn && EmailFilter.isNoReply(newest.fromAddress)
+        let shown = shownSuggestion(on: newest, thread: thread)
         return VStack(spacing: 8) {
             if let only = replyTarget.only, !chatExpanded {
                 replyingOnlyTo(only)
@@ -867,11 +886,11 @@ struct ChatThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    example: example,
+                    example: ChatReplyField.example(shown: shown, configured: example),
                     isNoReply: isNoReply,
-                    clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
-                    tutorialMove: tutorialMove(thread)),
+                    tutorialMove: tutorialMove(thread),
+                    suggestion: shown),
                 onFieldSend: { _ in fieldComposeOpened = false },
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: viewModel.message?.accountId,
@@ -928,47 +947,33 @@ struct ChatThreadView: View {
         // accounts as the card is taken; when it is not there the request ends and nothing opens.
         guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return }
         fieldComposeOpened = req.fieldReply != nil
-        agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))
+        agentCompose = req
     }
 
     /// The agent finished a request from the field with something to say: the sheet rises with
-    /// the request and the answer, and the field empties. After a compose card the reply
-    /// was the point, so nothing opens.
+    /// the request and the answer. After a compose card the reply was the point, so nothing opens.
+    /// The field's words are the request's to complete, on its own chat key (`ChatFieldWords`,
+    /// `.answered`), not this view's.
     private func agentAnswered() {
         guard !fieldComposeOpened else { return }
-        fieldClearCount += 1
         withAnimation(Self.pillSpring) { chatExpanded = true }
     }
 
-    /// A compose card from the chat closed. Sent: the field empties; a reply shows as its queued
-    /// email's bubble, read from the outbox.
+    /// A compose card from the chat closed. Sent: a reply shows as its queued email's bubble, read
+    /// from the outbox. The field's words are emptied by the request that opened the card, on its
+    /// own chat key (`AgentToolRouter.enqueueComposeAndAwaitOutcome`).
     private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {
         guard case .sent = outcome else { return }
         // A reply sent clears "Replying only to"; the next one is a Reply All again.
         if replyTo != nil { replyTarget = .replyAll }
-        fieldClearCount += 1
     }
 
-    @ViewBuilder
-    private func composeView(for card: ChatAgentCard) -> some View {
-        let req = card.request
-        let onOutcome: @MainActor (ComposeOutcome) -> Void = { outcome in
+    /// A new email opens from the account bound when its turn started (`ComposeRequest.fromAccountId`),
+    /// read from the same accounts `openAgentCompose` checked, never whichever email this chat shows.
+    private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
+        req.composeView(account: navigationStore.accounts.first { $0.id == req.fromAccountId }) { outcome in
             req.onOutcome(outcome)
             composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)
-        }
-        switch req.mode {
-        case .compose:
-            ComposeView(
-                suggestedBody: req.body, account: navigationStore.accounts.first { $0.id == req.fromAccountId },
-                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
-                onAgentOutcome: onOutcome)
-        case .reply:
-            card.reply.composeView(
-                replyTo: req.replyTo, suggestedBody: req.body, draftId: card.draftId, onAgentOutcome: onOutcome)
-        case .forward:
-            ComposeView(
-                replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
-                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, onAgentOutcome: onOutcome)
         }
     }
 }

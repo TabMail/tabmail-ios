@@ -4506,6 +4506,38 @@ final class AppDatabase: Sendable {
         ) { db in
             try rekeyChatSessionsByThread(db)
         }
+
+        // Chat view: a reply result also carries a short command that would change it
+        // (`replyChangeCommand`), the reply field's example while the AI Suggestion shows. On-device
+        // AI cache, the same class as `replyTextMessage`. NULLABLE and NO BACKFILL: a reply computed
+        // before this version has none, and the field shows a configured example instead.
+        // Convergence: a fresh install and an upgraded DB both end with the two columns, NULL on
+        // every pre-existing row.
+        migrator.registerTimedMigration(
+            "v108_addReplyChangeCommand", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "replyChangeCommand", .text)
+            }
+            try db.alter(table: "messageAICache") { t in
+                t.add(column: "replyChangeCommand", .text)
+            }
+        }
+
+        // v109 (ADR-IOS-117, #979): a chat field's unsent words, kept on this iPhone under the
+        // thread's chat key (`ChatFieldWords`), so Back and a closed app do not lose them. One row
+        // per chat with words; never synced or sent. Numbered after v108, which the chat view's
+        // `v108_addReplyChangeCommand` takes in the same release. A new, empty table: an upgrade and
+        // a fresh install converge on it.
+        migrator.registerTimedMigration(
+            "v109_addChatFieldWords", foreignKeyChecks: .immediate
+        ) { db in
+            try db.create(table: "chatFieldWords") { t in
+                t.primaryKey("sessionId", .text)
+                t.column("words", .text).notNull()
+                t.column("updatedAt", .datetime).notNull()
+            }
+        }
     }
 
     /// Move per-email chat turns to their thread's key (v107). Shared by the migration and its

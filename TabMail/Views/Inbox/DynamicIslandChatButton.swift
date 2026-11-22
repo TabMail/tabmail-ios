@@ -18,7 +18,14 @@ struct DynamicIslandChat: View {
     let message: MessageHeader?
     let draftSubject: String?
     let draftBody: String?
+    /// The AI Suggestion shown as the draft, as one value; nil when the draft is not it. Its text
+    /// version and change command are recorded with each edit, so a resend or rewind puts them back.
+    let draftSuggestion: ReplyResult?
     let composeContext: ComposeEditContext?
+    /// A compose edit request's own context, read after admission through the identity-checked
+    /// body read (`ComposeEditContext.relatedBodyText`); nil refuses the request. Absent: the
+    /// request uses `composeContext`.
+    let composeEditContext: (@MainActor () async -> ComposeEditContext?)?
     let draftId: String?
     let draftReplyToId: String?  // MessageHeader.id of the email being replied to (for draft eviction)
     /// The compose's reply-all kind (#915), stored on the row the agent's first
@@ -47,7 +54,9 @@ struct DynamicIslandChat: View {
     @Binding var isExpanded: Bool
     @Binding var isInputFocused: Bool
     @Binding var isWorking: Bool
-    var onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?) -> Void)?
+    /// Applies an edit's result, or a resend's or rewind's restore, to the draft; awaited under the
+    /// compose agent fence, so the draft and the suggestion's write are settled before the next step.
+    var onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?, String?, String?) async -> Void)?
     var onAgentReply: ((String) -> Void)?
     /// The chat view's reply field (`ChatReplyField`): collapsed, this pill is [mic] [field] [Send]
     /// on the thread's newest email instead of the Chat capsule.
@@ -76,10 +85,19 @@ struct DynamicIslandChat: View {
     /// Reply field: the words sent to the agent, shown pulsing while it works.
     @State var fieldSentText: String?
     /// The input's words and the reply field's state. `ChatFieldFill.apply` is the only way the words
-    /// change; no AI text is ever written into them (`ChatFieldFill`).
-    @State private var fieldFill = ChatFieldFill()
+    /// change; no AI text is ever written into them (`ChatFieldFill`). A pill about an email changes
+    /// its chat's one fill, which every pill on the chat shares (`ChatFieldWords`, ADR-IOS-117); the
+    /// inbox's chat and a compose's pill have their own.
+    private var fieldFill: ChatFieldWords.Field { ChatFieldWords.Field(key: wordsKey, own: $ownFill) }
+    @State private var ownFill = ChatFieldFill()
     /// The user's own words in the input (`ChatFieldFill.words`), read-only here.
     var inputText: String { fieldFill.words }
+    /// Where the field's unsent words are kept (`ChatFieldWords`, ADR-IOS-117): the thread chat key
+    /// of the pill's email. Nil for the inbox's chat and a compose's pill, which keep none.
+    private var wordsKey: String? {
+        guard composeContext == nil, let message else { return nil }
+        return ChatFieldWords.key(for: message)
+    }
     @State var fieldPulse = false
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
@@ -195,8 +213,11 @@ struct DynamicIslandChat: View {
         get { session.lastFailedSend }
         nonmutating set { session.lastFailedSend = newValue }
     }
-    /// Saved checkpoint for a turn cut off in transit — drives the "Connection
-    /// lost. Tap to retry." affordance. Separate from `lastFailedSend`.
+    /// Saved checkpoint for a turn cut off in transit. Drives the "Connection
+    /// lost. Tap to retry." affordance and the field's Retry (`chatRetry`): on an
+    /// empty field, or in Send's place while the field still holds the unedited
+    /// sent words of this same request (its `fieldWordsKey` is the field's
+    /// `wordsKey`). Separate from `lastFailedSend`.
     private var pendingResume: ChatPillState.Session.PendingResume? {
         get { session.pendingResume }
         nonmutating set { session.pendingResume = newValue }
@@ -285,7 +306,9 @@ struct DynamicIslandChat: View {
         message: MessageHeader? = nil,
         draftSubject: String? = nil,
         draftBody: String? = nil,
+        draftSuggestion: ReplyResult? = nil,
         composeContext: ComposeEditContext? = nil,
+        composeEditContext: (@MainActor () async -> ComposeEditContext?)? = nil,
         draftId: String? = nil,
         draftReplyToId: String? = nil,
         draftIsReplyAll: Bool = false,
@@ -301,7 +324,7 @@ struct DynamicIslandChat: View {
         isExpanded: Binding<Bool>,
         isInputFocused: Binding<Bool> = .constant(false),
         isWorking: Binding<Bool> = .constant(false),
-        onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?) -> Void)? = nil,
+        onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?, String?, String?) async -> Void)? = nil,
         onAgentReply: ((String) -> Void)? = nil,
         replyField: ChatReplyField? = nil,
         onFieldSend: ((String) -> Void)? = nil,
@@ -313,7 +336,9 @@ struct DynamicIslandChat: View {
         self.message = message
         self.draftSubject = draftSubject
         self.draftBody = draftBody
+        self.draftSuggestion = draftSuggestion
         self.composeContext = composeContext
+        self.composeEditContext = composeEditContext
         self.draftId = draftId
         self.draftReplyToId = draftReplyToId
         self.draftIsReplyAll = draftIsReplyAll
@@ -695,13 +720,10 @@ struct DynamicIslandChat: View {
                 speech.stop()
             }
         }
-        // Reply field (chat view): a clear empties the words that were sent; a confirmation card
-        // while collapsed opens the sheet, which takes the request.
-        .onChange(of: replyField?.clearCount) { _, _ in
-            fieldSentText = nil
-            // Words written after the send this completes are newer, and stay (`ChatFieldFill`).
-            fieldFill.apply(.completed)
-        }
+        // Reply field (chat view): a confirmation card while collapsed opens the sheet, which takes
+        // the request. The field's words are not changed here: the request's own transitions
+        // (card, answer, sent compose) land on the chat key it was sent under, in `ChatFieldWords`
+        // (`SessionUISink`, `sendAgentChat`, `AgentToolRouter.enqueueComposeAndAwaitOutcome`).
         // The thread's chat, read as the pill appears and whenever it is about a newer email, so a
         // card raised in any key of the thread opens the sheet while collapsed (ADR-IOS-114).
         .task(id: message?.id) {
@@ -714,9 +736,14 @@ struct DynamicIslandChat: View {
         // `initial`: a screen mounted with a request already waiting (the inbox entered again
         // from the sidebar, whose on-screen value starts true) takes it without a later change.
         .onChange(of: composeTakeWatch, initial: true) { _, watch in takeAgentCompose(for: watch.host) }
+        // The field's unsent words (ADR-IOS-117): the chat's kept words come back as the pill
+        // shows it; `ChatFieldWords.apply` keeps every change until it is sent.
+        .task(id: wordsKey) {
+            guard let key = wordsKey else { return }
+            await ChatFieldWords.shared.load(key)
+        }
         .onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
-            fieldFill.apply(.confirmationCard)
             fieldSentText = nil
             withAnimation(expandSpring) { isExpanded = true }
         }
@@ -983,9 +1010,11 @@ struct DynamicIslandChat: View {
             DictationSpinner(isRetrying: dictation.isRetrying)
                 .frame(width: 44, height: 44)
                 .accessibilityLabel("Transcribing")
-        } else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil) && isOnLiveSession && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
-            // Retry button. Reverts to the send button as soon as the user types
-            // (the `inputText.isEmpty` gate above). Routes to the right path:
+        } else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil) && isOnLiveSession
+                    && (inputText.trimmingCharacters(in: .whitespaces).isEmpty || (pendingResume?.fieldWordsKey == wordsKey && fieldFill.holdsSentWords)) {
+            // Retry button. Shown on an empty field, or on a field still holding the unchanged sent
+            // words of the field's own cut-off request (resuming it adds no user turn). Reverts to the send
+            // button as soon as the user types or edits. Routes to the right path:
             // a connection-lost RESUMES from saved state; a plain failure re-sends.
             Button {
                 if pendingResume != nil {
@@ -1542,7 +1571,7 @@ struct DynamicIslandChat: View {
         isWorking = true
         Task { @MainActor in
             await TutorialCoordinator.shared.runPracticeReplyEdit { reply in
-                onDraftUpdate?(nil, reply, nil, nil, nil)
+                await onDraftUpdate?(nil, reply.body, nil, nil, nil, reply.textMessage, nil)
             }
             isWorking = false
         }
@@ -1613,7 +1642,7 @@ struct DynamicIslandChat: View {
         onFieldSend?(text)
         // Who the reply goes to, as chosen now, travels with the send (its words and the agent's
         // compose card), whatever the chat shows when the card arrives or the send is retried.
-        let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) }
+        let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) }
         Task { @MainActor in
             MessageChatCollapseTip.hasStartedMessageChat = true
             sendAgentChat(text, field: send)
@@ -1657,7 +1686,69 @@ struct DynamicIslandChat: View {
         return true
     }
 
-    private func sendComposeEdit(_ instruction: String, agentAdmissionAcquired: Bool = false) {
+    /// `anchor`: a resend or rewind's restored turn. The request edits that turn's draft, as it
+    /// was when first asked, never the view's current one, and puts that draft back (awaited)
+    /// before its own result is applied.
+    /// The draft a compose edit reads: the restored turn's (`anchor`, a resend or rewind), else the
+    /// card's current one, with the suggestion's text version and change command when the draft is
+    /// the suggestion. A restore hands its turn here, so the edit never reads the card's draft from
+    /// before the restore reached it.
+    nonisolated static func editBase(
+        anchor: InlineEditTurn?, draftSubject: String?, draftBody: String?, draftSuggestion: ReplyResult?
+    ) -> (subject: String, body: String, atRequest: (textMessage: String?, changeCommand: String?)) {
+        if let anchor {
+            return (anchor.subjectAtRequest, anchor.bodyAtRequest,
+                    (anchor.textMessageAtRequest, anchor.changeCommandAtRequest))
+        }
+        return (draftSubject ?? "", draftBody ?? "",
+                (draftSuggestion?.textMessage, draftSuggestion?.changeCommand))
+    }
+
+    /// The history turn an accepted compose edit records: the request and the draft it edited
+    /// (`editBase`), with the suggestion's text version and change command when that draft was the
+    /// suggestion, so a resend or rewind puts the whole value back. Internal for testability.
+    nonisolated static func editTurn(
+        instruction: String, subject: String, body: String,
+        atRequest: (textMessage: String?, changeCommand: String?), assistantResponse: String
+    ) -> InlineEditTurn {
+        InlineEditTurn(
+            userRequest: instruction,
+            bodyAtRequest: body,
+            subjectAtRequest: subject,
+            assistantResponse: assistantResponse,
+            textMessageAtRequest: atRequest.textMessage,
+            changeCommandAtRequest: atRequest.changeCommand
+        )
+    }
+
+    /// Resend: the last turn is restored and leaves the history. Internal for testability.
+    nonisolated static func resendAnchor(_ history: [InlineEditTurn]) -> (anchor: InlineEditTurn?, history: [InlineEditTurn]) {
+        guard let last = history.last else { return (nil, history) }
+        return (last, Array(history.dropLast()))
+    }
+
+    /// Rewind to the user message after `userMessagesBefore` user messages: the turn at that index
+    /// (the draft as it was when that request was made) is restored, and it and every later turn
+    /// leave the history. Internal for testability.
+    nonisolated static func rewindAnchor(
+        _ history: [InlineEditTurn], userMessagesBefore: Int
+    ) -> (anchor: InlineEditTurn?, history: [InlineEditTurn]) {
+        let cutoff = min(userMessagesBefore, history.count)
+        guard cutoff < history.count else { return (nil, history) }
+        return (history[cutoff], Array(history.prefix(cutoff)))
+    }
+
+    /// Puts a resend's or rewind's turn's draft back, awaited, through the card's draft update.
+    /// Recipients are not tracked in editHistory: nil keeps the current values. Internal for testability.
+    static func restoreDraft(
+        _ anchor: InlineEditTurn,
+        through apply: (String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?, String?, String?) async -> Void
+    ) async {
+        await apply(anchor.subjectAtRequest, anchor.bodyAtRequest, nil, nil, nil,
+                    anchor.textMessageAtRequest, anchor.changeCommandAtRequest)
+    }
+
+    private func sendComposeEdit(_ instruction: String, agentAdmissionAcquired: Bool = false, from anchor: InlineEditTurn? = nil) {
         guard composeMutationAllowed else {
             if agentAdmissionAcquired { composeAgentSendFence?.finishAgent() }
             chatMessages.append(ChatMessage(
@@ -1683,9 +1774,13 @@ struct DynamicIslandChat: View {
             guard acquireComposeEditAdmission() else { return }
         }
 
-        // Capture current draft state from parent (values are up-to-date via SwiftUI re-render)
-        let currentSubject = draftSubject ?? ""
-        let currentBody = draftBody ?? ""
+        // The draft this request edits: the restored turn's, or the parent's current one (values
+        // are up-to-date via SwiftUI re-render), with the suggestion's text version and command.
+        let base = Self.editBase(anchor: anchor, draftSubject: draftSubject, draftBody: draftBody,
+                                 draftSuggestion: draftSuggestion)
+        let currentSubject = base.subject
+        let currentBody = base.body
+        let atRequest = base.atRequest
         // Snapshot — state may flip during the network round-trip.
         let skipSave = skipDraftAutoSave
 
@@ -1725,11 +1820,22 @@ struct DynamicIslandChat: View {
         sessionTurns.append(userTurn)
 
         // Unstructured timeout: cancel editTask if it takes >120s.
+        let contextSource = composeEditContext
         let editTask = Task {
-            try await AIService.shared.performInlineEdit(
+            // The request's context, read now that it is admitted, through the identity-checked
+            // body read: another email seated at the replied email's address refuses it.
+            var requestContext = ctx
+            if let contextSource {
+                guard let read = await contextSource() else {
+                    throw InlineEditFailure(message: "The email this draft answers changed. Close and reopen the draft before editing.")
+                }
+                requestContext = read
+            }
+            // The chat's one AI service, as the pills' agent requests use it (tests install theirs).
+            return try await ChatPillState.shared.aiService.performInlineEdit(
                 currentSubject: currentSubject,
                 currentBody: currentBody,
-                context: ctx,
+                context: requestContext,
                 instruction: instruction,
                 chatHistory: editHistory,
                 onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
@@ -1746,6 +1852,11 @@ struct DynamicIslandChat: View {
 
         activeChatTask = Task {
             defer { composeAgentSendFence?.finishAgent() }
+            // A resend or rewind first puts its turn's draft back, awaited under this request's
+            // admission, so this request's result lands over the restored draft, never before it.
+            if let anchor, let onDraftUpdate {
+                await Self.restoreDraft(anchor, through: onDraftUpdate)
+            }
             _ = await userTurnPersistence.value
             do {
                 let result = try await editTask.value
@@ -1754,8 +1865,8 @@ struct DynamicIslandChat: View {
                 // Guard: if user pressed stop, don't append result
                 guard !Task.isCancelled else { return }
 
-                // Update draft via callback (with animation)
-                onDraftUpdate?(result.subject, result.body, result.toDelta, result.ccDelta, result.bccDelta)
+                // Update the draft, awaited: its suggestion write lands while this request is admitted.
+                await onDraftUpdate?(result.subject, result.body, result.toDelta, result.ccDelta, result.bccDelta, result.textMessage, result.changeCommand)
 
                 // Show conversational response as chat bubble
                 let responseText = result.response ?? "Done."
@@ -1789,12 +1900,9 @@ struct DynamicIslandChat: View {
                 }
 
                 // Record in edit history for continuous editing (with draft state)
-                editHistory.append(InlineEditTurn(
-                    userRequest: instruction,
-                    bodyAtRequest: currentBody,
-                    subjectAtRequest: currentSubject,
-                    assistantResponse: result.raw
-                ))
+                editHistory.append(Self.editTurn(
+                    instruction: instruction, subject: currentSubject, body: currentBody,
+                    atRequest: atRequest, assistantResponse: result.raw))
 
                 // Persist assistant turn to GRDB
                 let assistantTurn = ChatTurn(
@@ -1858,10 +1966,10 @@ struct DynamicIslandChat: View {
                 //
                 // There is exactly ONE caller that sets `skipDraftAutoSave`
                 // (`ComposeView`, `skipDraftAutoSave: showingSuggestion`) and it does
-                // NOT own the save. `applyInlineEdit`'s suggestion branch calls
-                // `persistCachedReply` only `if replyTo != nil && !isForward`, so
+                // NOT own the save. `applyInlineEdit`'s suggestion branch writes
+                // only `if replyTo != nil && !isForward`, so
                 // new-message and forward have no durable writer at all — and even in
-                // reply mode `persistCachedReply` writes `messageHeader.cachedReply`,
+                // reply mode that write stores the header's AI Suggestion,
                 // which is not the `Draft` row this toast's tap resolves. The other
                 // half of `!autoSaveAttempted` is `draftId == nil`, where no durable
                 // draft exists by construction. In every one of those states the
@@ -2437,8 +2545,11 @@ struct DynamicIslandChat: View {
         // Captured with the session id: a demo turn is written only while its demo runs.
         let admission = DemoModeStore.shared.chatAdmission
         let capturedSessionKey = sessionKey
-        // Sent from the reply field: the request carries the field's send as it started.
+        // Sent from the reply field: the request carries the field's send as it started, and the
+        // chat key its words were sent under, where its card, answer and sent compose land
+        // (ADR-IOS-117), whichever chat this pill shows by then, and whether or not it still exists.
         let fieldReply = field?.fieldReply
+        let fieldWordsKey = field.map { ChatFieldWords.key(for: $0.message) }
         // The screen whose chat asked, where a compose card the turn asks for opens.
         let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)
 
@@ -2537,8 +2648,8 @@ struct DynamicIslandChat: View {
                 // by) the session that launched the turn — never a global slot that
                 // other mounted pills race for.
                 let invocation = ToolInvocation(
-                    uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply,
-                    composeOrigin: origin)
+                    uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: sessionKey,
+                    fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey)
                 let response: ChatResponse?
                 response = try await TutorialChatScript.response(for: script, invocation: invocation) {
                     try await ChatPillState.shared.aiService.sendChatMessage(
@@ -2617,6 +2728,11 @@ struct DynamicIslandChat: View {
                     animate: true
                 ))
                 BackgroundSyncLogger.logDebug("[AIChatRender] chatMessages appended (count=\(chatMessages.count)), about to set isWorking=false")
+                // The agent answered the field's send: it completes on the send's own chat key.
+                if let fieldWordsKey {
+                    ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)
+                    fieldSentText = nil
+                }
                 if !isExpanded {
                     if let onAgentReply {
                         // Parent view handles the toast (InboxView, ComposeView)
@@ -2645,7 +2761,8 @@ struct DynamicIslandChat: View {
                     // no `lastFailedSend` (that's the separate fork/resend pathway). The field's
                     // request goes with it, for the resumed turn's tools.
                     BackgroundSyncLogger.logChatError("Connection lost (resumable): \(error.localizedDescription)", userMessage: text)
-                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply, origin: origin)
+                    pendingResume = .init(
+                        request: resumable.resumeRequest, fieldReply: fieldReply, origin: origin, fieldWordsKey: fieldWordsKey)
                 } else {
                     // Connection/server error — enable retry
                     BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: text)
@@ -2714,8 +2831,8 @@ struct DynamicIslandChat: View {
                     request: resume.request,
                     onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
                     invocation: ToolInvocation(
-                        uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply,
-                        composeOrigin: origin)
+                        uiSink: SessionUISink(session: session, fieldWordsKey: resume.fieldWordsKey), sessionKey: sessionKey,
+                        fieldReply: resume.fieldReply, composeOrigin: origin, fieldWordsKey: resume.fieldWordsKey)
                 )
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."
@@ -2759,6 +2876,10 @@ struct DynamicIslandChat: View {
                     timestamp: Date(),
                     animate: true
                 ))
+                if let fieldWordsKey = resume.fieldWordsKey {
+                    ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)
+                    fieldSentText = nil
+                }
                 if !isExpanded {
                     if let onAgentReply {
                         onAgentReply(displayText)
@@ -2778,7 +2899,9 @@ struct DynamicIslandChat: View {
                 } else if let resumable = error as? ChatConnectionLostError {
                     // Cut off again — keep the affordance armed with the latest checkpoint.
                     BackgroundSyncLogger.logChatError("Connection lost again (resumable)", userMessage: "(resumed)")
-                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply, origin: resume.origin)
+                    pendingResume = .init(
+                        request: resumable.resumeRequest, fieldReply: resume.fieldReply, origin: resume.origin,
+                        fieldWordsKey: resume.fieldWordsKey)
                 } else {
                     // Non-transient failure — surface it; the user's message still has
                     // the fork/resend context menu for a fresh attempt.
@@ -2868,12 +2991,11 @@ struct DynamicIslandChat: View {
     private func resendLastUserComposeEdit(text: String, afterIndex index: Int) {
         guard acquireComposeEditAdmission() else { return }
         trimForResendLast(atIndex: index)
-        if let last = editHistory.last {
-            // Recipients are not tracked in editHistory — pass nil to keep current values.
-            onDraftUpdate?(last.subjectAtRequest, last.bodyAtRequest, nil, nil, nil)
-            editHistory.removeLast()
-        }
-        sendComposeEdit(text, agentAdmissionAcquired: true)
+        let replay = Self.resendAnchor(editHistory)
+        let anchor = replay.anchor
+        editHistory = replay.history
+        // The request restores the anchor's draft first (`sendComposeEdit(from:)`).
+        sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)
     }
 
     /// Rewind compose-edit chat to an earlier user message. In addition to the standard trim,
@@ -2883,14 +3005,11 @@ struct DynamicIslandChat: View {
         guard acquireComposeEditAdmission() else { return }
         let userMessagesBefore = trimForRewind(atIndex: index)
         // Snapshot on the earliest popped editHistory entry is the pre-edit draft for that turn.
-        let editCutoff = min(userMessagesBefore, editHistory.count)
-        if editCutoff < editHistory.count {
-            let anchor = editHistory[editCutoff]
-            // Recipients are not tracked in editHistory — pass nil to keep current values.
-            onDraftUpdate?(anchor.subjectAtRequest, anchor.bodyAtRequest, nil, nil, nil)
-            editHistory = Array(editHistory.prefix(editCutoff))
-        }
-        sendComposeEdit(text, agentAdmissionAcquired: true)
+        let replay = Self.rewindAnchor(editHistory, userMessagesBefore: userMessagesBefore)
+        let anchor = replay.anchor
+        editHistory = replay.history
+        // The request restores the anchor's draft first (`sendComposeEdit(from:)`).
+        sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)
     }
 
     /// Fork a new session from an earlier user message. Creates a new session on the __new__

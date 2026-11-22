@@ -326,7 +326,7 @@ struct MessageDetailView: View {
         }
         // The email screen chat's own compose cards, taken by its pill (ADR-IOS-053 Phase 2).
         .fullScreenCover(item: $agentCompose) { req in
-            composeViewForAgentRequest(req)
+            req.composeView(account: fromAccount(of: req), onOutcome: req.onOutcome)
         }
         .sheet(item: $moveMessage) { msg in
             MoveFolderPicker(accountId: msg.accountId, currentFolderPath: msg.folderPath) { destinationPath in

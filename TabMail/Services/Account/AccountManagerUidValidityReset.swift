@@ -646,7 +646,8 @@ extension AccountManager {
     /// deletion of the folder's `messageBody` and `chatIdMapping` sidecars, (iii)
     /// `messageHeader` (explicit — there is no folder→header foreign key;
     /// references/label associations cascade off the header), (iv) `pendingRender`,
-    /// (v) the folder's own sync-state reset.
+    /// (v) the folder's own sync-state reset. Before (iii), the chats' unsent field
+    /// words whose thread still has an email are re-stamped (`ChatFieldWords.restampLive`).
     ///
     /// The sidecars are deleted BEFORE their owning headers, using the exact
     /// `messageHeader.folderId` relation inside this same transaction. This avoids
@@ -697,6 +698,12 @@ extension AccountManager {
                         """,
                     arguments: [folderId]
                 )
+
+                // Every chat's unsent field words whose thread still has an email are
+                // re-stamped while this folder's headers are here
+                // (`ChatFieldWords.restampLive`, ADR-IOS-117), so the orphan pass gives
+                // them the full grace for the resync to bring the thread back.
+                try ChatFieldWords.restampLive(db: db, now: Date())
 
                 // (iii) messageHeader — explicit delete.
                 try MessageHeader.filter(Column("folderId") == folderId).deleteAll(db)

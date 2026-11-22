@@ -336,6 +336,9 @@ final class AgentToolRouter {
         /// showing that chat takes the request (`takeCompose(for:)`), so the card opens
         /// on the screen that asked, built by that screen.
         let origin: ComposeOrigin
+        /// A `.reply` opened on the stored AI Suggestion: the whole stored value, so an edit in the
+        /// card compares against exactly what is stored. Nil when the card opens on `body`.
+        let suggestion: ReplyResult?
         /// A `.reply` built from the reply-all recipient set (the AI reply
         /// tool). Carried into ComposeView so the send records reply-all on
         /// the original, like the Reply All button (#915).
@@ -344,6 +347,9 @@ final class AgentToolRouter {
         /// user chose in Reply to when the request was sent (ADR-IOS-114 decision 11). Nil for
         /// every other request, whose compose keeps the recipients above.
         let fieldReply: ChatFieldReply?
+        /// The draft the card saves to; nil, the reply's usual one. An edit of the AI Suggestion
+        /// opens on the suggestion's own draft (`Draft.separateReplyKey`), as the ghost's card does.
+        let draftId: String?
 
         /// Fires once when the user's compose session reaches a terminal state
         /// (send / cancel / persist-failure). Invoked on MainActor from
@@ -365,8 +371,10 @@ final class AgentToolRouter {
             subject: String?,
             body: String?,
             origin: ComposeOrigin,
+            suggestion: ReplyResult? = nil,
             isReplyAll: Bool = false,
             fieldReply: ChatFieldReply? = nil,
+            draftId: String? = nil,
             onOutcome: @escaping @MainActor (ComposeOutcome) -> Void = { _ in },
             outcomeState: ComposeOutcomeState = ComposeOutcomeState()
         ) {
@@ -378,8 +386,10 @@ final class AgentToolRouter {
             self.subject = subject
             self.body = body
             self.origin = origin
+            self.suggestion = suggestion
             self.isReplyAll = isReplyAll
             self.fieldReply = fieldReply
+            self.draftId = draftId
             self.onOutcome = onOutcome
             self.outcomeState = outcomeState
         }
@@ -685,17 +695,28 @@ extension AgentToolRouter {
     /// When the wait ends the request leaves the queue if it is still there: a request
     /// stopped while it waits for a screen that does not come back would otherwise keep its
     /// recipients and body in memory until some later take.
+    ///
+    /// `fieldWordsKey`: the request was sent from the chat's reply field under this chat key
+    /// (`ToolInvocation.fieldWordsKey`). The field's own reply card (`isFieldsOwnReply`,
+    /// `ChatFieldReply.isOwnReply`, decided apart from who it goes to) marks the field composing
+    /// there, and a sent card completes the field's send there, in `ChatFieldWords`, whether or not
+    /// a chat view still shows it (ADR-IOS-117).
     func enqueueComposeAndAwaitOutcome(
+        fieldWordsKey: String? = nil,
+        isFieldsOwnReply: Bool = false,
         make: (@escaping @MainActor (ComposeOutcome) -> Void, ComposeOutcomeState) -> ComposeRequest
     ) async -> ComposeOutcome {
         let state = ComposeOutcomeState()
-        let outcome = await awaitComposeOutcome(state: state, make: make)
+        let outcome = await awaitComposeOutcome(
+            state: state, fieldWordsKey: fieldWordsKey, isFieldsOwnReply: isFieldsOwnReply, make: make)
         composeQueue.removeAll { $0.outcomeState === state }
         return outcome
     }
 
     private func awaitComposeOutcome(
         state: ComposeOutcomeState,
+        fieldWordsKey: String?,
+        isFieldsOwnReply: Bool,
         make: (@escaping @MainActor (ComposeOutcome) -> Void, ComposeOutcomeState) -> ComposeRequest
     ) async -> ComposeOutcome {
         let guard_ = ComposeContinuationGuard()
@@ -723,8 +744,14 @@ extension AgentToolRouter {
                     // (MainActor). `tryResolve` is atomic so we don't depend
                     // on that isolation for correctness.
                     guard state.tryResolve(outcome) else { return }
+                    if case .sent = outcome, let fieldWordsKey {
+                        ChatFieldWords.shared.apply(.completed, to: fieldWordsKey)
+                    }
                     guard_.resume(returning: outcome)
                 }, state)
+                if let fieldWordsKey, isFieldsOwnReply {
+                    ChatFieldWords.shared.apply(.composeOpened, to: fieldWordsKey)
+                }
                 enqueueCompose(request)
             }
         } onCancel: {
