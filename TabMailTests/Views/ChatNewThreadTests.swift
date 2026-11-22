@@ -22,12 +22,12 @@ struct ChatNewThreadTests {
 
     // MARK: - Where it opens
 
-    @Test("The compose button opens the chat with the chat view on and signed in; off, or signed out, today's compose")
-    func composeButtonRoute() {
-        let on = ChatNewThreadRoute.composeButton(opensInChat: true, signedIn: true)
-        let off = ChatNewThreadRoute.composeButton(opensInChat: false, signedIn: true)
-        let signedOut = ChatNewThreadRoute.composeButton(opensInChat: true, signedIn: false)
-        let neither = ChatNewThreadRoute.composeButton(opensInChat: false, signedIn: false)
+    @Test("A new email opens the chat with the chat view on and signed in; off, or signed out, today's compose")
+    func newEmailRoute() {
+        let on = ChatNewThreadRoute.newEmail(opensInChat: true, signedIn: true)
+        let off = ChatNewThreadRoute.newEmail(opensInChat: false, signedIn: true)
+        let signedOut = ChatNewThreadRoute.newEmail(opensInChat: true, signedIn: false)
+        let neither = ChatNewThreadRoute.newEmail(opensInChat: false, signedIn: false)
         #expect(on == .newThread)
         #expect(off == .compose)
         #expect(signedOut == .compose, "signed out, the chat's field cannot send")
@@ -484,7 +484,7 @@ struct ChatNewThreadTests {
         // button: the compose button starts a new email in every folder, Drafts included.
         #expect(Self.count("ToolbarItem(placement: .topBarTrailing) { ComposeToolbarButton(onNewCompose: { collapseChat() startNewEmail() }) .tutorialLockedNavigation() .transaction { $0.disablesAnimations = true } }", in: inbox) == 1)
         #expect(Self.count("ComposeToolbarButton(", in: inbox) == 1, "one compose button in the mailbox")
-        #expect(Self.count("switch ChatNewThreadRoute.composeButton(opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession) { case .newThread: newEmail = ChatNewThreadModel(account: viewModel.primaryAccount) case .compose: viewModel.showCompose = true }", in: inbox) == 1)
+        #expect(Self.count("switch ChatNewThreadRoute.newEmail(opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession) { case .newThread: newEmail = ChatNewThreadModel(account: viewModel.primaryAccount) case .compose: viewModel.showCompose = true }", in: inbox) == 1)
         #expect(Self.count(".navigationDestination(item: $newEmail) { model in ChatNewThreadView(model: model) }", in: inbox) == 1)
         #expect(Self.count(".fullScreenCover(isPresented: $vm.showCompose) { ComposeView(account: viewModel.primaryAccount) }", in: inbox) == 1,
                 "the chat view off keeps today's compose")

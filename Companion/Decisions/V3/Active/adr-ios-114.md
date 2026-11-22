@@ -1464,8 +1464,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
 
 24. **A new email starts as an empty chat (amendment 2026-11-21).** With the chat view on, the mailbox
    list's compose button pushes an empty chat (`ChatNewThreadView`, `ChatNewThreadModel`) instead of
-   presenting compose; off, compose opens as before (`ChatNewThreadRoute.composeButton`, the setting
-   read once at the tap). A second rule, separate from the chat view setting, decides with it:
+   presenting compose; off, compose opens as before (`ChatNewThreadRoute.composeButton`, renamed
+   `ChatNewThreadRoute.newEmail` on 2026-11-22 when every new email took it, the setting read once at
+   the tap). A second rule, separate from the chat view setting, decides with it:
    signed out of TabMail (mail only), compose opens even with the setting on, since the chat's field
    cannot send then and compose is the only way left to write. The setting alone does not show this
    case: signing out keeps the last known plan (`AISubscriptionGate.noteSignedOut`), so
@@ -1473,10 +1474,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    button and a saved draft's reopen ask for the session too (`signedIn:`, read at the tap or as the
    open starts; review ruling 2026-11-22). The mailbox list (`InboxView`) is the list of every folder, so this is the
    compose button of the Inbox, Sent, Drafts and every other folder alike. Other ways of starting an
-   email (a contact, the email screen, links, the iPad split view) still open compose.
+   email (a contact, the email screen, links, the iPad split view) still opened compose until the
+   2026-11-22 amendment (*Every new email*, below), which sends them to the chat too.
    - *The chat.* The header sits where every chat's header is, with one empty avatar and "Add
      recipient" until people are picked (`ChatHeaderView(people:emptyTitle:hint:)`); the line under
-     it reads "New email"; the chat area says "New email. Type what you want to say, or ask TabMail
+     it reads "New email" (the subject a link brought or a reopened draft holds, since 2026-11-22);
+     the chat area says "New email. Type what you want to say, or ask TabMail
      to write it.", then "New email to Maria and Sam." once people are picked
      (`ChatNewDraft.recipientsLine`). The field is the chat's reply field (`ChatReplyField.newEmail`,
      `ChatNewEmailField`) with "Message or ask anything", an "e.g." line from its own config set
@@ -1519,7 +1522,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      which compose's Save also uses (`ComposeDraftSave.run`: a fail-closed read, the attachments
      staged, the row saved through the chat's generation (`ComposeGenerationCursor`), staged or
      superseded files removed only after the commit), then `queueDraftSave` (`ChatNewDraftSave.run`);
-     a subject, Cc or Bcc the row already holds is kept. In Drafts, a draft with no subject reads
+     a subject, Cc or Bcc the row already holds is kept (a new row gets the ones a link brought,
+     *Every new email*, below). In Drafts, a draft with no subject reads
      "Draft (no subject yet)" in the list and in Triage alike (`MessageRowView.subjectLine`); display
      only, the stored and uploaded subject stays empty. Back leaves
      only once the save is durable; a refused save keeps the chat open and offers "Leave without
@@ -1546,6 +1550,41 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      be read block saving from the chat, so the saved files are never replaced by an empty set, and
      the chat says so as it opens ("Attachments couldn't be loaded", 2026-11-22). The
      saved-draft path of decision 9's 2026-11-15 amendment is unchanged for every other draft.
+   - *Every new email (amendment 2026-11-22, ios#1191).* The chat replaces compose for every new
+     email, not only the list's compose button: the email screen's compose button, a contact pill in a
+     TabMail chat, a `mailto:` link tapped in an email, and a `mailto:` URL from outside the app
+     (TabMail as the default email app). One rule decides for all of them
+     (`ChatNewThreadRoute.newEmail`: chat view on and signed in, the setting and the session read once
+     as the request arrives); otherwise compose opens filled with what the request brought, as before.
+     Replies, forwards and the undo-send reopen are not new emails and are unchanged.
+     - *Where it comes up.* Except for the list's compose button, which pushes as above, the chat
+       comes up where compose came up: a full-screen cover with its own navigation stack, whose Back
+       closes it (`ChatNewEmailCover`, `ChatNewEmailCoverView`). The cover shows only what was
+       captured as the request arrived.
+     - *What a link brought.* Its To entries become the picked people (`ChatNewDraft.people(fromTo:)`,
+       as a reopened draft's To: a quoted name with a comma stays one person, and entries that name
+       no address are written back as written). Its body becomes the field's starting words, editable.
+       Its subject shows in the line under the header instead of "New email"
+       (`ChatNewEmailSubjectLine(subject:)`), and its Cc and Bcc as "Cc: Sam." and "Bcc: Alex." lines
+       in the chat area under the recipients line (`ChatNewDraft.copyLine`). Add recipient edits To
+       only; the subject, Cc and Bcc are changed on the compose card, and Bcc never becomes To or Cc.
+       They are written into the draft on its first save (`ChatNewDraft.Carried`,
+       `ChatNewDraftSave.run(carried:)`); a reopened draft shows its own subject, Cc and Bcc the same
+       way and keeps them.
+     - *Saving.* What the link brought is the chat's starting point
+       (`ChatNewDraft.needsSave(current:saved:opened:)`): Back saves nothing until the user typed,
+       picked or attached something beyond it, so a link opened by mistake leaves nothing in Drafts
+       and tapping it again starts over.
+     - *The account.* The chat starts from the primary account (`Account.primary`: the active primary
+       account, else the oldest active one), the rule the list's compose button already used, now one
+       function both use. Compose keeps its own default where it was given none.
+     - *One screen takes each request, the one on top.* The list takes it only while no email is
+       open over it (by a row, an email pill, or in Search); an open chat (`ChatThreadView`) while it
+       is on screen with nothing presented over it; the email screen while it shows, including the
+       one in a chat's email card. Before this an open chat took no request, so a contact pill or a
+       link did nothing while a chat was open. A request that arrives while another screen is
+       presented over the chat, or while Search is open with no email opened in it, is not taken
+       (as before for Search): the user taps again once it closes.
    - *Later, with the compose card.* The compose card stays today's compose; the chat's draft is
      deleted only once the card's Send has a durable outbox row (never-drop). The card's delivery and
      the Sending bubble come with that work, decided now so it is built on them:
@@ -1566,7 +1605,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    checked only in the source: the simulator has no camera), `ChatNewThreadScreenTests` (the whole
    screen hosted: Back, background, closing and their alerts, the empty field, the tray, Send's ask,
    the sheet, the chat hidden by another screen and shown again keeping what was typed, the Drafts
-   row and the opens from Drafts), `ComposeDraftSaveTests` (the shared writer
+   row and the opens from Drafts, and since 2026-11-22 a contact pill or link opening the chat with
+   what it brought), `ComposeDraftSaveTests` (the shared writer
    against a real database), `DraftAttachmentImportTests`.
 
 ## The longer index line (routed 2026-11-09)

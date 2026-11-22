@@ -233,13 +233,9 @@ struct InboxView: View {
     @Environment(\.syncNow) private var syncNowEnv
 
     private var isInboxView: Bool { folders.contains { $0.role == .inbox } }
-    @State private var contactComposeRequest: MailtoRequest?
-    private var contactComposePresented: Binding<Bool> {
-        Binding(
-            get: { contactComposeRequest != nil },
-            set: { if !$0 { contactComposeRequest = nil } }
-        )
-    }
+    /// A new email asked for by a contact pill or a `mailto:` link while the list is on top: today's
+    /// compose or the new email's chat, decided as it arrives (`ChatNewEmailCover`).
+    @State private var newEmailCover: ChatNewEmailCover?
 
     init(title: String, folders: [Folder], selection: MailboxSelection, selectedMessageId: Binding<String?>, pushedMessageId: Binding<String?>) {
         self.title = title
@@ -771,28 +767,20 @@ struct InboxView: View {
         }
         .modifier(CollapseChatOnNavigateModifier(chatExpanded: $chatExpanded))
         .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
-            // When MessageDetailView is pushed (selectedMessageId != nil), let
-            // its listener handle the compose so we don't present two covers.
-            guard selectedMessageId == nil else { return }
+            // One screen takes each request, the one on top: an email opened over the list, by a
+            // row (`selectedMessageId`) or an email pill (`pushedMessageId`), takes it itself, its
+            // chat or its email screen, and so does an email opened in Search.
+            guard selectedMessageId == nil, pushedMessageId == nil, !showSearch else { return }
             guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                 chatExpanded = false
             }
-            contactComposeRequest = request
+            newEmailCover = .make(
+                request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession,
+                chatAccount: viewModel.primaryAccount, composeAccount: viewModel.primaryAccount)
             BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose: \(request.to.first ?? "")")
         }
-        .fullScreenCover(isPresented: contactComposePresented) {
-            if let request = contactComposeRequest {
-                ComposeView(
-                    account: viewModel.primaryAccount,
-                    prefillTo: request.to,
-                    prefillCc: request.cc.isEmpty ? nil : request.cc,
-                    prefillBcc: request.bcc.isEmpty ? nil : request.bcc,
-                    prefillSubject: request.subject,
-                    prefillBody: request.body
-                )
-            }
-        }
+        .fullScreenCover(item: $newEmailCover) { ChatNewEmailCoverView(cover: $0) }
         .toolbarVisibility(chatExpanded && chatInputFocused ? .hidden : .automatic, for: .navigationBar)
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
@@ -1108,7 +1096,7 @@ struct InboxView: View {
     /// The compose button: with the chat view on and signed in to TabMail, a new email starts as
     /// an empty chat; otherwise today's compose. The setting and the session are read once, at the tap.
     private func startNewEmail() {
-        switch ChatNewThreadRoute.composeButton(opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession) {
+        switch ChatNewThreadRoute.newEmail(opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession) {
         case .newThread:
             newEmail = ChatNewThreadModel(account: viewModel.primaryAccount)
         case .compose:

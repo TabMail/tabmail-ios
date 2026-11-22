@@ -309,13 +309,7 @@ final class InboxViewModel {
 
     /// Primary account for compose (explicit isPrimary flag, fallback to oldest active).
     var primaryAccount: Account? {
-        let primary = try? dbPool.read { db in
-            try Account.filter(Column("isActive") == true && Column("isPrimary") == true).fetchOne(db)
-        }
-        if let primary { return primary }
-        return try? dbPool.read { db in
-            try Account.filter(Column("isActive") == true).order(Column("createdAt")).fetchOne(db)
-        }
+        Account.primary(pool: dbPool)
     }
 
     // MARK: - Live Object Lookup

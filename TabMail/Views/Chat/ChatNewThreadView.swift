@@ -5,8 +5,9 @@
 import PhotosUI
 import SwiftUI
 
-/// A new email as an empty chat (ADR-IOS-114): the chat view's compose button opens it, and a
-/// saved draft of one reopens it. The header is where every chat's header is, with one empty
+/// A new email as an empty chat (ADR-IOS-114): with the chat view on, every new email opens it (a
+/// compose button, a contact pill, a `mailto:` link, with what the request brought), and a saved
+/// draft of one reopens it. The header is where every chat's header is, with one empty
 /// avatar and "Add recipient" until people are picked; the chat area says what to do; the field is
 /// the chat's reply field with "Message or ask anything" and a paperclip at the text's end;
 /// attachments wait above the field, each with an x. Nothing is asked when leaving: Back and the
@@ -46,6 +47,20 @@ struct ChatNewThreadView: View {
     static let hintId = "chatNewEmailHint"
     static let savedLineId = "chatNewEmailSaved"
     static let backId = "chatNewEmailBack"
+    static let ccLineId = "chatNewEmailCc"
+    static let bccLineId = "chatNewEmailBcc"
+
+    /// A "Cc: ..." or "Bcc: ..." line in the chat area, when it has someone in it.
+    @ViewBuilder
+    private func copyLine(_ text: String?, id: String) -> some View {
+        if let text {
+            Text(text)
+                .font(.footnote)
+                .foregroundStyle(Theme.textSecondary)
+                .multilineTextAlignment(.center)
+                .accessibilityIdentifier(id)
+        }
+    }
 
     var body: some View {
         ScrollView {
@@ -55,6 +70,9 @@ struct ChatNewThreadView: View {
                     .foregroundStyle(Theme.textSecondary)
                     .multilineTextAlignment(.center)
                     .accessibilityIdentifier(Self.hintId)
+                // Cc and Bcc a link brought or a reopened draft holds: shown, changed on the compose card.
+                copyLine(ChatNewDraft.copyLine("Cc", model.carried.cc), id: Self.ccLineId)
+                copyLine(ChatNewDraft.copyLine("Bcc", model.carried.bcc), id: Self.bccLineId)
                 if let savedAt = model.savedAt {
                     Text(ChatNewDraft.savedLine(savedAt))
                         .font(.caption2)
@@ -88,7 +106,7 @@ struct ChatNewThreadView: View {
                                hint: ChatHeaderView.newEmailHint) { showsAddRecipient = true }
             }
         }
-        .safeAreaBar(edge: .top, spacing: 0) { ChatNewEmailSubjectLine() }
+        .safeAreaBar(edge: .top, spacing: 0) { ChatNewEmailSubjectLine(subject: model.carried.shownSubject) }
         .safeAreaBar(edge: .bottom, spacing: 0) { bottomBar }
         // The user's addresses are captured as the body runs, so the body depends on them and runs
         // again when `loadOwnAddresses` fills them in. Read only inside the sheet's closure, they
@@ -285,12 +303,14 @@ struct ChatNewThreadView: View {
 }
 
 /// The line under a new email's header, where a chat's subject is, drawn as a thread's
-/// (`ChatSubjectText`): it has no subject yet.
+/// (`ChatSubjectText`): the subject a `mailto:` link brought or a reopened draft holds, else
+/// "New email". The subject is written on the compose card.
 struct ChatNewEmailSubjectLine: View {
     static let text = "New email"
+    var subject: String?
 
     var body: some View {
-        ChatSubjectText(subject: Self.text)
+        ChatSubjectText(subject: subject ?? Self.text)
     }
 }
 
