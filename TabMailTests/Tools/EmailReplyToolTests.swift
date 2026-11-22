@@ -290,7 +290,7 @@ struct EmailReplyToolTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "msgR20", subject: "Hi")
         await translator.seed(header.id, as: 20)
 
-        let result = try await EmailReplyTool(context: ctx).execute(arguments: ["unique_id": .int(20)])
+        let result = try await ComposeTestOrigin.runWithoutOrigin(EmailReplyTool(context: ctx), arguments: ["unique_id": .int(20)])
         #expect(result == ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM)
         #expect(router.composeQueueDepth == 0, "no card waits for a screen that can never take it")
     }

@@ -171,7 +171,7 @@ struct EmailComposeToolOutcomeTests {
     @Test("A compose asked with no chat screen fails fast and queues nothing")
     func noOriginFailsFast() async throws {
         let (ctx, _, router) = try makeContext()
-        let result = try await EmailComposeTool(context: ctx).execute(arguments: [
+        let result = try await ComposeTestOrigin.runWithoutOrigin(EmailComposeTool(context: ctx), arguments: [
             "to": .array([.string("a@example.com")]),
             "subject": .string("Hello"),
         ])

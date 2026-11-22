@@ -836,10 +836,12 @@ struct ChatReplyFieldTests {
         #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false }, onAgentCompose: openAgentCompose, composeFromAccountId: viewModel.message?.accountId, composeHostCovered: isAnyPresentation)", in: chat) == 1,
                 "the chat's pill binds the email's account as a new message's From and takes nothing while the chat is covered")
         // A new message's card opens from the account bound when the turn started.
-        #expect(Self.count("ComposeView( suggestedBody: req.body, account: context.accounts.first { $0.id == req.fromAccountId },", in: chat) == 1)
+        #expect(Self.count("ComposeView( suggestedBody: req.body, account: navigationStore.accounts.first { $0.id == req.fromAccountId },", in: chat) == 1)
         // The card and fieldComposeOpened are set only for a request this chat's own pill took
         // (ADR-IOS-053 Phase 2; ChatComposeRoutingTests runs it with the inbox and the email screen mounted).
-        #expect(Self.count("private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) { fieldComposeOpened = req.fieldReply != nil agentCompose = ChatAgentCard(", in: chat) == 1)
+        #expect(Self.count("private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {", in: chat) == 1)
+        #expect(Self.count("guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } fieldComposeOpened = req.fieldReply != nil agentCompose = ChatAgentCard(", in: chat) == 1,
+                "a new email's bound account is looked up as the card is taken, before anything is set")
         #expect(Self.count("private func agentAnswered() { guard !fieldComposeOpened else { return }", in: chat) == 1)
         #expect(Self.count("fieldComposeOpened = true", in: chat) == 0)
         #expect(Self.count("if replyTo != nil { replyTarget = .replyAll }", in: chat) == 1, "a sent reply clears it")
@@ -860,12 +862,14 @@ struct ChatReplyFieldTests {
         #expect(Self.count("let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)", in: island) == 1)
         #expect(Self.count("return ComposeOrigin(sessionKey: sessionKey, screen: fieldReply != nil ? .chat : screen, fromAccountId: composeFromAccountId)", in: island) == 1)
         // A covered screen does not take: the pill takes only while its screen shows and nothing covers it.
-        #expect(Self.count("let host = composeHostShown && !composeHostCovered", in: island) == 1)
+        #expect(Self.count("let host = (composeHostShown ?? composeHostAppeared) && !composeHostCovered", in: island) == 1)
         // A recovered send keeps them: the resume carries the cut-off send's request, the retry the
         // failed send as it was sent (ChatReplyRecoveryTests sends both through the real chat).
-        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply)", in: island) == 1)
+        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply, origin: origin)", in: island) == 1)
         #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply, composeOrigin: origin)", in: island) == 1)
-        #expect(Self.count("let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: resume.fieldReply)", in: island) == 1)
+        // A resume continues its turn: the origin the turn started with, from any screen of the thread.
+        #expect(Self.count("let origin = resume.origin", in: island) == 1)
+        #expect(Self.count("composeOrigin(sessionKey: capturedSessionKey,", in: island) == 1, "only the send reads the pill's origin")
         // No screen takes another screen's compose request: no global slot is left to race for.
         for path in ["TabMail/Views/Chat/ChatThreadView.swift", "TabMail/Views/Inbox/InboxView.swift", "TabMail/Views/Message/MessageDetailView.swift"] {
             let text = try Self.source(path)
@@ -873,11 +877,16 @@ struct ChatReplyFieldTests {
         }
         let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
         let detail = try Self.source("TabMail/Views/Message/MessageDetailView.swift")
-        #expect(Self.count("onAgentCompose: { agentCompose = $0 })", in: inbox) == 1)
-        #expect(Self.count("onAgentCompose: { agentCompose = $0 }, composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)", in: detail) == 1)
+        #expect(Self.count("onAgentCompose: { agentCompose = $0 }, composeHostCovered: isAnyPresentation, composeHostShown: composeHostShown)", in: inbox) == 1,
+                "the inbox says from its navigation whether it shows, and passes its own sheets, covers and alert")
+        #expect(Self.count("private var composeHostShown: Bool { selectedMessageId == nil && pushedMessageId == nil }", in: inbox) == 1)
+        #expect(Self.count("showSearch || labelMenuMessage != nil || showLabelFilterPicker || moveMessageId != nil || moveThreadGroup != nil", in: inbox) == 1)
+        #expect(Self.count("onAgentCompose: openAgentCompose, composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)", in: detail) == 1)
         let detailActions = try Self.source("TabMail/Views/Message/MessageDetailView+Actions.swift")
         #expect(Self.count("account: fromAccount(of: req),", in: detailActions) == 1, "the email screen's new message opens from its bound account")
-        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply)", in: island) == 1)
+        #expect(Self.count("guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } agentCompose = req", in: detailActions) == 1)
+        #expect(Self.count("navigationStore.accounts.first { $0.id == req.fromAccountId }", in: detailActions) == 1)
+        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply, origin: resume.origin)", in: island) == 1)
         #expect(Self.count("lastFailedSend = .init(text: text, field: field)", in: island) == 1)
         #expect(Self.count("sendAgentChat(failed.text, field: failed.field)", in: island) == 1)
         // Re-send of the last turn sends it as it was sent: the bubble keeps the field's send and

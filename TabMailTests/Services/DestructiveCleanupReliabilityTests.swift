@@ -112,7 +112,8 @@ struct DestructiveCleanupReliabilityTests {
                 let request = AgentToolRouter.ComposeRequest(
                     mode: .reply, replyTo: email, to: ["alex@example.com"], cc: [], bcc: [],
                     subject: "Re: Keep", body: nil,
-                    origin: ComposeOrigin(sessionKey: ChatThreadKey.key(for: email), screen: .chat))
+                    origin: ComposeOrigin(
+                        sessionKey: ChatThreadKey.key(accountId: accountSnapshot.id, threadId: "t-keep"), screen: .chat))
                 router.enqueueCompose(request)
                 return request.id
             }
@@ -126,6 +127,23 @@ struct DestructiveCleanupReliabilityTests {
                     && AgentToolRouter.shared.firstQueuedRequestForTesting?.id == waitingCard
             }
             #expect(cardStillWaits, "an aborted removal ends no compose card of the account")
+            // The account is not fenced off: its chat still takes the waiting card, and a later
+            // request of the account is still admitted.
+            let afterAbort = await MainActor.run { () -> (taken: UUID?, admitted: Bool, laterOutcome: String?) in
+                let router = AgentToolRouter.shared
+                let key = ChatThreadKey.key(accountId: accountSnapshot.id, threadId: "t-keep")
+                let taken = router.takeCompose(for: AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [key]))?.id
+                router.resetComposeQueueForTesting()
+                let outcomes = Outcomes()
+                router.enqueueCompose(AgentToolRouter.ComposeRequest(
+                    mode: .compose, replyTo: nil, to: ["alex@example.com"], cc: [], bcc: [],
+                    subject: "Later", body: nil,
+                    origin: ComposeOrigin(sessionKey: key, screen: .chat, fromAccountId: accountSnapshot.id),
+                    onOutcome: { outcomes.bySubject["Later"] = $0 }))
+                return (taken, router.composeQueueDepth == 1, outcomes.bySubject["Later"]?.describeForLLM)
+            }
+            #expect(afterAbort.taken == waitingCard, "the account's chat still opens its waiting card")
+            #expect(afterAbort.admitted && afterAbort.laterOutcome == nil, "a later request of the account still waits for its card")
             #expect(try await pool.read { try Account.fetchCount($0) } == 1)
             #expect(try await pool.read { try OutboxMessage.fetchCount($0) } == 1)
             #expect(KeychainHelper.loadString(key: passwordKey) == "password")

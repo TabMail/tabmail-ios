@@ -32,7 +32,12 @@ import UIKit
 ///  7. A field reply recovered from the email screen's own pill opens in the chat view, to the
 ///     people chosen when it was sent, and nothing opens on the email screen.
 ///  8. A field reply narrowed in Reply to opens to the people chosen even when a Reply All draft is
-///     saved for that email, and leaves that draft as it was.
+///     saved for that email, and leaves that draft as it was; the open card holds a draft of its own.
+///  9. The inbox takes its cards as its navigation says it shows (no email pushed over it), not as
+///     its pill's appearance says, and takes none while one of its own sheets is up.
+/// 10. A new email asked in the chat view or on the email screen opens from the account bound when
+///     its turn started; one whose bound account is gone ends plainly and holds no card.
+/// 11. A turn cut off on one screen and resumed from another keeps the screen that asked.
 ///
 /// Each case mounts the real screens in a window: a NavigationStack with the inbox (or the email
 /// screen) at its root and the chat pushed over it, both mounted as in the app (case 5 mounts the
@@ -47,8 +52,9 @@ import UIKit
 /// origin check they also ran on the code before the fix. There, case 2 failed every time: the screen under the chat was the only one
 /// left to take the request, and opened a Reply All card. Cases 1 and 3 failed whenever the screen
 /// under the chat took the request before the chat did, which SwiftUI's update order decided.
-/// Cases 4 to 8 read the request's `ComposeOrigin` and the router's queue, which that code did not
-/// have. A case that must show nothing opened for a request asks the screen in question for a card
+/// Cases 4 to 11 read the request's `ComposeOrigin` and the router's queue, which that code did not
+/// have. Over the inbox, the inbox's pushed-email binding follows the pushed chat, as the app's
+/// navigation does. A case that must show nothing opened for a request asks the screen in question for a card
 /// of its own and waits for that card: once it opens, that screen has looked at the queue with the
 /// request in it and passed it over.
 @Suite("Where the agent's compose card opens", .serialized, .processGlobalState)
@@ -158,10 +164,16 @@ struct ChatComposeRoutingTests {
         }
     }
 
-    /// Whether the chat is pushed over the root screen.
+    /// Whether the chat is pushed over the root screen, and what the inbox's navigation says.
     @MainActor @Observable
     final class Route {
         var chatShown = false
+        /// What the inbox's navigation (its pushed-email binding) says: an email pushed over it
+        /// or not. Nil: whatever `chatShown` shows, as in the app. A case sets it to make the
+        /// inbox's navigation and its pill's appearance disagree, as the collapsed split view's
+        /// appearance callbacks do (ADR-IOS-054).
+        var inboxNavigationSaysPushed: Bool?
+        var inboxSaysPushed: Bool { inboxNavigationSaysPushed ?? chatShown }
     }
 
     /// The root screen with the chat pushed over it while `route.chatShown`.
@@ -264,9 +276,14 @@ struct ChatComposeRoutingTests {
         let rootView: AnyView
         switch root {
         case .inbox:
+            // The inbox's pushed-email binding says the chat is pushed over it, as the app's
+            // navigation does when it pushes an email's chat (`pushedMessageId`).
+            let pushed = Binding<String?>(
+                get: { route.inboxSaysPushed ? chatId : nil },
+                set: { route.chatShown = $0 != nil })
             rootView = AnyView(Stack(route: route, chatId: chatId, root: InboxView(
                 title: "Inbox", folders: [folder], selection: .unified(.inbox),
-                selectedMessageId: .constant(nil), pushedMessageId: .constant(nil))))
+                selectedMessageId: .constant(nil), pushedMessageId: pushed)))
         case .email:
             rootView = AnyView(Stack(route: route, chatId: chatId, root: MessageDetailView(messageId: chatId)))
         }
@@ -304,8 +321,8 @@ struct ChatComposeRoutingTests {
         }
         let screens = Screens(controller: controller, route: route, email: email, threadKey: threadKey, earlier: earlierEmail)
         do {
-            // The root screen shows first, then the chat is pushed over it.
-            try await Task.sleep(for: .seconds(1))
+            // The root screen shows first, with its pill, then the chat is pushed over it.
+            try await Self.waitUntil { HostedAccessibility.identifiers(in: screens.view).contains("chatPill") }
             if chat {
                 route.chatShown = true
                 try await Self.waitForChat(in: screens)
@@ -475,12 +492,28 @@ struct ChatComposeRoutingTests {
         #expect(closed, "control: the card closed")
     }
 
-    /// Polls `condition` for up to ten seconds; the caller asserts on it afterwards.
-    private static func waitUntil(_ condition: @MainActor () async throws -> Bool) async throws {
+    /// Polls `condition` for up to ten seconds, and records an issue where it was awaited when it
+    /// never holds, so a wait that times out fails there instead of letting the case go on.
+    private static func waitUntil(
+        sourceLocation: SourceLocation = #_sourceLocation,
+        _ condition: @MainActor () async throws -> Bool
+    ) async throws {
         for _ in 0..<100 {
             if try await condition() { return }
             try await Task.sleep(for: .milliseconds(100))
         }
+        Issue.record("the awaited condition never held within ten seconds", sourceLocation: sourceLocation)
+    }
+
+    /// The outcome a request's tool received.
+    @MainActor
+    final class OutcomeBox {
+        var outcome: ComposeOutcome?
+    }
+
+    /// Every accessibility label of the compose card open over the screens.
+    private static func cardLabels(in screens: Screens) -> [String] {
+        screens.presented.flatMap { HostedAccessibility.labels(in: $0.view) }
     }
 
     // MARK: - 1. The chat over another screen opens its own card, addressed as asked
@@ -564,11 +597,10 @@ struct ChatComposeRoutingTests {
                 #expect(waiting == 1, "the chat's request waits for its chat")
                 try await Self.closeCard(in: screens)
 
-                // The chat shows again and opens the card it asked for, over the chat.
+                // The chat shows again and opens the card it asked for, over the chat, as it
+                // appears: the card is read, not the chat it covers.
                 screens.route.chatShown = true
-                try await Self.waitForChat(in: screens)
                 let card = try await Self.openedCard(in: screens)
-                #expect(Self.namesButton(in: screens.view) != nil, "the chat is the screen under the card")
                 #expect(Self.addresses(card["to"]) == ["david@example.com"], "only David, as the chat built it: \(card)")
                 #expect(Self.addresses(card["cc"]).isEmpty && Self.addresses(card["bcc"]).isEmpty, "nobody else: \(card)")
                 #expect(router.composeQueueDepth == 0, "the request left the queue as its card opened")
@@ -657,6 +689,8 @@ struct ChatComposeRoutingTests {
                     to: ["alex@example.com", "david@example.com"], cc: ["sam@example.com"], bcc: [],
                     subject: nil, body: "Friday works",
                     origin: ComposeOrigin(sessionKey: "inbox", screen: .inbox), isReplyAll: true))
+                // A window for a take that must not happen: it can only miss a late take (and
+                // pass), never fail a correct inbox.
                 try await Task.sleep(for: .seconds(2))
                 let underTheChat = Self.card(in: screens)
                 #expect(underTheChat.isEmpty, "nothing opens while the inbox is under the chat: \(underTheChat)")
@@ -757,6 +791,8 @@ struct ChatComposeRoutingTests {
                 let sheet = try #require(screens.presented.last?.view, "control: Reply to is open")
                 try await Task.sleep(for: .milliseconds(300))
                 router.composePresentationDidEnd()
+                // A window for a take that must not happen: it can only miss a late take (and
+                // pass), never fail a correct chat.
                 try await Task.sleep(for: .seconds(2))
                 let depth = router.composeQueueDepth
                 let holding = router.composeAwaitingAppear
@@ -796,8 +832,8 @@ struct ChatComposeRoutingTests {
                     mode: .reply, replyTo: earlier, to: ["alex@example.com"], cc: [], bcc: [],
                     subject: nil, body: "Friday works",
                     origin: ComposeOrigin(sessionKey: otherKey, screen: .chat, fromAccountId: Self.otherAccount)))
+                // The card opens as the chat appears: the card is read, not the chat it covers.
                 screens.route.chatShown = true
-                try await Self.waitForChat(in: screens)
                 let card = try await Self.openedCard(in: screens)
                 #expect(Self.addresses(card["to"]) == ["alex@example.com"], "the chat opens its other key's request: \(card)")
                 #expect(router.composeQueueDepth == 0)
@@ -850,8 +886,8 @@ struct ChatComposeRoutingTests {
                     try await Self.closeCard(in: screens)
 
                     // The chat shows again and opens the reply, to David alone.
+                    // The card opens as the chat appears: the card is read, not the chat it covers.
                     screens.route.chatShown = true
-                    try await Self.waitForChat(in: screens)
                     let card = try await Self.openedCard(in: screens)
                     #expect(Self.addresses(card["to"]) == ["david@example.com"], "only David: \(card)")
                     #expect(Self.addresses(card["cc"]).isEmpty && Self.addresses(card["bcc"]).isEmpty, "nobody else: \(card)")
@@ -887,6 +923,15 @@ struct ChatComposeRoutingTests {
                 let card = try await Self.openedCard(in: screens)
                 #expect(Self.addresses(card["to"]) == ["david@example.com"], "only David, never the saved draft's people: \(card)")
                 #expect(Self.addresses(card["cc"]).isEmpty && Self.addresses(card["bcc"]).isEmpty, "nobody else: \(card)")
+                // The open card's draft, which its Save writes (a compose keeps the draft it opened
+                // with): one of its own for this email, never the saved Reply All draft.
+                let open = DraftSessionRegistry.shared.snapshot()
+                let ownDrafts = open.filter {
+                    $0.hasPrefix(Draft.separateReplyPrefix)
+                        && Draft.replyKeyTail(draftKey: $0, isForward: false).map(String.init) == parent
+                }
+                #expect(ownDrafts.count == 1, "the card holds one draft of its own for this email: \(open)")
+                #expect(!open.contains(savedKey), "never the saved Reply All draft: \(open)")
                 try await Self.closeCard(in: screens)
 
                 let drafts = try await AppDatabase.rawPool.read { try Draft.fetchAll($0) }
@@ -896,7 +941,7 @@ struct ChatComposeRoutingTests {
                 #expect(kept.toArray == ["alex@example.com", "david@example.com"] && kept.ccArray == ["sam@example.com"],
                         "its people are its own")
                 let others = drafts.filter { $0.id != savedKey }.map(\.id)
-                #expect(others.allSatisfy { $0.hasPrefix(Draft.separateReplyPrefix) }, "the card saves only to a draft of its own: \(others)")
+                #expect(others.allSatisfy { $0.hasPrefix(Draft.separateReplyPrefix) }, "nothing else saved under the email's usual draft: \(others)")
             }
         }
     }
@@ -931,5 +976,216 @@ struct ChatComposeRoutingTests {
         #expect(everyone == nil, "a field reply to everyone keeps the reply's usual draft")
         let asked = card(nil).draftId
         #expect(asked == nil, "a reply asked in the chat's sheet keeps the reply's usual draft")
+    }
+
+    // MARK: - 9. The inbox says from its navigation whether it shows
+
+    @Test("The inbox takes its card when its navigation says it shows, though its pill's appearance says it left")
+    func inboxShowsAsItsNavigationSays() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted screens")
+        let backend = Backend(asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await withScreens(.inbox, backend, tag: "nav-shows") { screens in
+                let router = AgentToolRouter.shared
+                // The chat is pushed, so the inbox's pill has had its disappear; the inbox's
+                // navigation says nothing is pushed over it. That is the inbox after the collapsed
+                // split view's disappear right after it appears, while it stays visible.
+                screens.route.inboxNavigationSaysPushed = false
+                router.enqueueCompose(AgentToolRouter.ComposeRequest(
+                    mode: .compose, replyTo: nil, to: [Self.ownCardAddress], cc: [], bcc: [],
+                    subject: "Lunch", body: "Lunch on Friday?", origin: ComposeOrigin(sessionKey: "inbox", screen: .inbox)))
+                try await Self.waitUntil { router.composeQueueDepth == 0 }
+                let depth = router.composeQueueDepth
+                #expect(depth == 0, "the inbox takes its card: its navigation, not its pill's appearance, says it shows")
+            }
+        }
+    }
+
+    @Test("The inbox takes nothing while its navigation says an email is pushed over it, though its pill appeared, and opens the card when it shows again")
+    func inboxUnderAPushedEmailTakesNothing() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted screens")
+        let backend = Backend(asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await withScreens(.inbox, backend, tag: "nav-pushed", chat: false) { screens in
+                let router = AgentToolRouter.shared
+                // The inbox's pill appeared and had no disappear; its navigation says an email is
+                // pushed over it, as when the collapsed split view sends no disappear for that push.
+                screens.route.inboxNavigationSaysPushed = true
+                router.enqueueCompose(AgentToolRouter.ComposeRequest(
+                    mode: .compose, replyTo: nil, to: [Self.ownCardAddress], cc: [], bcc: [],
+                    subject: "Lunch", body: "Lunch on Friday?", origin: ComposeOrigin(sessionKey: "inbox", screen: .inbox)))
+                // A window for a take that must not happen: it can only miss a late take (and
+                // pass), never fail a correct inbox.
+                try await Task.sleep(for: .seconds(2))
+                let depth = router.composeQueueDepth
+                let holding = router.composeAwaitingAppear
+                let underTheEmail = Self.card(in: screens)
+                #expect(depth == 1, "the inbox under a pushed email takes nothing")
+                #expect(!holding, "and holds no take for a card that cannot show")
+                #expect(underTheEmail.isEmpty, "nothing opens: \(underTheEmail)")
+
+                // The email is popped: the inbox shows again and opens its card.
+                screens.route.inboxNavigationSaysPushed = false
+                let card = try await Self.openedCard(in: screens)
+                #expect(Self.addresses(card["to"]) == [Self.ownCardAddress], "the inbox's card: \(card)")
+                #expect(router.composeQueueDepth == 0)
+            }
+        }
+    }
+
+    @Test("The inbox takes no card while its own Search sheet is up, and opens it once the sheet closes")
+    func inboxSheetHoldsTheCard() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted inbox")
+        let backend = Backend(asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await withScreens(.inbox, backend, tag: "inbox-sheet", chat: false) { screens in
+                let router = AgentToolRouter.shared
+                let search = try #require(HostedAccessibility.elements(under: screens.view).first { $0.accessibilityLabel == "Search" },
+                                          "control: the inbox shows Search: \(HostedAccessibility.labels(in: screens.view).prefix(20))")
+                #expect(search.accessibilityActivate(), "control: Search opens its sheet")
+                try await Self.waitUntil { !screens.presented.isEmpty }
+                router.enqueueCompose(AgentToolRouter.ComposeRequest(
+                    mode: .compose, replyTo: nil, to: [Self.ownCardAddress], cc: [], bcc: [],
+                    subject: "Lunch", body: "Lunch on Friday?", origin: ComposeOrigin(sessionKey: "inbox", screen: .inbox)))
+                // A window for a take that must not happen: it can only miss a late take (and
+                // pass), never fail a correct inbox.
+                try await Task.sleep(for: .seconds(2))
+                let depth = router.composeQueueDepth
+                let holding = router.composeAwaitingAppear
+                let underTheSheet = Self.card(in: screens)
+                #expect(depth == 1, "the inbox takes nothing while its own sheet is up")
+                #expect(!holding, "and holds no take for a card that cannot show")
+                #expect(underTheSheet.isEmpty, "no card opens with the sheet up: \(underTheSheet)")
+
+                // The sheet closes: the inbox is uncovered and opens the card, once.
+                screens.controller.dismiss(animated: false)
+                let card = try await Self.openedCard(in: screens)
+                #expect(Self.addresses(card["to"]) == [Self.ownCardAddress], "the inbox's card: \(card)")
+                #expect(router.composeQueueDepth == 0)
+                #expect(router.composePresentationCount == 1, "one card for the one request")
+            }
+        }
+    }
+
+    // MARK: - 10. A new email opens from the account bound when its turn started
+
+    @Test("A new email bound to the user's other account opens from that account, in the chat view and on the email screen",
+          arguments: Root.allCases)
+    func boundAccountIsTheCardsFrom(root: Root) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted screens")
+        let backend = Backend(asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            // Over the inbox, the pushed chat takes the request; at the email screen's root, that
+            // screen does. The other account is the app's second, so it is never a default.
+            try await withScreens(root, backend, tag: "from-\(root.rawValue)", chat: root == .inbox, earlier: true) { screens in
+                let screen: ComposeOrigin.Screen = root == .inbox ? .chat : .email
+                let card = try await Self.openOwnCard(
+                    ComposeOrigin(sessionKey: screens.threadKey, screen: screen, fromAccountId: Self.otherAccount), in: screens)
+                #expect(Self.addresses(card["to"]) == [Self.ownCardAddress], "control: the new email's card: \(card)")
+                let labels = Self.cardLabels(in: screens)
+                let fromBound = labels.contains { $0.contains(Self.other) }
+                let fromFirst = labels.contains { $0.contains(Self.me) }
+                #expect(fromBound, "the card sends from the account bound when the turn started: \(labels)")
+                #expect(!fromFirst, "never from the app's first account: \(labels)")
+            }
+        }
+    }
+
+    @Test("Control: a new email asked in the inbox binds no account and opens from the app's first account")
+    func inboxNewEmailPicksItsAccount() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted screens")
+        let backend = Backend(asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await withScreens(.inbox, backend, tag: "from-inbox", chat: false, earlier: true) { screens in
+                let card = try await Self.openOwnCard(Self.rootOrigin(.inbox, screens), in: screens)
+                #expect(Self.addresses(card["to"]) == [Self.ownCardAddress], "control: the new email's card: \(card)")
+                let labels = Self.cardLabels(in: screens)
+                let fromFirst = labels.contains { $0.contains(Self.me) }
+                #expect(fromFirst, "the inbox's new email picks the app's first account: \(labels)")
+            }
+        }
+    }
+
+    @Test("A new email whose bound account is not among the app's accounts ends as its screen takes it, opens nothing, and the next card opens",
+          arguments: Root.allCases)
+    func missingBoundAccountOpensNothing(root: Root) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted screens")
+        let backend = Backend(asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await withScreens(root, backend, tag: "missing-\(root.rawValue)", chat: root == .inbox) { screens in
+                let router = AgentToolRouter.shared
+                let screen: ComposeOrigin.Screen = root == .inbox ? .chat : .email
+                let ended = OutcomeBox()
+                router.enqueueCompose(AgentToolRouter.ComposeRequest(
+                    mode: .compose, replyTo: nil, to: ["sam@example.com"], cc: [], bcc: [],
+                    subject: "From nowhere", body: "Hello",
+                    origin: ComposeOrigin(sessionKey: screens.threadKey, screen: screen, fromAccountId: "acc-compose-routing-missing"),
+                    onOutcome: { ended.outcome = $0 }))
+                try await Self.waitUntil { ended.outcome != nil }
+                var reason: String?
+                if case .failed(let text)? = ended.outcome { reason = text }
+                #expect(reason == AgentToolRouter.fromAccountMissingReason,
+                        "the tool hears the account to send from is gone: \(String(describing: ended.outcome))")
+                #expect(router.composeQueueDepth == 0)
+
+                // The screen's next card opens, and is the only one: the ended request held nothing.
+                let next = try await Self.openOwnCard(
+                    ComposeOrigin(sessionKey: screens.threadKey, screen: screen, fromAccountId: Self.account), in: screens)
+                #expect(Self.addresses(next["to"]) == [Self.ownCardAddress], "the next card opens: \(next)")
+                #expect(router.composePresentationCount == 1, "only that card opened")
+            }
+        }
+    }
+
+    // MARK: - 11. A resumed turn keeps the screen that asked
+
+    @Test("A turn cut off on the email screen and resumed from the chat view keeps the email screen's origin, and its card opens there")
+    func resumeKeepsTheOriginItStartedWith() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted pill")
+        let backend = Backend(failsFirst: .connectionLost)
+        try await HostedAccessibility.withAutomation {
+            try await Self.withOpenablePill {
+                try await withScreens(.email, backend, tag: "resume", chat: false) { screens in
+                    let router = AgentToolRouter.shared
+                    let number = await ChatIdTranslator.shared.toNumericId(screens.email.id)
+                    backend.reply(to: number)
+                    // The email screen's own pill asks; the request is cut off in transit.
+                    try await Self.openPill(in: screens)
+                    #expect(Self.type("Tell them Friday works", in: screens.view), "control: the pill takes words")
+                    try await Task.sleep(for: .milliseconds(300))
+                    #expect(HostedAccessibility.activate("chatSend", in: screens.view),
+                            "control: the pill's Send takes a tap: \(HostedAccessibility.identifiers(in: screens.view))")
+                    try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                    #expect(backend.bodies.count == 1, "control: the request went out once and was cut off")
+
+                    // The chat view of the same email shows the same chat, and resumes the turn.
+                    screens.route.chatShown = true
+                    try await Self.waitForChat(in: screens)
+                    try await Self.waitUntil { HostedAccessibility.identifiers(in: screens.view).contains("chatRetry") }
+                    #expect(HostedAccessibility.activate("chatRetry", in: screens.view),
+                            "control: the chat offers the cut-off turn: \(HostedAccessibility.identifiers(in: screens.view))")
+                    try await Self.waitUntil { router.composeQueueDepth == 1 }
+                    let request = try #require(router.firstQueuedRequestForTesting, "control: the resumed turn asked for a reply")
+                    let asked = Self.rootOrigin(.email, screens)
+                    #expect(request.origin == asked,
+                            "the resumed turn keeps the email screen that asked, and its account: \(request.origin)")
+
+                    // The chat opens a card of its own: it passed the email screen's reply over.
+                    let own = try await Self.openOwnCard(
+                        ComposeOrigin(sessionKey: screens.threadKey, screen: .chat, fromAccountId: Self.account), in: screens)
+                    #expect(Self.addresses(own["to"]) == [Self.ownCardAddress], "the chat opens only its own card: \(own)")
+                    let waiting = router.composeQueueDepth
+                    #expect(waiting == 1, "the reply waits for the email screen")
+                    try await Self.closeCard(in: screens)
+
+                    // The email screen shows again and opens the reply.
+                    screens.route.chatShown = false
+                    let card = try await Self.openedCard(in: screens)
+                    #expect(Self.addresses(card["to"]) == ["alex@example.com", "david@example.com"], "the email screen's Reply All: \(card)")
+                    #expect(Self.addresses(card["cc"]) == ["sam@example.com"], "\(card)")
+                    #expect(router.composeQueueDepth == 0)
+                }
+            }
+        }
     }
 }

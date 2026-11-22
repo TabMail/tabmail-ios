@@ -150,7 +150,7 @@ struct EmailForwardToolOriginTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "msgF20", subject: "Agenda")
         await translator.seed(header.id, as: 20)
 
-        let result = try await EmailForwardTool(context: ctx).execute(arguments: [
+        let result = try await ComposeTestOrigin.runWithoutOrigin(EmailForwardTool(context: ctx), arguments: [
             "unique_id": .int(20),
             "to": .array([.string("sam@example.com")]),
             "body": .string("For you")

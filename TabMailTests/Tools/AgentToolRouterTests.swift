@@ -13,6 +13,18 @@ enum ComposeTestOrigin {
     static let inbox = ComposeOrigin(sessionKey: "inbox", screen: .inbox)
     static let inboxHost = AgentToolRouter.ComposeHost(screen: .inbox, sessionKeys: ["inbox"])
     static let invocation = ToolInvocation(composeOrigin: inbox)
+
+    /// Runs `tool` with no compose origin, cancelled after five seconds: a tool that waited for a
+    /// card no screen can take is stopped, so a regression fails instead of hanging the run.
+    static func runWithoutOrigin(_ tool: any AgentTool, arguments: [String: JSONValue]) async throws -> String {
+        let run = Task { try await tool.execute(arguments: arguments, invocation: .noninteractive) }
+        let watchdog = Task {
+            try? await Task.sleep(for: .seconds(5))
+            run.cancel()
+        }
+        defer { watchdog.cancel() }
+        return try await run.value
+    }
 }
 
 // MARK: - ComposeRequest Tests
@@ -848,6 +860,138 @@ struct AgentToolRouterRemovedAccountTests {
         #expect(!between.contains("}"), "inside the committed-removal branch that sets the fence")
         let setup = try source("TabMail/Services/Account/AccountManagerSetup.swift")
         #expect(!setup.contains("endComposeRequests"), "account removal schedules no drain of its own")
+    }
+
+    /// A fence that a second removal sets while a drain is reading it: once armed, the first read
+    /// of the armed account finds it not removed and then sets it, as a removal that commits on
+    /// the AccountManager actor in the middle of the drain does.
+    private final class FenceSetMidDrain: Sendable {
+        private struct State {
+            var removed: Set<String> = []
+            var armed: String?
+        }
+        private let state = Mutex(State())
+        func remove(_ accountId: String) { state.withLock { _ = $0.removed.insert(accountId) } }
+        func arm(_ accountId: String) { state.withLock { $0.armed = accountId } }
+        func isRemoved(_ accountId: String) -> Bool {
+            state.withLock { state in
+                if state.removed.contains(accountId) { return true }
+                if state.armed == accountId {
+                    state.removed.insert(accountId)
+                    state.armed = nil
+                }
+                return false
+            }
+        }
+    }
+
+    /// How many outcomes each request's tool received, by request subject.
+    @MainActor
+    private final class OutcomeCounts {
+        var bySubject: [String: [ComposeOutcome]] = [:]
+    }
+
+    /// INVARIANT: a request leaves the queue only together with its outcome. Two removals: the
+    /// second commits while the drain of the first runs. Every removed request's tool hears of its
+    /// removal exactly once, in that drain or the next; none is dropped and left waiting.
+    @Test("A removal that commits while another removal's drain runs drops no request without its outcome")
+    func removalDuringTheDrainLosesNoOutcome() {
+        let second = "acc-second"
+        let fence = FenceSetMidDrain()
+        let router = AgentToolRouter(isAccountRemoved: { fence.isRemoved($0) })
+        let counts = OutcomeCounts()
+        func request(_ subject: String, origin: ComposeOrigin) -> AgentToolRouter.ComposeRequest {
+            AgentToolRouter.ComposeRequest(
+                mode: .compose, replyTo: nil, to: ["alex@example.com"], cc: [], bcc: [],
+                subject: subject, body: nil, origin: origin,
+                onOutcome: { counts.bySubject[subject, default: []].append($0) })
+        }
+        router.enqueueCompose(request("from gone", origin: ComposeOrigin(sessionKey: Self.goneThread, screen: .chat, fromAccountId: Self.gone)))
+        // Asked in the kept account's chat, sent from the second account: only its From depends on it.
+        router.enqueueCompose(request("from second", origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: second)))
+        router.enqueueCompose(request("from kept", origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: Self.kept)))
+        let queued = router.composeQueueDepth
+        #expect(queued == 3, "control: all three wait")
+
+        fence.remove(Self.gone)
+        fence.arm(second)
+        router.endComposeRequestsOfRemovedAccounts()
+        // The second removal's own drain, scheduled when its fence was set.
+        router.endComposeRequestsOfRemovedAccounts()
+
+        let goneOutcomes = counts.bySubject["from gone"] ?? []
+        let secondOutcomes = counts.bySubject["from second"] ?? []
+        let keptOutcomes = counts.bySubject["from kept"] ?? []
+        #expect(goneOutcomes.count == 1 && Self.isRemovedFailure(goneOutcomes.first), "the first removal's request ends once: \(goneOutcomes)")
+        #expect(secondOutcomes.count == 1 && Self.isRemovedFailure(secondOutcomes.first),
+                "the second removal's request ends once, never dropped without an answer: \(secondOutcomes)")
+        #expect(keptOutcomes.isEmpty, "the kept account's request keeps waiting")
+        let left = router.composeQueueDepth
+        #expect(left == 1, "only the kept account's request is left")
+        let leftSubject = router.firstQueuedRequestForTesting?.subject
+        #expect(leftSubject == "from kept")
+    }
+
+    private static func account(_ id: String, _ address: String) -> Account {
+        var account = Account(emailAddress: address, displayName: "Account", provider: .imap)
+        account.id = id
+        return account
+    }
+
+    /// INVARIANT: a new email's card opens only from the account bound when its turn started.
+    /// When that account is not among the app's accounts as its screen takes the card, the
+    /// request ends with a plain failure the model reads, nothing opens, and the take's hold is
+    /// released so the next card can open.
+    @Test("A new email whose bound account is not among the app's accounts ends as its screen takes it, and frees the queue")
+    func missingBoundAccountEndsTheTakenRequest() throws {
+        let router = Self.router(Fence())
+        let outcomes = Outcomes()
+        let host = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [Self.keptThread])
+        router.enqueueCompose(Self.request("from a missing account", mode: .compose, replyTo: nil,
+                                           origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: "acc-missing"),
+                                           outcomes: outcomes))
+        router.enqueueCompose(Self.request("from kept", mode: .compose, replyTo: nil,
+                                           origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: Self.kept),
+                                           outcomes: outcomes))
+        let accounts = [Self.account(Self.kept, "kept@example.com")]
+        let offerBefore = router.composeOffer
+
+        let first = router.takeCompose(for: host)
+        let taken = try #require(first, "control: the screen takes the first card")
+        let opens = router.canOpen(taken, accounts: accounts)
+        #expect(!opens, "a card bound to an account that is not there never opens")
+        let ended = outcomes.bySubject["from a missing account"]
+        var reason: String?
+        if case .failed(let text)? = ended { reason = text }
+        #expect(reason == AgentToolRouter.fromAccountMissingReason, "its tool hears why: \(String(describing: ended))")
+        let holding = router.composeAwaitingAppear
+        #expect(!holding, "the take's hold is released")
+        let offerAfter = router.composeOffer
+        #expect(offerAfter > offerBefore, "and the screens are asked to look again")
+
+        let next = router.takeCompose(for: host)
+        #expect(next?.subject == "from kept", "the next card can open")
+        if let next {
+            let nextOpens = router.canOpen(next, accounts: accounts)
+            #expect(nextOpens, "control: a card bound to an account that is there opens")
+        }
+        let keptOutcome = outcomes.bySubject["from kept"]
+        #expect(keptOutcome == nil)
+    }
+
+    @Test("A reply, a forward and an inbox new email bind no account, so the app's accounts never stop them")
+    func unboundRequestsAlwaysOpen() {
+        let router = Self.router(Fence())
+        let outcomes = Outcomes()
+        let fromMissing = ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: "acc-missing")
+        let reply = Self.request("reply", mode: .reply, replyTo: Self.header(account: Self.kept), origin: fromMissing, outcomes: outcomes)
+        let forward = Self.request("forward", mode: .forward, replyTo: Self.header(account: Self.kept), origin: fromMissing, outcomes: outcomes)
+        let inboxNew = Self.request("inbox new email", mode: .compose, replyTo: nil, origin: ComposeTestOrigin.inbox, outcomes: outcomes)
+        for request in [reply, forward, inboxNew] {
+            let opens = router.canOpen(request, accounts: [])
+            #expect(opens, "\(request.subject ?? ""): its card picks its account itself")
+        }
+        #expect(outcomes.bySubject.isEmpty)
     }
 }
 
