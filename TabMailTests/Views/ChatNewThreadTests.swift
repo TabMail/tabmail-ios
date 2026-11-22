@@ -877,8 +877,9 @@ struct ChatNewDraftSaveTests {
             accountId: Self.accountId, draftsFolderPath: "Drafts", draftId: model.draftId, instanceEpoch: epoch)
         let headerRow = try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: headerId) }
         let placeholder = try #require(headerRow, "the Drafts list has the draft")
+        let draftId = model.draftId
         let ops = try await fixture.pool.read { db in
-            try PendingOperation.filter(Column("draftId") == model.draftId).fetchAll(db)
+            try PendingOperation.filter(Column("draftId") == draftId).fetchAll(db)
         }
         #expect(placeholder.folderPath == "Drafts")
         #expect(placeholder.snippet.contains("Lunch on Friday?"))

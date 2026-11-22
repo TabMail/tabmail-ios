@@ -48,7 +48,7 @@ struct ChatNewThreadScreenTests {
 
     /// The screen's scene phase and whether it is pushed, both moved by the test.
     @MainActor @Observable
-    private final class Stage {
+    fileprivate final class Stage {
         var phase: ScenePhase = .active
         var pushed: ChatNewThreadModel?
         var shown = true
@@ -671,7 +671,7 @@ struct ChatNewThreadScreenTests {
 
     /// Whether a cover or push the test opens is up; also, as a flag, whether a held open started.
     @MainActor @Observable
-    private final class Shown {
+    fileprivate final class Shown {
         var open = false
     }
 
