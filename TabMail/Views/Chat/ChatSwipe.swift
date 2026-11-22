@@ -775,9 +775,11 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         /// Whether the finger came back down from a handed-off text's end: `down`, the farthest it
         /// came down from its highest point since the hand-off (the sample before it too, when the
         /// text first read its end on a move down), is more than
-        /// `ChatViewLayout.fieldTextReversalSlack`. The text's own scroll follows the finger point
-        /// for point, so a finger that came down took the text back with it, whenever the text
-        /// shows it, and a finger that did not come down moved no text. The farthest, not where the
+        /// `ChatViewLayout.fieldTextReversalSlack`. The rule takes the text's own scroll to follow
+        /// the finger point for point while the finger drags it: a finger that came down is taken
+        /// to have brought the text back with it, whenever the text shows it, and a text that reads
+        /// short with the finger not come down is taken to have moved on its own (a caret scroll),
+        /// which keeps the hand-off. The farthest, not where the
         /// finger is now: a text read a sample late shows where the finger was, which may be lower
         /// than now.
         static func fingerCameBack(down: CGFloat) -> Bool {

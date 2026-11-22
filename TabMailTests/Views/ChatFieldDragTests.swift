@@ -524,6 +524,30 @@ struct ChatFieldDragTests {
         #expect(shut, "the panel stays shut")
         let fromTheOldHandOff = ChatFieldDrag.opens(letGo: Self.sample(0, -65))
         #expect(fromTheOldHandOff, "control: 65 from the old hand-off would have opened it")
+
+        // Up past the end and 15 down, then back up to half a point under its highest point: the
+        // text shows the 15 down only now, while the finger moves and at a let-go. The finger came
+        // down 15 since the hand-off, however close to its highest point it is now.
+        for atLetGo in [false, true] {
+            text.contentOffset = CGPoint(x: 0, y: end / 2)
+            coordinator.touchDown(on: inner)
+            text.contentOffset = CGPoint(x: 0, y: end)
+            let crossedAgain = coordinator.share(Self.sample(0, -130))
+            #expect(crossedAgain == Self.sample(0, -30), "control: past the end the field has the rest")
+            let top = coordinator.share(Self.sample(0, -180))
+            #expect(top == Self.sample(0, -80), "control: 80 past the end")
+            let down = coordinator.share(Self.sample(0, -165, speed: 300))
+            #expect(down == Self.sample(0, -65, speed: 300), "control: the text has not shown the 15 down yet")
+            text.contentOffset = CGPoint(x: 0, y: end - 15)
+            let nearTop = Self.sample(0, -179.5, speed: -300)
+            let shared = atLetGo
+                ? coordinator.share(ChatFieldDrag.letGo(nearTop, rested: 0), atLetGo: true)
+                : coordinator.share(nearTop)
+            #expect(shared == Self.sample(0, 0),
+                    "the text shows the 15 down with the finger half a point under its highest: nothing, no speed, is the field's (at the let-go: \(atLetGo))")
+        }
+        let nearTopFromTheOldHandOff = ChatFieldDrag.opens(letGo: Self.sample(0, -79.5, speed: -300))
+        #expect(nearTopFromTheOldHandOff, "control: from the old hand-off it would have opened")
     }
 
     // The pan can read the text before the text takes the finger's move: the text shows its end in
@@ -544,18 +568,18 @@ struct ChatFieldDragTests {
         text.contentOffset = CGPoint(x: 0, y: end)
         let turned = coordinator.share(Self.sample(0, -100, speed: 300))
         #expect(turned == Self.sample(0, 0, speed: 300), "control: an end shown on a move down hands off at that sample's end")
-        // 5 up again; the text shows the 10 down now.
+        // 9.5 up again, half a point under where it turned; the text shows the 10 down now.
         text.contentOffset = CGPoint(x: 0, y: end - 10)
-        let upAgain = coordinator.share(Self.sample(0, -105, speed: -300))
+        let upAgain = coordinator.share(Self.sample(0, -109.5, speed: -300))
         #expect(upAgain == Self.sample(0, 0), "the text took the 10 down back: nothing, no speed, is the field's")
-        // A quick flick up as the finger lifts, the text 5 short of its end.
-        text.contentOffset = CGPoint(x: 0, y: end - 5)
-        let flick = coordinator.share(ChatFieldDrag.letGo(Self.sample(0, -105, speed: -300), rested: 0), atLetGo: true)
+        // A quick flick up as the finger lifts, the text half a point short of its end.
+        text.contentOffset = CGPoint(x: 0, y: end - 0.5)
+        let flick = coordinator.share(ChatFieldDrag.letGo(Self.sample(0, -109.5, speed: -300), rested: 0), atLetGo: true)
         #expect(flick == Self.sample(0, 0), "the let-go gives the field nothing")
         let shut = !ChatFieldDrag.opens(letGo: flick)
         #expect(shut, "the panel stays shut")
-        let fromThatHandOff = ChatFieldDrag.opens(letGo: Self.sample(0, -5, speed: -300))
-        #expect(fromThatHandOff, "control: 5 up from that hand-off with the flick would have opened it")
+        let fromThatHandOff = ChatFieldDrag.opens(letGo: Self.sample(0, -9.5, speed: -300))
+        #expect(fromThatHandOff, "control: 9.5 up from that hand-off with the flick would have opened it")
     }
 
     @Test("A hand-off reads only its own reversal: after a second crossing, and in a new drag from the text's end, a scroll the finger did not make keeps the field's share")
@@ -597,6 +621,27 @@ struct ChatFieldDragTests {
         text.contentOffset = .zero
         let caretAgain = coordinator.share(Self.sample(0, -50))
         #expect(caretAgain == Self.sample(0, -50), "the last drag's 30 down is not this one's: the field keeps its share")
+    }
+
+    @Test("Through the pan, a finger come down a point with the text a point short keeps the field's share and speed; two points down ends it")
+    @MainActor
+    func reversalSlackThroughThePan() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        // (how far down, kept): a point, stated here rather than read from the layout's value, is
+        // still the finger going up; two are a reversal.
+        for (down, kept) in [(CGFloat(1), true), (CGFloat(2), false)] {
+            text.contentOffset = CGPoint(x: 0, y: end / 2)
+            coordinator.touchDown(on: inner)
+            text.contentOffset = CGPoint(x: 0, y: end)
+            let past = coordinator.share(Self.sample(0, -130))
+            #expect(past == Self.sample(0, -30), "control: past the end the field has the rest")
+            text.contentOffset = CGPoint(x: 0, y: end - down)
+            let back = coordinator.share(Self.sample(0, -130 + down, speed: 200))
+            let expected = kept ? Self.sample(0, -30 + down, speed: 200) : Self.sample(0, 0)
+            #expect(back == expected, "\(down) down with the text \(down) short: kept \(kept)")
+        }
     }
 
     @Test("The finger came back down once it is more than a point below its highest point since the hand-off; a point or less, or not at all, is still the finger going up")

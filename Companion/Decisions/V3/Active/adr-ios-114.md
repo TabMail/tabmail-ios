@@ -1313,9 +1313,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    text scrolls again drops the hand-off and takes a new one when the text is back at its end. Only
    the finger takes the drag back (amended 2026-11-22): the hand-off drops when the text reads short of
    its end once the finger has come down from its highest point since the hand-off by more than
-   `ChatViewLayout.fieldTextReversalSlack` (`ChatFieldPan.Coordinator.fingerCameBack`; 1 pt, at most a
-   pixel of text the field keeps). The text's own scroll follows the finger point for point, so a
-   finger that came down took the text back whenever the text shows it. It is read from the finger's
+   `ChatViewLayout.fieldTextReversalSlack` (`ChatFieldPan.Coordinator.fingerCameBack`; 1 pt of text
+   the field keeps, one to three pixels by screen scale). The rule takes the text's own scroll to
+   follow the finger point for point while the finger drags it, so a finger that came down is taken to
+   have brought the text back whenever the text shows it. It is read from the finger's
    distance, not from a sample's direction nor from how far short the text reads, and from the
    farthest, not from where the finger is now, because the text's scroll and the pan run side by side
    and UIKit does not say which hears a move first: the text can show a downward move one sample late,
@@ -1404,7 +1405,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    finger's reversal read when the text shows it a sample late, at a second crossing or at a rested
    let-go; `handOffFoundOnAMoveDownCountsThatMove` a reversal in the very sample the text first shows
    its end; `reversalHistoryEndsWithItsHandOff` each hand-off reading only its own reversal, after a
-   second crossing and in the next drag; `reversalSlack` the rule's own boundary; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
+   second crossing and in the next drag; `reversalSlack` the rule's own boundary and `reversalSlackThroughThePan` the same boundary through the
+   pan's share, speed included; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
    floating-point remainder; `handOffInsideACrossingSample` and
    `handOffInsideACrossingSampleAfterAReversal` the hand-off inside a sample that crosses the end, where
    the text reached it; `upwardShareCountsFromTheSecondHandOff` the upward share after a reversal,

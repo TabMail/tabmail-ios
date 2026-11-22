@@ -168,9 +168,9 @@ enum ChatViewLayout {
     static let fieldTextEndTolerance: CGFloat = 0.1
     /// How far the finger may come back down from its highest point after the text handed the
     /// drag on and still be going up (`ChatFieldPan.Coordinator.fingerCameBack`), in points: a
-    /// move down this small takes back at most a point of text, a pixel at 1x and less at any
-    /// other scale, so the field keeping it shows next to nothing. Past it the finger has taken
-    /// the drag back, and a text read short of its end then ends the hand-off.
+    /// move down this small takes back at most a point of text (one pixel at 1x, two at 2x,
+    /// three at 3x), so the field keeping its share then shows next to nothing. Past it the
+    /// finger has taken the drag back, and a text read short of its end then ends the hand-off.
     static let fieldTextReversalSlack: CGFloat = 1
     /// How far the collapsed field's measured height must move to be a new height
     /// (`ChatThreadView.pillHeightMoved`), in points: a drag's swell is added inside the field's
