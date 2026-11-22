@@ -1,6 +1,46 @@
 
 ## ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
 
+> **Current note (2026-11-21, #1062): what was pruned is recorded, not inferred.** The lowest held UID
+> is no evidence of what was pruned: an infinite-scroll page caches rows below the pruned UIDs, and a
+> window UID whose header could not be read sits below the first local one. The IMAP prune now records
+> the highest UID it deleted, with the folder's UIDVALIDITY (`CatchUpPruneCutoff`, `pruneCutoff` in
+> the folder's `catchUpState` JSON, no migration), in its own write transaction, only for a UID prune
+> order and only from rows that transaction deleted and that carried the folder's epoch; under a limit
+> the catch-up loads nothing at or below it (ADR-IOS-107, *Storage limit, prune cutoff*). Released
+> versions recorded no cutoff, so under a limit every UID-windowed folder with a known epoch, local rows
+> and no cutoff of that epoch gets ONE from the catch-up, whether a released version pruned it or not
+> (nothing tells the two apart): the lower of its first local UID and its window floor of the current
+> epoch (none: the first local UID alone), minus one. *Superseded in place:* in the note below,
+> "its lowest held UID is a clean floor, and the IMAP catch-up loads only above the higher of it and
+> the walk's start" and "the catch-up downloads them once (they sit above the lowest held UID)": a
+> released store's date-holes above the seeded cutoff are downloaded once, as before; holes below it
+> are not. Under a limit everything at or below the cutoff counts as pruned, including a UID that was
+> never local; scroll and search reach it. A deleted row with no epoch stamp does not raise the cutoff,
+> so the catch-up may download it once more, stamped; the next prune counts it.
+>
+> **Current note (2026-11-20, #1062).** The prune deletes each folder oldest-first in that folder's
+> SYNC ORDER, the fetch's ordering dimension (ADR-IOS-042): an IMAP folder loses its LOWEST UIDs
+> first (`CAST(messageId AS INTEGER)`, the form `SyncEngine.selectStaleHeaders` uses); a Gmail or
+> Exchange folder its oldest DATES first, as before. Bodies and headers are pruned in the same order.
+> The order comes from each account's `EmailProvider.staleWindowMode`, resolved by the caller
+> (`SyncEngine.pruneOrderByAccount`) and passed to `SyncEngine.runPruneIfOverBudget`; an account with
+> no registered provider (it failed to register) is still pruned, oldest date first as before #1062. So an IMAP folder under a limit holds one
+> contiguous top range of UIDs, its lowest held UID is a clean floor, and the IMAP catch-up loads
+> only above the higher of it and the walk's start (ADR-IOS-107, #1062), so rows infinite scroll
+> cached below the walk's cursor never pull the floor down; the catch-up insert's date skip is gone.
+> **Trade-off (Archive):** an IMAP Archive keeps its most recently ARCHIVED mail (highest UIDs), not
+> its newest-DATED mail: an old message archived today is kept, a recent one archived long ago may be
+> pruned. **No migration and no cleanup:** a store already pruned by date keeps its date-holes; the
+> catch-up downloads them once (they sit above the lowest held UID), and later prunes, now by UID,
+> settle the store into one contiguous top range. *Superseded:* decision 2's "oldest messages are
+> pruned" meant oldest by date for every provider; on IMAP that left pruned holes throughout the UID
+> range that every catch-up listing downloaded again.
+> **Gmail and Exchange under a limit (accepted):** their catch-up stops at the folder's oldest local
+> row by `providerDate`, while the prune orders by `date`, so a loaded message older by `date` than the
+> folder's oldest kept row can be inserted and pruned again at the next pass. Rare (those providers
+> list again only after a lapse) and harmless: it costs one download, never a kept message.
+>
 > **Current note (2026-11-12).** While a storage limit is in force, a Gmail catch-up listing goes no
 > lower than a folder's oldest local row, so the catch-up's direct load brings no pruned old mail
 > back; the re-arm (and its decline) is gone (ADR-IOS-107 decision 8, "the direct load"). The

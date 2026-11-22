@@ -571,6 +571,7 @@ final class SyncScheduler {
             // off-main and abandons on suspend at each step.
             if !Task.isCancelled {
                 let undoIds = Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
+                let pruneOrder = await manager.syncEngine.pruneOrderByAccount()
                 await Task.detached(priority: .utility) {
                     // `.background`, matching the foreground caller
                     // (`SyncEngine.scheduleMaintenanceInBackground`). The pass ends in
@@ -580,7 +581,7 @@ final class SyncScheduler {
                     // write already queued in `DatabaseWriteQueue`.
                     await SyncEngine.runWALMaintenance(
                         dbPool: AppDatabase.backgroundPool, includePrune: true,
-                        undoProtectedBodyIds: undoIds
+                        undoProtectedBodyIds: undoIds, pruneOrder: pruneOrder
                     )
                 }.value
             }

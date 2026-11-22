@@ -26,6 +26,35 @@ extension SyncEngine {
         return try await pass()
     }
 
+    /// Runs `body` holding the sync turn (`oneSyncAtATime`) of every account in
+    /// `accountIds`, taken one after another in sorted id order, so two callers
+    /// that need overlapping accounts never wait on each other in a cycle. A
+    /// Settings reset writes through this (#1062): no catch-up slice, change pass
+    /// or full sync of those accounts runs between its read and its write, so
+    /// nothing a pass read before the reset is written after it. Take the turns
+    /// before opening the database writer, never while holding it. Every turn is
+    /// released on every exit, a throw included.
+    func withSyncTurns<T: Sendable>(
+        accountIds: [String], _ body: @Sendable () async throws -> T
+    ) async throws -> T {
+        try await takeSyncTurns(Set(accountIds).sorted()[...], body)
+    }
+
+    private func takeSyncTurns<T: Sendable>(
+        _ accountIds: ArraySlice<String>, _ body: @Sendable () async throws -> T
+    ) async throws -> T {
+        guard let first = accountIds.first else { return try await body() }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[SyncTurn] \(first): waiting for the turn")
+        }
+        return try await oneSyncAtATime(accountId: first) {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[SyncTurn] \(first): turn taken")
+            }
+            return try await takeSyncTurns(accountIds.dropFirst(), body)
+        }
+    }
+
     /// The account's row as it is now, read as a pass's first step inside its
     /// turn (and again before a pass retries its change read, which the failed
     /// attempt may have moved); `nil` once the account has been removed. A pass never acts on sync
@@ -38,6 +67,14 @@ extension SyncEngine {
     func accountAtTurnStart(_ accountId: String) async throws -> Account? {
         try await dbPool.read { db in try Account.fetchOne(db, key: accountId) }
     }
+
+    #if DEBUG
+    /// Test-only seam: how many passes wait for the account's turn now, so a
+    /// test knows a caller is queued before acting. Compiled out of Release.
+    func syncPassWaiterCountForTesting(accountId: String) -> Int {
+        syncPassWaiters[accountId]?.count ?? 0
+    }
+    #endif
 
     /// Ends a pass: the oldest waiter takes the turn, or the account is free.
     private func handOverSyncPass(accountId: String) {

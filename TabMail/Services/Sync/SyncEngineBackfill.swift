@@ -106,16 +106,36 @@ actor UIDWalkCursor {
     /// of one UID cannot be split, so it is set aside for this walk instead.
     /// Never serves a failed range again at its own size.
     func failRangeSmaller(from: Int, to: Int) {
-        guard to > from else {
+        guard let halves = Self.halves(from: from, to: to) else {
             failRangeForThisWalk(from: from, to: to)
             return
         }
         inFlight.removeAll { $0.from == from && $0.to == to }
-        let mid = from + (to - from) / 2
-        // Upper half first: the walk runs downward.
-        retryQueue.append((from: mid + 1, to: to))
-        retryQueue.append((from: from, to: mid))
+        // Upper half first: the walk runs downward, so the half next to its
+        // confirmed cursor goes first.
+        retryQueue.append(halves.upper)
+        retryQueue.append(halves.lower)
         consecutiveSuccesses = 0
+    }
+
+    /// The two halves a failed range is retried as, together exactly the range;
+    /// nil for a range of one UID, which cannot be split (#1006). The walk's
+    /// retries cut here. A catch-up listing range that times out lowers the
+    /// listing's width cap instead (`IMAPCatchUpState.Listing.widthCap`, #1062).
+    /// *Superseded (#1062):* "The one splitting rule for UID ranges: the walk's
+    /// retries and the catch-up's listing ranges both cut here."
+    nonisolated static func halves(from: Int, to: Int) -> (lower: (from: Int, to: Int), upper: (from: Int, to: Int))? {
+        guard to > from else { return nil }
+        let mid = from + (to - from) / 2
+        return (lower: (from: from, to: mid), upper: (from: mid + 1, to: to))
+    }
+
+    /// Whether a failed UID-range request is answered by asking a smaller range:
+    /// it timed out, or its answer was too large or could not be decoded. Any
+    /// other failure (connection, SELECT) is not the range's size.
+    nonisolated static func failureCallsForSmallerRange(_ error: Error) -> Bool {
+        let desc = "\(error)"
+        return desc.contains("PayloadTooLargeError") || desc.contains("IMAPDecoderError") || desc.contains("timed out")
     }
 
     /// Whether any range was set aside for this walk.

@@ -962,27 +962,46 @@ extension SyncEngine {
     /// false when a chunk's transaction failed, so some of `headers` have no
     /// row. Neither caller moves its bookkeeping past them then: the walk keeps
     /// its page token, the catch-up writes no state. Only the catch-up sets
-    /// `catchUpReadStartedAt` (when its read began): the insert then skips a
+    /// `catchUpRead` (its read's start and over-age latch): the insert then skips a
     /// message the user's own newer action stands on, which is not a failure
     /// (`insertBackfillBatch`).
     func insertFetchedBackfillMessages(
         _ headers: [MessageHeaderInfo],
         bodies bodyData: [String: (htmlBody: String?, textBody: String?)],
         folder: Folder,
-        catchUpReadStartedAt: Date? = nil
+        catchUpRead: CatchUpReadLatch? = nil,
+        epochPremise: (premise: SyncEngine.CrawlEpochPremise, observedEpoch: UInt32)? = nil
     ) async -> (inserted: Int, allLanded: Bool) {
         // Step 1: Insert headers to GRDB (batch dedup).
-        // The premise-LESS overload, deliberately: this is the
-        // Gmail/Exchange page walk, and neither provider has a
-        // UIDVALIDITY concept at all, so there is no premise to
-        // hold and nothing a guard could compare. That overload
-        // has no refusal channel to discard (round 13 blocker 3),
-        // so this call site cannot silently swallow one.
-        let (inserted, ftsRecords, chunkFailed) = await insertBackfillBatch(
-            headers, folderId: folder.id, accountId: folder.accountId,
-            folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
-            observedEpoch: nil, catchUpReadStartedAt: catchUpReadStartedAt
-        )
+        // Without `epochPremise`, the premise-LESS overload, deliberately: the
+        // Gmail/Exchange page walk and their catch-up loads, and neither
+        // provider has a UIDVALIDITY concept at all, so there is no premise to
+        // hold and nothing a guard could compare. With one (a catch-up load
+        // whose ids carry an epoch, #1062), the premised overload: a turnover
+        // between the read and the insert refuses, and a refusal is reported
+        // as not landed (C3).
+        let inserted: Int
+        let ftsRecords: [FTSHeaderRecord]
+        let chunkFailed: Bool
+        if let epochPremise {
+            switch await insertBackfillBatch(
+                headers, folderId: folder.id, accountId: folder.accountId,
+                folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+                epochPremise: epochPremise.premise, observedEpoch: epochPremise.observedEpoch,
+                catchUpRead: catchUpRead
+            ) {
+            case .landed(let count, let records, let allLanded):
+                (inserted, ftsRecords, chunkFailed) = (count, records, !allLanded)
+            case .refused:
+                return (0, false)
+            }
+        } else {
+            (inserted, ftsRecords, chunkFailed) = await insertBackfillBatch(
+                headers, folderId: folder.id, accountId: folder.accountId,
+                folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+                observedEpoch: nil, catchUpRead: catchUpRead
+            )
+        }
         if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }
 
         // Step 2: Write bodies to FTS for inserted messages.
@@ -1879,9 +1898,8 @@ extension SyncEngine {
                                         }
                                     } catch {
                                         let desc = "\(error)"
-                                        let isPayloadError = desc.contains("PayloadTooLargeError") || desc.contains("IMAPDecoderError")
                                         let isTimeout = desc.contains("timed out")
-                                        if isPayloadError || isTimeout {
+                                        if UIDWalkCursor.failureCallsForSmallerRange(error) {
                                             // Never ask this range again at the same
                                             // size in this walk: its halves go back
                                             // for retry. A one-UID range is set aside

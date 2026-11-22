@@ -1108,8 +1108,8 @@ extension SyncEngine {
     /// back", and this branch has NO floor: every local row the fetch never went
     /// near was classified stale and deleted with its FTS entry. That is the
     /// ADR-IOS-042 / MIS-IOS-002 mass-deletion shape reached through a different
-    /// door, and it is not recoverable — `selfHealRecentMessages` covers 90 days
-    /// and the deep crawl only re-walks folders with `backfillComplete == false`.
+    /// door, and it is not recoverable — the catch-up's load of missing UIDs
+    /// (#1062; before it, a 90-day self-heal) reloads only what it lists, and the deep crawl only re-walks folders with `backfillComplete == false`.
     /// The fix is honest evidence, NOT a narrower blast radius: adding a floor here
     /// would degenerate this branch into the windowed one and destroy its purpose
     /// (deleting rows BELOW the window that the server dropped long ago).
@@ -1233,7 +1233,8 @@ extension SyncEngine {
     /// unbounded `SELECT messageId WHERE folderId = ?` was ~7s of write execution INSIDE
     /// the writer). When the caller already loaded the full local-id set for stale
     /// detection (`cachedLocalIds`, the small-folder branch), reuse it; otherwise do a
-    /// bounded, chunked membership check (same idiom as `SyncEngineSelfHeal`).
+    /// bounded, chunked membership check (the idiom the deleted `SyncEngineSelfHeal`
+    /// used, #1062).
     ///
     /// `messageId` IS the UID for IMAP — this is pure exact membership, with NO date/UID
     /// window, so it does NOT touch stale-window semantics (ADR-IOS-042-safe). Empty
@@ -1473,6 +1474,43 @@ extension SyncEngine {
             }
             try Self.bootstrapFolderUidValidity(
                 db, folderId: folderId, observed: observedEpochAtFetch.map { Int($0) })
+            // The gap trigger (#1062): a listing by UID whose lowest UID lies above
+            // the newest UID the folder held before it, plus one, leaves messages
+            // between the two that no window reaches. The folder's older-mail
+            // check is armed at once (a lapse), so the next worker run loads
+            // them, with no wait for its periodic check, and whether or not the
+            // older-mail walk has started (the load floor is then the lowest
+            // UID a window listing reached, `CatchUpWindowFloor`). Read before this pass
+            // inserts anything.
+            if provider.staleWindowMode == .uid {
+                if let lowestListed = messages.compactMap({ Int($0.messageId) }).min(),
+                   let newestHeld = try Int.fetchOne(db, sql: """
+                       SELECT MAX(CAST(messageId AS INTEGER)) FROM messageHeader WHERE folderId = ?
+                       """, arguments: [folderId]),
+                   lowestListed > newestHeld + 1 {
+                    try Self.markCatchUpLapse(folderId: folderId, db: db)
+                }
+                // Where window listings reach down to: the catch-up's load floor
+                // before the walk starts (`CatchUpWindowFloor`). After the lapse
+                // mark, which leaves a NULL state NULL. The lowest UID the server
+                // NAMED in the window, the ones whose header could not be read
+                // (`coverage.unmaterialisedIds`, from the same FETCH) included: a
+                // floor from the read headers alone sits above an unreadable
+                // lowest UID, and a catch-up before the walk would never load it
+                // once it reads. Only under a known epoch for this response: a
+                // floor from UIDs of unknown numbering could outlive an epoch
+                // change (ADR-IOS-061), so none is written. Stored with that epoch
+                // and read only under it, so a path that clears the folder's epoch
+                // but keeps its state never carries it into another numbering.
+                // *Superseded (#1062):* the floor was the lowest UID of the read
+                // headers, written whatever the response's epoch, with no epoch.
+                let namedUids = messages.compactMap { Int($0.messageId) }
+                    + coverage.unmaterialisedIds.compactMap { Int($0) }
+                if let sourceBoundEpoch, let lowestNamed = namedUids.min() {
+                    try Self.recordCatchUpWindowFloor(
+                        folderId: folderId, lowest: lowestNamed, epoch: sourceBoundEpoch, db: db)
+                }
+            }
             // Load pending operation message IDs to avoid undoing optimistic UI.
             // IMPORTANT: Filter by (accountId, folderPath) to prevent cross-folder UID collisions.
             // IMAP UIDs are per-folder — UID "500" in INBOX and UID "500" in Archive are different

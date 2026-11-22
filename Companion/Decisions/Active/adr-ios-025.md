@@ -1,5 +1,6 @@
 <!-- COMPANION-CURRENT-NOTE-BEGIN -->
 > **Current routing note (2026-11-09, tabmail-ios #495):** The date-window deep backfill, and the 1-day overlap between its windows, are deleted; it had no caller. Backfill walks by UID (IMAP) or by page token (Gmail, Exchange).
+> **Current note (2026-11-20, tabmail-ios #1062):** The date-based self-heal (`SyncEngineSelfHeal.swift`) is deleted too. Missing IMAP mail is found and loaded by UID by the catch-up (ADR-IOS-107, amendment of 2026-11-20). Any mention of the self-heal below is history.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-025: Backfill Crawl Progress Must Not Use Date-Based Anchors From Unrelated Queries

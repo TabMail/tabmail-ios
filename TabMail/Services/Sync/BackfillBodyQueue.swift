@@ -195,6 +195,19 @@ actor BackfillBodyQueue {
         storage = QueueStorage<Item>()
     }
 
+    #if DEBUG
+    /// Test-only seam (pattern: `ActiveAIQueue.setDispatchSuppressedForTesting`).
+    /// While set, `dispatchBatch` returns before it collects candidates, so the
+    /// queue sends nothing to the server. A batch download sends a header FETCH
+    /// byte-identical to the older-mail check's header load, so a test that
+    /// asserts exactly which requests that check sends cannot tell the two
+    /// apart while this queue runs. Items still queue as usual.
+    private var dispatchSuppressedForTesting = false
+    func setDispatchSuppressedForTesting(_ suppressed: Bool) {
+        dispatchSuppressedForTesting = suppressed
+    }
+    #endif
+
     /// Test-only seam: pre-set the per-folder batch cap so the disposition tests can
     /// pin that the defer decision keys on THIS batch's `items.count` and NOT on the
     /// shared cap.
@@ -561,6 +574,9 @@ actor BackfillBodyQueue {
     /// No deferred FTS buffer — the IMAP batch IS the write batch.
     /// Concurrency is per-batch (not per-item) — always collects full batches.
     private func dispatchBatch() async {
+        #if DEBUG
+        guard !dispatchSuppressedForTesting else { return }
+        #endif
         guard NetworkMonitor.checkConnected() else {
             if !storage.isEmpty { scheduleDispatchOnReconnect() }
             return

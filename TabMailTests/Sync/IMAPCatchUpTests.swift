@@ -106,9 +106,14 @@ struct IMAPCatchUpTests {
         await world.engine.runCatchUp(provider: world.provider, folderIds: [world.folderId], context: context)
     }
 
+    /// About how many messages one listing range holds here: 1, so every range
+    /// has the minimum width (`SyncConfig.catchUpListingMinRangeSpan` UIDs), the
+    /// layout these fixtures place their messages across (#1062).
+    static let rangeMessages = 1
+
     /// A budget that never runs out.
     private static func unlimited() -> CatchUpContext {
-        CatchUpContext(deadline: .distantFuture, clock: { Date() })
+        CatchUpContext(deadline: .distantFuture, clock: { Date() }, listingRangeMessages: rangeMessages)
     }
 
     /// A budget of exactly ONE listing request per pass: the clock advances one
@@ -118,7 +123,8 @@ struct IMAPCatchUpTests {
         let fetchesBefore = fetchCount(server)
         return CatchUpContext(
             deadline: start.addingTimeInterval(1),
-            clock: { start.addingTimeInterval(Double(fetchCount(server) - fetchesBefore)) })
+            clock: { start.addingTimeInterval(Double(fetchCount(server) - fetchesBefore)) },
+            listingRangeMessages: rangeMessages)
     }
 
     /// Runs `body` with NetworkMonitor's cached expensive flag set to `expensive`
@@ -296,8 +302,9 @@ struct IMAPCatchUpTests {
     // MARK: - The catch-up is not the backfill
 
     /// A folder with a partial backfill: the device holds UIDs 4...6 of a mailbox
-    /// that runs from 1 to 10. The catch-up may look only at what the device holds.
-    @Test("With a partial backfill, nothing outside the local range is listed and nothing is inserted")
+    /// that runs from 1 to 10. The catch-up loads nothing below the load floor and
+    /// still reconciles the flags and removals of the rows the device holds.
+    @Test("With a partial backfill, nothing below the load floor is inserted and cached rows are still reconciled")
     func staysInsideTheLocalRange() async throws {
         try await Self.withWorld("cu-frontier", serverUIDs: [1, 2, 3, 4, 6, 7, 8, 9, 10], localUIDs: [4, 5, 6]) { world async throws in
             world.server.setFlags(["\\Seen"], in: Self.path, uid: 6)
@@ -308,11 +315,12 @@ struct IMAPCatchUpTests {
                 .filter { $0.uppercased().hasPrefix("UID FETCH") || $0.uppercased().hasPrefix("UID SEARCH") }
             #expect(sent.contains { $0.uppercased().hasPrefix("UID FETCH") }, "precondition: the folder was listed")
             #expect(sent.contains { $0.uppercased().hasPrefix("UID SEARCH") }, "precondition: the removal proof ran")
-            for command in sent {
-                let named = command.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
-                #expect(named.allSatisfy { (4...6).contains($0) }, "\(command) names a UID the device does not hold")
-            }
             let rows = try Self.rows(world)
+            // Nothing below the load floor (the lowest UID the device holds) is inserted.
+            let belowFloor = rows.keys.compactMap { Int($0) }.filter { $0 < 4 }
+            #expect(belowFloor.isEmpty, "a message below the load floor was inserted: \(belowFloor.sorted())")
+            // Cached reconciliation still runs: UID 5's removal is proven and UID 6's flag is updated.
+            #expect(rows["5"] == nil, "the cached row the server expunged is removed")
             #expect(Set(rows.keys) == ["4", "6"], "UID 5 is gone from the server; no other row appears: \(rows.keys.sorted())")
             #expect(rows["6"]?.isRead == true)
         }
@@ -605,6 +613,33 @@ struct IMAPCatchUpTests {
         }
     }
 
+    /// A listing in progress already knows the folder's top, so its call reads
+    /// no UIDNEXT first: the range's own listing FETCH is the first request to
+    /// see the new numbering, and its epoch check alone keeps that numbering's
+    /// flags off the old rows.
+    @Test("A turnover first seen by a resumed listing's range FETCH applies no flags")
+    func turnoverSeenByAResumedListingAppliesNoFlags() async throws {
+        let raised = Mutex<[UInt32]>([])
+        AccountManager.shared.setUidValidityChangeHandlerForTesting { _, _, _, observed in
+            raised.withLock { $0.append(observed) }
+        }
+        defer { AccountManager.shared.resetUidValidityChangeHandlerForTesting() }
+        let uids = [1, 2, 3]
+        try await Self.withWorld("cu-turnover-resumed", serverUIDs: uids, localUIDs: uids) { world async throws in
+            var listing = IMAPCatchUpState.Listing(firstStamp: nil, nextUid: 1)
+            listing.top = uids.last
+            let resumed = IMAPCatchUpState(epoch: Self.epoch, completionStamp: nil, lastCompletedAt: nil, listing: listing)
+            try Self.setState(resumed, world)
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 1)
+            world.server.setUidValidity(Int(Self.epoch + 1), for: Self.path)
+            await Self.pass(world)
+
+            #expect(try Self.rows(world)["1"]?.isRead == false, "a flag from another numbering is another message's (C3)")
+            #expect(try Self.state(world) == resumed, "the listing in progress is left as it was")
+            #expect(raised.withLock { $0 } == [Self.epoch + 1], "the turnover reaction is raised")
+        }
+    }
+
     @Test("A turnover between a range's listing and its removal proof removes nothing")
     func turnoverBeforeTheRemovalProofRemovesNothing() async throws {
         let raised = Mutex<[UInt32]>([])
@@ -800,10 +835,11 @@ struct IMAPCatchUpTests {
             let interval: TimeInterval = 30
             // One second per UID FETCH: a slice lists one range. The deadline is far
             // away, so only the removal can end the run before the second range.
-            let run = SyncEngine.CatchUpRun(
+            var run = SyncEngine.CatchUpRun(
                 storageLimitInForce: false,
                 deadline: base.addingTimeInterval(1_000), sliceSeconds: 1, intervalSeconds: interval,
                 clock: { base.addingTimeInterval(Double(Self.fetchCount(server) - fetchesBefore)) })
+            run.listingRangeMessages = Self.rangeMessages
             let engine = world.engine
             let catchUp = Task { await engine.runCatchUpRun(account: account, run: run) }
 
@@ -1041,6 +1077,37 @@ struct CatchUpApplyTests {
             context: CatchUpContext(deadline: .distantFuture, clock: { Date() }))
         #expect(try Self.catchUpState(w.pool, w.folderId) == nil)
         #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-default", path: "Archive", pool: w.pool) == 3)
+    }
+
+    @Test("Under a storage limit, a provider that orders by date never gets the one-time UID prune cutoff seed: its catch-up runs as it does with no limit; the same folder under a UID-order provider is seeded")
+    func dateOrderProviderIsNeverSeeded() async throws {
+        let w = try Self.world("cua-date-seed", storedEpoch: Self.epoch)
+        defer { AppDatabase.shared.withLock { $0 = w.previous }; TestDatabaseTeardown.retire(pool: w.pool, directory: w.dir) }
+        let folderId = w.folderId
+        let seed = try await w.pool.read { db in try SyncEngine.catchUpPruneCutoffSeed(folderId: folderId, db: db) }
+        #expect(seed?.uid == 0 && seed?.epoch == Int(Self.epoch),
+                "setup: the folder is seed-eligible (known epoch, no cutoff, local rows): \(String(describing: seed))")
+        func context(limit: Bool) -> CatchUpContext {
+            var context = CatchUpContext(deadline: .distantFuture, clock: { Date() })
+            context.storageLimitInForce = limit
+            return context
+        }
+
+        let dateOrder = MockEmailProvider(staleWindowMode: .date)
+        await SyncEngine().runCatchUp(provider: dateOrder, folderIds: [folderId], context: context(limit: false))
+        let withoutLimit = try Self.catchUpState(w.pool, folderId)
+        await SyncEngine().runCatchUp(provider: dateOrder, folderIds: [folderId], context: context(limit: true))
+        let underLimit = try Self.catchUpState(w.pool, folderId)
+        #expect(!(underLimit ?? "").contains(CatchUpPruneCutoff.key),
+                "#1062: a date-order provider's folder gets no UID prune cutoff seed: \(String(describing: underLimit))")
+        #expect(underLimit == withoutLimit, "#1062: its catch-up under the limit leaves what it leaves with no limit")
+        #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-date-seed", path: "Archive", pool: w.pool) == 3,
+                "#1062: and its rows are untouched")
+
+        await SyncEngine().runCatchUp(
+            provider: MockEmailProvider(staleWindowMode: .uid), folderIds: [folderId], context: context(limit: true))
+        #expect(CatchUpPruneCutoff.read(try Self.catchUpState(w.pool, folderId), epoch: Int(Self.epoch)) == 0,
+                "setup: the same folder under a UID-order provider is seeded, so the check above can see a seed")
     }
 
     @Test("The local-row reader reads by range, by ids and in order")

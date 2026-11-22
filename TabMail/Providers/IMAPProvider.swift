@@ -270,9 +270,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// files, none of them a type you can cite. Neither self-heal nor deep
     /// backfill is epoch-guarded, so both now write this mirror. Do not restate
     /// any "sole caller" claim here without re-running that search.
+    /// (Current note, #1062: the self-heal and `SyncEngineSelfHeal.swift` are
+    /// deleted; missing mail is loaded by UID by the catch-up, which does not
+    /// call this overload. The text above and below is history.)
     ///
     /// ⚠ **UPDATE (round 13, blocker 2): self-heal IS epoch-guarded now**
-    /// (`SyncEngine.selfHealFolder`) — and it is guarded WITHOUT reading this
+    /// (then `SyncEngine.selfHealFolder`, deleted in #1062: the catch-up's load of
+    /// missing UIDs, `IMAPProvider.catchUp`, took its place, with the same rule) — and it is guarded WITHOUT reading this
     /// mirror, by the epoch `fetchMessageHeadersWithObservedEpoch` returns from
     /// the SELECTs that served its headers. It still WRITES the mirror, because
     /// its fetch still routes through this helper. (The unguarded date-window
@@ -7451,19 +7455,26 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// it cannot say which message it describes — so this THROWS rather than
     /// returning a listing with a hole in it, which the caller would read as a
     /// removal (the `liveSourceUIDs` rule). A UID absent from the result is only a
-    /// CANDIDATE removal: the caller still confirms it with
-    /// `searchExistingUIDs(folder:uids:)`, because a short FETCH is a real server
+    /// CANDIDATE removal: the caller still proves it with the range's membership
+    /// search, `searchMembership(folder:uids:range:)`, because a short FETCH is a real server
     /// shape (`[IMAP-FETCH-GAP]`, MIS-IOS-002).
+    /// In the catch-up, `searchExistingUIDs(folder:uids:)` only asks again for
+    /// the UIDs a header load left unanswered.
+    ///
+    /// Each UID also carries whether the server flags it `\Deleted` (such a
+    /// message is not shown, ADR-IOS-111 item 3), and the answer carries the
+    /// UIDNEXT of the same SELECT (nil when not reported): the catch-up's upper
+    /// bound for a folder with no change bookmark (#1062).
     func listFlagsInUIDRange(
         folder: String, from: Int, to: Int
-    ) async throws -> (flags: [UInt32: (isRead: Bool, isFlagged: Bool)], uidValidity: UInt32) {
-        guard from >= 1, to >= from else { return ([:], 0) }
+    ) async throws -> (flags: [UInt32: (isRead: Bool, isFlagged: Bool, isDeleted: Bool)], uidValidity: UInt32, uidNext: UInt32?) {
+        guard from >= 1, to >= from else { return ([:], 0, nil) }
         try Task.checkCancellation()
         return try await withFolderConnection(folder: folder) { server in
             let selection = try await selectMailboxTracked(server, folder: folder)
             let infos = try await server.fetchMessageInfos(
                 uidRange: UID(UInt32(from))...UID(UInt32(to)), options: .uidFlagsOnly)
-            var flags: [UInt32: (isRead: Bool, isFlagged: Bool)] = [:]
+            var flags: [UInt32: (isRead: Bool, isFlagged: Bool, isDeleted: Bool)] = [:]
             for info in infos {
                 guard let uid = info.uid else {
                     if DebugModeManager.isLoggingEnabled() {
@@ -7471,10 +7482,58 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     }
                     throw IMAPCatchUpRangeInconclusive.unparsedUid(folder: folder)
                 }
-                flags[uid.value] = (info.flags.contains(.seen), info.flags.contains(.flagged))
+                flags[uid.value] = (info.flags.contains(.seen), info.flags.contains(.flagged), info.flags.contains(.deleted))
             }
-            return (flags, selection.uidValidity.value)
+            let uidNext = selection.uidNext.value
+            return (flags, selection.uidValidity.value, uidNext != 0 ? uidNext : nil)
         }
+    }
+
+    /// The membership proof of one listing range (#1062): `UID SEARCH UID <set>`
+    /// for `uids` (local rows the FETCH did not list) and the whole of `range`
+    /// (where missing UIDs load), asked as ranges, never expanded, so the answer
+    /// scales with the messages the range holds. An answer naming a UID outside
+    /// the request proves nothing (`listed(within:)` throws). The epoch is the
+    /// one of THIS SELECT.
+    func searchMembership(folder: String, uids: [UInt32], range: ClosedRange<Int>?) async throws -> UIDExistenceResult {
+        try Task.checkCancellation()
+        return try await withFolderConnection(folder: folder) { server in
+            let selection = try await selectMailboxTracked(server, folder: folder)
+            var searchSet = MessageIdentifierSet<UID>()
+            for uid in uids { searchSet.insert(UID(uid)) }
+            if let range { searchSet.insert(range: range) }
+            let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(
+                identifierSet: searchSet, criteria: [.all])
+            let listed = try extResult.listed(within: searchSet)
+            return UIDExistenceResult(
+                found: Set(listed.toArray().map(\.value)), uidValidity: selection.uidValidity.value)
+        }
+    }
+
+    /// One catch-up header batch on one SELECT: the records the client could
+    /// read, the UIDs whose record it could not (per record, so one bad record
+    /// never fails the batch), and the epoch of that SELECT (nil: not reported).
+    func fetchCatchUpHeaders(
+        folder: String, uids: [UInt32], expectedEpoch: UInt32
+    ) async throws -> (decoded: [MessageHeaderInfo], undecoded: [UInt32], observedEpoch: UInt32?) {
+        try Task.checkCancellation()
+        var uidSet = UIDSet()
+        for uid in uids { uidSet.insert(UID(uid)) }
+        let fetched: (infos: [SwiftMail.MessageInfo], observed: UInt32) =
+            try await withFolderConnection(folder: folder) { server in
+                let selection = try await selectMailboxTracked(server, folder: folder)
+                // Under another numbering these UIDs name other messages: the
+                // FETCH is never sent, only the observed epoch returns (#1062).
+                guard selection.uidValidity.value == expectedEpoch else { return ([], selection.uidValidity.value) }
+                return (try await server.fetchMessageInfosBulk(using: uidSet), selection.uidValidity.value)
+            }
+        var decoded: [MessageHeaderInfo] = []
+        var undecoded: [UInt32] = []
+        for info in fetched.infos {
+            guard let uid = info.uid?.value else { continue }
+            if let header = mapMessageInfo(info) { decoded.append(header) } else { undecoded.append(uid) }
+        }
+        return (decoded, undecoded, fetched.observed != 0 ? fetched.observed : nil)
     }
 
     /// The listing request above could not say which messages a range holds.

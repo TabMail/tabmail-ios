@@ -25,8 +25,9 @@ import GRDB
 // holds a change bookmark on any folder takes the rule the drain applies to a
 // move retired without proof (ADR-IOS-111, the exit rule):
 // - a move: its source and destination folders drop their bookmark with one
-//   self-heal owed (`dropChangeBookmark(selfHealDue: true)`), so the full sync
-//   lists them and the self-heal reaches below the window. Its ids go on no
+//   older-mail check owed (`dropChangeBookmark(selfHealDue: true)`), so the full
+//   sync lists them and the catch-up loads what is missing below the window, by
+//   UID (#1062). Its ids go on no
 //   list: a source UID names nothing, or another message, in the destination,
 //   and the optimistic row sits there under the source's address, which a
 //   re-read can never prove it owns. Every folder of the account when the

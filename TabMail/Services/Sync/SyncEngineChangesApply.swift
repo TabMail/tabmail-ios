@@ -265,10 +265,14 @@ extension SyncEngine {
     /// kept. A folder with no bookmark is otherwise left as it is.
     /// `onlyIfHeld: false` (a refused read) ends the folder's tracking even when
     /// it holds no bookmark (a refused baseline). `selfHealDue: true` (a move
-    /// retired without proof) also owes the folder one self-heal pass before it
-    /// is tracked again (`FolderChangeState.selfHealOwed`), with or without a
-    /// bookmark: a folder awaiting its first baseline is tracked after its next
-    /// listing, which does not reach below the window either.
+    /// retired without proof) also owes the folder one clean older-mail check
+    /// before it is tracked again (`FolderChangeState.selfHealOwed`), with or
+    /// without a bookmark: the catch-up is always armed, and the lapse count after
+    /// the mark is recorded (`selfHealLapse`) so only a listing that starts after
+    /// it clears the mark (#1062). A folder awaiting its first baseline is tracked
+    /// after its next listing, which does not reach below the window either.
+    /// *Superseded (#1062):* "with `selfHealDue` and no bookmark it writes only
+    /// `selfHealOwed`" (the self-heal pass, deleted, ran without the lapse).
     /// Reads the folder's raw columns only (no model is decoded), so the release
     /// boundary can call it inside `AppDatabase.init` (#876).
     nonisolated static func dropChangeBookmark(folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, db: Database) throws {
@@ -278,7 +282,15 @@ extension SyncEngine {
         let accountId = String.fromDatabaseValue(row["accountId"] as DatabaseValue)
         let changeCursor = String.fromDatabaseValue(row["changeCursor"] as DatabaseValue)
         var state = FolderChangeState(raw: String.fromDatabaseValue(row["changeState"] as DatabaseValue))
-        if selfHealDue { state.selfHealOwed += 1 }
+        if selfHealDue {
+            state.selfHealOwed += 1
+            try markCatchUpLapse(folderId: folderId, db: db)
+            state.selfHealLapse = try Int.fetchOne(db, sql: """
+                SELECT CASE WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object'
+                    THEN COALESCE(json_extract(catchUpState, '$.' || ?), 0) ELSE 0 END
+                FROM folder WHERE id = ?
+                """, arguments: [CatchUpLapse.countKey, folderId]) ?? 0
+        }
         guard !onlyIfHeld || changeCursor != nil else {
             if selfHealDue {
                 try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
@@ -288,7 +300,7 @@ extension SyncEngine {
         state.tracking = false
         try db.execute(sql: "UPDATE folder SET changeCursor = NULL, changeState = ? WHERE id = ?",
                        arguments: [state.encoded, folderId])
-        try markCatchUpLapse(folderId: folderId, db: db)
+        if !selfHealDue { try markCatchUpLapse(folderId: folderId, db: db) }
         try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
     }
 
@@ -304,6 +316,53 @@ extension SyncEngine {
                 ELSE NULL END
             WHERE id = ? AND catchUpState IS NOT NULL
             """, arguments: [CatchUpLapse.countKey, CatchUpLapse.countKey, folderId])
+    }
+
+    /// Record that a window listing of the folder named UID `lowest` in epoch
+    /// `epoch` (`CatchUpWindowFloor`, #1062): the floor becomes the lower of the
+    /// one it holds for that epoch and `lowest`; one held for another epoch is
+    /// replaced. A NULL state, or one that is not a JSON object, becomes an object
+    /// holding only the floor (which a provider reads as "never listed"). Called
+    /// only for a provider that windows by UID, in the window merge's own
+    /// transaction, with the listing's proven epoch, and by the catch-up apply to
+    /// carry the floor across its state write.
+    /// *Superseded (#1062):* the floor stored as a bare number, with no epoch.
+    nonisolated static func recordCatchUpWindowFloor(folderId: String, lowest: Int, epoch: Int, db: Database) throws {
+        try recordCatchUpEpochValue(
+            key: CatchUpWindowFloor.key, folderId: folderId, uid: lowest, epoch: epoch, keep: "MIN", db: db)
+    }
+
+    /// Record that the storage prune removed the folder's rows up to UID
+    /// `highest` in epoch `epoch` (`CatchUpPruneCutoff`, #1062): the cutoff
+    /// becomes the higher of the one it holds for that epoch and `highest`; one
+    /// held for another epoch is replaced. A NULL state, or one that is not a
+    /// JSON object, becomes an object holding only the cutoff (which a provider
+    /// reads as "never listed"). Called in the transaction that deletes the rows,
+    /// by the catch-up slice's one-time seed, and by the catch-up apply to carry
+    /// the cutoff across its state write.
+    nonisolated static func recordCatchUpPruneCutoff(folderId: String, highest: Int, epoch: Int, db: Database) throws {
+        try recordCatchUpEpochValue(
+            key: CatchUpPruneCutoff.key, folderId: folderId, uid: highest, epoch: epoch, keep: "MAX", db: db)
+    }
+
+    /// Writes `{uid, epoch}` under `key` of the folder's catch-up state
+    /// (`CatchUpEpochValue`): within the same epoch the `keep` (MIN or MAX) of the
+    /// stored and new UID, otherwise the new value. `keep` is one of two fixed
+    /// SQL function names, never caller data.
+    private nonisolated static func recordCatchUpEpochValue(
+        key: String, folderId: String, uid: Int, epoch: Int, keep: StaticString, db: Database
+    ) throws {
+        try db.execute(sql: """
+            UPDATE folder SET catchUpState = CASE
+                WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object' THEN json_set(
+                    catchUpState, '$.' || :key, json_object(
+                        'uid', CASE WHEN json_extract(catchUpState, '$.' || :key || '.epoch') = :epoch
+                            THEN \(keep)(COALESCE(json_extract(catchUpState, '$.' || :key || '.uid'), :uid), :uid)
+                            ELSE :uid END,
+                        'epoch', :epoch))
+                ELSE json_object(:key, json_object('uid', :uid, 'epoch', :epoch)) END
+            WHERE id = :id
+            """, arguments: ["key": key, "uid": uid, "epoch": epoch, "id": folderId])
     }
 
     /// One record in one folder. Returns false when a shield kept the change back.

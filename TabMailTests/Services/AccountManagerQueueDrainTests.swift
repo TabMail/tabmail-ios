@@ -1547,7 +1547,7 @@ struct AccountManagerQueueDrainTests {
     /// at all.
     ///
     /// The deletion here is performed by the REAL producer —
-    /// `SettingsView.localIndexWipeTxn`, the "delete all local email data"
+    /// `SyncEngine.localIndexWipeTxn`, the "delete all local email data"
     /// gesture, whose statement list contains
     /// `DELETE FROM pendingOperation WHERE type != 'saveDraft'` — driven INSIDE
     /// the claimed window, while the lane's first operation is parked on the
@@ -1600,7 +1600,7 @@ struct AccountManagerQueueDrainTests {
 
             // THE USER'S NEWER GESTURE, committed while the lane holds its
             // snapshot of both ops.
-            try await pool.write { db in try SettingsView.localIndexWipeTxn(db) }
+            try await pool.write { db in try SyncEngine.localIndexWipeTxn(db) }
             let leftBehind = try await pool.read { db in try PendingOperation.fetchCount(db) }
             #expect(leftBehind == 0,
                     "the wipe left \(leftBehind) operation(s) behind, so the skip arm is not reached")

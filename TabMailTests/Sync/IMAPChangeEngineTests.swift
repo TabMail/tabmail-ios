@@ -341,22 +341,4 @@ struct IMAPChangeEngineTests {
         }
     }
 
-    @Test("Self-heal skips a tracked folder (no command names it); the same folder untracked is healed")
-    func selfHealSkipsTrackedFolder() async throws {
-        for tracked in [true, false] {
-            try await Self.withWorld("eng-heal-\(tracked)", capabilities: Self.qresync,
-                                     serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3], tracked: tracked) { w in
-                UserDefaults.standard.removeObject(forKey: "selfHeal_lastRun_\(w.account.id)")
-                defer { UserDefaults.standard.removeObject(forKey: "selfHeal_lastRun_\(w.account.id)") }
-                let start = w.server.recordedCommands().count
-                await w.engine.selfHealRecentMessages(account: w.account)
-                let touched = w.commandsNamingFolder(since: start)
-                if tracked {
-                    #expect(touched.isEmpty, "the tracked folder was healed: \(touched)")
-                } else {
-                    #expect(!touched.isEmpty, "control: the untracked folder is healed")
-                }
-            }
-        }
-    }
 }

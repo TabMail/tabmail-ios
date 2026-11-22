@@ -10,8 +10,39 @@ extension SyncEngine {
 
     // MARK: - Background Maintenance (nonisolated)
 
-    /// Nonisolated prune — runs entirely off the main thread.
-    nonisolated static func runPruneIfOverBudget(dbPool: PrioritizedDatabase) {
+    /// Each account's sync-ordering dimension (`EmailProvider.staleWindowMode`),
+    /// which the prune deletes oldest-first in: `.uid` (IMAP) lowest UID first,
+    /// `.date` (Gmail, Exchange) oldest date first. Resolved here, at the provider
+    /// boundary, and passed to the prune (ADR-IOS-006, ADR-IOS-042).
+    func pruneOrderByAccount() -> [String: StaleWindowMode] {
+        providers.mapValues { $0.staleWindowMode }
+    }
+
+    /// The prune's oldest-first order for one folder, in its account's sync
+    /// order: an IMAP folder keeps its highest UIDs, and the prune records the
+    /// highest UID it deleted (`CatchUpPruneCutoff`), below which the catch-up
+    /// loads nothing under a limit (ADR-IOS-006 current note, #1062).
+    /// *Superseded (#1062):* "its lowest held UID is a clean floor below which
+    /// nothing is kept, and the catch-up loads nothing below it": a scroll page
+    /// caches rows below it, so it is no record of the prune. The same `CAST(messageId AS
+    /// INTEGER)` form `SyncEngine.selectStaleHeaders`' UID window uses. A
+    /// non-numeric `messageId` in an IMAP folder would read as 0 and so sort
+    /// first, pruned before every UID; no IMAP path writes one.
+    nonisolated static func pruneOrderSQL(_ mode: StaleWindowMode) -> String {
+        switch mode {
+        case .uid: return "CAST(messageId AS INTEGER) ASC"
+        case .date: return "date ASC"
+        }
+    }
+
+    /// Nonisolated prune — runs entirely off the main thread. `pruneOrder` is each
+    /// account's sync order (`pruneOrderByAccount`); bodies and headers are both
+    /// pruned in it. An account with no resolved order (no registered provider)
+    /// is pruned oldest date first, as before #1062.
+    /// *Superseded (#1062):* every folder was pruned oldest DATE first, which on
+    /// IMAP left pruned holes throughout the UID range (UID and date are
+    /// decorrelated, ADR-IOS-042) that every catch-up listing downloaded again.
+    nonisolated static func runPruneIfOverBudget(dbPool: PrioritizedDatabase, pruneOrder: [String: StaleWindowMode]) {
         guard StorageEstimator.isOverBudget() else { return }
 
         let budgetMB = StorageEstimator.budgetMB
@@ -34,6 +65,10 @@ extension SyncEngine {
 
         var bodiesRemoved = 0
         for account in accounts {
+            // An account with no registered provider (it failed to register,
+            // e.g. missing credentials) is still pruned, oldest date first as
+            // before #1062: no catch-up of it runs to reload what is pruned.
+            let orderSQL = pruneOrderSQL(pruneOrder[account.id] ?? .date)
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
                 guard StorageEstimator.isOverBudget() else { break }
@@ -50,7 +85,7 @@ extension SyncEngine {
                             MessageHeader
                                 .select(Column("id"))
                                 .filter(Column("folderId") == folder.id)
-                                .order(Column("date").asc)
+                                .order(sql: orderSQL)
                                 .limit(pruneChunkSize, offset: offset)
                         )
                     }) ?? []
@@ -69,6 +104,10 @@ extension SyncEngine {
 
         var headersRemoved = 0
         for account in accounts {
+            // An account with no registered provider (it failed to register,
+            // e.g. missing credentials) is still pruned, oldest date first as
+            // before #1062: no catch-up of it runs to reload what is pruned.
+            let orderSQL = pruneOrderSQL(pruneOrder[account.id] ?? .date)
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
                 guard StorageEstimator.isOverBudget() else { break }
@@ -80,7 +119,7 @@ extension SyncEngine {
                     let batch: [MessageHeader] = (try? dbPool.read { db in
                         try MessageHeader
                             .filter(Column("folderId") == folder.id)
-                            .order(Column("date").asc)
+                            .order(sql: orderSQL)
                             .limit(pruneChunkSize)
                             .fetchAll(db)
                     }) ?? []
@@ -89,11 +128,44 @@ extension SyncEngine {
                     var chunkIds: [String] = []
                     do {
                         try dbPool.write { db in
+                            // A folder pruned lowest UID first records where the
+                            // prune reached, with the folder's epoch, in this same
+                            // transaction (`CatchUpPruneCutoff`, #1062): under a
+                            // storage limit the catch-up loads nothing at or below
+                            // it, even after another path caches a lower row. Only
+                            // rows THIS transaction deleted count, re-read here
+                            // (the batch was selected before it): still in this
+                            // folder under the same UID, and stamped with the
+                            // folder's epoch both when selected and now, so a row
+                            // a reset or a turnover removed meanwhile, a row an
+                            // optimistic move brought in under its source UID
+                            // (stamp cleared), or a row of another numbering never
+                            // moves it. An unknown epoch records nothing, so no
+                            // cutoff outlives an epoch change (ADR-IOS-061).
+                            var cutoffEpoch: Int?
+                            if pruneOrder[account.id] == .uid {
+                                cutoffEpoch = Self.knownUidValidity(try Int.fetchOne(
+                                    db, sql: "SELECT lastKnownUidValidity FROM folder WHERE id = ?",
+                                    arguments: [folder.id]))
+                            }
+                            var highestPrunedUid: Int?
                             for msg in batch {
                                 guard StorageEstimator.isOverBudget() else { break }
                                 chunkIds.append(msg.id)
-                                try msg.delete(db)
+                                var current: MessageHeader?
+                                if cutoffEpoch != nil { current = try MessageHeader.fetchOne(db, key: msg.id) }
+                                let deleted = try msg.delete(db)
                                 headersRemoved += 1
+                                if deleted, let cutoffEpoch, let current,
+                                   current.folderId == folder.id, current.messageId == msg.messageId,
+                                   current.observedUidValidity == cutoffEpoch, msg.observedUidValidity == cutoffEpoch,
+                                   let uid = Int(current.messageId) {
+                                    highestPrunedUid = max(highestPrunedUid ?? uid, uid)
+                                }
+                            }
+                            if let cutoffEpoch, let highestPrunedUid {
+                                try Self.recordCatchUpPruneCutoff(
+                                    folderId: folder.id, highest: highestPrunedUid, epoch: cutoffEpoch, db: db)
                             }
                         }
                     } catch {

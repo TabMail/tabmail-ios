@@ -1128,7 +1128,7 @@ struct GmailDeltaApplyInvariantTests {
             try await w.pool.write { db in
                 _ = try Account.filter(Column("id") == w.accountId).updateAll(db,
                     Column("lastFullSyncAt").set(to: Date()), Column("lastSyncedAt").set(to: nil as Date?))
-                try AccountDetailView.resetMessageDataTxn(db, accountId: w.accountId)
+                try SyncEngine.resetMessageDataTxn(db, accountId: w.accountId)
             }
             try await SearchIndex.shared.removeMessagesForAccount(accountId: w.accountId)
             #expect(try w.rows("p20-newest").isEmpty, "precondition: the reset cleared the mail")
