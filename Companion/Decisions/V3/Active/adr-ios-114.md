@@ -1199,7 +1199,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    its eligibility and brings it back after it is ended). The app configures TipKit once with its
    live pacing and the debug fixture changes only where the datastore is: one fixed folder of the
    swipe fixture's (`TabMailApp.fieldDragTipTestStore`, honoured only with `--chat-swipe-ui-test`;
-   amended 2026-11-22). Those launches mark the chat's AI summaries notice as already shown for
+   amended 2026-11-22); a debug launch on it stops when the folder cannot be prepared or TipKit
+   cannot open it, so the lifecycle tests never run without their store. Those launches mark the chat's AI summaries notice as already shown for
    that launch only, since with the onboarding gate open it would otherwise open over the first
    landing of a fresh install:
    `testFieldDragTipWaitingForRoomKeepsItsOneShowing` (landscape at the largest text size the tip
