@@ -1494,15 +1494,21 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      separate work. **Amended 2026-11-22 (ios#1177):** the sheet now has it.
    - *Recent people.* Below "Add someone", a "Recent" section lists the people the user recently
      sent email to (`ChatReplyToSheet(recentPeople:)`, read by `ChatRecentPeople.load` as the sheet
-     opens): the To then Cc people of the newest `ChatViewConfig.recentPeopleScanCount` emails in
-     every account's Sent folder, newest first, each once, at most `ChatViewConfig.recentPeopleCount`,
-     each under the newest name an email gives them (else the part of the address before the @),
-     never the user's own addresses. It is computed from the stored headers each time and nothing new
-     is stored (ADR-004). A row shows only someone not in the list above
-     (`ChatReplyToChoice.unlisted`); a tap adds them there, ticked, as a search result does. A read
-     that fails shows no Recent section. The "Reply to" sheet of an email's chat has no Recent
-     section. Tests: `ChatRecentPeopleTests.swift` (the people and their order, the Sent-folder
-     read against a real database, the section on screen).
+     opens): the To, Cc then Bcc people of the newest `ChatViewConfig.recentPeopleScanCount` emails
+     across the folders whose role is Sent, newest first, each once, at most
+     `ChatViewConfig.recentPeopleCount`, each under the newest name a sent email's recipient fields
+     give them (else the part of the address before the @; a sent email's From is the user and names
+     nobody), never the user's own addresses. Each Sent folder's newest are read on its own
+     (folderId, date) index and the newest of those kept (`SearchView.recentHeaders`), so no read
+     sorts a whole Sent history; with no Sent folder nothing is read. In demo mode only the demo
+     account's Sent folder, otherwise only real accounts' (`Folder.demoScope`, demo state read as the
+     sheet opens). It is computed from the stored headers each time and nothing new is stored
+     (ADR-004). A row shows only someone not in the list above (`ChatReplyToChoice.unlisted`); a tap
+     adds them there, ticked, and clears the search, as a search result does (so Done does not add
+     the typed text too). A read that fails shows no Recent section. The "Reply to" sheet of an
+     email's chat has no Recent section. Tests: `ChatRecentPeopleTests.swift` (the people, their
+     order and names, the Sent-folder read against a real database including demo mode and the scan
+     across folders, the section on screen with Done and Cancel).
    - *Attachments.* Picked photos and videos, a camera photo and files wait above the field
      (`ChatAttachmentTray`: photos as thumbnails, files as chips, each with an x). They are named and
      typed by the rules compose uses (`DraftAttachmentImport`, moved out of `ComposeView` with tests

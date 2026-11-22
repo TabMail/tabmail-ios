@@ -97,7 +97,8 @@ struct ChatNewThreadView: View {
         .sheet(isPresented: $showsAddRecipient) { [ownAddresses] in
             ChatReplyToSheet(replyPeople: model.people, target: .replyAll, ownAddresses: ownAddresses,
                              title: ChatReplyToSheet.addRecipientTitle,
-                             recentPeople: { await ChatRecentPeople.load(pool: AppDatabase.dbPool, ownAddresses: ownAddresses) }) { done in
+                             recentPeople: { await ChatRecentPeople.load(pool: AppDatabase.dbPool, ownAddresses: ownAddresses,
+                                                                           demoActive: DemoModeStore.isDemoActive) }) { done in
                 model.setPeople(ChatNewDraft.people(after: done, current: model.people))
             }
         }

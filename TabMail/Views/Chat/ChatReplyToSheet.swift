@@ -106,10 +106,7 @@ struct ChatReplyToSheet: View {
                         .focused($queryFocused)
                         .onSubmit { addTyped() }
                     ForEach(contactSearch.search(query)) { contact in
-                        Button {
-                            choice.add(contact.email, name: contact.name, ownAddresses: ownAddresses)
-                            query = ""
-                        } label: {
+                        Button { pick(contact.email, name: contact.name) } label: {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(contact.name.isEmpty ? contact.email : contact.name)
                                     .foregroundStyle(Theme.textPrimary)
@@ -126,9 +123,7 @@ struct ChatReplyToSheet: View {
                 if !recentToAdd.isEmpty {
                     Section(Self.recentTitle) {
                         ForEach(recentToAdd, id: \.address) { person in
-                            Button {
-                                choice.add(person.address, name: person.name, ownAddresses: ownAddresses)
-                            } label: { row(person) }
+                            Button { pick(person.address, name: person.name) } label: { row(person) }
                                 .buttonStyle(.plain)
                                 .accessibilityIdentifier(Self.recentId)
                         }
@@ -151,10 +146,10 @@ struct ChatReplyToSheet: View {
                     .disabled(!choice.canFinish && query.isEmpty)
                 }
             }
-            .onAppear { contactSearch.requestAccess() }
             .task {
                 if let recentPeople { recent = await recentPeople() }
             }
+            .onAppear { contactSearch.requestAccess() }
         }
         .dismissKeyboardOnTap()
         .presentationDetents([.medium, .large])
@@ -163,6 +158,13 @@ struct ChatReplyToSheet: View {
 
     private func addTyped() {
         if choice.add(query, ownAddresses: ownAddresses) { query = "" }
+    }
+
+    /// A search result or a Recent row: added, ticked, and the search cleared, so Done does not
+    /// add the typed text as well.
+    private func pick(_ address: String, name: String) {
+        choice.add(address, name: name, ownAddresses: ownAddresses)
+        query = ""
     }
 
     private func row(_ person: ChatThread.Person) -> some View {

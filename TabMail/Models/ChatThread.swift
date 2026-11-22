@@ -145,7 +145,7 @@ struct ChatThread: Equatable {
     }
 
     /// An email's To then Cc recipients, lowercased, each once.
-    static func recipients(of header: MessageHeader) -> [(address: String, name: String?)] {
+    private static func recipients(of header: MessageHeader) -> [(address: String, name: String?)] {
         var seen = Set<String>()
         return [header.to, header.cc].flatMap { RecipientEntry($0).recipients }
             .map { (address: $0.address.lowercased(), name: $0.name) }
