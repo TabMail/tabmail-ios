@@ -322,7 +322,7 @@ final class ChatSwipeUITests: XCTestCase {
         let app = launchIntoChat(signedIn: true)
         let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
         field.tap()
-        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
         field.typeText(Self.shortQuestion)
         let typed = typedField(containing: Self.shortQuestion, in: app)
         XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
@@ -587,7 +587,7 @@ final class ChatSwipeUITests: XCTestCase {
         let app = launchIntoChat()
         let field = replyField(in: app)
         field.tap()
-        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
         field.typeText(Self.overflowingText)
         let long = typedField(containing: Self.overflowingLastLine, in: app)
         XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
@@ -688,7 +688,7 @@ final class ChatSwipeUITests: XCTestCase {
     private func signedInDraftAtItsTop(_ text: String, lastLine: String, in app: XCUIApplication) -> XCUIElement {
         let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
         field.tap()
-        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
         field.typeText(text)
         let long = typedField(containing: lastLine, in: app)
         XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
@@ -739,7 +739,7 @@ final class ChatSwipeUITests: XCTestCase {
         let app = launchIntoChat()
         let field = replyField(in: app)
         field.tap()
-        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
         field.typeText(Self.caretPhrase)
         let typed = typedField(containing: Self.caretPhrase, in: app)
         XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the phrase is in the field")
@@ -790,7 +790,7 @@ final class ChatSwipeUITests: XCTestCase {
         let app = launchIntoChat()
         let field = replyField(in: app)
         field.tap()
-        XCTAssertTrue(waitForFocus(field, true, timeout: 5), "control: the reply field has the keyboard")
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
         field.typeText(Self.shortQuestion)
         let typed = typedField(containing: Self.shortQuestion, in: app)
         XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
@@ -1472,15 +1472,20 @@ final class ChatSwipeUITests: XCTestCase {
     }
 
     /// Whether `element` has (or has lost) the keyboard's focus within `timeout`, read from the
-    /// element, so it holds whether the simulator shows its software keyboard or not. Focus gained,
-    /// it notes whether a software keyboard came up for it (`noteTheKeyboard`) before the caller
-    /// types the first key.
+    /// element, so it holds whether the simulator shows its software keyboard or not.
     private func waitForFocus(_ element: XCUIElement, _ focused: Bool, timeout: TimeInterval) -> Bool {
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "hasKeyboardFocus == %@", NSNumber(value: focused)), object: element)
-        let reached = XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
-        if focused, reached { noteTheKeyboard(in: XCUIApplication()) }
-        return reached
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    /// Whether `field` takes the keyboard's focus within `timeout`, for a caller that types next and
+    /// then waits for the keyboard (`waitForTheKeyboardBack`): focus gained, it notes whether a
+    /// software keyboard came up for it (`noteTheKeyboard`) before the first key.
+    private func waitForTypingFocus(_ field: XCUIElement, timeout: TimeInterval) -> Bool {
+        let focused = waitForFocus(field, true, timeout: timeout)
+        if focused { noteTheKeyboard(in: XCUIApplication()) }
+        return focused
     }
 
     /// Notes whether a keyboard of a software keyboard's size comes up for the field just focused,

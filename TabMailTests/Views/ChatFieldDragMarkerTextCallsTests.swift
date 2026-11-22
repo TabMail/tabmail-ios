@@ -6,6 +6,7 @@
 import Foundation
 import Observation
 import ObjectiveC
+import Synchronization
 import Testing
 import UIKit
 @testable import TabMail
@@ -19,24 +20,27 @@ import UIKit
 ///   selector and every argument unchanged, and returns its answer, whichever it is;
 /// - a call is noted only for the watched text, once however many times the wrappers are
 ///   installed;
-/// - a class that only inherits a method gets the wrapper as its own, for the scroll calls and the
-///   text calls alike, and its superclass, its sibling classes and UIKit's own classes are left
-///   untouched;
-/// - a launch the swipe UI tests did not make wraps neither UIKit class;
+/// - one installation wraps the scroll calls on its scroll class and the text calls on its text
+///   class; a class that only inherits a method gets the wrapper as its own, and its superclass, its
+///   sibling classes and UIKit's own classes are left untouched;
+/// - a launch the swipe UI tests did not make wraps neither of UIKit's classes, at a let-go or
+///   when a text is watched;
 /// - a pan or back-swipe note never updates the marker inside the call that notes it, and shows
 ///   after it;
-/// - the back swipe's watch records only real turnings on or off, timed from its own binding,
-///   ignores a stop by another owner, records nothing once stopped, and starts empty under a new
-///   owner.
+/// - the back swipe's watch records only real turnings on or off, each binding timed from that
+///   binding and starting empty, ignores a stop by an owner it no longer has, and records nothing
+///   once its own owner stops it.
 @MainActor
 @Suite("Drag marker text calls", .serialized)
 struct ChatFieldDragMarkerTextCallsTests {
     /// Has the six stand-ins as its own methods (`FixtureOriginals`), so the wrapper replaces them.
     final class ForwardingText: UITextView {}
 
-    /// Has the six stand-ins as its own methods; the child and the sibling only inherit them.
+    /// Has the six stand-ins as its own methods; its subclasses only inherit them. One installation
+    /// takes the scroll class and the text class.
     class ParentText: UITextView {}
-    final class ChildText: ParentText {}
+    final class ScrollChild: ParentText {}
+    final class TextChild: ParentText {}
     final class SiblingText: ParentText {}
 
     private static let offsetSelector = #selector(UIScrollView.setContentOffset(_:animated:))
@@ -54,6 +58,20 @@ struct ChatFieldDragMarkerTextCallsTests {
         let field = label.split(separator: " ").first { $0.hasPrefix("calls=") }.map { String($0.dropFirst("calls=".count)) }
         guard let field, field != "none" else { return [] }
         return field.split(separator: ",").map { String($0.split(separator: "@").first ?? "") }
+    }
+
+    /// The milliseconds a back-swipe entry (`<name>@+<ms>ms…`) is timed at; nil when it has none.
+    private static func elapsed(of entry: String) -> Double? {
+        let parts = entry.split(separator: "@")
+        guard parts.count > 1, parts[1].hasPrefix("+"), parts[1].hasSuffix("ms") else { return nil }
+        return Double(parts[1].dropFirst().dropLast("ms".count))
+    }
+
+    /// Whether `cls`'s `selector` runs a wrapper: an implementation made from a block
+    /// (`imp_implementationWithBlock`), as every `TextCalls` wrapper is and no class's own code is.
+    private static func isWrapped(_ cls: AnyClass, _ selector: Selector) -> Bool {
+        guard let imp = class_getMethodImplementation(cls, selector) else { return false }
+        return imp_getBlock(imp) != nil
     }
 
     /// Whether `condition` holds within `publishTurns` main-actor turns.
@@ -86,9 +104,13 @@ struct ChatFieldDragMarkerTextCallsTests {
     func forwardsEveryWrappedCallAndNotesOnlyTheWatchedText() throws {
         let added = FixtureOriginals.add(to: ForwardingText.self)
         #expect(added, "control: the six stand-ins are the class's own methods")
+        let wrappedBefore = Self.isWrapped(ForwardingText.self, Self.offsetSelector)
+        #expect(!wrappedBefore, "control: before the wrap, the class runs its own stand-in")
         // Installed twice: each class is wrapped once, so each call is noted once.
         ChatFieldDragMarker.TextCalls.install(scrollView: ForwardingText.self, textView: ForwardingText.self)
         ChatFieldDragMarker.TextCalls.install(scrollView: ForwardingText.self, textView: ForwardingText.self)
+        let wrappedAfter = Self.isWrapped(ForwardingText.self, Self.offsetSelector)
+        #expect(wrappedAfter, "control: a wrapper is told apart from the class's own code")
 
         let watched = ForwardingText(frame: Self.frame)
         let control = ForwardingText(frame: Self.frame)
@@ -99,6 +121,13 @@ struct ChatFieldDragMarkerTextCallsTests {
         probe.watchText(watched, lastMoved: 0)
         defer { probe.watchText(nil, lastMoved: 0) }
         FixtureOriginals.reset()
+
+        // The other text first, while the watch is open and nothing is noted yet.
+        let controlScroll: UIScrollView = control
+        controlScroll.setContentOffset(CGPoint(x: 9, y: 10), animated: true)
+        #expect(FixtureOriginals.asked(by: control) == ["setContentOffset:animated: 9.0,10.0 true"],
+                "control: the other text's original ran")
+        #expect(Self.calls(in: probe.label).isEmpty, "the other text's call is not noted: \(probe.label)")
 
         // Called as UIKit calls them, through the Objective-C runtime.
         let scroll: UIScrollView = watched
@@ -112,12 +141,10 @@ struct ChatFieldDragMarkerTextCallsTests {
         text.selectedTextRange = range
         text.selectedTextRange = nil
         text.selectedRange = NSRange(location: 1, length: 4)
-        FixtureOriginals.answer = true
+        FixtureOriginals.setAnswer(true)
         let yes = responder.becomeFirstResponder()
-        FixtureOriginals.answer = false
+        FixtureOriginals.setAnswer(false)
         let no = responder.becomeFirstResponder()
-        let controlScroll: UIScrollView = control
-        controlScroll.setContentOffset(CGPoint(x: 9, y: 10), animated: true)
 
         #expect(FixtureOriginals.asked(by: watched) == [
             "setContentOffset:animated: 3.0,7.0 false",
@@ -134,76 +161,79 @@ struct ChatFieldDragMarkerTextCallsTests {
         let passed = FixtureOriginals.textRanges
         #expect(passed.count == 2, "control: the text range setter's original ran twice")
         guard passed.count == 2 else { return }
-        #expect(passed[0] === range, "the text range itself was passed on")
+        let rangeIdentity = ObjectIdentifier(range)
+        #expect(passed[0] == rangeIdentity, "the text range itself was passed on")
         #expect(passed[1] == nil, "a nil text range was passed on as nil")
         #expect(yes, "the wrapper returned the original's yes")
         #expect(!no, "the wrapper returned the original's no")
-        #expect(FixtureOriginals.asked(by: control) == ["setContentOffset:animated: 9.0,10.0 true"],
-                "control: the other text's original ran too")
         #expect(Self.calls(in: probe.label) == [
             "offset", "offsetAnimated", "rect", "rectAnimated", "rangeToVisible",
             "selectedTextRange", "selectedTextRange", "selectedRange", "becomeFirstResponder", "becomeFirstResponder",
         ], "only the watched text's calls are noted, each once: \(probe.label)")
     }
 
-    @Test("A class that only inherits the wrapped methods gets the wrappers as its own; its superclass, its sibling and UIKit are untouched")
-    func inheritedMethodsAreWrappedOnTheClassAlone() {
+    @Test("One installation wraps the scroll calls on its scroll class and the text calls on its text class, each as the class's own; no other class changes")
+    func eachFamilyIsWrappedOnItsOwnClassAlone() {
         let added = FixtureOriginals.add(to: ParentText.self)
         #expect(added, "control: the six stand-ins are the parent's own methods")
         let families = [Self.offsetSelector, Self.selectedRangeSelector]
+        let children: [AnyClass] = [ScrollChild.self, TextChild.self, SiblingText.self]
         let baseline = families.map { class_getMethodImplementation(ParentText.self, $0) }
         let uikitBefore = [class_getMethodImplementation(UIScrollView.self, Self.offsetSelector),
                            class_getMethodImplementation(UITextView.self, Self.selectedRangeSelector)]
-        let childBefore = families.map { class_getMethodImplementation(ChildText.self, $0) }
-        #expect(childBefore == baseline, "control: the child inherits the parent's methods")
+        let childrenBefore = children.map { child in families.map { class_getMethodImplementation(child, $0) } }
+        let allInherit = childrenBefore.allSatisfy { $0 == baseline }
+        #expect(allInherit, "control: every child inherits the parent's methods")
 
-        ChatFieldDragMarker.TextCalls.install(scrollView: ChildText.self, textView: ChildText.self)
+        ChatFieldDragMarker.TextCalls.install(scrollView: ScrollChild.self, textView: TextChild.self)
 
-        let childAfter = families.map { class_getMethodImplementation(ChildText.self, $0) }
+        let scrollChild = families.map { class_getMethodImplementation(ScrollChild.self, $0) }
+        let textChild = families.map { class_getMethodImplementation(TextChild.self, $0) }
         let parentAfter = families.map { class_getMethodImplementation(ParentText.self, $0) }
         let siblingAfter = families.map { class_getMethodImplementation(SiblingText.self, $0) }
         let uikitAfter = [class_getMethodImplementation(UIScrollView.self, Self.offsetSelector),
                           class_getMethodImplementation(UITextView.self, Self.selectedRangeSelector)]
-        #expect(childAfter[0] != baseline[0], "the child has the scroll call's wrapper as its own")
-        #expect(childAfter[1] != baseline[1], "the child has the text call's wrapper as its own")
+        #expect(scrollChild[0] != baseline[0], "the scroll class has the scroll call's wrapper as its own")
+        #expect(scrollChild[1] == baseline[1], "the scroll class's text calls are not wrapped")
+        #expect(textChild[1] != baseline[1], "the text class has the text call's wrapper as its own")
+        #expect(textChild[0] == baseline[0], "the text class's scroll calls are not wrapped")
         #expect(parentAfter == baseline, "the parent's methods are untouched")
         #expect(siblingAfter == baseline, "the sibling still inherits the parent's methods")
         #expect(uikitAfter == uikitBefore, "UIKit's own methods are untouched")
 
+        // Made before the record is reset, so nothing their setup asks for is counted.
+        let cases: [(text: ParentText, noted: [String], what: String)] = [
+            (ScrollChild(frame: Self.frame), ["offset"], "the scroll class notes its scroll call alone"),
+            (TextChild(frame: Self.frame), ["selectedRange"], "the text class notes its text call alone"),
+            (SiblingText(frame: Self.frame), [], "the sibling is not wrapped, so nothing is noted"),
+        ]
         let probe = ChatFieldDragMarker.Probe.shared
         defer { probe.watchText(nil, lastMoved: 0) }
-        let child = ChildText(frame: Self.frame)
-        let sibling = SiblingText(frame: Self.frame)
         FixtureOriginals.reset()
-        probe.watchText(child, lastMoved: 0)
-        let childScroll: UIScrollView = child
-        let childText: UITextView = child
-        childScroll.setContentOffset(CGPoint(x: 2, y: 5), animated: false)
-        childText.selectedRange = NSRange(location: 1, length: 2)
-        #expect(FixtureOriginals.asked(by: child) == ["setContentOffset:animated: 2.0,5.0 false", "setSelectedRange: 1,2"],
-                "the inherited originals ran once, with their arguments")
-        #expect(Self.calls(in: probe.label) == ["offset", "selectedRange"], "the child's calls are noted: \(probe.label)")
-
-        probe.watchText(sibling, lastMoved: 0)
-        let siblingScroll: UIScrollView = sibling
-        let siblingText: UITextView = sibling
-        siblingScroll.setContentOffset(CGPoint(x: 6, y: 7), animated: true)
-        siblingText.selectedRange = NSRange(location: 3, length: 1)
-        #expect(FixtureOriginals.asked(by: sibling) == ["setContentOffset:animated: 6.0,7.0 true", "setSelectedRange: 3,1"],
-                "control: the sibling's originals ran")
-        #expect(Self.calls(in: probe.label).isEmpty, "the sibling is not wrapped, so nothing is noted: \(probe.label)")
+        for (text, noted, what) in cases {
+            probe.watchText(text, lastMoved: 0)
+            let scroll: UIScrollView = text
+            let textView: UITextView = text
+            scroll.setContentOffset(CGPoint(x: 2, y: 5), animated: false)
+            textView.selectedRange = NSRange(location: 1, length: 2)
+            #expect(FixtureOriginals.asked(by: text) == ["setContentOffset:animated: 2.0,5.0 false", "setSelectedRange: 1,2"],
+                    "control: both originals ran once, with their arguments (\(what))")
+            #expect(Self.calls(in: probe.label) == noted, "\(what): \(probe.label)")
+        }
     }
 
-    @Test("A launch the swipe UI tests did not make wraps neither UIKit class at a let-go")
+    @Test("A launch the swipe UI tests did not make wraps neither UIKit class, at a let-go or when a text is watched")
     func anInactiveLaunchWrapsNothing() {
         #expect(!ChatFieldDragMarker.Probe.isActive, "control: the unit test host is not the swipe UI tests' launch")
-        let before = [class_getMethodImplementation(UIScrollView.self, Self.offsetSelector),
-                      class_getMethodImplementation(UITextView.self, Self.selectedRangeSelector)]
-        ChatFieldDragMarker.textLetGo(UITextView(frame: Self.frame), lastMoved: 0)
-        let after = [class_getMethodImplementation(UIScrollView.self, Self.offsetSelector),
-                     class_getMethodImplementation(UITextView.self, Self.selectedRangeSelector)]
-        #expect(after[0] == before[0], "the scroll calls are not wrapped")
-        #expect(after[1] == before[1], "the text calls are not wrapped")
+        let text = UITextView(frame: Self.frame)
+        ChatFieldDragMarker.textLetGo(text, lastMoved: 0)
+        let probe = ChatFieldDragMarker.Probe.shared
+        probe.watchText(text, lastMoved: 0)
+        defer { probe.watchText(nil, lastMoved: 0) }
+        let scrollWrapped = Self.isWrapped(UIScrollView.self, Self.offsetSelector)
+        let textWrapped = Self.isWrapped(UITextView.self, Self.selectedRangeSelector)
+        #expect(!scrollWrapped, "the scroll calls are not wrapped")
+        #expect(!textWrapped, "the text calls are not wrapped")
     }
 
     @Test("A pan note shows after the call that notes it, never inside it")
@@ -219,56 +249,66 @@ struct ChatFieldDragMarkerTextCallsTests {
         #expect(changed.fired, "control: the marker is updated once they show")
     }
 
-    @Test("The back swipe's watch records real turnings on or off from its binding, until its own owner stops it")
+    @Test("The back swipe's watch records real turnings on or off, each binding timed from itself, until its own owner stops it")
     func backSwipeWatchRecordsUntilItsOwnerStops() async throws {
         let probe = ChatFieldDragMarker.Probe.shared
         let watch = ChatFieldDragMarker.PopWatch()
         let swipe = UIPanGestureRecognizer()
         let ownerA = NSObject()
         let ownerB = NSObject()
-        // The watch's clock ages before it is bound: a binding restarts it.
-        try await Task.sleep(for: .milliseconds(Self.staleClockMilliseconds))
-        watch.watch(swipe, for: ObjectIdentifier(ownerA))
+        let limit = Double(Self.staleClockMilliseconds)
         defer { watch.stop(for: ObjectIdentifier(ownerB)) }
 
+        // The watch's clock ages before it is bound: the binding restarts it.
+        try await Task.sleep(for: .milliseconds(Self.staleClockMilliseconds))
+        watch.watch(swipe, for: ObjectIdentifier(ownerA))
+        await Self.settle()
         let changed = Self.watchChange { _ = probe.popEntries }
         swipe.isEnabled = false
         #expect(!changed.fired, "the marker is not updated inside the turning off")
         let off = await Self.published { probe.popEntries.count == 1 }
         #expect(off, "the turning off shows after it: \(probe.popEntries)")
+        #expect(changed.fired, "control: the marker is updated once it shows")
         let first = probe.popEntries
         guard first.count == 1 else { return }
-        let parts = first[0].split(separator: "@")
-        #expect(parts.first == "en:0", "the turning off is recorded: \(first[0])")
-        guard parts.count > 1 else { return }
-        let elapsed = Double(parts[1].dropFirst().dropLast("ms".count))
-        let limit = Double(Self.staleClockMilliseconds)
-        #expect(elapsed.map { $0 < limit } == true, "timed from the binding, not the watch's older clock: \(first[0])")
+        #expect(first[0].hasPrefix("en:0@"), "the turning off is recorded: \(first[0])")
+        let firstTime = Self.elapsed(of: first[0])
+        let firstMs = try #require(firstTime, "the turning off is timed: \(first[0])")
+        let firstFresh = firstMs >= 0 && firstMs < limit
+        #expect(firstFresh, "timed from the binding, not the watch's older clock: \(first[0])")
 
         swipe.isEnabled = false
         await Self.settle()
         #expect(probe.popEntries.count == 1, "setting the value it has records nothing: \(probe.popEntries)")
 
-        watch.stop(for: ObjectIdentifier(ownerB))
-        swipe.isEnabled = true
-        let on = await Self.published { probe.popEntries.count == 2 }
-        #expect(on, "another owner's stop leaves the watch on: \(probe.popEntries)")
-        #expect(probe.popEntries.last?.hasPrefix("en:1@") == true, "the turning on is recorded: \(probe.popEntries)")
-
-        watch.stop(for: ObjectIdentifier(ownerA))
-        let cleared = await Self.published { probe.popEntries.isEmpty }
-        #expect(cleared, "its own owner's stop clears the record: \(probe.popEntries)")
-        swipe.isEnabled = false
-        await Self.settle()
-        #expect(probe.popEntries.isEmpty, "a stopped watch records nothing: \(probe.popEntries)")
-
+        // A new owner takes the same swipe over, after the first binding's clock has aged.
+        try await Task.sleep(for: .milliseconds(Self.staleClockMilliseconds))
         watch.watch(swipe, for: ObjectIdentifier(ownerB))
         await Self.settle()
-        #expect(probe.popEntries.isEmpty, "a new owner's watch starts empty: \(probe.popEntries)")
+        #expect(probe.popEntries.isEmpty, "the new owner's watch starts empty: \(probe.popEntries)")
         swipe.isEnabled = true
-        let rebound = await Self.published { probe.popEntries.count == 1 }
-        #expect(rebound, "the new owner's watch records: \(probe.popEntries)")
-        #expect(probe.popEntries.first?.hasPrefix("en:1@") == true, "the turning on is recorded: \(probe.popEntries)")
+        let on = await Self.published { probe.popEntries.count == 1 }
+        #expect(on, "the new owner's watch records: \(probe.popEntries)")
+        let second = probe.popEntries
+        guard second.count == 1 else { return }
+        #expect(second[0].hasPrefix("en:1@"), "the turning on is recorded: \(second[0])")
+        let secondTime = Self.elapsed(of: second[0])
+        let secondMs = try #require(secondTime, "the turning on is timed: \(second[0])")
+        let secondFresh = secondMs >= 0 && secondMs < limit
+        #expect(secondFresh, "timed from the new binding, not the one it replaced: \(second[0])")
+
+        watch.stop(for: ObjectIdentifier(ownerA))
+        swipe.isEnabled = false
+        let kept = await Self.published { probe.popEntries.count == 2 }
+        #expect(kept, "a stop by the owner it no longer has leaves the watch on: \(probe.popEntries)")
+        #expect(probe.popEntries.last?.hasPrefix("en:0@") == true, "the turning off is recorded: \(probe.popEntries)")
+
+        watch.stop(for: ObjectIdentifier(ownerB))
+        let cleared = await Self.published { probe.popEntries.isEmpty }
+        #expect(cleared, "its own owner's stop clears the record: \(probe.popEntries)")
+        swipe.isEnabled = true
+        await Self.settle()
+        #expect(probe.popEntries.isEmpty, "a stopped watch records nothing: \(probe.popEntries)")
     }
 }
 
@@ -276,24 +316,38 @@ struct ChatFieldDragMarkerTextCallsTests {
 /// as plain C functions: each records the receiver, the selector it was called with and every
 /// argument, and touches nothing else, so a record is exactly what the wrapper passed on.
 private enum FixtureOriginals {
-    nonisolated(unsafe) static var records: [(receiver: ObjectIdentifier, call: String)] = []
-    nonisolated(unsafe) static var textRanges: [UITextRange?] = []
-    /// What the responder stand-in answers.
-    nonisolated(unsafe) static var answer = true
+    struct State {
+        var records: [(receiver: ObjectIdentifier, call: String)] = []
+        /// The text ranges the text range setter's stand-in was given, by identity; nil for none.
+        var textRanges: [ObjectIdentifier?] = []
+        /// What the responder stand-in answers.
+        var answer = true
+    }
+
+    /// Written by the stand-ins, which the Objective-C runtime calls, and read by the tests: one lock.
+    static let state = Mutex(State())
 
     static func reset() {
-        records = []
-        textRanges = []
-        answer = true
+        state.withLock { $0 = State() }
+    }
+
+    static func setAnswer(_ answer: Bool) {
+        state.withLock { $0.answer = answer }
+    }
+
+    static var textRanges: [ObjectIdentifier?] {
+        state.withLock { $0.textRanges }
     }
 
     static func asked(by receiver: AnyObject) -> [String] {
-        records.filter { $0.receiver == ObjectIdentifier(receiver) }.map(\.call)
+        let identity = ObjectIdentifier(receiver)
+        return state.withLock { $0.records.filter { $0.receiver == identity }.map(\.call) }
     }
 
     static func record(_ receiver: AnyObject, _ selector: Selector, _ arguments: String) {
+        let identity = ObjectIdentifier(receiver)
         let call = NSStringFromSelector(selector) + (arguments.isEmpty ? "" : " " + arguments)
-        records.append((ObjectIdentifier(receiver), call))
+        state.withLock { $0.records.append((identity, call)) }
     }
 
     /// Adds the six stand-ins to `cls` as its own methods, each with UIKit's type encoding;
@@ -309,12 +363,13 @@ private enum FixtureOriginals {
             FixtureOriginals.record(receiver, selector, "\(value.location),\(value.length)")
         }
         let textRange: @convention(c) (AnyObject, Selector, UITextRange?) -> Void = { receiver, selector, value in
-            FixtureOriginals.textRanges.append(value)
+            let identity = value.map { ObjectIdentifier($0) }
+            FixtureOriginals.state.withLock { $0.textRanges.append(identity) }
             FixtureOriginals.record(receiver, selector, value == nil ? "nil" : "range")
         }
         let answer: @convention(c) (AnyObject, Selector) -> ObjCBool = { receiver, selector in
             FixtureOriginals.record(receiver, selector, "")
-            return ObjCBool(FixtureOriginals.answer)
+            return ObjCBool(FixtureOriginals.state.withLock { $0.answer })
         }
         let standIns: [(Selector, AnyClass, IMP)] = [
             (#selector(UIScrollView.setContentOffset(_:animated:)), UIScrollView.self, unsafeBitCast(pointAndFlag, to: IMP.self)),
