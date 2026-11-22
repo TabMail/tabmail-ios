@@ -398,6 +398,9 @@ struct InboxView: View {
     /// migration + Drafts sync while compose is open, so the presentation must
     /// never depend on re-fetching it.
     @State private var draftOpen: DraftOpenRequest?
+    /// A new email the compose button started as a chat (chat view on): pushed on the inbox's
+    /// navigation, with its own Back.
+    @State private var newEmail: ChatNewThreadModel?
     private var archiveOldEmailsTip = ArchiveOldEmailsTip()
     private var enableInboxPushTip = EnableInboxPushTip()
     private var undoService: UndoService { UndoService.shared }
@@ -854,7 +857,7 @@ struct InboxView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 ComposeToolbarButton(onNewCompose: {
                     collapseChat()
-                    viewModel.showCompose = true
+                    startNewEmail()
                 })
                 .tutorialLockedNavigation()
                 .transaction { $0.disablesAnimations = true }
@@ -862,6 +865,9 @@ struct InboxView: View {
         }
         .fullScreenCover(isPresented: $vm.showCompose) {
             ComposeView(account: viewModel.primaryAccount)
+        }
+        .navigationDestination(item: $newEmail) { model in
+            ChatNewThreadView(model: model)
         }
         .sheet(isPresented: Binding(
             get: { moveMessageId != nil || moveThreadGroup != nil },
@@ -1096,6 +1102,17 @@ struct InboxView: View {
             Text(undoAlertStackCount > 1
                  ? "\(undoAlertLabel)\n\(undoAlertStackCount) actions remaining"
                  : undoAlertLabel)
+        }
+    }
+
+    /// The compose button: with the chat view on, a new email starts as an empty chat; off,
+    /// today's compose. The setting is read once, at the tap.
+    private func startNewEmail() {
+        switch ChatNewThreadRoute.composeButton(opensInChat: ChatViewConfig.opensInChat) {
+        case .newThread:
+            newEmail = ChatNewThreadModel(account: viewModel.primaryAccount)
+        case .compose:
+            viewModel.showCompose = true
         }
     }
 

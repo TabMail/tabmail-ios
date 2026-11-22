@@ -49,7 +49,7 @@ struct MessageOpenView: View {
         switch Self.route(messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
                           opensInChat: opensInChat, pool: AppDatabase.dbPool) {
         case .draftEditor(let header):
-            DraftComposePresenter(source: .header(header))
+            DraftComposePresenter(source: .header(header), presentedAsCover: false)
         case .chat:
             ChatThreadView(
                 messageId: messageId,

@@ -70,8 +70,16 @@ extension DynamicIslandChat {
                             // The drag stays on while the agent works: so does its VoiceOver action.
                             .showChatAction(field.showChat, isExpanded: isExpanded)
                     } else {
-                        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask",
-                                   showChat: field.showChat)
+                        if let newEmail = field.newEmail {
+                            // A new email's paperclip sits at the text's end, inside the field: the
+                            // row's mic, text and Send keep their places.
+                            HStack(alignment: .bottom, spacing: ChatViewLayout.fieldTextGap) {
+                                replyInput(field)
+                                ChatPaperclipButton(attach: newEmail.attach)
+                            }
+                        } else {
+                            replyInput(field)
+                        }
                         if showsExample, let example = field.example {
                             exampleLine(example)
                         }
@@ -83,6 +91,11 @@ extension DynamicIslandChat {
         }
         // A drag up swells the field itself toward the panel, its top following the finger.
         .padding(.top, field.swell)
+    }
+
+    private func replyInput(_ field: ChatReplyField) -> some View {
+        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask",
+                   showChat: field.showChat)
     }
 
     /// The "e.g." line shows under the empty field, signed in, while nothing is being said.

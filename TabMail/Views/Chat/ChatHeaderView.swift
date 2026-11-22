@@ -5,23 +5,45 @@
 import SwiftUI
 
 /// The chat's header, in the navigation bar's principal slot as in Messages: the avatars level with
-/// Back, the names under them. Tapping the names changes who gets the reply.
+/// Back, the names under them. Tapping the names changes who gets the reply. A new email's header
+/// (`ChatNewThreadView`) starts with nobody: one empty avatar and "Add recipient", the same tap.
 struct ChatHeaderView: View {
-    let thread: ChatThread
+    let people: [ChatThread.Person]
+    /// With nobody yet, the empty avatar's line ("Add recipient"); nil shows nothing then.
+    var emptyTitle: String? = nil
+    var hint: String = Self.replyHint
     var onTapNames: (() -> Void)? = nil
+
+    static let replyHint = "Changes who gets your reply"
+    static let newEmailHint = "Chooses who gets this email"
+
+    init(thread: ChatThread, onTapNames: (() -> Void)? = nil) {
+        self.init(people: thread.replyPeople, onTapNames: onTapNames)
+    }
+
+    init(people: [ChatThread.Person], emptyTitle: String? = nil, hint: String = Self.replyHint,
+         onTapNames: (() -> Void)? = nil) {
+        self.people = people
+        self.emptyTitle = emptyTitle
+        self.hint = hint
+        self.onTapNames = onTapNames
+    }
 
     var body: some View {
         VStack(spacing: ChatViewLayout.subjectLineSpacing) {
             HStack(spacing: -8) {
-                ForEach(Array(thread.replyPeople.prefix(ChatViewLayout.headerNameCount + 1).enumerated()), id: \.offset) { _, person in
+                if people.isEmpty, emptyTitle != nil {
+                    emptyAvatar
+                }
+                ForEach(Array(people.prefix(ChatViewLayout.headerNameCount + 1).enumerated()), id: \.offset) { _, person in
                     ChatAvatar(person: person, size: ChatViewLayout.headerAvatarSize)
                         .overlay(Circle().stroke(Palette.previewPaneBg, lineWidth: 2))
                 }
             }
-            if !thread.replyPeople.isEmpty {
+            if let title = people.isEmpty ? emptyTitle : ChatThread.headerTitle(people) {
                 Button { onTapNames?() } label: {
                     HStack(spacing: 2) {
-                        Text(ChatThread.headerTitle(thread.replyPeople))
+                        Text(title)
                             .font(.caption)
                             .fontWeight(.semibold)
                             .foregroundStyle(Theme.textPrimary)
@@ -33,10 +55,24 @@ struct ChatHeaderView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(onTapNames == nil)
-                .accessibilityHint("Changes who gets your reply")
+                .accessibilityHint(hint)
+                .accessibilityIdentifier(Self.namesId)
             }
         }
         .accessibilityElement(children: .contain)
+    }
+
+    /// The names' button, as tests find it.
+    static let namesId = "chatHeaderNames"
+
+    /// A new email's avatar before anyone is picked.
+    private var emptyAvatar: some View {
+        Image(systemName: "person.fill")
+            .font(.system(size: ChatViewLayout.headerAvatarSize * ChatViewLayout.emptyAvatarGlyphScale))
+            .foregroundStyle(Theme.textSecondary)
+            .frame(width: ChatViewLayout.headerAvatarSize, height: ChatViewLayout.headerAvatarSize)
+            .background(Circle().fill(Palette.boxBg))
+            .accessibilityHidden(true)
     }
 }
 

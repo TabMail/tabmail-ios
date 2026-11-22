@@ -29,8 +29,14 @@ struct ChatReplyField {
     /// equivalent, offered on the element VoiceOver focuses (`showChatAction`); nil offers nothing
     /// (the panel open, the tutorial).
     var showChat: (() -> Void)? = nil
+    /// A new email's chat (`ChatNewThreadView`): the field has no email to reply to; nil in a
+    /// thread's chat.
+    var newEmail: ChatNewEmailField? = nil
 
-    var placeholder: String { isNoReply ? "Ask anything" : "Reply or ask anything" }
+    var placeholder: String {
+        if newEmail != nil { return ChatNewEmailField.placeholder }
+        return isNoReply ? "Ask anything" : "Reply or ask anything"
+    }
 
     /// The ready AI Suggestion of the thread's newest email, as its ghost bubble shows it: its text
     /// message, while the full reply is stored. Nothing on the user's turn, for a no-reply sender,
@@ -84,6 +90,49 @@ struct ChatReplyField {
     static func statusLine(_ label: String) -> String {
         label == ToolRegistry.activityLabels["email_reply"] ? "Writing your email" : label
     }
+}
+
+/// The field of a new email's chat (`ChatNewThreadView`): no email to reply to, so Send goes to the
+/// new email's chat, which asks who it is to or writes it; the field's words are the new email's
+/// draft; the paperclip at the field's end adds attachments. Its agent chat is its own, in memory
+/// only (`sessionKey`), never an email's thread chat or the inbox chat.
+struct ChatNewEmailField {
+    static let placeholder = "Message or ask anything"
+
+    /// Where the paperclip's menu takes the user.
+    enum AttachSource: CaseIterable {
+        case photos, camera, files
+
+        var title: String {
+            switch self {
+            case .photos: "Photos"
+            case .camera: "Camera"
+            case .files: "Files"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .photos: "photo.on.rectangle"
+            case .camera: "camera"
+            case .files: "folder"
+            }
+        }
+    }
+
+    /// The words a reopened draft puts in the field as it appears; empty for a new email.
+    let startWords: String
+    /// This new email's own agent session, in memory only.
+    let sessionKey: String
+    /// Each change of the field's words.
+    let wordsChanged: (String) -> Void
+    /// Send with words in the field.
+    let send: (String) -> Void
+    /// A choice in the paperclip's menu.
+    let attach: (AttachSource) -> Void
+
+    /// A new email's chat session key: a fresh one for each new email's chat.
+    static func newSessionKey() -> String { "new-email:\(UUID().uuidString)" }
 }
 
 /// The chat input's words, which are all the reply field shows: the AI Suggestion never enters the
