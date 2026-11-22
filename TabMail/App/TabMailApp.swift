@@ -218,11 +218,13 @@ struct TabMailApp: App {
             ])
             Tips.hideAllTipsForTesting()
         } else {
-            var tipStore = Tips.ConfigurationOption.DatastoreLocation.applicationDefault
             #if DEBUG
             // Debug UI tests only: these same tip rules, nothing forced, on the swipe fixture's own
             // datastore, which outlives a relaunch (`Self.fieldDragTipTestStore`).
-            if usesFieldDragTipStore { tipStore = .url(Self.fieldDragTipTestStore()) }
+            let tipStore: Tips.ConfigurationOption.DatastoreLocation = usesFieldDragTipStore
+                ? .url(Self.fieldDragTipTestStore()) : .applicationDefault
+            #else
+            let tipStore = Tips.ConfigurationOption.DatastoreLocation.applicationDefault
             #endif
             try? Tips.configure([
                 .displayFrequency(.daily),
