@@ -111,6 +111,8 @@ struct ChatThreadView: View {
     @State private var headerBottom = -CGFloat.infinity
     @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
+    /// Whether the field's drag tip waits for room: `ViewThatFits` picked its empty stand-in.
+    @State private var tipWaitsForRoom = false
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Held only while a grow is pending: set when the AI Suggestion's row becomes Writing, cleared
@@ -989,9 +991,15 @@ struct ChatThreadView: View {
                         ViewThatFits(in: .vertical) {
                             TipView(ChatFieldDragTip(), arrowEdge: .bottom)
                                 .fixedSize(horizontal: false, vertical: true)
+                                // `ViewThatFits` keeps the candidate it did not pick in the
+                                // accessibility tree: VoiceOver must not read a card that is not
+                                // on screen while the stand-in shows.
+                                .accessibilityHidden(tipWaitsForRoom)
                                 // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop))
                             Color.clear.frame(height: 0)
+                                .onAppear { tipWaitsForRoom = true }
+                                .onDisappear { tipWaitsForRoom = false }
                                 // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipWait())
                         }

@@ -136,6 +136,45 @@ struct ChatFieldDragTests {
         }
     }
 
+    // UIKit's pan reports at its end the speed of the finger's last move however long the finger
+    // then held still, so a drag held before the let-go must not carry that speed into the flick.
+    @Test("A finger held still before it lifts lets go at rest; one lifted with its move keeps its speed")
+    func heldLetGoIsAtRest() {
+        let rest = ChatViewLayout.fieldFlickRest
+        // 25 up at 250 pt/s predicts 87.5: a flick that opens.
+        let flick = ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: -25), velocity: CGSize(width: 0, height: -250))
+        let atRest = ChatHorizontalPan.Sample(travel: flick.travel, velocity: .zero)
+        let lifted = ChatFieldDrag.letGo(flick, rested: 0)
+        let liftedSoon = ChatFieldDrag.letGo(flick, rested: rest / 2)
+        let justShort = ChatFieldDrag.letGo(flick, rested: rest.nextDown)
+        let heldTheRest = ChatFieldDrag.letGo(flick, rested: rest)
+        let heldLong = ChatFieldDrag.letGo(flick, rested: 0.3)
+        #expect(lifted == flick && ChatFieldDrag.opens(letGo: lifted), "lifted with its move, it is a flick")
+        #expect(liftedSoon == flick && ChatFieldDrag.opens(letGo: liftedSoon), "lifted a few frames after its move, still a flick")
+        #expect(justShort == flick, "just short of the rest, its speed is kept")
+        #expect(heldTheRest == atRest, "held still the rest, it lets go at rest, its travel kept")
+        #expect(heldLong == atRest && !ChatFieldDrag.opens(letGo: heldLong), "held still 0.3 s at 25 up, it settles back")
+        let far = ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: -70), velocity: CGSize(width: 0, height: -250))
+        let farHeld = ChatFieldDrag.letGo(far, rested: 0.3)
+        #expect(ChatFieldDrag.opens(letGo: farHeld), "held still past the open distance, it still opens")
+    }
+
+    @Test("The field's pan reads how long the finger held still before it lifted: from its last move, nothing before the lift")
+    @MainActor
+    func panReadsTheRest() {
+        let pan = ChatFieldPan.Recognizer()
+        #expect(pan.restedBeforeLift == 0, "nothing before the finger is down")
+        pan.moved(at: 10)
+        pan.moved(at: 10.25)
+        #expect(pan.restedBeforeLift == 0, "nothing while the finger is down")
+        pan.lifted(at: 10.75)
+        #expect(pan.restedBeforeLift == 0.5, "from the last move, not the first")
+        pan.reset()
+        #expect(pan.restedBeforeLift == 0, "a new drag starts with nothing")
+        pan.lifted(at: 11)
+        #expect(pan.restedBeforeLift == 0, "a lift with no move read is no rest")
+    }
+
     /// A drag that started in the focused field's text, and the field's share of it, worked out by
     /// hand: the text keeps the drag until its end, the rest of the same drag is the field's, both
     /// axes counted from the hand-off (`handOff`, the drag's travel where the text reached its end;

@@ -119,6 +119,15 @@ enum ChatFieldDrag {
                                         velocity: drag.velocity)
     }
 
+    /// The let-go's sample once the finger held still `rested` seconds before it lifted: UIKit's
+    /// pan reports at its end the speed of the finger's last move however long it then held still,
+    /// so a drag held before the let-go would carry that old speed into the flick prediction and
+    /// open the panel. Held still for `ChatViewLayout.fieldFlickRest` or longer, it lets go at rest.
+    static func letGo(_ drag: ChatHorizontalPan.Sample, rested: TimeInterval) -> ChatHorizontalPan.Sample {
+        guard rested >= ChatViewLayout.fieldFlickRest else { return drag }
+        return ChatHorizontalPan.Sample(travel: drag.travel, velocity: .zero)
+    }
+
     /// Whether a let-go with this last sample (`ChatHorizontalPan.Sample`) opens the panel: its
     /// swell, or its predicted swell, reaches the open distance.
     static func opens(letGo drag: ChatHorizontalPan.Sample) -> Bool {

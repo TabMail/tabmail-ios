@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import SwiftUI
+import UIKit
 
 /// What a drag on the reply field did to the chat, as an accessibility-only marker for the chat
 /// swipe UI tests: XCUITest reads a frame only once the app is idle, well after the swell and its
@@ -25,8 +26,11 @@ import SwiftUI
 /// how many taps the open panel's dim has taken, `over` how far the text under the last drag went
 /// past its end while the drag moved (the most the field's pan read, negative if the text stayed
 /// short of its end; `none` until the pan has read it), `events` what happened to the last drag, in
-/// order (`Probe.events`), and `wait` whether the
-/// drag tip is waiting for room (`TipWait`).
+/// order (`Probe.events`), `wait` whether the
+/// drag tip is waiting for room (`TipWait`), then `textAt=<last read>:<at let-go>|none` where the
+/// text under the last drag was when the drag last read it and when it let go, `textEnd=<points>|none`
+/// where it was when the watch ended, and `textMove=<from>-><to>@<frame>|<frame>…|none` its first
+/// move after the let-go with the call stack that made it (`Probe.watchText`; no spaces in any).
 enum ChatFieldDragMarker {
     static let identifier = "chatFieldDragMarker"
 
@@ -109,6 +113,18 @@ enum ChatFieldDragMarker {
     static func dragEnded(finished: Bool) {
         #if DEBUG
         if Probe.isActive { Probe.shared.dragEnded(finished: finished) }
+        #endif
+    }
+
+    /// The drag on the field let go or was cut off with `text` under it (the focused field's
+    /// scrolling text, if any), the text last read at `lastMoved` while the drag moved: records
+    /// where the text is now and, for `Probe.watchAfterLetGo`, its first move after that with the
+    /// call stack that made it, to find what moves a text the drag left scrolled (debug builds
+    /// only; nothing in release).
+    @MainActor
+    static func textLetGo(_ text: UIScrollView?, lastMoved: CGFloat) {
+        #if DEBUG
+        if Probe.isActive { Probe.shared.watchText(text, lastMoved: lastMoved) }
         #endif
     }
 
@@ -223,6 +239,61 @@ enum ChatFieldDragMarker {
             events.append(finished ? "end" : "cut")
         }
 
+        /// The text under the last drag: where it was when the drag last read it and at the
+        /// let-go, where it was when the watch ended, and its first move after the let-go with the
+        /// stack that made it; nil until a drag over a text lets go (`watchText`).
+        private(set) var textAtLetGo: String?
+        private(set) var textAtWatchEnd: String?
+        private(set) var textMoveAfterLetGo: String?
+        @ObservationIgnored private weak var watchedText: UIScrollView?
+        @ObservationIgnored private var textWatch: NSKeyValueObservation?
+        /// The most stack frames `textMoveAfterLetGo` keeps, the KeyValue machinery left out.
+        private static let textMoveFrames = 30
+
+        /// The drag let go with `text` under it, last read at `lastMoved`: notes where it is now and
+        /// watches its scroll position until its first move of a point or more, or until the watch
+        /// ends (`dragChanged`).
+        func watchText(_ text: UIScrollView?, lastMoved: CGFloat) {
+            stopTextWatch()
+            textMoveAfterLetGo = nil
+            textAtWatchEnd = nil
+            watchedText = text
+            guard let text else {
+                textAtLetGo = "none"
+                return
+            }
+            let from = text.contentOffset.y
+            textAtLetGo = String(format: "%.1f:%.1f", lastMoved, from)
+            textWatch = text.observe(\.contentOffset, options: [.new]) { [weak self] _, change in
+                // A scroll view's position changes on the main thread (layout and gesture driven).
+                MainActor.assumeIsolated {
+                    guard let self, let to = change.newValue?.y, abs(to - from) >= 1 else { return }
+                    self.textMoveAfterLetGo = String(format: "%.1f->%.1f@", from, to) + Self.stack()
+                    self.stopTextWatch()
+                }
+            }
+        }
+
+        private func stopTextWatch() {
+            textWatch?.invalidate()
+            textWatch = nil
+        }
+
+        /// The current call stack as `<module>:<symbol>` frames joined by `|`, spaces replaced, the
+        /// observer's own frame and the KeyValue machinery left out.
+        private static func stack() -> String {
+            Thread.callStackSymbols.dropFirst().compactMap { line -> String? in
+                let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+                guard parts.count > 3 else { return nil }
+                let symbol = parts.dropFirst(3).joined(separator: " ")
+                    .replacingOccurrences(of: #" \+ \d+$"#, with: "", options: .regularExpression)
+                guard !symbol.contains("KeyValue") else { return nil }
+                return "\(parts[1]):\(symbol)".replacingOccurrences(of: " ", with: "_")
+            }
+            .prefix(textMoveFrames)
+            .joined(separator: "|")
+        }
+
         func glassMoved(to minY: CGFloat) {
             glassTop = minY
             guard dragging, let glassRest else { return }
@@ -254,6 +325,11 @@ enum ChatFieldDragMarker {
                 rise = 0
                 pastEnd = nil
                 events = []
+                stopTextWatch()
+                watchedText = nil
+                textAtLetGo = nil
+                textAtWatchEnd = nil
+                textMoveAfterLetGo = nil
                 return
             }
             let token = UUID()
@@ -264,6 +340,10 @@ enum ChatFieldDragMarker {
                 self.heldAtSettle = PreviewFreezeGate.shared.isFrozen
                 try? await Task.sleep(for: Self.watchAfterLetGo - Self.sampleAfterLetGo)
                 guard self.watchToken == token else { return }
+                self.stopTextWatch()
+                if self.textAtLetGo != nil {
+                    self.textAtWatchEnd = self.watchedText.map { String(format: "%.1f", $0.contentOffset.y) } ?? "none"
+                }
                 self.watching = false
             }
         }
@@ -273,7 +353,7 @@ enum ChatFieldDragMarker {
             let at = String(format: "%.1f", newestMinY ?? -1)
             let tip = tipFrame.map { String(format: "%.1f:%.1f", $0.minY, $0.maxY) } ?? "none"
             let room = tipRoom.map { String(format: "%.1f", $0) }.joined(separator: ":")
-            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(pastEnd.map { String(format: "%.1f", $0) } ?? "none") events=\(events.isEmpty ? "none" : events.joined(separator: ",")) wait=\(tipWaiting ? 1 : 0)"
+            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(pastEnd.map { String(format: "%.1f", $0) } ?? "none") events=\(events.isEmpty ? "none" : events.joined(separator: ",")) wait=\(tipWaiting ? 1 : 0) textAt=\(textAtLetGo ?? "none") textEnd=\(textAtWatchEnd ?? "none") textMove=\(textMoveAfterLetGo ?? "none")"
         }
     }
 

@@ -154,8 +154,10 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(isInChat(app), "the chat stays")
     }
 
-    /// How far from the navigation bar and the panel a dim tap must land to be the dim's.
-    private static let dimTapMargin: CGFloat = 10
+    /// How far from the navigation bar and the panel a dim tap must land to be the dim's. The open
+    /// panel leaves about 17 points of dim below the bar on an iPhone, so the midpoint tap has
+    /// about 8 on each side.
+    private static let dimTapMargin: CGFloat = 5
 
     /// The swell is not the field's room: across a short drag and its settle the chat does not move.
     /// XCUITest reads frames only once the app is idle, after the spring, so the app's marker
@@ -256,12 +258,25 @@ final class ChatSwipeUITests: XCTestCase {
     }
 
     /// With nothing open, a back swipe that starts on the reply field goes back: the field's drag
-    /// takes only drags more up than sideways.
+    /// takes only drags more up than sideways. The drag runs most of the screen's width: the back
+    /// swipe takes it once the field's drag has declined, a few dozen points in, and a back swipe
+    /// that stops short of half the width before the finger lifts settles back, as iOS's does.
     func testNothingOpenRightDragOnTheReplyFieldGoesBack() {
         let app = launchIntoChat()
-        dragRight(atY: replyField(in: app).frame.midY, in: app)
+        let field = replyField(in: app)
+        let y = field.frame.midY / app.frame.height
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: Self.longBackSwipeStart, dy: y))
+        XCTAssertGreaterThan(start.screenPoint.x, field.frame.minX, "control: the drag starts on the field's text")
+        XCTAssertGreaterThan(start.screenPoint.x, Self.backSwipeEdge, "control: outside the screen edge's own back swipe")
+        start.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: Self.longBackSwipeEnd, dy: y)))
         XCTAssertTrue(wentBack(app), "a right drag from the field goes back")
     }
+
+    /// A right drag across most of the screen, and the screen edge's own back-swipe zone
+    /// (`ChatViewLayout.backSwipeEdgeWidth`), which a content back swipe starts outside of.
+    private static let longBackSwipeStart: CGFloat = 0.15
+    private static let longBackSwipeEnd: CGFloat = 0.95
+    private static let backSwipeEdge: CGFloat = 24
 
     /// Starts in the screen's margin beside the field, outside the field's glass.
     func testNothingOpenEdgeDragOnTheReplyFieldGoesBack() {
@@ -304,6 +319,7 @@ final class ChatSwipeUITests: XCTestCase {
         field.typeText(Self.shortQuestion)
         let typed = typedField(containing: Self.shortQuestion, in: app)
         XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
+        waitForTheKeyboardBack(under: typed, in: app)
         dragUp(atY: typed.frame.midY, in: app)
         XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag opened the panel while the field had focus")
         XCTAssertFalse(app.staticTexts[Self.signInBarText].exists, "control: signed in, the panel has its editor, not the sign-in bar")
@@ -559,15 +575,17 @@ final class ChatSwipeUITests: XCTestCase {
         field.typeText(Self.overflowingText)
         let long = typedField(containing: Self.overflowingLastLine, in: app)
         XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
+        waitForTheKeyboardBack(under: long, in: app)
         // Down to the text's top: the field's drag takes only drags up, so this is the text's scroll.
         textScroll(long, by: Self.toTheTextsTop, in: app)
-        XCTAssertEqual(topLine(of: long), "Line 1", "control: the text is at its top, with room to scroll")
+        XCTAssertEqual(topLine(of: long, in: app), "Line 1", "control: the text is at its top, with room to scroll")
         textScroll(long, by: -Self.withinTheScrollRoom, in: app)
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the drag scrolled the overflowing text; the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "and the field kept its focus")
-        let after = topLine(of: long)
+        let watched = dragMarkerLabel(afterDrags: 1, in: app)
+        let after = topLine(of: long, in: app)
         XCTAssertNotNil(after, "control: a line is at the text's top")
-        XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag")
+        XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag (marker: \(watched))")
         XCTAssertEqual(long.value as? String, Self.overflowingText, "control: the text is unchanged")
     }
 
@@ -609,9 +627,10 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertLessThan(marker.rise, 1, "the text kept the whole drag; the field's glass did not rise: \(marker.rise)")
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
-        let after = topLine(of: long)
+        let watched = dragMarkerLabel(afterDrags: 1, in: app)
+        let after = topLine(of: long, in: app)
         XCTAssertNotNil(after, "control: a line is at the text's top")
-        XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag")
+        XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag (marker: \(watched))")
         XCTAssertEqual(long.value as? String, Self.longDraft, "control: the draft is unchanged")
     }
 
@@ -656,9 +675,10 @@ final class ChatSwipeUITests: XCTestCase {
         field.typeText(text)
         let long = typedField(containing: lastLine, in: app)
         XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
+        waitForTheKeyboardBack(under: long, in: app)
         // Down to the text's top: the field's drag takes only drags up, so this is the text's scroll.
         textScroll(long, by: Self.toTheTextsTop, in: app)
-        XCTAssertEqual(topLine(of: long), "Line 1", "control: the text is at its top, with room to scroll")
+        XCTAssertEqual(topLine(of: long, in: app), "Line 1", "control: the text is at its top, with room to scroll")
         return long
     }
 
@@ -670,12 +690,14 @@ final class ChatSwipeUITests: XCTestCase {
     }
 
     /// The line at the top of the text: a tap at its top-left corner puts the caret at that line's
-    /// start, a typed mark shows where, and the mark is deleted again.
-    private func topLine(of text: XCUIElement) -> String? {
+    /// start, a typed mark shows where, and the mark is deleted again. The typing drops the software
+    /// keyboard for a moment, so it waits for it to come back before the next gesture.
+    private func topLine(of text: XCUIElement, in app: XCUIApplication) -> String? {
         text.coordinate(withNormalizedOffset: .zero).withOffset(Self.insideTheTextsCorner).tap()
         text.typeText(Self.lineMark)
         let value = text.value as? String ?? ""
         text.typeText(XCUIKeyboardKey.delete.rawValue)
+        waitForTheKeyboardBack(under: text, in: app)
         return value.components(separatedBy: "\n").first { $0.hasPrefix(Self.lineMark) }.map { String($0.dropFirst(Self.lineMark.count)) }
     }
 
@@ -700,16 +722,25 @@ final class ChatSwipeUITests: XCTestCase {
         field.typeText(Self.caretPhrase)
         let typed = typedField(containing: Self.caretPhrase, in: app)
         XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the phrase is in the field")
-        typed.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: Self.insideTheTextsCorner.dx, dy: 0))
+        waitForTheKeyboardBack(under: typed, in: app)
+        typed.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: Self.caretPressInset, dy: 0))
             .press(forDuration: Self.textLongPressHold)
         typed.typeText(Self.lineMark)
-        XCTAssertEqual(typed.value as? String, Self.lineMark + Self.caretPhrase,
+        // Found again by its last word, which the mark cannot split wherever it lands.
+        let marked = typedField(containing: Self.caretPhraseLastWord, in: app)
+        XCTAssertTrue(marked.waitForExistence(timeout: 5), "control: the field still holds the phrase")
+        XCTAssertEqual(marked.value as? String, Self.lineMark + Self.caretPhrase,
                        "the long press put the caret at the text's start")
         XCTAssertFalse(app.buttons["chatClose"].exists, "control: the press opened nothing")
     }
 
-    /// One short line, typed so the caret ends after it.
+    /// One short line, typed so the caret ends after it, and its last word.
     private static let caretPhrase = "Lunch works"
+    private static let caretPhraseLastWord = "works"
+    /// Where the long press lands, from the text's leading edge: the text's long press puts the
+    /// caret at the nearest character boundary, so a press past the middle of the first letter
+    /// (about 4 points at the body size) would put it after that letter.
+    private static let caretPressInset: CGFloat = 1
 
     /// Signed in, an overflowing draft at its top: a double tap on its first word makes the text
     /// view's own selection of that word, and the typed word replaces exactly that selection. The
@@ -742,6 +773,7 @@ final class ChatSwipeUITests: XCTestCase {
         field.typeText(Self.shortQuestion)
         let typed = typedField(containing: Self.shortQuestion, in: app)
         XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
+        waitForTheKeyboardBack(under: typed, in: app)
         let onTheWords = typed.coordinate(withNormalizedOffset: CGVector(dx: Self.onTheWordsDx, dy: 0.5))
         onTheWords.press(forDuration: Self.textLongPressHold,
                          thenDragTo: onTheWords.withOffset(CGVector(dx: 0, dy: -Self.pastTheOpenDistance)))
@@ -1414,6 +1446,40 @@ final class ChatSwipeUITests: XCTestCase {
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 
+    /// XCUITest types like a hardware keyboard: the simulator drops its software keyboard at the
+    /// first typed key and brings it back about one and a half seconds after the last, and the
+    /// focused field rides down and up with it. A gesture aimed at the field in between lands where
+    /// the field was. Returns once `element` holds still: above the software keyboard once it is
+    /// back, or, on a simulator that shows none, for longer than the keyboard takes to come back.
+    private func waitForTheKeyboardBack(under element: XCUIElement, in app: XCUIApplication) {
+        let keyboard = app.keyboards.firstMatch
+        var last: CGRect?
+        var stillSince = Date()
+        let deadline = Date().addingTimeInterval(Self.keyboardBackLimit)
+        repeat {
+            let frame = element.frame
+            if frame != last {
+                last = frame
+                stillSince = Date()
+            } else if keyboard.exists, keyboard.frame.height > app.frame.height * Self.keyboardMinShare,
+                      frame.maxY <= keyboard.frame.minY + 1 {
+                return
+            } else if Date().timeIntervalSince(stillSince) > Self.keyboardReturnWindow {
+                return
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.keyboardBackPollStep))
+        } while Date() < deadline
+        XCTFail("control: the field holds still after the typing (last at \(String(describing: last)))")
+    }
+
+    /// How long the field may keep moving after typing; how often it is read; the least share of the
+    /// screen's height a software keyboard covers (the hardware keyboard's small bar covers less);
+    /// how long a field with no software keyboard must hold still, past the keyboard's return.
+    private static let keyboardBackLimit: TimeInterval = 8
+    private static let keyboardBackPollStep: TimeInterval = 0.25
+    private static let keyboardMinShare: CGFloat = 0.25
+    private static let keyboardReturnWindow: TimeInterval = 2.5
+
     /// How long a focus read through the app's marker may take to settle.
     private static let focusMarkerPollLimit: TimeInterval = 3
     private static let focusMarkerPollStep: TimeInterval = 0.1
@@ -1516,6 +1582,15 @@ final class ChatSwipeUITests: XCTestCase {
             RunLoop.current.run(until: Date().addingTimeInterval(Self.focusMarkerPollStep))
         } while Date() < deadline
         return nil
+    }
+
+    /// The marker's raw label once it has seen `drags` drags and stopped watching the last one
+    /// (prefixed when it never stopped), for a failure message: its `textAt`, `textEnd` and
+    /// `textMove` say what moved the text under the drag after its let-go.
+    private func dragMarkerLabel(afterDrags drags: Int, in app: XCUIApplication) -> String {
+        let settled = dragMarker(afterDrags: drags, in: app) != nil
+        let marker = app.descendants(matching: .any)["chatFieldDragMarker"].firstMatch
+        return (settled ? "" : "unsettled: ") + (marker.exists ? marker.label : "none")
     }
 
     /// Drags the collapsed reply field up past the open distance and waits for the panel.

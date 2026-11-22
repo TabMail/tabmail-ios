@@ -155,6 +155,11 @@ enum ChatViewLayout {
     /// (`ChatFieldDrag.begins`), opens the panel exactly when it did. It is not a promise that every
     /// physical flick does, since UIKit's pan and SwiftUI's drag measure a finger in their own ways.
     static let fieldFlickCarry: CGFloat = 0.25
+    /// How long the finger may hold still before it lifts and still flick (`ChatFieldDrag.letGo`),
+    /// in seconds: UIKit's pan keeps the speed of the finger's last move at its let-go, so a drag
+    /// held still this long lets go at rest. Six frames at 60 Hz; a flick lifts within a frame or
+    /// two of its last move.
+    static let fieldFlickRest: TimeInterval = 0.1
     /// The pill's spring (the panel opening and closing, the field's swell springing back): its
     /// response in seconds and its damping ratio. A drag's settle lasts this spring's own settling
     /// duration (`ChatThreadView.fieldDragSettle`).
