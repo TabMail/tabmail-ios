@@ -1311,7 +1311,8 @@ read by `accountId`, tens per account); no query selects by the mark alone.
 
 **Consequences.** A folder the user has acted in is kept current like a favourite, at the cost of its change
 read and catch-up from then on. The set only grows; a folder the user stops using stays followed.
-Limits (each recovers through the ordinary schedule, because the folder is followed from then on):
+Limits (each recovers through the ordinary schedule, because the folder is followed from then on, except
+the #1268 label sets and the #1276 cost, as their bullets say):
 - An access that comes inside an open slice window waits for it (at most `catchUpSliceIntervalSeconds`).
 - A visit shorter than the folder view's start delay before its sync is not an access: no sync starts,
   so the folder is not marked. This is on purpose: the mark is never cleared, so a folder tapped by
@@ -1336,9 +1337,19 @@ Limits (each recovers through the ordinary schedule, because the folder is follo
   the teardown can cancel the new registration's access run; the marks stay, and the ordinary catch-up
   reconciles the folders.
 - Following widens two existing limits to followed folders: a Gmail label's re-read overflow cut in a
-  syncable label drops the retry for a label set the catch-up never replaces (#1268); Outlook reads
-  tracking folders before baselines every pass, so with many synced folders a new followed folder can
-  wait long for its baseline, and its catch-up stays gated meanwhile (#1269).
+  syncable label drops the retry for a label set the catch-up never replaces, so a cut message's user
+  labels stay stale until a later change to that message is read; the ordinary schedule does not
+  recover them (#1268). Outlook reads tracking folders before baselines every pass, in a fixed order,
+  so once the tracking folders fill a pass's request allowance every baseline waits: a new followed
+  folder's, and a main folder's re-baseline after a refused change token (the Inbox is first only
+  within its phase), whose catch-up stays gated meanwhile; in a background pass the later tracking
+  folders, secondary roles included, are not read either. A foreground pass recovers them for
+  realistic folder counts (#1269).
+- On IMAP without CONDSTORE no folder holds a change bookmark, so every folder is untracked, and an
+  access whose counters moved lists the whole folder again: an arrival raises UIDNEXT, and the user's
+  own archive out of the Inbox lowers EXISTS and raises the Archive's counters. While a user triages,
+  the Inbox and the Archive are listed far more often than the daily check did (paced by the slice
+  window). Cost only, nothing shown is wrong; skipping counters that show only arrivals is #1276.
 - Pre-existing, not changed here: an IMAP folder the reader can no longer track keeps its bookmark on
   purpose, so the catch-up plan counts it as tracked and it gets neither the daily nor the access check
   (#1264).
@@ -1364,4 +1375,4 @@ Keywords: isFollowed, followed folder, follow mark, markFollowed, followedColumn
 followFolders, startAccessCatchUp, access catch-up run, accessedFolderIds, accessCatchUpRunSeconds,
 catchUpAccessCheckAgeSeconds, completionCounters, firstCounters, Counters, syncable set, isSyncable,
 custom non-favourite folder, sync on demand, v112_addFolderIsFollowed, accessesFolder, body poll, #1109,
-#1263, #1264, #1268, #1269.
+#1263, #1264, #1268, #1269, #1276.

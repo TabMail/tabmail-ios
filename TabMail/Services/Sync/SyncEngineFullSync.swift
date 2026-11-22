@@ -321,9 +321,11 @@ extension SyncEngine {
              try Account.fetchOne(db, key: account.id)?.lastHistoryId != nil)
         }
 
-        // Sync messages for main roles + favorited folders, prioritized:
-        // inbox first, then favorites, then secondary roles, then custom.
-        // Custom non-favorited folders sync on-demand when the user navigates to them.
+        // Sync messages for the syncable folders (main roles, favourites and
+        // followed folders, `SyncEngine.isSyncable`), prioritized: inbox first,
+        // then favorites, then secondary roles, then followed folders. A custom
+        // folder no user action has landed in syncs on demand when the user
+        // navigates to it, which also follows it (#1109).
         let syncableFolders = syncableFoldersInOrder(folders)
 
         BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) syncing \(syncableFolders.count) folders: \(syncableFolders.map(\.name).joined(separator: ", "))")
@@ -613,10 +615,10 @@ extension SyncEngine {
     @discardableResult
     func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws -> ListingOutcome? {
         // T4.S6 re-drive — the THIRD owner, and the ONLY one that reaches a custom
-        // non-favourite folder. `fullSync` (after its listing, in the pass's own
-        // task) and `imapDeltaSync` both branch into the reaction for a quarantined
-        // folder, but both iterate
-        // `syncableFolders` (primary ∪ secondary ∪ favourite), so a quarantined
+        // folder that is neither a favourite nor followed. `fullSync` (after its
+        // listing, in the pass's own task) and `imapDeltaSync` both branch into the
+        // reaction for a quarantined folder, but both iterate
+        // `syncableFolders` (primary ∪ secondary ∪ favourite ∪ followed, #1109), so a quarantined
         // custom folder previously had NO re-drive at all: `runSyncMessages`'s
         // in-transaction quarantine term correctly SKIPS the merge pass and
         // `isFolderWalkComplete` refuses the crawl, which together left the folder

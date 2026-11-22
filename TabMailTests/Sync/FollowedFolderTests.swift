@@ -93,7 +93,9 @@ struct FollowedFolderMarkTests {
         #expect(P.catchUpPlan(state: state(recent, counters), freshModSeq: nil, now: now, counters: fewer) == .none)
         // An access with nothing moved and a recent listing: nothing.
         #expect(P.catchUpPlan(state: state(recent, counters), freshModSeq: nil, now: now, counters: counters, accessed: true) == .none)
-        // A message removed elsewhere moves EXISTS; one arriving moves UIDNEXT.
+        // A message removed elsewhere lowers EXISTS (`fewer`). With EXISTS equal, a
+        // moved UIDNEXT means one message arrived and another was removed
+        // (`arrived`). Either moved counter lists the folder.
         #expect(P.catchUpPlan(state: state(recent, counters), freshModSeq: nil, now: now, counters: fewer, accessed: true) == list(fewer))
         #expect(P.catchUpPlan(state: state(recent, counters), freshModSeq: nil, now: now, counters: arrived, accessed: true) == list(arrived))
         // A flag change moves no counter: past the access age the folder is listed anyway.
