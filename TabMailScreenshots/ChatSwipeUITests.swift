@@ -416,6 +416,18 @@ final class ChatSwipeUITests: XCTestCase {
         assertTipStaysGoneOnTheNextPresentations(of: app)
     }
 
+    /// The app's own tip rules on a fresh datastore of the test's own: the tip shows at most once.
+    /// Once its whole card has shown, it is spent even when the user leaves the chat without
+    /// touching the field or closing the tip: it does not come back when the chat is opened again
+    /// with room for it, nor after a relaunch on the same datastore.
+    func testFieldDragTipShownOnceStaysGoneAfterLeavingTheChat() {
+        let app = launchIntoChat(tipStore: .fresh)
+        let tip = app.staticTexts[Self.fieldDragTipText].firstMatch
+        XCTAssertTrue(tip.waitForExistence(timeout: 5), "control: on a fresh datastore the tip shows")
+        assertTipCardFits(shownTipCard(in: app), "control: its whole card showed between the header and the field")
+        assertTipStaysGoneOnTheNextPresentations(of: app)
+    }
+
     /// The ended tip stays gone when the chat is opened again in the same launch, and in a relaunch
     /// on the same datastore.
     private func assertTipStaysGoneOnTheNextPresentations(of app: XCUIApplication,
@@ -1337,8 +1349,11 @@ final class ChatSwipeUITests: XCTestCase {
     /// The TipKit datastore of the tip tests' own, under the app's own tip rules (nothing forced):
     /// emptied at this launch, or kept from the launch before.
     private enum TipStore { case fresh, kept }
-    /// The name of that datastore, the same across a test's launches.
-    private static let tipStoreName = "chat-field-drag-tip-ui-test"
+    /// With the tip rules live the onboarding gate is open, so the chat's own first-open notice (the
+    /// AI summaries popover, which keeps its own flag outside TipKit) would open over the first
+    /// landing of a fresh install and take the test's first touch. This launch argument marks it as
+    /// already shown for that launch only (the argument domain), and stores nothing.
+    private static let noticeAlreadyShown = ["-chatView.aiSummariesNotice.shownOnFirstOpen", "YES"]
 
     private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false,
                                 lateSuggestion: Bool = false, unread: Bool = false,
@@ -1363,7 +1378,7 @@ final class ChatSwipeUITests: XCTestCase {
             + (signedIn ? ["--chat-swipe-signed-in"] : [])
             + (openPanelUnderDrag ? ["--chat-swipe-open-panel-under-drag"] : [])
         if let tipStore {
-            app.launchArguments += ["--chat-field-drag-tip-store", Self.tipStoreName]
+            app.launchArguments += ["--chat-field-drag-tip-store"] + Self.noticeAlreadyShown
             if tipStore == .fresh { app.launchArguments.append("--chat-field-drag-tip-fresh") }
         }
         app.launch()

@@ -1183,11 +1183,18 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    empty stand-in). The tip's lifecycle is tested under the app's own TipKit rules, nothing forced,
    on a datastore of the test's own that a relaunch keeps (`--chat-field-drag-tip-store`, emptied
    first with `--chat-field-drag-tip-fresh`; amended 2026-11-21, since forcing the tip on bypasses
-   its eligibility and brings it back after it is ended):
+   its eligibility and brings it back after it is ended). The app configures TipKit once with its
+   live pacing and the debug fixture changes only where the datastore is: one fixed folder of the
+   swipe fixture's (`TabMailApp.fieldDragTipTestStore`, honoured only with `--chat-swipe-ui-test`;
+   amended 2026-11-22). Those launches mark the chat's AI summaries notice as already shown for
+   that launch only, since with the onboarding gate open it would otherwise open over the first
+   landing of a fresh install:
    `testFieldDragTipWaitingForRoomKeepsItsOneShowing` (landscape at the largest text size the tip
    waits and shows no card; relaunched upright on the same datastore it shows whole),
    `testFieldDragTipStaysGoneAfterAShortDrag` and `testFieldDragTipStaysGoneAfterATap` (ended, it
-   stays gone in the chat opened again and after a relaunch on the same datastore).
+   stays gone in the chat opened again and after a relaunch on the same datastore), and
+   `testFieldDragTipShownOnceStaysGoneAfterLeavingTheChat` (shown at most once: after its whole card
+   has shown, leaving the chat without touching the field or the tip spends it).
 
 21. **A new email rises into the open chat (amendment 2026-11-20).** When the newest email changes
    after the chat has landed (`ChatArrival.isArrival`), the new bubble rises from behind the reply

@@ -66,6 +66,29 @@ struct TabMailApp: App {
     ) async {
         await initializeEmbeddingAfterStartup(readiness: readiness, initialize: initialize)
     }
+
+    /// Debug UI tests only (`--chat-swipe-ui-test` with `--chat-field-drag-tip-store`): the swipe
+    /// fixture's own TipKit datastore, one fixed folder in the temporary directory, so a test can
+    /// follow the drag tip's one showing from launch to launch; emptied first when the launch also
+    /// says `--chat-field-drag-tip-fresh`. A folder that cannot be emptied or made stops the launch,
+    /// so the test fails at once instead of reading an old datastore.
+    static func fieldDragTipTestStore() -> URL {
+        let files = FileManager.default
+        let store = files.temporaryDirectory.appendingPathComponent(fieldDragTipTestStoreName, isDirectory: true)
+        do {
+            if ProcessInfo.processInfo.arguments.contains("--chat-field-drag-tip-fresh"),
+               files.fileExists(atPath: store.path) {
+                try files.removeItem(at: store)
+            }
+            try files.createDirectory(at: store, withIntermediateDirectories: true)
+        } catch {
+            preconditionFailure("The drag tip test's datastore could not be prepared: \(error)")
+        }
+        return store
+    }
+
+    /// The folder name of that datastore.
+    static let fieldDragTipTestStoreName = "chat-field-drag-tip-ui-test"
     #endif
 
     init() {
@@ -173,13 +196,11 @@ struct TabMailApp: App {
         #if DEBUG
         let arguments = ProcessInfo.processInfo.arguments
         let showsFieldDragTip = arguments.contains("--chat-field-drag-tip")
-        let fieldDragTipStore = arguments.firstIndex(of: "--chat-field-drag-tip-store")
-            .flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil }
-        let freshFieldDragTipStore = arguments.contains("--chat-field-drag-tip-fresh")
+        let usesFieldDragTipStore = arguments.contains("--chat-swipe-ui-test")
+            && arguments.contains("--chat-field-drag-tip-store")
         #else
         let showsFieldDragTip = false
-        let fieldDragTipStore: String? = nil
-        let freshFieldDragTipStore = false
+        let usesFieldDragTipStore = false
         #endif
         if showsFieldDragTip {
             // Debug UI tests only: a fresh datastore with the chat field's drag tip forced on, so
@@ -190,31 +211,28 @@ struct TabMailApp: App {
                 .displayFrequency(.immediate),
                 .datastoreLocation(.applicationDefault)
             ])
-        } else if let fieldDragTipStore {
-            // Debug UI tests only: the app's own tip pacing and rules, nothing forced, on a datastore
-            // of the test's own that outlives a relaunch (emptied first when the test asks), so a
-            // test can follow the drag tip's one showing from launch to launch. The swipe fixture
-            // has no RootView to open the onboarding gate, so it is opened here, as for a user past
-            // onboarding.
-            let store = FileManager.default.temporaryDirectory.appendingPathComponent(fieldDragTipStore, isDirectory: true)
-            if freshFieldDragTipStore { try? FileManager.default.removeItem(at: store) }
-            try? FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
-            try? Tips.configure([
-                .displayFrequency(.daily),
-                .datastoreLocation(.url(store))
-            ])
-            OnboardingTipGate.onboardingComplete = true
-        } else if ScreenshotMode.isActive || ScreenshotMode.isSplashMode {
+        } else if (ScreenshotMode.isActive || ScreenshotMode.isSplashMode) && !usesFieldDragTipStore {
             // Suppress all tips in screenshot mode
             try? Tips.configure([
                 .datastoreLocation(.applicationDefault)
             ])
             Tips.hideAllTipsForTesting()
         } else {
+            var tipStore = Tips.ConfigurationOption.DatastoreLocation.applicationDefault
+            #if DEBUG
+            // Debug UI tests only: these same tip rules, nothing forced, on the swipe fixture's own
+            // datastore, which outlives a relaunch (`Self.fieldDragTipTestStore`).
+            if usesFieldDragTipStore { tipStore = .url(Self.fieldDragTipTestStore()) }
+            #endif
             try? Tips.configure([
                 .displayFrequency(.daily),
-                .datastoreLocation(.applicationDefault)
+                .datastoreLocation(tipStore)
             ])
+            #if DEBUG
+            // The swipe fixture has no RootView to open the onboarding gate: opened here, as for a
+            // user past onboarding.
+            if usesFieldDragTipStore { OnboardingTipGate.onboardingComplete = true }
+            #endif
         }
 
         // Enable battery monitoring for power-aware backfill (BackfillProfile).
