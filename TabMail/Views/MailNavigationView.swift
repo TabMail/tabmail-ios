@@ -136,6 +136,9 @@ struct MailNavigationView: View {
     @State private var columnVisibility = NavigationSplitViewVisibility.automatic
     @State private var expandedAccounts: Set<String> = []
     @State private var templateSheetItem: TemplateSheetItem?
+    /// Whether the list has a sheet or cover up, written by the list and read by the detail
+    /// column's screens as a new-email request arrives (`ListPresentationState`).
+    @State private var listPresentation = ListPresentationState()
     private var manager: AccountManager { AccountManager.shared }
     private var state: AccountManagerState { AccountManagerState.shared }
 
@@ -583,6 +586,7 @@ struct MailNavigationView: View {
             // `pushedMessageId` doc comment above for why pill opens use this
             // instead of `selectedMessageId`.
             MailContentColumn(selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId)
+                .environment(\.listPresentationWriter, listPresentation)
                 .navigationDestination(item: $pushedMessageId) { id in
                     PushedMessageDestination(messageId: id)
                 }
@@ -600,6 +604,7 @@ struct MailNavigationView: View {
             // SwiftUI skips MessageDetailContainer.body when selectedMessageId
             // hasn't changed, even if the parent re-renders.
             MessageDetailContainer(selectedMessageId: selectedMessageId, notificationOpenedId: notificationOpenedId)
+                .environment(\.listPresentationBesideDetail, listPresentation)
         }
         .background(Palette.previewPaneBg)
         .onChange(of: selection) { oldValue, newValue in

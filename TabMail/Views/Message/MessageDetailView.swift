@@ -69,6 +69,8 @@ struct MessageDetailView: View {
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) var optOutAllAI = false
     @Environment(\.dismiss) var dismiss
     @Environment(\.hasTabMailSession) var hasTabMailSession
+    /// In the detail column: whether the list beside it has a sheet or cover up (`ListPresentationState`).
+    @Environment(\.listPresentationBesideDetail) private var listPresentationBesideDetail
 
     var anyAISourceEnabled: Bool {
         (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
@@ -208,6 +210,10 @@ struct MessageDetailView: View {
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
+                // With a sheet or cover of its own up (a new email's included), this screen takes
+                // no request: what is up is not replaced. In the detail column it takes none while
+                // the list beside it has a sheet or cover up (iPad).
+                guard !isAnyCoverPresented, listPresentationBesideDetail?.isUp != true else { return }
                 guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
                 withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                     chatExpanded = false

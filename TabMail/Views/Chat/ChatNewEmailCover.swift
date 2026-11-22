@@ -41,6 +41,39 @@ struct ChatNewEmailCover: Identifiable {
     }
 }
 
+/// Whether the list has a sheet or cover of its own up (Search, a reply, compose, a move or label
+/// sheet, a new email). On iPad the detail column beside the list is then behind it, so the screen
+/// there takes no new-email request. The list writes it (`listPresentationWriter`); only the detail
+/// column reads it (`listPresentationBesideDetail`), so an email opened inside the list's Search
+/// sheet, which carries the list's environment, still takes one. Not observed: it is read only as
+/// a request arrives, so it never redraws a screen.
+@MainActor
+final class ListPresentationState {
+    var isUp = false
+}
+
+private struct ListPresentationWriterKey: EnvironmentKey {
+    static let defaultValue: ListPresentationState? = nil
+}
+
+private struct ListPresentationBesideDetailKey: EnvironmentKey {
+    static let defaultValue: ListPresentationState? = nil
+}
+
+extension EnvironmentValues {
+    /// The list's presentation state, given to the list column, which keeps it current.
+    var listPresentationWriter: ListPresentationState? {
+        get { self[ListPresentationWriterKey.self] }
+        set { self[ListPresentationWriterKey.self] = newValue }
+    }
+
+    /// The same state, given to the detail column only, whose screens read it.
+    var listPresentationBesideDetail: ListPresentationState? {
+        get { self[ListPresentationBesideDetailKey.self] }
+        set { self[ListPresentationBesideDetailKey.self] = newValue }
+    }
+}
+
 /// What a `ChatNewEmailCover` shows.
 struct ChatNewEmailCoverView: View {
     let cover: ChatNewEmailCover

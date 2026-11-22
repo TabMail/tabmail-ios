@@ -119,6 +119,8 @@ struct ChatThreadView: View {
     @Environment(\.hasTabMailSession) private var hasTabMailSession
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// In the detail column: whether the list beside it has a sheet or cover up (`ListPresentationState`).
+    @Environment(\.listPresentationBesideDetail) private var listPresentationBesideDetail
     /// Held only while a grow is pending: set when the AI Suggestion's row becomes Writing, cleared
     /// inside the fill's `withAnimation` (`showSuggestion`), so the working bubble filling in is one
     /// animated transaction with its re-pin. A ready suggestion with nothing held is the ghost, so
@@ -308,9 +310,10 @@ struct ChatThreadView: View {
         }
         // A contact pill or a `mailto:` link: one screen takes each request, the one on top. This
         // chat takes it while it shows and nothing is presented over it; its email card's screen
-        // takes it while that card is up, and a pushed screen (`isOnScreen`) takes it itself.
+        // takes it while that card is up, and a pushed screen (`isOnScreen`) takes it itself. In
+        // the detail column it takes none while the list beside it has a sheet or cover up (iPad).
         .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
-            guard isOnScreen, !isAnyPresentation else { return }
+            guard isOnScreen, !isAnyPresentation, listPresentationBesideDetail?.isUp != true else { return }
             guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
             withAnimation(Self.pillSpring) { chatExpanded = false }
             newEmailCover = .make(

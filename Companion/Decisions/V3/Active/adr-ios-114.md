@@ -1585,6 +1585,22 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        link did nothing while a chat was open. A request that arrives while another screen is
        presented over the chat, or while Search is open with no email opened in it, is not taken
        (as before for Search): the user taps again once it closes.
+       A screen with a sheet or cover of its own up takes none either, its own new email's included
+       (review ruling 2026-11-22): a second request never replaces a new email being written, and
+       nothing is queued for later. The list counts every sheet and cover it presents
+       (`InboxView.isAnyListPresentation`), the email screen its own (`isAnyCoverPresented`), a chat
+       its own (`isAnyPresentation`). On iPad the screen in the detail column stays on screen behind
+       the list's Search or any other sheet or cover the list has up, so the list reports what it
+       has up (`ListPresentationState`, written through `listPresentationWriter` on the list column)
+       and the detail column's chat and email screen take nothing while it is up; only the detail
+       column reads it (`listPresentationBesideDetail`), so an email opened inside Search, which
+       carries the list's environment, still takes the request.
+     - *A save whose push was refused (review ruling 2026-11-22).* A save writes the row on the
+       device first and then queues its push to the server's Drafts; when only the queue refuses,
+       the row still holds that version. From then on the row is what later saves compare with, not
+       what the link brought: going back to the link's own words, or emptying the field, is saved
+       over it, and the next save writes and queues the push again even when nothing changed
+       (`ChatNewDraftSave.run` reports `committed`; `ChatNewThreadModel.pushPending`).
    - *Later, with the compose card.* The compose card stays today's compose; the chat's draft is
      deleted only once the card's Send has a durable outbox row (never-drop). The card's delivery and
      the Sending bubble come with that work, decided now so it is built on them:

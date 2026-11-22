@@ -236,6 +236,23 @@ struct InboxView: View {
     /// A new email asked for by a contact pill or a `mailto:` link while the list is on top: today's
     /// compose or the new email's chat, decided as it arrives (`ChatNewEmailCover`).
     @State private var newEmailCover: ChatNewEmailCover?
+    /// Where the list reports `isAnyListPresentation` for the detail column beside it (iPad).
+    @Environment(\.listPresentationWriter) private var listPresentationWriter
+
+    /// A sheet or cover the list itself has up (Search included). The list then takes no new-email
+    /// request: what is up is not replaced, and a second presentation from the list would not show.
+    private var isAnyListPresentation: Bool {
+        newEmailCover != nil
+            || showSearch
+            || viewModel.showCompose
+            || replyMessage != nil
+            || draftOpen != nil
+            || agentCompose != nil
+            || moveMessageId != nil
+            || moveThreadGroup != nil
+            || labelMenuMessage != nil
+            || showLabelFilterPicker
+    }
 
     init(title: String, folders: [Folder], selection: MailboxSelection, selectedMessageId: Binding<String?>, pushedMessageId: Binding<String?>) {
         self.title = title
@@ -769,8 +786,9 @@ struct InboxView: View {
         .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
             // One screen takes each request, the one on top: an email opened over the list, by a
             // row (`selectedMessageId`) or an email pill (`pushedMessageId`), takes it itself, its
-            // chat or its email screen, and so does an email opened in Search.
-            guard selectedMessageId == nil, pushedMessageId == nil, !showSearch else { return }
+            // chat or its email screen, and so does an email opened in Search. With a sheet or cover
+            // of its own up, the list takes none (`isAnyListPresentation`).
+            guard selectedMessageId == nil, pushedMessageId == nil, !isAnyListPresentation else { return }
             guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                 chatExpanded = false
@@ -781,6 +799,9 @@ struct InboxView: View {
             BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose: \(request.to.first ?? "")")
         }
         .fullScreenCover(item: $newEmailCover) { ChatNewEmailCoverView(cover: $0) }
+        // The detail column beside the list is behind whatever the list has up.
+        .onChange(of: isAnyListPresentation, initial: true) { _, up in listPresentationWriter?.isUp = up }
+        .onDisappear { listPresentationWriter?.isUp = false }
         .toolbarVisibility(chatExpanded && chatInputFocused ? .hidden : .automatic, for: .navigationBar)
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)

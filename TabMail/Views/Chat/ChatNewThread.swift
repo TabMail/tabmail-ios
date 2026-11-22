@@ -62,7 +62,7 @@ enum ChatNewDraft {
     /// save and shown in the chat; changed on the compose card. Bcc stays Bcc.
     struct Carried: Equatable {
         var subject: String?
-        /// Mailboxes as a draft stores them (`entries(_:)`).
+        /// Mailboxes as a draft stores them (`RecipientEntry.draftEntries`).
         var cc: [String]
         var bcc: [String]
 
@@ -73,14 +73,6 @@ enum ChatNewDraft {
             guard let subject, !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return subject
         }
-    }
-
-    /// Recipient entries as a draft stores them: each mailbox as text that reads back as itself
-    /// (`RecipientEntry.text`, as compose writes its tokens), then the entries that name no
-    /// address, as written. A link's `"Doe, John" <john@example.com>` stays one mailbox.
-    static func entries(_ raw: [String]) -> [String] {
-        let entry = RecipientEntry(raw)
-        return entry.recipients.map { RecipientEntry.text(name: $0.name, address: $0.address) } + entry.leftovers
     }
 
     /// The chat area's line for Cc or Bcc: "Cc: Sam and Alex." Nil when there is no one.
@@ -193,7 +185,8 @@ enum ChatNewDraftSave {
 
     /// `to` is the chat's recipients; a subject, Cc or Bcc the row already holds (written in
     /// compose, or by this chat's first save) is kept, as the chat does not edit them. A new row
-    /// takes them from `carried`, what a `mailto:` link brought.
+    /// takes them from `carried`, what a `mailto:` link brought. `committed` says the row now
+    /// holds this version on the device: true also when only the queue refused its push.
     static func run(
         draftId: String,
         accountId: String,
@@ -204,7 +197,7 @@ enum ChatNewDraftSave {
         cursor: ComposeGenerationCursor,
         now: Double,
         queueDraftSave: QueueDraftSave = queueThroughAccounts
-    ) async -> Outcome {
+    ) async -> (outcome: Outcome, committed: Bool) {
         let written = await ComposeDraftSave.run(
             draftId: draftId, accountId: accountId, attachments: attachments, now: now,
             fields: { existing in
@@ -222,18 +215,18 @@ enum ChatNewDraftSave {
         case .committed:
             break
         case .readFailed:
-            return .refused(busyMessage)
+            return (.refused(busyMessage), false)
         case .attachmentsNotStaged(let reason):
-            return .refused("The attachments couldn't be saved: \(reason)")
+            return (.refused("The attachments couldn't be saved: \(reason)"), false)
         case .saveFailed(let reason):
-            return .refused("This draft couldn't be saved: \(reason)")
+            return (.refused("This draft couldn't be saved: \(reason)"), false)
         case .superseded:
-            return .refused("This draft couldn't be saved: \(DraftStore.DraftEpochAdmissionError.staleOrReserved.localizedDescription)")
+            return (.refused("This draft couldn't be saved: \(DraftStore.DraftEpochAdmissionError.staleOrReserved.localizedDescription)"), false)
         }
         guard await queueDraftSave(draftId, accountId) else {
-            return .refused(notQueuedMessage)
+            return (.refused(notQueuedMessage), true)
         }
-        return .saved
+        return (.saved, true)
     }
 }
 
@@ -277,6 +270,9 @@ final class ChatNewThreadModel: Hashable {
     let carryGate = ComposeAttachmentCarryGate()
     /// What the saved row holds, as last read or written here; nil while there is no row.
     @ObservationIgnored private var saved: ChatNewDraft.Content?
+    /// The row holds `saved` on the device but the queue refused its push: the next save writes
+    /// and queues it again, changed or not.
+    @ObservationIgnored private var pushPending = false
     /// What the chat opened with: a contact's or a link's people and words, or nothing. Left as
     /// it is, it is not saved (`ChatNewDraft.needsSave`).
     private let openedContent: ChatNewDraft.Content
@@ -310,8 +306,8 @@ final class ChatNewThreadModel: Hashable {
         words = startWords
         carried = ChatNewDraft.Carried(
             subject: request?.subject,
-            cc: ChatNewDraft.entries(request?.cc ?? []),
-            bcc: ChatNewDraft.entries(request?.bcc ?? []))
+            cc: RecipientEntry(request?.cc ?? []).draftEntries,
+            bcc: RecipientEntry(request?.bcc ?? []).draftEntries)
         attachments = []
         attachmentLoadFailed = false
         cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
@@ -425,14 +421,15 @@ final class ChatNewThreadModel: Hashable {
     }
 
     /// Saves the draft when leaving or going to the background requires it (`needsSave`), after
-    /// any picked photo still loading has landed. One save at a time: a second waits for the first
+    /// any picked photo still loading has landed, or when the last version saved on the device
+    /// still waits for its push (`pushPending`). One save at a time: a second waits for the first
     /// and then decides again. Returns `.saved` when nothing needed saving.
     func saveIfNeeded(now: () -> Date = Date.init) async -> ChatNewDraftSave.Outcome {
         await carryGate.waitUntilSettled()
         // No suspension between this loop and the save's start below, so no two saves overlap.
         while let running = inFlight { _ = await running.value }
         let snapshot = content
-        guard ChatNewDraft.needsSave(current: snapshot, saved: saved, opened: openedContent) else { return .saved }
+        guard pushPending || ChatNewDraft.needsSave(current: snapshot, saved: saved, opened: openedContent) else { return .saved }
         guard !attachmentLoadFailed else { return .refused(Self.attachmentLoadMessage) }
         guard let account else { return .refused(Self.noAccountMessage) }
         let to = snapshot.recipients
@@ -444,11 +441,16 @@ final class ChatNewThreadModel: Hashable {
         let queue = queueDraftSave
         let savedAt = now()
         let task = Task { @MainActor () -> ChatNewDraftSave.Outcome in
-            let outcome = await ChatNewDraftSave.run(
+            let (outcome, committed) = await ChatNewDraftSave.run(
                 draftId: id, accountId: account.id, to: to, body: body, carried: kept, attachments: files,
                 cursor: generation, now: savedAt.timeIntervalSince1970, queueDraftSave: queue)
-            if outcome == .saved {
+            // A row written on the device is what later saves compare with, even when its push
+            // was refused: a link's untouched words are then saved over it, not skipped.
+            if committed {
                 self.saved = snapshot
+                self.pushPending = outcome != .saved
+            }
+            if outcome == .saved {
                 self.savedAt = savedAt
             }
             self.inFlight = nil
