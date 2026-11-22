@@ -30,8 +30,9 @@ struct ChatFieldDragTests {
         let measured: CGFloat = 158.287109375
         let runRemainder = ChatThreadView.pillHeightMoved(from: measured, to: 158.28710937500003)
         #expect(!runRemainder, "the UI run's remainder is the same height")
-        // The swell's round trip as the layout makes it: added inside the glass under the field's
-        // chrome, taken back out around it, for every swell a drag reaches in thirds of a point.
+        // The swell's round trip, as this test models the layout's arithmetic (SwiftUI does not
+        // document its order of sums): added inside the glass under the field's chrome, taken back
+        // out around it, for every swell a drag reaches in thirds of a point.
         let text: CGFloat = 130.33333333333334
         let chrome = measured - text
         var remainders = 0
@@ -642,6 +643,39 @@ struct ChatFieldDragTests {
             let expected = kept ? Self.sample(0, -30 + down, speed: 200) : Self.sample(0, 0)
             #expect(back == expected, "\(down) down with the text \(down) short: kept \(kept)")
         }
+    }
+
+    @Test("A finger that comes back down slowly, half a point a sample, ends the hand-off once it has come down more than a point in all; a flick up at the let-go then opens nothing")
+    @MainActor
+    func slowReversalAddsUp() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        text.contentOffset = CGPoint(x: 0, y: end / 2)
+        coordinator.touchDown(on: inner)
+        text.contentOffset = CGPoint(x: 0, y: end)
+        let past = coordinator.share(Self.sample(0, -130))
+        #expect(past == Self.sample(0, -30), "control: past the end the field has the rest")
+        // Half a point down a sample, the text following it, to 10 down: no one sample comes down
+        // more than a point (stated here, not read from the layout's value), the finger has by the
+        // third.
+        let step: CGFloat = 0.5
+        for n in 1...20 {
+            let down = step * CGFloat(n)
+            text.contentOffset = CGPoint(x: 0, y: end - down)
+            let shared = coordinator.share(Self.sample(0, -130 + down, speed: 60))
+            let ended = down > 1
+            let expected = ended ? Self.sample(0, 0) : Self.sample(0, -30 + down, speed: 60)
+            #expect(shared == expected, "\(down) down in half-point samples: the field's share ended \(ended)")
+        }
+        // A flick up as the finger lifts, the text 5 short.
+        text.contentOffset = CGPoint(x: 0, y: end - 5)
+        let flick = coordinator.share(ChatFieldDrag.letGo(Self.sample(0, -125, speed: -600), rested: 0), atLetGo: true)
+        #expect(flick == Self.sample(0, 0), "the let-go gives the field nothing")
+        let shut = !ChatFieldDrag.opens(letGo: flick)
+        #expect(shut, "the panel stays shut")
+        let fromTheOldHandOff = ChatFieldDrag.opens(letGo: Self.sample(0, -25, speed: -600))
+        #expect(fromTheOldHandOff, "control: 25 up from the old hand-off with the flick would have opened it")
     }
 
     @Test("The finger came back down once it is more than a point below its highest point since the hand-off; a point or less, or not at all, is still the finger going up")
