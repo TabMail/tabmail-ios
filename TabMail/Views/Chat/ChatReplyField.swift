@@ -307,17 +307,24 @@ struct ChatReplyCompose: Equatable {
     }
 
     /// Whether a draft with `recipients` and `subject`, from `accountId`, is this envelope: the same
-    /// subject, exactly, and the same addresses in each role. Names and order do not count.
+    /// subject, exactly, and in each role the same addresses and the same entries that name no
+    /// sendable address (a Reply-To's `undisclosed-recipients:;`), each read as its text, in any
+    /// case. Names and order do not count.
     func holds(recipients: ComposeDraftGuards.Recipients, subject: String, accountId: String, of message: MessageHeader) -> Bool {
         func addresses(_ list: [String]) -> Set<String> { Set(RecipientEntry(list).addresses.map { $0.lowercased() }) }
         func addresses(_ field: ComposeDraftGuards.RecipientField) -> Set<String> {
             Set(field.tokens.map { $0.lowercased() })
         }
+        func leftovers(_ list: [String]) -> Set<String> { Set(RecipientEntry(list).leftovers.map { $0.lowercased() }) }
+        func leftovers(_ field: ComposeDraftGuards.RecipientField) -> Set<String> {
+            Set(field.rejected.map { $0.lowercased() })
+        }
         return accountId == message.accountId
             && subject == self.subject
             && addresses(recipients.to) == addresses(to) && addresses(recipients.cc) == addresses(cc)
             && addresses(recipients.bcc) == addresses(bcc)
-            && recipients.to.rejected.isEmpty && recipients.cc.rejected.isEmpty && recipients.bcc.rejected.isEmpty
+            && leftovers(recipients.to) == leftovers(to) && leftovers(recipients.cc) == leftovers(cc)
+            && leftovers(recipients.bcc) == leftovers(bcc)
     }
 
     /// The compose card, opened in this kind, as main's Reply All entries open it.

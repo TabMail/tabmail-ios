@@ -249,9 +249,11 @@ struct SuggestionRewriteRouteTests {
         }, storeSuggestionEdit: Self.store(fixture.db))
     }
 
-    nonisolated static func edit(subject: String = "Re: Offsite", addCc: [[String: Any]] = [], removeTo: [String] = []) -> InlineEditResult {
+    nonisolated static func edit(
+        subject: String = "Re: Offsite", addTo: [[String: Any]] = [], addCc: [[String: Any]] = [], removeTo: [String] = []
+    ) -> InlineEditResult {
         AIService.parseInlineEditResponse(ComposeEditJSON.make(
-            response: "Done.", removeTo: removeTo, addCc: addCc, subject: subject, body: editedBody,
+            response: "Done.", addTo: addTo, removeTo: removeTo, addCc: addCc, subject: subject, body: editedBody,
             textMessage: editedText, changeCommand: editedCommand))!
     }
 
@@ -1017,8 +1019,8 @@ struct SuggestionRewriteRouteTests {
         #expect(Array(card.applied.suffix(2)) == [restored, finalValue], "the restore lands before the result")
     }
 
-    /// A card whose recipient field holds an entry that is not an address (rejected) is not the
-    /// suggestion's envelope: its edit stays in the card.
+    /// A card whose recipient field holds an entry that is not an address (rejected), one the
+    /// suggestion's envelope does not hold, is not that envelope: its edit stays in the card.
     @Test("A card holding a rejected recipient entry keeps its edit; the same card without it is the suggestion's")
     func rejectedEntryIsNotTheEnvelope() async throws {
         let fixture = try await fixture()
@@ -1034,6 +1036,63 @@ struct SuggestionRewriteRouteTests {
                 showingSuggestion: true, isForward: false, replyTo: fixture.header,
                 recipients: recipients, subject: envelope.subject, accountId: nil, accounts: []) == nil,
                     "\(role): the edit stays in its card")
+        }
+    }
+
+    /// A Reply-To entry that names no address (`Undisclosed-Recipients:;`) is part of the
+    /// suggestion's envelope as its text, in any case. An edit that keeps every address but leaves
+    /// that entry out is another audience: the card opens and the suggestion is unchanged. An edit
+    /// that keeps it is the suggestion's own envelope: it is published in place. The field's edit
+    /// and the card's own edit decide alike.
+    @Test("An edit that leaves out an audience entry with no address opens the card; one that keeps it is published in place",
+          arguments: [false, true])
+    func audienceEntryWithNoAddressDecidesInPlace(keepsEntry: Bool) async throws {
+        let fixture = try await fixture()
+        try await fixture.db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET replyTo = ? WHERE id = ?",
+                           arguments: ["sender@example.com, Undisclosed-Recipients:;", fixture.header.id])
+        }
+        let email = try await row(fixture.db, fixture.header.id)
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: email, accounts: [])
+        #expect(envelope.to == ["sender@example.com", "Undisclosed-Recipients:;", "recipient@example.com"] && envelope.cc.isEmpty,
+                "control: the envelope holds the entry as written, beside the addresses")
+
+        let everyAddress: [[String: Any]] = [
+            ["name": "", "email": "sender@example.com"], ["name": "", "email": "recipient@example.com"],
+        ]
+        let answer = keepsEntry ? Self.edit() : Self.edit(addTo: everyAddress, removeTo: ["*"])
+        let card = OSAllocatedUnfairLock<ChatReplyCompose?>(initialState: nil)
+        let output = await EmailReplyTool.finishSuggestionEdit(
+            answer, shown: Self.shownReply, start: envelope, suggestionEnvelope: envelope, email: email,
+            rewritesInPlace: true, store: Self.store(fixture.db),
+            openCard: { opening, _ in
+                card.withLock { $0 = opening }
+                return "cancelled"
+            })
+        let opened = card.withLock { $0 }
+        let stored = try await row(fixture.db, fixture.header.id).suggestion
+        let edited = ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand)
+        let after = envelope.recipients.applying(to: answer.toDelta, cc: answer.ccDelta, bcc: answer.bccDelta)
+        let cardTarget = ComposeView.suggestionEditTarget(
+            showingSuggestion: true, isForward: false, replyTo: email,
+            recipients: after, subject: envelope.subject, accountId: nil, accounts: [])
+        if keepsEntry {
+            #expect(opened == nil && output.contains("in place"), "the entry kept: no card opens")
+            #expect(stored == edited, "the entry kept: the edit replaces the suggestion")
+            #expect(cardTarget?.id == email.id, "the card's own edit replaces the suggestion too")
+            let otherCase = envelope.recipients.filling(
+                to: RecipientEntry(["sender@example.com", "UNDISCLOSED-RECIPIENTS:;", "recipient@example.com"]))
+            #expect(otherCase.to.rejected == ["UNDISCLOSED-RECIPIENTS:;"], "control: the entry kept, written in another case")
+            let otherCaseTarget = ComposeView.suggestionEditTarget(
+                showingSuggestion: true, isForward: false, replyTo: email,
+                recipients: otherCase, subject: envelope.subject, accountId: nil, accounts: [])
+            #expect(otherCaseTarget?.id == email.id, "the entry kept in another case: still the suggestion's envelope")
+        } else {
+            let cardTo = RecipientEntry(opened?.to ?? [])
+            #expect(cardTo.addresses == ["sender@example.com", "recipient@example.com"] && cardTo.leftovers.isEmpty,
+                    "control: the card keeps every address and leaves the entry out")
+            #expect(stored == Self.shownReply, "the entry left out: another audience, the suggestion is unchanged")
+            #expect(cardTarget == nil, "the card's own edit stays in the card too")
         }
     }
 }

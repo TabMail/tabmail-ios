@@ -872,17 +872,20 @@ struct ChatReplyFieldTests {
                 "the card goes to the agent's recipients only")
     }
 
-    /// A Reply-To entry that names no sendable address (`undisclosed-recipients:;`) is part of the
+    /// A Reply-To entry that names no sendable address (`Undisclosed-Recipients:;`) is part of the
     /// Reply All audience as the text written: the card keeps it, so leaving it out narrows the
-    /// audience as leaving out a person does, and keeping it in another case does not.
-    @Test("An audience entry that names no address counts as its text: left out it is a plain reply, kept in any case it is Reply All")
+    /// audience as leaving out a person does, and keeping it in another case or in another field
+    /// (To, Cc or Bcc) does not. The entry is written in mixed case on both sides, so the
+    /// comparison must fold the case of each.
+    @Test("An audience entry that names no address counts as its text: left out it is a plain reply, kept in any case or field it is Reply All")
     func audienceEntryWithNoAddressCountsAsItsText() {
+        let entry = "Undisclosed-Recipients:;"
         var email = Self.header("n1")
-        email.replyTo = "Alex Doe <alex@example.com>, undisclosed-recipients:;"
+        email.replyTo = "Alex Doe <alex@example.com>, \(entry)"
         email.to = "me@example.com, david@example.com"
         email.cc = "sam@example.com"
         let envelope = ChatReplyCompose.suggestionEnvelope(for: email, accounts: [Self.me])
-        #expect(envelope.to == ["alex@example.com", "undisclosed-recipients:;", "david@example.com"] && envelope.cc == ["sam@example.com"],
+        #expect(envelope.to == ["alex@example.com", entry, "david@example.com"] && envelope.cc == ["sam@example.com"],
                 "control: the audience holds the entry as written, beside the addresses")
         let unchanged = envelope.with(recipients: envelope.recipients, subject: envelope.subject)
         #expect(unchanged.isReplyAll, "control: the whole audience, unchanged, is Reply All")
@@ -899,7 +902,27 @@ struct ChatReplyFieldTests {
         let entryInOtherCase = envelope.with(recipients: otherCase, subject: envelope.subject)
         #expect(entryInOtherCase.isReplyAll, "the whole audience kept, the entry in another case: Reply All")
 
-        let davidLeftOut = envelope.recipients.filling(to: RecipientEntry(["alex@example.com", "undisclosed-recipients:;"]))
+        let inCc = envelope.recipients.filling(
+            to: RecipientEntry(["alex@example.com", "david@example.com"]), cc: RecipientEntry(["sam@example.com", entry]))
+        #expect(inCc.to.rejected.isEmpty && inCc.cc.rejected == [entry], "control: the entry moved to Cc")
+        let entryInCc = envelope.with(recipients: inCc, subject: envelope.subject)
+        #expect(entryInCc.isReplyAll, "the whole audience kept, the entry only in Cc: Reply All")
+
+        let inBcc = envelope.recipients.filling(
+            to: RecipientEntry(["alex@example.com", "david@example.com"]), bcc: RecipientEntry([entry]))
+        #expect(inBcc.to.rejected.isEmpty && inBcc.cc.rejected.isEmpty && inBcc.bcc.rejected == [entry],
+                "control: the entry moved to Bcc")
+        let entryInBcc = envelope.with(recipients: inBcc, subject: envelope.subject)
+        #expect(entryInBcc.isReplyAll, "the whole audience kept, the entry only in Bcc: Reply All")
+
+        let davidInBcc = envelope.recipients.filling(
+            to: RecipientEntry(["alex@example.com", entry]), bcc: RecipientEntry(["david@example.com"]))
+        #expect(davidInBcc.to.tokens == ["alex@example.com"] && davidInBcc.bcc.tokens == ["david@example.com"],
+                "control: David moved to Bcc")
+        let davidOnlyInBcc = envelope.with(recipients: davidInBcc, subject: envelope.subject)
+        #expect(davidOnlyInBcc.isReplyAll, "the whole audience kept, David only in Bcc: Reply All")
+
+        let davidLeftOut = envelope.recipients.filling(to: RecipientEntry(["alex@example.com", entry]))
         let withoutDavid = envelope.with(recipients: davidLeftOut, subject: envelope.subject)
         #expect(!withoutDavid.isReplyAll, "a person left out, the entry kept: a plain reply")
     }

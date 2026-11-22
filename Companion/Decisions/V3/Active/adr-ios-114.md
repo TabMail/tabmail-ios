@@ -1140,8 +1140,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
       sender, To, Cc and Bcc by role) is built once, by the same builder for the ghost tap and the chat
       field's edit.
     - **Publish or card.** An edit is published to the suggestion only when its envelope equals the
-      starting one. Anything else opens the compose card with exactly the edited envelope, under a separate
-      reply-draft key, or stays in the card. A narrowed audience therefore never becomes the shared
+      starting one (`ChatReplyCompose.holds`: per role the same addresses, and the same entries that
+      name no sendable address, each as its text in any case). Anything else opens the compose card
+      with exactly the edited envelope, under a separate reply-draft key, or stays in the card. A narrowed audience therefore never becomes the shared
       suggestion.
     - **Identity.** The field's edit is bound to the displayed row and its identity, re-checked before the
       body is read. The field's audience applies to copies with the same account and Message-ID.
