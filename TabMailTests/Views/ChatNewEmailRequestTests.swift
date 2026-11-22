@@ -924,7 +924,10 @@ struct ChatNewEmailRequestHostedTests {
             replyToId: nil, isForward: false, editHistoryJSON: nil, createdAt: now - 60, updatedAt: now - 60,
             serverDraftId: nil, serverPushStatus: nil, rfc822MessageId: nil, attachmentsDirName: nil)
         try await withScreen { seed in
-            NavigationStack { ChatNewThreadView(model: ChatNewThreadModel(reopening: draft, account: seed.account)) }
+            // No account: nothing is shown, and the wait below fails.
+            if let account = seed.account {
+                NavigationStack { ChatNewThreadView(model: ChatNewThreadModel(reopening: draft, account: account)) }
+            }
         } body: { screen in
             try await ThreadChatTests.wait { !Self.labels(of: ChatNewThreadView.ccLineId, in: screen.view).isEmpty }
             #expect(Self.labels(of: ChatNewThreadView.ccLineId, in: screen.view) == ["Cc: Sam Park."], "the draft's Cc: \(ThreadChatTests.labels(screen.view).prefix(16))")
