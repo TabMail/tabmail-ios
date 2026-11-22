@@ -823,6 +823,11 @@ struct ChatFieldWordsTests {
         try pool.write { try $0.execute(sql: "UPDATE chatFieldWords SET updatedAt = ? WHERE sessionId = ?", arguments: [old, key]) }
     }
 
+    /// Sets the row `key`'s last stamp to `instant`.
+    private static func stamp(_ key: String, at instant: Date, pool: DatabasePool) throws {
+        try pool.write { try $0.execute(sql: "UPDATE chatFieldWords SET updatedAt = ? WHERE sessionId = ?", arguments: [instant, key]) }
+    }
+
     /// `days` days after `base`.
     private static func later(_ days: Int, from base: Date) throws -> Date {
         try #require(Calendar.current.date(byAdding: .day, value: days, to: base))
@@ -955,6 +960,10 @@ struct ChatFieldWordsTests {
             // polled): only the reset itself can mark the threads as seen.
             if passSawTheThread {
                 let lastPass = try Self.hours(-SyncConfig.aiCacheOrphanGraceDays * 12, after: Date())
+                // What that pass left: the words stamped when it saw the threads. Set here, not
+                // left to the pass, so the words are inside the grace at the reset whichever rows
+                // a pass re-stamps.
+                for live in [key, lostKey] { try Self.stamp(live, at: lastPass, pool: pool) }
                 SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: lastPass)
                 #expect(try Self.rows(pool).map(\.sessionId).sorted() == [key, lostKey, orphan].sorted(),
                         "control: the last pass kept every row")
