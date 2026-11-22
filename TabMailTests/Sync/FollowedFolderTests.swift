@@ -384,8 +384,10 @@ struct FollowedFolderIMAPTests {
         /// left (plus the UIDs `plus` that an action moved in, less the UIDs
         /// `minus` it moved out), one row each, with the read and flag state the
         /// other client set, on the device and still on the server; and the only
-        /// change sent to the server is the action's own `UID MOVE` (`move`: the
-        /// UID it moved, from the mailbox it was in), or none for an open.
+        /// changes sent to the server are the action's own: its `UID MOVE`
+        /// (`move`: the UID it moved, from the mailbox it was in), preceded for a
+        /// move out of the Inbox by the legacy `tm_*` keyword removal on that UID;
+        /// or none for an open.
         func expectScenarioReconciled(
             _ label: String, plus: [Int] = [], minus: [Int] = [], move: (uid: Int, from: String)? = nil,
             sourceLocation: SourceLocation = #_sourceLocation
@@ -415,21 +417,36 @@ struct FollowedFolderIMAPTests {
             let changes = server.recordedCommandsWithMailbox().filter { Self.isMutating($0.command) }
             let sent = changes.map(\.command)
             if let move {
+                // The action's own changes, all on the moved message in the
+                // mailbox it was in: its one `UID MOVE`, and, for a move out of
+                // the Inbox, the removal of the legacy `tm_*` keywords that the
+                // provider's move sends first.
                 let prefix = "UID MOVE \(move.uid) "
-                let onlyTheMove = changes.count == 1
-                    && changes.allSatisfy { $0.mailbox == move.from && $0.command.uppercased().hasPrefix(prefix) }
+                let legacyStrip = "UID STORE \(move.uid) -FLAGS (TM_REPLY TM_ARCHIVE TM_DELETE TM_NONE)"
+                let moves = changes.filter { $0.command.uppercased().hasPrefix(prefix) }
+                let ownChanges = changes.allSatisfy { change in
+                    let upper = change.command.uppercased()
+                    let isStrip = move.from.uppercased() == "INBOX" && upper == legacyStrip
+                    return change.mailbox == move.from && (upper.hasPrefix(prefix) || isStrip)
+                }
+                let onlyTheMove = moves.count == 1 && ownChanges
                 #expect(onlyTheMove, "\(label): the action's move is the only change sent to the server: \(sent)", sourceLocation: sourceLocation)
             } else {
                 #expect(sent.isEmpty, "\(label): an open changes nothing on the server: \(sent)", sourceLocation: sourceLocation)
             }
         }
 
-        /// The device's rows for the message `rfc` in the folder `folderId`.
+        /// The device's rows for the message `rfc` in the folder `folderId`,
+        /// compared as the app compares Message-IDs (`EmailFilter.normalizeMessageId`):
+        /// a row this world inserted holds the bracketed form, and a row a listing
+        /// wrote holds the bare form the app stores.
         func rows(rfc822MessageId rfc: String, in folderId: String) throws -> Int {
-            try pool.read { db in
-                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader WHERE folderId = ? AND rfc822MessageId = ?",
-                                 arguments: [folderId, rfc]) ?? 0
+            let stored = try pool.read { db in
+                try String.fetchAll(db, sql: "SELECT rfc822MessageId FROM messageHeader WHERE folderId = ? AND rfc822MessageId IS NOT NULL",
+                                    arguments: [folderId])
             }
+            let wanted = EmailFilter.normalizeMessageId(rfc)
+            return stored.filter { EmailFilter.normalizeMessageId($0) == wanted }.count
         }
 
         func expectFollowed(_ folderIds: [String], _ label: String, sourceLocation: SourceLocation = #_sourceLocation) throws {
@@ -724,11 +741,7 @@ struct FollowedFolderIMAPTests {
             let leftInInbox = w.server.uids(in: "INBOX", rfc822MessageId: rfc)
             #expect(landed.count == 1, "setup: the move landed on the server: \(landed)")
             #expect(leftInInbox.isEmpty, "setup: the move left nothing in the server's Inbox: \(leftInInbox)")
-            let inboxId = w.inboxId
-            let localInbox = try await w.pool.read { db in
-                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader WHERE folderId = ? AND rfc822MessageId = ?",
-                                 arguments: [inboxId, rfc]) ?? 0
-            }
+            let localInbox = try w.rows(rfc822MessageId: rfc, in: w.inboxId)
             #expect(localInbox == 0, "the moved message has left the device's Inbox")
             try w.expectFollowed([w.folderId, w.inboxId], "move in")
             try w.expectReconciled("move in")
