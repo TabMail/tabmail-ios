@@ -497,9 +497,9 @@ same AI result, kept as long as the email itself is shown.
    opened with. The bubble's redraw schedule (`ChatUndoSendSchedule`) makes its instants one at a
    time, once a second until the fill's window and every frame inside it: a queued row's hold can lie
    far ahead of a clock set back, and a schedule laid out in memory at 30 frames a second up to it
-   could exhaust the app's memory. The sequence closes with `Date.distantFuture` after the deadline: a
-   TimelineView does not redraw at its schedule's last date, so ending on the deadline left a
-   mounted bubble offering Undo past it. The agent's cards open through their one presenter on every
+   could exhaust the app's memory. The sequence closes with `Date.distantFuture` after the deadline:
+   the mounted bubble's TimelineView was seen not to redraw at its schedule's last date, so ending on
+   the deadline left it offering Undo past it. The agent's cards open through their one presenter on every
    host (`AgentToolRouter.ComposeRequest.composeView(account:openedOn:onOutcome:)`): the chat gives
    it its `composeScreen(answering:)` for the card's email, the inbox and the email's screen give
    none, and a new email records none. Tests:
