@@ -29,6 +29,13 @@ struct EmailDeleteTool: AgentTool, Sendable {
             return #"{"error": "missing or empty unique_ids array"}"#
         }
 
+        // Stamped BEFORE the reads whose headers the confirmation card shows;
+        // the move below runs under it, so if the rows' folder finishes a
+        // UIDVALIDITY reset after this point (the wait for the user is
+        // unbounded) the move is refused instead of acting on a different email
+        // re-seated at the same id.
+        let cardStamp = FolderResetGeneration.current()
+
         // Resolve numeric IDs to MessageHeaders
         let translator = ctx.translator
         var resolved: [MessageHeader] = []
@@ -96,9 +103,11 @@ struct EmailDeleteTool: AgentTool, Sendable {
         // never shown, which is the same C3 misattribution and is exactly as
         // forbidden. `ExpectedMessageIdentity.map` reads the witness off the
         // headers already rendered on the confirmation card — zero extra I/O.
-        let admission = await AccountManager.shared.performCoordinatedRoleMove(
-            ids: resolved.map(\.id), role: .trash,
-            expectedIdentities: ExpectedMessageIdentity.map(resolved))
+        let admission = await FolderResetGeneration.$gestureStamp.withValue(cardStamp) {
+            await AccountManager.shared.performCoordinatedRoleMove(
+                ids: resolved.map(\.id), role: .trash,
+                expectedIdentities: ExpectedMessageIdentity.map(resolved))
+        }
         // T4.V8 (PORT of `v2final:EmailDeleteTool.execute`, commit `b1c89ad4a`):
         // report only DURABLY ADMITTED work as deleted. This call previously
         // reported `"success": true` with `deleted_count == resolved.count`

@@ -488,7 +488,7 @@ extension AccountManager {
         let needsReply = current.cachedReply == nil
         guard needsSummary || needsAction || needsReply else { return } // already fully processed
 
-        let aiDisabled = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
+        let aiDisabled = AIService.isAIOff
         let deviceSyncEnabled = UserDefaults.standard.object(forKey: "device_sync_auto_enabled") as? Bool ?? true
         let hasSession = TabMailAuthService.hasSession()
         guard hasSession && (!aiDisabled || deviceSyncEnabled) else { return }
@@ -880,11 +880,28 @@ extension AccountManager {
         // row durable first, mirroring markRead/markUnread/markFlagged/move.
         await ensureDurable([message])
 
-        // Step 1: Update GRDB state immediately (optimistic UI)
-        try? await dbPool.write { db in
-            guard var msg = try MessageHeader.fetchOne(db, key: message.id) else { return }
-            msg.setActionTag(tag)
-            try msg.save(db)
+        // Step 1: Update GRDB state immediately (optimistic UI). Refused when
+        // this gesture's view of the row predates its folder's id reset: the
+        // row at this id may be a different email, and neither the tag nor the
+        // cache and teaching steps below may be attributed to it.
+        let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
+        let allowed: Bool
+        do {
+            allowed = try await dbPool.write { db -> Bool in
+                guard !FolderResetGeneration.refuses(folderId: folderId) else { return false }
+                guard var msg = try MessageHeader.fetchOne(db, key: message.id) else { return true }
+                msg.setActionTag(tag)
+                try msg.save(db)
+                return true
+            }
+        } catch {
+            // The write never ran its check; a failed write still may not
+            // attribute the tag below to a re-seated row.
+            allowed = !FolderResetGeneration.refuses(folderId: folderId)
+        }
+        guard allowed else {
+            BackgroundSyncLogger.logDebug("[ManualTag] refused: '\(folderPath)' was reset after the gesture for \(messageId)")
+            return
         }
 
         Task { @MainActor in NotificationCenter.default.post(name: .inboxDataDidChange, object: nil) }
@@ -972,7 +989,8 @@ extension AccountManager {
         let content = UNMutableNotificationContent()
         EmailNotificationBuilder.fill(
             content, signal: signal,
-            accountId: header.accountId, messageId: header.messageId
+            accountId: header.accountId, messageId: header.messageId,
+            observedUidValidity: header.observedUidValidity
         )
 
         try await UNUserNotificationCenter.current().add(

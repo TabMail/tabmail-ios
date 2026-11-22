@@ -712,17 +712,22 @@ extension AccountManager {
                 // step 5 owns advancing it, and leaving it here is what makes an
                 // abort between the two re-drivable.
                 if var folder = try Folder.fetchOne(db, key: folderId) {
-                    folder.lastKnownUidNext = nil
-                    folder.lastKnownHighestModSeq = nil
                     folder.catchUpState = nil
+                    // The change bookmark and re-read list name the dead
+                    // generation: a kept bookmark would cost a pass refused on
+                    // the old UIDVALIDITY, and the listed ids name other messages.
+                    folder.changeCursor = nil
+                    folder.changeState = nil
                     folder.backfillComplete = false
                     folder.backfillUidCursor = nil
                     folder.backfillPageToken = nil
                     folder.backfillPageHeldSince = nil
                     folder.oldestSyncedDate = Date()
                     folder.unreadCount = 0
-                    folder.totalCount = 0
                     try folder.update(db)
+                    // The listing's counters, through their one owner.
+                    try SyncEngine.invalidateListingCounters(
+                        Folder.filter(Column("id") == folderId), resettingCount: true, db: db)
                 }
 
                 return UidValidityResetPurgeResult(purgedMessageIds: purgedMessageIds)
@@ -846,9 +851,19 @@ extension AccountManager {
                     .filter(Column("accountId") == accountId && Column("folderPath") == folderPath)
                     .fetchAll(db)
                 for op in ops where Self.opIsProvenInvalidatedByReset(op, fresh: fresh) {
-                    _ = try PendingOperation.deleteOne(db, key: op.id)
+                    // A .move goes through the exit rule (ADR-IOS-111 item 11): its
+                    // optimistic row may sit in a tracked destination.
+                    try AccountOperationExecutor.deleteRetiringOperation(op, db: db)
                     BackgroundSyncLogger.log("[UIDValidity] dropped address-only op \(op.type.rawValue) \(op.id.prefix(8)) on \(folderId) — recorded under UIDVALIDITY \(op.observedUidValidity.map(String.init) ?? "?"), server now \(fresh); its UIDs belong to the epoch the server discarded (exit 4)")
                 }
+                // Before the new epoch becomes admissible: every gesture stamped
+                // earlier (queued work, a surface read before the reset) is
+                // refused for this folder, because the resync re-seats different
+                // emails at its ids. Only on this stamping path, so an idempotent
+                // re-drive does not refuse gestures taken after the real stamp. A
+                // rolled-back transaction leaves the bump in place, which only
+                // refuses more pre-reset work.
+                FolderResetGeneration.recordReset(folderId: folderId)
                 folder.lastKnownUidValidity = Int(fresh)
                 folder.uidValidityResetPendingAt = nil
                 try folder.update(db)

@@ -1843,16 +1843,9 @@ struct DictationControllerTests {
 @Suite(.serialized, .processGlobalState)
 struct DictationOptOutFlagTests {
     @Test func theSettingsOptOutStopsDictationBeforeTheMicrophone() async {
-        let store = AIService.optOutStore
-        let previous = store.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous {
-                store.set(previous, forKey: AIService.optOutAllAIKey)
-            } else {
-                store.removeObject(forKey: AIService.optOutAllAIKey)
-            }
-        }
-        AIService.writeOptOutFlag(true)
+        let restore = AITestSetting.save()
+        defer { restore() }
+        AITestSetting.set(aiOff: true)
 
         let capture = FakeCapture()
         let recorded = Recorded()
@@ -2300,7 +2293,7 @@ struct DictationLanguageSettingTests {
             dictationLanguage: { language },
             smartDictation: { true },
             wordFrequencies: { _ in [:] },
-            transcribe: DictationController.backendTranscription(BackendClient(llmSession: http.session)),
+            transcribe: DictationController.backendTranscription(BackendClient(llmSession: http.session, isAIOff: { false })),
             warmUp: {},
             speechDetector: FakeSpeechDetector.hearing()
         )

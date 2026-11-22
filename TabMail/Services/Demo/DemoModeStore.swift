@@ -14,8 +14,9 @@ import Synchronization
 ///   `demo.callsConsumed`. Survives app restart, demo exit, and re-entry.
 /// - `startInProgress` gates the "Try the demo" button so user can't double-tap
 ///   while the JWT mint is in flight.
-/// - `aiEnabled` mirrors what the user picked on the AI consent gate during
-///   demo entry. Demo-specific — never read by production code paths.
+/// - The demo has no AI setting of its own: it uses the device's
+///   (`AIService.isAIOff`), which the demo's AI screen records when the device
+///   has no AI choice yet. Only the age and terms flag is the demo's own.
 ///
 /// All public mutations happen on the main actor. Counter consumes use a
 /// dedicated `consumeCall` / `refundCall` API so the refund matrix is
@@ -32,8 +33,6 @@ final class DemoModeStore {
     private enum Keys {
         static let callsConsumed = "demo.callsConsumed"
         static let hasCompletedConsentGate = "demo.hasCompletedConsentGate"
-        static let hasSeenAIConsent = "demo.hasSeenAIConsent"
-        static let aiEnabled = "demo.aiEnabled"
     }
 
     /// Whether demo mode is currently active for this app session.
@@ -91,28 +90,16 @@ final class DemoModeStore {
         set { UserDefaults.standard.set(newValue, forKey: Keys.hasCompletedConsentGate) }
     }
 
-    var hasSeenAIConsent: Bool {
-        get { UserDefaults.standard.bool(forKey: Keys.hasSeenAIConsent) }
-        set { UserDefaults.standard.set(newValue, forKey: Keys.hasSeenAIConsent) }
-    }
-
-    /// Whether the user accepted AI on the demo's AI consent gate. Drives the
-    /// AI-disabled rendering path.
-    var aiEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: Keys.aiEnabled) }
-        set { UserDefaults.standard.set(newValue, forKey: Keys.aiEnabled) }
-    }
-
     /// The guided tutorial is running (ADR-IOS-038 amendment 2026-10-21). Its
     /// steps are scripted and send nothing anywhere (`BackendClient` refuses
     /// every request), so the seeded, pre-written tags and summaries show
-    /// whatever the demo AI choice. Set by `TutorialCoordinator`, in memory only.
+    /// whatever the device's AI setting. Set by `TutorialCoordinator`, in memory only.
     var isTutorialPractice = false
 
-    /// Demo AI surfaces render as off: the demo is active and AI was declined,
-    /// outside the tutorial.
+    /// Demo AI surfaces render as off: the demo is active and the device's AI
+    /// setting is off, outside the tutorial.
     var hidesAIContent: Bool {
-        isActive && !aiEnabled && !isTutorialPractice
+        isActive && AIService.isAIOff && !isTutorialPractice
     }
 
     // MARK: - Counter API
@@ -248,8 +235,6 @@ final class DemoModeStore {
         callsConsumed = 0
         UserDefaults.standard.set(0, forKey: Keys.callsConsumed)
         UserDefaults.standard.set(false, forKey: Keys.hasCompletedConsentGate)
-        UserDefaults.standard.set(false, forKey: Keys.hasSeenAIConsent)
-        UserDefaults.standard.set(false, forKey: Keys.aiEnabled)
         isTutorialPractice = false
         isActive = false
         enteredFromDebugMenu = false

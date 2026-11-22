@@ -18,6 +18,8 @@ struct MessageRowView: View {
     /// adds no information.
     var showsRecipientInsteadOfSender: Bool = false
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
+    /// The AI choice, observed with the opt-out for the row's own chat-style decision (`chatViewActive`, as `AIService.isAIOff` reads them).
+    @AppStorage(AIService.aiChoiceMadeKey, store: AIService.optOutStore) private var aiChoiceMade = false
     @AppStorage(ChatViewConfig.enabledKey) private var chatViewEnabled = true
     @State private var tagTapTick = 0
     @State private var tagMenuOpenTick = 0
@@ -30,13 +32,16 @@ struct MessageRowView: View {
             deviceSyncAuto: DeviceSyncService.shared.isAutoEnabled, subscribed: AISubscriptionGate.shared.isActive)
     }
 
-    /// The chat view's switch, as the row can observe it: the Settings toggle and the opt-out are
-    /// observed, so the row repaints when either changes.
+    /// The chat view's switch, as the row can observe it: the Settings toggle, the AI choice and the
+    /// opt-out are observed, so the row repaints when any of them changes. AI is off as
+    /// `AIService.isAIOff` reads it: no AI choice yet, or opted out. A tutorial run shows what it
+    /// teaches, as its opens do (`ChatViewConfig.followingTutorial`, which observes the run).
     private var chatViewActive: Bool {
-        ChatViewConfig.isActive(
+        ChatViewConfig.followingTutorial(ChatViewConfig.isActive(
             enabledByUser: chatViewEnabled,
             aiOn: !DemoModeStore.shared.hidesAIContent
-                && ChatViewConfig.isAIOn(optedOut: optOutAllAI, subscribed: AISubscriptionGate.shared.isActive))
+                && ChatViewConfig.isAIOn(aiOff: AIConsentPolicy.isDisabled(choiceMade: aiChoiceMade, optedOut: optOutAllAI),
+                                         subscribed: AISubscriptionGate.shared.isActive)))
     }
 
     /// Effective sender (or recipient) display:

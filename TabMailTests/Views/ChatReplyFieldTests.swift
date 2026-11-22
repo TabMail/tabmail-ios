@@ -25,7 +25,8 @@ import Testing
 ///     exactly when it goes to the chat's whole audience: the AI Suggestion and a reply asked for
 ///     in the field are Reply All to everyone and a plain reply to the people chosen; a reply the
 ///     agent writes in the open sheet keeps its recipients and is Reply All only when they are the
-///     whole Reply All audience.
+///     whole Reply All audience, compared by address (a mailbox the agent names counts as its
+///     address, in any case; an entry that names no address counts as the text written).
 ///  7. VoiceOver reads who an email went to when it was not everyone.
 ///  8. The field shows the user's words and nothing else, collapsed or in the open sheet: words
 ///     typed or said are never replaced, and a completion empties only the words that were sent.
@@ -763,6 +764,98 @@ struct ChatReplyFieldTests {
         ], from: .field(onlyTo: nil))
         let swapped = Self.card(agent: widenedNarrowed, accounts: otherAccounts)
         #expect(!swapped.isReplyAll, "someone added but someone dropped: a plain reply")
+    }
+
+    /// The agent names a recipient as `{name, email}`, which the reply tool keeps as a mailbox
+    /// with its display name (`"Team Lead" <team@example.com>`). Moving an original To recipient
+    /// to Cc that way keeps everyone, so the card is still Reply All: the audience is compared by
+    /// address, not by the text the agent wrote.
+    @Test("A reply the agent moves someone from To to Cc by name is still Reply All, and the card keeps the name and the Cc")
+    func agentReplyThatMovesSomeoneToCcByNameIsStillReplyAll() async throws {
+        let teamLead: JSONValue = .dictionary(["name": .string("Team Lead"), "email": .string("team@example.com")])
+        for origin in [Origin.field(onlyTo: nil), .sheet] {
+            let (moved, accounts) = try await Self.agentReplyRequest([
+                "remove_recipients": .array([.string("team@example.com")]),
+                "add_cc": .array([teamLead]),
+            ], from: origin)
+            #expect(moved.to == ["sender@example.com"] && moved.bcc.isEmpty, "control: team@example.com left To")
+            let named = RecipientEntry(moved.cc).recipients
+            let expectedCc = [RecipientEntry.Recipient(address: "team@example.com", name: "Team Lead")]
+            #expect(named == expectedCc, "control: the agent's Cc is the named mailbox, not a bare address")
+            let compose = Self.card(agent: moved, accounts: accounts)
+            #expect(compose.isReplyAll, "everyone in the Reply All audience is on it, one of them by name in Cc: Reply All")
+            #expect(compose.prefillTo == ["sender@example.com"], "the card keeps the To the agent chose")
+            #expect(compose.prefillCc == moved.cc && compose.prefillBcc == nil, "the card keeps the agent's Cc as written")
+            let cardCc = RecipientEntry(compose.prefillCc ?? []).recipients
+            #expect(cardCc == expectedCc, "the card's Cc is team@example.com, under its name")
+        }
+
+        // The narrowed control: the agent names someone else in Cc and leaves team@example.com out.
+        let otherLead: JSONValue = .dictionary(["name": .string("Team Lead"), "email": .string("lead@example.com")])
+        let (narrowed, narrowedAccounts) = try await Self.agentReplyRequest([
+            "remove_recipients": .array([.string("team@example.com")]),
+            "add_cc": .array([otherLead]),
+        ], from: .field(onlyTo: nil))
+        let fewer = Self.card(agent: narrowed, accounts: narrowedAccounts)
+        #expect(!fewer.isReplyAll, "someone of the audience left out, another named instead: a plain reply")
+        #expect(fewer.prefillTo == ["sender@example.com"] && fewer.prefillCc == narrowed.cc,
+                "the card goes to the agent's recipients only")
+    }
+
+    /// The audience is compared as compose reads its fields: each mailbox by its address in any
+    /// case, wherever the agent puts it (To, Cc or Bcc alone, by name, the same person in both To
+    /// and Cc), and an entry that names no sendable address (a Reply-To's
+    /// `undisclosed-recipients:;`) as the text written, so a reply that leaves that entry out
+    /// leaves part of the audience out. The valid recipients stay the same in the two cases that
+    /// differ only in that entry.
+    @Test("""
+    A reply the agent writes to mixed-case named mailboxes is Reply All exactly when it holds the \
+    whole audience, a Reply-To entry with no address included and someone moved to Bcc alone, \
+    from the field and the sheet; the card keeps the To, Cc and Bcc as written
+    """)
+    func agentReplyAudienceIsComparedAsComposeReadsIt() {
+        var email = Self.header("n1")
+        email.replyTo = "Alex Doe <alex@example.com>, undisclosed-recipients:;"
+        email.to = "me@example.com, David Roe <David@Example.com>"
+        email.cc = "Sam Poe <sam@example.com>"
+        let audience = buildReplyAllRecipients(for: email, allAccounts: [Self.me])
+        #expect(audience.to == ["alex@example.com", "undisclosed-recipients:;", "david@example.com"] && audience.cc == ["sam@example.com"],
+                "control: the audience is Alex, the entry with no address, David and Sam")
+
+        let alex = "\"Alex Doe\" <Alex@Example.com>"
+        let noAddress = "undisclosed-recipients:;"
+        let davidTo = "\"David Roe\" <DAVID@example.com>"
+        let davidCc = "\"David Roe\" <david@EXAMPLE.com>"
+        let sam = "\"Sam Poe\" <Sam@Example.COM>"
+        let davidBcc = "\"David Roe\" <David@EXAMPLE.com>"
+        let written = RecipientEntry([alex, noAddress, davidTo, sam, davidCc])
+        #expect(written.addresses == ["Alex@Example.com", "DAVID@example.com", "Sam@Example.COM"] && written.leftovers == [noAddress],
+                "control: the agent's mailboxes keep their mixed case, David counts once, the entry stays as written")
+
+        // Each case: the agent's To, Cc and Bcc, and whether they hold the whole audience. The first
+        // two differ only in the entry with no address; Alex is in To alone. In the last, the agent
+        // moved David from To to Bcc and nowhere else: he still gets the reply, so it is Reply All.
+        let cases: [(name: String, to: [String], cc: [String], bcc: [String], whole: Bool)] = [
+            ("everyone, David in To and in Cc", [alex, noAddress, davidTo], [sam, davidCc], [], true),
+            ("the entry with no address left out", [alex, davidTo], [sam, davidCc], [], false),
+            ("David left out", [alex, noAddress], [sam], [], false),
+            ("everyone, David moved to Bcc alone", [alex, noAddress], [sam], [davidBcc], true),
+        ]
+        for origin in [Origin.field(onlyTo: nil), .sheet] {
+            var fieldReply: ChatFieldReply?
+            if case .field(let onlyTo) = origin { fieldReply = ChatFieldReply(emailKey: ChatThread.copyKey(email), onlyTo: onlyTo) }
+            for item in cases {
+                // As the AI reply tool builds it: a reply from the Reply All set, as the agent edited it.
+                let request = AgentToolRouter.ComposeRequest(
+                    mode: .reply, replyTo: email, to: item.to, cc: item.cc, bcc: item.bcc,
+                    subject: "Re: Plans", body: "Friday works", isReplyAll: true, fieldReply: fieldReply)
+                let compose = Self.card(agent: request, accounts: [Self.me])
+                let expectedBcc: [String]? = item.bcc.isEmpty ? nil : item.bcc
+                #expect(compose.isReplyAll == item.whole, "\(origin), \(item.name): Reply All is \(item.whole)")
+                #expect(compose.prefillTo == item.to && compose.prefillCc == item.cc && compose.prefillBcc == expectedBcc,
+                        "\(origin), \(item.name): the card keeps the agent's To, Cc and Bcc as written")
+            }
+        }
     }
 
     @Test("A reply the agent writes in the open sheet keeps its recipients, and is Reply All only to the whole audience")

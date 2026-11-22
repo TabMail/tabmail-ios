@@ -336,36 +336,32 @@ struct TutorialChatViewRunTests {
         Issue.record("the tutorial never reached \(step); it is at \(String(describing: TutorialCoordinator.shared.step))")
     }
 
-    /// Runs `body` with the Chat View setting and the AI opt-out as given, then puts both back.
-    private func withSettings(chatView: Bool, optedOut: Bool = false, _ body: () async throws -> Void) async throws {
+    /// Runs `body` with the Chat View setting and the AI setting as given (the AI choice made,
+    /// opted out or not; or, with `aiChoiceMade` false, no AI choice yet), then puts both back,
+    /// with the subscription gate as it was found (`AIGateTestState`: its open state, its checked
+    /// bit and both stored values).
+    private func withSettings(chatView: Bool, optedOut: Bool = false, aiChoiceMade: Bool = true,
+                              _ body: () async throws -> Void) async throws {
         let defaults = UserDefaults.standard
         let savedChat = defaults.object(forKey: ChatViewConfig.enabledKey)
-        let savedOptOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
+        let restoreAISetting = AITestSetting.save()
         let progressKeys = ["tutorial.version", "tutorial.completedLessons", "tutorial.discoveries"]
         let savedProgress = progressKeys.map { defaults.object(forKey: $0) }
         let gate = AISubscriptionGate.shared
-        let gateWasActive = gate.isActive
+        let gateState = AIGateTestState()
         defer {
             defaults.set(savedChat, forKey: ChatViewConfig.enabledKey)
-            AIService.optOutStore.set(savedOptOut, forKey: AIService.optOutAllAIKey)
+            restoreAISetting()
             for (key, value) in zip(progressKeys, savedProgress) { defaults.set(value, forKey: key) }
-            if gateWasActive { gate.openGate() } else { gate.closeGate() }
+            gateState.restore()
             DemoModeStore.shared._resetForTests()
         }
         defaults.set(chatView, forKey: ChatViewConfig.enabledKey)
-        AIService.optOutStore.set(optedOut, forKey: AIService.optOutAllAIKey)
+        if aiChoiceMade { AITestSetting.set(aiOff: optedOut) } else { AITestSetting.clear() }
         for key in progressKeys { defaults.removeObject(forKey: key) }
         DemoModeStore.shared._resetForTests()
         gate.closeGate()
         try await body()
-    }
-
-    private func start(_ lesson: TutorialLesson) async throws {
-        let coordinator = TutorialCoordinator.shared
-        try #require(!coordinator.isRunning)
-        await coordinator.start(lesson, hasTabMailSession: false)
-        try await DemoModeService.shared.completeSetup()
-        coordinator.seedingFinished()
     }
 
     @Test("With Chat View on, the run teaches in the chat view from its start to the switch, whatever the setting does meanwhile")
@@ -375,120 +371,512 @@ struct TutorialChatViewRunTests {
         try await withSettings(chatView: true) {
             let coordinator = TutorialCoordinator.shared
             let pool = fixture.0
-            try await start(.reuseReply)
-            #expect(coordinator.teachesChat)
-            #expect(coordinator.step == .replyToPriya)
-            #expect(ChatViewConfig.opensInChat, "the run's chats open as chats")
-            // The setting changes mid-run: the run keeps what it started with.
-            UserDefaults.standard.set(false, forKey: ChatViewConfig.enabledKey)
-            #expect(coordinator.teachesChat)
-            #expect(ChatViewConfig.opensInChat)
-            #expect(!TutorialCoordinator.chatViewOnForTutorial, "the next run would not")
+            try await whileRunning(.reuseReply) {
+                #expect(coordinator.teachesChat)
+                #expect(coordinator.step == .replyToPriya)
+                #expect(ChatViewConfig.opensInChat, "the run's chats open as chats")
+                // The setting changes mid-run: the run keeps what it started with.
+                UserDefaults.standard.set(false, forKey: ChatViewConfig.enabledKey)
+                #expect(coordinator.teachesChat)
+                #expect(ChatViewConfig.opensInChat)
+                #expect(!TutorialCoordinator.chatViewOnForTutorial, "the next run would not")
 
-            // Part 2: the AI Suggestion waits in Priya's chat; the inbox chat has nothing to send.
-            #expect(coordinator.fieldMove(inPracticeChat: true) == .tapSuggestion)
-            #expect(coordinator.fieldMove(inPracticeChat: false) == nil)
-            #expect(coordinator.chatPrompt == nil)
-            // The edit keeps the reply a yes.
-            #expect(coordinator.composeEditPrompt == TutorialCoordinator.chatViewEditPrompt)
-            var edited: String?
-            await coordinator.runPracticeReplyEdit { edited = $0 }
-            #expect(edited == TutorialChatScript.shorterReply)
+                // Part 2: the AI Suggestion waits in Priya's chat; the inbox chat has nothing to send.
+                #expect(coordinator.fieldMove(inPracticeChat: true) == .tapSuggestion)
+                #expect(coordinator.fieldMove(inPracticeChat: false) == nil)
+                #expect(coordinator.chatPrompt == nil)
+                // The edit keeps the reply a yes.
+                #expect(coordinator.composeEditPrompt == TutorialCoordinator.chatViewEditPrompt)
+                var edited: String?
+                await coordinator.runPracticeReplyEdit { edited = $0 }
+                #expect(edited == TutorialChatScript.shorterReply)
 
-            // The practice reply goes out, as compose sends it.
-            let reply = TutorialChatScript.shorterReply
-            coordinator.practiceReplyAuthored(reply)
-            try await Task.sleep(for: .seconds(1))
-            let draftId = "tutorial-practice-\(UUID().uuidString)"
-            try await pool.write { db in
-                var draft = Draft(
-                    id: draftId, accountId: DemoSeed.demoAccountId,
-                    toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
-                    subject: "Re: Engineering offsite", body: reply, replyToId: nil,
-                    isForward: false, editHistoryJSON: nil,
-                    createdAt: Date().timeIntervalSince1970,
-                    updatedAt: Date().timeIntervalSince1970)
-                draft.instanceEpoch = "E1"
-                try draft.insert(db)
-            }
-            let account = try #require(try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) })
-            let priya = try #require(try await pool.read { db in
-                try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
-                    && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
-            })
-            // Linked to Priya's email, as compose links a reply.
-            let queued = try await AccountManager.shared.queueSend(
-                draft: DraftMessage(to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply,
-                                    inReplyTo: priya.rfc822MessageId),
-                from: account, replyToHeaderId: priya.id, draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
-            try await waitFor(.makeTemplate)
-
-            // Its Sent copy joins Priya's chat as the user's own bubble, with its own words: the
-            // tutorial makes no AI call, so nothing else would ever write its text message.
-            var sentCopy: MessageHeader?
-            for _ in 0..<80 {
-                sentCopy = try await pool.read { db in
-                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
-                        && Column("messageId") == "sent-\(queued.outboxId)").fetchOne(db)
+                // The practice reply goes out, as compose sends it.
+                let reply = TutorialChatScript.shorterReply
+                coordinator.practiceReplyAuthored(reply)
+                try await Task.sleep(for: .seconds(1))
+                let draftId = "tutorial-practice-\(UUID().uuidString)"
+                try await pool.write { db in
+                    var draft = Draft(
+                        id: draftId, accountId: DemoSeed.demoAccountId,
+                        toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                        subject: "Re: Engineering offsite", body: reply, replyToId: nil,
+                        isForward: false, editHistoryJSON: nil,
+                        createdAt: Date().timeIntervalSince1970,
+                        updatedAt: Date().timeIntervalSince1970)
+                    draft.instanceEpoch = "E1"
+                    try draft.insert(db)
                 }
-                if sentCopy?.summaryTextMessage != nil { break }
-                try await Task.sleep(for: .milliseconds(100))
+                let account = try #require(try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) })
+                let priya = try #require(try await pool.read { db in
+                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                        && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+                })
+                // Linked to Priya's email, as compose links a reply.
+                let queued = try await AccountManager.shared.queueSend(
+                    draft: DraftMessage(to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply,
+                                        inReplyTo: priya.rfc822MessageId),
+                    from: account, replyToHeaderId: priya.id, draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
+                try await waitFor(.makeTemplate)
+
+                // Its Sent copy joins Priya's chat as the user's own bubble, with its own words: the
+                // tutorial makes no AI call, so nothing else would ever write its text message.
+                var sentCopy: MessageHeader?
+                for _ in 0..<80 {
+                    sentCopy = try await pool.read { db in
+                        try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                            && Column("messageId") == "sent-\(queued.outboxId)").fetchOne(db)
+                    }
+                    if sentCopy?.summaryTextMessage != nil { break }
+                    try await Task.sleep(for: .milliseconds(100))
+                }
+                let sent = try #require(sentCopy, "the demo provider files the Sent copy")
+                #expect(sent.summaryTextMessage == reply)
+                let related = try ThreadDetection.findRelatedMessages(for: priya, in: pool)
+                #expect(related.contains { $0.id == sent.id }, "the sent reply is in Priya's chat")
+                let chat = ChatThread(
+                    members: [priya] + related, replyAddresses: { [$0.fromAddress] },
+                    ownAddresses: [DemoSeed.demoEmail.lowercased()], draftFolderIds: [],
+                    sentFolderIds: [sent.folderId], unreadAtOpen: [], preferredId: priya.id)
+                let bubble = try #require(chat.items.first { $0.id == sent.id })
+                #expect(bubble.isOwn)
+                #expect(bubble.textMessage == reply, "its own words, never Summarizing")
+
+                // The request in the same field, then Create.
+                #expect(coordinator.fieldMove(inPracticeChat: true) == .ask(.saveReplyAsTemplate))
+                #expect(coordinator.chatPrompt == nil, "the request is in Priya's field, not the inbox chat")
+                #expect(coordinator.highlightsTemplateCreate)
+                _ = await TutorialChatScript.answer(
+                    .saveReplyAsTemplate, practiceReply: coordinator.practiceReplyText,
+                    invocation: ToolInvocation(uiSink: AcceptingSink()))
+                try await waitFor(.reuseReplyDone)
+                let templateId = try #require(coordinator.savedTemplateId)
+                let template = try #require(PromptStore.shared.templates.first { $0.id == templateId })
+                #expect(template.name == TutorialChatScript.chatViewTemplateName)
+                #expect(template.exampleReply == reply)
+                #expect(coordinator.highlightsChatClose, "the chat's sheet closes onto the card")
+
+                // Part 3: the answer opens Jordan's chat at his email.
+                coordinator.nextLesson()
+                #expect(coordinator.chatPrompt == .flights)
+                coordinator.chatPromptSent(.flights)
+                coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
+                #expect(coordinator.step == .askAnythingDone)
+                coordinator.showMoreToAsk()
+                coordinator.chatPromptSent(.whatCanYouDo)
+
+                // The switch step, then the recap.
+                #expect(!coordinator.highlightsChatViewSwitch)
+                coordinator.finishChatViewSwitch()
+                #expect(coordinator.step == .moreToAsk, "Finish on the switch counts only at the switch")
+                coordinator.showRecap()
+                #expect(coordinator.step == .chatViewSwitch)
+                #expect(coordinator.highlightsChatViewSwitch)
+                coordinator.showRecap()
+                #expect(coordinator.step == .chatViewSwitch, "the recap's Finish runs once")
+                coordinator.finishChatViewSwitch()
+                #expect(coordinator.step == .finished)
+
+                await coordinator.end()
+                #expect(!coordinator.teachesChat, "an ended run teaches nothing")
+                #expect(!coordinator.highlightsChatViewSwitch)
             }
-            let sent = try #require(sentCopy, "the demo provider files the Sent copy")
-            #expect(sent.summaryTextMessage == reply)
-            let related = try ThreadDetection.findRelatedMessages(for: priya, in: pool)
-            #expect(related.contains { $0.id == sent.id }, "the sent reply is in Priya's chat")
-            let chat = ChatThread(
-                members: [priya] + related, replyAddresses: { [$0.fromAddress] },
-                ownAddresses: [DemoSeed.demoEmail.lowercased()], draftFolderIds: [],
-                sentFolderIds: [sent.folderId], unreadAtOpen: [], preferredId: priya.id)
-            let bubble = try #require(chat.items.first { $0.id == sent.id })
-            #expect(bubble.isOwn)
-            #expect(bubble.textMessage == reply, "its own words, never Summarizing")
-
-            // The request in the same field, then Create.
-            #expect(coordinator.fieldMove(inPracticeChat: true) == .ask(.saveReplyAsTemplate))
-            #expect(coordinator.chatPrompt == nil, "the request is in Priya's field, not the inbox chat")
-            #expect(coordinator.highlightsTemplateCreate)
-            _ = await TutorialChatScript.answer(
-                .saveReplyAsTemplate, practiceReply: coordinator.practiceReplyText,
-                invocation: ToolInvocation(uiSink: AcceptingSink()))
-            try await waitFor(.reuseReplyDone)
-            let templateId = try #require(coordinator.savedTemplateId)
-            let template = try #require(PromptStore.shared.templates.first { $0.id == templateId })
-            #expect(template.name == TutorialChatScript.chatViewTemplateName)
-            #expect(template.exampleReply == reply)
-            #expect(coordinator.highlightsChatClose, "the chat's sheet closes onto the card")
-
-            // Part 3: the answer opens Jordan's chat at his email.
-            coordinator.nextLesson()
-            #expect(coordinator.chatPrompt == .flights)
-            coordinator.chatPromptSent(.flights)
-            coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
-            #expect(coordinator.step == .askAnythingDone)
-            coordinator.showMoreToAsk()
-            coordinator.chatPromptSent(.whatCanYouDo)
-
-            // The switch step, then the recap.
-            #expect(!coordinator.highlightsChatViewSwitch)
-            coordinator.finishChatViewSwitch()
-            #expect(coordinator.step == .moreToAsk, "Finish on the switch counts only at the switch")
-            coordinator.showRecap()
-            #expect(coordinator.step == .chatViewSwitch)
-            #expect(coordinator.highlightsChatViewSwitch)
-            coordinator.showRecap()
-            #expect(coordinator.step == .chatViewSwitch, "the recap's Finish runs once")
-            coordinator.finishChatViewSwitch()
-            #expect(coordinator.step == .finished)
-
-            await coordinator.end()
-            #expect(!coordinator.teachesChat, "an ended run teaches nothing")
-            #expect(!coordinator.highlightsChatViewSwitch)
         }
     }
 
     private static func scrollViews(_ view: UIView) -> [UIScrollView] {
         ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap { scrollViews($0) }
+    }
+
+    private static func switches(in view: UIView) -> [UISwitch] {
+        (view as? UISwitch).map { [$0] } ?? view.subviews.flatMap { switches(in: $0) }
+    }
+
+    /// Bounded: a condition that never holds fails the test rather than hanging it.
+    private static func waitUntil(seconds: TimeInterval = 8, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return condition()
+    }
+
+    /// Starts `lesson`, runs `body`, and ends the run on every way out. The cleanup boundary
+    /// encloses the start itself: once the coordinator claims the run, a throw anywhere after (the
+    /// demo's setup included) still ends it here, before `withSettings` resets the demo store.
+    private func whileRunning(_ lesson: TutorialLesson, _ body: () async throws -> Void) async throws {
+        let coordinator = TutorialCoordinator.shared
+        try #require(!coordinator.isRunning, "control: no run is live before this one")
+        do {
+            await coordinator.start(lesson, hasTabMailSession: false)
+            try await DemoModeService.shared.completeSetup()
+            coordinator.seedingFinished()
+            try await body()
+        } catch {
+            await coordinator.end()
+            throw error
+        }
+        await coordinator.end()
+    }
+
+    /// Priya's email from the demo seed, as an inbox row shows it, with its two lines: the chat
+    /// style's text message and today's snippet, which differ.
+    private func priyaRow(_ pool: DatabasePool) async throws -> (row: MessageSnapshot, textMessage: String, snippet: String) {
+        let found = try await pool.read { db in
+            try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+        }
+        let priya = try #require(found, "the demo seed has Priya's email")
+        let row = MessageSnapshot(from: priya)
+        let textMessage = try #require(row.summaryTextMessage, "Priya's email has its text message")
+        let snippet = row.snippet
+        #expect(!snippet.isEmpty, "control: the row has a snippet")
+        #expect(textMessage != snippet, "control: the chat-style line and the classic one differ")
+        return (row, textMessage, snippet)
+    }
+
+    /// An inbox row and the Enable Chat View switch, each hosted in its own window as the inbox and
+    /// Settings host them. They stay on screen until `close`, so a check after a change of the run
+    /// or of a setting sees the same views repaint.
+    @MainActor
+    private final class HostedRowAndSwitch {
+        let rowController: UIViewController
+        let switchController: UIViewController
+        private let windows: [UIWindow]
+
+        init(row: MessageSnapshot) throws {
+            let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            let scene = try #require(scenes.first, "a window scene hosts the row and the switch")
+            rowController = UIHostingController(rootView: MessageRowView(message: row))
+            switchController = UIHostingController(rootView: Form { ChatViewToggleRow() })
+            let rowWindow = UIWindow(windowScene: scene)
+            rowWindow.frame = CGRect(x: 0, y: 0, width: 390, height: 200)
+            rowWindow.rootViewController = rowController
+            let switchWindow = UIWindow(windowScene: scene)
+            switchWindow.frame = CGRect(x: 0, y: 0, width: 390, height: 400)
+            switchWindow.rootViewController = switchController
+            windows = [rowWindow, switchWindow]
+            for window in windows { window.makeKeyAndVisible() }
+        }
+
+        func close() {
+            for window in windows {
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+        }
+
+        /// The row's labels, for a failure message.
+        func rowLabels() -> [String] { HostedAccessibility.labels(in: rowController.view) }
+
+        func rowShows(_ line: String) -> Bool { rowLabels().contains(line) }
+
+        func theSwitch() -> UISwitch? {
+            let found = TutorialChatViewRunTests.switches(in: switchController.view)
+            return found.count == 1 ? found[0] : nil
+        }
+    }
+
+    // A first-launch tour starts before the AI choice and teaches the chat view. Its inbox rows and
+    // its Chat View switch follow the run, as its opens do: chat-style rows and a switch that works.
+    // The switch changes only the Chat View setting; the AI choice stays unmade. Once the run ends,
+    // still before the choice, AI is off: the rows are classic and the switch is grayed out. Both
+    // views stay on screen across the run's end, so they must repaint when the run state changes.
+    @Test("Before the AI choice, a chat-view run shows chat-style rows and a working switch that records no AI choice; after it, classic rows and a grayed-out switch")
+    func runBeforeTheAIChoice() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted row")
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        try await withSettings(chatView: true, aiChoiceMade: false) {
+            let coordinator = TutorialCoordinator.shared
+            let store = AIService.optOutStore
+            let defaults = UserDefaults.standard
+            #expect(AIService.isAIOff, "control: no AI choice yet, so AI is off")
+            try await whileRunning(.reuseReply) {
+                #expect(coordinator.teachesChat, "control: the run teaches the chat view")
+                let (row, textMessage, snippet) = try await priyaRow(fixture.0)
+                try await HostedAccessibility.withAutomation {
+                    let hosted = try HostedRowAndSwitch(row: row)
+                    defer { hosted.close() }
+
+                    // (1) The run: chat-style rows and a switch that works.
+                    let chatRow = await Self.waitUntil { hosted.rowShows(textMessage) }
+                    let runLabels = hosted.rowLabels()
+                    #expect(chatRow, "the run's row shows the text message: \(runLabels)")
+                    let runShowsSnippet = hosted.rowShows(snippet)
+                    #expect(!runShowsSnippet, "the run's row does not show the snippet")
+                    _ = await Self.waitUntil { hosted.theSwitch() != nil }
+                    let rendered = hosted.theSwitch()
+                    let control = try #require(rendered, "the switch renders")
+                    #expect(control.isEnabled, "the run's switch can be used before the AI choice")
+                    #expect(control.isOn, "it shows Chat View on")
+
+                    // The switch changes the Chat View setting and nothing else: no AI choice is recorded.
+                    control.setOn(false, animated: false)
+                    control.sendActions(for: .valueChanged)
+                    let off = await Self.waitUntil { defaults.object(forKey: ChatViewConfig.enabledKey) as? Bool == false }
+                    #expect(off, "flipping the switch stores Chat View off")
+                    #expect(store.object(forKey: AIService.aiChoiceMadeKey) == nil, "the switch records no AI choice")
+                    #expect(store.object(forKey: AIService.optOutAllAIKey) == nil, "the switch writes no opt-out")
+                    #expect(AIService.isAIOff, "AI stays off: the choice is still to be made")
+                    control.setOn(true, animated: false)
+                    control.sendActions(for: .valueChanged)
+                    let on = await Self.waitUntil { defaults.object(forKey: ChatViewConfig.enabledKey) as? Bool == true }
+                    #expect(on, "flipping it back stores Chat View on")
+                    #expect(store.object(forKey: AIService.aiChoiceMadeKey) == nil, "still no AI choice")
+
+                    // (2) The run ends, still before the AI choice: classic rows and a grayed-out switch.
+                    await coordinator.end()
+                    #expect(!coordinator.isRunning, "control: the run ended")
+                    #expect(ChatViewConfig.isEnabledByUser, "control: Chat View is still on")
+                    #expect(AIService.isAIOff, "control: still no AI choice")
+                    let classicRow = await Self.waitUntil { hosted.rowShows(snippet) }
+                    let afterLabels = hosted.rowLabels()
+                    #expect(classicRow, "after the run the row shows the snippet: \(afterLabels)")
+                    let afterShowsText = hosted.rowShows(textMessage)
+                    #expect(!afterShowsText, "after the run the row does not show the text message")
+                    let grayed = await Self.waitUntil { hosted.theSwitch()?.isEnabled == false }
+                    #expect(grayed, "after the run the switch is grayed out")
+                }
+            }
+        }
+    }
+
+    // A first-launch tour starts before the AI choice and teaches the chat view, so its sample email
+    // opens as a chat: a real open (`MessageOpenView`, routed as its body routes it, then hosted on
+    // screen as a navigation stack shows it) made during the run shows the chat. Neither the tour,
+    // its demo setup nor the open, routed or on screen, records an AI choice or an opt-out on the
+    // device: both values stay absent throughout. Once the run has ended, still before the choice,
+    // an open of a real email (the tour's sample is removed with the demo) goes to today's detail:
+    // outside a tour, AI is off until the choice is made.
+    @Test("Before the AI choice, the tour opens its sample email as a chat and records no AI choice; after the tour, still before the choice, an open of a real email is today's detail")
+    func openBeforeTheAIChoice() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted open")
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        /// The device AI values (the AI choice and Opt Out of AI) that are stored.
+        func storedAIValues() -> [String] {
+            [AIService.aiChoiceMadeKey, AIService.optOutAllAIKey].filter { AIService.optOutStore.object(forKey: $0) != nil }
+        }
+        try await withSettings(chatView: true, aiChoiceMade: false) {
+            let coordinator = TutorialCoordinator.shared
+            let database = PrioritizedDatabase(pool: fixture.0)
+            #expect(AIService.isAIOff, "control: no AI choice yet, so AI is off")
+            let beforeRun = storedAIValues()
+            #expect(beforeRun.isEmpty, "before the tour no AI value is stored: \(beforeRun)")
+            try await whileRunning(.reuseReply) {
+                #expect(coordinator.teachesChat, "control: the run teaches the chat view")
+                let found = try await fixture.0.read { db in
+                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                        && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+                }
+                let priya = try #require(found, "the demo seed has Priya's email")
+                let beforeOpen = storedAIValues()
+                #expect(beforeOpen.isEmpty, "the tour's setup stores no AI value: \(beforeOpen)")
+                let route = MessageOpenView(messageId: priya.id).route(pool: database)
+                #expect(route == .chat, "the tour opens its sample email as a chat before the AI choice")
+                let afterOpen = storedAIValues()
+                #expect(afterOpen.isEmpty, "the routed open stores no AI value: \(afterOpen)")
+
+                // The same open on screen: the chat shows its bubbles, and still no AI value is stored.
+                try await HostedAccessibility.withAutomation {
+                    let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+                    let window = UIWindow(windowScene: scene)
+                    let controller = UIHostingController(rootView: NavigationStack { MessageOpenView(messageId: priya.id) })
+                    window.rootViewController = controller
+                    window.makeKeyAndVisible()
+                    defer {
+                        window.isHidden = true
+                        window.rootViewController = nil
+                    }
+                    @MainActor func bubbleLabels() -> [String] {
+                        HostedAccessibility.labels(in: controller.view).filter { $0.contains(" said: ") }
+                    }
+                    @MainActor func showsDetail() -> Bool {
+                        HostedAccessibility.identifiers(in: controller.view).contains("replyMenu")
+                    }
+                    for _ in 0..<80 where bubbleLabels().isEmpty && !showsDetail() { try await Task.sleep(for: .milliseconds(100)) }
+                    let bubbles = bubbleLabels()
+                    #expect(!bubbles.isEmpty, "the sample email opens on screen as a chat, with its bubbles")
+                    let detail = showsDetail()
+                    #expect(!detail, "no detail reply menu")
+                    let afterShown = storedAIValues()
+                    #expect(afterShown.isEmpty, "the open on screen stores no AI value: \(afterShown)")
+                }
+            }
+            #expect(!coordinator.isRunning, "control: the run ended")
+            #expect(ChatViewConfig.isEnabledByUser, "control: Chat View is still on")
+            #expect(AIService.isAIOff, "control: still no AI choice")
+            let afterRun = storedAIValues()
+            #expect(afterRun.isEmpty, "the tour's end stores no AI value: \(afterRun)")
+
+            // A real email, outside the demo, in a real account's inbox.
+            let accountId = "after-tour"
+            _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: fixture.0)
+            try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: fixture.0)
+            let real = MessageHeader(
+                messageId: "1", subject: "Plans", from: "Alex", fromAddress: "alex@example.com",
+                to: "\(accountId)@example.com", date: Date(), snippet: "Lunch moves to noon",
+                folderId: MessageIdentity.folderId(accountId: accountId, folderPath: "INBOX"),
+                accountId: accountId, folderPath: "INBOX", isInInbox: true)
+            try await fixture.0.write { db in try real.insert(db) }
+            let stored = try await fixture.0.read { db in try MessageHeader.fetchOne(db, key: real.id) }
+            #expect(stored?.accountId == accountId, "control: the real email is stored, outside the demo account")
+            #expect(accountId != DemoSeed.demoAccountId, "control: the account is not the demo's")
+            let after = MessageOpenView(messageId: real.id).route(pool: database)
+            #expect(after == .detail, "outside the tour, before the AI choice, an open is today's detail")
+            let afterRealOpen = storedAIValues()
+            #expect(afterRealOpen.isEmpty, "the open after the tour stores no AI value: \(afterRealOpen)")
+        }
+    }
+
+    // A run that teaches today's view (Chat View off when it started) keeps today's view on every
+    // surface until it ends, even when every live value says chat: Chat View turned on, the AI
+    // choice made with AI on, and a plan. The rows show the snippet and the switch stays grayed out
+    // through the run's last moment; once it ends, the same hosted views show the chat style (the
+    // control that the live values do say chat).
+    @Test("A run teaching today's view shows classic rows and a grayed-out switch until it ends, whatever the live setting says")
+    func classicRunStaysClassic() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted row")
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        try await withSettings(chatView: false) {
+            let coordinator = TutorialCoordinator.shared
+            try await whileRunning(.reuseReply) {
+                #expect(!coordinator.teachesChat, "control: the run teaches today's view")
+                let (row, textMessage, snippet) = try await priyaRow(fixture.0)
+                // Every live value says chat.
+                UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
+                AISubscriptionGate.shared.openGate()
+                #expect(!AIService.isAIOff, "control: the AI choice is made and AI is on")
+                let liveSaysChat = ChatViewConfig.isActive
+                #expect(liveSaysChat, "control: the live chat view is on")
+                try await HostedAccessibility.withAutomation {
+                    let hosted = try HostedRowAndSwitch(row: row)
+                    defer { hosted.close() }
+                    _ = await Self.waitUntil { hosted.theSwitch() != nil && hosted.rowShows(snippet) }
+                    // Through the run: today's view on both, checked over a span, not once.
+                    for _ in 0..<5 {
+                        let showsSnippet = hosted.rowShows(snippet)
+                        let showsText = hosted.rowShows(textMessage)
+                        let enabled = hosted.theSwitch()?.isEnabled
+                        let labels = hosted.rowLabels()
+                        #expect(showsSnippet, "the run's row shows the snippet: \(labels)")
+                        #expect(!showsText, "the run's row does not show the text message")
+                        #expect(enabled == false, "the run's switch is grayed out")
+                        try await Task.sleep(for: .milliseconds(100))
+                    }
+                    #expect(coordinator.isRunning, "control: the run was live for every check above")
+
+                    // Once the run ends the same views follow the live values: the chat style.
+                    await coordinator.end()
+                    let chatRow = await Self.waitUntil { hosted.rowShows(textMessage) }
+                    let afterLabels = hosted.rowLabels()
+                    #expect(chatRow, "after the run the row shows the text message: \(afterLabels)")
+                    let usable = await Self.waitUntil { hosted.theSwitch()?.isEnabled == true }
+                    #expect(usable, "after the run the switch can be used")
+                }
+            }
+        }
+    }
+
+    /// Runs `body` with a TabMail session and the age and terms consent in place (the summary at
+    /// Send's other inputs), then puts both back.
+    private func withSessionAndConsent(_ body: () async throws -> Void) async throws {
+        let standard = UserDefaults.standard
+        let consentBefore = standard.object(forKey: AgeAndTermsConsent.completedKey)
+        let previousSession = TabMailSessionStore.shared.loadActiveSession()?.data
+        defer {
+            _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
+            if let previousSession { _ = try? TabMailSessionStore.shared.installNewSession(previousSession) }
+            if let consentBefore { standard.set(consentBefore, forKey: AgeAndTermsConsent.completedKey) } else {
+                standard.removeObject(forKey: AgeAndTermsConsent.completedKey)
+            }
+        }
+        standard.set(true, forKey: AgeAndTermsConsent.completedKey)
+        let sessionData = try JSONSerialization.data(withJSONObject: [
+            "access_token": "synthetic-worker-token", "refresh_token": "synthetic-refresh-token",
+            "expires_at": Int(Date().addingTimeInterval(86400).timeIntervalSince1970),
+            "user": ["id": "11111111-1111-4111-8111-111111111111", "email": "user@example.com"],
+        ])
+        _ = try TabMailSessionStore.shared.installNewSession(sessionData)
+        try await body()
+    }
+
+    // The summary at Send follows the run, as the run's opens do: with its other inputs met (a
+    // session, consent, a plan, AI on), a chat-view run allows it with Chat View turned off live, and
+    // a run teaching today's view refuses it with Chat View turned on live. The run's own practice
+    // send is scripted: it is summarized on the device and sends no AI request.
+    @Test("The summary at Send follows the run whatever the live Chat View setting says; the run's practice send sends no AI request",
+          arguments: [true, false])
+    func summaryAtSendFollowsTheRun(chatViewRun: Bool) async throws {
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        try await withSettings(chatView: chatViewRun) {
+            try await withSessionAndConsent {
+                let coordinator = TutorialCoordinator.shared
+                try await whileRunning(.reuseReply) {
+                    #expect(coordinator.teachesChat == chatViewRun, "control: the run kind")
+                    // The live toggle disagrees with the run; every other input is met.
+                    UserDefaults.standard.set(!chatViewRun, forKey: ChatViewConfig.enabledKey)
+                    AISubscriptionGate.shared.openGate()
+                    let liveActive = ChatViewConfig.isActive
+                    #expect(liveActive == !chatViewRun, "control: the live chat view disagrees with the run")
+                    #expect(TabMailAuthService.hasSession(), "control: signed in")
+                    let mayRun = SentEmailSummary.mayRun()
+                    #expect(mayRun == chatViewRun, "the summary at Send follows the run, not the live setting")
+                    guard chatViewRun else { return }
+
+                    // The run's practice send, with a summary service that records every request.
+                    let http = FakeHTTP.Scenario()
+                    defer { http.close() }
+                    http.register(path: "/completions/chat", method: "POST", response: .status(500))
+                    let recording = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+                    let pool = fixture.0
+                    let reply = TutorialChatScript.shorterReply
+                    let draftId = "tutorial-practice-\(UUID().uuidString)"
+                    try await pool.write { db in
+                        var draft = Draft(
+                            id: draftId, accountId: DemoSeed.demoAccountId,
+                            toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                            subject: "Re: Engineering offsite", body: reply, replyToId: nil,
+                            isForward: false, editHistoryJSON: nil,
+                            createdAt: Date().timeIntervalSince1970,
+                            updatedAt: Date().timeIntervalSince1970)
+                        draft.instanceEpoch = "E1"
+                        try draft.insert(db)
+                    }
+                    let demoAccount = try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) }
+                    let account = try #require(demoAccount, "the demo account is set up")
+                    let found = try await pool.read { db in
+                        try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                            && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+                    }
+                    let priya = try #require(found, "the demo seed has Priya's email")
+                    // Linked to Priya's email, as compose links the practice reply.
+                    let queued = try await AccountManager.shared.queueSend(
+                        draft: DraftMessage(to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply,
+                                            inReplyTo: priya.rfc822MessageId),
+                        from: account, replyToHeaderId: priya.id, draftId: draftId, instanceEpoch: "E1", holdsForUndo: false,
+                        summaryService: recording)
+                    // Its Sent copy carries its own words as its text message: the local summary ran.
+                    var sentCopy: MessageHeader?
+                    for _ in 0..<80 {
+                        sentCopy = try await pool.read { db in
+                            try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                                && Column("messageId") == "sent-\(queued.outboxId)").fetchOne(db)
+                        }
+                        if sentCopy?.summaryTextMessage != nil { break }
+                        try await Task.sleep(for: .milliseconds(100))
+                    }
+                    let sentText = sentCopy?.summaryTextMessage
+                    #expect(sentText == reply, "the practice send is summarized on the device, in its own words")
+                    let requests = http.recordedCalls().count
+                    #expect(requests == 0, "the practice send sends no AI request")
+                }
+            }
+        }
     }
 
     // The coach card is part of the chat's top bar: while it shows, no bubble sits under it; once
@@ -501,62 +889,58 @@ struct TutorialChatViewRunTests {
         defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
         try await withSettings(chatView: true) {
             let coordinator = TutorialCoordinator.shared
-            try await start(.reuseReply)
-            #expect(coordinator.step == .replyToPriya)
-            let priya = try #require(try await fixture.0.read { db in
-                try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
-                    && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
-            })
-            // The run ends on every way out, so a failure here leaves no live run for the next test.
-            do { try await HostedAccessibility.withAutomation {
-                let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-                let window = UIWindow(windowScene: scene)
-                let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) })
-                window.rootViewController = controller
-                window.makeKeyAndVisible()
-                defer {
-                    window.isHidden = true
-                    window.rootViewController = nil
-                }
-                @MainActor func coach() -> CGRect? {
-                    HostedAccessibility.elements(under: controller.view)
-                        .first { HostedAccessibility.identifier(of: $0) == "tutorial-coach" }?.accessibilityFrame
-                }
-                // The top of the first bubble: Priya's chat is short, so it sits at the bottom (its
-                // default anchor) and SwiftUI fills the space above it into the safe area. The room
-                // the card takes is therefore not readable from the scroll view here; what is
-                // readable, and what the bar must keep, is that nothing it holds covers a bubble.
-                @MainActor func firstBubbleTop() -> CGFloat? {
-                    HostedAccessibility.elements(under: controller.view)
-                        .filter { $0.accessibilityLabel?.contains(" said: ") == true }
-                        .map(\.accessibilityFrame.minY).min()
-                }
-                @MainActor func subject() -> CGRect? {
-                    HostedAccessibility.elements(under: controller.view)
-                        .first { $0.accessibilityLabel == priya.subject && $0.accessibilityHint == nil }?.accessibilityFrame
-                }
-                for _ in 0..<80 where coach() == nil || firstBubbleTop() == nil { try await Task.sleep(for: .milliseconds(100)) }
-                try await Task.sleep(for: .milliseconds(500))
-                let card = try #require(coach(), "the coach card shows: \(HostedAccessibility.identifiers(in: controller.view))")
-                #expect(card.height > 0)
-                let withCard = try #require(firstBubbleTop(), "Priya's bubbles show")
-                #expect(withCard >= card.maxY - 0.5, "the first bubble \(withCard) sits below the card \(card)")
+            try await whileRunning(.reuseReply) {
+                #expect(coordinator.step == .replyToPriya)
+                let priya = try #require(try await fixture.0.read { db in
+                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                        && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+                })
+                try await HostedAccessibility.withAutomation {
+                    let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+                    let window = UIWindow(windowScene: scene)
+                    let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) })
+                    window.rootViewController = controller
+                    window.makeKeyAndVisible()
+                    defer {
+                        window.isHidden = true
+                        window.rootViewController = nil
+                    }
+                    @MainActor func coach() -> CGRect? {
+                        HostedAccessibility.elements(under: controller.view)
+                            .first { HostedAccessibility.identifier(of: $0) == "tutorial-coach" }?.accessibilityFrame
+                    }
+                    // The top of the first bubble: Priya's chat is short, so it sits at the bottom (its
+                    // default anchor) and SwiftUI fills the space above it into the safe area. The room
+                    // the card takes is therefore not readable from the scroll view here; what is
+                    // readable, and what the bar must keep, is that nothing it holds covers a bubble.
+                    @MainActor func firstBubbleTop() -> CGFloat? {
+                        HostedAccessibility.elements(under: controller.view)
+                            .filter { $0.accessibilityLabel?.contains(" said: ") == true }
+                            .map(\.accessibilityFrame.minY).min()
+                    }
+                    @MainActor func subject() -> CGRect? {
+                        HostedAccessibility.elements(under: controller.view)
+                            .first { $0.accessibilityLabel == priya.subject && $0.accessibilityHint == nil }?.accessibilityFrame
+                    }
+                    for _ in 0..<80 where coach() == nil || firstBubbleTop() == nil { try await Task.sleep(for: .milliseconds(100)) }
+                    try await Task.sleep(for: .milliseconds(500))
+                    let card = try #require(coach(), "the coach card shows: \(HostedAccessibility.identifiers(in: controller.view))")
+                    #expect(card.height > 0)
+                    let withCard = try #require(firstBubbleTop(), "Priya's bubbles show")
+                    #expect(withCard >= card.maxY - 0.5, "the first bubble \(withCard) sits below the card \(card)")
 
-                // Part 3 starts in the inbox: Priya's chat holds no card for it. The demo, and so the
-                // chat, stays.
-                coordinator.nextLesson()
-                #expect(coordinator.step != .replyToPriya, "control: the run moved on")
-                for _ in 0..<80 where coach() != nil { try await Task.sleep(for: .milliseconds(100)) }
-                try await Task.sleep(for: .milliseconds(500))
-                #expect(coach() == nil, "the card goes once the run moves on")
-                let line = try #require(subject(), "the subject line shows: \(HostedAccessibility.labels(in: controller.view).prefix(20))")
-                let without = try #require(firstBubbleTop())
-                #expect(without >= line.maxY - 0.5, "the first bubble \(without) sits below the subject \(line)")
-            } } catch {
-                await coordinator.end()
-                throw error
+                    // Part 3 starts in the inbox: Priya's chat holds no card for it. The demo, and so the
+                    // chat, stays.
+                    coordinator.nextLesson()
+                    #expect(coordinator.step != .replyToPriya, "control: the run moved on")
+                    for _ in 0..<80 where coach() != nil { try await Task.sleep(for: .milliseconds(100)) }
+                    try await Task.sleep(for: .milliseconds(500))
+                    #expect(coach() == nil, "the card goes once the run moves on")
+                    let line = try #require(subject(), "the subject line shows: \(HostedAccessibility.labels(in: controller.view).prefix(20))")
+                    let without = try #require(firstBubbleTop())
+                    #expect(without >= line.maxY - 0.5, "the first bubble \(without) sits below the subject \(line)")
+                }
             }
-            await coordinator.end()
         }
     }
 
@@ -568,16 +952,16 @@ struct TutorialChatViewRunTests {
             try await withSettings(chatView: chatView, optedOut: optedOut) {
                 let coordinator = TutorialCoordinator.shared
                 #expect(!TutorialCoordinator.chatViewOnForTutorial)
-                try await start(.askAnything)
-                #expect(!coordinator.teachesChat)
-                #expect(!ChatViewConfig.opensInChat, "the run's emails open in today's view")
-                #expect(coordinator.fieldMove(inPracticeChat: true) == nil)
-                coordinator.chatPromptSent(.flights)
-                coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
-                coordinator.showMoreToAsk()
-                coordinator.showRecap()
-                #expect(coordinator.step == .finished, "no switch step in today's run")
-                await coordinator.end()
+                try await whileRunning(.askAnything) {
+                    #expect(!coordinator.teachesChat)
+                    #expect(!ChatViewConfig.opensInChat, "the run's emails open in today's view")
+                    #expect(coordinator.fieldMove(inPracticeChat: true) == nil)
+                    coordinator.chatPromptSent(.flights)
+                    coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
+                    coordinator.showMoreToAsk()
+                    coordinator.showRecap()
+                    #expect(coordinator.step == .finished, "no switch step in today's run")
+                }
             }
         }
     }

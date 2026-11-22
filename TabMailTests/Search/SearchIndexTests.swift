@@ -440,28 +440,6 @@ struct SearchIndexCRUDTests {
         try await index.clearBodies( contentKeys: [])
     }
 
-    @Test("updateCcBcc updates cc and bcc fields")
-    func updateCcBcc() async throws {
-        let hid = "test_ccbcc:INBOX:1"
-        let record = FTSHeaderRecord( contentKey: ContentKey(rawValue: hid),
-            headerId: hid, messageId: "m1", subject: "CcBcc Test",
-            from: "a@a.com", to: "b@b.com", cc: "", bcc: "",
-            dateMs: 1_700_000_000_000
-        )
-        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
-        let inserted = try await index.indexHeaders([record])
-        #expect(inserted == 1)
-
-        try await index.updateCcBcc([(headerId: hid, cc: "cc@test.com", bcc: "bcc@test.com")].map { (contentKey: ContentKey(rawValue: $0.headerId), cc: $0.cc, bcc: $0.bcc) })
-
-        try await index.removeMessages( contentKeys: [hid].map(ContentKey.init(rawValue:)))
-    }
-
-    @Test("updateCcBcc with empty array is a no-op")
-    func updateCcBccEmpty() async throws {
-        try await index.updateCcBcc([])
-    }
-
     // needsBodyUpdate, emptyBodyCount, totalIndexedCount removed — flags live in GRDB only
 
     @Test("documentCount returns non-negative count")

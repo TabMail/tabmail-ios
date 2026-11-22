@@ -151,7 +151,7 @@ extension AccountManager {
     ///  - the drain's own `COPYUID` re-key (`MessageHeaderRekey.finishMove`, with
     ///    the FTS/bodyAsset mirror in `publishMoveFinish`), and
     ///  - the sync's UID remap (`SyncEngine.runSyncMessages`, with its FTS mirror
-    ///    in `SyncEngineFullSync.syncMessages`) when no `COPYUID` was available.
+    ///    in `SyncEngine.runListing`) when no `COPYUID` was available.
     ///
     /// Both mirrors have completed by the time the post-drain sync call above
     /// returns, so **at this point the durable id and the FTS key agree by

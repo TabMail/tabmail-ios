@@ -17,6 +17,14 @@ actor SyncEngine {
     let primaryRoles = SyncEngine.syncedPrimaryRoles
     let secondaryRoles = SyncEngine.syncedSecondaryRoles
 
+    /// Per account: a listing in the current foreground pass that proved
+    /// nothing. Only grows during the pass (every unproven `listFolder` and
+    /// full-sync listing adds the account; nothing removes it but the start of
+    /// the next pass), so an error after it, in any later folder or route,
+    /// never loses it; `lastFullSyncAt` is stamped only when the account is not
+    /// in it (#755).
+    var unprovenListingPasses: Set<UUID> = []
+
     var headerBackfillTasks: [String: Task<Void, Never>] = [:]
 
     /// When the account's current catch-up slice window ends (ADR-IOS-107, #766):
@@ -25,9 +33,6 @@ actor SyncEngine {
     /// `SyncConfig.catchUpSliceIntervalSeconds`. In memory only; a relaunch starts afresh.
     var catchUpSliceWindowEnds: [String: Date] = [:]
 
-    /// Cached server-reported total message count for Gmail/Exchange accounts.
-    /// Used as progress denominator instead of FTS row count (which grows with crawl).
-    var serverMessageTotal: [String: Int] = [:]
 
     /// Generation counter per account — prevents stale task defer from clearing
     /// a replacement task's dictionary entry after resetCrawlState.
@@ -57,6 +62,13 @@ actor SyncEngine {
     /// their turn, oldest first (`oneSyncAtATime`).
     var syncPassRunning: Set<String> = []
     var syncPassWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    /// Header walks (`runBackfillWalk`) executing now, foreground or job. A walk
+    /// admitted before a download gate closed keeps running on its own snapshot,
+    /// so Fast Sync's keep-awake lock reads this, not the gate, to know the walk
+    /// is still progressing (#1098).
+    var runningBackfillWalks = 0
+    var backfillWalkRunning: Bool { runningBackfillWalks > 0 }
 
     /// Embedding rebuild task (one at a time).
 
@@ -105,7 +117,8 @@ actor SyncEngine {
     ///   .aggressive — plugged in. Full throughput, UI stays responsive (priority lock).
     ///   .normal     — on battery. Moderate progress, reasonable drain.
     ///   .low        — thermal throttling. Minimal resource usage.
-    /// Note: Low Power Mode and battery < 20% pause backfill entirely (getShouldPauseBackfill).
+    /// Note: Low Power Mode and battery < 20% hold only the walk; the folder scans
+    /// still run (backfillWalkAllowed, #1063).
     /// Reads UIDevice state via MainActor hop — always returns latest power state.
     func getBackfillProfile() async -> BackfillProfile {
         await MainActor.run {
@@ -123,20 +136,195 @@ actor SyncEngine {
         }
     }
 
-    /// Whether backfill should be paused entirely.
-    /// Pauses when: battery < 20% (not charging), or Low Power Mode enabled.
-    /// Fast sync mode bypasses this gate entirely.
-    /// Reads UIDevice state via MainActor hop.
-    func getShouldPauseBackfill() async -> Bool {
-        await MainActor.run {
-            let isFastSync = AccountManagerState.shared.fastSyncModeActive
-            if isFastSync { return false }
-            let isOnPower = UIDevice.current.batteryState == .charging || UIDevice.current.batteryState == .full
-            if ProcessInfo.processInfo.isLowPowerModeEnabled && !isOnPower { return true }
-            let level = UIDevice.current.batteryLevel
-            // batteryLevel returns -1 if monitoring not enabled (shouldn't happen — set in TabMailApp.init)
-            return !isOnPower && level >= 0 && level < 0.20
+    /// The power state together with the background-job flag and the job's Wi-Fi
+    /// measurement, all read in ONE MainActor step. The job sets and clears its
+    /// synthetic Fast Sync, the job flag and its (still unknown) Wi-Fi measurement
+    /// together in one MainActor step (`SyncScheduler.handleBackgroundAIProcessing`),
+    /// and publishes the reading on the MainActor only while the job runs, so a
+    /// reader never pairs the job's Fast Sync with "no job", nor the job with
+    /// another job's network (#1064). `jobOnWiFi` nil: the reading has not landed.
+    nonisolated static func currentBackfillPowerAndJobState() async
+        -> (power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), jobActive: Bool, jobOnWiFi: Bool?)
+    {
+        #if DEBUG
+        if let hook = Self.backfillPowerReadHookForTesting.withLock({ $0 }) { await hook() }
+        if let state = Self.backfillPowerStateForTesting.withLock({ $0 }) {
+            // The seam replaces the device readings; the app's Fast Sync flag and the
+            // job flag are still read live, so a test drives the real job entry/exit.
+            return await MainActor.run {
+                ((state.fastSync || AccountManagerState.shared.fastSyncModeActive, state.lowPowerMode,
+                  state.onPower, state.batteryLevel),
+                 backgroundProcessingJobActive.withLock { $0 },
+                 backgroundProcessingJobOnWiFi.withLock { $0 })
+            }
         }
+        #endif
+        return await MainActor.run {
+            let battery = UIDevice.current.batteryState
+            return ((AccountManagerState.shared.fastSyncModeActive, ProcessInfo.processInfo.isLowPowerModeEnabled,
+                     battery == .charging || battery == .full, UIDevice.current.batteryLevel),
+                    backgroundProcessingJobActive.withLock { $0 },
+                    backgroundProcessingJobOnWiFi.withLock { $0 })
+        }
+    }
+
+    #if DEBUG
+    /// Test seams for the backfill worker, nil (the default) in normal use: the
+    /// power state `backfillPowerState` returns instead of the device's, and the
+    /// wait between cycles, called with its length in seconds instead of
+    /// sleeping. They exist because a simulator cannot enter Low Power Mode and
+    /// no test can wait out the worker's pauses.
+    nonisolated static let backfillPowerStateForTesting =
+        Mutex<(fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float)?>(nil)
+    /// Awaited at the start of every power read, so a test can park an admission
+    /// decision across the read the way the production MainActor hop suspends.
+    nonisolated static let backfillPowerReadHookForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
+    /// Awaited in `backfillDownloadsAllowedNow` after the power/job read and before
+    /// the decision uses it, so a test can let the job end across that gap.
+    nonisolated static let backfillAdmissionDecisionHookForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
+    nonisolated static let backfillSleepForTesting = Mutex<(@Sendable (TimeInterval) async -> Void)?>(nil)
+    /// Awaited at the start of every header walk, after it counts itself running,
+    /// so a test can hold a walk in progress.
+    nonisolated static let backfillWalkStartedHookForTesting = Mutex<(@Sendable () async -> Void)?>(nil)
+    #endif
+
+    /// The worker's wait between cycles.
+    nonisolated static func backfillSleep(seconds: TimeInterval) async {
+        #if DEBUG
+        if let sleeper = backfillSleepForTesting.withLock({ $0 }) { await sleeper(seconds); return }
+        #endif
+        try? await Task.sleep(for: .seconds(seconds))
+    }
+
+    /// The foreground worker's walk decision for one cycle, from one snapshot.
+    /// The cycle always runs, so the folder scans (the catch-up) always run; the
+    /// gates hold only the walk, which downloads mail (#1063). Low Power Mode off
+    /// power, or battery below 20% off power, holds it (fast sync lifts both), and
+    /// so does the Wi-Fi-only setting on an expensive network.
+    nonisolated static func backfillWalkAllowed(
+        fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float, wifiOnly: Bool, expensive: Bool
+    ) -> Bool {
+        // batteryLevel is -1 when monitoring is off (it is set in TabMailApp.init).
+        let powerHeld = !fastSync && !onPower && (lowPowerMode || (batteryLevel >= 0 && batteryLevel < 0.20))
+        return !powerHeld && !(wifiOnly && expensive)
+    }
+
+    /// The one meaning of "on Wi-Fi" for the Wi-Fi-only setting (#1064): an
+    /// unmetered network, a satisfied path that iOS does not mark expensive,
+    /// whatever the interface. The setting saves metered data, so wired Ethernet
+    /// counts and a Personal Hotspot (Wi-Fi marked expensive) does not. Read by all three
+    /// older-mail download decisions: the foreground gate
+    /// (`backfillDownloadsAllowed`, from NetworkMonitor's path), and the job's body
+    /// gate and walk (both from the job's one measurement, `SyncScheduler.measureJobOnWiFi`).
+    nonisolated static func onUnmeteredNetwork(_ facts: NetworkPathFacts) -> Bool {
+        facts.satisfied && !facts.isExpensive
+    }
+
+    /// The Wi-Fi-only preference (Settings toggle, unset = on). Read once at the
+    /// start of each gate decision and passed through (snapshot rule).
+    nonisolated static func backfillWifiOnlySetting() -> Bool {
+        UserDefaults.standard.object(forKey: SyncScheduler.wifiOnlyKey) as? Bool ?? true
+    }
+
+    /// True while the BGProcessing job runs (`SyncScheduler.handleBackgroundAIProcessing`).
+    /// The job sets fast sync for throughput, so the body gate must not read that
+    /// flag as a user's Fast Sync: during the job, older-mail bodies follow the
+    /// job's own walk decision (`SyncScheduler.backgroundBackfillPlan`, #1064).
+    nonisolated static let backgroundProcessingJobActive = Mutex<Bool>(false)
+
+    /// The running job's network state (an unmetered network, `onUnmeteredNetwork`), measured
+    /// once with `SyncScheduler.measureJobOnWiFi`, started at job start concurrently with
+    /// the job's work so no scan waits for it. nil (unknown) from job start until
+    /// the reading lands, then true/false; written on the MainActor, reset to nil
+    /// in the same MainActor step that clears `backgroundProcessingJobActive`.
+    /// Both the job's walk and the body gate's job branch decide with this one
+    /// value and hold while it is unknown, so one decision has one network input
+    /// (#1064). The job may launch the app from terminated, where NetworkMonitor
+    /// never starts; this does not read it. nil outside a job (never read then).
+    nonisolated static let backgroundProcessingJobOnWiFi = Mutex<Bool?>(nil)
+
+    /// Waits for the running job's Wi-Fi reading, re-checking every
+    /// `SyncConfig.backfillBodyGateRecheckSeconds` (through `backfillSleep`, so a
+    /// test controls the wait). Returns nil if the job ends or the task is
+    /// cancelled first. The reading itself is bounded by
+    /// `SyncConfig.wifiCheckTimeoutSeconds`. Used only by the job's walk, after its
+    /// scans have run (`SyncScheduler.runBackgroundBackfill`).
+    nonisolated static func awaitBackgroundProcessingJobOnWiFi() async -> Bool? {
+        while !Task.isCancelled {
+            let (active, onWiFi) = await MainActor.run {
+                (backgroundProcessingJobActive.withLock { $0 }, backgroundProcessingJobOnWiFi.withLock { $0 })
+            }
+            guard active else { return nil }
+            if let onWiFi { return onWiFi }
+            await backfillSleep(seconds: SyncConfig.backfillBodyGateRecheckSeconds)
+        }
+        return nil
+    }
+
+    /// One older-mail body download decision (BackfillBodyQueue, #1064). Each call
+    /// is its own operation: the Wi-Fi-only preference is snapshotted first, before
+    /// any suspension. The job context is a live fact, read after the suspension in the
+    /// same MainActor step as the power state (`currentBackfillPowerAndJobState`): the
+    /// job's synthetic Fast Sync and its flag change together, so a job entering or
+    /// ending around the read can never make the job's Fast Sync count as a user's.
+    /// In the job the job's
+    /// walk decision applies, with the job's own Wi-Fi measurement; otherwise the
+    /// foreground walk's rule, where a network NetworkMonitor has not reported yet
+    /// holds. ActiveBodyQueue is not gated.
+    nonisolated static func backfillDownloadsAllowedNow() async -> Bool {
+        await backfillDownloadDecisionNow().allowed
+    }
+
+    /// `backfillDownloadsAllowedNow` together with the power snapshot it decided
+    /// from. The backfill worker's walk reads this too, so a worker that outlives
+    /// the foreground into the background processing job decides its walk with the
+    /// job's rule and the job's one network measurement, exactly as the bodies do;
+    /// its scans still run every cycle (#1064). `power` is for the worker's log and
+    /// pause length only.
+    nonisolated static func backfillDownloadDecisionNow() async
+        -> (allowed: Bool, power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float))
+    {
+        let wifiOnly = backfillWifiOnlySetting()
+        let (power, jobActive, jobOnWiFi) = await currentBackfillPowerAndJobState()
+        #if DEBUG
+        if let hook = backfillAdmissionDecisionHookForTesting.withLock({ $0 }) { await hook() }
+        #endif
+        return (backfillDownloadsAllowed(power: power, jobActive: jobActive, jobOnWiFi: jobOnWiFi, wifiOnly: wifiOnly), power)
+    }
+
+    /// The decision of `backfillDownloadDecisionNow` for one read.
+    private nonisolated static func backfillDownloadsAllowed(
+        power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float),
+        jobActive: Bool, jobOnWiFi: Bool?, wifiOnly: Bool
+    ) -> Bool {
+        if jobActive {
+            // The job's walk decision with the job's walk input: its Wi-Fi state
+            // measured once from job start (`measureJobOnWiFi`), never NetworkMonitor, which
+            // a job that launched the app from terminated never starts (#1064).
+            // Until the reading lands the bodies hold; the gate watcher's re-check
+            // (`backfillBodyGateRecheckSeconds`) picks up the lift.
+            guard let jobOnWiFi else { return false }
+            return SyncScheduler.backgroundBackfillPlan(
+                isLowPowerMode: power.lowPowerMode, wifiOnly: wifiOnly, onWiFi: jobOnWiFi)
+        }
+        return backfillDownloadsAllowed(power: power, wifiOnly: wifiOnly)
+    }
+
+    /// The foreground walk gate for a power snapshot and the Wi-Fi-only value the
+    /// caller captured, with the network read now. Shared by the walk and
+    /// BackfillBodyQueue. "On Wi-Fi" is `onUnmeteredNetwork` of NetworkMonitor's
+    /// latest path (Mutex-backed), the same rule the job applies to its own
+    /// measurement; an expensive or unsatisfied path (cellular, a Personal
+    /// Hotspot) counts as metered. A network no path update has reported yet counts as metered, so
+    /// Wi-Fi-only holds until the monitor knows (as the job's measurement holds on
+    /// its timeout, #1064).
+    nonisolated static func backfillDownloadsAllowed(
+        power: (fastSync: Bool, lowPowerMode: Bool, onPower: Bool, batteryLevel: Float), wifiOnly: Bool
+    ) -> Bool {
+        let onWiFi = NetworkMonitor.checkPathFactsIfKnown().map(onUnmeteredNetwork) ?? false
+        return backfillWalkAllowed(
+            fastSync: power.fastSync, lowPowerMode: power.lowPowerMode, onPower: power.onPower,
+            batteryLevel: power.batteryLevel, wifiOnly: wifiOnly, expensive: !onWiFi)
     }
 
     func register(accountId: String, provider: any EmailProvider, workQueue: ProviderWorkQueue) {
@@ -544,9 +732,14 @@ actor SyncEngine {
         // makes the full sync due in this pass, and its listings decide which
         // folders become tracked and whether a candidate bookmark is stored.
         var changePass: ChangePassOutcome?
+        // This pass's own unproven listings (#755): its change pass's
+        // untracked refreshes record here; an on-demand listing running at the
+        // same time belongs to no pass and never does.
+        let pass = UUID()
+        defer { unprovenListingPasses.remove(pass) }
         do {
             let deltaResult = try await queue.execute(priority: .headerFetch) {
-                try await self.performChangePass(account: account, provider: provider, deadline: deadline)
+                try await self.performChangePass(account: account, provider: provider, deadline: deadline, pass: pass)
             }
             changePass = deltaResult
             if deltaResult.succeeded {
@@ -570,7 +763,7 @@ actor SyncEngine {
                     // retry reads from the account row as it is now.
                     guard let current = try await accountAtTurnStart(account.id) else { throw error }
                     let retryResult = try await queue.execute(priority: .headerFetch) {
-                        try await self.performChangePass(account: current, provider: provider, deadline: deadline)
+                        try await self.performChangePass(account: current, provider: provider, deadline: deadline, pass: pass)
                     }
                     changePass = retryResult
                     if retryResult.succeeded {
@@ -610,7 +803,7 @@ actor SyncEngine {
         let fullSyncDue = timeSinceFullSync >= fullSyncInterval || listingNeeded
         if fullSyncDue {
             BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"), new bookmark: \(listingNeeded))...")
-            let plan = FullSyncPlan(appliedFolderList: changePass?.appliedFolderList)
+            let plan = FullSyncPlan(deadline: deadline)
             let listing: FullSyncListing
             do {
                 listing = try await queue.execute(priority: .headerFetch) {
@@ -636,17 +829,24 @@ actor SyncEngine {
             // due: the next foreground pass lists the folders still untracked
             // (tracked ones get no window listing) instead of waiting for the
             // next scheduled full sync.
-            var listingDone = true
+            // A folder an unproven move dropped the bookmark of gets its one
+            // self-heal pass before the baseline below may track it again.
+            await queue.execute(priority: .headerFetch) {
+                await self.healFoldersAfterAnUnprovenMove(account: account)
+            }
+
             if let changePass, changePass.fromReader {
                 // The reader's bookmark was read BEFORE these listings; store a
                 // candidate and turn tracking on only now that they are done.
                 try await commitChangeBaseline(
                     account: account, outcome: changePass, listedFolderIds: listing.listedFolderIds)
-                listingDone = !listing.droppedFolder
             }
 
+            // Never stamped after a pass in which a started listing failed to
+            // prove its window (#755). A folder the server made not listable
+            // (SELECT refused, no usable EXISTS) does not withhold it.
             let now = Date()
-            let fullSyncDone = listingDone
+            let fullSyncDone = !listing.droppedFolder && !unprovenListingPasses.contains(pass)
             try await dbPool.write { db in
                 _ = try Account.filter(Column("id") == account.id)
                     .updateAll(db, Column("lastSyncedAt").set(to: now))
@@ -663,7 +863,7 @@ actor SyncEngine {
                 await self.sweepStaleActionTags(account: account, provider: provider)
             }
             await queue.execute(priority: .bodyFetch) {
-                await self.selfHealRecentMessages(account: account)
+                _ = await self.selfHealRecentMessages(account: account)
             }
         }
 
@@ -902,12 +1102,16 @@ actor SyncEngine {
                 }
 
                 // Sent-folder reply discovery — no-op when folder.role != .sent.
-                let discovered = try ReplyParentResolver.markParentsReplied(
+                var discovered = try ReplyParentResolver.markParentsReplied(
                     inReplyTos: headers.map(\.inReplyTo),
                     folderRole: folder.role,
                     accountId: folder.accountId,
                     db: db
                 )
+                // The other direction: an inserted parent whose reply is already stored in Sent.
+                discovered += try ReplyParentResolver.markInsertedParentsOfStoredReplies(
+                    insertedRfc822Ids: inserted.compactMap(\.rfc822MessageId),
+                    accountId: folder.accountId, db: db)
 
                 return (inserted, discovered)
             }
@@ -972,6 +1176,7 @@ actor SyncEngine {
     /// Not a connection error — the connection is fine, just this folder can't be opened.
     /// Callers should skip the folder and continue with the next one.
     nonisolated static func isSelectFailedError(_ error: Error) -> Bool {
+        if error is ProviderFolderNotListable { return true }
         let msg = "\(error)"
         return msg.contains("Select mailbox failed")
     }

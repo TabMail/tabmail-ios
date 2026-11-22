@@ -1,3 +1,6 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **AMENDMENT (2026-11-17, tabmail-ios #538) — interval 1 is closed for IMAP/iCloud notifications that carry an epoch.** The notification payload now records `observedUidValidity`, the UIDVALIDITY its UID was observed under (`EmailNotificationBuilder.observedUidValidityUserInfoKey`). At tap time `NotificationActionRouter.execute` refuses a resolved row whose proven epoch differs, and the cold path queues nothing when the folder's live epoch is no longer the notified one. Notifications without the key (other providers, unproven epochs, payloads delivered before this change) keep the behaviour below. The body is preserved unedited.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-NOTIFY-001
 
 > Routed from `KNOWN_ISSUES.md` line 564 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).

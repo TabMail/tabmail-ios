@@ -72,6 +72,70 @@ struct ReplyParentResolverTests {
         return header
     }
 
+    // MARK: - 0. Parent side: an inserted parent whose reply is stored in Sent
+
+    /// Store a reply in `folderRole`'s folder of `accountId` whose In-Reply-To is `parent`.
+    private func insertReply(
+        _ db: DatabaseQueue, uid: String, to parent: String,
+        accountId: String = "acc1", folderPath: String = "Sent", folderRole: FolderRole = .sent
+    ) throws {
+        let reply = try insertParent(db, rfc822: "reply-\(uid)@x", accountId: accountId,
+                                     folderPath: folderPath, folderRole: folderRole, messageId: uid)
+        try db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET inReplyTo = ? WHERE id = ?", arguments: [parent, reply.id])
+        }
+    }
+
+    @Test("Parent side: only a reply stored in a Sent folder of the same account marks an inserted parent")
+    func insertedParentMarkedOnlyBySameAccountSentReply() throws {
+        let db = try TestDatabase.make()
+        // Inserted parents: one answered from Sent, one answered only from
+        // another account's Sent, one answered only from a non-Sent folder.
+        let matched = try insertParent(db, rfc822: "matched@x", actionTag: .reply)
+        let foreign = try insertParent(db, rfc822: "foreign@x", actionTag: .reply)
+        let nonSent = try insertParent(db, rfc822: "nonsent@x", actionTag: .reply)
+        // A stored parent that a stored reply answers, but that this batch did not insert.
+        let unrelated = try insertParent(db, rfc822: "unrelated@x", actionTag: .reply)
+        try insertReply(db, uid: "r1", to: "matched@x")
+        try insertReply(db, uid: "r2", to: "foreign@x", accountId: "acc2")
+        try insertParent(db, rfc822: "foreign@x", accountId: "acc2", actionTag: .reply, messageId: "p-acc2")
+        try insertReply(db, uid: "r3", to: "nonsent@x", folderPath: "Archive", folderRole: .archive)
+        try insertReply(db, uid: "r4", to: "unrelated@x")
+
+        let updated = try db.write { db in
+            try ReplyParentResolver.markInsertedParentsOfStoredReplies(
+                insertedRfc822Ids: ["matched@x", "foreign@x", "nonsent@x"], accountId: "acc1", db: db)
+        }
+
+        #expect(updated == [matched.id])
+        let rows = try db.read { db in
+            try MessageHeader.filter(Column("rfc822MessageId") != nil).fetchAll(db)
+        }
+        let byId = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+        #expect(byId[matched.id]?.isReplied == true && byId[matched.id]?.actionTag == ActionTag.none)
+        for control in [foreign, nonSent, unrelated] {
+            #expect(byId[control.id]?.isReplied == false && byId[control.id]?.actionTag == .reply,
+                    "\(control.rfc822MessageId ?? "") was marked")
+        }
+        #expect(rows.filter { $0.accountId == "acc2" }.allSatisfy { !$0.isReplied }, "another account's row was marked")
+        let ops = try db.read { try PendingOperation.fetchAll($0) }
+        #expect(ops.count == 1 && ops.first?.type == .setTag && ops.first?.accountId == "acc1"
+                && ops.first?.folderPath == "INBOX" && ops.first?.tagValue == ActionTag.none.rawValue,
+                "queued ops: \(ops.map { ($0.type, $0.accountId, $0.folderPath, $0.messageIds) })")
+    }
+
+    @Test("Parent side: no query and no change when nothing was inserted")
+    func insertedParentNoInsertsNoChange() throws {
+        let db = try TestDatabase.make()
+        let parent = try insertParent(db, rfc822: "p@x", actionTag: .reply)
+        try insertReply(db, uid: "r1", to: "p@x")
+        let updated = try db.write { db in
+            try ReplyParentResolver.markInsertedParentsOfStoredReplies(insertedRfc822Ids: [], accountId: "acc1", db: db)
+        }
+        #expect(updated.isEmpty)
+        #expect(try db.read { try MessageHeader.fetchOne($0, key: parent.id) }?.isReplied == false)
+    }
+
     // MARK: - 1. No-op when folder is not Sent
 
     @Test("Returns empty and does not touch DB when folder.role != .sent")

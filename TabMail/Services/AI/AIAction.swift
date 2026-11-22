@@ -65,7 +65,14 @@ extension AIService {
         // Single attempt — natural retry via queue loop on next sync cycle.
         let llmT0 = CFAbsoluteTimeGetCurrent()
         BackgroundSyncLogger.logAIProcessing("Action LLM START")
-        let response = try await backend.sendCompletions(request)
+        let response: CompletionsResponse
+        do {
+            response = try await backend.sendCompletions(request)
+        } catch is AIOffError {
+            // AI was turned off while this waited to be sent: end as the check above does.
+            BackgroundSyncLogger.logAIProcessing("Action not sent: AI turned off")
+            return nil
+        }
         let llmElapsed = Int((CFAbsoluteTimeGetCurrent() - llmT0) * 1000)
         BackgroundSyncLogger.logAIProcessing("Action LLM END in \(llmElapsed)ms")
         guard let text = response.assistant, let tag = Self.parseActionResponse(text) else {

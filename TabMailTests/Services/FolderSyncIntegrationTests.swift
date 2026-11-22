@@ -29,12 +29,12 @@ struct FolderSyncUpsertTests {
                     existing.name = info.name
                     existing.totalCount = info.totalCount
                     if let uidNext = info.uidNext { existing.lastKnownUidNext = uidNext }
-                    try existing.update(dbConn)
+                    try existing.updateWithListingCounters(dbConn)
                 } else {
                     var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: accountId)
                     folder.totalCount = info.totalCount
                     folder.lastKnownUidNext = info.uidNext
-                    try folder.insert(dbConn)
+                    try folder.insertWithListingCounters(dbConn)
                 }
             }
 
@@ -167,7 +167,7 @@ struct FolderSyncUpsertTests {
     func uidNextOnlyUpdatesWhenNonNil() throws {
         var folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
         folder.lastKnownUidNext = 500
-        try db.write { try folder.update($0) }
+        try db.write { try folder.updateWithListingCounters($0) }
 
         // Remote provides a new uidNext
         let remote = [
@@ -183,7 +183,7 @@ struct FolderSyncUpsertTests {
     func nilUidNextPreservesExisting() throws {
         var folder = try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
         folder.lastKnownUidNext = 500
-        try db.write { try folder.update($0) }
+        try db.write { try folder.updateWithListingCounters($0) }
 
         // Remote returns nil uidNext (e.g. Gmail has no uidNext concept)
         let remote = [
@@ -290,7 +290,7 @@ struct FolderSyncDeletionEdgeCaseTests {
         folder.lastKnownUidNext = 999
         folder.totalCount = 42
         folder.isFavorite = true
-        try db.write { try folder.update($0) }
+        try db.write { try folder.updateWithListingCounters($0) }
 
         // Delete the folder
         _ = try db.write { dbConn in
@@ -310,7 +310,7 @@ struct FolderSyncDeletionEdgeCaseTests {
                 var newFolder = Folder(name: info.name, path: info.path, role: info.role, accountId: "acc1")
                 newFolder.totalCount = info.totalCount
                 newFolder.lastKnownUidNext = info.uidNext
-                try newFolder.insert(dbConn)
+                try newFolder.insertWithListingCounters(dbConn)
             }
         }
 
@@ -442,12 +442,12 @@ struct FolderSyncProviderFlowTests {
                     existing.name = info.name
                     existing.totalCount = info.totalCount
                     if let uidNext = info.uidNext { existing.lastKnownUidNext = uidNext }
-                    try existing.update(dbConn)
+                    try existing.updateWithListingCounters(dbConn)
                 } else {
                     var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: accountId)
                     folder.totalCount = info.totalCount
                     folder.lastKnownUidNext = info.uidNext
-                    try folder.insert(dbConn)
+                    try folder.insertWithListingCounters(dbConn)
                 }
             }
 
@@ -473,12 +473,12 @@ struct FolderSyncProviderFlowTests {
                     existing.name = info.name
                     existing.totalCount = info.totalCount
                     if let uidNext = info.uidNext { existing.lastKnownUidNext = uidNext }
-                    try existing.update(dbConn)
+                    try existing.updateWithListingCounters(dbConn)
                 } else {
                     var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: accountId)
                     folder.totalCount = info.totalCount
                     folder.lastKnownUidNext = info.uidNext
-                    try folder.insert(dbConn)
+                    try folder.insertWithListingCounters(dbConn)
                 }
             }
 

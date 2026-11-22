@@ -107,6 +107,7 @@ struct ChatBubbleView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityText)
         .accessibilityHint("Opens the email")
+        .accessibilityIdentifier(isHighlighted ? Self.highlightedBubbleId : Self.bubbleId)
         .accessibilityAddTraits(.isButton)
         .accessibilityActions {
             ForEach(actions) { action in
@@ -114,6 +115,11 @@ struct ChatBubbleView: View {
             }
         }
     }
+
+    /// The bubble's identifier, and the one it has while it glows (an email opened from search or
+    /// a notification), so a test can tell which bubble glows. VoiceOver does not read either.
+    static let bubbleId = "chat.bubble"
+    static let highlightedBubbleId = "chat.bubble.highlighted"
 
     /// VoiceOver: what is on screen, in order.
     private var accessibilityText: String {

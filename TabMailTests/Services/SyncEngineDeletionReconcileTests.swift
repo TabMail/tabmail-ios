@@ -549,6 +549,58 @@ struct DeletionReconcileWalkTests {
         )
         #expect(!outcome.aborted)
         #expect(outcome.deletedCount == 3)
+        #expect(outcome.finished)
+    }
+
+    @Test("Out of time, the walk stops before its next chunk and does not count as finished")
+    func outOfTimeStopsTheWalk() async {
+        let recorder = WalkRecorder()
+        let chunks = Mutex(0)
+        let outcome = await SyncEngine.runDeletionReconcileWalk(
+            localUIDs: [1, 2, 3, 4], chunkSize: 2, storedUidValidity: 7, maxDeletions: .max, interChunkDelaySeconds: 0,
+            search: { chunk in
+                recorder.recordSearch(chunk)
+                chunks.withLock { $0 += 1 }
+                return UIDExistenceResult(found: [], uidValidity: 7)
+            },
+            deleteGhosts: { ghosts in recorder.recordDelete(ghosts); return ghosts.count },
+            outOfTime: { chunks.withLock { $0 } >= 1 })
+        #expect(recorder.searchCalls.count == 1, "no chunk starts past the deadline")
+        #expect(outcome.aborted)
+        #expect(!outcome.finished)
+    }
+
+    @Test("A ghost a shield keeps back leaves the walk unfinished")
+    func shieldedGhostLeavesTheWalkUnfinished() async {
+        let outcome = await SyncEngine.runDeletionReconcileWalk(
+            localUIDs: [1, 2], chunkSize: 2, storedUidValidity: 7, maxDeletions: .max, interChunkDelaySeconds: 0,
+            search: { _ in UIDExistenceResult(found: [], uidValidity: 7) },
+            deleteGhosts: { ghosts in ghosts.count - 1 })
+        #expect(!outcome.aborted)
+        #expect(outcome.shieldedCount == 1)
+        #expect(!outcome.finished)
+    }
+}
+
+@Suite("DeletionReconcile — the listing's due flag", .serialized, .processGlobalState)
+struct DeletionReconcileDueFlagTests {
+    @Test("A pass already past its deadline does not walk: nothing is removed and the folder's listing stays due")
+    func pastDeadlineLeavesTheListingDue() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        _ = try FolderEpochTestFixture.makeAccount(id: "due-acct", provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "due-acct", path: "Archive", role: .archive, pool: pool,
+                                                totalCount: 2, lastKnownUidValidity: 7)
+        try FolderEpochTestFixture.insertHeaders(accountId: "due-acct", path: "Archive", uids: [1, 2, 3, 4], pool: pool)
+        let folderId = "due-acct:Archive"
+        let folder = try #require(try await pool.read { db in try Folder.fetchOne(db, key: folderId) })
+        let engine = SyncEngine()
+        await engine.reconcileDeletionsAfterListing(
+            folder: folder, provider: MockEmailProvider(), serverCount: 2, logPrefix: "[Test]",
+            deadline: Date().addingTimeInterval(-1))
+        let after = try #require(try await pool.read { db in try Folder.fetchOne(db, key: folderId) })
+        #expect(FolderChangeState(raw: after.changeState).listingDue, "the walk did not run, so the listing stays due")
+        #expect(try await pool.read { db in try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db) } == 4)
     }
 }
 

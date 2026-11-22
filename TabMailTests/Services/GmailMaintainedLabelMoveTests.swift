@@ -245,6 +245,53 @@ struct GmailMaintainedLabelMoveTests {
         await finish(f)
     }
 
+    /// Gmail keeps SENT on a trashed message, so after the delete the server
+    /// says `[SENT, TRASH]`. A message carrying TRASH is a member of no folder
+    /// but Trash: the change passes that read it back, once the
+    /// recent-completion hold is over, must not put it back into Sent.
+    @Test("A delete from Sent is not put back by the re-read after the hold")
+    @MainActor
+    func deleteFromSentIsNotPutBackAfterTheHold() async throws {
+        let id = "sentmsg-reread"
+        let server = StatefulGmailActionServer(messages: [.init(
+            rfc822MessageId: "\(id)@example.com",
+            providerMessageId: id,
+            labels: ["SENT"]
+        )], userLabels: ["Label_7": "Projects"], systemLabels: ["INBOX", "SENT", "DRAFT", "TRASH"])
+        defer { server.close() }
+        let f = try fixture(accountId: "gmail-delete-sent-reread")
+        let cursor = server.currentHistoryId()
+        try await f.pool.write { db in
+            try db.execute(sql: "UPDATE account SET lastHistoryId = ? WHERE id = ?", arguments: [cursor, f.accountId])
+        }
+        await AccountManager.shared.registerProviderForTesting(accountId: f.accountId, provider: server.provider())
+        let seeded = try seedHeader(f, providerId: id, folderPath: "SENT")
+
+        await AccountManager.shared.move([seeded], to: "TRASH")
+        try await drainToQuiescence(f)
+        #expect(server.snapshot(providerMessageId: id)?.labels == ["SENT", "TRASH"],
+                "precondition: Gmail keeps SENT on the trashed message")
+
+        // One pass inside the hold, then passes after it.
+        let engine = SyncEngine()
+        for pass in 0..<3 {
+            if pass > 0 { await AccountManager.shared.clearRecentlyCompletedForTesting() }
+            let account = try await f.pool.read { db in try Account.fetchOne(db, key: f.accountId) }
+            let current = try #require(account)
+            let outcome = try await engine.performDeltaSync(account: current, provider: server.provider())
+            #expect(outcome.succeeded, "precondition: change pass \(pass) ran")
+        }
+
+        let rows = try await f.pool.read { db in
+            try MessageHeader.filter(Column("accountId") == f.accountId && Column("messageId") == id).fetchAll(db)
+        }
+        #expect(rows.filter { $0.folderPath == "SENT" }.isEmpty,
+                "a message carrying TRASH is not in Sent: \(rows.map(\.folderPath))")
+        #expect(rows.filter { $0.folderPath == "TRASH" }.count == 1,
+                "the message is in Trash once: \(rows.map(\.folderPath))")
+        await finish(f)
+    }
+
     /// One member Gmail cannot act on must not strand the others: each member
     /// of a delete from Sent, and of its Undo, is settled on its own. The
     /// member Gmail cannot act on is tried first, and is either an id Gmail
