@@ -280,7 +280,12 @@ struct EmailForwardToolBodyReadTests {
             Issue.record("control: the forward card opens")
             return
         }
-        let output = try await task.value
+        // Bounded in both arms: a tool that parks with no card to take fails here, never hangs.
+        guard let finished = await BoundedWait.result(of: task, within: .seconds(5)) else {
+            Issue.record("the forward tool ends")
+            return
+        }
+        let output = try finished.get()
 
         if resetPending {
             #expect(calls.all.isEmpty, "the row's body never goes to the model")

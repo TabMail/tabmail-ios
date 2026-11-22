@@ -613,7 +613,8 @@ struct ChatReplyRecoveryTests {
     /// chat. The ghost's button itself does not take an accessibility activation in a hosted test,
     /// so the card is opened the way the tap opens it.
     private static func openGhostCard(_ shown: ReplyResult, in chat: Chat) async throws {
-        let message = try #require(try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) })
+        let fetched = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
+        let message = try #require(fetched)
         let ready = ChatReadyReply(message: message, suggestion: shown, accounts: chat.accounts)
         let store = NavigationStore()
         store.accounts = chat.accounts

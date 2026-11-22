@@ -391,6 +391,15 @@ struct ChatReplyFieldRuntimeTests {
                     && send.contains("let fieldWordsKey = ownsFieldWords ? field.map { ChatFieldWords.key(for: $0.message) } : nil"),
                 "a send's field key comes from its field alone, and only for the field's own send")
         #expect(!send.contains("holdsSentWords"), "what the field holds never names a send's field key")
+        // The key is derived in that one place, every request part takes that key as it is, and the
+        // send's own transition of the words is its answer on that key: a send that owns no words
+        // has no other way to reach them.
+        #expect(send.components(separatedBy: "ChatFieldWords.key(for:").count == 2, "one field key derivation in a send")
+        #expect(send.components(separatedBy: "fieldWordsKey: ").count == send.components(separatedBy: "fieldWordsKey: fieldWordsKey").count,
+                "every part of the request takes the send's own field key")
+        #expect(send.components(separatedBy: "ChatFieldWords.shared.apply(").count == 2
+                    && send.contains("ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)"),
+                "the send's only transition of the words is its answer, on its own field key")
         // A failed re-send's Retry keeps the rule: the failure records whether the send owned words.
         #expect(send.contains("lastFailedSend = .init(text: text, field: field, ownsFieldWords: fieldWordsKey != nil)"),
                 "a failed send records whether it owned the field's words")

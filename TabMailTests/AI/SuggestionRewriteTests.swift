@@ -231,7 +231,8 @@ struct SuggestionRewriteRouteTests {
             }
         }
         if imap {
-            header = try #require(try await db.read { try MessageHeader.fetchOne($0, key: id) })
+            let fetched = try await db.read { try MessageHeader.fetchOne($0, key: id) }
+            header = try #require(fetched)
         }
         let translator = MockChatIdTranslator()
         await translator.seed(header.id, as: 1)
@@ -266,7 +267,8 @@ struct SuggestionRewriteRouteTests {
     }
 
     func row(_ db: DatabaseQueue, _ id: MessageHeader.ID) async throws -> MessageHeader {
-        try #require(try await db.read { try MessageHeader.fetchOne($0, key: id) })
+        let fetched = try await db.read { try MessageHeader.fetchOne($0, key: id) }
+        return try #require(fetched)
     }
 
     func waitForCard(_ router: AgentToolRouter) async -> AgentToolRouter.ComposeRequest? {
@@ -664,6 +666,13 @@ struct SuggestionRewriteRouteTests {
             let card = try #require(await waitForCard(fixture.router))
             #expect((card.fieldReply?.onlyTo == ["sender@example.com"]) == keepsAudience)
             #expect(calls.all.first?.body == "", "the field's suggestion is not this copy's draft")
+            // Who the reply goes to follows the audience alone: only the chosen person on the same
+            // account's copy, everyone on another account's copy, for the model and for the card.
+            let audience: Set<String> = keepsAudience ? ["sender@example.com"] : ["sender@example.com", "recipient@example.com"]
+            let call = try #require(calls.all.first)
+            #expect(Set(call.context.toRecipients + call.context.ccRecipients) == audience,
+                    "the model's draft goes to \(audience): \(call.context.toRecipients) cc \(call.context.ccRecipients)")
+            #expect(Set(card.to + card.cc) == audience, "the card goes to \(audience): \(card.to) cc \(card.cc)")
             #expect(try await row(fixture.db, copy.id).suggestion == Self.shownReply, "no suggestion edit stored on a copy")
             card.onOutcome(.cancelled)
             _ = try await task.value
@@ -717,7 +726,8 @@ struct SuggestionRewriteRouteTests {
         let newer = try TestDatabase.insertMessageHeader(fixture.db, messageId: "s9", subject: "Re: Offsite")
         for (value, expected) in [(ReplyResult.filtered, nil), (late, ReplyResult.filtered)] as [(ReplyResult, ReplyResult?)] {
             let outcome = try await fixture.db.write { db -> AIWriteOutcome in
-                let target = try #require(try AIWriteTarget.capture(message: newer, db: db))
+                let captured = try AIWriteTarget.capture(message: newer, db: db)
+                let target = try #require(captured)
                 return try AccountManager.storeSuggestion(value, replacing: expected, target: target, db: db)
             }
             #expect(outcome == .written)
