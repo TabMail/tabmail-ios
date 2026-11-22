@@ -340,7 +340,7 @@ struct ChatRecentPeopleHostedTests {
                 "Sam left Recent: \(Self.labels(ChatReplyToSheet.recentId, in: window))")
         let listed = Self.elements(ChatReplyToSheet.personId, in: window)
         let samRow = listed.first { ($0.accessibilityLabel ?? "").contains("Sam Patel") }
-        let samTicked = samRow.map { $0.accessibilityTraits.contains(.isSelected) }
+        let samTicked = samRow.map { $0.accessibilityTraits.contains(.selected) }
         #expect(samTicked == true,
                 "Sam is in the list, ticked: \(listed.map { $0.accessibilityLabel ?? "" })")
     }
