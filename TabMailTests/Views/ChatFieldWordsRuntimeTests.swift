@@ -741,7 +741,7 @@ struct ChatFieldWordsRuntimeTests {
     /// elsewhere, none of the field's.
     static func invocation(_ origin: ComposeOrigin, email: MessageHeader) -> ToolInvocation {
         guard origin != .sheet else { return ToolInvocation() }
-        return ToolInvocation(fieldReply: ChatFieldReply(emailKey: ChatThread.copyKey(email), onlyTo: nil),
+        return ToolInvocation(fieldReply: ChatFieldReply(email: email, onlyTo: nil),
                               fieldWordsKey: ChatFieldWords.key(for: email))
     }
 
