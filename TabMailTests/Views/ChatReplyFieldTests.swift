@@ -540,7 +540,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("composeEnded(.", in: text) == 0 && Self.count("{ _ in composeEnded", in: text) == 0)
         // The AI Suggestion's card is not a send from the field: its outcome leaves the field's
         // words alone (a completion with no field send would empty them).
-        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestedBody: ready.message.cachedReply, draftId: ready.draftId, onAgentOutcome: { _ in })", in: text) == 1,
+        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestedBody: ready.message.cachedReply, draftId: ready.draftId, openedOn: composeScreen(answering: ready.message), onAgentOutcome: { _ in })", in: text) == 1,
                 "the card holds the tapped row's reply and never completes the field")
         #expect(Self.count("@State private var example = ChatSuggestionConfig.randomExample()", in: text) == 1,
                 "one example per chat open, kept across redraws")
@@ -648,13 +648,13 @@ struct ChatReplyFieldTests {
     /// The compose card the chat opens for the AI Suggestion, as the chat's cover builds it.
     private static func card(_ message: MessageHeader, accounts: [Account] = [me]) -> ComposeView {
         ChatReplyCompose.make(replyAllTo: message, accounts: accounts)
-            .composeView(replyTo: message, onAgentOutcome: { _ in })
+            .composeView(replyTo: message, openedOn: .chat, onAgentOutcome: { _ in })
     }
 
     /// The compose card the chat opens for the agent's reply, as the chat's cover builds it.
     private static func card(agent request: AgentToolRouter.ComposeRequest, accounts: [Account]) -> ComposeView {
         ChatReplyCompose.make(agent: request, accounts: accounts)
-            .composeView(replyTo: request.replyTo, suggestedBody: request.body, onAgentOutcome: { _ in })
+            .composeView(replyTo: request.replyTo, suggestedBody: request.body, openedOn: .chat, onAgentOutcome: { _ in })
     }
 
     /// Where the agent's reply was asked for: the open sheet, or the reply field with who was
@@ -916,7 +916,7 @@ struct ChatReplyFieldTests {
         // when the reply goes to everyone, and the recipients with it.
         #expect(Self.count("agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))", in: chat) == 1,
                 "the agent's card is read from its request alone (who it goes to is the request's: ChatReplyComposeOriginTests)")
-        #expect(Self.count("case .reply: card.reply.composeView(replyTo: req.replyTo, suggestedBody: req.body, onAgentOutcome: onOutcome)", in: chat) == 1,
+        #expect(Self.count("case .reply: card.reply.composeView( replyTo: req.replyTo, suggestedBody: req.body, openedOn: composeScreen(answering: req.replyTo), onAgentOutcome: onOutcome)", in: chat) == 1,
                 "the agent's reply card opens in the helper's kind")
         #expect(Self.count("ChatReplyCompose.make(", in: chat) == 2, "the AI Suggestion and the agent's reply")
         #expect(Self.count("isReplyAll", in: chat) == 0 && Self.count("buildReplyAllRecipients", in: chat) == 1,
@@ -930,7 +930,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ownAddresses: context.ownAddresses) { replyTarget = $0 }", in: chat) == 1, "Done sets it")
         #expect(Self.count("ChatHeaderView(thread: thread) { guard TutorialCoordinator.shared.admits(.other) else { return } showsReplyTo = true }", in: chat) == 1)
         #expect(Self.count("Button { guard TutorialCoordinator.shared.admits(.other) else { return } forwardMessage = thread.newest }", in: chat) == 1)
-        #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }", in: chat) == 1)
+        #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }", in: chat) == 1)
         #expect(Self.count(".onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }", in: chat) == 1,
                 "a new newest email resets the choice, even one whose UID matches the last")
 

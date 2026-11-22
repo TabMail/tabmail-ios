@@ -1278,8 +1278,8 @@ struct ComposeView: View {
     /// owner/generation reconstructed before confirmed Outbox cancellation.
     var retainedDraftAuthority: PendingSendService.RetainedDraftAuthority?
     /// The screen this compose was opened on, given as it opens and never changed (nil: a screen
-    /// that names none). Read at Send to decide who offers the send's Undo
-    /// (`PendingSendService.sendHasBubbleUndo`).
+    /// that names none, or a chat that does not show this compose's send). Read at Send to decide who
+    /// offers the send's Undo (`PendingSendService.sendHasBubbleUndo`).
     var openedOn: ComposeScreen?
     /// Fires when the user either sends, fails to persist, or dismisses —
     /// exactly once per compose session, via `ComposeOutcomeState.tryResolve`

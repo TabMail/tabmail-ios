@@ -310,10 +310,10 @@ struct ChatThreadView: View {
             // suggestion through the outbox.
             ready.compose.composeView(
                 replyTo: ready.message, suggestedBody: ready.message.cachedReply, draftId: ready.draftId,
-                onAgentOutcome: { _ in })
+                openedOn: composeScreen(answering: ready.message), onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
-        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: .chat) }
+        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }
         .sheet(isPresented: $showsReplyTo) {
             ChatReplyToSheet(
                 replyPeople: thread.replyPeople, target: replyTarget,
@@ -949,17 +949,36 @@ struct ChatThreadView: View {
         }
         switch req.mode {
         case .compose:
+            // A new email: no chat shows it, so it records no screen and keeps the toast.
             ComposeView(
                 suggestedBody: req.body, account: context.accounts.first { $0.id == viewModel.message?.accountId },
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
-                openedOn: .chat, onAgentOutcome: onOutcome)
+                onAgentOutcome: onOutcome)
         case .reply:
-            card.reply.composeView(replyTo: req.replyTo, suggestedBody: req.body, onAgentOutcome: onOutcome)
+            card.reply.composeView(
+                replyTo: req.replyTo, suggestedBody: req.body, openedOn: composeScreen(answering: req.replyTo),
+                onAgentOutcome: onOutcome)
         case .forward:
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
-                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, openedOn: .chat, onAgentOutcome: onOutcome)
+                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc,
+                openedOn: composeScreen(answering: req.replyTo), onAgentOutcome: onOutcome)
         }
+    }
+
+    /// The screen this chat records for a compose it opens (`ComposeView.openedOn`).
+    private func composeScreen(answering target: MessageHeader?) -> ComposeScreen? {
+        Self.composeScreen(answering: target, chatMessageIds: messageIds)
+    }
+
+    /// The screen a chat records for a compose it opens, as the compose opens: the chat
+    /// (`ComposeScreen.chat`) only when it shows that compose's send as its bubble, a reply to or a
+    /// forward of one of its own emails (`ChatUnsentReply.answers`, by the target's Message-ID).
+    /// Any other records none, and its send keeps the toast: a new email, and an agent's card for an
+    /// email of another thread (its tools can name any email), whose send shows only in that
+    /// thread's chat. `chatMessageIds`: the normalized Message-IDs of the chat's emails.
+    nonisolated static func composeScreen(answering target: MessageHeader?, chatMessageIds: Set<String>) -> ComposeScreen? {
+        ChatUnsentReply.answers(target?.rfc822MessageId, in: chatMessageIds) ? .chat : nil
     }
 }
 

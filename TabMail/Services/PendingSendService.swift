@@ -175,11 +175,11 @@ final class PendingSendService {
     /// Whether the send gets a chat bubble with its own Undo, so its toast is not shown. Every send
     /// keeps exactly one visible Undo. The bubble offers it for a reply (the chat shows a send by its
     /// In-Reply-To, `ChatUnsentReply`) sent with the chat view on (read once at the Send tap) from a
-    /// compose the chat opened (`ComposeScreen.chat`, given as the compose opened): that compose
-    /// closes back onto the chat that shows the bubble. Every other send keeps the toast: a new
-    /// email, and a reply from a compose opened anywhere else (the Drafts list, the inbox, the
-    /// compose an Undo reopens), whose screen shows no bubble. A later change that gives new emails
-    /// a bubble changes this one rule.
+    /// compose the chat opened for one of its own emails (`ComposeScreen.chat`, given as the compose
+    /// opened): that compose closes back onto the chat that shows the bubble. Every other send keeps
+    /// the toast: a new email, a reply from a compose opened anywhere else (the Drafts list, the
+    /// inbox, the compose an Undo reopens), and a chat's card for an email of another thread, whose
+    /// screen shows no bubble. A later change that gives new emails a bubble changes this one rule.
     nonisolated static func sendHasBubbleUndo(
         chatViewActive: Bool, openedOn: ComposeScreen?, inReplyTo: String?
     ) -> Bool {

@@ -251,17 +251,18 @@ struct ChatReplyCompose: Equatable {
         return ChatReplyCompose(isReplyAll: isReplyAll, to: req.to, cc: req.cc, bcc: req.bcc)
     }
 
-    /// The compose card, opened in this kind, as main's Reply All entries open it, on the chat
-    /// (`ComposeScreen.chat`). `draftId`: the draft it saves to; nil, the reply's usual one.
+    /// The compose card, opened in this kind, as main's Reply All entries open it. `draftId`: the
+    /// draft it saves to; nil, the reply's usual one. `openedOn`: the screen the chat records for it
+    /// (`ChatThreadView.composeScreen`).
     @MainActor
     func composeView(
         replyTo message: MessageHeader?, suggestedBody: String? = nil, draftId: String? = nil,
-        onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
+        openedOn: ComposeScreen?, onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
     ) -> ComposeView {
         ComposeView(
             replyTo: message, suggestedBody: suggestedBody, isReplyAll: isReplyAll,
             prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,
-            prefillBcc: bcc.isEmpty ? nil : bcc, prefillDraftId: draftId, openedOn: .chat,
+            prefillBcc: bcc.isEmpty ? nil : bcc, prefillDraftId: draftId, openedOn: openedOn,
             onAgentOutcome: onAgentOutcome)
     }
 }
@@ -331,8 +332,7 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
             .order(Column("createdAt"), Column("id"))
             .fetchAll(db)
         return try rows.compactMap { row in
-            guard let parent = row.inReplyTo.map(EmailFilter.normalizeMessageId),
-                  messageIds.contains(parent) else { return nil }
+            guard answers(row.inReplyTo, in: messageIds) else { return nil }
             var filed = false
             if row.sentAt != nil {
                 guard let sentId = row.sentMessageId.map(EmailFilter.normalizeMessageId),
@@ -345,6 +345,14 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
                                    draftId: row.draftId, instanceEpoch: row.instanceEpoch, filed: filed,
                                    textMessage: try summary(of: row, db: db))
         }
+    }
+
+    /// Whether a send with this In-Reply-To shows in the chat whose emails have `messageIds`
+    /// (normalized Message-IDs): it answers one of them. The one rule for which chat shows an outbox
+    /// row (`fetch`), and so for which chat a compose records as its screen (`ChatThreadView.composeScreen`).
+    nonisolated static func answers(_ inReplyTo: String?, in messageIds: Set<String>) -> Bool {
+        guard let parent = inReplyTo.map(EmailFilter.normalizeMessageId) else { return false }
+        return messageIds.contains(parent)
     }
 
     /// The unsent replies answering `messageIds`, now and after every change, from one observation.

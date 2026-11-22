@@ -421,19 +421,47 @@ struct ChatUndoSendTests {
                 "the Search sheet, which can hold a chat, closes for an Undo's outcome")
     }
 
-    @Test("Every compose the chat view opens records that the chat opened it, and no other screen's compose does")
+    @Test("A chat records itself for a compose only when its target is one of the chat's own emails")
+    func chatRecordsItselfOnlyForItsOwnEmail() {
+        func email(_ rfc822MessageId: String?) -> MessageHeader {
+            var header = MessageHeader(
+                messageId: "screen-target", subject: "Lunch plans", from: "sender@example.com", fromAddress: "sender@example.com",
+                to: "me@example.com", date: Date(), snippet: "Note",
+                folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: "INBOX"),
+                accountId: Self.account, folderPath: "INBOX", isInInbox: true)
+            header.rfc822MessageId = rfc822MessageId
+            return header
+        }
+        let chat: Set<String> = [EmailFilter.normalizeMessageId("<own@example.com>")]
+        #expect(ChatThreadView.composeScreen(answering: email("<own@example.com>"), chatMessageIds: chat) == .chat)
+        #expect(ChatThreadView.composeScreen(answering: email("own@example.com"), chatMessageIds: chat) == .chat,
+                "the same Message-ID written without brackets")
+        #expect(ChatThreadView.composeScreen(answering: email("<other-thread@example.com>"), chatMessageIds: chat) == nil,
+                "an agent's card for an email of another thread: that chat, not this one, shows its send")
+        #expect(ChatThreadView.composeScreen(answering: email(nil), chatMessageIds: chat) == nil,
+                "an email with no Message-ID: no chat finds its send")
+        #expect(ChatThreadView.composeScreen(answering: nil, chatMessageIds: chat) == nil, "a new email")
+        // One rule: the chat records itself exactly for the sends it shows as its bubbles.
+        #expect(ChatUnsentReply.answers("<own@example.com>", in: chat) && !ChatUnsentReply.answers("<other-thread@example.com>", in: chat)
+                && !ChatUnsentReply.answers(nil, in: chat))
+    }
+
+    @Test("Every compose the chat view opens for a reply or forward records the chat only for its own email, and no other screen's compose records it")
     func onlyTheChatsComposesRecordTheChat() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        let built = chat.components(separatedBy: "ComposeView(").count - 1
-        let recorded = chat.components(separatedBy: "openedOn: .chat").count - 1
-        #expect(built > 0, "control: the chat builds composes of its own (agent cards, Forward)")
-        #expect(recorded == built, "each of them records the chat: \(recorded) of \(built)")
+        // Its builders: the agent's new email, its Forward card and the toolbar Forward (`ComposeView(`);
+        // the AI Suggestion and the agent's reply card (`.composeView(`).
+        let built = chat.components(separatedBy: "ComposeView(").count - 1 + chat.components(separatedBy: ".composeView(").count - 1
+        let decided = chat.components(separatedBy: "openedOn: composeScreen(answering: ").count - 1
+        #expect(built == 5, "control: the chat's compose builders: \(built)")
+        #expect(decided == 4, "every reply or forward it opens records the chat only for its own email: \(decided) of 4")
         let builder = try Self.source("TabMail/Views/Chat/ChatReplyField.swift")
-        #expect(builder.contains("prefillDraftId: draftId, openedOn: .chat,"),
-                "the chat's reply builder (AI Suggestion, agent reply) records it")
-        let recorders = try Self.appSourceFiles(containing: "openedOn: .chat")
-        #expect(recorders == ["ChatReplyField.swift", "ChatThreadView.swift"],
-                "no other screen's compose records the chat: \(recorders)")
+        #expect(builder.contains("prefillDraftId: draftId, openedOn: openedOn,"),
+                "the chat's reply builder (AI Suggestion, agent reply) records what the chat decided")
+        let unconditional = try Self.appSourceFiles(containing: "openedOn: .chat")
+        #expect(unconditional.isEmpty, "no compose records the chat whatever its target: \(unconditional)")
+        let producers = try Self.appSourceFiles(containing: "? .chat : nil")
+        #expect(producers == ["ChatThreadView.swift"], "the chat's one decision makes the value: \(producers)")
     }
 
     // MARK: - 6. Owner kept, retry, hand-back

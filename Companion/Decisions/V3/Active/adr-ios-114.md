@@ -478,7 +478,12 @@ same AI result, kept as long as the email itself is shown.
    Undo's outcome is known, so RootView alone presents the reopen or the "Couldn't undo" notice.
    *Amended 2026-11-21:* the first rule read only the setting and the In-Reply-To, so a reply opened
    from the Drafts list, or sent again from the compose an Undo reopened, put its Undo on a bubble
-   that no screen showed; the screen the compose was opened on now decides as well. Tests:
+   that no screen showed; the screen the compose was opened on now decides as well.
+   *Amended 2026-11-22:* an agent's card can name an email of another thread, whose send shows only
+   in that thread's chat; recorded as `.chat`, it had no visible Undo from the chat that opened it.
+   A chat now records itself only for a compose whose target is one of its own emails, by the same
+   rule that finds a bubble's chat (`ChatUnsentReply.answers`, through
+   `ChatThreadView.composeScreen`), decided as the compose opens; any other keeps the toast. Tests:
    `ChatUndoSendTests`, `ChatUndoSendRoutingTests` (the real Send of each kind of compose),
    `UndoSendReturnsToDraftsTests` (the return to Drafts from the toast and from the bubble).
    **Superseded by the rebuild (2026-11-09), kept for history:**

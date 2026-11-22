@@ -152,7 +152,7 @@ struct ComposeAttachmentCarryTests {
             before: "private func deleteClearedDraftAndDismiss() async {",
             in: source)
         let send = try functionBody(
-            "private func send() async {",
+            "private func send(chatViewActive: Bool) async {",
             before: "// MARK: - Discard-unsaved-edits confirmation",
             in: source)
         for (name, body) in [("close", close), ("send", send)] {

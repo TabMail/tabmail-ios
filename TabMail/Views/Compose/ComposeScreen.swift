@@ -5,13 +5,16 @@
 /// The kind of screen a compose window was opened on, given by that screen as the compose opens
 /// (`ComposeView.openedOn`) and never read later from what is on screen. With the chat view
 /// setting read at the Send tap, it decides whether a reply's Undo is on the chat's "Sending"
-/// bubble (`PendingSendService.sendHasBubbleUndo`): only a compose the chat opened closes back onto
-/// the chat that shows that bubble. A compose opened anywhere else (the Drafts list, the inbox, an
-/// email screen, the compose an Undo reopens) records none, and its send keeps the toast.
+/// bubble (`PendingSendService.sendHasBubbleUndo`): only a compose the chat opened for one of its
+/// own emails closes back onto the chat that shows that bubble. A compose opened anywhere else (the
+/// Drafts list, the inbox, an email screen, the compose an Undo reopens) records none, and its send
+/// keeps the toast.
 ///
 /// Only a screen whose compose behaves differently is named; nil stands for every other.
 enum ComposeScreen: Hashable, Sendable {
-    /// The chat view (`ChatThreadView`): its AI Suggestion, the agent's compose cards it opens (a
-    /// reply asked for in its reply field included), and its Forward.
+    /// The chat view (`ChatThreadView`), for a compose whose send it shows as its bubble: a reply to
+    /// or a forward of one of its emails, from its AI Suggestion, an agent's card or its Forward
+    /// (`ChatThreadView.composeScreen`). A compose it opens for a new email, or for an email of
+    /// another thread, records none.
     case chat
 }
