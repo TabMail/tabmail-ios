@@ -255,7 +255,12 @@ struct ChatReplyAttachTests {
         HostedAccessibility.labels(in: card)
     }
 
-    @Test("In the chat, a camera photo from the paperclip opens the Reply All card with it and the AI Suggestion shown")
+    // Which suggestion the card's box holds is not read here: the compose card's suggestion box is
+    // hidden from accessibility (tabmail-ios#1124), so a hosted test cannot see it either way. The
+    // card is given only the suggestion the chat shows, pinned by `replyAllCard`, `onlyToCard` and
+    // `presentedCard` (the card's values, `offersStoredSuggestion` false) and the compose fence on
+    // its stored-suggestion read.
+    @Test("In the chat, a camera photo from the paperclip opens the Reply All card with it")
     func hostedReplyAll() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
         let backend = ChatReplyRecoveryTests.Backend(failure: .serverError, asksForReply: false)
@@ -274,13 +279,11 @@ struct ChatReplyAttachTests {
                         "the card goes to everyone on the email: \(recipients)")
                 try await ChatReplyRecoveryTests.waitUntil { Self.cardLabels(card).contains { $0.contains("photo_1.jpg") } }
                 #expect(Self.cardLabels(card).contains { $0.contains("photo_1.jpg") }, "the photo is attached: \(Self.cardLabels(card).prefix(30))")
-                // Also the control for the case below: the card's suggestion box is readable here.
-                #expect(Self.cardLabels(card).contains("Use Suggestion"), "the suggestion the chat showed is in its box: \(Self.cardLabels(card).prefix(30))")
             }
         }
     }
 
-    @Test("In the chat, replying only to David, a library photo from the paperclip opens a plain reply to David with it and no suggestion")
+    @Test("In the chat, replying only to David, a library photo from the paperclip opens a plain reply to David with it")
     func hostedOnlyTo() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
         let backend = ChatReplyRecoveryTests.Backend(failure: .serverError, asksForReply: false)
@@ -298,12 +301,9 @@ struct ChatReplyAttachTests {
                 #expect(ChatReplyRecoveryTests.addresses(recipients["to"]) == ["david@example.com"], "only David: \(recipients)")
                 #expect(ChatReplyRecoveryTests.addresses(recipients["cc"]).isEmpty && ChatReplyRecoveryTests.addresses(recipients["bcc"]).isEmpty,
                         "nobody else: \(recipients)")
-                // The photo loads through the card's carry gate after the card has prepopulated, so
-                // once it shows, a suggestion the card was given or read would show too.
+                // The library photo loads through the card's carry gate (`providedItem`).
                 try await ChatReplyRecoveryTests.waitUntil { Self.cardLabels(card).contains { $0.contains("photo_1.jpeg") } }
                 #expect(Self.cardLabels(card).contains { $0.contains("photo_1.jpeg") }, "the photo is attached: \(Self.cardLabels(card).prefix(30))")
-                #expect(!Self.cardLabels(card).contains("Use Suggestion"),
-                        "the suggestion written for everyone stays out of the card: \(Self.cardLabels(card).prefix(30))")
             }
         }
     }
