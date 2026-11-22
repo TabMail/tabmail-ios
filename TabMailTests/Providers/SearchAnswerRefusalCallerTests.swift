@@ -47,6 +47,26 @@ struct SearchAnswerRefusalCallerTests {
         """)
     }
 
+    /// A message whose text does not contain "change fixture", the app search's query.
+    static func unrelatedMessage(_ uid: Int) -> FakeIMAPServer.Message {
+        FakeIMAPServer.makeMessage(uid: uid, rfc822Text: """
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: unrelated \(uid)\r
+        Date: \(TestFixtureDate.rfc2822(daysFromAnchor: -uid))\r
+        Message-ID: <unrelated-\(uid)@example.com>\r
+        Content-Type: text/plain; charset=utf-8\r
+        \r
+        other words\r
+
+        """)
+    }
+
+    /// The HEADER key a Message-ID search sends for `value`, in the form the pinned SwiftMail writes it.
+    static func messageIdKey(_ value: String) -> String {
+        "HEADER \"Message-ID\" \"\(value)\""
+    }
+
     /// The mailbox holds 5, 6 and 7 (dated 5, 6 and 7 days ago, Message-ID `<change-N@example.com>`),
     /// or `messages` when given.
     static func withProvider(
@@ -113,13 +133,15 @@ struct SearchAnswerRefusalCallerTests {
     @Test("App search: an unlisted answer fails the search, never an empty result; a complete answer is read",
           arguments: [false, true])
     func appSearch(_ control: Bool) async throws {
-        try await Self.withProvider { server, provider in
-            // "change fixture" is in every message's subject: the control's answer lists all three.
+        // "change fixture" is in the subjects of 5, 6 and 7, not in 8's text: the control's answer
+        // lists the three, so 8 is in the mailbox but not in the result.
+        let messages = [5, 6, 7].map(IMAPChangeReaderTests.message) + [Self.unrelatedMessage(8)]
+        try await Self.withProvider(messages: messages) { server, provider in
             server.answerNextUIDSearch(in: "INBOX", esearchData: control ? Self.allThree : Self.unlisted)
             if control {
                 let found = try await provider.search(query: "change fixture", folder: "INBOX")
                 let ids = Set(found.map(\.messageId))
-                #expect(ids == ["5", "6", "7"], "the complete answer's matches are the search's result")
+                #expect(ids == ["5", "6", "7"], "exactly the complete answer's matches are the search's result")
             } else {
                 await #expect(throws: (any Error).self) {
                     _ = try await provider.search(query: "change fixture", folder: "INBOX")
@@ -132,20 +154,30 @@ struct SearchAnswerRefusalCallerTests {
     @Test("Older-mail date lookup: an unlisted answer fails the lookup, with and without a start date; a complete answer is read",
           arguments: [(true, false), (false, false), (true, true), (false, true)])
     func olderMailDateLookup(_ withSince: Bool, _ control: Bool) async throws {
-        try await Self.withProvider { server, provider in
-            // The messages are 5 to 7 days old: inside the last 30 days and before today, so
-            // both searches' complete answers list all three.
-            server.answerNextUIDSearch(in: "INBOX", esearchData: control ? Self.allThree : Self.unlisted)
+        // 5, 6 and 7 are 5 to 7 days old, 40 is 40 days old; every one is before today. The start
+        // date is 30 days back, so only the lookup without a start date lists 40.
+        let messages = [5, 6, 7, 40].map(IMAPChangeReaderTests.message)
+        try await Self.withProvider(messages: messages) { server, provider in
+            // The control is answered by the server itself, from each message's date (RFC 9051
+            // 6.4.4 SINCE and BEFORE), so a lookup that sent the other date search would get the
+            // other answer. The refusal rows are scripted: their answer does not list its matches.
+            if control {
+                server.honorSearchDateCriteria()
+            } else {
+                server.answerNextUIDSearch(in: "INBOX", esearchData: Self.unlisted)
+            }
             let since = withSince ? Date().addingTimeInterval(-30 * 86_400) : nil
             if control {
                 let found = try await provider.searchBackfillUIDs(folder: "INBOX", since: since)
-                #expect(Set(found) == [5, 6, 7], "the complete answer's matches are the lookup's result")
+                let expected: Set<UInt32> = withSince ? [5, 6, 7] : [5, 6, 7, 40]
+                #expect(Set(found) == expected, "exactly the messages inside the requested dates are the lookup's result")
             } else {
                 await #expect(throws: (any Error).self) {
                     _ = try await provider.searchBackfillUIDs(folder: "INBOX", since: since)
                 }
             }
-            #expect(server.compactUIDSearchAnswersServed() == 1, "precondition: the answer under test was served")
+            let served = control ? 0 : 1
+            #expect(server.compactUIDSearchAnswersServed() == served, "precondition: only the refusal rows are scripted")
         }
     }
 
@@ -176,10 +208,11 @@ struct SearchAnswerRefusalCallerTests {
             let searches = server.recordedCommands().filter { $0.uppercased().contains("UID SEARCH") }
             #expect(searches.count == searchCount)
             guard searches.count == searchCount else { return }
-            #expect(searches[0].contains("<\(messageId)>"), "the first search asks for the bracketed Message-ID: \(searches[0])")
+            let bracketedKey = Self.messageIdKey("<\(messageId)>")
+            #expect(searches[0].contains(bracketedKey), "the first search asks the Message-ID header for the bracketed id: \(searches[0])")
             if searchCount == 2 {
-                #expect(searches[1].contains(messageId) && !searches[1].contains("<\(messageId)>"),
-                        "the second asks for the bare one: \(searches[1])")
+                let bareKey = Self.messageIdKey(messageId)
+                #expect(searches[1].contains(bareKey), "the second asks the Message-ID header for the bare id: \(searches[1])")
             }
         }
     }
@@ -212,15 +245,16 @@ struct SearchAnswerRefusalCallerTests {
         let searches = server.recordedCommands().filter { $0.uppercased().contains("UID SEARCH") }
         #expect(searches.count == searchCount)
         if searches.count == searchCount {
-            #expect(searches[0].contains("<\(messageId)>"), "the first search asks for the bracketed Message-ID: \(searches[0])")
+            let bracketedKey = Self.messageIdKey("<\(messageId)>")
+            #expect(searches[0].contains(bracketedKey), "the first search asks the Message-ID header for the bracketed id: \(searches[0])")
             if searchCount == 2 {
-                #expect(searches[1].contains(messageId) && !searches[1].contains("<\(messageId)>"),
-                        "the second asks for the bare one: \(searches[1])")
+                let bareKey = Self.messageIdKey(messageId)
+                #expect(searches[1].contains(bareKey), "the second asks the Message-ID header for the bare id: \(searches[1])")
             }
         }
         let fetches = server.recordedCommands().filter { $0.uppercased().contains("UID FETCH") }
         if which == "unlisted" {
-            #expect(result == nil, "an unlisted answer is not read as a match or as absence")
+            #expect(result == nil, "an unlisted answer yields no message")
             #expect(fetches.isEmpty, "nothing is fetched on an answer that lists nothing: \(fetches)")
         } else {
             #expect(result?.metadata.messageId == "5", "the listed match is the message fetched")

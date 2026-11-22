@@ -1403,10 +1403,15 @@ struct IMAPMoveWireContractTests {
         #expect(copies.count == 1)
         if let copy = copies.first {
             #expect(copy.mailbox == "Work", "the COPY was sent from the source folder: \(copy)")
-            // The whole mailbox argument is Archive, bare or in its quoted wire form (RFC 9051 astring).
-            let prefix = "UID COPY 71 "
-            let destination = copy.command.hasPrefix(prefix) ? String(copy.command.dropFirst(prefix.count)) : ""
-            #expect(destination == "Archive" || destination == "\"Archive\"", "it copies UID 71 to Archive: \(copy.command)")
+            // The UID set names 71 alone (as `71` or the range `71:71`), and the whole mailbox argument
+            // is Archive, bare or in its quoted wire form (RFC 9051 sequence-set, astring).
+            let prefix = "UID COPY "
+            let rest = copy.command.hasPrefix(prefix) ? String(copy.command.dropFirst(prefix.count)) : ""
+            let parts = rest.split(separator: " ", maxSplits: 1).map(String.init)
+            let uidSet = parts.first ?? ""
+            let destination = parts.count == 2 ? parts[1] : ""
+            #expect(uidSet == "71" || uidSet == "71:71", "it copies UID 71 alone: \(copy.command)")
+            #expect(destination == "Archive" || destination == "\"Archive\"", "it copies to Archive: \(copy.command)")
         }
         task.cancel()
         server.releaseHeldCommand(containing: "UID COPY")
