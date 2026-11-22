@@ -49,10 +49,15 @@ struct ComposeDraftSaveTests {
         FileManager.default.fileExists(atPath: DraftAttachmentStorage.dirURL(for: name).path)
     }
 
-    /// Every folder in the attachment store, staged or live.
-    private static func attachmentFolders() -> Set<String> {
-        Set((try? FileManager.default.contentsOfDirectory(atPath: DraftAttachmentStorage.baseDir.path)) ?? [])
+    /// Every folder in the attachment store, staged or live. A listing that fails throws: it is
+    /// never an empty store.
+    private static func attachmentFolders() throws -> Set<String> {
+        Set(try FileManager.default.contentsOfDirectory(atPath: DraftAttachmentStorage.baseDir.path))
     }
+
+    /// A file the store refuses to keep under its name (`AttachmentFilename.isSafeFileComponent`:
+    /// a name is one path component).
+    private static let refusedFile = DraftAttachment(filename: "notes/today.txt", mimeType: "text/plain", data: Data([5, 6]))
 
     private static let oldFile = DraftAttachment(filename: "old.pdf", mimeType: "application/pdf", data: Data([1, 2, 3]))
     private static let newFile = DraftAttachment(filename: "new.txt", mimeType: "text/plain", data: Data([7, 8, 9]))
@@ -287,7 +292,8 @@ struct ComposeDraftSaveTests {
         let id = "compose-production-read-failed"
         let earlier = try await earlierRow(fixture, id: id)
         let liveDir = try #require(earlier.attachmentsDirName)
-        let foldersBefore = Self.attachmentFolders()
+        let foldersBefore = try Self.attachmentFolders()
+        #expect(foldersBefore.contains(liveDir), "control: the listing sees the row's own folder")
         let table = Draft.databaseTableName
         let hidden = "\(table)_hidden_by_test"
         try await fixture.pool.write { db in try db.execute(sql: "ALTER TABLE \(table) RENAME TO \(hidden)") }
@@ -316,7 +322,50 @@ struct ComposeDraftSaveTests {
         #expect(after.updatedAt == earlier.updatedAt)
         #expect(after.attachmentsDirName == liveDir)
         #expect(liveData == [Self.oldFile.data])
-        #expect(Self.attachmentFolders() == foldersBefore, "no staging folder is left behind")
+        let foldersAfter = try Self.attachmentFolders()
+        #expect(foldersAfter == foldersBefore, "no staging folder is left behind")
+    }
+
+    @Test("Files the store refuses to stage are a failed save: nothing asked or admitted, no folder left, the row and its files as they were")
+    func refusedStagingWritesNothing() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let id = "compose-staging-refused"
+        let earlier = try await earlierRow(fixture, id: id)
+        let liveDir = try #require(earlier.attachmentsDirName)
+        let foldersBefore = try Self.attachmentFolders()
+        #expect(foldersBefore.contains(liveDir), "control: the listing sees the row's own folder")
+        let refused = AttachmentFilename.isSafeFileComponent(Self.refusedFile.filename)
+        #expect(!refused, "control: the store refuses this name")
+        var asked = 0
+        var admitted = 0
+        let outcome = await ComposeDraftSave.run(
+            draftId: id, accountId: Self.accountId, attachments: [Self.newFile, Self.refusedFile],
+            now: Date().timeIntervalSince1970,
+            fields: { _ in
+                asked += 1
+                return Self.fields()
+            },
+            admit: { draft in
+                admitted += 1
+                return try await DraftStore.shared.saveAsync(draft, epoch: Self.generation, expectedPredecessor: Self.generation)
+            })
+        let afterRow = try await row(fixture, id)
+        let after = try #require(afterRow)
+        let live = try DraftAttachmentStorage.loadAttachments(dirName: liveDir)
+        let liveData = live.map(\.data)
+        let foldersAfter = try Self.attachmentFolders()
+        var notStaged = false
+        if case .attachmentsNotStaged = outcome { notStaged = true }
+        #expect(notStaged, "the refusal is reported as files not staged: \(outcome)")
+        #expect(asked == 0, "the editor's fields are not taken for a save that cannot happen")
+        #expect(admitted == 0, "nothing is saved")
+        #expect(after.body == "Old words")
+        #expect(after.updatedAt == earlier.updatedAt)
+        #expect(after.attachmentsDirName == liveDir, "the row still names its own files")
+        #expect(after.editHistoryJSON == Self.history)
+        #expect(liveData == [Self.oldFile.data], "the live files are untouched")
+        #expect(foldersAfter == foldersBefore, "no staging folder is left behind")
     }
 
     @Test("A save another editor's generation refuses is a failed save: the row and files stay as they were")

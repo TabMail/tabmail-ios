@@ -1232,8 +1232,13 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
 22. **A new email starts as an empty chat (amendment 2026-11-21).** With the chat view on, the mailbox
    list's compose button pushes an empty chat (`ChatNewThreadView`, `ChatNewThreadModel`) instead of
    presenting compose; off, compose opens as before (`ChatNewThreadRoute.composeButton`, the setting
-   read once at the tap). Signed out of TabMail (mail only), compose opens too, since the chat's
-   field cannot send then (`signedIn:`, the session read at the tap; amended 2026-11-22). The mailbox list (`InboxView`) is the list of every folder, so this is the
+   read once at the tap). A second rule, separate from the chat view setting, decides with it:
+   signed out of TabMail (mail only), compose opens even with the setting on, since the chat's field
+   cannot send then and compose is the only way left to write. The setting alone does not show this
+   case: signing out keeps the last known plan (`AISubscriptionGate.noteSignedOut`), so
+   `ChatViewConfig.opensInChat` can still read on while mail navigation stays. So both the compose
+   button and a saved draft's reopen ask for the session too (`signedIn:`, read at the tap or as the
+   open starts; review ruling 2026-11-22). The mailbox list (`InboxView`) is the list of every folder, so this is the
    compose button of the Inbox, Sent, Drafts and every other folder alike. Other ways of starting an
    email (a contact, the email screen, links, the iPad split view) still open compose.
    - *The chat.* The header sits where every chat's header is, with one empty avatar and "Add
@@ -1251,8 +1256,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      contact search and typed address; Done needs someone ticked (`ChatReplyToChoice.canFinish`), and
      its result replaces the picked people (`ChatNewDraft.people(after:current:)`). The user's own
      addresses (every account's address, read as the chat opens) are never added
-     (`ChatReplyToChoice.add(_:name:ownAddresses:)`), as in the "Reply to" sheet. No "Recent"
-     section: a recent-people source is separate work.
+     (`ChatReplyToChoice.add(_:name:ownAddresses:)`), as in the "Reply to" sheet. Cancel closes the
+     sheet and leaves the picked people as they were. No "Recent" section: a recent-people source is
+     separate work.
    - *Attachments.* Picked photos and videos, a camera photo and files wait above the field
      (`ChatAttachmentTray`: photos as thumbnails, files as chips, each with an x). They are named and
      typed by the rules compose uses (`DraftAttachmentImport`, moved out of `ComposeView` with tests
@@ -1261,9 +1267,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      (`ComposeAttachmentCarryGate`); items that do not load are listed in "Couldn't add".
    - *Send.* With nobody picked, Send asks "Who is this to?" ("Add at least one recipient to send
      this email.", Add recipient / Cancel) and the words and attachments stay
-     (`ChatNewDraft.send(people:)`). Writing the email for its recipients, the compose card that
-     follows, and the Sending bubble after the card's Send are later work; until then Send with
-     people picked does nothing.
+     (`ChatNewDraft.send(people:)`); Cancel closes the ask and changes nothing. Writing the email for
+     its recipients, the compose card that follows, and the Sending bubble after the card's Send are
+     later work; until then Send with people picked does nothing, and keeps the words and
+     attachments.
    - *The agent chat.* Each new email's chat has its own session key, in memory only
      (`ChatNewEmailField.newSessionKey`, held by `ChatNewThreadModel.sessionKey`), never carried into
      another chat; no chat turn is stored for it (ADR-004). The screen ends it as it closes
@@ -1285,9 +1292,13 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      only once the save is durable; a refused save keeps the chat open and offers "Leave without
      saving" or "Stay". Back replaces the system Back, so the edge swipe back is off in this chat.
      The screen closing any other way (on iPad, another mailbox picked while it is open replaces the
-     list it sits on) saves the draft the same way, unless "Leave without saving" was chosen; a
-     refusal there is only logged, as the screen is gone (2026-11-22; a known gap, ios#1227: a file
-     the store would refuse is to be refused when picked). The camera's cover does not
+     list it sits on) saves the draft the same way, unless "Leave without saving" was chosen. The
+     contract is that a new email's words and files are never lost without the user seeing why: Back
+     and the background keep the chat and say so when a save is refused. A refusal as the screen
+     closes any other way is only logged today, as the screen is gone; that is a known gap
+     (ios#1227, rare: it needs a file name the store refuses, or a database or account refusal, at
+     that moment): a file the store would refuse is to be refused when picked, and a closing save
+     still refused is to leave something the user can reach (2026-11-22). The camera's cover does not
      close it. While the chat is open its draft is exempt from eviction (`DraftSessionRegistry`),
      given back only once the closing save is done.
    - *Reopening.* A `chat-new:` draft opened from any path while the chat view is on reopens as its
@@ -1314,9 +1325,14 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        (`ChatThreadView`), as a reply's bubble hands over to its Sent copy (decision 10).
      - The undo toast follows the chat's rule for every send: it is hidden only for a send that has
        a Sending bubble, so a new email sent from this chat shows its bubble, not the toast.
+     - Send's ask offers Add recipient: Done in the sheet it opens continues that Send for the people
+       now picked, so the user does not press Send again; Cancel there leaves the words, files and
+       picks as they were.
    Tests: `ChatNewThreadTests` (routing, the pure decisions, the saves against a real database, the
-   reopen route, the source wiring), `ChatNewThreadScreenTests` (the whole screen hosted: Back,
-   background, closing, the camera's cover, the alerts), `ComposeDraftSaveTests` (the shared writer
+   reopen route, the source wiring, including the camera's cover not closing the screen, which is
+   checked only in the source: the simulator has no camera), `ChatNewThreadScreenTests` (the whole
+   screen hosted: Back, background, closing and their alerts, the empty field, the tray, Send's ask,
+   the sheet, the Drafts row and the opens from Drafts), `ComposeDraftSaveTests` (the shared writer
    against a real database), `DraftAttachmentImportTests`.
 
 ## The longer index line (routed 2026-11-09)

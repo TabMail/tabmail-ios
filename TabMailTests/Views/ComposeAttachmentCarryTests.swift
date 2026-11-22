@@ -268,6 +268,11 @@ struct ComposeAttachmentCarryTests {
         for failure in failures {
             #expect(flat.contains(failure), "compose's Save keeps this failure's message and stop: \(failure)")
         }
+        // A save the queue admitted closes compose: the push, then the real dismissal, and the
+        // refusal's message otherwise (`ComposeDraftGuards.runCheckedDurableSaveThenDismiss`, whose
+        // own tests drive both arms).
+        #expect(flat.contains("await ComposeDraftGuards.runCheckedDurableSaveThenDismiss( save: { await AccountManager.shared.queueDraftSave( draftId: draftId, accountId: account.id) }, dismiss: { dismiss() }, onAdmissionFailure: {"),
+                "compose's Save pushes, then dismisses compose itself")
     }
 
     @Test("Photos-picker work joins the same attachment completion boundary")
@@ -296,6 +301,11 @@ struct ComposeAttachmentCarryTests {
         #expect(body.contains("fail: { recordAttachmentPreparationFailure($0) },"), "every item that does not load is surfaced")
         #expect(body.contains("attachmentCarryGate.completeOne(succeeded: succeeded)"),
                 "each item settles the gate with its own result, so a failed pick holds Save until it is seen")
+        // The whole closure, so nothing wraps the call: a failed item that skipped it would leave
+        // the gate waiting for it forever, and Save with it.
+        let flat = body.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        #expect(flat.contains("settled: { succeeded in attachmentCarryGate.completeOne(succeeded: succeeded) publishAttachmentPreparationFailuresIfSettled() })"),
+                "every item settles the gate, failed or not, then failures are published")
     }
 
     @Test("File and camera attachment preparation failures are surfaced")

@@ -351,7 +351,16 @@ struct ChatNewThreadTests {
     @Test("The new email's e.g. line comes from its own config set")
     func examples() {
         let examples = ChatSuggestionConfig.newEmailExamples
-        #expect(!examples.isEmpty)
+        #expect(examples == [
+            "ask for the Q2 numbers",
+            "invite them to lunch on Friday",
+            "thank them for yesterday's meeting",
+            "ask when they are free next week",
+            "send them the slides from today",
+            "ask how the launch went",
+            "remind them about Thursday's review",
+            "introduce yourself and ask for a call",
+        ], "the decided set: each is an email to write, none a reply")
         #expect(Set(examples).isDisjoint(with: ChatSuggestionConfig.replyExamples))
         let picked = ChatSuggestionConfig.randomExample(from: examples)
         let isMember = picked.map(examples.contains) ?? false
@@ -471,6 +480,10 @@ struct ChatNewThreadTests {
     func inboxWiring() throws {
         let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
         #expect(Self.count("ComposeToolbarButton(onNewCompose: { collapseChat() startNewEmail() })", in: inbox) == 1)
+        // The whole toolbar item, so no modifier (a `.disabled` in some folder) is added to the
+        // button: the compose button starts a new email in every folder, Drafts included.
+        #expect(Self.count("ToolbarItem(placement: .topBarTrailing) { ComposeToolbarButton(onNewCompose: { collapseChat() startNewEmail() }) .tutorialLockedNavigation() .transaction { $0.disablesAnimations = true } }", in: inbox) == 1)
+        #expect(Self.count("ComposeToolbarButton(", in: inbox) == 1, "one compose button in the mailbox")
         #expect(Self.count("switch ChatNewThreadRoute.composeButton(opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession) { case .newThread: newEmail = ChatNewThreadModel(account: viewModel.primaryAccount) case .compose: viewModel.showCompose = true }", in: inbox) == 1)
         #expect(Self.count(".navigationDestination(item: $newEmail) { model in ChatNewThreadView(model: model) }", in: inbox) == 1)
         #expect(Self.count(".fullScreenCover(isPresented: $vm.showCompose) { ComposeView(account: viewModel.primaryAccount) }", in: inbox) == 1,
@@ -497,6 +510,10 @@ struct ChatNewThreadTests {
         let pill = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count("private var isInboxChat: Bool { composeContext == nil && message == nil && replyField?.newEmail == nil }", in: pill) == 1)
         #expect(Self.count("!isComposeMode && message == nil", in: pill) == 0, "every inbox-only rule asks isInboxChat")
+        // The old gate in any spelling: spaces and parentheses do not matter to it.
+        let bare = pill.filter { !$0.isWhitespace && $0 != "(" && $0 != ")" }
+        #expect(Self.count("!isComposeMode&&message==nil", in: bare) == 0, "nor in another spelling")
+        #expect(Self.count("message==nil&&!isComposeMode", in: bare) == 0, "nor turned around")
         let sessionAt = try #require(pill.range(of: "if let newEmail = replyField?.newEmail { return newEmail.sessionKey }"))
         let inboxAt = try #require(pill.range(of: "return \"inbox\""))
         #expect(sessionAt.lowerBound < inboxAt.lowerBound, "its own session, before the inbox's")
@@ -525,6 +542,10 @@ struct ChatNewThreadTests {
         #expect(Self.count("DraftSessionRegistry.shared.register(model.draftId)", in: view) == 1)
         #expect(Self.count("DraftSessionRegistry.shared.unregister(model.draftId)", in: view) == 1)
         #expect(Self.count("model.setPeople(ChatNewDraft.people(after: done, current: model.people))", in: view) == 1)
+        // The paperclip's three choices each open their own picker (the simulator has no camera,
+        // and a system picker cannot be driven from a hosted test).
+        #expect(Self.count("switch source { case .photos: showsPhotoPicker = true case .camera: showsCamera = true case .files: showsFilePicker = true }", in: view) == 1,
+                "photos, camera and files each open their own picker")
         // The keyboard rule, on this screen itself, as the chat's own thread installs it.
         #expect(Self.count(".defaultScrollAnchor(.bottom) .scrollDismissesKeyboard(.interactively) .frame(maxWidth: .infinity, maxHeight: .infinity) .background(Palette.previewPaneBg) .dismissKeyboardOnTap()", in: view) == 1,
                 "a tap on the stream, or a drag, dismisses the keyboard")
@@ -879,6 +900,17 @@ struct ChatNewDraftSaveTests {
         #expect(!wireId.contains(model.draftId))
         #expect(!wireId.contains(Draft.newEmailPrefix), "the local key never goes on the wire")
         #expect(!wireId.lowercased().contains(localPart), "nor its own id, in any spelling of the key: \(wireId)")
+        #expect(wireId.contains("@"), "a usable Message-ID of its own: \(wireId)")
+        // A new email replies to nothing, and its own id is in no header, with or without hyphens.
+        let pushed = sent[0]
+        #expect(pushed.inReplyTo == nil, "a new email replies to nothing")
+        #expect(pushed.references.isEmpty, "and is in no thread")
+        let compact: (String) -> String = { $0.lowercased().replacingOccurrences(of: "-", with: "") }
+        let key = compact(localPart)
+        let headers = [wireId] + [pushed.inReplyTo].compactMap { $0 } + pushed.references
+        let leaked = headers.filter { compact($0).contains(key) }
+        #expect(!key.isEmpty, "control: the key's own id")
+        #expect(leaked.isEmpty, "the key's own id is in no header, in any spelling: \(leaked)")
         #expect(sent[0].body == "Lunch on Friday?")
         #expect(sent[0].to == ["\"Maria\" <maria@example.com>"])
     }
@@ -1209,13 +1241,30 @@ struct ChatNewDraftSaveTests {
         let recorder = QueueRecorder()
         let model = makeModel(fixture, recorder)
         model.words = "Saved once"
-        let savedAt = Date()
-        let first = Task { await model.saveIfNeeded(now: { savedAt }) }
-        let second = Task { await model.saveIfNeeded(now: { savedAt }) }
+        // The database's writer is held, so the first save is still running when the second starts.
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let (holding, holdingNow) = AsyncStream<Void>.makeStream()
+        let pool = fixture.pool
+        let hold = Task.detached {
+            try await pool.writeWithoutTransaction { _ in
+                holdingNow.yield(())
+                release.wait()
+            }
+        }
+        for await _ in holding { break }
+        let first = await Self.startedSave(model)
+        let firstRunning = model.isSaving
+        #expect(firstRunning, "control: the first save is running, held at the database")
+        let second = await Self.startedSave(model)
+        let queuedWhileHeld = recorder.calls.count
+        #expect(queuedWhileHeld == 0, "control: no save is done while the writer is held")
+        release.signal()
+        try await hold.value
         let outcomes = [await first.value, await second.value]
         let rows = try await rowCount(fixture)
         #expect(outcomes == [.saved, .saved])
-        #expect(recorder.calls.count == 1)
+        #expect(recorder.calls.count == 1, "the second save waited for the first and found nothing left to save")
         #expect(rows == 1)
         #expect(model.isSaving == false)
     }
