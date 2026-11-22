@@ -1344,12 +1344,16 @@ struct DraftServerCopyNamesParentMigrationTests {
         AppDatabase.registerAllMigrations(on: &migrator)
         try migrator.migrate(db, upTo: "v91_addMessageHeaderProviderDate")
         try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        // Both kinds of draft an earlier build could leave: a reply that names its parent and was
+        // pushed to the server, and a new email saved on the device and never uploaded.
         try db.write { conn in
             try conn.execute(sql: """
-                INSERT INTO draft (id, accountId, toJSON, ccJSON, bccJSON, subject, body,
+                INSERT INTO draft (id, accountId, toJSON, ccJSON, bccJSON, subject, body, replyToId,
                                    isForward, createdAt, updatedAt, serverDraftId, serverPushStatus)
                 VALUES ('reply:acc1:parent@example.com', 'acc1', '[]', '[]', '[]', 'Re: hi', 'body',
-                        0, 1, 2, 'r1', 'pushed')
+                        'acc1:INBOX:41', 0, 1, 2, 'r1', 'pushed'),
+                       ('new:local-draft', 'acc1', '[]', '[]', '[]', 'Hello', 'body', NULL,
+                        0, 1, 2, NULL, NULL)
                 """)
         }
 
@@ -1358,10 +1362,15 @@ struct DraftServerCopyNamesParentMigrationTests {
         let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(draft)") }
         let column = try #require(columns.first { ($0["name"] as String) == "serverCopyNamesParent" })
         #expect((column["notnull"] as Int) == 0)
-        let drafts = try db.read { try Draft.fetchAll($0) }
-        #expect(drafts.count == 1)
-        guard drafts.count == 1 else { return }
-        #expect(drafts[0].serverCopyNamesParent == nil)
+        // Raw columns, not a decoded `Draft`: the record needs columns later migrations add
+        // (`isReplyAll`, v104), so it cannot decode at v94.
+        let drafts = try db.read {
+            try Row.fetchAll($0, sql: "SELECT id, serverCopyNamesParent FROM draft ORDER BY id")
+        }
+        let ids = drafts.map { $0["id"] as String }
+        #expect(ids == ["new:local-draft", "reply:acc1:parent@example.com"])
+        let unknown = drafts.filter { ($0["serverCopyNamesParent"] as DatabaseValue).isNull }.map { $0["id"] as String }
+        #expect(unknown == ids, "every existing draft is unknown (NULL), never false, uploaded or not")
     }
 }
 
