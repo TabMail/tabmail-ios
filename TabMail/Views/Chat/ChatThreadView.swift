@@ -842,11 +842,8 @@ struct ChatThreadView: View {
         let aiSourceEnabled = AIWorkingRule.anyAISourceEnabled(
             demoHidesAI: DemoModeStore.shared.hidesAIContent, optedOutAllAI: optOutAllAI,
             deviceSyncAuto: DeviceSyncService.shared.isAutoEnabled, subscribed: subscribed)
-        // Only the working bubble comes from the row's rule: a suggestion stored but not shown (a
-        // compose card is open) shows no row until the card closes.
-        let phase = ChatReplyField.suggestionPhase(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only,
-                                                   aiSourceEnabled: aiSourceEnabled, subscribed: subscribed)
-        return phase == .writing ? .writing : nil
+        return ChatReplyField.suggestionPhase(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only,
+                                              aiSourceEnabled: aiSourceEnabled, subscribed: subscribed)
     }
 
     /// The tutorial's move in this chat, if it holds the practice email.

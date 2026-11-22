@@ -103,8 +103,9 @@ struct EmailComposeTool: AgentTool, Sendable {
 
     /// Shared compose edit flow matching TB's `runComposeEdit()`.
     /// Resolves account/prompts, builds `ComposeEditContext`, and calls `performInlineEdit()`.
-    /// Used by email_compose (mode "edit_new"), email_reply (mode "edit_reply"),
-    /// and email_forward (mode "edit_forward") tools for full TB parity.
+    /// Used by the email_compose (mode "edit_new") and email_forward (mode "edit_forward") tools
+    /// for full TB parity. email_reply (mode "edit_reply") builds the same context with
+    /// `ComposeEditContext.make`, as the compose card does.
     static func runComposeEdit(
         to: [String],
         cc: [String],

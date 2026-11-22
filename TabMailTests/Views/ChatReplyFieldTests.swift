@@ -632,12 +632,12 @@ struct ChatReplyFieldTests {
         // The working bubble: the inbox row's rule, never while the agent works on the field's request.
         #expect(Self.count("guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking, context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }", in: text) == 1,
                 "no working bubble before the thread and accounts load, or while the agent works")
-        #expect(Self.count("ChatReplyField.suggestionPhase(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only, aiSourceEnabled: aiSourceEnabled, subscribed: subscribed)", in: text) == 1)
+        #expect(Self.count("return ChatReplyField.suggestionPhase(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only, aiSourceEnabled: aiSourceEnabled, subscribed: subscribed)", in: text) == 1,
+                "the working bubble is the row's rule as it is (it never yields the ghost)")
         #expect(Self.count("let aiSourceEnabled = AIWorkingRule.anyAISourceEnabled( demoHidesAI: DemoModeStore.shared.hidesAIContent, optedOutAllAI: optOutAllAI, deviceSyncAuto: DeviceSyncService.shared.isAutoEnabled, subscribed: subscribed)", in: text) == 1,
                 "the chat reads the inbox row's AI-source rule")
         // The ghost is only ever the suggestion the chat shows; the row's rule adds the working bubble alone.
         #expect(Self.count("if let text = shown?.textMessage { return .ready(text) }", in: text) == 1)
-        #expect(Self.count("return phase == .writing ? .writing : nil", in: text) == 1)
         #expect(Self.count("suggestionPhase(on: $0, shown: shown, thread: thread)", in: text) == 1,
                 "the row's phase takes the suggestion the chat shows, whichever card is open")
         #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1,

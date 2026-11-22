@@ -16,7 +16,8 @@ struct ComposeEditContext: Sendable {
     let toRecipients: [String]
     let ccRecipients: [String]
     let bccRecipients: [String]
-    /// Display-name lookups keyed by lowercase email. Used when formatting
+    /// Display-name lookups keyed by the address as written (the formatter also reads the
+    /// lowercased key). Used when formatting
     /// `Name <email>` lines so the LLM preserves the name on copy-through.
     let toDisplayNames: [String: String]
     let ccDisplayNames: [String: String]
