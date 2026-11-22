@@ -5,7 +5,7 @@
 @testable import TabMail
 
 extension PendingSendService {
-    /// The toast's Undo tap as RootView runs it (`undoAndReopen()`), returning the compose it
+    /// The toast's Undo tap as its presenter runs it (`PendingSendToastPresenter`: `undoAndReopen()`), returning the compose it
     /// queued to reopen, or nil when it queued none. The reopen queue is emptied before and after,
     /// so no reopen leaks into another test.
     func tapToastUndo() -> ReopenSnapshot? {

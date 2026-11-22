@@ -973,12 +973,16 @@ struct ChatThreadView: View {
 
     /// The screen a chat records for a compose it opens, as the compose opens: the chat
     /// (`ComposeScreen.chat`) only when it shows that compose's send as its bubble, a reply to or a
-    /// forward of one of its own emails (`ChatUnsentReply.answers`, by the target's Message-ID).
+    /// forward of one of its own emails. It is decided on the In-Reply-To the send's outbox row will
+    /// carry (`ThreadUtils.outgoingInReplyTo`), by the rule the chat finds its bubbles with
+    /// (`ChatUnsentReply.answers`), so an email whose Message-ID the send cannot carry as the chat
+    /// matches it (blank, or written with spaces inside its brackets) keeps the toast.
     /// Any other records none, and its send keeps the toast: a new email, and an agent's card for an
     /// email of another thread (its tools can name any email), whose send shows only in that
     /// thread's chat. `chatMessageIds`: the normalized Message-IDs of the chat's emails.
     nonisolated static func composeScreen(answering target: MessageHeader?, chatMessageIds: Set<String>) -> ComposeScreen? {
-        ChatUnsentReply.answers(target?.rfc822MessageId, in: chatMessageIds) ? .chat : nil
+        let inReplyTo = ThreadUtils.outgoingInReplyTo(parentRfc822MessageId: target?.rfc822MessageId)
+        return ChatUnsentReply.answers(inReplyTo, in: chatMessageIds) ? .chat : nil
     }
 }
 

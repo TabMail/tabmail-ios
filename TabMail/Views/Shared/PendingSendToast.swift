@@ -112,3 +112,26 @@ struct PendingSendToast: View {
         .padding(.horizontal, 16)
     }
 }
+
+/// RootView's presenter of the undo-send toast, for the send whose Undo is on the toast
+/// (`PendingSendService.visibleToast`); a send whose Undo is on its chat bubble shows none.
+/// Positioning matches the inbox undo chip (InboxView.swift:283-284): ignore the bottom safe
+/// area and use negative padding to sit where other app toasts sit.
+struct PendingSendToastPresenter: ViewModifier {
+    private var service: PendingSendService { PendingSendService.shared }
+
+    func body(content: Content) -> some View {
+        content.overlay(alignment: .bottom) {
+            if let pending = service.visibleToast {
+                PendingSendToast(
+                    pending: pending,
+                    onUndo: { service.undoAndReopen() },
+                    onDismiss: { service.dismiss() }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .ignoresSafeArea(.container, edges: .bottom)
+                .padding(.bottom, -12)
+            }
+        }
+    }
+}

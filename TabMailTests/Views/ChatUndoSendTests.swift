@@ -411,9 +411,11 @@ struct ChatUndoSendTests {
     @Test("RootView shows the toast only for a send whose Undo is not on a bubble, and both Undos share one reopen")
     func rootViewWiring() throws {
         let text = try Self.source("TabMail/Views/RootView.swift")
-        #expect(text.contains("if let pending = pendingSendService.visibleToast {"))
-        #expect(text.contains("onUndo: { pendingSendService.undoAndReopen() }"))
+        #expect(text.contains(".modifier(PendingSendToastPresenter())"), "RootView mounts the toast's presenter")
         #expect(text.contains(".modifier(UndoReopenPresenter())"), "RootView is the one presenter of the reopen")
+        let toast = try Self.source("TabMail/Views/Shared/PendingSendToast.swift")
+        #expect(toast.contains("if let pending = service.visibleToast {"))
+        #expect(toast.contains("onUndo: { service.undoAndReopen() }"), "the toast's Undo is the one undo-and-reopen")
         let compose = try Self.source("TabMail/Views/Compose/ComposeView.swift")
         #expect(compose.contains("owner: snapshot.sendHasBubbleUndo ? .bubble : .toast"))
         let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
@@ -432,7 +434,9 @@ struct ChatUndoSendTests {
             header.rfc822MessageId = rfc822MessageId
             return header
         }
-        let chat: Set<String> = [EmailFilter.normalizeMessageId("<own@example.com>")]
+        // The chat's Message-IDs as `ChatThreadView` builds them from its emails: one written with spaces
+        // inside its brackets, and one blank.
+        let chat = Set(["<own@example.com>", "< padded@example.com >", ""].map(EmailFilter.normalizeMessageId))
         #expect(ChatThreadView.composeScreen(answering: email("<own@example.com>"), chatMessageIds: chat) == .chat)
         #expect(ChatThreadView.composeScreen(answering: email("own@example.com"), chatMessageIds: chat) == .chat,
                 "the same Message-ID written without brackets")
@@ -441,9 +445,21 @@ struct ChatUndoSendTests {
         #expect(ChatThreadView.composeScreen(answering: email(nil), chatMessageIds: chat) == nil,
                 "an email with no Message-ID: no chat finds its send")
         #expect(ChatThreadView.composeScreen(answering: nil, chatMessageIds: chat) == nil, "a new email")
-        // One rule: the chat records itself exactly for the sends it shows as its bubbles.
-        #expect(ChatUnsentReply.answers("<own@example.com>", in: chat) && !ChatUnsentReply.answers("<other-thread@example.com>", in: chat)
-                && !ChatUnsentReply.answers(nil, in: chat))
+        #expect(ChatThreadView.composeScreen(answering: email("< padded@example.com >"), chatMessageIds: chat) == nil,
+                "the chat's own email, but its send's In-Reply-To is not found by the chat: no bubble, so the toast")
+        #expect(ChatThreadView.composeScreen(answering: email(""), chatMessageIds: chat) == nil,
+                "a blank Message-ID: the send carries no In-Reply-To")
+        // One rule: the chat records itself exactly for the sends it shows as its bubbles, judged on the
+        // In-Reply-To the send queues (`ThreadUtils.outgoingThreadHeaders`, as Send builds it).
+        let stored: [String?] = ["<own@example.com>", "own@example.com", "<other-thread@example.com>", "< padded@example.com >", "", nil]
+        for id in stored {
+            let target = email(id)
+            let queued = ThreadUtils.outgoingThreadHeaders(
+                replyTo: target, sendAccountId: Self.account, sendSubject: "Re: Lunch plans", providerKind: .gmail).inReplyTo
+            let shown = ChatUnsentReply.answers(queued, in: chat)
+            let recorded = ChatThreadView.composeScreen(answering: target, chatMessageIds: chat) == .chat
+            #expect(recorded == shown, "\(String(describing: id)): the chat records itself only for a send it shows as a bubble")
+        }
     }
 
     @Test("Every compose the chat view opens for a reply or forward records the chat only for its own email, and no other screen's compose records it")
@@ -460,8 +476,6 @@ struct ChatUndoSendTests {
                 "the chat's reply builder (AI Suggestion, agent reply) records what the chat decided")
         let unconditional = try Self.appSourceFiles(containing: "openedOn: .chat")
         #expect(unconditional.isEmpty, "no compose records the chat whatever its target: \(unconditional)")
-        let producers = try Self.appSourceFiles(containing: "? .chat : nil")
-        #expect(producers == ["ChatThreadView.swift"], "the chat's one decision makes the value: \(producers)")
     }
 
     // MARK: - 6. Owner kept, retry, hand-back
@@ -675,14 +689,14 @@ struct ChatUndoSendTests {
         #expect(service.undoOwner(for: late.id) == .toast, "past its deadline the toast keeps it (no Undo left anywhere)")
     }
 
-    // MARK: - 7. Hosted: reopen through RootView, the bubble under Reduce Motion
+    // MARK: - 7. Hosted: reopen through the app's reopen presenter, the bubble under Reduce Motion
 
     private static func textViews(_ view: UIView) -> [UITextView] {
         (view as? UITextView).map { [$0] } ?? view.subviews.flatMap { textViews($0) }
     }
 
-    @Test("Two Undos before either compose opens: RootView reopens both composes, one after the other, each with its own draft")
-    func rootViewReopensBothComposes() async throws {
+    @Test("Two Undos before either compose opens: the app's one reopen presenter opens both composes, one after the other, each with its own draft")
+    func reopenPresenterReopensBothComposes() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted window")
         try await HostedAccessibility.withAutomation { @MainActor in try await reopenBody() }
     }
@@ -707,7 +721,10 @@ struct ChatUndoSendTests {
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        window.rootViewController = UIHostingController(rootView: RootView().environment(NavigationStore()))
+        // RootView's reopen presenter (`UndoReopenPresenter`, its mounting fenced in `rootViewWiring`) on an
+        // inert view: no RootView, so none of its startup work runs.
+        window.rootViewController = UIHostingController(
+            rootView: Color.clear.modifier(UndoReopenPresenter()).environment(Self.navigationStore(fixture)))
         window.makeKeyAndVisible()
         defer {
             window.rootViewController?.dismiss(animated: false)
@@ -730,7 +747,7 @@ struct ChatUndoSendTests {
         #expect(!shows("Second reopened words"), "one compose at a time")
         // Reach the next compose without the compose's Close (its close decision belongs to
         // ADR-IOS-065, not to this test): the cover goes away as the system dismisses it, which
-        // clears RootView's binding.
+        // clears the presenter's binding.
         window.rootViewController?.presentedViewController?.dismiss(animated: false)
         try await Self.waitFor { shows("Second reopened words") }
         #expect(shows("Second reopened words") && !shows("First reopened words"),

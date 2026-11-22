@@ -1930,10 +1930,7 @@ struct ComposeView: View {
                 onDiscard: { dismiss() }))
             .overlay { if isCheckingServerCopy { ServerCopyCheckCover() } }
             .alert("Empty Body", isPresented: $showEmptyBodyPrompt) {
-                Button("Send Anyway") {
-                    let chatViewActive = ChatViewConfig.isActive
-                    Task { await send(chatViewActive: chatViewActive) }
-                }
+                Button("Send Anyway") { startSend() }
                 Button("Cancel", role: .cancel) { }
             } message: {
                 Text("The message body is empty. Send anyway?")
@@ -3584,12 +3581,18 @@ struct ComposeView: View {
             guard TutorialCoordinator.shared.admits(
                 .useSuggestion, accountId: replyTo?.accountId, messageId: replyTo?.messageId) else { return }
             acceptVisibleSuggestionIfOffered()
-            let chatViewActive = ChatViewConfig.isActive
-            Task { await send(chatViewActive: chatViewActive) }
+            startSend()
         case .sendAsTyped:
-            let chatViewActive = ChatViewConfig.isActive
-            Task { await send(chatViewActive: chatViewActive) }
+            startSend()
         }
+    }
+
+    /// Starts this compose's send, for every way the user sends it: Send, Send with the shown
+    /// suggestion, and the Empty Body alert's Send Anyway. The chat view setting is read here, at
+    /// the tap, before anything suspends (snapshot settings at operation start).
+    private func startSend() {
+        let chatViewActive = ChatViewConfig.isActive
+        Task { await send(chatViewActive: chatViewActive) }
     }
 
     /// `chatViewActive` is the chat view setting read at the Send tap, before anything suspends

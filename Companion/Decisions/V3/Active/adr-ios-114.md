@@ -483,8 +483,16 @@ same AI result, kept as long as the email itself is shown.
    in that thread's chat; recorded as `.chat`, it had no visible Undo from the chat that opened it.
    A chat now records itself only for a compose whose target is one of its own emails, by the same
    rule that finds a bubble's chat (`ChatUnsentReply.answers`, through
-   `ChatThreadView.composeScreen`), decided as the compose opens; any other keeps the toast. Tests:
-   `ChatUndoSendTests`, `ChatUndoSendRoutingTests` (the real Send of each kind of compose),
+   `ChatThreadView.composeScreen`), decided as the compose opens; any other keeps the toast.
+   It is judged on the In-Reply-To the send's outbox row will carry (`ThreadUtils.outgoingInReplyTo`,
+   the value `outgoingThreadHeaders` gives the send), not on the target's stored Message-ID: a
+   Message-ID written with spaces inside its brackets matched the chat at open but not the row the
+   chat looks for after Send, which lost the Undo. Every way of sending (Send, Send with the shown
+   suggestion, the Empty Body alert's Send Anyway) reads the setting in one place
+   (`ComposeView.startSend`). RootView's toast is its own presenter (`PendingSendToastPresenter`),
+   so a test draws it over the real chat and counts the Undos on screen. Tests:
+   `ChatUndoSendTests`, `ChatUndoSendRoutingTests` (the real Send of each kind of compose; the
+   agent's cards from the mounted chat with the toast over it, one Undo on screen),
    `UndoSendReturnsToDraftsTests` (the return to Drafts from the toast and from the bubble).
    **Superseded by the rebuild (2026-11-09), kept for history:**
    **The Sending bubble follows its queued email (decided 2026-11-07):** a reply sent from

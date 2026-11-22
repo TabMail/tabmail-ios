@@ -368,21 +368,8 @@ struct RootView: View {
             OnboardingTipGate.onboardingComplete = allOnboardingGatesPassed && !demoStore.isActive
         }
         // Undo-send toast (Gmail-style) — mounted at RootView so it persists
-        // across compose dismiss + navigation. Positioning matches the inbox
-        // undo chip (InboxView.swift:283-284): ignore the bottom safe area
-        // and use negative padding to sit where other app toasts sit.
-        .overlay(alignment: .bottom) {
-            if let pending = pendingSendService.visibleToast {
-                PendingSendToast(
-                    pending: pending,
-                    onUndo: { pendingSendService.undoAndReopen() },
-                    onDismiss: { pendingSendService.dismiss() }
-                )
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-                .ignoresSafeArea(.container, edges: .bottom)
-                .padding(.bottom, -12)
-            }
-        }
+        // across compose dismiss + navigation.
+        .modifier(PendingSendToastPresenter())
         // Demo Mode banner — bottom overlay; persists across all in-app
         // navigation. Compose's `fullScreenCover` covers it during edit;
         // banner re-appears on dismiss. Suppressed for debug-menu entry

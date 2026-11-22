@@ -385,7 +385,7 @@ struct ComposeSuggestionPersistTests {
         // adopts the suggestion synchronously before the send task is created.
         let gate = try #require(body.range(of: ".useSuggestion, accountId: replyTo?.accountId"))
         let accept = try #require(body.range(of: "acceptVisibleSuggestionIfOffered()"))
-        let send = try #require(body.range(of: "Task { await send(chatViewActive: chatViewActive) }"))
+        let send = try #require(body.range(of: "startSend()"))
         #expect(gate.lowerBound < accept.lowerBound && accept.lowerBound < send.lowerBound,
                 "tutorial gate, then adoption, then the send task")
 
