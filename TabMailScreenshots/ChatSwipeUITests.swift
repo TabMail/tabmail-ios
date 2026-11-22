@@ -609,8 +609,9 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the drag scrolled the overflowing text; the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "and the field kept its focus")
         let watched = dragMarkerLabel(afterDrags: 1, in: app)
-        // Where the drag left it: the caret is at the draft's end, so a scroll to the caret after the
-        // let-go would still leave a line other than Line 1 at the top.
+        // Where the drag left it: the control read above left the caret at the draft's start, and a
+        // scroll toward it after the let-go can stop with another line on top, so the top line alone
+        // cannot show the text stayed put.
         XCTAssertEqual(dragMarker(afterDrags: 1, in: app)?.textMove, "none",
                        "after the let-go the text stayed where the drag left it (marker: \(watched))")
         let after = topLine(of: long, in: app)
