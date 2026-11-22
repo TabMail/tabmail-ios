@@ -294,8 +294,8 @@ struct ChatReplyFieldTests {
 
     @Test("The placeholder offers a reply only when the sender takes replies")
     func placeholder() {
-        #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).placeholder == "Reply or ask anything")
-        #expect(ChatReplyField(example: nil, isNoReply: true, clearCount: 0).placeholder == "Ask anything")
+        #expect(ChatReplyField(example: nil, isNoReply: false).placeholder == "Reply or ask anything")
+        #expect(ChatReplyField(example: nil, isNoReply: true).placeholder == "Ask anything")
     }
 
     // MARK: - 2. The "e.g." line
@@ -482,8 +482,11 @@ struct ChatReplyFieldTests {
 
     @Test("A completion empties only the words that were sent, or none; newer words stay")
     func completionClearsOnlyTheSentWords() {
-        // Nothing sent yet (a reply sent from a bubble's compose card): the words empty.
-        #expect(Self.fill(Self.typed("Anything"), .completed).words == "")
+        // No send open (a reply sent from a bubble's compose card, or nothing sent): no
+        // completion, card or answer touches the user's words.
+        #expect(Self.fill(Self.typed("Anything"), .completed).words == "Anything")
+        #expect(Self.fill(Self.typed("Anything"), .confirmationCard).words == "Anything")
+        #expect(Self.fill(Self.typed("Anything"), .answered).words == "Anything")
 
         // Sent from the collapsed field, then a newer draft typed in the open sheet.
         var fill = Self.fill(Self.typed("First request"), .sentFromField)
@@ -492,11 +495,44 @@ struct ChatReplyFieldTests {
         fill.apply(.completed)
         #expect(fill.words == "My newer draft", "words written after the send are newer")
         #expect(fill.atSend == nil)
-        // Once completed, the next completion has no send to protect.
+        // Once completed, the same request's later transitions have no send left to complete:
+        // a second compose's Send, a later confirmation card and the closing answer keep the
+        // newer draft.
         fill.apply(.completed)
-        #expect(fill.words == "")
+        #expect(fill.words == "My newer draft", "a second compose's Send keeps the newer draft")
+        fill.apply(.confirmationCard)
+        #expect(fill.words == "My newer draft", "a later confirmation card keeps the newer draft")
+        fill.apply(.answered)
+        #expect(fill.words == "My newer draft", "the closing answer keeps the newer draft")
+        #expect(fill.unsent == "My newer draft", "the newer draft is what is kept")
+        // Control: the same sequences with the sent words unchanged empty them once.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed, .completed).words == "")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed, .confirmationCard).words == "")
         // The words sent, still there: the completion empties them.
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed).words == "")
+        // A compose card's Send completed the field's send; the request's closing answer after it
+        // has nothing left to complete: newer words stay.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, Self.typed("Newer"), .completed, .answered).words == "Newer")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer"), .completed, .answered).words == "Newer")
+        // An answer to a send still open empties the words sent.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .answered).words == "")
+        // A compose card that opened and closed without sending: the closing answer empties
+        // nothing and hands the words back to the user, so they are kept.
+        let closed = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, .answered)
+        #expect(closed.words == "Ask" && closed.atSend == nil && !closed.composing && closed.unsent == "Ask")
+        // A compose card closed unsent, then a new field send before any answer: that send's
+        // answer empties its sent words (the new send is not the closed card's).
+        let resent = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, Self.typed("Ask again"), .sentFromField, .answered)
+        #expect(resent.words == "" && resent.atSend == nil && !resent.composing, "\(resent)")
+        // A compose card opened for the send, then the same request raises a confirmation card for
+        // another step: the compose card owns the completion, so the confirmation empties nothing,
+        // and once the card closed unsent the answer hands the words back.
+        let confirmed = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, .confirmationCard)
+        #expect(confirmed.words == "Ask" && confirmed.atSend == "Ask" && confirmed.composing, "\(confirmed)")
+        let handedBack = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, .confirmationCard, .answered)
+        #expect(handedBack.words == "Ask" && handedBack.unsent == "Ask", "\(handedBack)")
+        // Control: the compose card's own Send still completes the send and empties the sent words.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, .confirmationCard, .completed).words == "")
 
         // From the open sheet the words go at once; a draft typed next stays through the completion.
         let sheet = Self.fill(Self.typed("Ask"), .sentFromSheet)
@@ -506,6 +542,60 @@ struct ChatReplyFieldTests {
         let card = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard)
         #expect(card.words == "" && card.atSend == "Ask")
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer"), .confirmationCard).words == "Newer")
+    }
+
+    @Test("Sent words a confirmation card took off the field come back when the field's own card then closes unsent; an edit since, or a completion, keeps them gone")
+    func confirmationBeforeTheOwnCardHandsTheWordsBack() {
+        // A confirmation card first (an archive), then the field's own reply card, closed unsent:
+        // the answer hands the words back as it does when they stayed in the field.
+        let taken = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard)
+        #expect(taken.words == "" && taken.unsent == "" && taken.atSend == "Ask", "the card took them: \(taken)")
+        let handedBack = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .answered)
+        #expect(handedBack.words == "Ask" && handedBack.unsent == "Ask" && handedBack.atSend == nil
+                    && !handedBack.composing, "\(handedBack)")
+        // Once handed back the send is over: a later answer or completion leaves them.
+        let after = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .answered, .completed, .answered)
+        #expect(after.words == "Ask", "\(after)")
+        // A second confirmation before the card finds them taken already.
+        let twice = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .confirmationCard, .composeOpened, .answered)
+        #expect(twice.words == "Ask", "\(twice)")
+        // The user's edit after the card took them is the user's: nothing comes back over it.
+        let edited = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, Self.typed("x"), Self.typed(""), .composeOpened, .answered)
+        #expect(edited.words == "", "\(edited)")
+        let newer = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, Self.typed("Newer"), .composeOpened, .answered)
+        #expect(newer.words == "Newer", "\(newer)")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .said("more"), .composeOpened, .answered).words
+                    == DictationController.appending("more", to: ""))
+        // A live transcript is the user's too, also when it writes while the card is open.
+        let heard = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .startHearing, .heard("Lunch instead"),
+                              .composeOpened, .answered)
+        #expect(heard.words == DictationController.appending("Lunch instead", to: ""), "\(heard)")
+        let heardWhileOpen = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .startHearing,
+                                       .heard("Lunch instead"), .answered)
+        #expect(heardWhileOpen.words == DictationController.appending("Lunch instead", to: ""), "\(heardWhileOpen)")
+        // With no card of the field's own the answer completes the send; a card's Send completes it.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .answered).words == "")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .completed, .answered).words == "")
+    }
+
+    @Test("Words cleared and retyped to the sent text after Send are newly written: kept, never emptied by the send")
+    func retypedSentTextIsNewWords() {
+        // Unchanged sent words: not kept, and the send's answer empties them.
+        let unchanged = Self.fill(Self.typed("Ask"), .sentFromField)
+        #expect(unchanged.unsent == "")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .answered).words == "")
+        // A binding's echo of the same text is no edit.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Ask")).unsent == "")
+        // Cleared and retyped identically while the send is open: newly written words.
+        let retyped = Self.fill(Self.typed("Ask"), .sentFromField, Self.typed(""), Self.typed("Ask"))
+        #expect(retyped.words == "Ask" && retyped.unsent == "Ask", "the retyped words are kept")
+        for ending in [ChatFieldFill.Change.answered, .completed, .confirmationCard] {
+            var fill = retyped
+            fill.apply(ending)
+            #expect(fill.words == "Ask" && fill.unsent == "Ask", "the older send never empties newly written words")
+        }
+        // Said words, too, are an edit.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .said("more"), .answered).words != "")
     }
 
     @Test("A live transcript adds to the words it started on, and is dropped once anything else changed them")
@@ -524,8 +614,14 @@ struct ChatReplyFieldTests {
         #expect(fill.words == "My own words")
         fill.apply(.heard("there friend, later"))
         #expect(fill.words == "My own words")
-        // So does any other change: a completion, a send, an Edit, a dictation's text.
-        for change in [ChatFieldFill.Change.completed, .sentFromSheet, .put("Edited"), .said("said")] {
+        // So does any other change: a send, an Edit, a dictation's text.
+        // A completion that empties the sent words is a change too.
+        var completed = Self.fill(Self.typed("Hi"), .sentFromField, .startHearing)
+        completed.apply(.completed)
+        #expect(completed.words == "", "control: the completion emptied the sent words")
+        completed.apply(.heard("one"))
+        #expect(completed.words == "", "a transcript after the completion is dropped")
+        for change in [ChatFieldFill.Change.sentFromSheet, .put("Edited"), .said("said")] {
             var other = Self.fill(Self.typed("Hi"), .startHearing, .heard("one"))
             other.apply(change)
             let after = other.words
@@ -567,27 +663,25 @@ struct ChatReplyFieldTests {
         #expect(Self.count("TextField(placeholder, text: typedText,", in: text) == 1)
         #expect(Self.count("Binding(get: { inputText }, set: { fieldFill.apply(.put($0)) })", in: text) == 1)
         #expect(Self.count("dictation.isActive || speech.isRecording || speech.isStarting", in: text) == 1)
-        // ONE API: the view only reads the words; every change is a `fieldFill.apply`.
+        // ONE API: the view only reads the words and whether they are the sent words (both
+        // read-only state); every change is a `fieldFill.apply`.
         #expect(Self.count("var inputText: String { fieldFill.words }", in: text) == 1)
         #expect(Self.count("var inputText", in: text) == 1)
         #expect(Self.count("fieldFill.", in: text)
-                == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text),
+                == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text)
+                    + Self.count("fieldFill.holdsSentWords", in: text),
                 "nothing else touches the field's state")
-        // Each change, where it happens: typing (above), both dictations, both sends, the
-        // completion, a confirmation card, and an Edit.
+        // Each change, where it happens: typing (above), both dictations, both sends, and an Edit.
         #expect(Self.count("fieldFill.apply(.startHearing) speech.start(locale: speechLocale, auto: auto) { transcript in fieldFill.apply(.heard(transcript))", in: text) == 1)
         #expect(Self.count("{ text in fieldFill.apply(.said(text))", in: text) == 1)
-        #expect(Self.count("fieldSentText = nil // Words written after the send this completes are newer, and stay (`ChatFieldFill`). fieldFill.apply(.completed)", in: text) == 1)
-        // A confirmation card raises the sheet and ends the field's pulse over the earlier send
-        // (the sheet rising is also run for real: `ChatReplyFieldRuntimeTests.confirmationCardOpensTheSheet`).
-        // It watches the thread's whole chat, so a card raised for an earlier email of the thread counts.
-        #expect(Self.count(".onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in guard hasCard, replyField != nil, !isExpanded else { return } fieldFill.apply(.confirmationCard) fieldSentText = nil withAnimation(expandSpring) { isExpanded = true } }", in: text) == 1)
+        // The completion and a confirmation card land on the sent request's chat key in
+        // `ChatFieldWords`, never through this view (`ChatReplyFieldRuntimeTests.clearWiring`).
         #expect(Self.count("dictation.inputSent(inputText) // From the open sheet the input empties as it goes; a newer draft is what is typed next. fieldFill.apply(.sentFromSheet)", in: text) == 1)
         #expect(Self.count("isTextFieldFocused = false fieldFill.apply(.sentFromField) dictation.inputSent(inputText)", in: text) == 1)
         #expect(Self.count("fieldFill.apply(.put(text)) isTextFieldFocused = true", in: text) == 1)
         // The "e.g." line's change goes in as words and is never sent from here.
         #expect(Self.count("func putExample(_ example: String) { fieldFill.apply(.put(example)) inputSelection = .init(insertionPoint: inputText.endIndex) }", in: text) == 1)
-        #expect(Self.count("fieldFill.apply(", in: text) == 10)
+        #expect(Self.count("fieldFill.apply(", in: text) == 8)
     }
 
     @Test("The field's Send sends the words to the agent; nothing in the field opens compose")
@@ -644,7 +738,8 @@ struct ChatReplyFieldTests {
                 "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
         #expect(Self.count("guard case .sent = outcome else { return }", in: ended) == 1)
-        #expect(Self.count("fieldClearCount += 1", in: ended) == 1, "only after a send")
+        #expect(Self.count("ChatFieldWords", in: ended) == 0 && Self.count("fieldFill", in: ended) == 0,
+                "the view never completes the field: the request does, on its own key (ChatFieldWordsRuntimeTests)")
         // The bubbles are the database's: one observation keyed by the chat's Message-IDs.
         #expect(Self.count("for try await found in ChatUnsentReply.changes(answering: messageIds) {", in: text) == 1)
         // A reply filed or gone reloads the chat's emails, so a sent reply's copy takes its place.
@@ -1072,7 +1167,7 @@ struct ChatReplyFieldTests {
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         // The field itself; the suggestion's rule takes them too (`shownSuggestion`, pinned above).
-        #expect(Self.count("clearCount: fieldClearCount, onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
+        #expect(Self.count("isNoReply: isNoReply, onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
         // Both reply cards open through the one helper, read as the card opens: Reply All exactly
         // when the reply goes to everyone, and the recipients with it.
         #expect(Self.count("agentCompose = req", in: chat) == 1,
@@ -1097,13 +1192,13 @@ struct ChatReplyFieldTests {
         #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) }", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
         #expect(Self.count("let fieldReply = field?.fieldReply", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)", in: island) == 1,
+        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: sessionKey, fieldReply: fieldReply, fieldWordsKey: fieldWordsKey)", in: island) == 1,
                 "and travel with the request to the agent's tools")
         // A recovered send keeps them: the resume carries the cut-off send's request, the retry the
         // failed send as it was sent (ChatReplyRecoveryTests sends both through the real chat).
-        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply)", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply)", in: island) == 1)
-        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply)", in: island) == 1)
+        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply, fieldWordsKey: fieldWordsKey)", in: island) == 1)
+        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: resume.fieldWordsKey), sessionKey: sessionKey, fieldReply: resume.fieldReply, fieldWordsKey: resume.fieldWordsKey)", in: island) == 1)
+        #expect(Self.count("pendingResume = .init( request: resumable.resumeRequest, fieldReply: resume.fieldReply, fieldWordsKey: resume.fieldWordsKey)", in: island) == 1)
         #expect(Self.count("lastFailedSend = .init(text: text, field: field)", in: island) == 1)
         #expect(Self.count("sendAgentChat(failed.text, field: failed.field)", in: island) == 1)
         #expect(Self.count("replyField?.onlyTo", in: island) == 0 && Self.count("replyField?.isNoReply", in: island) == 0,

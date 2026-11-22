@@ -591,7 +591,14 @@ extension AgentToolRouter {
     /// Exactly-once resume is guaranteed by:
     ///   - `ComposeOutcomeState.tryResolve` — atomic first-wins flag
     ///   - `ComposeContinuationGuard.resume` — NSLock-serialized resume
+    /// `fieldWordsKey`: the request was sent from the chat's reply field under this chat key
+    /// (`ToolInvocation.fieldWordsKey`). The field's own reply card (`isFieldsOwnReply`,
+    /// `ChatFieldReply.isOwnReply`, decided apart from who it goes to) marks the field composing
+    /// there, and a sent card completes the field's send there, in `ChatFieldWords`, whether or not
+    /// a chat view still shows it (ADR-IOS-117).
     func enqueueComposeAndAwaitOutcome(
+        fieldWordsKey: String? = nil,
+        isFieldsOwnReply: Bool = false,
         make: (@escaping @MainActor (ComposeOutcome) -> Void, ComposeOutcomeState) -> ComposeRequest
     ) async -> ComposeOutcome {
         let state = ComposeOutcomeState()
@@ -620,8 +627,14 @@ extension AgentToolRouter {
                     // (MainActor). `tryResolve` is atomic so we don't depend
                     // on that isolation for correctness.
                     guard state.tryResolve(outcome) else { return }
+                    if case .sent = outcome, let fieldWordsKey {
+                        ChatFieldWords.shared.apply(.completed, to: fieldWordsKey)
+                    }
                     guard_.resume(returning: outcome)
                 }, state)
+                if let fieldWordsKey, isFieldsOwnReply {
+                    ChatFieldWords.shared.apply(.composeOpened, to: fieldWordsKey)
+                }
                 enqueueCompose(request)
             }
         } onCancel: {

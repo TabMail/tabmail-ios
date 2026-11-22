@@ -23,6 +23,12 @@ struct EmailComposeTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        try await execute(arguments: arguments, invocation: .noninteractive)
+    }
+
+    /// `invocation.fieldWordsKey`: the request was sent from the chat's reply field; a sent card
+    /// completes that send in `ChatFieldWords` (ADR-IOS-117).
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         // Parse recipients
         let to = Self.parseStringArray(arguments["to"]) ?? Self.parseStringArray(arguments["recipients"]) ?? []
         let cc = Self.parseStringArray(arguments["cc"]) ?? []
@@ -83,7 +89,7 @@ struct EmailComposeTool: AgentTool, Sendable {
         }
 
         // Suspend until the user sends, dismisses, or Stop cancels the task.
-        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome { onOutcome, state in
+        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome(fieldWordsKey: invocation.fieldWordsKey) { onOutcome, state in
             AgentToolRouter.ComposeRequest(
                 mode: .compose,
                 replyTo: nil,

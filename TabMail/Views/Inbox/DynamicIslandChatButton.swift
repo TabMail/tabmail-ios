@@ -67,10 +67,19 @@ struct DynamicIslandChat: View {
     /// Reply field: the words sent to the agent, shown pulsing while it works.
     @State var fieldSentText: String?
     /// The input's words and the reply field's state. `ChatFieldFill.apply` is the only way the words
-    /// change; no AI text is ever written into them (`ChatFieldFill`).
-    @State private var fieldFill = ChatFieldFill()
+    /// change; no AI text is ever written into them (`ChatFieldFill`). A pill about an email changes
+    /// its chat's one fill, which every pill on the chat shares (`ChatFieldWords`, ADR-IOS-117); the
+    /// inbox's chat and a compose's pill have their own.
+    private var fieldFill: ChatFieldWords.Field { ChatFieldWords.Field(key: wordsKey, own: $ownFill) }
+    @State private var ownFill = ChatFieldFill()
     /// The user's own words in the input (`ChatFieldFill.words`), read-only here.
     var inputText: String { fieldFill.words }
+    /// Where the field's unsent words are kept (`ChatFieldWords`, ADR-IOS-117): the thread chat key
+    /// of the pill's email. Nil for the inbox's chat and a compose's pill, which keep none.
+    private var wordsKey: String? {
+        guard composeContext == nil, let message else { return nil }
+        return ChatFieldWords.key(for: message)
+    }
     @State var fieldPulse = false
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
@@ -150,8 +159,11 @@ struct DynamicIslandChat: View {
         get { session.lastFailedSend }
         nonmutating set { session.lastFailedSend = newValue }
     }
-    /// Saved checkpoint for a turn cut off in transit — drives the "Connection
-    /// lost. Tap to retry." affordance. Separate from `lastFailedSend`.
+    /// Saved checkpoint for a turn cut off in transit. Drives the "Connection
+    /// lost. Tap to retry." affordance and the field's Retry (`chatRetry`): on an
+    /// empty field, or in Send's place while the field still holds the unedited
+    /// sent words of this same request (its `fieldWordsKey` is the field's
+    /// `wordsKey`). Separate from `lastFailedSend`.
     private var pendingResume: ChatPillState.Session.PendingResume? {
         get { session.pendingResume }
         nonmutating set { session.pendingResume = newValue }
@@ -646,22 +658,24 @@ struct DynamicIslandChat: View {
                 speech.stop()
             }
         }
-        // Reply field (chat view): a clear empties the words that were sent; a confirmation card
-        // while collapsed opens the sheet, which takes the request.
-        .onChange(of: replyField?.clearCount) { _, _ in
-            fieldSentText = nil
-            // Words written after the send this completes are newer, and stay (`ChatFieldFill`).
-            fieldFill.apply(.completed)
-        }
+        // Reply field (chat view): a confirmation card while collapsed opens the sheet, which takes
+        // the request. The field's words are not changed here: the request's own transitions
+        // (card, answer, sent compose) land on the chat key it was sent under, in `ChatFieldWords`
+        // (`SessionUISink`, `sendAgentChat`, `AgentToolRouter.enqueueComposeAndAwaitOutcome`).
         // The thread's chat, read as the pill appears and whenever it is about a newer email, so a
         // card raised in any key of the thread opens the sheet while collapsed (ADR-IOS-114).
         .task(id: message?.id) {
             guard let message else { return }
             await loadThreadChat(about: message)
         }
+        // The field's unsent words (ADR-IOS-117): the chat's kept words come back as the pill
+        // shows it; `ChatFieldWords.apply` keeps every change until it is sent.
+        .task(id: wordsKey) {
+            guard let key = wordsKey else { return }
+            await ChatFieldWords.shared.load(key)
+        }
         .onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
-            fieldFill.apply(.confirmationCard)
             fieldSentText = nil
             withAnimation(expandSpring) { isExpanded = true }
         }
@@ -926,9 +940,11 @@ struct DynamicIslandChat: View {
             DictationSpinner(isRetrying: dictation.isRetrying)
                 .frame(width: 44, height: 44)
                 .accessibilityLabel("Transcribing")
-        } else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil) && isOnLiveSession && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
-            // Retry button. Reverts to the send button as soon as the user types
-            // (the `inputText.isEmpty` gate above). Routes to the right path:
+        } else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil) && isOnLiveSession
+                    && (inputText.trimmingCharacters(in: .whitespaces).isEmpty || (pendingResume?.fieldWordsKey == wordsKey && fieldFill.holdsSentWords)) {
+            // Retry button. Shown on an empty field, or on a field still holding the unchanged sent
+            // words of the field's own cut-off request (resuming it adds no user turn). Reverts to the send
+            // button as soon as the user types or edits. Routes to the right path:
             // a connection-lost RESUMES from saved state; a plain failure re-sends.
             Button {
                 if pendingResume != nil {
@@ -2459,8 +2475,11 @@ struct DynamicIslandChat: View {
         // Captured with the session id: a demo turn is written only while its demo runs.
         let admission = DemoModeStore.shared.chatAdmission
         let capturedSessionKey = sessionKey
-        // Sent from the reply field: the request carries the field's send as it started.
+        // Sent from the reply field: the request carries the field's send as it started, and the
+        // chat key its words were sent under, where its card, answer and sent compose land
+        // (ADR-IOS-117), whichever chat this pill shows by then, and whether or not it still exists.
         let fieldReply = field?.fieldReply
+        let fieldWordsKey = field.map { ChatFieldWords.key(for: $0.message) }
 
         activeChatTask = Task {
             // Ensure email context is registered before building enrichedText.
@@ -2557,7 +2576,8 @@ struct DynamicIslandChat: View {
                 // by) the session that launched the turn — never a global slot that
                 // other mounted pills race for.
                 let invocation = ToolInvocation(
-                    uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)
+                    uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: sessionKey,
+                    fieldReply: fieldReply, fieldWordsKey: fieldWordsKey)
                 let response: ChatResponse?
                 response = try await TutorialChatScript.response(for: script, invocation: invocation) {
                     try await ChatPillState.shared.aiService.sendChatMessage(
@@ -2636,6 +2656,11 @@ struct DynamicIslandChat: View {
                     animate: true
                 ))
                 BackgroundSyncLogger.logDebug("[AIChatRender] chatMessages appended (count=\(chatMessages.count)), about to set isWorking=false")
+                // The agent answered the field's send: it completes on the send's own chat key.
+                if let fieldWordsKey {
+                    ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)
+                    fieldSentText = nil
+                }
                 if !isExpanded {
                     if let onAgentReply {
                         // Parent view handles the toast (InboxView, ComposeView)
@@ -2664,7 +2689,7 @@ struct DynamicIslandChat: View {
                     // no `lastFailedSend` (that's the separate fork/resend pathway). The field's
                     // request goes with it, for the resumed turn's tools.
                     BackgroundSyncLogger.logChatError("Connection lost (resumable): \(error.localizedDescription)", userMessage: text)
-                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply)
+                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply, fieldWordsKey: fieldWordsKey)
                 } else {
                     // Connection/server error — enable retry
                     BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: text)
@@ -2730,7 +2755,8 @@ struct DynamicIslandChat: View {
                     request: resume.request,
                     onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
                     invocation: ToolInvocation(
-                        uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply)
+                        uiSink: SessionUISink(session: session, fieldWordsKey: resume.fieldWordsKey), sessionKey: sessionKey,
+                        fieldReply: resume.fieldReply, fieldWordsKey: resume.fieldWordsKey)
                 )
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."
@@ -2774,6 +2800,10 @@ struct DynamicIslandChat: View {
                     timestamp: Date(),
                     animate: true
                 ))
+                if let fieldWordsKey = resume.fieldWordsKey {
+                    ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)
+                    fieldSentText = nil
+                }
                 if !isExpanded {
                     if let onAgentReply {
                         onAgentReply(displayText)
@@ -2793,7 +2823,8 @@ struct DynamicIslandChat: View {
                 } else if let resumable = error as? ChatConnectionLostError {
                     // Cut off again — keep the affordance armed with the latest checkpoint.
                     BackgroundSyncLogger.logChatError("Connection lost again (resumable)", userMessage: "(resumed)")
-                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply)
+                    pendingResume = .init(
+                        request: resumable.resumeRequest, fieldReply: resume.fieldReply, fieldWordsKey: resume.fieldWordsKey)
                 } else {
                     // Non-transient failure — surface it; the user's message still has
                     // the fork/resend context menu for a fresh attempt.

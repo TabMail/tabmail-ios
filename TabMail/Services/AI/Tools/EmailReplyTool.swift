@@ -183,7 +183,8 @@ struct EmailReplyTool: AgentTool, Sendable {
                 openCard: { envelope, body in
                     await openReplyCard(
                         header: header, envelope: envelope, body: body, fieldReply: fieldReply,
-                        draftId: Draft.separateReplyKey(replyTo: "\(header.accountId):\(header.stableId)"))
+                        draftId: Draft.separateReplyKey(replyTo: "\(header.accountId):\(header.stableId)"),
+                        invocation: invocation)
                 })
         }
 
@@ -217,7 +218,7 @@ struct EmailReplyTool: AgentTool, Sendable {
 
         return await openReplyCard(
             header: header, envelope: envelope, body: generatedBody, suggestion: storedSuggestion,
-            fieldReply: fieldReply, draftId: nil)
+            fieldReply: fieldReply, draftId: nil, invocation: invocation)
     }
 
     /// The email's body for a compose edit's context (`ComposeEditContext.relatedBodyText`, the one
@@ -250,10 +251,13 @@ struct EmailReplyTool: AgentTool, Sendable {
     }
 
     /// Opens the reply's compose card and waits until the user sends, dismisses, or Stop cancels
-    /// the task.
+    /// the task. `fieldReply` is the field's request as it applies to this reply (its audience
+    /// only in the same account); whether the card is the field's own reply is read from the
+    /// whole request (`invocation`), any copy of the email in any account
+    /// (`ChatFieldReply.isOwnReply`).
     private func openReplyCard(
         header: MessageHeader, envelope: ChatReplyCompose, body: String?, suggestion: ReplyResult? = nil,
-        fieldReply: ChatFieldReply?, draftId: String?
+        fieldReply: ChatFieldReply?, draftId: String?, invocation: ToolInvocation
     ) async -> String {
         // Short-circuit duplicate retries: if we just sent a reply to this
         // same email within the TTL, don't re-prompt the user. Round 2 HTTP
@@ -274,7 +278,10 @@ struct EmailReplyTool: AgentTool, Sendable {
         // The helper threads onOutcome + outcomeState into ComposeRequest so
         // the MainActor-isolated ComposeView callback resumes this tool's
         // continuation.
-        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome { onOutcome, state in
+        let isFieldsOwnReply = invocation.fieldReply?.isOwnReply(to: header) == true
+        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome(
+            fieldWordsKey: invocation.fieldWordsKey, isFieldsOwnReply: isFieldsOwnReply
+        ) { onOutcome, state in
             AgentToolRouter.ComposeRequest(
                 mode: .reply,
                 replyTo: header,

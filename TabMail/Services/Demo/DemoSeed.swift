@@ -85,6 +85,8 @@ enum DemoSeed {
         // Settings > Chat History and Stage A self-heal would re-index them
         // into memory.db right after the exit purge.
         try db.execute(sql: "DELETE FROM chatHistory WHERE sessionId >= 'demo:' AND sessionId < 'demo;'")
+        // The demo's chats' unsent words (ADR-IOS-117).
+        try db.execute(sql: "DELETE FROM chatFieldWords WHERE sessionId >= 'demo:' AND sessionId < 'demo;'")
         try db.execute(sql: "DELETE FROM outboxMessage WHERE accountId = ?", arguments: [demoAccountId])
         try db.execute(sql: "DELETE FROM draft WHERE accountId = ?", arguments: [demoAccountId])
         try db.execute(sql: "DELETE FROM pendingOperation WHERE accountId = ?", arguments: [demoAccountId])

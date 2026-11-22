@@ -16,9 +16,6 @@ struct ChatReplyField: Equatable {
     let example: String?
     /// The newest email is from a no-reply address.
     let isNoReply: Bool
-    /// Changes when the field must empty: the reply went out, or the agent answered in the
-    /// sheet.
-    let clearCount: Int
     /// The reply goes only to these people; nil for Reply All.
     var onlyTo: [ChatThread.Person]? = nil
     /// In the tutorial, what the read-only field holds and sends (part 2); nil holds nothing.
@@ -113,7 +110,10 @@ struct ChatReplyField: Equatable {
 /// an await. No AI text enters, so no late suggestion can land on the user's words.
 /// The one asynchronous producer that replaces words, the on-device live transcript, enters with
 /// a change-counter compare (`heard`): it is dropped once anything else changed the words.
-struct ChatFieldFill {
+///
+/// A pill about an email does not hold its own: its chat's one fill is in `ChatFieldWords`
+/// (ADR-IOS-117), which every pill on that chat reads and changes, and which keeps what is not sent.
+struct ChatFieldFill: Equatable {
     /// The user's own words in the input: typed, said, or put there by the app for them (an Edit).
     /// Never AI text.
     private(set) var words = ""
@@ -121,11 +121,28 @@ struct ChatFieldFill {
     /// send completed. An answer or a sent reply completes it, so it empties only those words:
     /// words the user wrote after it are newer and stay.
     private(set) var atSend: String?
+    /// The field still holds the words of its open send, unedited: true from the field's Send until
+    /// any edit of the words. Ownership follows edits, not content: words cleared and retyped to the
+    /// same text after Send are newly written, so they are kept and no completion empties them.
+    private(set) var holdsSentWords = false
+    /// A confirmation card took the field's sent words off the input (the request shows in the
+    /// sheet), unedited since: true from that card until any edit of the words or the send's end.
+    /// They are still the send's words, so if the field's own compose card then closes unsent, the
+    /// answer hands them back (`answered`) as it does when they stayed on the input.
+    private(set) var sentWordsTaken = false
     /// How many changes the words have had: the change counter a live transcript compares.
     private(set) var changes = 0
+    /// A compose card opened for the field's send: the reply is the point, so the agent's closing
+    /// answer completes nothing; the card's own send does (`completed`).
+    private(set) var composing = false
     /// The live transcript in progress: the words it adds to, and the change count of its own last
     /// write. Ends when anything else changes the words.
-    private var hearing: (base: String, at: Int)?
+    private var hearing: Hearing?
+
+    private struct Hearing: Equatable {
+        let base: String
+        let at: Int
+    }
 
     /// Every change to the words.
     enum Change {
@@ -143,12 +160,21 @@ struct ChatFieldFill {
         case sentFromSheet
         /// Send from the collapsed field: the words stay, pulsing, until the send completes.
         case sentFromField
-        /// The last send completed (the reply went out, or the agent answered in the sheet): it
-        /// empties the words only if they are still the words sent, or none.
+        /// The open send completed (its compose card's reply went out): it empties the words only
+        /// if a send is open and they are still the words sent, or none.
         case completed
+        /// The agent answered the field's send: `completed`, unless a compose card opened for it and
+        /// closed unsent; then the words are the user's again, kept and not emptied.
+        case answered
+        /// A compose card opened for the field's send (`composing`).
+        case composeOpened
         /// A confirmation card opened the sheet: the same check, and the send is still open.
         case confirmationCard
     }
+
+    /// The words to keep for the chat (`ChatFieldWords`): the words, except a send's still in
+    /// flight (they went to the agent).
+    var unsent: String { holdsSentWords ? "" : words }
 
     /// The only way the words change.
     mutating func apply(_ change: Change) {
@@ -156,36 +182,79 @@ struct ChatFieldFill {
         switch change {
         case let .said(text):
             words = DictationController.appending(text, to: words)
+            holdsSentWords = false
+            sentWordsTaken = false
         case .startHearing:
-            hearing = (words, changes)
+            hearing = Hearing(base: words, at: changes)
             return
         case let .heard(transcript):
             guard let hearing, hearing.at == changes else { self.hearing = nil; return }
             words = DictationController.appending(transcript, to: hearing.base)
+            holdsSentWords = false
+            sentWordsTaken = false
             changes += 1
-            self.hearing = (hearing.base, changes)
+            self.hearing = Hearing(base: hearing.base, at: changes)
             return
         case let .put(text):
+            // A set that leaves the words as they are is no edit (a binding's echo); any real
+            // edit, even one that ends back on the sent text, makes the words newly written.
+            guard text != words else { return }
             words = text
+            holdsSentWords = false
+            sentWordsTaken = false
         case .sentFromSheet:
             atSend = ""
             words = ""
+            holdsSentWords = false
+            sentWordsTaken = false
         case .sentFromField:
             atSend = words
+            holdsSentWords = true
+            sentWordsTaken = false
+            composing = false
         case .completed:
             if clears { words = "" }
             atSend = nil
+            holdsSentWords = false
+            sentWordsTaken = false
+            composing = false
+        case .answered:
+            // A compose card that opened for the send owns its completion. The answer comes once
+            // the card is done; if it is still composing, the card closed unsent: the answer
+            // empties nothing and hands the words back to the user, so they are kept. Words a
+            // confirmation card took off the input before the card opened come back too.
+            if composing {
+                if sentWordsTaken, let atSend { words = atSend }
+            } else if clears {
+                words = ""
+            }
+            atSend = nil
+            holdsSentWords = false
+            sentWordsTaken = false
+            composing = false
+        case .composeOpened:
+            composing = true
         case .confirmationCard:
-            if clears { words = "" }
+            // Same ownership as `answered`: once a compose card opened for the send, the card owns
+            // its completion, and a confirmation for another step of the request empties nothing.
+            // Before that, it takes the sent words off the input, still the send's words (a
+            // second card finds them taken already).
+            if !composing, clears {
+                if holdsSentWords { sentWordsTaken = true }
+                words = ""
+                holdsSentWords = false
+            }
         }
         if words != before { changes += 1 }
     }
 
-    /// Whether the last send's completion may empty the words: they are still the words sent, or
-    /// none. Anything else the user wrote after the send.
+    /// Whether a send's completion may empty the words: only while a send is open, and only if
+    /// they are still the words sent, unedited (`holdsSentWords`), or none. With no send open (a compose card's Send already
+    /// completed it, or nothing was sent), a later card, compose or answer of the same request
+    /// leaves the words: they are newer than the send.
     private var clears: Bool {
-        guard let atSend else { return true }
-        return words == atSend || words.isEmpty
+        guard atSend != nil else { return false }
+        return holdsSentWords || words.isEmpty
     }
 }
 
@@ -226,6 +295,14 @@ struct ChatFieldReply: Sendable, Equatable {
     /// showed in the same account, any copy of it (another folder's), never another account's copy.
     func audienceApplies(to header: MessageHeader) -> Bool {
         header.accountId == email.accountId && ChatThread.copyKey(header) == ChatThread.copyKey(email)
+    }
+
+    /// Whether a reply to `header` is the field's own reply, the card its send asked for: `header`
+    /// is the email the field showed, any copy of it, in any account (`ChatThread.copyKey`). Unlike
+    /// the audience, it holds across accounts: the user asked for this reply in the field, so its
+    /// card owns the send's completion (`ChatFieldFill.Change.composeOpened`).
+    func isOwnReply(to header: MessageHeader) -> Bool {
+        ChatThread.copyKey(header) == ChatThread.copyKey(email)
     }
 }
 

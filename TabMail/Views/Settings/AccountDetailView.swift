@@ -600,7 +600,11 @@ struct AccountDetailView: View {
 
     /// Authoritative account-scoped reset in one GRDB transaction. Split-out
     /// for a real injected-ABORT test; no FTS/memory/UI side effect belongs here.
+    /// First, while the headers are still here, every chat's unsent field words whose thread
+    /// has an email are re-stamped (`ChatFieldWords.restampLive`, ADR-IOS-117), so the orphan
+    /// pass gives them the full grace for the resync to bring their thread back.
     nonisolated static func resetMessageDataTxn(_ db: Database, accountId: String) throws {
+        try ChatFieldWords.restampLive(db: db, now: Date())
         try db.execute(
             sql: "DELETE FROM messageHeader WHERE accountId = ?",
             arguments: [accountId]
