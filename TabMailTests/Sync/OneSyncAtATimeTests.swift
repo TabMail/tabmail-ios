@@ -395,7 +395,11 @@ struct OneSyncAtATimeTests {
     /// foreground pass found the account synced moments ago and returned before
     /// the full sync that was due. The pass is gated by the two clocks alone: it
     /// reads changes, and runs the full sync when `lastFullSyncAt` says it is due.
-    @Test("A pass right after a change read reads changes and runs the full sync when due",
+    /// Either way it then starts the older-mail catch-up (the backfill worker,
+    /// which stops on its own once a cycle finds nothing to do): the pass is the
+    /// only automatic start, so a pass that returned early left the catch-up
+    /// stopped for good.
+    @Test("A pass right after a change read reads changes, runs the full sync when due, and starts the older-mail catch-up",
           arguments: LastFullSync.allCases)
     func passRightAfterAChangeRead(lastFullSync: LastFullSync) async throws {
         try await Self.withAppDB { pool in
@@ -419,6 +423,11 @@ struct OneSyncAtATimeTests {
             #expect(stampedJustNow, "precondition: the change read stamped the account just now")
             #expect(wire.snapshot.historyStarts == ["1500"], "precondition: the change read ran from the stored cursor")
             #expect(wire.snapshot.listingRequests == 0, "precondition: the change read runs no full sync")
+            // Counts every start of the catch-up worker; it never goes down, so a
+            // worker that already finished still shows.
+            let generationBefore = await engine.backfillGeneration[Self.accountId]
+            let catchUpsBefore = generationBefore ?? 0
+            #expect(catchUpsBefore == 0, "precondition: the change read starts no older-mail catch-up")
             // Ten seconds back, still moments ago: the pass's own stamp is then
             // seen as a later one.
             let readStamp = try await Self.backdateLastSyncedAt(pool, seconds: 10)
@@ -427,8 +436,12 @@ struct OneSyncAtATimeTests {
             _ = try await engine.sync(account: account)
 
             let afterPass = try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) }
+            let generationAfter = await engine.backfillGeneration[Self.accountId]
+            let catchUpsAfter = generationAfter ?? 0
             #expect(wire.snapshot.historyStarts == ["1500", "2001"],
                     "the pass must read changes from the cursor the change read left")
+            #expect(catchUpsAfter > catchUpsBefore,
+                    "the pass did not start the older-mail catch-up, whether or not a full sync was due")
             switch lastFullSync {
             case .never, .anHourAgo:
                 let recorded = afterPass?.lastFullSyncAt.map { Date().timeIntervalSince($0) < 15 } == true

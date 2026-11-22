@@ -289,8 +289,7 @@ struct IMAPChangeCondstoreTests {
     /// One real foreground pass (`SyncEngine.sync`): the change read, the
     /// listings it needs, and the baseline commit that alone turns tracking on
     /// (`commitChangeBaseline`). `listing` makes the scheduled full sync due.
-    /// The pass starts
-    /// the account's background backfill (`SyncEngine.startBackfill`), whose walk
+    /// The pass starts the account's background backfill (`SyncEngine.startBackfill`), whose walk
     /// and catch-up would reach the same server at a moment the test does not
     /// choose; the pass stops it before it starts, and a test that needs the
     /// catch-up runs it itself (`catchUp`).
