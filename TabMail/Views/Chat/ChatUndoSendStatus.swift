@@ -96,7 +96,10 @@ enum ChatUndoSendConfig {
 /// (all the countdown needs); while the fill rises (no Reduce Motion), every frame
 /// (`ChatUndoSendConfig.fillFramesPerSecond`) inside the fill's window, the last
 /// `SyncConfig.outboxUndoHoldSeconds` before the deadline (before it the fill is empty and does
-/// not move); then the deadline itself. Nothing is scheduled after the deadline.
+/// not move); then the deadline itself. Nothing is scheduled after the deadline: the sequence
+/// closes with `Date.distantFuture`, an instant the timeline never reaches. A TimelineView does not
+/// redraw at its schedule's last date, so ending on the deadline left a mounted bubble showing
+/// Undo past it.
 ///
 /// The instants are made one at a time, as the timeline asks for them, never laid out in memory:
 /// a queued row's durable hold can lie far ahead of the clock (a reply queued while the device's
@@ -120,6 +123,8 @@ struct ChatUndoSendSchedule: TimelineSchedule {
         /// nil once the deadline was given, or when `start` is not before it.
         private var left: Int?
         private var startGiven = false
+        /// The closing `Date.distantFuture` was given: the sequence has ended.
+        private var closed = false
 
         init(start: Date, deadline: Date, animatesFill: Bool) {
             self.start = start
@@ -150,7 +155,9 @@ struct ChatUndoSendSchedule: TimelineSchedule {
                 // Rounding can put the first unit at `start`, which was already given.
                 if instant > start { return instant }
             }
-            return nil
+            guard !closed else { return nil }
+            closed = true
+            return .distantFuture
         }
     }
 }

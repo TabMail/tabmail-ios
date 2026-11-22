@@ -76,9 +76,19 @@ struct ChatUndoSendTests {
         #expect(Self.reply(holdUntil: hold, draftId: nil).undoSecondsLeft(at: now) == nil)
     }
 
-    /// The bubble's redraw instants from `start`, as its timeline asks for them.
-    private static func redraws(from start: Date, deadline: Date, animatesFill: Bool) -> [Date] {
+    /// The bubble's redraw instants from `start`, as its timeline asks for them: the whole sequence,
+    /// its closing `Date.distantFuture` included.
+    private static func schedule(from start: Date, deadline: Date, animatesFill: Bool) -> [Date] {
         Array(ChatUndoSendSchedule(deadline: deadline, animatesFill: animatesFill).entries(from: start, mode: .normal))
+    }
+
+    /// The instants the timeline actually redraws at: the sequence less its closing entry. A
+    /// TimelineView does not redraw at its schedule's last date, so the sequence must not end on one
+    /// it needs.
+    private static func redraws(from start: Date, deadline: Date, animatesFill: Bool) -> [Date] {
+        let all = schedule(from: start, deadline: deadline, animatesFill: animatesFill)
+        #expect(all.last == .distantFuture, "the sequence closes with an instant the timeline never reaches")
+        return Array(all.dropLast())
     }
 
     @Test("The countdown's ticks fall on each whole second before the deadline and end at it")
@@ -91,6 +101,11 @@ struct ChatUndoSendTests {
                 "nothing scheduled after the deadline")
         #expect(Self.redraws(from: deadline.addingTimeInterval(1), deadline: deadline, animatesFill: true).count == 1,
                 "nor with the fill")
+        for animatesFill in [false, true] {
+            let all = Self.schedule(from: start, deadline: deadline, animatesFill: animatesFill)
+            #expect(all.dropLast().last == deadline,
+                    "the deadline is not the schedule's last date, so the timeline redraws at it: \(animatesFill)")
+        }
     }
 
     @Test("A hold far ahead of the clock redraws once a second until the fill's window, then frame by frame to the deadline")

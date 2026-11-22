@@ -811,8 +811,13 @@ struct UndoWindowTimingTests {
 @MainActor
 struct UndoAffordanceHoldInvariantTests {
 
+    /// The shared service with no toast and no send's Undo owner left by an earlier case. Every
+    /// case presents the same outbox id, and closing a toast inside its window hands that send's
+    /// Undo to its chat bubble, so without the reset a later case's present would find the id
+    /// already owned by a bubble and show no toast.
     private func freshService() -> PendingSendService {
         PendingSendService.shared.dismiss()
+        PendingSendService.shared.resetUndoOwnersForTesting()
         return PendingSendService.shared
     }
 
