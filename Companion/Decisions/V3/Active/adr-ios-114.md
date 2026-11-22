@@ -1500,7 +1500,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      give them (else the part of the address before the @; a sent email's From is the user and names
      nobody), never the user's own addresses. Each Sent folder's newest are read on its own
      (folderId, date) index and the newest of those kept (`SearchView.recentHeaders`), so no read
-     sorts a whole Sent history; with no Sent folder nothing is read. In demo mode only the demo
+     sorts a whole Sent history; with no Sent folder nothing is read. The read takes the raw GRDB
+     pool (`AppDatabase.rawPool`), as the search's local pass does, so it never waits for the
+     notification staging merge that `PrioritizedDatabase`'s async read runs first. In demo mode only the demo
      account's Sent folder, otherwise only real accounts' (`Folder.demoScope`, demo state read as the
      sheet opens). It is computed from the stored headers each time and nothing new is stored
      (ADR-004). A row shows only someone not in the list above (`ChatReplyToChoice.unlisted`); a tap

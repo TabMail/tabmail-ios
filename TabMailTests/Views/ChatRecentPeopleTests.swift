@@ -76,13 +76,16 @@ struct ChatRecentPeopleTests {
                        bcc: "Kim Park <kim@example.com>, me@company.com", minutesAgo: 1),
             // Sent as a shared address that is not one of the user's accounts.
             Self.email("1", to: "maria@example.com", minutesAgo: 100, from: "Team Desk", fromAddress: "desk@example.com"),
+            // Sam has no recipient name anywhere; an older email sent as Sam's shared address names
+            // nobody either.
+            Self.email("0", to: "maria@example.com", minutesAgo: 200, from: "Sam Lee", fromAddress: "sam@example.com"),
         ]
         let people = ChatRecentPeople.people(sentNewestFirst: sent, ownAddresses: Self.own, limit: 10)
         #expect(people.map(\.address) == ["desk@example.com", "sam@example.com", "kim@example.com", "maria@example.com"],
                 "To, Cc, then Bcc, never the user")
         #expect(people.map(\.name) == ["Help Desk", ChatThread.fallbackName("sam@example.com"), "Kim Park",
                                        ChatThread.fallbackName("maria@example.com")],
-                "the newer recipient name, not the older From name")
+                "the newer recipient name, not the older From name; no recipient name and a From name: the address's own")
     }
 
     @Test("A Recent row offers only someone not in the list; once added they are in the list, ticked")
@@ -104,8 +107,8 @@ struct ChatRecentPeopleTests {
     @Test("Only the new email's sheet reads recent people, as it opens and in the mode it opens in; an email's Reply to sheet has none")
     func wiring() throws {
         let view = try Self.source("TabMail/Views/Chat/ChatNewThreadView.swift")
-        #expect(view.contains("title: ChatReplyToSheet.addRecipientTitle, recentPeople: { await ChatRecentPeople.load(pool: AppDatabase.dbPool, ownAddresses: ownAddresses, demoActive: DemoModeStore.isDemoActive) }) { done in"),
-                "the new email's sheet reads them with the user's own addresses and the demo mode as it opens")
+        #expect(view.contains("title: ChatReplyToSheet.addRecipientTitle, recentPeople: { await ChatRecentPeople.load(pool: AppDatabase.rawPool, ownAddresses: ownAddresses, demoActive: DemoModeStore.isDemoActive) }) { done in"),
+                "the new email's sheet reads them from the raw pool, with the user's own addresses and the demo mode, as it opens")
         let thread = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(thread.contains("ChatReplyToSheet("), "control: the email's chat opens the sheet")
         #expect(!thread.contains("recentPeople"), "the Reply to sheet has no Recent section")
@@ -114,6 +117,8 @@ struct ChatRecentPeopleTests {
                 "read each time the sheet opens, into the sheet's own state")
         let reader = try Self.source("TabMail/Views/Chat/ChatRecentPeople.swift")
         #expect(reader.contains("try await pool.read { db in"), "control: the reader reads")
+        #expect(reader.contains("static func load( pool: DatabasePool,") && !reader.contains("PrioritizedDatabase("),
+                "GRDB's own read: never the async read that runs the staging merge first")
         #expect(reader.contains("return try SearchView.recentHeaders(db, folderIds: sentFolderIds, budget: scanCount)"),
                 "each Sent folder's newest on its own index, then the newest of those")
         #expect(!reader.contains("write") && !reader.contains("UserDefaults") && !reader.contains("insert"), "nothing is stored")
@@ -179,7 +184,7 @@ struct ChatRecentPeopleLoadTests {
             T.email("d1", to: "draft@example.com", minutesAgo: 2, folder: "Drafts"),
             T.email("a1", to: "archived@example.com", minutesAgo: 3, folder: "Archive"),
         ], fixture)
-        let people = await ChatRecentPeople.load(pool: PrioritizedDatabase(pool: fixture.pool), ownAddresses: T.own, demoActive: false)
+        let people = await ChatRecentPeople.load(pool: fixture.pool, ownAddresses: T.own, demoActive: false)
         #expect(people.map(\.address) == ["sam@example.com", "maria@example.com", "jordan@example.com"])
     }
 
@@ -188,7 +193,7 @@ struct ChatRecentPeopleLoadTests {
         let fixture = try fixture()
         defer { finish(fixture) }
         typealias T = ChatRecentPeopleTests
-        let pool = PrioritizedDatabase(pool: fixture.pool)
+        let pool = fixture.pool
         try await insert([T.email("s1", to: "maria@example.com", minutesAgo: 30)], fixture)
         let before = await ChatRecentPeople.load(pool: pool, ownAddresses: T.own, demoActive: false)
         #expect(before.map(\.address) == ["maria@example.com"], "control")
@@ -202,7 +207,7 @@ struct ChatRecentPeopleLoadTests {
         let fixture = try fixture()
         defer { finish(fixture) }
         typealias T = ChatRecentPeopleTests
-        let pool = PrioritizedDatabase(pool: fixture.pool)
+        let pool = fixture.pool
         try await insert([
             T.email("s1", to: "maria@example.com", minutesAgo: 30),
             T.email("i1", to: "me@example.com", cc: "inbox-cc@example.com", minutesAgo: 1, folder: "INBOX"),
@@ -228,7 +233,7 @@ struct ChatRecentPeopleLoadTests {
             T.email("demo1", to: "demo-person@example.com", minutesAgo: 1, accountId: DemoSeed.demoAccountId),
             T.email("s1", to: "maria@example.com", minutesAgo: 30),
         ], fixture)
-        let real = await ChatRecentPeople.load(pool: PrioritizedDatabase(pool: fixture.pool), ownAddresses: T.own,
+        let real = await ChatRecentPeople.load(pool: fixture.pool, ownAddresses: T.own,
                                                demoActive: false, scanCount: 1)
         #expect(real.map(\.address) == ["maria@example.com"])
     }
@@ -242,7 +247,7 @@ struct ChatRecentPeopleLoadTests {
         var headers = (0..<scan).map { T.email("s\($0)", to: "maria@example.com", minutesAgo: Double($0 + 1)) }
         headers.append(T.email("o1", to: "sam@example.com", minutesAgo: Double(scan + 10), accountId: Self.other, folder: Self.otherSent))
         try await insert(headers, fixture)
-        let pool = PrioritizedDatabase(pool: fixture.pool)
+        let pool = fixture.pool
         let people = await ChatRecentPeople.load(pool: pool, ownAddresses: T.own, demoActive: false)
         #expect(people.map(\.address) == ["maria@example.com"], "Sam's email is older than the newest \(scan)")
         let wider = await ChatRecentPeople.load(pool: pool, ownAddresses: T.own, demoActive: false, scanCount: scan + 1)
@@ -259,7 +264,7 @@ struct ChatRecentPeopleLoadTests {
             T.email("s2", to: "sam@example.com", minutesAgo: 2, accountId: Self.other, folder: Self.otherSent),
             T.email("s3", to: "jordan@example.com", minutesAgo: 3),
         ], fixture)
-        let pool = PrioritizedDatabase(pool: fixture.pool)
+        let pool = fixture.pool
         let two = await ChatRecentPeople.load(pool: pool, ownAddresses: T.own, demoActive: false, scanCount: 2)
         #expect(two.map(\.address) == ["maria@example.com", "sam@example.com"])
         let all = await ChatRecentPeople.load(pool: pool, ownAddresses: T.own, demoActive: false, scanCount: 3)
@@ -274,7 +279,7 @@ struct ChatRecentPeopleLoadTests {
         let count = ChatViewConfig.recentPeopleCount
         let headers = (0...count).map { T.email("s\($0)", to: "person\($0)@example.com", minutesAgo: Double($0 + 1)) }
         try await insert(headers, fixture)
-        let people = await ChatRecentPeople.load(pool: PrioritizedDatabase(pool: fixture.pool), ownAddresses: T.own, demoActive: false)
+        let people = await ChatRecentPeople.load(pool: fixture.pool, ownAddresses: T.own, demoActive: false)
         let expected = (0..<count).map { "person\($0)@example.com" }
         #expect(people.map(\.address) == expected)
     }
@@ -286,7 +291,7 @@ struct ChatRecentPeopleLoadTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         // A database with no tables: the read throws.
         let empty = try DatabasePool(path: directory.appendingPathComponent("empty.sqlite").path)
-        let people = await ChatRecentPeople.load(pool: PrioritizedDatabase(pool: empty), ownAddresses: ChatRecentPeopleTests.own, demoActive: false)
+        let people = await ChatRecentPeople.load(pool: empty, ownAddresses: ChatRecentPeopleTests.own, demoActive: false)
         #expect(people.isEmpty)
         try empty.close()
     }

@@ -33,9 +33,11 @@ enum ChatRecentPeople {
     /// The recent people from the newest `scanCount` emails of the Sent folders: the demo
     /// account's while demo is on, else every real account's (`demoActive`, read once by the
     /// caller as the sheet opens). A read that fails gives nobody: the sheet then shows no Recent
-    /// section.
+    /// section. `pool` is the raw GRDB pool (`AppDatabase.rawPool`), as for the search's local pass:
+    /// `PrioritizedDatabase`'s async read runs the notification staging merge first, which can hold
+    /// the Recent section for seconds.
     static func load(
-        pool: PrioritizedDatabase,
+        pool: DatabasePool,
         ownAddresses: Set<String>,
         demoActive: Bool,
         limit: Int = ChatViewConfig.recentPeopleCount,
