@@ -1202,7 +1202,11 @@ struct ChatReplyFieldTests {
         // 2026-11-22): the bar's height moves only by a change a screen can show.
         #expect(Self.count("if !chatExpanded, Self.pillHeightMoved(from: pillHeight, to: height) { pillHeight = height }", in: chat) == 1,
                 "the measured height sets the bar's height only once it really moved")
-        #expect(Self.count("pillHeight = height", in: chat) == 1, "and nothing else sets it from a measurement")
+        // Every write to the bar's height, whatever it is set to: the declaration and that one write.
+        let heightWrites = try NSRegularExpression(pattern: #"\bpillHeight\s*[-+*/]?=(?!=)"#)
+        let writes = heightWrites.numberOfMatches(in: chat, range: NSRange(chat.startIndex..., in: chat))
+        #expect(writes == 2, "the declaration and the guarded write: nothing else sets the bar's height")
+        #expect(Self.count("$pillHeight", in: chat) == 0, "and no binding hands it to a writer elsewhere")
         let fieldBar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
         #expect(Self.count(".modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))", in: fieldBar) == 1, "the swell on the glass")
         let editor = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")

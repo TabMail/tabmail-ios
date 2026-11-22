@@ -1311,11 +1311,18 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    earlier crossing after a reversal. Sideways
    travel made while the text had the drag is not the field's, and a drag that reverses until the
    text scrolls again drops the hand-off and takes a new one when the text is back at its end. Only
-   the finger takes the drag back (amended 2026-11-22): a sample that moved down with the text short
-   of its end drops the hand-off; a move of the text the finger did not make keeps it, so the rest of
-   the drag stays the field's. UIKit scrolls the field's text to its caret on the first layout after
-   the field is built again, and a UI run showed that under a held drag past the end (the text back
-   at its caret at its start, the let-go reading no share and the panel staying shut); the
+   the finger takes the drag back (amended 2026-11-22): the hand-off drops once the finger has come
+   down from its highest point since the hand-off and the text reads short of its end by no more than
+   the farthest it came down (`ChatFieldPan.Coordinator.fingerBroughtTextBack`, within
+   `ChatViewLayout.fieldTextReversalSlack`, 1 pt for a pixel's rounding at 1x: the text's own scroll
+   follows the finger point for point). It is read from the distance, not from a sample's direction,
+   and from the farthest, not from where the finger is now, because the text's scroll and the pan run
+   side by side and UIKit does not say which hears a move first: the text can show a downward move one
+   sample late, when the finger is already going up again, or only at the let-go. A text short by
+   more than the finger came down moved without it, and an earned hand-off survives that move, so the
+   rest of the drag stays the field's. Observed in a UI run, not documented by UIKit: on a layout
+   after the field was built again under a held drag past the end, UIKit scrolled the field's text to
+   its caret at its start, and the let-go read no share and the panel stayed shut; the
    field's segment keeps the more-up-than-sideways rule, and whether the pan begins at all is
    still decided on the drag's first movement. UIKit cannot
    start a recognizer that failed earlier in the same touch, so waiting for the scroll could never
@@ -1389,8 +1396,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `ChatFieldDragTests.fieldShareOfATextDrag` and `panSharesWithTheTextUnderTheTouch` (the field's
    share, from a touch-down offset that is not zero; `handOffClearsOnAReversal` and
    `diagonalThenStraightUp` the hand-off's state, both axes; `handOffSurvivesATextScrollTheFingerDidNotMake`
-   the hand-off kept through a scroll of the text the finger did not make, and dropped by the finger
-   coming back down; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
+   the hand-off kept through a scroll of the text the finger did not make, a flick let go there, and
+   dropped by the finger coming back down; `handOffDropsWhenTheTextShowsTheFingersMoveLate` the
+   finger's reversal read when the text shows it a sample late, at a second crossing or at a rested
+   let-go; `reversalSlack` the rule's own boundary; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
    floating-point remainder; `handOffInsideACrossingSample` and
    `handOffInsideACrossingSampleAfterAReversal` the hand-off inside a sample that crosses the end, where
    the text reached it; `upwardShareCountsFromTheSecondHandOff` the upward share after a reversal,

@@ -663,10 +663,14 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
 
         /// The text the drag's first touch landed in, and the drag's travel, both axes, where the
         /// text last reached its end (nil until it does, and again once the finger brings it back
-        /// from its end): the field's share counts from that one point. The previous sample's travel and the text's place then, to find where in
-        /// the next sample the text reached its end.
+        /// from its end): the field's share counts from that one point. The drag's highest travel
+        /// since then, and the farthest the finger has come back down from it. The previous
+        /// sample's travel and the text's place then, to find where in the next sample the text
+        /// reached its end.
         private weak var text: UIScrollView?
         private var handOff: CGSize?
+        private var highest: CGFloat = 0
+        private var farthestDown: CGFloat = 0
         private var lastTravel = CGSize.zero
         private var lastOffset: CGFloat = 0
 
@@ -685,6 +689,8 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             text = Self.scrollingText(around: view)
             text?.bouncesVertically = false
             lastTravel = .zero
+            highest = 0
+            farthestDown = 0
             lastOffset = text?.contentOffset.y ?? 0
             // A drag that starts with the text at its end is the field's from its start.
             let end = text.map { Self.end(of: $0) }
@@ -698,24 +704,37 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         }
 
         /// The field's share of `drag` (`ChatFieldDrag.fieldShare`): the drag's travel, both axes,
-        /// from the point where the text under it reached its end; none while the text can still
-        /// scroll. The hand-off is found in the first sample with the text at its end, at the point
-        /// of that sample where the text reached it (`crossing`), and dropped when the finger brings
-        /// the text back from it (a sample that moved down with the text short of its end), so a
-        /// drag that reverses into the text and reaches the end again hands off afresh. A move of
-        /// the text the finger did not make keeps the hand-off: UIKit scrolls the field's text to its
-        /// caret on a layout after the field is built again, which can happen while the finger is
-        /// down (UI run 2026-11-22), and the rest of the drag stays the field's. Off the text, all
-        /// of it. `atLetGo`: the let-go's sample (for the debug marker).
+        /// from the point where the text under it reached its end; none while the text still has
+        /// the drag (before it first reaches its end, and after the finger brings it back). The
+        /// hand-off is found in the first sample with the text at its end, at the point of that
+        /// sample where the text reached it (`crossing`), and dropped when the finger brings the
+        /// text back from it (`fingerBroughtTextBack`), so a drag that reverses into the text and
+        /// reaches the end again hands off afresh. That is read from how far the finger came down,
+        /// not from the sample's direction: the text's own scroll and this pan run side by side,
+        /// and UIKit does not say which hears a move first, so the text can show a downward move
+        /// one sample late, with the finger already going up again, or only at the let-go. A move
+        /// of the text the finger did not make keeps
+        /// the hand-off, and the rest of the drag stays the field's: seen in a UI run (2026-11-22),
+        /// UIKit scrolled the field's text to its caret on a layout after the field was built
+        /// again while the finger was down. Off the text, all of it. `atLetGo`: the let-go's
+        /// sample (for the debug marker).
         func share(_ drag: ChatHorizontalPan.Sample, atLetGo: Bool = false) -> ChatHorizontalPan.Sample {
             guard let text else { return drag }
             let end = Self.end(of: text)
             let offset = text.contentOffset.y
             let wasHandedOff = handOff != nil
+            if handOff != nil {
+                highest = min(highest, drag.travel.height)
+                farthestDown = max(farthestDown, drag.travel.height - highest)
+            }
             if !Self.isAtEnd(offset, end: end) {
-                if drag.travel.height > lastTravel.height { handOff = nil }
+                if handOff != nil, Self.fingerBroughtTextBack(short: end - offset, fingerDown: farthestDown) {
+                    handOff = nil
+                }
             } else if handOff == nil {
                 handOff = Self.crossing(from: lastTravel, textAt: lastOffset, to: drag.travel, end: end)
+                highest = drag.travel.height
+                farthestDown = 0
             }
             lastTravel = drag.travel
             lastOffset = min(offset, end)
@@ -747,6 +766,17 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             let room = min(up, max(0, end - textAt))
             return CGSize(width: last.width + (travel.width - last.width) * (room / up),
                           height: last.height - room)
+        }
+
+        /// Whether the finger brought a handed-off text back from its end: it came down
+        /// (`fingerDown`, the farthest from its highest point since the hand-off) and the text
+        /// reads `short` of its end by no more than that, within
+        /// `ChatViewLayout.fieldTextReversalSlack`. The text's own scroll follows the finger point
+        /// for point, so a text short by more than the finger came down moved without it, and a
+        /// finger that did not come down moved no text. The farthest, not where the finger is now:
+        /// a text read a sample late shows where the finger was, which may be lower than now.
+        static func fingerBroughtTextBack(short: CGFloat, fingerDown: CGFloat) -> Bool {
+            fingerDown > 0 && short <= fingerDown + ChatViewLayout.fieldTextReversalSlack
         }
 
         /// Whether the text at scroll position `offset` is at its `end`: within
