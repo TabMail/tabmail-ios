@@ -82,13 +82,23 @@ struct BackendErrorExtendedTests {
     }
 
     /// A connection-lost error's round request, with marker values in every place a
-    /// request holds text: the message, its variables and each tier's settings.
+    /// request holds text: the message, its variables, each tier's settings, and the
+    /// continuation of the earlier rounds (a tool's result and the model's thinking).
     private static func connectionLostRequest(marker: String) -> CompletionsRequest {
         let tier = BYOKTierConfig(provider: "openai", api_key: "fixture-key-\(marker)", model: "fixture-model-\(marker)")
+        let earlierRounds = ConversationState(
+            harmony_messages: [
+                HarmonyMessage(role: "assistant", content: nil, thinking: "fixture thinking \(marker)",
+                               tool_calls: nil, tool_call_id: nil),
+                HarmonyMessage(role: "tool", content: "fixture tool result \(marker)", thinking: nil,
+                               tool_calls: nil, tool_call_id: "call-\(marker)"),
+            ],
+            current_round: 2)
         return CompletionsRequest(
             messages: [CompletionsMessage(role: "user", content: "fixture prompt \(marker)",
                                           vars: ["email_body": .string("fixture body \(marker)")])],
             client_timezone: "UTC", disable_tools: nil,
+            conversation_state: earlierRounds,
             byok: BYOKConfig(background: tier, interactive: tier))
     }
 
@@ -98,8 +108,12 @@ struct BackendErrorExtendedTests {
         let error = ChatConnectionLostError(resumeRequest: Self.connectionLostRequest(marker: marker))
         // Control: the error keeps the whole request, and the request's own text holds the markers.
         let requestText = String(describing: error.resumeRequest)
-        #expect(requestText.contains("fixture-key-\(marker)") && requestText.contains("fixture prompt \(marker)"),
-                "control: the fixture's markers are in the request the error keeps")
+        let keptMarkers = ["fixture-key-\(marker)", "fixture prompt \(marker)", "fixture body \(marker)",
+                           "fixture thinking \(marker)", "fixture tool result \(marker)"]
+        for kept in keptMarkers {
+            let isKept = requestText.contains(kept)
+            #expect(isKept, "control: the request the error keeps holds \(kept)")
+        }
 
         let asError: any Error = error
         let renderings = [
