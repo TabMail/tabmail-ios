@@ -260,10 +260,12 @@ struct ChatComposeRoutingTests {
     /// `earlierEmail(tag)` in the user's other account. `waiting` is queued before the screens
     /// mount, as a request whose screen is entered again; the root's pill is then not awaited,
     /// since the card can cover it at once. `emailsOpenBeside` mounts the inbox as the expanded
-    /// split view does, where an opened email shows beside it.
+    /// split view does, where an opened email shows beside it. `inboxOpened` mounts the inbox with
+    /// the email already selected and pushed, so no take the inbox's pill works out, the one as it
+    /// first appears included, ever sees the inbox shown while that holds.
     private func withScreens(
         _ root: Root, _ backend: Backend, tag: String, chat: Bool = true, earlier: Bool = false,
-        waiting: AgentToolRouter.ComposeRequest? = nil, emailsOpenBeside: Bool = false,
+        waiting: AgentToolRouter.ComposeRequest? = nil, emailsOpenBeside: Bool = false, inboxOpened: Bool = false,
         _ body: @MainActor (Screens) async throws -> Void
     ) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -328,6 +330,10 @@ struct ChatComposeRoutingTests {
                 set: { route.chatShown = $0 != nil })
             let selected = Binding<String?>(get: { route.inboxSelected }, set: { route.inboxSelected = $0 })
             route.inboxEmailsOpenBeside = emailsOpenBeside
+            if inboxOpened {
+                route.inboxSelected = chatId
+                route.inboxNavigationSaysPushed = true
+            }
             rootView = AnyView(Stack(route: route, chatId: chatId, root: InboxRoot(
                 route: route, folder: folder, selected: selected, pushed: pushed)))
         case .email:
@@ -1160,11 +1166,15 @@ struct ChatComposeRoutingTests {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted screens")
         let backend = Backend(asksForReply: false)
         try await HostedAccessibility.withAutomation {
-            try await withScreens(.inbox, backend, tag: "nav-turns", chat: false) { screens in
+            // Collapsed, mounted with a selected and a pushed email over the inbox, so its card
+            // waits. Opened at mount rather than in the test's turn: a take the pill worked out as
+            // it first appeared, with the inbox shown, could otherwise run after the request is
+            // queued in that same turn.
+            try await withScreens(.inbox, backend, tag: "nav-turns", chat: false, inboxOpened: true) { screens in
                 let router = AgentToolRouter.shared
-                // Collapsed: a selected and a pushed email show over the inbox, so its card waits.
-                screens.route.inboxSelected = screens.email.id
-                screens.route.inboxNavigationSaysPushed = true
+                // The pushed email alone keeps the inbox hidden, whatever the list does with the
+                // selection while its rows load.
+                #expect(screens.route.inboxSaysPushed, "control: the email is pushed over the inbox")
                 router.enqueueCompose(AgentToolRouter.ComposeRequest(
                     mode: .compose, replyTo: nil, to: [Self.ownCardAddress], cc: [], bcc: [],
                     subject: "Lunch", body: "Lunch on Friday?", origin: ComposeOrigin(sessionKey: "inbox", screen: .inbox)))
