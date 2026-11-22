@@ -358,8 +358,8 @@ struct ChatReplyAttachTests {
                 try await ChatReplyRecoveryTests.waitUntil { Self.presented(UIDocumentPickerViewController.self, over: chat) != nil }
                 let picker = try #require(Self.presented(UIDocumentPickerViewController.self, over: chat), "control: the Files picker opened")
                 let delegate = try #require(picker.delegate, "the Files picker reports its pick to the chat")
-                #expect(ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view).isEmpty,
-                        "control: no card is open while the picker is")
+                let recipientsWhilePicking = ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view)
+                #expect(recipientsWhilePicking.isEmpty, "control: no card is open while the picker is")
                 switch order {
                 case .reportsThenCloses:
                     // The pick while the picker is open; the picker then closes, and only then the card opens.
