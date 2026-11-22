@@ -511,9 +511,9 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
 /// cancels the touch for the views under it (`cancelsTouchesInView`), so the field's text view
 /// never takes the let-go as a tap and takes focus; a tap does not move, never starts it, and
 /// focuses the field as before. In the focused field's overflowing text it runs alongside the
-/// text's scroll and hands on only the field's share of the drag (`Coordinator.share`): none while
-/// the text can still scroll, the rest of the same drag once the text has reached its end (mock
-/// v15 H2). That text never bounces vertically (`Coordinator.touchDown`), so past its end it stays
+/// text's scroll and hands on only the field's share of the drag (`Coordinator.share`): none until
+/// the text first reaches its end, the rest of the same drag from there (mock v15 H2), and none
+/// again once the finger takes the drag back into the text. That text never bounces vertically (`Coordinator.touchDown`), so past its end it stays
 /// at its end while the field swells.
 struct ChatFieldPan: UIGestureRecognizerRepresentable {
     /// Off over the open panel and in the tutorial, so no new drag starts there. UIKit cancels an
@@ -662,8 +662,9 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         }
 
         /// The text the drag's first touch landed in, and the drag's travel, both axes, where the
-        /// text last reached its end (nil until it does, and again once the finger brings it back
-        /// from its end): the field's share counts from that one point. The drag's highest travel
+        /// text last reached its end (nil until it does, and again once the text reads short of its
+        /// end after the finger came back down, `share`): the field's share counts from that one
+        /// point. The drag's highest travel
         /// since then, and the farthest the finger has come back down from it. The previous
         /// sample's travel and the text's place then, to find where in the next sample the text
         /// reached its end.

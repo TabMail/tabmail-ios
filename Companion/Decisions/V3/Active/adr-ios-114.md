@@ -1406,7 +1406,7 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    let-go; `handOffFoundOnAMoveDownCountsThatMove` a reversal in the very sample the text first shows
    its end; `reversalHistoryEndsWithItsHandOff` each hand-off reading only its own reversal, after a
    second crossing and in the next drag; `reversalSlack` the rule's own boundary and `reversalSlackThroughThePan` the same boundary through the
-   pan's share, speed included; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
+   pan's share, speed included; `slowReversalAddsUp` a descent in half-point samples adding up past it; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
    floating-point remainder; `handOffInsideACrossingSample` and
    `handOffInsideACrossingSampleAfterAReversal` the hand-off inside a sample that crosses the end, where
    the text reached it; `upwardShareCountsFromTheSecondHandOff` the upward share after a reversal,
