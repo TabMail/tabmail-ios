@@ -1704,10 +1704,15 @@ extension SyncEngine {
                 switch windowMode {
                 case .uid:
                     // messageId is a numeric IMAP UID; CAST avoids a lexicographic compare.
+                    // At most `staleDetectionMaxFullScan` rows, newest first: after another
+                    // client deletes thousands of a folder's newest messages, the window up to
+                    // UIDNEXT - 1 can hold that many rows, and one write loads and removes no
+                    // more than the whole-folder branch may. The rest stay (fail closed) and the
+                    // next listing judges them.
                     if let (floorUID, ceilingUID) = Self.windowedSweepUIDBounds(fetched: messages, coverage: effectiveCoverage) {
                         candidates = try MessageHeader.fetchAll(db, sql:
-                            "SELECT * FROM messageHeader WHERE folderId = ? AND CAST(messageId AS INTEGER) BETWEEN ? AND ?",
-                            arguments: [folderId, floorUID, ceilingUID])
+                            "SELECT * FROM messageHeader WHERE folderId = ? AND CAST(messageId AS INTEGER) BETWEEN ? AND ? ORDER BY CAST(messageId AS INTEGER) DESC LIMIT ?",
+                            arguments: [folderId, floorUID, ceilingUID, SyncConfig.staleDetectionMaxFullScan])
                     } else {
                         candidates = []  // no parseable UID floor → delete nothing (safe)
                     }

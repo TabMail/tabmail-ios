@@ -173,6 +173,8 @@ enum SyncConfig {
     /// writer — so above this count we fall through to the windowed slice instead
     /// (which can't conclude anything outside its floor). Generous on purpose; only
     /// pathologically large folders (Gmail All Mail / big Archives) trip it.
+    /// The windowed IMAP slice loads at most this many rows too, newest UID first, so a
+    /// window reaching UIDNEXT - 1 after a mass deletion elsewhere stays bounded (#1184).
     ///
     /// 🚨 **This is a MEMORY bound, and it was never the safety bound.** The branch it
     /// gates used to trip on `messages.count < syncMessageLimit` — a count taken AFTER

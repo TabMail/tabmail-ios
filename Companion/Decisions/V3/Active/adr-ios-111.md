@@ -1045,14 +1045,28 @@ SELECT and is not in the listing's window, which reaches the folder's newest mes
 returned every record that window holds, so such a UID is a message the server no longer holds. A record
 the client could not parse stays present (`unmaterialisedIds`).
 
+**The load stays bounded.** After another client deletes thousands of a folder's newest messages, the
+window up to UIDNEXT - 1 can hold that many rows. The windowed slice therefore loads at most
+`SyncConfig.staleDetectionMaxFullScan` rows, newest UID first, the same bound the whole-folder branch has;
+the rows past it stay (fail closed) and the next listing judges them.
+
+**Accepted residual.** The window reaches the folder's newest message because the listing FETCHes the
+highest sequence numbers its SELECT's EXISTS counted, and sequence numbers ascend with UIDs. A server whose
+EXISTS undercounted the mailbox while reporting a correct UIDNEXT would have its uncounted newest messages
+removed from the device; a later listing with a correct EXISTS fetches them again. No server is known to
+answer this way, and nothing on the server is touched.
+
 Tests: `ListingCountersTests.provenWindowHoldsExactlyTheServersMessagesUpToUidNext` (red with the old
 ceiling: the newest message, deleted after a proven listing, survived the next full sync);
 `StaleDetectionWindowTests.uidWindowStillDeletesGenuinelyStale` (the harness now carries the listing's
 UIDNEXT); `ListingCountersTests.overlappingWindowedListingKeepsAnArrivalAboveItsWindow` and
-`SyncEngineRunSyncTests.rowAboveOwnUidNextSurvivesBothSweepBranches` keep pinning the #755 protection.
+`SyncEngineRunSyncTests.rowAboveOwnUidNextSurvivesBothSweepBranches` keep pinning the #755 protection;
+`ListingCountersTests.massDeletionSweepIsBoundedAndConverges` (the bound, newest first, rows below the
+window kept, convergence on the next listing); `ListingCountersTests.noUidNextBoundsTheWindowedSweep` (with
+no UIDNEXT a windowed listing stops at the highest UID it fetched).
 
 Keywords: windowedSweepUIDBounds, stale sweep ceiling, UIDNEXT - 1, highest fetched UID, deleted newest
-message, windowed listing, #1184, #755, #997.
+message, windowed listing, staleDetectionMaxFullScan, mass deletion, EXISTS undercount, #1184, #755, #997.
 
 ### Amendment 2026-11-20 (#1062): the owed check is the catch-up's UID listing
 
