@@ -1047,8 +1047,19 @@ the client could not parse stays present (`unmaterialisedIds`).
 
 **The load stays bounded.** After another client deletes thousands of a folder's newest messages, the
 window up to UIDNEXT - 1 can hold that many rows. The windowed slice therefore loads at most
-`SyncConfig.staleDetectionMaxFullScan` rows, newest UID first, the same bound the whole-folder branch has;
-the rows past it stay (fail closed) and the next listing judges them.
+`SyncConfig.staleDetectionMaxFullScan` rows, newest UID first (numerically), the same bound the
+whole-folder branch has; the rows past it stay (fail closed). The next listing judges those that are still
+inside its own window, which reaches from its lowest fetched UID up, so a clipped row stays in reach until
+`syncMessageLimit` newer messages have arrived on the server above it. A clipped row that a later window's
+floor has passed is a row below the window (IOS-IMAP-008): the ADR-IOS-051 count walk removes it when the
+device holds more rows than the server, and the whole-folder branch once the device holds at most the bound.
+Reaching that case takes more than `staleDetectionMaxFullScan` deletions in the folder's newest messages and
+`syncMessageLimit` arrivals before the next listing. On a partly mirrored folder the count walk does not fire,
+so such a row can stay, as any row below the window can (IOS-IMAP-008), until the catch-up's UID check finds
+it gone where that check runs, or the folder becomes small enough for the whole-folder branch; a row still
+flagged `\Deleted` (one the clipped listing saw) is first left until it is expunged. Ordering the slice upwards
+instead would keep the window's own rows first but leave the folder's newest deleted messages, the ones the
+user sees at the top of the list, for later listings; the newest-first order is kept on purpose.
 
 **Accepted residual.** The window reaches the folder's newest message because the listing FETCHes the
 highest sequence numbers its SELECT's EXISTS counted, and sequence numbers ascend with UIDs. A server whose
@@ -1056,17 +1067,33 @@ EXISTS undercounted the mailbox while reporting a correct UIDNEXT would have its
 removed from the device; a later listing with a correct EXISTS fetches them again. No server is known to
 answer this way, and nothing on the server is touched.
 
+**The widened band is judged as the window always was.** The rows between the highest fetched UID and
+UIDNEXT - 1 go through the same `selectStaleHeaders`, RFC remap and stale protections as every other row of
+the window; this amendment adds no new rule for them. Two consequences are the window's own, unchanged:
+- A stale row whose RFC Message-ID matches an incoming record the device does not hold is rekeyed onto it
+  (Memory 023) before `staleFiltered` applies the pending and recent protections, as inside the old window.
+  The codebase treats one RFC Message-ID as one message's content (the two-layer keying; full-text search is
+  keyed by it), so the rekeyed row carries the same message; its flags and labels follow the server on the
+  next merge. An optimistically moved row (IOS-MOVE-002) is protected from deletion by its pending move,
+  and its move drains by its source address either way.
+- A row is judged by the listing's epoch, not its own (IOS-EPOCH-002): a nil row epoch, or a SELECT without
+  UIDVALIDITY (a server declaring no UID support, RFC 3501 §2.3.1.1), is treated inside the band as inside
+  the old window. Narrowing either for the band alone would make one window follow two rules.
+
 Tests: `ListingCountersTests.provenWindowHoldsExactlyTheServersMessagesUpToUidNext` (red with the old
 ceiling: the newest message, deleted after a proven listing, survived the next full sync);
 `StaleDetectionWindowTests.uidWindowStillDeletesGenuinelyStale` (the harness now carries the listing's
 UIDNEXT); `ListingCountersTests.overlappingWindowedListingKeepsAnArrivalAboveItsWindow` and
 `SyncEngineRunSyncTests.rowAboveOwnUidNextSurvivesBothSweepBranches` keep pinning the #755 protection;
-`ListingCountersTests.massDeletionSweepIsBoundedAndConverges` (the bound, newest first, rows below the
-window kept, convergence on the next listing); `ListingCountersTests.noUidNextBoundsTheWindowedSweep` (with
+`ListingCountersTests.massDeletionSweepIsBoundedAndConverges` (each windowed listing judges exactly the
+newest `staleDetectionMaxFullScan` rows of its window by numeric UID; the next windowed listing, after an
+arrival, continues where it stopped; rows below the window kept; convergence once the device holds at most
+the bound); `ListingCountersTests.noUidNextBoundsTheWindowedSweep` (with
 no UIDNEXT a windowed listing stops at the highest UID it fetched).
 
 Keywords: windowedSweepUIDBounds, stale sweep ceiling, UIDNEXT - 1, highest fetched UID, deleted newest
-message, windowed listing, staleDetectionMaxFullScan, mass deletion, EXISTS undercount, #1184, #755, #997.
+message, windowed listing, staleDetectionMaxFullScan, mass deletion, clipped rows, newest first, RFC remap,
+row epoch, EXISTS undercount, #1184, #755, #997.
 
 ### Amendment 2026-11-20 (#1062): the owed check is the catch-up's UID listing
 
