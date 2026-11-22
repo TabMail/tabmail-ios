@@ -915,6 +915,15 @@ struct ChatReplyFieldTests {
             #expect(Self.count(debugOnly, in: release) == 0, "\(debugOnly) is in debug builds only")
             #expect(Self.count(debugOnly, in: tips) > 0, "control: \(debugOnly) is in the debug build")
         }
+        #expect(Self.count("Tips.configure(", in: release) == 2, "a release build compiles the screenshot and everyday branches only")
+        // A release launch reaches it: init calls it outside every conditional block. (Counted
+        // in init, not by `releaseView` over the file: a comment there names `#if DEBUG`.)
+        let launch = try #require(app.range(of: " init() {"))
+        let call = try #require(app[launch.upperBound...].range(of: "Self.configureTips()"))
+        let beforeCall = String(app[launch.upperBound..<call.lowerBound])
+        let opened = Self.count("#if ", in: beforeCall)
+        let closed = Self.count("#endif", in: beforeCall)
+        #expect(opened == closed, "a release launch configures TipKit")
     }
 
     @Test("The drag is the UIKit field pan; its swell resets with the pill's spring however it ends; it holds the freeze once per drag")
