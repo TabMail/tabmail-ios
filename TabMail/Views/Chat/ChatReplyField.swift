@@ -277,17 +277,25 @@ struct ChatReplyCompose: Equatable {
         ChatReplyCompose(isReplyAll: false, to: people, cc: [], bcc: [], subject: ThreadUtils.replySubject(for: message.subject))
     }
 
-    /// The envelope with `recipients` and `subject`, exactly: the card shows these fields as they are.
-    /// Its kind follows the final audience: a Reply All only while the recipients (To, Cc and Bcc)
-    /// still hold this envelope's whole Reply All audience (its To and Cc), people added included;
-    /// narrowed, even to one person, it is a plain reply, so the send records a reply on the original.
+    /// The envelope with `recipients` and `subject`, exactly: the card shows these fields as they are,
+    /// each recipient under the name its field holds for it (keyed by the address as the field
+    /// stores it, in any case). Its kind follows the final audience: a Reply All only while the
+    /// recipients (To, Cc and Bcc) still hold this envelope's whole Reply All audience (its To and
+    /// Cc), people added included; narrowed, even to one person, it is a plain reply, so the send
+    /// records a reply on the original. Both sides are read as compose reads its fields: each
+    /// mailbox as its address, and an entry that names no sendable address (a Reply-To's
+    /// `undisclosed-recipients:;`) as the text written, in any case; leaving that entry out
+    /// narrows the audience too.
     func with(recipients: ComposeDraftGuards.Recipients, subject: String) -> ChatReplyCompose {
         func texts(_ field: ComposeDraftGuards.RecipientField) -> [String] {
-            field.tokens.map { RecipientEntry.text(name: field.displayNames[$0.lowercased()], address: $0) }
-                + field.rejected
+            field.tokens.map {
+                RecipientEntry.text(name: field.displayNames[$0] ?? field.displayNames[$0.lowercased()], address: $0)
+            } + field.rejected
         }
-        let final = Set((recipients.to.tokens + recipients.cc.tokens + recipients.bcc.tokens).map { $0.lowercased() })
-        let audience = Set(RecipientEntry(to + cc).addresses.map { $0.lowercased() })
+        let fields = [recipients.to, recipients.cc, recipients.bcc]
+        let final = Set(fields.flatMap { $0.tokens + $0.rejected }.map { $0.lowercased() })
+        let start = RecipientEntry(to + cc)
+        let audience = Set((start.addresses + start.leftovers).map { $0.lowercased() })
         return ChatReplyCompose(
             isReplyAll: isReplyAll && final.isSuperset(of: audience),
             to: texts(recipients.to), cc: texts(recipients.cc), bcc: texts(recipients.bcc), subject: subject)

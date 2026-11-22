@@ -26,7 +26,7 @@ import Testing
 ///     in the field are Reply All to everyone and a plain reply to the people chosen; a reply the
 ///     agent writes in the open sheet keeps its recipients and is Reply All only when they are the
 ///     whole Reply All audience, compared by address (a mailbox the agent names counts as its
-///     address).
+///     address, in any case; an entry that names no address counts as the text written).
 ///  7. VoiceOver reads who an email went to when it was not everyone.
 ///  8. The field shows the user's words and nothing else, collapsed or in the open sheet: words
 ///     typed or said are never replaced, and a completion empties only the words that were sent.
@@ -617,6 +617,8 @@ struct ChatReplyFieldTests {
         // The ghost is only ever the suggestion the chat shows; the row's rule adds the working bubble alone.
         #expect(Self.count("if let text = shown?.textMessage { return .ready(text) }", in: text) == 1)
         #expect(Self.count("return phase == .writing ? .writing : nil", in: text) == 1)
+        #expect(Self.count("suggestionPhase(on: $0, shown: shown, thread: thread)", in: text) == 1,
+                "the row's phase takes the suggestion the chat shows, whichever card is open")
         #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1,
                 "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
@@ -852,7 +854,8 @@ struct ChatReplyFieldTests {
             let compose = Self.card(agent: moved, accounts: accounts)
             #expect(compose.isReplyAll, "everyone in the Reply All audience is on it, one of them by name in Cc: Reply All")
             #expect(compose.prefillTo == ["sender@example.com"], "the card keeps the To the agent chose")
-            #expect(compose.prefillCc == moved.cc && compose.prefillBcc == nil, "the card keeps the agent's Cc as written")
+            #expect(compose.prefillCc == moved.cc && compose.prefillBcc == moved.bcc,
+                    "the card keeps the agent's Cc as written, and its empty Bcc exactly")
             let cardCc = RecipientEntry(compose.prefillCc ?? []).recipients
             #expect(cardCc == expectedCc, "the card's Cc is team@example.com, under its name")
         }
@@ -867,6 +870,38 @@ struct ChatReplyFieldTests {
         #expect(!fewer.isReplyAll, "someone of the audience left out, another named instead: a plain reply")
         #expect(fewer.prefillTo == ["sender@example.com"] && fewer.prefillCc == narrowed.cc,
                 "the card goes to the agent's recipients only")
+    }
+
+    /// A Reply-To entry that names no sendable address (`undisclosed-recipients:;`) is part of the
+    /// Reply All audience as the text written: the card keeps it, so leaving it out narrows the
+    /// audience as leaving out a person does, and keeping it in another case does not.
+    @Test("An audience entry that names no address counts as its text: left out it is a plain reply, kept in any case it is Reply All")
+    func audienceEntryWithNoAddressCountsAsItsText() {
+        var email = Self.header("n1")
+        email.replyTo = "Alex Doe <alex@example.com>, undisclosed-recipients:;"
+        email.to = "me@example.com, david@example.com"
+        email.cc = "sam@example.com"
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: email, accounts: [Self.me])
+        #expect(envelope.to == ["alex@example.com", "undisclosed-recipients:;", "david@example.com"] && envelope.cc == ["sam@example.com"],
+                "control: the audience holds the entry as written, beside the addresses")
+        let unchanged = envelope.with(recipients: envelope.recipients, subject: envelope.subject)
+        #expect(unchanged.isReplyAll, "control: the whole audience, unchanged, is Reply All")
+
+        let addressesOnly = envelope.recipients.filling(to: RecipientEntry(["alex@example.com", "david@example.com"]))
+        #expect(addressesOnly.to.tokens == ["alex@example.com", "david@example.com"] && addressesOnly.to.rejected.isEmpty,
+                "control: every address kept, the entry left out")
+        let withoutEntry = envelope.with(recipients: addressesOnly, subject: envelope.subject)
+        #expect(!withoutEntry.isReplyAll, "the entry that names no address left out: the audience narrowed, a plain reply")
+
+        let otherCase = envelope.recipients.filling(
+            to: RecipientEntry(["alex@example.com", "UNDISCLOSED-RECIPIENTS:;", "david@example.com"]))
+        #expect(otherCase.to.rejected == ["UNDISCLOSED-RECIPIENTS:;"], "control: the entry kept, written in another case")
+        let entryInOtherCase = envelope.with(recipients: otherCase, subject: envelope.subject)
+        #expect(entryInOtherCase.isReplyAll, "the whole audience kept, the entry in another case: Reply All")
+
+        let davidLeftOut = envelope.recipients.filling(to: RecipientEntry(["alex@example.com", "undisclosed-recipients:;"]))
+        let withoutDavid = envelope.with(recipients: davidLeftOut, subject: envelope.subject)
+        #expect(!withoutDavid.isReplyAll, "a person left out, the entry kept: a plain reply")
     }
 
     @Test("A reply the agent writes in the open sheet keeps its recipients, and is Reply All only to the whole audience")

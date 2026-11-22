@@ -546,14 +546,17 @@ same AI result, kept as long as the email itself is shown.
    Outlook's own apps record; the kind drives the Outlook last-verb marker on the original. A reply
    that drops anyone in the audience stays a plain reply; from the open sheet the agent must also have
    opened it as a Reply All, as before. Before this, a reply the agent widened was a plain reply.
-   `ChatReplyCompose.make` checks containment once for every agent reply. Tests:
+   `ChatReplyCompose.make` checks containment once for every agent reply (since decision 18,
+   `ChatReplyCompose.with`; `make` is gone). Tests:
    `ChatReplyFieldTests.agentReplyThatAddsPeopleIsStillReplyAll`,
    `agentReplyFromTheFieldFollowsTheTarget`, `agentReplyFromTheSheetKeepsItsRecipients`.
    **Who a field reply is for travels with its request (2026-11-16, current):** whether a reply was
    asked for in the field, and who was chosen in Reply to, are read once, as the field's send
    starts, and travel with the request (`ChatFieldReply`: `ToolInvocation.fieldReply`, stamped on
    the `ComposeRequest` by the reply tool only for a reply to the email the field replies to). The
-   agent's compose card is read from its request alone (`ChatReplyCompose.make(agent:)`): with
+   agent's compose card is read from its request alone (`ChatReplyCompose.make(agent:)`; since
+   decision 18, the reply tool's start envelope, `ChatReplyCompose.suggestionEnvelope` or
+   `onlyTo`, through `ChatReplyCompose.with`, and one presenter): with
    people chosen when it was sent, a plain reply to only them; otherwise the agent's recipients,
    under the containment rule above. The chat that shows the card decides nothing from its own state
    at that moment. Before this, the chat replaced any agent reply's recipients with its current
@@ -948,13 +951,15 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `chatSuggestionText`; `ChatViewLayout.suggestionStrokeWidth`, `suggestionDash`), with "AI
    Suggestion · Tap to use" under it. The name is "AI Suggestion", the one compose's suggestion box
    uses (`ChatSuggestionConfig.label`); "AI Reply" is gone from the chat view's strings. Its text is
-   the reply's text message, read from the email's row (`ChatReplyField.suggestionText`), so a new
+   the reply's text message, read from the email's row (`ChatReplyField.suggestionText`; since
+   decision 18, the one shown value `ChatReplyField.shown`), so a new
    text message there rewrites the ghost in place, with no second copy. None shows on the user's
    turn, for a no-reply sender, or while the reply goes only to people chosen in Reply to (the
    suggestion was written for everyone; the field has the agent write one for them).
    - **Tap** (the bubble or its caption, one button): opens today's Reply All compose card with the
      full reply in its suggestion box, as Send did (`ChatThreadView.openSuggestion`,
-     `ChatReplyCompose.make(replyAllTo:)`); Send there sends and the Sent bubble replaces the ghost,
+     `ChatReplyCompose.make(replyAllTo:)`; since decision 18, `ChatReadyReply` with
+     `ChatReplyCompose.suggestionEnvelope`); Send there sends and the Sent bubble replaces the ghost,
      and the field's words stay (the card is not a send from the field); Close goes back with the
      ghost still there. An edit or a Recompute in the card that is stored on the row posts
      `.messageDataDidChange`, so the ghost shows the stored change once the card closes (the
@@ -1154,6 +1159,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
     - **The kind follows the final audience.** A reply card is Reply All only while its To, Cc and Bcc
       still hold the whole Reply All audience (people added included); narrowed, even to one person,
       it is a plain reply, so the send records a reply on the original (`ChatReplyCompose.with`).
+      Both sides are read as compose reads its fields: each mailbox as its address, and an entry that
+      names no sendable address (a Reply-To's `undisclosed-recipients:;`) as the text written, in any
+      case, so leaving that entry out narrows the audience too.
       The reply tool derives one start envelope (`ChatReplyCompose.suggestionEnvelope` with the call's
       recipient changes, or `onlyTo` for people chosen in the field) and uses it for both the model's
       context and the card; the subject is the edit's when it writes one, else the start's.

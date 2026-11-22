@@ -338,6 +338,38 @@ struct ComposeEditRecipientRolesTests {
         #expect(Self.cardNames(captured.bcc) == [Self.blind: "Lee Park"])
     }
 
+    /// The field keeps an added address as it was written, and its name under that address: the
+    /// name is read back under the address in the same case, so a mixed-case address keeps it.
+    @Test("email_reply: a named addition written in mixed case keeps its name in the edit request and on the card")
+    func replyKeepsMixedCaseAddedNames() async throws {
+        let (ctx, db, translator, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "rep4", subject: "Offsite",
+            from: Self.primary, fromAddress: Self.primary,
+            to: "test@example.com"
+        )
+        await translator.seed(header.id, as: 16)
+
+        let mixedCase = "Kim@example.com"
+        let tool = EmailReplyTool(context: ctx)
+        let captured = try await captureEditAndRequest(router: router) {
+            try await tool.execute(arguments: [
+                "unique_id": .int(16),
+                "add_cc": .array([.dictionary(["name": .string("Kim Cho"), "email": .string(mixedCase)])]),
+                "request": .string("Say Friday works"),
+            ])
+        }
+        let contexts = captured.contexts
+        #expect(contexts.count == 1)
+        guard contexts.count == 1 else { return }
+        #expect(contexts[0].ccRecipients == [mixedCase], "control: the Cc holds the address as it was written")
+        #expect(contexts[0].ccDisplayNames[mixedCase] == "Kim Cho")
+        let cardCc = Self.cardNames(captured.cc)
+        #expect(cardCc[mixedCase] == "Kim Cho")
+    }
+
     @Test("email_reply: adding the original sender by name keeps one To recipient")
     func replyAddingSenderByNameKeepsOneTo() async throws {
         let (ctx, db, translator, router) = try makeContext()
