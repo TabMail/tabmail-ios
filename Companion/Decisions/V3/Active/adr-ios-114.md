@@ -1610,12 +1610,16 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        or while a preview is up (`PreviewFreezeGate`); one check, `ChatNewEmailCover.composeOrPreviewIsUp`,
        in all three screens (review ruling 2026-11-22). A preview counts from the moment its
        attachment starts downloading, so a request that comes during a slow download is not taken
-       either. Popovers and sheets a screen's own parts show are not counted (the AI summaries
-       notice and its report sheet, menus, alerts, a chat's email card, the attached-email sheet):
-       a request from outside the app while one is up is taken by the screen under it, and UIKit
-       may refuse its cover; that screen then takes no other request until it is left. The same
-       holds for an email an email pill pushes beneath a chat's email card, whose screen and the
-       chat may then both take one (ios#1259, P4). An agent's compose released as a cover closes
+       either. The attached-email sheet and a chat's swipe (with its settle hold) hold the same
+       freeze, so they count as previews: no screen takes a request while one is up, a `mailto:`
+       inside the attached email included. Popovers and sheets a screen's own parts show are not
+       counted (the AI summaries notice and its report sheet, menus, alerts, a chat's email card),
+       nor are the sheets and covers the navigation's root presents (templates, sign-in, the trial
+       feedback sheet, the tutorial's sheets and replay cover): a request from outside the app
+       while one is up is taken by the screen under it, and UIKit may refuse its cover; that
+       screen then takes no other request until it is left. The same holds for an email an email
+       pill pushes beneath a chat's email card, whose screen and the chat may then both take one
+       (ios#1259, P4). An agent's compose released as a cover closes
        goes to whichever screen observes it first (ADR-IOS-030's one global slot, ios#1172).
      - *The agent's compose waits for it.* The new email's chat cover keeps ADR-IOS-030's
        presentation count while it is up, as `DraftComposePresenter` does for a draft's chat, so an
