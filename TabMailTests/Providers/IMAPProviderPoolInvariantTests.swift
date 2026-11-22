@@ -2433,14 +2433,36 @@ struct IMAPProviderPoolInvariantTests {
             // THE EVENT.
             await provider.markDirty()
         case .launchConnecting:
+            // The first launch's connection (created before its pre-claim
+            // window), so the case can require a DIFFERENT connection after.
+            let firstLaunch = Mutex<IMAPServer?>(nil)
+            provider.setServerCreatedTestHookForTesting { created, site in
+                guard site == "idleLaunch" else { return }
+                firstLaunch.withLock { if $0 == nil { $0 = created } }
+            }
             let entries = Mutex(0)
+            let markedInWindow = Mutex(false)
             await provider.setIdleLaunchPlantRaceTestHookForTesting { [provider] in
                 let first = entries.withLock { (n: inout Int) -> Bool in n += 1; return n == 1 }
                 // THE EVENT, inside the first launch's pre-claim window; the
                 // successor's own launch passes straight through.
-                if first { await provider.markDirty() }
+                if first {
+                    await provider.markDirty()
+                    markedInWindow.withLock { $0 = true }
+                }
             }
             await provider.startIdle { _, _ in }
+            let reached = await waitUntil { markedInWindow.withLock { $0 } }
+            #expect(reached, "setup: markDirty() never ran inside the first launch's pre-claim window")
+            ended = firstLaunch.withLock { $0 }
+            let captured = ended != nil
+            #expect(captured, "setup: the first IDLE launch's connection was never created")
+            guard reached, captured else {
+                provider.setServerCreatedTestHookForTesting(nil)
+                await provider.setIdleLaunchPlantRaceTestHookForTesting(nil)
+                await provider.stopIdle()
+                return
+            }
         }
 
         if window == .stopped {
@@ -2462,6 +2484,7 @@ struct IMAPProviderPoolInvariantTests {
             #expect(resumed, "IDLE stayed off after markDirty() while it was wanted (\(window.rawValue)): \(idleCommands()) IDLE command(s), tracked=\(tracked)")
         }
         await provider.setIdleLaunchPlantRaceTestHookForTesting(nil)
+        provider.setServerCreatedTestHookForTesting(nil)
 
         // Every connection markDirty() ended (the live session, or the
         // cancelled launch's surplus connection) is logged out exactly once.
