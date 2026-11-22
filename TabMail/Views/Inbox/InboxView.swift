@@ -233,6 +233,19 @@ struct InboxView: View {
     @Environment(\.syncNow) private var syncNowEnv
 
     private var isInboxView: Bool { folders.contains { $0.role == .inbox } }
+    /// The inbox is on screen as its navigation says: no email is pushed over it. Its pill takes
+    /// the inbox chat's compose cards only then (ADR-IOS-053 Phase 2). Read from the pushed-email
+    /// bindings, not the page's appearance callbacks, which fire a disappear right after the page
+    /// appears in the collapsed split view and none when an email is pushed (ADR-IOS-054).
+    private var composeHostShown: Bool { selectedMessageId == nil && pushedMessageId == nil }
+    /// One of the inbox's own sheets, covers or alerts is up: its pill takes no compose card until
+    /// it closes, so a card never opens under it.
+    private var isAnyPresentation: Bool {
+        showSearch || labelMenuMessage != nil || showLabelFilterPicker
+            || moveMessageId != nil || moveThreadGroup != nil
+            || replyMessage != nil || draftOpen != nil || agentCompose != nil
+            || contactComposeRequest != nil || viewModel.showCompose || showUndoAlert
+    }
     @State private var contactComposeRequest: MailtoRequest?
     private var contactComposePresented: Binding<Bool> {
         Binding(
@@ -642,7 +655,8 @@ struct InboxView: View {
                 if !DemoModeStore.shared.hidesAIContent {
                     DynamicIslandChat(isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
                         showAgentToast(text, sessionKey: "inbox")
-                    }, onAgentCompose: { agentCompose = $0 })
+                    }, onAgentCompose: { agentCompose = $0 },
+                    composeHostCovered: isAnyPresentation, composeHostShown: composeHostShown)
                 }
 
                 if !chatExpanded && sideButtonsReady {

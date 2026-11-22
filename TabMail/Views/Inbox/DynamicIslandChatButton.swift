@@ -64,8 +64,14 @@ struct DynamicIslandChat: View {
     /// The host's own sheet or cover is up over the pill: it takes no compose card until that
     /// closes, so a card never opens under it.
     let composeHostCovered: Bool
-    /// The pill is on screen, so its host can present the compose cards its chat asked for.
-    @State private var composeHostShown = false
+    /// Whether the host is on screen, as the host's own navigation state says. The inbox supplies
+    /// it: in the collapsed split view its page gets a disappear right after it appears while it
+    /// stays visible, and no disappear when an email is pushed over it (ADR-IOS-054), so its
+    /// appearance callbacks cannot say whether it shows. Nil: the pill's own appearance says
+    /// (`composeHostAppeared`), as for a pushed screen (the chat view, the email screen).
+    let composeHostShown: Bool?
+    /// The pill has appeared and not disappeared since.
+    @State private var composeHostAppeared = false
     @Environment(\.hasTabMailSession) var hasTabMailSession
     /// Reply field: the words sent to the agent, shown pulsing while it works.
     @State var fieldSentText: String?
@@ -146,8 +152,9 @@ struct DynamicIslandChat: View {
     }
     /// Where a compose card a turn asks for opens, and the account a new email it asks for is
     /// sent from, read as the turn starts. A turn carrying the reply field's send belongs to the
-    /// chat view, where the field and the choice it carries live, even when it is retried or
-    /// resumed from another screen of the thread.
+    /// chat view, where the field and the choice it carries live, even when it is retried from
+    /// another screen of the thread. A resume reuses the origin its turn started with
+    /// (`PendingResume.origin`).
     private func composeOrigin(sessionKey: String, fieldReply: ChatFieldReply?) -> ComposeOrigin? {
         guard let screen = composeScreen else { return nil }
         return ComposeOrigin(sessionKey: sessionKey, screen: fieldReply != nil ? .chat : screen,
@@ -161,7 +168,7 @@ struct DynamicIslandChat: View {
         let host: AgentToolRouter.ComposeHost?
     }
     private var composeTakeWatch: ComposeTakeWatch {
-        let host = composeHostShown && !composeHostCovered
+        let host = (composeHostShown ?? composeHostAppeared) && !composeHostCovered
             ? composeScreen.map { AgentToolRouter.ComposeHost(screen: $0, sessionKeys: chatKeys) } : nil
         return ComposeTakeWatch(offer: AgentToolRouter.shared.composeOffer, host: host)
     }
@@ -300,7 +307,8 @@ struct DynamicIslandChat: View {
         onFieldSend: ((String) -> Void)? = nil,
         onAgentCompose: ((AgentToolRouter.ComposeRequest) -> Void)? = nil,
         composeFromAccountId: String? = nil,
-        composeHostCovered: Bool = false
+        composeHostCovered: Bool = false,
+        composeHostShown: Bool? = nil
     ) {
         self.message = message
         self.draftSubject = draftSubject
@@ -328,6 +336,7 @@ struct DynamicIslandChat: View {
         self.onAgentCompose = onAgentCompose
         self.composeFromAccountId = composeFromAccountId
         self.composeHostCovered = composeHostCovered
+        self.composeHostShown = composeHostShown
     }
 
     /// Max expanded height as fraction of screen height.
@@ -792,7 +801,7 @@ struct DynamicIslandChat: View {
             }
         }
         .onAppear {
-            composeHostShown = true
+            composeHostAppeared = true
             // Sync isWorking with ActiveAgentTracker on view (re)appearance.
             // .onChange only fires on CHANGES — if the agent started/finished while
             // this view was off-screen, isWorking would be stale.
@@ -805,7 +814,7 @@ struct DynamicIslandChat: View {
             }
         }
         .onDisappear {
-            composeHostShown = false
+            composeHostAppeared = false
             // Recording must never outlive its UI: if this pill vanishes while
             // dictating (host view dismissed/torn down), stop the mic and cancel
             // any pending auto-restart so it can't re-arm after removal
@@ -2634,7 +2643,7 @@ struct DynamicIslandChat: View {
                     // no `lastFailedSend` (that's the separate fork/resend pathway). The field's
                     // request goes with it, for the resumed turn's tools.
                     BackgroundSyncLogger.logChatError("Connection lost (resumable): \(error.localizedDescription)", userMessage: text)
-                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply)
+                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply, origin: origin)
                 } else {
                     // Connection/server error — enable retry
                     BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: text)
@@ -2693,8 +2702,9 @@ struct DynamicIslandChat: View {
         // Captured with the session id: a demo turn is written only while its demo runs.
         let admission = DemoModeStore.shared.chatAdmission
         let capturedSessionKey = sessionKey
-        // The screen resuming the turn (the chat, for the field's request), where a compose card opens.
-        let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: resume.fieldReply)
+        // The screen that asked when the turn was sent, and the account bound then: a resume
+        // continues that turn, from whichever screen of the thread resumes it.
+        let origin = resume.origin
 
         activeChatTask = Task {
             do {
@@ -2766,7 +2776,7 @@ struct DynamicIslandChat: View {
                 } else if let resumable = error as? ChatConnectionLostError {
                     // Cut off again — keep the affordance armed with the latest checkpoint.
                     BackgroundSyncLogger.logChatError("Connection lost again (resumable)", userMessage: "(resumed)")
-                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply)
+                    pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply, origin: resume.origin)
                 } else {
                     // Non-transient failure — surface it; the user's message still has
                     // the fork/resend context menu for a fresh attempt.

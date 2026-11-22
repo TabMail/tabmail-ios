@@ -171,6 +171,10 @@ final class AgentToolRouter {
     /// while the request waited for its screen.
     static let removedAccountReason = "the email account was removed before the compose window opened"
 
+    /// What a compose tool tells the model when the account its new email was bound to send from
+    /// is not among the app's accounts as its screen takes the card.
+    static let fromAccountMissingReason = "the email account to send from was not found when the compose window opened"
+
     init(isAccountRemoved: @escaping @Sendable (String) -> Bool = { AccountManager.shared.isRuntimeRemoved($0) }) {
         self.isAccountRemoved = isAccountRemoved
     }
@@ -206,10 +210,18 @@ final class AgentToolRouter {
     /// `.failed(removedAccountReason)` and nothing opens. Scheduled by `disconnectAccount` right
     /// after it sets the fence, which refuses every later request (`enqueueCompose`) and every
     /// take (`takeCompose(for:)`) in between.
+    ///
+    /// Each request is read against the fence once: another removal can set the fence while this
+    /// runs (the fence is set on the AccountManager actor), and a request it catches is removed
+    /// only together with its outcome, here or in the next drain, never without one.
     func endComposeRequestsOfRemovedAccounts() {
-        let ended = composeQueue.filter { dependsOnRemovedAccount($0) }
+        var ended: [ComposeRequest] = []
+        var kept: [ComposeRequest] = []
+        for request in composeQueue {
+            if dependsOnRemovedAccount(request) { ended.append(request) } else { kept.append(request) }
+        }
         guard !ended.isEmpty else { return }
-        composeQueue.removeAll { dependsOnRemovedAccount($0) }
+        composeQueue = kept
         for request in ended {
             request.onOutcome(.failed(Self.removedAccountReason))
         }
@@ -240,6 +252,20 @@ final class AgentToolRouter {
         guard let index = composeQueue.firstIndex(where: { host.asked($0.origin) }) else { return nil }
         awaitingAppear = true
         return composeQueue.remove(at: index)
+    }
+
+    /// Whether a request its screen just took can open: a new email bound to an account
+    /// (`ComposeRequest.fromAccountId`) opens only when that account is in `accounts`, the
+    /// app's accounts as the screen takes the card, so the card never opens from another account.
+    /// When it is not, the request ends with `.failed(fromAccountMissingReason)`, which the model
+    /// reports, the take's hold is released and the queue is offered again; nothing opens.
+    func canOpen(_ request: ComposeRequest, accounts: [Account]) -> Bool {
+        guard let accountId = request.fromAccountId,
+              !accounts.contains(where: { $0.id == accountId }) else { return true }
+        awaitingAppear = false
+        composeOffer += 1
+        request.onOutcome(.failed(Self.fromAccountMissingReason))
+        return false
     }
 
     /// Called by `ComposeView.onAppear`. Marks the compose UI as busy so the queue holds

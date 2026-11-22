@@ -86,6 +86,8 @@ struct ChatThreadView: View {
     @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
     @Environment(\.dismiss) private var dismiss
+    /// The app's accounts: a new email's card opens from its bound account, looked up here.
+    @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Held only while a grow is pending: set when the AI Suggestion's row becomes Writing, cleared
     /// inside the fill's `withAnimation` (`showSuggestion`), so the working bubble filling in is one
@@ -901,6 +903,9 @@ struct ChatThreadView: View {
     /// open nothing. Who the card goes to travels with the request (`fieldReply`); this chat's own
     /// state decides nothing.
     private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
+        // A new email opens from the account bound when its turn started, looked up in the app's
+        // accounts as the card is taken; when it is not there the request ends and nothing opens.
+        guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return }
         fieldComposeOpened = req.fieldReply != nil
         agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))
     }
@@ -933,7 +938,7 @@ struct ChatThreadView: View {
         switch req.mode {
         case .compose:
             ComposeView(
-                suggestedBody: req.body, account: context.accounts.first { $0.id == req.fromAccountId },
+                suggestedBody: req.body, account: navigationStore.accounts.first { $0.id == req.fromAccountId },
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
                 onAgentOutcome: onOutcome)
         case .reply:

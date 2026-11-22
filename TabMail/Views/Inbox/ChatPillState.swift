@@ -118,10 +118,14 @@ final class ChatPillState {
         }
 
         /// The cut-off turn's request and, when the reply field sent it, the field's request as it
-        /// was sent (`ChatFieldReply`): the resumed turn's tools get the same one.
+        /// was sent (`ChatFieldReply`): the resumed turn's tools get the same one. With them, the
+        /// turn's `ComposeOrigin` as the send started: a resume continues the turn, so its compose
+        /// card still belongs to the screen that asked and sends from the account bound then,
+        /// whichever screen of the thread resumes it.
         struct PendingResume {
             let request: CompletionsRequest
             let fieldReply: ChatFieldReply?
+            let origin: ComposeOrigin?
         }
         /// Buffer 1 (display): shown on the "new session" page. Swapped from Buffer 2
         /// on pill expand for instant display. Stable while being shown.

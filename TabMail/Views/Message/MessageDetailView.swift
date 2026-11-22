@@ -68,6 +68,8 @@ struct MessageDetailView: View {
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) var optOutAllAI = false
     @Environment(\.dismiss) var dismiss
     @Environment(\.hasTabMailSession) var hasTabMailSession
+    /// The app's accounts: a new email's card opens from its bound account, looked up here.
+    @Environment(NavigationStore.self) var navigationStore
 
     var anyAISourceEnabled: Bool {
         (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
@@ -589,7 +591,7 @@ struct MessageDetailView: View {
 
                 DynamicIslandChat(message: chatContextMessage ?? message, isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
                     showAgentToast(text)
-                }, onAgentCompose: { agentCompose = $0 },
+                }, onAgentCompose: openAgentCompose,
                 composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)
 
                 Menu {
