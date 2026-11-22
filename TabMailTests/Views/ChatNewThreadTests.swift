@@ -1140,7 +1140,7 @@ struct ChatNewDraftSaveTests {
         #expect(recorder.calls.isEmpty)
     }
 
-    @Test("A draft another session saved after the chat opened is never overwritten from the chat")
+    @Test("A draft another session saved after the chat opened is never overwritten from the chat, and going back to what was opened then saves nothing")
     func newerSessionWins() async throws {
         let fixture = try fixture()
         defer { finish(fixture) }
@@ -1160,6 +1160,16 @@ struct ChatNewDraftSaveTests {
         if case .refused = outcome { refused = true } else { refused = false }
         #expect(refused)
         #expect(after.body == "Written in compose")
+        #expect(recorder.calls.isEmpty)
+
+        // A refused save wrote nothing, so the chat still compares with what it opened: going
+        // back to the draft's own words saves nothing and leaves the other session's row as it is.
+        model.words = "Lunch on Friday?"
+        let again = await model.saveIfNeeded()
+        let finalRow = try await row(fixture, draft.id)
+        let final = try #require(finalRow)
+        #expect(again == .saved, "back to what was opened: nothing to save")
+        #expect(final.body == "Written in compose")
         #expect(recorder.calls.isEmpty)
     }
 
