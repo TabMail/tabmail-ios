@@ -1122,7 +1122,8 @@ extension SyncEngine {
     /// judged: a deleted newest message leaves the device. The highest fetched
     /// UID is the bound only when the listing carried no UIDNEXT. The one source
     /// for both the candidate load and the removal decision. Nil when no fetched
-    /// record carried a usable UID: the sweep removes nothing.
+    /// record carried a usable UID: the sweep removes nothing. Callers use it
+    /// only once `listingProvedItsWindow` holds for the listing.
     nonisolated static func windowedSweepUIDBounds(fetched: [MessageHeaderInfo], coverage: FetchCoverage) -> (floor: Int64, ceiling: Int64)? {
         let fetchedUIDs = fetched.compactMap { Int64($0.messageId) }
         guard let floorUID = fetchedUIDs.min(), let fetchedMax = fetchedUIDs.max() else { return nil }

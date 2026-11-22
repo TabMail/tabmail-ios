@@ -309,7 +309,7 @@ struct ListingCountersTests {
         }
     }
 
-    @Test("Two overlapping listings, windowed: a message above the highest UID the earlier listing fetched survives its write; one gone inside the window is removed and rows below the window are untouched")
+    @Test("Two overlapping listings, windowed: a message at or above the earlier listing's UIDNEXT survives its write; one gone inside the window is removed and rows below the window are untouched")
     func overlappingWindowedListingKeepsAnArrivalAboveItsWindow() async throws {
         try await E.withWorld("lc-overlap-window", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
             // The earlier listing fetches the newest 3 of 1, 2, 3, 5, 6: [3, 5, 6].

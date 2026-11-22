@@ -958,7 +958,7 @@ struct StaleDetectionWindowTests {
         #expect(result.staleIds.contains("acc1:Archive:101"))
     }
 
-    @Test("IMAP .uid window still deletes a row INSIDE the fetched UID slice that the server dropped")
+    @Test("IMAP .uid window deletes a row above the highest fetched UID but below the listing's UIDNEXT that the server dropped")
     func uidWindowStillDeletesGenuinelyStale() throws {
         let db = try TestDatabase.make()
         let archive = try seedArchive(db)
