@@ -95,17 +95,21 @@ struct MessageDetailView: View {
     /// `expectedRfc822MessageId` — the content witness of the message the OPENER
     /// proved it was opening, forwarded to the view model so its own re-resolve
     /// cannot durably mark a different message read. See
-    /// `MessageDetailViewModel.openIdentity`. Defaulted `nil` (fail open) so every
+    /// `MessageDetailViewModel.openIdentity`. `expectedObservedUidValidity` is the
+    /// address-epoch witness for a message with no usable Message-ID. Both are
+    /// defaulted `nil` (fail open) so every
     /// opener that has no witness keeps today's behaviour unchanged.
 #if DEBUG
     init(
         messageId: String,
         opensWithSkeletonDwell: Bool = false,
         expectedRfc822MessageId: String? = nil,
+        expectedObservedUidValidity: Int? = nil,
         testBypassesDisclosureOpenAnchorDisarm: Bool = false
     ) {
         self._viewModel = State(initialValue: MessageDetailViewModel(
-            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId))
+            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
+            expectedObservedUidValidity: expectedObservedUidValidity))
         self.opensWithSkeletonDwell = opensWithSkeletonDwell
         self.testBypassesDisclosureOpenAnchorDisarm = testBypassesDisclosureOpenAnchorDisarm
         self._skeletonOverlayVisible = State(initialValue: opensWithSkeletonDwell)
@@ -117,10 +121,12 @@ struct MessageDetailView: View {
     init(
         messageId: String,
         opensWithSkeletonDwell: Bool = false,
-        expectedRfc822MessageId: String? = nil
+        expectedRfc822MessageId: String? = nil,
+        expectedObservedUidValidity: Int? = nil
     ) {
         self._viewModel = State(initialValue: MessageDetailViewModel(
-            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId))
+            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
+            expectedObservedUidValidity: expectedObservedUidValidity))
         self.opensWithSkeletonDwell = opensWithSkeletonDwell
         self._skeletonOverlayVisible = State(initialValue: opensWithSkeletonDwell)
         if DebugModeManager.isLoggingEnabled() {
@@ -317,7 +323,7 @@ struct MessageDetailView: View {
             ComposeView(replyTo: msg, isForward: true)
         }
         .fullScreenCover(item: $agentCompose) { req in
-            composeViewForAgentRequest(req)
+            req.composeView(account: currentAccount, onOutcome: req.onOutcome)
         }
         .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
             if newId != nil {

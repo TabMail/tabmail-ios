@@ -120,8 +120,8 @@ final class DictationController {
         capture: any AudioCapturing = MicrophoneCapture(),
         requestMicrophoneAccess: @escaping @MainActor () async -> Bool = DictationController.requestMicrophoneAccess,
         isOnline: @escaping @MainActor () -> Bool = { NetworkMonitor.shared.isConnected },
-        // Settings' "Opt Out of AI" (also set by declining AI consent), as every AI call reads it.
-        isOptedOutOfAI: @escaping @MainActor () -> Bool = { AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) },
+        // The AI setting (Settings' "Opt Out of AI" and the AI choice), as every AI call reads it.
+        isOptedOutOfAI: @escaping @MainActor () -> Bool = { AIService.isAIOff },
         dictationLanguage: @escaping @MainActor () -> String? = { DictationLanguage.current() },
         smartDictation: @escaping @MainActor () -> Bool = { SmartDictation.isOn() },
         wordFrequencies: @escaping ScreenWordFrequencies = { await WordList.bundled?.seen($0) ?? [:] },

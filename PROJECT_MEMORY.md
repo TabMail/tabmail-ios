@@ -49,7 +49,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | IMAP Message IDs & UID Resolution | [read in full](Companion/Memory/Current/023-imap-message-ids-uid-resolution.md) |
 | iOS Keychain Persistence | [read in full](Companion/Memory/Current/024-ios-keychain-persistence.md) |
 | Persistent Offline Action Queue (ADR-IOS-003, ADR-IOS-018) | [read in full](Companion/Memory/Current/025-persistent-offline-action-queue-adr-ios-003-adr-ios-018.md) |
-| Progressive Backfill & Storage Budget (ADR-IOS-005, ADR-IOS-006) | [read in full](Companion/Memory/Current/026-progressive-backfill-storage-budget-adr-ios-005-adr-ios-006.md) |
+| Progressive Backfill & Storage Budget (ADR-IOS-005, ADR-IOS-006); IMAP UID walk bounds: refused SEARCH range (`IMAPSearchRefused`, `failRangeForThisWalk`), FETCH timeout split, dropped connection, per-call decline; walk drops stored UIDs before FETCH (#1016; was re-FETCH, #1006); reply-parent marking from both sides, cc/bcc fill and `ccBccBackfillDone` deleted | [read in full](Companion/Memory/Current/026-progressive-backfill-storage-budget-adr-ios-005-adr-ios-006.md) |
 | Backfill diagnostics: `backfill.log` channel (2026-07-02) | [read in full](Companion/Memory/Current/027-backfill-diagnostics-backfill-log-channel-2026-07-02.md) |
 | Backfill stall fixes (2026-07-02) — UID-remap re-key, no fast-sync cursor reset, persisted server limit | [read in full](Companion/Memory/Current/028-backfill-stall-fixes-2026-07-02-uid-remap-re-key-no-fast-sync-cursor-res.md) |
 | `bodyComplete` = FTS-indexed truth; display cache has NO flag (ADR-IOS-050, 2026-07-02) | [read in full](Companion/Memory/Current/029-bodycomplete-fts-indexed-truth-display-cache-has-no-flag-adr-ios-050-202.md) |
@@ -57,7 +57,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Ever-Rolling FIFO Queues (ADR-IOS-027) | [read in full](Companion/Memory/Current/031-ever-rolling-fifo-queues-adr-ios-027.md) |
 | Bounded Memory (CRITICAL) | [read in full](Companion/Memory/Current/032-bounded-memory-critical.md) |
 | Optimistic UI Rollback | [read in full](Companion/Memory/Current/033-optimistic-ui-rollback.md) |
-| Gmail Label System; user-label rules in the providers (`userLabel(named:connected:)`, `userLabelCatalog` nil not `[]`, `storedUserLabelIds`, `emailProviderType`, #500) | [read in full](Companion/Memory/Current/034-gmail-label-system.md) |
+| Gmail Label System; user-label rules in the providers (`userLabel(named:connected:)`, `userLabelCatalog` nil not `[]`, `storedUserLabelIds`, `emailProviderType`, #500); Trash/Spam exclusive membership (TRASH or SPAM = no other folder, #1066) | [read in full](Companion/Memory/Current/034-gmail-label-system.md) |
 | SwiftUI Observable Array Mutation Safety | [read in full](Companion/Memory/Current/035-swiftui-observable-array-mutation-safety.md) |
 | SwiftUI Layout Gotchas | [read in full](Companion/Memory/Current/036-swiftui-layout-gotchas.md) |
 | HTML Email Render Pipeline (AutoSizingHTMLView) — MUST stay idempotent (ADR-IOS-039) | [read in full](Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md) |

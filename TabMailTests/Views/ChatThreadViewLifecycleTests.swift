@@ -15,7 +15,9 @@ import UIKit
 ///
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. The open lands where it asks: the bottom when every email is read, the Unread line when
-///     some are not, the opened email when it came from search or a notification.
+///     some are not, the opened email when it came from search or a notification. A search
+///     result's open, mounted as search shows it, shows the chat with Chat View on (only the
+///     opened email's bubble glows, then the glow ends) and today's detail with it off.
 ///  2. Every email of the thread is marked read in the database once the chat shows it.
 ///  3. The open asks for the newest `ChatViewConfig.summaryWindow` emails, newest first, wherever
 ///     it lands. Any other email is asked for only once it has been on screen: scrolling up asks
@@ -410,6 +412,126 @@ struct ChatThreadViewLifecycleTests {
         let skipped = (target + ChatViewConfig.summaryWindow)..<(Self.length - 2 * ChatViewConfig.summaryWindow)
         #expect(!opened.older.contains { skipped.contains($0) },
                 "the emails between the landing and the bottom were never shown and ask nothing: \(opened.queued)")
+    }
+
+    /// What a search result's tap shows, mounted as search's navigation stack shows it: the open
+    /// `SearchView.destination` builds for the email search found. With Chat View on it is the chat
+    /// (its reply pill and bubbles, no detail reply menu); the chat lands on that email, whose
+    /// bubble alone glows (its neighbours on screen do not), and the glow ends. With Chat View off
+    /// it is today's detail (its reply menu, no reply pill and no bubbles).
+    @Test("From search: the open shows the chat or the detail as the setting says, and the chat glows only the email search found",
+          arguments: [true, false])
+    func searchOpenShowsItsSurfaceAndGlowsTheEmail(opensInChat: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted open")
+        try await HostedAccessibility.withAutomation {
+            let saved = ChatSummaryQueueTests.SavedChatViewState()
+            let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+            let queue = ActiveAIQueue.shared
+            await queue.setDispatchSuppressedForTesting(true)
+            await queue.clearForTesting()
+            defer {
+                saved.restore()
+                InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+            }
+            do {
+                try await showSearchOpen(opensInChat: opensInChat, saved: saved, pool: pool)
+            } catch {
+                await AccountManager.shared.awaitWriteQueueDrain()
+                await queue.clearForTesting()
+                await queue.setDispatchSuppressedForTesting(false)
+                throw error
+            }
+            await AccountManager.shared.awaitWriteQueueDrain()
+            await queue.clearForTesting()
+            await queue.setDispatchSuppressedForTesting(false)
+        }
+    }
+
+    private func showSearchOpen(
+        opensInChat: Bool, saved: ChatSummaryQueueTests.SavedChatViewState, pool: DatabasePool
+    ) async throws {
+        saved.setChatView(on: opensInChat)
+        let live = ChatViewConfig.opensInChat
+        #expect(live == opensInChat, "control: the Chat View setting routes opens to the \(opensInChat ? "chat" : "detail")")
+        let headers = try Self.insertThread(unreadFrom: nil, pool: pool)
+        #expect(headers.count == Self.length)
+        guard headers.count == Self.length else { return }
+        let target = 5
+        let open = SearchView.destination(for: SearchView.OpenTarget(
+            headerId: headers[target].id, provenRfc822MessageId: Self.rfc(target)))
+        let route = open.route(pool: PrioritizedDatabase(pool: pool))
+        let expectedRoute: MessageOpenView.Route = opensInChat ? .chat : .detail
+        #expect(route == expectedRoute, "control: the open routes to the \(opensInChat ? "chat" : "detail")")
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: NavigationStack { open })
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        let pill = ChatThreadView.replyPillId
+        let replyMenu = "replyMenu"
+        func identifiers() -> [String] { HostedAccessibility.identifiers(in: controller.view) }
+
+        guard opensInChat else {
+            var shown: [String] = []
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                shown = identifiers()
+                if shown.contains(replyMenu) || shown.contains(pill) { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            #expect(shown.contains(replyMenu), "today's detail shows its reply menu: \(shown)")
+            #expect(!shown.contains(pill), "no chat reply pill: \(shown)")
+            let bubbleLabels = HostedAccessibility.labels(in: controller.view).filter { $0.contains(" said: ") }
+            #expect(bubbleLabels.isEmpty, "no chat bubbles: \(bubbleLabels)")
+            return
+        }
+
+        /// Each bubble on screen: its email's index (its label reads "… said: Plans N, …") and
+        /// whether it glows (its identifier).
+        func bubbles() -> [(index: Int, glows: Bool)] {
+            HostedAccessibility.elements(under: controller.view).compactMap { element in
+                guard let label = element.accessibilityLabel,
+                      let range = label.range(of: " said: Plans ") else { return nil }
+                let digits = label[range.upperBound...].prefix { $0.isNumber }
+                guard let index = Int(digits) else { return nil }
+                let id = HostedAccessibility.identifier(of: element)
+                if id == ChatBubbleView.highlightedBubbleId { return (index: index, glows: true) }
+                if id == ChatBubbleView.bubbleId { return (index: index, glows: false) }
+                return nil
+            }
+        }
+        // Sampled often: the glow lasts `ChatViewLayout.highlightDuration` from the landing.
+        var glowed = Set<Int>()
+        var plainWhileTargetGlowed = Set<Int>()
+        var glowEnded = false
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            let now = bubbles()
+            let lit = Set(now.filter(\.glows).map(\.index))
+            glowed.formUnion(lit)
+            if lit.contains(target) { plainWhileTargetGlowed.formUnion(now.filter { !$0.glows }.map(\.index)) }
+            // The glow has ended once the email that glowed is on screen again without it; a
+            // sample that misses its bubble says nothing.
+            if glowed.contains(target) && now.contains(where: { $0.index == target && !$0.glows }) {
+                glowEnded = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        let onlyTarget: Set<Int> = [target]
+        #expect(glowed == onlyTarget, "only the email search found glows: \(glowed.sorted())")
+        let neighboursPlain = plainWhileTargetGlowed.isSuperset(of: [target - 1, target + 1])
+        #expect(neighboursPlain, "its neighbours are on screen without the glow: \(plainWhileTargetGlowed.sorted())")
+        #expect(glowEnded, "the glow ends: the email search found is on screen again without it")
+        let shown = identifiers()
+        #expect(shown.contains(pill), "the chat shows its reply pill: \(shown)")
+        #expect(!shown.contains(replyMenu), "no detail reply menu: \(shown)")
     }
 
     @Test("Scrolling to the top asks for the emails it shows, and the ones it jumped past ask nothing")

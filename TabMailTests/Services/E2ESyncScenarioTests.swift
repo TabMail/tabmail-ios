@@ -56,7 +56,7 @@ private func makeHeaderInfo(
     )
 }
 
-/// Simulates the core of `SyncEngine.runSyncMessages()` against a DatabaseQueue.
+/// Simulates the core of `SyncEngine.runListing` against a DatabaseQueue.
 /// Replicates upsert + stale detection logic for testing.
 private func simulateRunSyncMessages(
     db: DatabaseQueue,

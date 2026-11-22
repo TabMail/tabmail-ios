@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import GRDB
+import SwiftMail
 
 /// Context needed to build a compose edit request, gathered from ComposeView.
 struct ComposeEditContext: Sendable {
@@ -14,7 +16,8 @@ struct ComposeEditContext: Sendable {
     let toRecipients: [String]
     let ccRecipients: [String]
     let bccRecipients: [String]
-    /// Display-name lookups keyed by lowercase email. Used when formatting
+    /// Display-name lookups keyed by the address as written (the formatter also reads the
+    /// lowercased key). Used when formatting
     /// `Name <email>` lines so the LLM preserves the name on copy-through.
     let toDisplayNames: [String: String]
     let ccDisplayNames: [String: String]
@@ -33,6 +36,57 @@ struct ComposeEditContext: Sendable {
     let bodyText: String  // original email body for reply/forward context
 }
 
+extension ComposeEditContext {
+    /// THE context of a compose edit, built the same for the compose card and for the chat field's
+    /// edit of the AI Suggestion, so the backend reads the same draft from either: the draft's
+    /// To, Cc and Bcc by role with their names, the sending account, and the email replied to or
+    /// forwarded (`related`) with its body text (`relatedBodyText`; nil: its snippet).
+    static func make(
+        recipients: ComposeDraftGuards.Recipients, account: Account?, mode: String, related: MessageHeader?,
+        relatedBodyText: String?, compositionPrompt: String, kbText: String
+    ) -> ComposeEditContext {
+        ComposeEditContext(
+            recipients: recipients.to.tokens,
+            toRecipients: recipients.to.tokens,
+            ccRecipients: recipients.cc.tokens,
+            bccRecipients: recipients.bcc.tokens,
+            toDisplayNames: recipients.to.displayNames,
+            ccDisplayNames: recipients.cc.displayNames,
+            bccDisplayNames: recipients.bcc.displayNames,
+            senderName: account?.displayName ?? "",
+            senderEmail: account?.emailAddress ?? "",
+            mode: mode,
+            compositionPrompt: compositionPrompt,
+            kbText: kbText,
+            relatedDate: related.map { AIService.formatTimestampForAgent($0.date) } ?? "",
+            relatedSubject: related?.subject ?? "",
+            relatedFrom: related.map { $0.fromAddress.isEmpty ? $0.from : "\($0.from) <\($0.fromAddress)>" } ?? "",
+            relatedTo: related?.to ?? "",
+            relatedCc: related?.cc ?? "",
+            bodyText: related.map { relatedBodyText ?? $0.snippet } ?? "")
+    }
+
+    /// THE body read of every compose edit's context: the text of `header`'s body, the primary
+    /// message only (embedded .eml sections stripped, they are other people's emails), read in the
+    /// same snapshot as the check that the row at its address is still that email
+    /// (`AIWriteTarget.stillHolds`). The outer nil refuses: another email is seated at the address
+    /// (a UIDVALIDITY reset), so its body is never sent with this email's context. The inner nil:
+    /// no body is stored (the context then carries the snippet).
+    static func relatedBodyText(of header: MessageHeader, db: Database) throws -> String?? {
+        guard try AIWriteTarget.stillHolds(header, db: db) else { return nil }
+        guard let html = try MessageBody.fetchOne(db, key: header.id)?.htmlContent, !html.isEmpty else { return .some(nil) }
+        return .some(EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html)))
+    }
+}
+
+/// A compose edit that came back with no edit: no answer, or one that is not the compose edit
+/// JSON. Thrown, so every caller takes its failure path (the chat's error, the suggestion left as
+/// it was) and never its success path: no draft update, no edit turn, no save.
+struct InlineEditFailure: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
 /// A single turn in the inline edit conversation history.
 /// Stores the draft state at the time of the request so the LLM can see the full evolution.
 struct InlineEditTurn: Sendable {
@@ -40,17 +94,22 @@ struct InlineEditTurn: Sendable {
     let bodyAtRequest: String
     let subjectAtRequest: String
     let assistantResponse: String
+    /// The text version stored with `bodyAtRequest` when it was the AI Suggestion shown,
+    /// so a resend or rewind that puts that body back keeps its chat-view ghost. Nil when
+    /// the body was not the stored suggestion, or for history saved before this was kept.
+    var textMessageAtRequest: String? = nil
+    /// The change command stored with `bodyAtRequest`, kept like `textMessageAtRequest`.
+    var changeCommandAtRequest: String? = nil
 }
 
 /// Delta for one recipient field (To / Cc / Bcc) extracted from the LLM response.
 /// Applied on top of the current draft's tokens: removals first, then adds.
 struct RecipientDelta: Sendable {
-    /// The `+<field>:` line read as recipient text, like typed text
-    /// (ADR-IOS-092): its mailboxes, with any names the LLM gave, and the
-    /// text that names no sendable address.
+    /// The field's add items, one mailbox each, read as recipient text like typed text
+    /// (ADR-IOS-092): their mailboxes, with any names the LLM gave.
     let adds: RecipientEntry
     /// Lowercased emails to remove. Contains `"*"` (literal) when the LLM asked to clear
-    /// the entire field (via e.g. `-Cc: *`).
+    /// the entire field (`"remove_cc": ["*"]`).
     let removes: [String]
 
     var clearsField: Bool { removes.contains("*") }
@@ -59,19 +118,28 @@ struct RecipientDelta: Sendable {
 
 /// Result of an inline edit operation.
 struct InlineEditResult: Sendable {
-    let response: String?  // Conversational description of edits (from "Response:" field)
-    let subject: String?   // Updated subject (from "Subject:" field)
-    let body: String?      // Updated body (from "Body:" field)
-    /// Delta for the To field. `nil` when neither `+To:` nor `-To:` appeared in the
-    /// response — meaning the field should be left untouched. Non-nil = the LLM
-    /// intentionally expressed a change.
+    let response: String?  // Conversational description of edits (`response`)
+    let subject: String?   // Updated subject (`subject`)
+    let body: String?      // Updated body (`body`)
+    /// Delta for the To field. `nil` when `add_to` and `remove_to` are both empty, meaning the
+    /// field is left untouched. Non-nil = the LLM intentionally expressed a change.
     let toDelta: RecipientDelta?
     let ccDelta: RecipientDelta?
     let bccDelta: RecipientDelta?
+    /// The email as a short text message (`text_message`): what the chat's AI Suggestion shows.
+    let textMessage: String?
+    /// One suggested change for this draft (`change_command`), shown as the field's "e.g." line.
+    let changeCommand: String?
     let raw: String        // Raw LLM response for storing in chat history
 }
 
 extension AIService {
+
+    /// What an inline edit returns with AI turned off, at its start or while it runs.
+    static let inlineEditWithAIOff = InlineEditResult(
+        response: "AI calls are disabled.", subject: nil, body: nil, toDelta: nil, ccDelta: nil, bccDelta: nil,
+        textMessage: nil, changeCommand: nil, raw: ""
+    )
 
     /// Perform an inline edit of the compose draft, matching TB's `runComposeEdit()` in edit.js.
     /// Sends the current draft state + user instruction (+ optional chat history for continuous editing)
@@ -89,7 +157,7 @@ extension AIService {
     ) async throws -> InlineEditResult {
         guard !disableLLMCalls else {
             BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: SKIP — LLM calls disabled")
-            return InlineEditResult(response: "AI calls are disabled.", subject: nil, body: nil, toDelta: nil, ccDelta: nil, bccDelta: nil, raw: "")
+            return Self.inlineEditWithAIOff
         }
 
         // Demo Mode budget. One performInlineEdit = one count.
@@ -220,6 +288,14 @@ extension AIService {
         let response: CompletionsResponse
         do {
             response = try await backend.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent, invocation: invocation)
+        } catch is AIOffError {
+            // AI was turned off during the edit: end as the check above does, with no
+            // Demo Mode call used.
+            if inDemo {
+                await MainActor.run { DemoModeStore.shared.refundCall() }
+            }
+            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: stopped — AI turned off")
+            return Self.inlineEditWithAIOff
         } catch {
             if inDemo, DemoModeStore.shouldRefund(for: error) {
                 await MainActor.run { DemoModeStore.shared.refundCall() }
@@ -230,21 +306,17 @@ extension AIService {
 
         guard let text = response.assistant, !text.isEmpty else {
             BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: no assistant text (error=\(response.error ?? "nil"))")
-            return InlineEditResult(
-                response: response.error ?? "No response from AI.",
-                subject: nil,
-                body: nil,
-                toDelta: nil,
-                ccDelta: nil,
-                bccDelta: nil,
-                raw: ""
-            )
+            throw InlineEditFailure(message: response.error ?? "No response from AI.")
         }
 
         BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: raw response length=\(text.count)")
         BackgroundSyncLogger.logDebug("[AIService]   response preview: \(text.prefix(200))")
 
-        let result = Self.parseInlineEditResponse(text)
+        guard let result = Self.parseInlineEditResponse(text) else {
+            // Not the compose edit JSON: the edit failed, and the draft stays as it was.
+            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: response is not the compose edit JSON (\(text.count) chars)")
+            throw InlineEditFailure(message: "The edit could not be read. Please try again.")
+        }
         if DebugModeManager.isLoggingEnabled() {
             let toDesc = result.toDelta.map { "+\($0.adds.recipients.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
             let ccDesc = result.ccDelta.map { "+\($0.adds.recipients.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
@@ -254,96 +326,103 @@ extension AIService {
         return result
     }
 
-    /// Parse the inline edit response format: Response / +To / -To / +Cc / -Cc / +Bcc / -Bcc / Subject / Body.
-    /// Absent `+X:`/`-X:` line pair → corresponding delta is `nil` (keep field untouched).
-    /// A `-X: *` line marks a clear-all. See email_edit_response_format-v1.5.16.md.
-    /// Falls back to treating the entire text as body when neither Subject: nor Body: appears.
-    static func parseInlineEditResponse(_ rawText: String) -> InlineEditResult {
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Extract "Response:" line (first occurrence, single line)
-        var response: String?
-        if let range = text.range(of: #"(?mi)^Response:\s*(.*)$"#, options: .regularExpression) {
-            let match = String(text[range])
-            if let colonRange = match.range(of: "Response:", options: .caseInsensitive) {
-                response = match[colonRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-            }
+    /// Read a compose edit as the backend sends it to a client at the JSON protocol
+    /// (`TabMailProtocolVersion` 2.0.0, ADR-IOS-114): one JSON object with `response`, the six
+    /// recipient changes, `subject`, `body`, `text_message` and `change_command`. This app sends
+    /// that marker, so this is the only reader of a compose edit; labelled text is not one.
+    ///
+    /// Keys this reader does not know are ignored, so a later protocol can add fields. A missing
+    /// or malformed known field is an error (nil): a body or text message that is missing or
+    /// blank, a wrong type,
+    /// an add item without a non-blank email, a blank removal, or `"*"` beside other removals.
+    /// An add item's name may be "" (the field then shows the email).
+    ///
+    /// Each recipient field is a delta: `[]` in both its add and its remove list leaves it
+    /// unchanged (nil delta); `["*"]` in a remove list clears it. Each add item is one
+    /// recipient and goes through `RecipientEntry` as its own entry, as typed text does
+    /// (ADR-IOS-092).
+    static func parseInlineEditResponse(_ rawText: String) -> InlineEditResult? {
+        struct Added: Decodable {
+            let name: String
+            let email: String
         }
-
-        // Extract "Subject:" line (single line after "Subject:")
-        var subject: String?
-        if let range = text.range(of: #"(?mi)^Subject:\s*(.*)$"#, options: .regularExpression) {
-            let match = String(text[range])
-            if let colonRange = match.range(of: "Subject:", options: .caseInsensitive) {
-                let s = match[colonRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-                if !s.isEmpty { subject = s }
-            }
+        struct Edit: Decodable {
+            let response: String
+            let add_to: [Added]
+            let remove_to: [String]
+            let add_cc: [Added]
+            let remove_cc: [String]
+            let add_bcc: [Added]
+            let remove_bcc: [String]
+            let subject: String
+            let body: String
+            let text_message: String
+            let change_command: String
         }
-
-        // Extract "Body:" — everything after it (multiline)
-        var body: String?
-        if let range = text.range(of: #"(?mi)^Body:\s*([\s\S]*)$"#, options: .regularExpression) {
-            let match = String(text[range])
-            if let colonRange = match.range(of: "Body:", options: .caseInsensitive) {
-                let b = match[colonRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-                if !b.isEmpty { body = b }
-            }
-        }
-
-        // Parse recipient deltas. A field gets a non-nil delta iff the LLM emitted
-        // either `+X:` or `-X:` (or both).
-        let toDelta = parseDeltaForField(text, field: "To")
-        let ccDelta = parseDeltaForField(text, field: "Cc")
-        let bccDelta = parseDeltaForField(text, field: "Bcc")
-
-        // Fallback: if no Body: found, treat entire text as body (matching TB's processEditResponse)
-        if body == nil && subject == nil {
-            body = text
-        }
+        guard let data = rawText.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+              let edit = try? JSONDecoder().decode(Edit.self, from: data),
+              !edit.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let textMessage = nonBlank(edit.text_message),
+              case .some(let toDelta) = recipientDelta(adds: edit.add_to.map { ($0.name, $0.email) }, removes: edit.remove_to),
+              case .some(let ccDelta) = recipientDelta(adds: edit.add_cc.map { ($0.name, $0.email) }, removes: edit.remove_cc),
+              case .some(let bccDelta) = recipientDelta(adds: edit.add_bcc.map { ($0.name, $0.email) }, removes: edit.remove_bcc)
+        else { return nil }
 
         return InlineEditResult(
-            response: response,
-            subject: subject,
-            body: body,
+            response: nonBlank(edit.response),
+            // A blank subject is no subject from the model (the backend sends '' for one): the draft
+            // keeps the subject the edit started from. Only a written subject replaces it.
+            subject: edit.subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : edit.subject,
+            // The body as the backend sends it: the draft outside the edit stays verbatim.
+            body: edit.body,
             toDelta: toDelta,
             ccDelta: ccDelta,
             bccDelta: bccDelta,
+            textMessage: textMessage,
+            changeCommand: nonBlank(edit.change_command),
             raw: rawText
         )
     }
 
-    /// Build a `RecipientDelta` from the `+<field>:` and `-<field>:` lines in the
-    /// response. Returns `nil` when neither line is present for that field.
-    static func parseDeltaForField(_ text: String, field: String) -> RecipientDelta? {
-        let addLine = extractLabelLine(text, prefix: "+", label: field)
-        let removeLine = extractLabelLine(text, prefix: "-", label: field)
-        if addLine == nil && removeLine == nil { return nil }
-
-        // Each line is split as typed text is, before anything reads it, so a
-        // list in any separator and a quoted name with a comma stay whole.
-        let adds = RecipientEntry(addLine.map { [$0] } ?? [])
-        var removes: [String] = []
-        if let raw = removeLine {
-            let entry = RecipientEntry(raw)
-            removes = entry.addresses.map { $0.lowercased() }
-            // Preserve the "*" sentinel literally.
-            if entry.leftovers.contains("*") { removes.append("*") }
-        }
-
-        return RecipientDelta(adds: adds, removes: removes)
+    private static func nonBlank(_ value: String?) -> String? {
+        let text = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return text.isEmpty ? nil : text
     }
 
-    /// Extract the raw text after `{prefix}{label}:` on its line. Returns `nil` if the line
-    /// is absent. `prefix` is escaped for regex use.
-    static func extractLabelLine(_ text: String, prefix: String, label: String) -> String? {
-        let escapedPrefix = NSRegularExpression.escapedPattern(for: prefix)
-        let escapedLabel = NSRegularExpression.escapedPattern(for: label)
-        let pattern = "(?mi)^\(escapedPrefix)\(escapedLabel):[ \\t]*(.*)$"
-        guard let range = text.range(of: pattern, options: .regularExpression) else {
-            return nil
+    /// One recipient field's change from its add items (name, email) and removals. Each item
+    /// names exactly one mailbox, read with the address parser every send uses (`RecipientEntry`,
+    /// ADR-IOS-092), and an add is written back with that parser's formatter
+    /// (`RecipientEntry.text`). The outer nil is a malformed field: an item that names no mailbox or
+    /// several, or `"*"` beside other removals, so the edit fails visibly and changes nothing; an
+    /// inner nil is an unchanged field (both lists empty).
+    static func recipientDelta(adds: [(name: String, email: String)], removes: [String]) -> RecipientDelta?? {
+        var addTexts: [String] = []
+        for item in adds {
+            guard let address = singleMailbox(item.email) else { return .none }
+            let name = item.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            addTexts.append(RecipientEntry.text(name: name.isEmpty ? nil : name, address: address))
         }
-        let match = String(text[range])
-        guard let colonIdx = match.firstIndex(of: ":") else { return "" }
-        return String(match[match.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
+        var removals: [String] = []
+        for item in removes {
+            if item.trimmingCharacters(in: .whitespacesAndNewlines) == "*" {
+                removals.append("*")
+                continue
+            }
+            guard let address = singleMailbox(item) else { return .none }
+            removals.append(address.lowercased())
+        }
+        if removals.contains("*") && removals.count != 1 { return .none }
+        if addTexts.isEmpty && removals.isEmpty { return .some(nil) }
+        // Each item is an entry of its own, so nothing joins two items.
+        return .some(RecipientDelta(adds: RecipientEntry(addTexts), removes: removals))
+    }
+
+    /// The one sendable mailbox `text` names; nil when it names none or several. Read with
+    /// SwiftMail's one-element parser (`AddressListEntry`), so an item holding two elements, a group
+    /// or the same mailbox twice is malformed, never deduplicated into one.
+    private static func singleMailbox(_ text: String) -> String? {
+        guard case .mailbox(let mailbox)? = AddressListEntry(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              isValidEmailAddress(mailbox.address) else { return nil }
+        return mailbox.address
     }
 }

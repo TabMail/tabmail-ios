@@ -188,6 +188,9 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         let bodyAtRequest: String
         let subjectAtRequest: String
         let assistantResponse: String
+        /// Optional: history saved by older builds has none and decodes nil.
+        let textMessageAtRequest: String?
+        let changeCommandAtRequest: String?
     }
 
     var editHistory: [InlineEditTurn] {
@@ -195,14 +198,18 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
               let decoded = try? JSONDecoder().decode([EditTurnCodable].self, from: data) else { return [] }
         return decoded.map {
             InlineEditTurn(userRequest: $0.userRequest, bodyAtRequest: $0.bodyAtRequest,
-                           subjectAtRequest: $0.subjectAtRequest, assistantResponse: $0.assistantResponse)
+                           subjectAtRequest: $0.subjectAtRequest, assistantResponse: $0.assistantResponse,
+                           textMessageAtRequest: $0.textMessageAtRequest,
+                           changeCommandAtRequest: $0.changeCommandAtRequest)
         }
     }
 
     static func encodeEditHistory(_ turns: [InlineEditTurn]) -> String? {
         let codable = turns.map {
             EditTurnCodable(userRequest: $0.userRequest, bodyAtRequest: $0.bodyAtRequest,
-                            subjectAtRequest: $0.subjectAtRequest, assistantResponse: $0.assistantResponse)
+                            subjectAtRequest: $0.subjectAtRequest, assistantResponse: $0.assistantResponse,
+                            textMessageAtRequest: $0.textMessageAtRequest,
+                            changeCommandAtRequest: $0.changeCommandAtRequest)
         }
         guard let data = try? JSONEncoder().encode(codable) else { return nil }
         return String(data: data, encoding: .utf8)

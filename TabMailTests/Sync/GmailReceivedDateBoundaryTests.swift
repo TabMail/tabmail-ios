@@ -155,8 +155,8 @@ struct GmailReceivedDateBoundaryTests {
         try Self.insertLocal(pool: pool, accountId: accountId, messageId: "n1", date: clock.daysAgo(20), providerDate: clock.daysAgo(20),
                              folderId: "\(accountId):ARCHIVE")
 
-        _ = try await SyncEngine.runSyncMessages(
-            for: folder, provider: server.provider(), limit: 3, dbPool: PrioritizedDatabase(pool: pool))
+        _ = try await SyncEngine.runListing(
+            for: folder, provider: server.provider(), limit: 3, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         let rows = try Self.localRows(pool: pool, accountId: accountId)
         #expect(rows["list-post"] != nil, "the list message (internalDate below the page floor) must survive the .date window")
@@ -199,8 +199,8 @@ struct GmailReceivedDateBoundaryTests {
         ])
         defer { server.close() }
 
-        _ = try await SyncEngine.runSyncMessages(
-            for: folder, provider: server.provider(), limit: 3, dbPool: PrioritizedDatabase(pool: pool))
+        _ = try await SyncEngine.runListing(
+            for: folder, provider: server.provider(), limit: 3, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         let rows = try Self.localRows(pool: pool, accountId: accountId)
         #expect(rows["old-id"] == nil, "the old provider id is retired by the remap")

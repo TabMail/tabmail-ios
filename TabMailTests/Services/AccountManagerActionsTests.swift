@@ -559,7 +559,7 @@ struct AccountManagerActionsTests {
                 rfc822MessageId: message.rfc822MessageId,
                 summaryBlurb: "Already computed",
                 actionTag: .archive,
-                cachedReply: "Already drafted",
+                reply: ReplyResult(body: "Already drafted", textMessage: nil),
                 db: db)
             try MessageHeader.filter(Column("id") == message.id).updateAll(
                 db,
@@ -1559,8 +1559,15 @@ struct MarkReadOnArchiveDeleteSettingTests {
             }
         }
         #expect(calls == 7, "the helper's own pass-through, the coordinated move, the inbox archive and delete, the inbox thread step they share with move, the chat and Settings")
+        // Settings: the Archive confirmation runs the action, the action reads the setting first
+        // and hands it to the sweep, and the sweep hands it to the read-before-move. No other
+        // Settings code reads the setting.
         let settings = try source("TabMail/Views/Settings/SettingsView.swift")
-        #expect(settings.contains("private func archiveOldMessages() async { // The mark-as-read setting as it stands when the action starts. let marksRead = AccountManager.markReadOnArchiveDeleteEnabled"))
+        #expect(settings.contains("private func archiveOldMessages() async { let archiveCutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.archiveAgeDays, to: Date()) ?? Date() guard let totalArchived = await Self.archiveOldMessagesAction( folders: navigationStore.folders, archiveCutoff: archiveCutoff) else { return }"))
+        #expect(settings.contains("static func archiveOldMessagesAction( folders: [Folder], archiveCutoff: Date, afterRead: () async -> Void = {} ) async -> Int? { // The mark-as-read setting as it stands when the action starts. let marksRead = AccountManager.markReadOnArchiveDeleteEnabled"))
+        #expect(settings.contains("return await archiveOldMessages( inboxFolderIds: inboxFolderIds, archiveCutoff: archiveCutoff, marksRead: marksRead, afterRead: afterRead)"))
         #expect(settings.contains("markReadBeforeRoleMove(ids: messages.map(\\.id), enabled: marksRead)"))
+        let settingReads = settings.components(separatedBy: "AccountManager.markReadOnArchiveDeleteEnabled").count - 1
+        #expect(settingReads == 1, "Settings reads the setting only where the Archive action starts")
     }
 }

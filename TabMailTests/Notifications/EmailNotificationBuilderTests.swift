@@ -45,7 +45,7 @@ struct EmailNotificationBuilderTests {
             actionTag: nil
         )
 
-        let wasActive = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg1")
+        let wasActive = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg1", observedUidValidity: nil)
 
         #expect(!wasActive)
         #expect(content.interruptionLevel == .passive)
@@ -66,7 +66,7 @@ struct EmailNotificationBuilderTests {
             actionTag: "reply"
         )
 
-        let wasActive = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg2")
+        let wasActive = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg2", observedUidValidity: nil)
 
         #expect(wasActive)
         #expect(content.interruptionLevel == .active)
@@ -80,7 +80,7 @@ struct EmailNotificationBuilderTests {
         let content = UNMutableNotificationContent()
         let signal = EmailNotificationBuilder.Signal(senderName: "Carol", subject: "No AI yet")
 
-        let wasActive = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg3")
+        let wasActive = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg3", observedUidValidity: nil)
 
         #expect(!wasActive)
         #expect(content.interruptionLevel == .passive)
@@ -111,7 +111,7 @@ struct EmailNotificationBuilderTests {
             dueDate: todayString
         )
 
-        _ = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg4")
+        _ = EmailNotificationBuilder.fill(content, signal: signal, accountId: "acc1", messageId: "msg4", observedUidValidity: nil)
 
         #expect(content.body == "Today \u{2014} Renew the domain")
         #expect(content.interruptionLevel == .passive)
@@ -137,7 +137,7 @@ struct EmailNotificationBuilderTests {
         _ = EmailNotificationBuilder.fill(
             archiveContent,
             signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "FYI", actionTag: "archive"),
-            accountId: "acc1", messageId: "msg5"
+            accountId: "acc1", messageId: "msg5", observedUidValidity: nil
         )
         #expect(archiveContent.categoryIdentifier == "EMAIL_TAG_ARCHIVE")
 
@@ -145,7 +145,7 @@ struct EmailNotificationBuilderTests {
         _ = EmailNotificationBuilder.fill(
             deleteContent,
             signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "Spam-ish", actionTag: "delete"),
-            accountId: "acc1", messageId: "msg6"
+            accountId: "acc1", messageId: "msg6", observedUidValidity: nil
         )
         #expect(deleteContent.categoryIdentifier == "EMAIL_TAG_DELETE")
 
@@ -153,7 +153,7 @@ struct EmailNotificationBuilderTests {
         _ = EmailNotificationBuilder.fill(
             replyContent,
             signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "Question", actionTag: "reply"),
-            accountId: "acc1", messageId: "msg7"
+            accountId: "acc1", messageId: "msg7", observedUidValidity: nil
         )
         #expect(replyContent.categoryIdentifier == "EMAIL")
 
@@ -161,7 +161,7 @@ struct EmailNotificationBuilderTests {
         _ = EmailNotificationBuilder.fill(
             bareContent,
             signal: EmailNotificationBuilder.Signal(senderName: "Eve", subject: "No AI yet"),
-            accountId: "acc1", messageId: "msg8"
+            accountId: "acc1", messageId: "msg8", observedUidValidity: nil
         )
         #expect(bareContent.categoryIdentifier == "EMAIL")
     }

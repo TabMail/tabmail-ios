@@ -49,6 +49,7 @@ Secrets.xcconfig.bak
 # backend internals) and are not part of the public client. One slipped in
 # once; this rule prevents a recurrence.
 PLAN_*.md
+STATE.md
 # ...and their companion evidence DIRECTORIES (`PLAN_<NAME>/` — vet briefs, agent
 # reports, measurement dumps). `PLAN_*.md` does NOT match a directory, so such a
 # directory sat untracked-but-publishable until 2026-08-07.
@@ -65,3 +66,5 @@ scratchpad/*
 
 # Local build/test scratch — logs, .xcresult bundles, .bak files. Never committed.
 scratchpad/
+
+/STATE.md

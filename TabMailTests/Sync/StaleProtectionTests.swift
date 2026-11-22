@@ -58,7 +58,14 @@ struct StaleProtectionTests {
     /// A fetch that returns NOTHING — the server transiently not including the just-arrived
     /// message (STATUS/fetch propagation lag), which is what makes stale detection want to
     /// delete it. `fetchMessagesResult` defaults to `[]`.
-    private func missingFetchMock() -> MockEmailProvider { MockEmailProvider(staleWindowMode: .uid) }
+    /// The listing's SELECT reports an empty INBOX bounded by UIDNEXT 501, so
+    /// UID 500 sits inside what this listing judges; without that bound the
+    /// sweep judges nothing and the protection would not be load-bearing.
+    private func missingFetchMock() -> MockEmailProvider {
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        mock.setListingCounters(ListingCounters(messageCount: 0, uidNext: 501, highestModSeq: nil), folder: "INBOX")
+        return mock
+    }
 
     @Test("A recentlyCompleted-protected message the fetch missed is NOT marked stale")
     func protectedSurvives() async throws {
@@ -72,9 +79,9 @@ struct StaleProtectionTests {
         await AccountManager.shared.recordRecentlyCompleted(
             messageIds: ["500", EmailFilter.normalizeMessageId("<new-500@ex.com>")])
         defer { Task { await AccountManager.shared.clearRecentlyCompletedForTesting() } }
-        let result = try await SyncEngine.runSyncMessages(
+        let result = try await SyncEngine.runListing(
             for: folder, provider: missingFetchMock(), limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
 
         #expect(!result.staleIds.contains(headerId),
                 "a protected just-arrived message must not be stale-deleted by a racing sync")
@@ -87,9 +94,9 @@ struct StaleProtectionTests {
         let (folder, headerId) = try seed(pool)
 
         await AccountManager.shared.clearRecentlyCompletedForTesting()  // no protection
-        let result = try await SyncEngine.runSyncMessages(
+        let result = try await SyncEngine.runListing(
             for: folder, provider: missingFetchMock(), limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
 
         #expect(result.staleIds.contains(headerId),
                 "an unprotected message the fetch missed IS stale-deleted — the pre-fix drop race")

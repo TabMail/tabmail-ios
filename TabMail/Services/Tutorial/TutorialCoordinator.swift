@@ -75,12 +75,15 @@ final class TutorialCoordinator {
     private(set) var teachesChat = false
 
     /// Whether a run starting now teaches in the chat view: the user's Chat View setting with AI
-    /// on, since the tutorial opens the AI gate itself and only an AI opt-out keeps it off.
+    /// on, since the tutorial opens the AI gate itself and only an AI opt-out keeps it off. The
+    /// tour is a scripted demo that sends no AI request and touches no mail of the user's, so it
+    /// does not wait for the AI choice (`AIService.isAIOff`): a first-launch tour, before the
+    /// choice, teaches the chat view.
     static var chatViewOnForTutorial: Bool {
         ChatViewConfig.isActive(
             enabledByUser: ChatViewConfig.isEnabledByUser,
             aiOn: ChatViewConfig.isAIOn(
-                optedOut: AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey), subscribed: true))
+                aiOff: AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey), subscribed: true))
     }
 
     /// The flight question was sent: the chat card moves on to "Check the original".
@@ -345,15 +348,15 @@ final class TutorialCoordinator {
     var highlightsTemplateCreate: Bool { step == .makeTemplate }
 
     /// The practice reply's scripted edit: after the edit's wait, hands the
-    /// declined reply to `apply` (the draft) and records the edit. Nothing
+    /// edited reply, with its text version, to `apply` (the draft) and records the edit. Nothing
     /// happens when the demo run it began in has ended meanwhile (Skip, then a
     /// new run, before the wait is over): the edit belongs to that run alone.
-    func runPracticeReplyEdit(apply: (String) -> Void) async {
+    func runPracticeReplyEdit(apply: (ReplyResult) async -> Void) async {
         let admission = DemoModeStore.shared.chatAdmission
         let edited = TutorialChatScript.editedReply(teachesChat: teachesChat)
         try? await Task.sleep(for: TutorialChatScript.editDuration)
         guard DemoModeStore.admits(admission) else { return }
-        apply(edited)
+        await apply(edited)
         practiceReplyEdited()
     }
 

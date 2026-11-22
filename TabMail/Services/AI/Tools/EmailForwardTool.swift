@@ -12,9 +12,13 @@ import GRDB
 struct EmailForwardTool: AgentTool, Sendable {
     let name = "email_forward"
     private let ctx: ToolContext
+    /// The compose edit a request runs (`EmailReplyTool.ComposeEdit`); tests answer it as the
+    /// backend would.
+    private let composeEdit: EmailReplyTool.ComposeEdit
 
-    init(context: ToolContext? = nil) {
+    init(context: ToolContext? = nil, composeEdit: EmailReplyTool.ComposeEdit? = nil) {
         self.ctx = context ?? ToolContext()
+        self.composeEdit = composeEdit ?? EmailReplyTool.chatComposeEdit
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
@@ -82,21 +86,25 @@ struct EmailForwardTool: AgentTool, Sendable {
         var generatedBody: String? = explicitBody
         if let composeRequest {
             let wrappedRequest = "Forward email with subject \"\(header.subject)\" to recipients: \(recipientsFormatted). Content request: \(composeRequest)"
+            // The related email's body for context, through the one identity-checked read: another
+            // email seated at its address since it was read refuses the request.
+            guard let relatedBodyText = try await ctx.db.read({ db in
+                try ComposeEditContext.relatedBodyText(of: header, db: db)
+            }) else {
+                return ComposeOutcome.failed("the email changed since it was read; nothing was done").describeForLLM
+            }
             do {
-                // Get related email body text for context
-                let relatedBodyText: String? = try? await ctx.db.read { db in
-                    guard let messageBody = try MessageBody.fetchOne(db, key: header.id),
-                          let html = messageBody.htmlContent, !html.isEmpty else { return nil }
-                    return EmailFilter.htmlToPlainText(html)
-                }
                 let result = try await EmailComposeTool.runComposeEdit(
-                    recipients: to + cc,
+                    to: to,
+                    cc: cc,
                     subject: nil,
                     body: nil,
                     request: wrappedRequest,
                     mode: "edit_forward",
                     relatedHeader: header,
-                    relatedBodyText: relatedBodyText
+                    relatedBodyText: relatedBodyText,
+                    db: ctx.db,
+                    composeEdit: composeEdit
                 )
                 generatedSubject = result.subject
                 generatedBody = result.body ?? generatedBody

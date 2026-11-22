@@ -25,7 +25,8 @@ import Testing
 ///     exactly when it goes to the chat's whole audience: the AI Suggestion and a reply asked for
 ///     in the field are Reply All to everyone and a plain reply to the people chosen; a reply the
 ///     agent writes in the open sheet keeps its recipients and is Reply All only when they are the
-///     whole Reply All audience.
+///     whole Reply All audience, compared by address (a mailbox the agent names counts as its
+///     address, in any case; an entry that names no address counts as the text written).
 ///  7. VoiceOver reads who an email went to when it was not everyone.
 ///  8. The field shows the user's words and nothing else, collapsed or in the open sheet: words
 ///     typed or said are never replaced, and a completion empties only the words that were sent.
@@ -60,26 +61,81 @@ struct ChatReplyFieldTests {
 
     // MARK: - 1. The AI Suggestion
 
+    @Test("The e.g. line offers the suggestion's change command while it shows, else the configured example",
+          arguments: [
+            (true, "ask for Friday" as String?, "ask for Friday" as String?),
+            (true, nil, "politely decline"),
+            (true, "   ", "politely decline"),
+            (false, "ask for Friday", "politely decline"),
+            (false, nil, "politely decline"),
+          ])
+    func exampleLine(_ shows: Bool, _ command: String?, _ expected: String?) {
+        let shown = shows ? ReplyResult(body: "Hi Alex", textMessage: "Tuesday works", changeCommand: command) : nil
+        #expect(ChatReplyField.example(shown: shown, configured: "politely decline") == expected)
+    }
+
     @Test("The AI Suggestion shows the reply's text message only for someone else's email with a full reply, to everyone")
     func suggestionText() {
         let ready = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
-        #expect(ChatReplyField.suggestionText(newest: ready, usersTurn: false, onlyTo: nil) == "Tuesday works")
-        #expect(ChatReplyField.suggestionText(newest: ready, usersTurn: true, onlyTo: nil) == nil, "the user's turn")
-        #expect(ChatReplyField.suggestionText(newest: ready, usersTurn: false, onlyTo: [Self.david]) == nil,
+        #expect(ChatReplyField.shown(newest: ready, usersTurn: false, onlyTo: nil)?.textMessage == "Tuesday works")
+        #expect(ChatReplyField.shown(newest: ready, usersTurn: false, onlyTo: nil) == ready.suggestion,
+                "the ghost, the e.g. line and the field's edit read one value")
+        #expect(ChatReplyField.shown(newest: ready, usersTurn: true, onlyTo: nil)?.textMessage == nil, "the user's turn")
+        #expect(ChatReplyField.shown(newest: ready, usersTurn: false, onlyTo: [Self.david])?.textMessage == nil,
                 "written for everyone, so none while the reply goes only to some")
 
         let noReply = Self.header("2", fromAddress: "noreply@example.com", reply: "Hi", replyText: "Hi")
-        #expect(ChatReplyField.suggestionText(newest: noReply, usersTurn: false, onlyTo: nil) == nil, "a no-reply sender")
+        #expect(ChatReplyField.shown(newest: noReply, usersTurn: false, onlyTo: nil)?.textMessage == nil, "a no-reply sender")
 
         let noFullReply = Self.header("3", reply: "", replyText: "Tuesday works")
-        #expect(ChatReplyField.suggestionText(newest: noFullReply, usersTurn: false, onlyTo: nil) == nil, "no full reply stored")
+        #expect(ChatReplyField.shown(newest: noFullReply, usersTurn: false, onlyTo: nil)?.textMessage == nil, "no full reply stored")
         let missingReply = Self.header("4", replyText: "Tuesday works")
-        #expect(ChatReplyField.suggestionText(newest: missingReply, usersTurn: false, onlyTo: nil) == nil)
+        #expect(ChatReplyField.shown(newest: missingReply, usersTurn: false, onlyTo: nil)?.textMessage == nil)
 
         let noText = Self.header("5", reply: "Hi Alex", replyText: "")
-        #expect(ChatReplyField.suggestionText(newest: noText, usersTurn: false, onlyTo: nil) == nil, "no text message")
+        #expect(ChatReplyField.shown(newest: noText, usersTurn: false, onlyTo: nil)?.textMessage == nil, "no text message")
         let missingText = Self.header("6", reply: "Hi Alex")
-        #expect(ChatReplyField.suggestionText(newest: missingText, usersTurn: false, onlyTo: nil) == nil)
+        #expect(ChatReplyField.shown(newest: missingText, usersTurn: false, onlyTo: nil)?.textMessage == nil)
+    }
+
+    /// A late AI Suggestion (ready while the user is busy): hidden while "Writing your email" runs
+    /// and while a compose card is open, shown once the card closes without sending, never after a
+    /// send (the reply in the outbox makes it the user's turn). Whether it shows takes no input from
+    /// the field's words.
+    @Test("A late AI Suggestion is hidden while writing")
+    func lateSuggestionHiddenWhileWriting() {
+        let late = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: true, cardOpen: false) == nil)
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: false, cardOpen: false) == late.suggestion,
+                "shown once writing ends with no card open")
+    }
+
+    @Test("A late AI Suggestion is hidden while the compose card is open")
+    func lateSuggestionHiddenWhileCardOpen() {
+        let late = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: false, cardOpen: true) == nil)
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: true, cardOpen: true) == nil)
+    }
+
+    @Test("A late AI Suggestion shows after the card closes without sending")
+    func lateSuggestionShownAfterCloseWithoutSend() {
+        let late = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        // Closed without sending: no reply in the outbox, still the other side's turn.
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: false, cardOpen: false)?.textMessage == "Tuesday works")
+    }
+
+    @Test("A late AI Suggestion does not show after the card sends")
+    func lateSuggestionNotShownAfterSend() {
+        let late = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        // Sent: the reply in the outbox (or its Sent copy as the newest email) is the user's turn.
+        #expect(ChatReplyField.shown(newest: late, usersTurn: true, onlyTo: nil, writing: false, cardOpen: false) == nil)
+    }
+
+    @Test("A late AI Suggestion shows with no writing and no card open, whatever the field holds")
+    func lateSuggestionShownWithNoWritingOrCard() {
+        let late = Self.header("1", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        #expect(ChatReplyField.shown(newest: late, usersTurn: false, onlyTo: nil, writing: false, cardOpen: false)?.textMessage == "Tuesday works",
+                "shown takes no input from the field, so its words cannot hide the ghost")
     }
 
     private static func phase(_ email: MessageHeader, usersTurn: Bool = false, onlyTo: [ChatThread.Person]? = nil,
@@ -106,6 +162,13 @@ struct ChatReplyFieldTests {
         var filtered = Self.header("r4", reply: "")
         filtered.actionTag = ActionTag.none
         #expect(Self.phase(filtered) == nil, "filtered: no reply will come, no Writing")
+        // A reply stored with no text version shows no ghost, so an untagged Inbox email with
+        // one is still case 2: Writing.
+        let bodyOnly = Self.header("r5", reply: "Hi Alex,\n\nTuesday works.")
+        #expect(bodyOnly.actionTag == nil && bodyOnly.isInInbox)
+        let bodyOnlyShown = ChatReplyField.shown(newest: bodyOnly, usersTurn: false, onlyTo: nil)
+        #expect(bodyOnlyShown == nil, "control: no text version, no ghost")
+        #expect(Self.phase(bodyOnly) == .writing, "untagged in the Inbox with a reply but no ghost: Writing")
         // The same predicate the inbox row reads.
         #expect(AIWorkingRule.isWorking(tagged: true, replyProcessed: false, inInbox: false, aiSourceEnabled: false, subscribed: true))
         #expect(AIWorkingRule.isWorking(tagged: false, replyProcessed: false, inInbox: true, aiSourceEnabled: true, subscribed: false))
@@ -155,14 +218,24 @@ struct ChatReplyFieldTests {
         #expect(Self.count("AIWorkingRule.", in: text) == 4, "no inline copy of the rule")
     }
 
-    @Test("The AI Suggestion's row is the working bubble while the reply is written, then the ghost")
-    func suggestionPhaseWritingThenReady() {
+    @Test("The row's rule is the working bubble while the reply is written, never the ghost")
+    func suggestionPhaseWritingNeverReady() {
         var email = Self.header("w1")
         email.actionTag = .reply
         #expect(Self.phase(email) == .writing, "tagged with no reply yet: Writing")
         email.cachedReply = "Hi Alex,\n\nTuesday works."
         email.replyTextMessage = "Tuesday works"
-        #expect(Self.phase(email) == .ready("Tuesday works"), "the stored reply fills it in")
+        let stored = ChatReplyField.shown(newest: email, usersTurn: false, onlyTo: nil)?.textMessage
+        #expect(stored == "Tuesday works", "control: the stored reply is the ghost the chat shows")
+        #expect(Self.phase(email) == nil, "the stored reply ends Writing; the ghost is the chat's own")
+        // Untagged in the Inbox with an AI source on stays the inbox row's case 2 with its reply
+        // stored; the chat's row still gives no working bubble for it, card open or not.
+        let untagged = Self.header("w2", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        #expect(untagged.actionTag == nil && untagged.isInInbox)
+        let untaggedWorking = AIWorkingRule.isWorking(
+            tagged: false, replyProcessed: true, inInbox: untagged.isInInbox, aiSourceEnabled: true, subscribed: true)
+        #expect(untaggedWorking, "control: the inbox row's rule still counts it as working")
+        #expect(Self.phase(untagged) == nil, "an untagged email with its reply stored: no Writing")
 
         // Nothing where the user cannot use a suggestion.
         var writing = Self.header("w4")
@@ -179,8 +252,10 @@ struct ChatReplyFieldTests {
     func suggestionPhaseNewEmailResetsToWriting() {
         var first = Self.header("n1", minutesAgo: 5, reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
         first.actionTag = .reply
-        let shown = Self.phase(first)
-        #expect(shown == .ready("Tuesday works"))
+        #expect(Self.phase(first) == nil, "the row's rule adds no Writing under the ghost")
+        let firstText = ChatReplyField.shown(newest: first, usersTurn: false, onlyTo: nil)?.textMessage
+        #expect(firstText == "Tuesday works", "control: the first email's ghost shows")
+        let shown = ChatSuggestionPhase.ready("Tuesday works")
 
         // The usual arrival: staged before it is tagged.
         var second = Self.header("n2", inReplyTo: first.rfc822MessageId)
@@ -195,8 +270,10 @@ struct ChatReplyFieldTests {
 
         second.cachedReply = "Hi Alex,\n\nSee you then."
         second.replyTextMessage = "See you then"
-        let ready = Self.phase(second)
-        #expect(ready == .ready("See you then"))
+        #expect(Self.phase(second) == nil, "its stored reply ends Writing")
+        let secondText = ChatReplyField.shown(newest: second, usersTurn: false, onlyTo: nil)?.textMessage
+        #expect(secondText == "See you then", "control: its ghost shows")
+        let ready = ChatSuggestionPhase.ready("See you then")
         #expect(ChatSuggestionPhase.fills(from: afterArrival, to: ready), "the working bubble grows into the ghost")
 
         #expect(!ChatSuggestionPhase.fills(from: nil, to: ready), "a ghost with no working bubble before it shows at once")
@@ -557,24 +634,36 @@ struct ChatReplyFieldTests {
     @Test("The chat opens compose for the AI Suggestion, empties the field after a send, and shows the outbox's unsent replies")
     func chatWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(Self.count("readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make( replyAllTo: newest, accounts: context.accounts))", in: text) == 1)
-        #expect(Self.count("onAgentOutcome: onOutcome)", in: text) == 3, "every agent compose")
-        #expect(Self.count("onAgentOutcome:", in: text) == 4)
+        #expect(Self.count("readyReply = ChatReadyReply(message: newest, suggestion: shown, accounts: context.accounts)", in: text) == 1)
+        #expect(Self.count("req.composeView(account:", in: text) == 1, "every agent compose opens through the one presenter")
+        #expect(Self.count("onAgentOutcome:", in: text) == 1, "only the AI Suggestion's card")
         #expect(Self.count("composeEnded(.", in: text) == 0 && Self.count("{ _ in composeEnded", in: text) == 0)
         // The AI Suggestion's card is not a send from the field: its outcome leaves the field's
         // words alone (a completion with no field send would empty them).
-        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestedBody: ready.message.cachedReply, draftId: ready.draftId, onAgentOutcome: { _ in })", in: text) == 1,
-                "the card holds the tapped row's reply and never completes the field")
+        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId, onAgentOutcome: { _ in })", in: text) == 1,
+                "the card holds the suggestion the ghost showed and never completes the field")
         #expect(Self.count("@State private var example = ChatSuggestionConfig.randomExample()", in: text) == 1,
                 "one example per chat open, kept across redraws")
         #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
         // Who the reply goes to and whose turn it is decide whether the suggestion shows.
-        #expect(Self.count("let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty", in: text) == 1)
+        #expect(Self.count("let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty", in: text) == 2,
+                "the suggestion and the working bubble read the user's turn the same way")
+        #expect(Self.count("guard viewModel.hasLoadedThread, context.isLoaded, context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }", in: text) == 1,
+                "no suggestion before the thread and accounts load")
+        // Every compose card the chat opens hides it; "Writing your email" hides it.
+        #expect(Self.count("let cardOpen = readyReply != nil || agentCompose != nil || forwardMessage != nil", in: text) == 1)
+        #expect(Self.count("ChatReplyField.shown( newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only, writing: chatWorking, cardOpen: cardOpen)", in: text) == 1)
+        // The working bubble: the inbox row's rule, never while the agent works on the field's request.
         #expect(Self.count("guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking, context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }", in: text) == 1,
-                "no suggestion before the thread and accounts load, or while the agent works")
-        #expect(Self.count("ChatReplyField.suggestionPhase(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only, aiSourceEnabled: aiSourceEnabled, subscribed: subscribed)", in: text) == 1)
+                "no working bubble before the thread and accounts load, or while the agent works")
+        #expect(Self.count("return ChatReplyField.suggestionPhase(newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only, aiSourceEnabled: aiSourceEnabled, subscribed: subscribed)", in: text) == 1,
+                "the working bubble is the row's rule as it is (it never yields the ghost)")
         #expect(Self.count("let aiSourceEnabled = AIWorkingRule.anyAISourceEnabled( demoHidesAI: DemoModeStore.shared.hidesAIContent, optedOutAllAI: optOutAllAI, deviceSyncAuto: DeviceSyncService.shared.isAutoEnabled, subscribed: subscribed)", in: text) == 1,
                 "the chat reads the inbox row's AI-source rule")
+        // The ghost is only ever the suggestion the chat shows; the row's rule adds the working bubble alone.
+        #expect(Self.count("if let text = shown?.textMessage { return .ready(text) }", in: text) == 1)
+        #expect(Self.count("suggestionPhase(on: $0, shown: shown, thread: thread)", in: text) == 1,
+                "the row's phase takes the suggestion the chat shows, whichever card is open")
         #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1,
                 "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
@@ -646,8 +735,8 @@ struct ChatReplyFieldTests {
                 "the e.g. line shows only on an empty, signed-in field, never while dictating")
 
         let compose = try Self.source("TabMail/Views/Compose/ComposeView.swift")
-        #expect(Self.count("if outcome == .written { await postMessageDataDidChange(reply.id) }", in: compose) == 2,
-                "both the edit and the Recompute writer refresh an open chat after a stored write")
+        #expect(Self.count("if outcome == .written { await postMessageDataDidChange(reply.id) }", in: compose) == 1,
+                "the one writer, used by the edit and the Recompute, refreshes an open chat after a stored write")
     }
 
     // MARK: - 6b. Reply All is recorded exactly when the reply goes to the chat's whole audience
@@ -670,14 +759,13 @@ struct ChatReplyFieldTests {
 
     /// The compose card the chat opens for the AI Suggestion, as the chat's cover builds it.
     private static func card(_ message: MessageHeader, accounts: [Account] = [me]) -> ComposeView {
-        ChatReplyCompose.make(replyAllTo: message, accounts: accounts)
-            .composeView(replyTo: message, onAgentOutcome: { _ in })
+        let ready = ChatReadyReply(message: message, suggestion: message.suggestion ?? .filtered, accounts: accounts)
+        return ready.compose.composeView(replyTo: message, suggestion: ready.suggestion, draftId: ready.draftId, onAgentOutcome: { _ in })
     }
 
     /// The compose card the chat opens for the agent's reply, as the chat's cover builds it.
     private static func card(agent request: AgentToolRouter.ComposeRequest, accounts: [Account]) -> ComposeView {
-        ChatReplyCompose.make(agent: request, accounts: accounts)
-            .composeView(replyTo: request.replyTo, suggestedBody: request.body, onAgentOutcome: { _ in })
+        request.composeView(account: accounts.first, onOutcome: { _ in })
     }
 
     /// Where the agent's reply was asked for: the open sheet, or the reply field with who was
@@ -693,7 +781,8 @@ struct ChatReplyFieldTests {
         let compose = Self.card(email)
         #expect(compose.isReplyAll, "the send records a Reply All on the original")
         #expect(compose.prefillTo == ["alex@example.com", "david@example.com"] && compose.prefillCc == ["sam@example.com"])
-        #expect(compose.prefillBcc == nil && compose.replyTo?.id == email.id && !compose.isForward)
+        #expect(compose.prefillBcc == [] && compose.replyTo?.id == email.id && !compose.isForward)
+        #expect(compose.prefillSubject == ThreadUtils.replySubject(for: email.subject))
     }
 
     /// The reply request the AI reply tool opens for `arguments`, on an email from
@@ -710,7 +799,7 @@ struct ChatReplyFieldTests {
         await translator.seed(header.id, as: 1)
         let tool = EmailReplyTool(context: ToolContext(db: db, translator: translator, router: router))
         var fieldReply: ChatFieldReply?
-        if case .field(let onlyTo) = origin { fieldReply = ChatFieldReply(emailKey: ChatThread.copyKey(header), onlyTo: onlyTo) }
+        if case .field(let onlyTo) = origin { fieldReply = ChatFieldReply(email: header, onlyTo: onlyTo) }
         let invocation = ToolInvocation(fieldReply: fieldReply)
         let task = Task { @MainActor () -> String in
             try await tool.execute(
@@ -736,10 +825,12 @@ struct ChatReplyFieldTests {
             "add_bcc": .array([.string("hidden@example.com")]),
         ]
         let (chosen, chosenAccounts) = try await Self.agentReplyRequest(widening, from: .field(onlyTo: [Self.david.address]))
-        #expect(chosen.mode == .reply && chosen.bcc == ["hidden@example.com"] && chosen.cc.contains("extra@example.com"))
+        #expect(chosen.mode == .reply && !chosen.isReplyAll && chosen.to == [Self.david.address] && chosen.cc.isEmpty && chosen.bcc.isEmpty,
+                "the request itself is the plain reply to David: the agent's added people are not applied")
+        #expect(chosen.subject == ThreadUtils.replySubject(for: "Plans"), "the reply subject")
         let toChosen = Self.card(agent: chosen, accounts: chosenAccounts)
         #expect(!toChosen.isReplyAll, "Replying only to David is a plain reply")
-        #expect(toChosen.prefillTo == [Self.david.address] && toChosen.prefillCc == nil && toChosen.prefillBcc == nil,
+        #expect(toChosen.prefillTo == [Self.david.address] && toChosen.prefillCc == [] && toChosen.prefillBcc == [],
                 "Replying only to David: nobody else, seen or hidden")
 
         let (req, accounts) = try await Self.agentReplyRequest(widening, from: .field(onlyTo: nil))
@@ -754,7 +845,7 @@ struct ChatReplyFieldTests {
         let (everyone, accounts) = try await Self.agentReplyRequest([:], from: .field(onlyTo: nil))
         let whole = Self.card(agent: everyone, accounts: accounts)
         #expect(whole.isReplyAll, "the agent's reply goes to the whole audience: Reply All")
-        #expect(whole.prefillTo == everyone.to && whole.prefillCc == (everyone.cc.isEmpty ? nil : everyone.cc))
+        #expect(whole.prefillTo == everyone.to && whole.prefillCc == everyone.cc)
 
         let (narrowed, narrowedAccounts) = try await Self.agentReplyRequest(
             ["remove_recipients": .array([.string("team@example.com")])], from: .field(onlyTo: nil))
@@ -762,7 +853,7 @@ struct ChatReplyFieldTests {
                 "the agent itself left team@example.com out")
         let fewer = Self.card(agent: narrowed, accounts: narrowedAccounts)
         #expect(!fewer.isReplyAll, "someone left out by the agent: a plain reply, never recorded as Reply All")
-        #expect(fewer.prefillTo == ["sender@example.com"] && fewer.prefillCc == nil && fewer.prefillBcc == nil,
+        #expect(fewer.prefillTo == ["sender@example.com"] && fewer.prefillCc == [] && fewer.prefillBcc == [],
                 "the card goes to the agent's recipients only")
     }
 
@@ -789,13 +880,175 @@ struct ChatReplyFieldTests {
         #expect(!swapped.isReplyAll, "someone added but someone dropped: a plain reply")
     }
 
+    /// The agent names a recipient as `{name, email}`, which the reply tool keeps as a mailbox
+    /// with its display name (`"Team Lead" <team@example.com>`). Moving an original To recipient
+    /// to Cc that way keeps everyone, so the card is still Reply All: the audience is compared by
+    /// address, not by the text the agent wrote.
+    @Test("A reply the agent moves someone from To to Cc by name is still Reply All, and the card keeps the name and the Cc")
+    func agentReplyThatMovesSomeoneToCcByNameIsStillReplyAll() async throws {
+        let teamLead: JSONValue = .dictionary(["name": .string("Team Lead"), "email": .string("team@example.com")])
+        for origin in [Origin.field(onlyTo: nil), .sheet] {
+            let (moved, accounts) = try await Self.agentReplyRequest([
+                "remove_recipients": .array([.string("team@example.com")]),
+                "add_cc": .array([teamLead]),
+            ], from: origin)
+            #expect(moved.to == ["sender@example.com"] && moved.bcc.isEmpty, "control: team@example.com left To")
+            let named = RecipientEntry(moved.cc).recipients
+            let expectedCc = [RecipientEntry.Recipient(address: "team@example.com", name: "Team Lead")]
+            #expect(named == expectedCc, "control: the agent's Cc is the named mailbox, not a bare address")
+            let compose = Self.card(agent: moved, accounts: accounts)
+            #expect(compose.isReplyAll, "everyone in the Reply All audience is on it, one of them by name in Cc: Reply All")
+            #expect(compose.prefillTo == ["sender@example.com"], "the card keeps the To the agent chose")
+            #expect(compose.prefillCc == moved.cc && compose.prefillBcc == moved.bcc,
+                    "the card keeps the agent's Cc as written, and its empty Bcc exactly")
+            let cardCc = RecipientEntry(compose.prefillCc ?? []).recipients
+            #expect(cardCc == expectedCc, "the card's Cc is team@example.com, under its name")
+        }
+
+        // The narrowed control: the agent names someone else in Cc and leaves team@example.com out.
+        let otherLead: JSONValue = .dictionary(["name": .string("Team Lead"), "email": .string("lead@example.com")])
+        let (narrowed, narrowedAccounts) = try await Self.agentReplyRequest([
+            "remove_recipients": .array([.string("team@example.com")]),
+            "add_cc": .array([otherLead]),
+        ], from: .field(onlyTo: nil))
+        let fewer = Self.card(agent: narrowed, accounts: narrowedAccounts)
+        #expect(!fewer.isReplyAll, "someone of the audience left out, another named instead: a plain reply")
+        #expect(fewer.prefillTo == ["sender@example.com"] && fewer.prefillCc == narrowed.cc,
+                "the card goes to the agent's recipients only")
+    }
+
+    /// A Reply-To entry that names no sendable address (`Undisclosed-Recipients:;`) is part of the
+    /// Reply All audience as the text written: the card keeps it, so leaving it out narrows the
+    /// audience as leaving out a person does, and keeping it in another case or in another field
+    /// (To, Cc or Bcc) does not. The entry is written in mixed case on both sides, so the
+    /// comparison must fold the case of each.
+    @Test("An audience entry that names no address counts as its text: left out it is a plain reply, kept in any case or field it is Reply All")
+    func audienceEntryWithNoAddressCountsAsItsText() {
+        let entry = "Undisclosed-Recipients:;"
+        var email = Self.header("n1")
+        email.replyTo = "Alex Doe <alex@example.com>, \(entry)"
+        email.to = "me@example.com, david@example.com"
+        email.cc = "sam@example.com"
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: email, accounts: [Self.me])
+        #expect(envelope.to == ["alex@example.com", entry, "david@example.com"] && envelope.cc == ["sam@example.com"],
+                "control: the audience holds the entry as written, beside the addresses")
+        let unchanged = envelope.with(recipients: envelope.recipients, subject: envelope.subject)
+        #expect(unchanged.isReplyAll, "control: the whole audience, unchanged, is Reply All")
+
+        let addressesOnly = envelope.recipients.filling(to: RecipientEntry(["alex@example.com", "david@example.com"]))
+        #expect(addressesOnly.to.tokens == ["alex@example.com", "david@example.com"] && addressesOnly.to.rejected.isEmpty,
+                "control: every address kept, the entry left out")
+        let withoutEntry = envelope.with(recipients: addressesOnly, subject: envelope.subject)
+        #expect(!withoutEntry.isReplyAll, "the entry that names no address left out: the audience narrowed, a plain reply")
+
+        let otherCase = envelope.recipients.filling(
+            to: RecipientEntry(["alex@example.com", "UNDISCLOSED-RECIPIENTS:;", "david@example.com"]))
+        #expect(otherCase.to.rejected == ["UNDISCLOSED-RECIPIENTS:;"], "control: the entry kept, written in another case")
+        let entryInOtherCase = envelope.with(recipients: otherCase, subject: envelope.subject)
+        #expect(entryInOtherCase.isReplyAll, "the whole audience kept, the entry in another case: Reply All")
+
+        let inCc = envelope.recipients.filling(
+            to: RecipientEntry(["alex@example.com", "david@example.com"]), cc: RecipientEntry(["sam@example.com", entry]))
+        #expect(inCc.to.rejected.isEmpty && inCc.cc.rejected == [entry], "control: the entry moved to Cc")
+        let entryInCc = envelope.with(recipients: inCc, subject: envelope.subject)
+        #expect(entryInCc.isReplyAll, "the whole audience kept, the entry only in Cc: Reply All")
+
+        let inBcc = envelope.recipients.filling(
+            to: RecipientEntry(["alex@example.com", "david@example.com"]), bcc: RecipientEntry([entry]))
+        #expect(inBcc.to.rejected.isEmpty && inBcc.cc.rejected.isEmpty && inBcc.bcc.rejected == [entry],
+                "control: the entry moved to Bcc")
+        let entryInBcc = envelope.with(recipients: inBcc, subject: envelope.subject)
+        #expect(entryInBcc.isReplyAll, "the whole audience kept, the entry only in Bcc: Reply All")
+
+        let davidInBcc = envelope.recipients.filling(
+            to: RecipientEntry(["alex@example.com", entry]), bcc: RecipientEntry(["david@example.com"]))
+        #expect(davidInBcc.to.tokens == ["alex@example.com"] && davidInBcc.bcc.tokens == ["david@example.com"],
+                "control: David moved to Bcc")
+        let davidOnlyInBcc = envelope.with(recipients: davidInBcc, subject: envelope.subject)
+        #expect(davidOnlyInBcc.isReplyAll, "the whole audience kept, David only in Bcc: Reply All")
+
+        let davidLeftOut = envelope.recipients.filling(to: RecipientEntry(["alex@example.com", entry]))
+        let withoutDavid = envelope.with(recipients: davidLeftOut, subject: envelope.subject)
+        #expect(!withoutDavid.isReplyAll, "a person left out, the entry kept: a plain reply")
+    }
+
+    /// The audience is compared as compose reads its fields: each mailbox by its address in any
+    /// case, wherever the agent puts it (To, Cc or Bcc alone, by name, the same person in both To
+    /// and Cc), and an entry that names no sendable address (a Reply-To's
+    /// `undisclosed-recipients:;`) as the text written, so a reply that leaves that entry out
+    /// leaves part of the audience out. The valid recipients stay the same in the two cases that
+    /// differ only in that entry. The reply tool decides the kind on the AI Suggestion's envelope
+    /// (`ChatReplyCompose.with`), from the field and the sheet alike, and the card takes the
+    /// request as it is (`ComposeRequest.composeView`).
+    @Test("""
+    A reply the agent writes to mixed-case named mailboxes is Reply All exactly when it holds the \
+    whole audience, a Reply-To entry with no address included and someone moved to Bcc alone; \
+    the card keeps each field's mailboxes with their names and case, and the entry as written
+    """)
+    func agentReplyAudienceIsComparedAsComposeReadsIt() {
+        // The Reply-To writes the entry with no address in another case than the agent does, so
+        // both sides of the comparison must fold the case.
+        let startEntry = "Undisclosed-Recipients:;"
+        var email = Self.header("n1")
+        email.replyTo = "Alex Doe <alex@example.com>, \(startEntry)"
+        email.to = "me@example.com, David Roe <David@Example.com>"
+        email.cc = "Sam Poe <sam@example.com>"
+        let audience = buildReplyAllRecipients(for: email, allAccounts: [Self.me])
+        #expect(audience.to == ["alex@example.com", startEntry, "david@example.com"] && audience.cc == ["sam@example.com"],
+                "control: the audience is Alex, the entry with no address as written, David and Sam")
+
+        let alex = "\"Alex Doe\" <Alex@Example.com>"
+        let noAddress = "undisclosed-recipients:;"
+        let davidTo = "\"David Roe\" <DAVID@example.com>"
+        let davidCc = "\"David Roe\" <david@EXAMPLE.com>"
+        let sam = "\"Sam Poe\" <Sam@Example.COM>"
+        let davidBcc = "\"David Roe\" <David@EXAMPLE.com>"
+        let written = RecipientEntry([alex, noAddress, davidTo, sam, davidCc])
+        #expect(written.addresses == ["Alex@Example.com", "DAVID@example.com", "Sam@Example.COM"] && written.leftovers == [noAddress],
+                "control: the agent's mailboxes keep their mixed case, David counts once, the entry stays as written")
+
+        // Each case: the agent's To, Cc and Bcc, and whether they hold the whole audience. The first
+        // two differ only in the entry with no address; Alex is in To alone. In the last, the agent
+        // moved David from To to Bcc and nowhere else: he still gets the reply, so it is Reply All.
+        let cases: [(name: String, to: [String], cc: [String], bcc: [String], whole: Bool)] = [
+            ("everyone, David in To and in Cc", [alex, noAddress, davidTo], [sam, davidCc], [], true),
+            ("the entry with no address left out", [alex, davidTo], [sam, davidCc], [], false),
+            ("David left out", [alex, noAddress], [sam], [], false),
+            ("everyone, David moved to Bcc alone", [alex, noAddress], [sam], [davidBcc], true),
+        ]
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: email, accounts: [Self.me])
+        #expect(envelope.to == ["alex@example.com", startEntry, "david@example.com"] && envelope.cc == ["sam@example.com"],
+                "control: the AI Suggestion's envelope keeps the entry as the Reply-To wrote it, not as the agent does")
+        for item in cases {
+            // As the AI reply tool builds it: the AI Suggestion's envelope, as the agent edited it.
+            let edited = envelope.with(
+                recipients: ComposeDraftGuards.Recipients().filling(
+                    to: RecipientEntry(item.to), cc: RecipientEntry(item.cc), bcc: RecipientEntry(item.bcc)),
+                subject: envelope.subject)
+            let request = AgentToolRouter.ComposeRequest(
+                mode: .reply, replyTo: email, to: edited.to, cc: edited.cc, bcc: edited.bcc,
+                subject: edited.subject, body: "Friday works", isReplyAll: edited.isReplyAll)
+            let compose = Self.card(agent: request, accounts: [Self.me])
+            #expect(compose.isReplyAll == item.whole, "\(item.name): Reply All is \(item.whole)")
+            let fields: [(name: String, card: [String]?, agent: [String])] = [
+                ("To", compose.prefillTo, item.to), ("Cc", compose.prefillCc, item.cc), ("Bcc", compose.prefillBcc, item.bcc),
+            ]
+            for field in fields {
+                let card = RecipientEntry(field.card ?? [])
+                let agent = RecipientEntry(field.agent)
+                #expect(card.recipients == agent.recipients && card.leftovers == agent.leftovers,
+                        "\(item.name): the card's \(field.name) keeps the agent's mailboxes, their names and their case, and the entry as written")
+            }
+        }
+    }
+
     @Test("A reply the agent writes in the open sheet keeps its recipients, and is Reply All only to the whole audience")
     func agentReplyFromTheSheetKeepsItsRecipients() async throws {
         let (everyone, accounts) = try await Self.agentReplyRequest([:], from: .sheet)
         #expect(everyone.fieldReply == nil, "control: asked for in the sheet, the request carries no field choice")
         let all = Self.card(agent: everyone, accounts: accounts)
         #expect(all.isReplyAll, "the agent's reply goes to the whole audience")
-        #expect(all.prefillTo == everyone.to && all.prefillCc == (everyone.cc.isEmpty ? nil : everyone.cc))
+        #expect(all.prefillTo == everyone.to && all.prefillCc == everyone.cc)
 
         let (widened, widenedAccounts) = try await Self.agentReplyRequest(["add_cc": .array([.string("extra@example.com")])], from: .sheet)
         let compose = Self.card(agent: widened, accounts: widenedAccounts)
@@ -879,7 +1132,9 @@ struct ChatReplyFieldTests {
         // the no-reply notice rather than over them: hung by its bottom from the stack's top edge.
         // Only while the whole card fits between the header and the stack: otherwise nothing, so
         // the tip waits for room and keeps its one showing.
-        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop)) Color.clear.frame(height: 0) // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipWait()) } .frame(height: tipRoom, alignment: .bottom) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
+        // While it waits, the card `ViewThatFits` did not pick is hidden from VoiceOver, which would
+        // otherwise read a card that is not on screen.
+        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) // `ViewThatFits` keeps the candidate it did not pick in the // accessibility tree: VoiceOver must not read a card that is not // on screen while the stand-in shows. .accessibilityHidden(tipWaitsForRoom) // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop)) Color.clear.frame(height: 0) .onAppear { tipWaitsForRoom = true } .onDisappear { tipWaitsForRoom = false } // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipWait()) } .frame(height: tipRoom, alignment: .bottom) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
         let room = try Self.body(of: "private var tipRoom: CGFloat {", in: chat)
         #expect(Self.count("let room = pillTop - headerBottom return room.isFinite ? max(0, room) : 0", in: room) == 1,
                 "the measured space between the header's bottom and the stack's top; none until measured")
@@ -964,8 +1219,15 @@ struct ChatReplyFieldTests {
         // One bridge for every chat pan: the field's drag reads the swipes' sample and outcome, with
         // no delivery of its own.
         let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
-        #expect(Self.count("ChatHorizontalPan.deliver(recognizer, moved: { moved(coordinator.share($0)) }, ended: { ended(coordinator.share($0), $1) })", in: swipe) == 1,
-                "the field's pan hands on only the field's share of each sample (`ChatFieldPan.Coordinator.share`)")
+        #expect(Self.count("ChatHorizontalPan.deliver(recognizer, moved: { moved(coordinator.share($0)) }, ended: { coordinator.letGo() ended(coordinator.share(ChatFieldDrag.letGo($0, rested: recognizer.restedBeforeLift)), $1) })", in: swipe) == 1,
+                "the field's pan hands on only the field's share of each sample (`ChatFieldPan.Coordinator.share`), its let-go at rest after a hold (`ChatFieldDrag.letGo`)")
+        // The rest is read on the touches' clock from the last move to the lift; a touch coming
+        // down is not a move (a second finger landing during a hold leaves it a hold), and each
+        // new drag starts with nothing.
+        #expect(Self.count("override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) { moved(at: event.timestamp) super.touchesMoved(touches, with: event) }", in: swipe) == 1)
+        #expect(Self.count("override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) { lifted(at: event.timestamp) super.touchesEnded(touches, with: event) }", in: swipe) == 1)
+        #expect(Self.count("override func touchesBegan(", in: swipe) == 0)
+        #expect(Self.count("override func reset() { super.reset() lastMove = nil lift = nil }", in: swipe) == 1)
         #expect(Self.count("static func deliver(", in: swipe) == 2, "the bridge's, and the swipe's sideways reading of it")
         #expect(Self.count("recognizer.translation(in:", in: swipe) == 1, "one place samples a pan")
         // VoiceOver opens the panel with a named action on the text field it focuses, offered only
@@ -1027,16 +1289,15 @@ struct ChatReplyFieldTests {
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(Self.count("onlyTo: replyTarget.only, tutorialMove: tutorialMove(thread),", in: chat) == 1, "the field knows the people chosen")
+        // The field itself; the suggestion's rule takes them too (`shownSuggestion`, pinned above).
+        #expect(Self.count("clearCount: fieldClearCount, onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
         // Both reply cards open through the one helper, read as the card opens: Reply All exactly
         // when the reply goes to everyone, and the recipients with it.
-        #expect(Self.count("agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))", in: chat) == 1,
-                "the agent's card is read from its request alone (who it goes to is the request's: ChatReplyComposeOriginTests)")
-        #expect(Self.count("case .reply: card.reply.composeView(replyTo: req.replyTo, suggestedBody: req.body, onAgentOutcome: onOutcome)", in: chat) == 1,
-                "the agent's reply card opens in the helper's kind")
-        #expect(Self.count("ChatReplyCompose.make(", in: chat) == 2, "the AI Suggestion and the agent's reply")
-        #expect(Self.count("isReplyAll", in: chat) == 0 && Self.count("buildReplyAllRecipients", in: chat) == 1,
-                "no card decides the kind or the Reply All recipients itself; the one call left is the header's people")
+        #expect(Self.count("agentCompose = req", in: chat) == 1,
+                "the agent's card is its request, exactly as the reply tool built it (ChatReplyComposeOriginTests)")
+        #expect(Self.count("ChatReplyCompose.", in: chat) == 0, "the chat builds no envelope of its own")
+        #expect(Self.count("isReplyAll", in: chat) == 0,
+                "no card decides the kind or the Reply All recipients itself")
         // A card from a field request: the agent's closing words open nothing; a field send starts afresh.
         #expect(Self.count("fieldComposeOpened = req.fieldReply != nil", in: chat) == 1)
         #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false })", in: chat) == 1)
@@ -1051,7 +1312,7 @@ struct ChatReplyFieldTests {
                 "a new newest email resets the choice, even one whose UID matches the last")
 
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
-        #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply) }", in: island) == 1,
+        #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) }", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
         #expect(Self.count("let fieldReply = field?.fieldReply", in: island) == 1)
         #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)", in: island) == 1,

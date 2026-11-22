@@ -24,28 +24,26 @@ extension SyncEngine {
     }
 
     /// One change pass: the provider's change reader under the generic apply
-    /// (ADR-IOS-111) when it has one, otherwise that provider's remaining delta.
+    /// (ADR-IOS-111). A provider without a reader (Demo, test providers) reads
+    /// nothing.
     /// - Parameter deadline: the caller's own deadline for the pass (its
     ///   timeout), or nil when it sets none. A reader's read budget ends early
     ///   enough for what it read to be applied before it (`changeReadEnd`).
+    /// - Parameter pass: the foreground pass this change pass belongs to, whose
+    ///   full-sync stamp its unproven listings withhold; nil for none.
     func performChangePass(
-        account: Account, provider: any EmailProvider, inboxOnly: Bool = false, deadline: Date? = nil
+        account: Account, provider: any EmailProvider, inboxOnly: Bool = false, deadline: Date? = nil, pass: UUID? = nil
     ) async throws -> ChangePassOutcome {
+        await redriveArmedTurnovers(accountId: account.id)
         if let outcome = try await readAndApplyChanges(
-            account: account, provider: provider, scope: inboxOnly ? .inboxOnly : .all, deadline: deadline) {
+            account: account, provider: provider, scope: inboxOnly ? .inboxOnly : .all, deadline: deadline, pass: pass) {
             return outcome
         }
-        let result: (succeeded: Bool, hadChanges: Bool)
-        if (account.provider == .imap || account.provider == .icloud), let imapProvider = provider as? IMAPProvider {
-            result = try await imapDeltaSync(account: account, provider: imapProvider, inboxOnly: inboxOnly)
-        } else {
-            result = (false, false)
-        }
-        return ChangePassOutcome(succeeded: result.succeeded, hadChanges: result.hadChanges)
+        return ChangePassOutcome()
     }
 
     /// Publish downloading phase for a specific account.
-    private func publishDownloading(_ count: Int, forAccount accountId: String) {
+    func publishDownloading(_ count: Int, forAccount accountId: String) {
         Task { @MainActor in
             AccountManagerState.shared.setSyncPhase(.downloading(count), forAccount: accountId)
         }
@@ -59,8 +57,16 @@ extension SyncEngine {
     /// nonisolated for unit testing; the epoch (UIDVALIDITY) subtlety is handled safely
     /// upstream because this only gates FETCHING, never deletion.
     nonisolated static func modSeqIndicatesChange(server: Int?, cached: Int?) -> Bool {
-        guard let server, let cached else { return false }
+        guard let server = knownModSeq(server), let cached = knownModSeq(cached) else { return false }
         return server != cached
+    }
+
+    /// A HIGHESTMODSEQ that tracks changes, or nil. RFC 7162 §3.1.2.2: a mailbox
+    /// that does not keep mod-sequences (NOMODSEQ) reports 0 in STATUS, which is
+    /// no value to compare, so 0 normalises to nil like an absent one.
+    nonisolated static func knownModSeq(_ value: Int?) -> Int? {
+        guard let value, value > 0 else { return nil }
+        return value
     }
 
     /// A UIDVALIDITY the server ACTUALLY reported, or nil for "unknown" — the
@@ -347,193 +353,5 @@ extension SyncEngine {
             // static reports whether its UPDATE matched.
             _ = try Self.bootstrapFolderUidValidity(db, folderId: folderId, observed: observed)
         }
-    }
-
-    /// IMAP delta sync using STATUS-based change detection.
-    /// Calls STATUS on each folder to check uidNext/messageCount — skips unchanged folders.
-    private func imapDeltaSync(account: Account, provider: IMAPProvider, inboxOnly: Bool = false) async throws -> (succeeded: Bool, hadChanges: Bool) {
-        let folders = try await dbPool.read { db in
-            try Folder.filter(Column("accountId") == account.id).fetchAll(db)
-        }
-        let syncableFolders = folders.filter { folder in
-            guard !folder.path.isEmpty else { return false }
-            if inboxOnly {
-                // BGAppRefresh: only check inbox to minimize battery drain
-                return folder.role == .inbox
-            }
-            return primaryRoles.contains(folder.role) ||
-                secondaryRoles.contains(folder.role) ||
-                folder.isFavorite
-        }
-
-        guard !syncableFolders.isEmpty else { return (true, false) }
-
-        // SELECT INBOX + NOOP flushes pending server-side state — without this,
-        // some IMAP servers return cached STATUS values on persistent connections
-        // and miss new mail. SELECT is the lowest-common-denominator approach.
-        try await provider.flushServerState()
-
-        var anyChanged = false
-        for folder in syncableFolders {
-            // T4.S6 re-drive: a folder left quarantined by an interrupted reaction
-            // branches into the reaction rather than being delta-synced. Same
-            // ownership rule as full sync's per-folder loop.
-            if folder.uidValidityResetPendingAt != nil {
-                await AccountManager.shared.runUidValidityResetReaction(
-                    accountId: account.id, folderPath: folder.path
-                )
-                continue
-            }
-            let status = try await provider.folderStatus(path: folder.path)
-
-            // T4.S6 free trigger: STATUS reports UIDVALIDITY at no extra cost on a
-            // UIDPLUS server. Both sides must be KNOWN — a server that omits the
-            // attribute yields no signal (nil), and a folder whose epoch has never
-            // been bootstrapped has nothing to disagree with. This is a TRIGGER, not
-            // a guard: it decides nothing about this folder's pass, and the reaction
-            // it fires re-reads every value fresh rather than trusting these.
-            if let observedStatusEpoch = Self.knownUidValidity(status.uidValidity).flatMap({ UInt32(exactly: $0) }),
-               let storedEpoch = Self.knownUidValidity(folder.lastKnownUidValidity).flatMap({ UInt32(exactly: $0) }),
-               observedStatusEpoch != storedEpoch {
-                AccountManager.shared.fireUidValidityChangeHandler(
-                    accountId: account.id, folderPath: folder.path,
-                    storedValue: storedEpoch, observedValue: observedStatusEpoch
-                )
-                continue
-            }
-
-            let uidNextChanged = folder.lastKnownUidNext != nil && status.uidNext != folder.lastKnownUidNext
-            let countChanged = status.messageCount != folder.totalCount
-            // CONDSTORE flag-awareness (RFC 7162): HIGHESTMODSEQ bumps on \Seen/flag
-            // changes to EXISTING messages that leave uidNext+count unchanged — which the
-            // two checks above MISS today (a message read on another client stays "unread"
-            // on iOS until an unrelated add/delete happens to trip a resync, or never, if
-            // it's below the top-N window). This gate only decides whether we FETCH, never
-            // whether we delete (stale/reconcile own deletions, with their own UIDVALIDITY
-            // guards), so it's safe by construction: a wrong result at worst delays a flag
-            // update one cycle. Non-CONDSTORE servers (nil modseq) and the first
-            // observation (nil cursor) yield no modseq signal → exactly today's behavior.
-            // A UIDVALIDITY change resets the server's modseq, but that also moves
-            // uidNext/count → caught by those; we still refresh the cursor below.
-            let modSeqChanged = Self.modSeqIndicatesChange(
-                server: status.highestModSeq, cached: folder.lastKnownHighestModSeq)
-
-            if !uidNextChanged && !countChanged && !modSeqChanged {
-                BackgroundSyncLogger.logDebug("[Sync] IMAP delta: \(folder.name) unchanged (uidNext=\(status.uidNext), count=\(status.messageCount), modseq=\(status.highestModSeq.map(String.init) ?? "-"))")
-                // A QUIET folder is exactly the folder that would otherwise never get an
-                // epoch: the changed-branch persist below never runs for it, and the
-                // deletion-reconcile walk (the only other writer) only fires on a count
-                // mismatch. BOOTSTRAP the observed UIDVALIDITY before the early return —
-                // and only bootstrap: `uidValidityBootstrapWrite` returns nil the moment
-                // the column holds anything, so the steady state opens no write at all and
-                // a turnover can NEVER be stamped over the epoch the local UIDs belong to
-                // (that would disarm the reconcile walk's abort guard — ADR-IOS-051).
-                //
-                // The pre-read check is a cheap early-out only (WAL etiquette: the steady
-                // state opens no write transaction at all). The BINDING checks are the
-                // `lastKnownUidValidity IS NULL` **and** `NOT EXISTS (… messageHeader …)`
-                // predicates inside the UPDATE itself — `folder` was read BEFORE the
-                // STATUS round trip suspended us, so its epoch is a stale snapshot and a
-                // reentrant path (another sync pass, a merge, the NSE bridge) can have
-                // bootstrapped the column OR inserted the folder's first row in between.
-                // T4.S6b: a QUIET folder that already holds rows is therefore NOT stamped
-                // here — the verified door owns that case.
-                if Self.uidValidityBootstrapWrite(
-                    observed: status.uidValidity, stored: folder.lastKnownUidValidity) != nil {
-                    try await bootstrapFolderUidValidity(
-                        folderId: folder.id, observed: status.uidValidity)
-                }
-                continue
-            }
-
-            // Something changed — sync this folder
-            BackgroundSyncLogger.logDebug("[Sync] IMAP delta: \(folder.name) changed (uidNext: \(folder.lastKnownUidNext ?? 0)→\(status.uidNext), count: \(folder.totalCount)→\(status.messageCount))")
-            let newCount = max(0, status.messageCount - folder.totalCount)
-            if newCount > 0 { publishDownloading(newCount, forAccount: account.id) }
-            do {
-                try await syncMessages(
-                    for: folder,
-                    provider: provider,
-                    limit: SyncConfig.syncMessageLimit
-                )
-            } catch {
-                if SyncEngine.isSelectFailedError(error) {
-                    BackgroundSyncLogger.logDebug("[Sync] IMAP delta: SELECT failed for \(folder.name) — skipping")
-                    continue
-                }
-                throw error
-            }
-
-            // Update cached state (uidNext, totalCount) — unread recount handled by UnreadCountManager
-            try await dbPool.write { db in
-                var assignments: [ColumnAssignment] = [
-                    Column("lastKnownUidNext").set(to: status.uidNext),
-                    Column("totalCount").set(to: status.messageCount)
-                ]
-                // Refresh the CONDSTORE cursor so the NEXT delta can detect flag-only
-                // changes. A UIDVALIDITY change moves uidNext/count (→ this path re-runs),
-                // so a stale-epoch modseq self-corrects on the following cycle.
-                if let modseq = status.highestModSeq {
-                    assignments.append(Column("lastKnownHighestModSeq").set(to: modseq))
-                }
-                _ = try Folder.filter(Column("id") == folder.id).updateAll(db, assignments)
-                // BOOTSTRAP the epoch in the SAME transaction but as its OWN conditional
-                // statement: the `lastKnownUidValidity IS NULL` predicate must be evaluated
-                // by SQLite at write time, never against `folder` — that snapshot predates
-                // the STATUS round trip, so it cannot decide whether the column is still
-                // empty. Never an overwrite (see `uidValidityBootstrapWrite`): stamping a
-                // live epoch over the one the local UIDs belong to disarms the
-                // deletion-reconcile walk's abort guard (ADR-IOS-051).
-                try Self.bootstrapFolderUidValidity(
-                    db, folderId: folder.id, observed: status.uidValidity)
-            }
-
-            // ADR-IOS-051 Phase 2 trigger: compare the LIVE local header count
-            // against the just-fetched STATUS count (NOT the cached totalCount,
-            // which the overwrite above consumes). Local GRDB is a partial
-            // mirror — optimistic local deletes only LOWER local count — so
-            // localCount > serverCount proves ghost rows below the windowed
-            // sync's UID floor. `local < server` is backfill-normal and never
-            // triggers.
-            do {
-                let folderId = folder.id
-                let localCount = try await dbPool.read { db in
-                    try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db)
-                }
-                if Self.shouldReconcileDeletions(
-                    localCount: localCount,
-                    serverCount: status.messageCount,
-                    tolerance: SyncConfig.deletionReconcileCountTolerance
-                ) {
-                    if DebugModeManager.isLoggingEnabled() {
-                        BackgroundSyncLogger.logDebug("[Sync] IMAP delta: \(folder.name) local=\(localCount) > server=\(status.messageCount) — reconciling external deletions")
-                    }
-                    await reconcileExternallyDeletedMessages(
-                        folder: folder,
-                        provider: provider,
-                        expectedGhosts: localCount - status.messageCount
-                    )
-                }
-            } catch {
-                // Trigger evaluation is best-effort — the evidence is durable
-                // and re-fires on the next delta/full sync pass.
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[Sync] IMAP delta: reconcile trigger check failed for \(folder.name): \(error)")
-                }
-            }
-
-            // syncGeneration advanced inside syncMessages() — no need to advance here.
-            anyChanged = true
-        }
-
-        if !anyChanged {
-            BackgroundSyncLogger.logDebug("[Sync] IMAP delta: no changes across \(syncableFolders.count) folders")
-            BackgroundSyncLogger.log("imapDelta: \(account.emailAddress) noChanges (\(syncableFolders.count) folders)")
-        } else {
-            BackgroundSyncLogger.log("imapDelta: \(account.emailAddress) changed")
-            // Unread recount is now handled per-folder inside syncMessages, immediately after header commit.
-        }
-
-        return (true, anyChanged)
     }
 }

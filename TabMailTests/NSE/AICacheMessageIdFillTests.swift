@@ -185,7 +185,7 @@ struct AICacheMessageIdFillTests {
             default:
                 try MessageAICache.writeThrough(
                     accountId: Self.accountId, folderPath: "INBOX", rfc822MessageId: Self.rfc822,
-                    cachedReply: "A new reply", replyTextMessage: "A new reply text", db: db)
+                    reply: ReplyResult(body: "A new reply", textMessage: "A new reply text"), db: db)
             }
         }
 

@@ -4,6 +4,21 @@
 
 import Foundation
 
+/// A precomputed reply, the AI Suggestion: the email body, its short text-message version and the
+/// change command that came with it (`MessageHeader.cachedReply` / `replyTextMessage` /
+/// `replyChangeCommand`). The one value its reader (`AIResponseParser.parseReplyResponse`) returns
+/// and every store holds.
+struct ReplyResult: Sendable, Equatable {
+    let body: String
+    let textMessage: String?
+    /// A short command that would change this reply, the reply field's example. Nil when none came
+    /// with it.
+    var changeCommand: String? = nil
+
+    /// The quality filters' sentinel: no reply wanted (an empty body), distinct from nil (error, retried).
+    static let filtered = ReplyResult(body: "", textMessage: nil)
+}
+
 /// Shared AI response parsing between main app and NSE.
 /// Single source of truth — both targets reference this file.
 ///
@@ -49,16 +64,13 @@ enum AIResponseParser {
         )
     }
 
-    struct ReplyResult {
-        let body: String
-        let textMessage: String?
-    }
-
-    /// Parse the precache reply JSON: `{"subject": "..", "body": "..", "text_message": ".."}`. Nil when
+    /// Parse the precache reply JSON: `{"subject": "..", "body": "..", "text_message": "..",
+    /// "change_command": ".."}`. Nil when
     /// it is not that object or has no body; the caller treats that as no reply (retried later).
     static func parseReplyResponse(_ text: String) -> ReplyResult? {
         guard let object = jsonObject(text), let body = (object["body"] as? String).flatMap(nonEmpty) else { return nil }
-        return ReplyResult(body: body, textMessage: (object["text_message"] as? String).flatMap(nonEmpty))
+        return ReplyResult(body: body, textMessage: (object["text_message"] as? String).flatMap(nonEmpty),
+                           changeCommand: (object["change_command"] as? String).flatMap(nonEmpty))
     }
 
     /// The JSON object `text` holds, else nil.

@@ -13,9 +13,13 @@ import GRDB
 struct EmailComposeTool: AgentTool, Sendable {
     let name = "email_compose"
     private let ctx: ToolContext
+    /// The compose edit a request runs (`EmailReplyTool.ComposeEdit`); tests answer it as the
+    /// backend would.
+    private let composeEdit: EmailReplyTool.ComposeEdit
 
-    init(context: ToolContext? = nil) {
+    init(context: ToolContext? = nil, composeEdit: EmailReplyTool.ComposeEdit? = nil) {
         self.ctx = context ?? ToolContext()
+        self.composeEdit = composeEdit ?? EmailReplyTool.chatComposeEdit
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
@@ -61,12 +65,14 @@ struct EmailComposeTool: AgentTool, Sendable {
         if let composeRequest {
             do {
                 let result = try await Self.runComposeEdit(
-                    recipients: to + cc,
+                    to: to,
+                    cc: cc,
                     subject: subject,
                     body: body,
                     request: composeRequest,
                     mode: "edit_new",
-                    db: ctx.db
+                    db: ctx.db,
+                    composeEdit: composeEdit
                 )
                 generatedSubject = result.subject ?? generatedSubject
                 generatedBody = result.body ?? generatedBody
@@ -97,17 +103,20 @@ struct EmailComposeTool: AgentTool, Sendable {
 
     /// Shared compose edit flow matching TB's `runComposeEdit()`.
     /// Resolves account/prompts, builds `ComposeEditContext`, and calls `performInlineEdit()`.
-    /// Used by email_compose (mode "edit_new"), email_reply (mode "edit_reply"),
-    /// and email_forward (mode "edit_forward") tools for full TB parity.
+    /// Used by the email_compose (mode "edit_new") and email_forward (mode "edit_forward") tools
+    /// for full TB parity. email_reply (mode "edit_reply") builds the same context with
+    /// `ComposeEditContext.make`, as the compose card does.
     static func runComposeEdit(
-        recipients: [String],
+        to: [String],
+        cc: [String],
         subject: String?,
         body: String?,
         request: String,
         mode: String,
         relatedHeader: MessageHeader? = nil,
         relatedBodyText: String? = nil,
-        db: (any DatabaseReader & Sendable)? = nil
+        db: (any DatabaseReader & Sendable)? = nil,
+        composeEdit: EmailReplyTool.ComposeEdit
     ) async throws -> InlineEditResult {
         let dbReader = db ?? AppDatabase.rawPool
         // Get sender info from primary account (matching TB's user identity
@@ -164,13 +173,20 @@ struct EmailComposeTool: AgentTool, Sendable {
             bodyText = ""
         }
 
+        // Each recipient keeps its role: `recipients` (recipients_json) is the To list, as in
+        // TB's buildComposeEditChat, and Cc goes to ccRecipients (original_cc), so the AI
+        // does not address a copied recipient as a primary one.
+        // Recipients may be mailbox text (`Name <email>`); give the AI the addresses and
+        // their names separately, as ComposeView's own edit context does.
+        let toEntry = RecipientEntry(to)
+        let ccEntry = RecipientEntry(cc)
         let context = ComposeEditContext(
-            recipients: recipients,
-            toRecipients: recipients,
-            ccRecipients: [],
+            recipients: toEntry.addresses,
+            toRecipients: toEntry.addresses,
+            ccRecipients: ccEntry.addresses,
             bccRecipients: [],
-            toDisplayNames: [:],
-            ccDisplayNames: [:],
+            toDisplayNames: Self.displayNames(toEntry),
+            ccDisplayNames: Self.displayNames(ccEntry),
             bccDisplayNames: [:],
             senderName: account?.displayName ?? "",
             senderEmail: account?.emailAddress ?? "",
@@ -185,22 +201,26 @@ struct EmailComposeTool: AgentTool, Sendable {
             bodyText: bodyText
         )
 
-        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] runComposeEdit: mode=\(mode) recipients=\(recipients.count) request=\(request.prefix(80))") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] runComposeEdit: mode=\(mode) to=\(to.count) cc=\(cc.count) request=\(request.prefix(80))") }
 
-        return try await AIService.shared.performInlineEdit(
-            currentSubject: subject ?? "",
-            currentBody: body ?? "",
-            context: context,
-            instruction: request,
-            chatHistory: []
-        )
+        return try await composeEdit(context, subject ?? "", body ?? "", request)
     }
 
     // MARK: - Helpers
 
+    /// Display names by address, for the entry's recipients that carry one.
+    static func displayNames(_ entry: RecipientEntry) -> [String: String] {
+        var names: [String: String] = [:]
+        for recipient in entry.recipients {
+            if let name = recipient.name, !name.isEmpty { names[recipient.address] = name }
+        }
+        return names
+    }
+
     /// Parse a JSON value as a string array.
-    /// Handles: array of strings, array of `{"email": "..."}` objects (tool schema format),
-    /// or a single string. Extracts the `email` field from object items.
+    /// Handles: array of strings, array of `{"name": "...", "email": "..."}` objects (tool
+    /// schema format), or a single string. An object item becomes `Name <email>` when it
+    /// carries a name, else the bare `email`.
     static func parseStringArray(_ value: JSONValue?) -> [String]? {
         guard let value else { return nil }
         switch value {
@@ -208,7 +228,16 @@ struct EmailComposeTool: AgentTool, Sendable {
             let strings = arr.compactMap { item -> String? in
                 if case .string(let s) = item { return s }
                 if case .dictionary(let dict) = item,
-                   case .string(let email) = dict["email"], !email.isEmpty { return email }
+                   case .string(let email) = dict["email"], !email.isEmpty {
+                    // Keep the display name the model gave, as TB's compose draft does
+                    // (`name <email>`), rendered as a mailbox `RecipientEntry` reads back.
+                    var name: String?
+                    if case .string(let n) = dict["name"] {
+                        let trimmed = n.trimmingCharacters(in: .whitespacesAndNewlines)
+                        name = trimmed.isEmpty ? nil : trimmed
+                    }
+                    return RecipientEntry.text(name: name, address: email)
+                }
                 return nil
             }
             return strings.isEmpty ? nil : strings

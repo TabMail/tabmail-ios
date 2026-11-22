@@ -334,11 +334,11 @@ final class AppDatabase: Sendable {
                     folderPath: folderPath, instanceEpoch: instanceEpoch)
                 try op.insert(db)
             }
-            // The full sync lists every folder the change reader does not track
-            // (and every folder of an account with no change bookmark), which
-            // corrects the optimistic state of a retired action there. A tracked
-            // folder gets no window listing (ADR-IOS-111): its correction is the
-            // re-read list or the catch-up armed above, not this full sync.
+            // The full sync lists every folder the change reader does not track,
+            // including each folder whose bookmark the recheck above dropped,
+            // which corrects the optimistic state of a retired action there. A
+            // tracked folder gets no window listing (ADR-IOS-111): its correction
+            // is the re-read list or the catch-up armed above, not this full sync.
             try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL")
             try db.execute(sql: """
                 INSERT INTO appReleaseStamp (id, release) VALUES (1, ?)
@@ -353,7 +353,7 @@ final class AppDatabase: Sendable {
         // "did the boundary fire, and how much did it take" when a user reports
         // an action that did not survive an update.
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[AppDatabase] Release boundary crossed to \(currentRelease) — retired \(retiredRows) previous-release pendingOperation row(s) and marked full sync due; re-read list +\(recheck.listedIds) id(s), catch-up armed on \(recheck.armedFolders) folder(s), \(recheck.undecodableRows) undecodable row(s)")
+            BackgroundSyncLogger.logDebug("[AppDatabase] Release boundary crossed to \(currentRelease) — retired \(retiredRows) previous-release pendingOperation row(s) and marked full sync due; re-read list +\(recheck.listedIds) id(s), catch-up armed on \(recheck.armedFolders) folder(s), bookmark dropped on \(recheck.droppedBookmarks) folder(s), \(recheck.undecodableRows) undecodable row(s)")
         }
         return true
     }
@@ -4505,6 +4505,23 @@ final class AppDatabase: Sendable {
             "v107_rekeyChatSessionsByThread", foreignKeyChecks: .immediate
         ) { db in
             try rekeyChatSessionsByThread(db)
+        }
+
+        // Chat view: a reply result also carries a short command that would change it
+        // (`replyChangeCommand`), the reply field's example while the AI Suggestion shows. On-device
+        // AI cache, the same class as `replyTextMessage`. NULLABLE and NO BACKFILL: a reply computed
+        // before this version has none, and the field shows a configured example instead.
+        // Convergence: a fresh install and an upgraded DB both end with the two columns, NULL on
+        // every pre-existing row.
+        migrator.registerTimedMigration(
+            "v108_addReplyChangeCommand", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "replyChangeCommand", .text)
+            }
+            try db.alter(table: "messageAICache") { t in
+                t.add(column: "replyChangeCommand", .text)
+            }
         }
     }
 

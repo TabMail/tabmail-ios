@@ -123,6 +123,11 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// Two-tier fuzzer (Testing Rule 11) seam — see
         /// `killConnectionOnNextCommand(containing:)`'s doc comment.
         var killConnection: Bool = false
+        /// `failEveryCommand(containing:message:)`: answers every match, never
+        /// consumed, until `stopFailingCommands(containing:)`.
+        var persistent: Bool = false
+        /// The tagged status the injected failure answers with: "NO" or "BAD".
+        var status: String = "NO"
     }
 
     /// One deterministic mailbox reset applied only after the matching
@@ -151,12 +156,37 @@ final class FakeIMAPServer: @unchecked Sendable {
         case verifiedPartialCompletion
     }
 
+    struct QResyncMailbox {
+        var epoch: Int
+        var highestModSeq: Int
+        var modSeqByUID: [Int: Int]
+        var flagsByUID: [Int: Set<String>]
+        var expunged: [(uid: Int, modSeq: Int)] = []
+        var maxUID: Int
+        /// The modseq at which each message was first seen.
+        var addedModSeq: [Int: Int] = [:]
+    }
+
     private struct State {
         var messagesByMailbox: [String: [Message]]
         var flagsByMailbox: [String: [Int: Set<String>]] = [:]
         var commandLog: [String] = []
+        /// The same commands, by connection (its fd), in order.
+        var commandLogByConnection: [Int32: [String]] = [:]
         var injectedFailureCountdowns: [String: [InjectedFailure]] = [:]
         var consumedInjectedFailureCount = 0
+        /// `setStatusStaleUntilNoop`: each connection's STATUS answers as of its
+        /// last NOOP (or its first STATUS), per mailbox and attribute list.
+        var statusStaleUntilNoop = false
+        var staleStatusByFd: [Int32: [String: String]] = [:]
+        /// `setMaxLoggedInSessions`: a LOGIN past this many live sessions is
+        /// refused with Dovecot's connection-limit wording. Nil = no limit.
+        var maxLoggedInSessions: Int?
+        /// `refuseNextLogins`: how many coming LOGINs are refused with the same
+        /// wording whatever the live count, so a retry after an eviction is
+        /// refused too (a slot taken by another client meanwhile).
+        var forcedLoginRefusals = 0
+        var refusedLoginCount = 0
         var postResponseMailboxResets: [PostResponseMailboxReset] = []
         /// Mailboxes SELECT must reject as gone. Value = whether the NO
         /// response carries the RFC 5530 `[NONEXISTENT]` response code (the
@@ -199,15 +229,65 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// mailbox recreation (message list churn is separately simulated via
         /// `setMessages`).
         var uidValidityByMailbox: [String: Int] = [:]
-        /// CONDSTORE (RFC 7162) model, used only when the fake advertises
-        /// `CONDSTORE`: each mailbox's HIGHESTMODSEQ, and the content fingerprint
-        /// (UIDs plus flags) it was last reported for. STATUS bumps the counter
-        /// whenever the fingerprint moved since the previous report, so ANY
-        /// mutation path — a test seam, STORE, EXPUNGE, MOVE, APPEND — raises it,
-        /// and it never decreases. A client that only ever reads the value through
-        /// STATUS cannot tell this from a server bumping it at mutation time.
-        var highestModSeqByMailbox: [String: Int] = [:]
-        var modSeqFingerprintByMailbox: [String: String] = [:]
+        /// CONDSTORE/QRESYNC (RFC 7162) model, used when the fake advertises
+        /// `CONDSTORE` or `QRESYNC`: per mailbox, each message's MODSEQ and the
+        /// expunge log. It is brought up to date lazily, at every STATUS, SELECT
+        /// and MODSEQ-carrying FETCH, by diffing the mailbox against the last
+        /// observation: a new or re-flagged message and an expunge each get the
+        /// next modseq (one bump per observation), so ANY mutation path — a test
+        /// seam, STORE, EXPUNGE, MOVE, APPEND — raises it, and it never
+        /// decreases. A client cannot tell this from a server assigning modseqs
+        /// at mutation time. Reset (the history dropped) when the mailbox's
+        /// UIDVALIDITY changes. (Before #755 a CONDSTORE-only fake kept a
+        /// per-mailbox fingerprint counter instead; its STATUS answers were the
+        /// same, one bump per observed change.)
+        var qresyncByMailbox: [String: QResyncMailbox] = [:]
+        /// `setUidValidity(_:for:highestModSeq:)`: the HIGHESTMODSEQ the next
+        /// epoch's model starts at, in place of one past the old epoch's.
+        var qresyncModSeqStartByMailbox: [String: Int] = [:]
+        /// Mailboxes whose expunges do not raise HIGHESTMODSEQ (RFC 7162 lets a
+        /// CONDSTORE-only server do so: only MESSAGES shows them).
+        var expungeKeepsHighestModSeqMailboxes: Set<String> = []
+        /// UIDs a mailbox's UID SEARCH leaves out although they are present (a
+        /// server answering from a stale index).
+        var searchOmittedUIDsByMailbox: [String: Set<Int>] = [:]
+        /// A compact `* ESEARCH … UID ALL <set>` answer every UID SEARCH in the
+        /// mailbox gets instead of its real one (an overbroad server answer).
+        var searchAnswerAllByMailbox: [String: String] = [:]
+        /// A FETCH answer that also carries a conflicting record: after the
+        /// record of `templateUID`, a copy of it at sequence `sequence` with UID
+        /// `uid` (a faulty server naming two UIDs for one slot). Per mailbox.
+        var conflictingFetchRecordByMailbox: [String: (templateUID: Int, sequence: Int, uid: Int)] = [:]
+        /// `ENABLE CONDSTORE` is answered with an empty `* ENABLED`.
+        var ignoresEnableCondStore = false
+        /// Every `ENABLE CONDSTORE` by connection and every `SELECT … (CONDSTORE)`.
+        var enableCondStoreCountByConnection: [Int32: Int] = [:]
+        /// Every ENABLE a connection sent after a SELECT (refused, RFC 5161 §3.1).
+        var enableInSelectedStateCount = 0
+        var condStoreSelectCount = 0
+
+        /// STATUS attributes a mailbox's answer leaves out (a server may omit one).
+        var statusOmittedAttributesByMailbox: [String: Set<String>] = [:]
+        /// Mailboxes whose QRESYNC SELECT reports no FETCH for messages added
+        /// since the client's modseq (RFC 7162 §3.2.5.1 requires flag changes and
+        /// expunges only).
+        var qresyncOmitsArrivalsMailboxes: Set<String> = []
+        /// Mailboxes whose SELECT answers `[NOMODSEQ]` (no modseqs kept).
+        var noModSeqMailboxes: Set<String> = []
+        /// Mailboxes whose `VANISHED (EARLIER)` reports every UID up to the
+        /// highest ever seen, not only the expunged ones (a server without an
+        /// exact expunge history; RFC 7162 §3.2.5 lets it send a superset).
+        var lossyExpungeHistoryMailboxes: Set<String> = []
+        /// `ENABLE QRESYNC` is answered with an empty `* ENABLED` (not acknowledged).
+        var ignoresEnableQResync = false
+        /// Every `ENABLE QRESYNC` a connection sent, by connection (its fd), and
+        /// every QRESYNC SELECT answered, by connection: the wire oracle for
+        /// "QRESYNC is enabled once per session, on one connection only".
+        var enableQResyncCountByConnection: [Int32: Int] = [:]
+        var qresyncSelectCountByConnection: [Int32: Int] = [:]
+        /// SELECT with a QRESYNC parameter on a connection that never enabled it
+        /// (answered BAD, RFC 7162 §3.2.5).
+        var qresyncSelectWithoutEnableCount = 0
         /// Mailboxes whose SELECT/EXAMINE response OMITS the
         /// `* OK [UIDVALIDITY n]` line entirely (T1.2b, `suppressSelectUidValidity`).
         /// RFC 3501 §6.3.1 says a server SHOULD send it, not MUST, and SwiftMail
@@ -226,6 +306,21 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// deterministic way to produce the "the server did not say" wire
         /// shape. Empty for every pre-existing test.
         var selectUidNextSuppressed: Set<String> = []
+        /// Mailboxes whose SELECT/EXAMINE omits `* n EXISTS` (#755,
+        /// `suppressSelectExists`): NONCONFORMING (RFC 3501 §6.3.1 REQUIRES it);
+        /// SwiftMail reads the omission as `messageCount == 0`.
+        var selectExistsSuppressed: Set<String> = []
+        /// Mailboxes whose SELECT/EXAMINE reports this EXISTS count instead of
+        /// the real one (#755, `setSelectExists`): a server whose count is wrong
+        /// (an explicit `* 0 EXISTS` while messages are present).
+        var selectExistsOverride: [String: Int] = [:]
+        var selectExistsOverrideUses: [String: Int] = [:]
+        /// Mailboxes whose SELECT/EXAMINE reports this HIGHESTMODSEQ instead of
+        /// the model's (#755 boundary values, `setSelectHighestModSeq`).
+        var selectHighestModSeqOverride: [String: UInt64] = [:]
+        /// Mailboxes whose SELECT/EXAMINE omits the HIGHESTMODSEQ line without
+        /// sending NOMODSEQ (#755, `suppressSelectHighestModSeq`).
+        var selectHighestModSeqSuppressed: Set<String> = []
         /// T3.4 — source UIDs this server COPIES normally but deliberately
         /// leaves OUT of its `COPYUID` response code. RFC 4315 §3 makes sending
         /// `COPYUID` a MAY, so a real UIDPLUS server withholding it (for some
@@ -267,6 +362,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// state but before its tagged response is sent. This is the exact
         /// ambiguous-success boundary atomic retry is meant to survive.
         var disconnectAfterUIDMoveCommitCount = 0
+        /// Command fragments whose next match is answered in full, then has its
+        /// connection closed (the session ends between two commands).
+        var closeAfterAnsweringFragments: [String] = []
         /// SwiftMail PR #208's post-completion failure contract. The mutation
         /// lands first; only the evidence accompanying tagged NO differs.
         /// Fires on the NEXT UID MOVE only, then clears (#115): a retry is
@@ -282,12 +380,14 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// window — infinite-scroll paging, whose cursor IS the window — opts in via
         /// `honorSearchDateCriteria()`.
         var honorsSearchDateCriteria = false
-        /// Whether UID SEARCH honours a `UID <set>` search key (RFC 3501 §6.4.4).
-        /// `false` by default for the same reason as `honorsSearchDateCriteria`:
-        /// this fake has always answered with the whole mailbox. A fixture whose
-        /// subject is the backfill UID walk's per-range SEARCH opts in via
-        /// `honorSearchUIDSetCriterion()`, or every range finds every message.
-        var honorsSearchUIDSetCriterion = false
+        /// Whether UID SEARCH honours a `UID <set>` search key (RFC 3501 §6.4.4):
+        /// a conforming server answers only UIDs in the set, where `n:*` with the
+        /// mailbox's highest UID below `n` still matches that highest UID (§6.4.8,
+        /// §9 `seq-number`). `true` by default (#1076): answering outside the set
+        /// made catch-up and change-read fixtures fail on a server no real client
+        /// meets. An ADVERSARIAL fixture that pins the client's refusal of an
+        /// over-broad answer opts out via `ignoreSearchUIDSetCriterion()`.
+        var honorsSearchUIDSetCriterion = true
         /// B1 (ADR-IOS-068/D4) — mailboxes whose APPEND is accepted, assigned a
         /// UID and acknowledged normally, but whose tagged OK omits the
         /// `APPENDUID` response code even though this server advertises UIDPLUS.
@@ -340,6 +440,12 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// messages, the FETCH over a range covering all N returns fewer than N.
         /// Empty for every pre-existing test.
         var fetchRecordSuppressedByMailbox: [String: Set<Int>] = [:]
+        /// Per-mailbox ESEARCH data for the next UID SEARCHes, in order
+        /// (`answerNextUIDSearch(in:all:)`, `answerNextUIDSearch(in:esearchData:)`):
+        /// each is sent as `* ESEARCH (TAG …) UID <data>` and consumed. Empty for
+        /// every pre-existing test.
+        var compactUIDSearchAnswersByMailbox: [String: [String?]] = [:]
+        var compactUIDSearchAnswersServed = 0
         /// Invariant test layer (2026-07-16) — wrong-message wire oracle,
         /// deliverable 1. The rfc822 Message-ID(s) the CURRENT test's user
         /// intention(s) target, registered via `expectMutation(rfc822MessageId:)`.
@@ -373,6 +479,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// below, which is NOT cleared on close — see that field's and
         /// `closeClientFd`'s doc comments.
         var loggedInFds: Set<Int32> = []
+        /// The most sessions logged in at once since the last
+        /// `resetPeakSessionCount()`.
+        var peakLoggedIn = 0
         /// R12-F1: every fd that has EVER completed a successful LOGIN —
         /// unlike `loggedInFds` above (which `closeClientFd` unconditionally
         /// clears on ANY close, logout or not), this one is only consulted
@@ -395,6 +504,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// branch, and `stop()`'s test-teardown sweep. Consulted+removed in
         /// `closeClientFd`.
         var testInitiatedCloseFds: Set<Int32> = []
+        /// Client fds currently inside an IDLE command (set when IDLE is
+        /// answered, cleared on DONE). `endIdleSessionsFromServer()` ends them.
+        var idlingFds: Set<Int32> = []
         /// R12-F1 (Round 12 finding F1) — the wire-level "abandoned logged-in
         /// session" oracle. `liveSessionCount()` (`loggedInFds.count` above)
         /// cannot distinguish "logged out cleanly" from "abandoned, then the
@@ -453,6 +565,17 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// Command fragment (uppercased) → seconds to hold the NEXT matching
         /// command's response, one entry per match. See `stallNextCommand`.
         var stalls: [String: [Double]] = [:]
+        /// `holdNextCommand(containing:)`: armed fragments, and whether one is held now.
+        var heldGates: [String: Bool] = [:]
+        var heldGateReleased: Set<String> = []
+        /// Set by `stop()`: a held command is let go so its handler can end.
+        var heldGatesAbandoned = false
+        /// Like `stalls`, but the hold ends the session as soon as the client
+        /// closes the connection. See `stallNextCommandWatchingClient`.
+        var watchedStalls: [String: [Double]] = [:]
+        /// Seconds to hold the answer to the NEXT IDLE `DONE`, one entry per
+        /// DONE. See `delayNextIdleDoneReply`.
+        var idleDoneReplyDelays: [Double] = []
         /// `holdGreetings()` is in place: new connections wait on `greetingGate`.
         var greetingsHeld = false
         /// Connections that waited for their greeting under a hold.
@@ -521,7 +644,28 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// (RFC 6851 — see `IMAPServer+Manipulation.swift`'s `move` in the
     /// pinned SwiftMail fork).
     static let defaultCapabilities = ["IMAP4rev1", "AUTH=PLAIN", "LITERAL+", "ID", "NAMESPACE", "UIDPLUS", "MOVE", "IDLE"]
-    private let capabilities: [String]
+    /// Its own lock: read inside and outside `withState`.
+    private let capabilitiesLock = NSLock()
+    private var advertisedCapabilities: [String]
+    private var capabilities: [String] {
+        capabilitiesLock.lock()
+        defer { capabilitiesLock.unlock() }
+        return advertisedCapabilities
+    }
+
+    /// Test seam: what the server advertises from now on (a server upgraded or
+    /// downgraded between sessions). A session already open keeps what it read.
+    func setCapabilities(_ capabilities: [String]) {
+        capabilitiesLock.lock()
+        defer { capabilitiesLock.unlock() }
+        advertisedCapabilities = capabilities
+    }
+
+    /// The per-message modseq model is kept when either is advertised.
+    private var modelsModSeqs: Bool {
+        let advertised = capabilities
+        return advertised.contains("CONDSTORE") || advertised.contains("QRESYNC")
+    }
 
     private var listenFd: Int32 = -1
     private var acceptSource: DispatchSourceRead?
@@ -540,7 +684,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         self.port = port
         self.username = username
         self.password = password
-        self.capabilities = capabilities
+        self.advertisedCapabilities = capabilities
         self.state = State(messagesByMailbox: ["INBOX": messages])
     }
 
@@ -552,7 +696,7 @@ final class FakeIMAPServer: @unchecked Sendable {
         self.port = port
         self.username = username
         self.password = password
-        self.capabilities = capabilities
+        self.advertisedCapabilities = capabilities
         self.state = State(messagesByMailbox: mailboxes)
     }
 
@@ -575,6 +719,15 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// (observed repeatedly once a test disconnected its provider mid-test
     /// and kept doing GRDB work before `stop()`). Untracking under the lock
     /// BEFORE closing makes whichever side arrives second a no-op.
+    ///
+    /// Only the connection's own `handleClient` closes its fd; `stop()` shuts
+    /// the socket down instead (`shutdownAllClientFds`). A `stop()` that
+    /// closed the fd freed its NUMBER while the connection's thread could
+    /// still be answering (a stalled command, `stallNextCommand`): the number
+    /// went to a socket of a later test, the late answer was written into it
+    /// and the thread went on reading that socket's commands (seen
+    /// 2026-11-16: a stalled SELECT's `A008 OK` reached the next test's change
+    /// connection as an unknown tag).
     private func trackClientFd(_ fd: Int32) {
         stateLock.lock()
         clientFds.append(fd)
@@ -593,6 +746,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         // forever — defensive cleanup alongside the LOGOUT command handler.
         withState { state in
             _ = state.loggedInFds.remove(fd)
+            _ = state.idlingFds.remove(fd)
+            // A later connection may reuse the fd: it starts with no cached view.
+            _ = state.staleStatusByFd.removeValue(forKey: fd)
             // R12-F1: the REAL abandoned-logged-in-session oracle. Deliberately
             // keyed off `everLoggedInFds`/`loggedOutFds`, NOT the `loggedInFds`
             // removal just above — `loggedInFds` is ALREADY cleared by the
@@ -612,14 +768,28 @@ final class FakeIMAPServer: @unchecked Sendable {
         if wasTracked { close(fd) }
     }
 
-    /// Snapshot-and-clear for `stop()` — the returned fds are no longer
-    /// tracked, so a concurrent `closeClientFd` from a client loop no-ops.
-    private func takeAllClientFds() -> [Int32] {
+    /// For `stop()`: mark every open connection test-initiated, then shut its
+    /// socket down, under `stateLock`, so every fd is still open (a
+    /// `closeClientFd` untracks under the same lock before it closes). The
+    /// connection's thread sees end-of-file (or a failed write) and closes
+    /// the fd itself, so its number stays taken until no thread uses it.
+    private func shutdownAllClientFds() {
         stateLock.lock()
         let fds = clientFds
-        clientFds.removeAll()
         stateLock.unlock()
-        return fds
+        // R12-F1 exclusion (ii): mark these fds test-initiated BEFORE the
+        // shutdown — this is test teardown ending every still-open connection
+        // (including perfectly healthy, still-in-use ones), not an abandoned
+        // session a production leak forgot to log out. `handleClient`'s
+        // client-loop-exit path runs `closeClientFd(fd)` once it sees the
+        // socket shut, and its `sessionsEndedWithoutLogout` bookkeeping needs
+        // the exclusion in place by then.
+        withState { state in
+            for fd in fds { _ = state.testInitiatedCloseFds.insert(fd) }
+        }
+        stateLock.lock()
+        for fd in clientFds { _ = shutdown(fd, SHUT_RDWR) }
+        stateLock.unlock()
     }
 
     func messageIDs(in mailbox: String) -> [String] {
@@ -631,6 +801,18 @@ final class FakeIMAPServer: @unchecked Sendable {
     func flags(in mailbox: String, uid: Int) -> Set<String> {
         withState { state in
             state.flagsByMailbox[mailbox]?[uid] ?? []
+        }
+    }
+
+    /// Test convenience: the UIDs currently holding `rfc822MessageId` in
+    /// `mailbox` (bracket-or-bare match).
+    func uids(in mailbox: String, rfc822MessageId: String) -> [Int] {
+        withState { state in
+            let bracketSet = CharacterSet(charactersIn: "<>")
+            let target = rfc822MessageId.trimmingCharacters(in: bracketSet)
+            return (state.messagesByMailbox[mailbox] ?? [])
+                .filter { $0.messageID.trimmingCharacters(in: bracketSet) == target }
+                .map(\.uid)
         }
     }
 
@@ -668,6 +850,18 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// Use `abandonedSessionCount()` for the latter.
     func liveSessionCount() -> Int {
         withState { $0.loggedInFds.count }
+    }
+
+    /// The most sessions logged in at the same time since the last
+    /// `resetPeakSessionCount()` (a server's per-account connection limit counts
+    /// exactly these).
+    func peakSessionCount() -> Int {
+        withState { $0.peakLoggedIn }
+    }
+
+    /// Start the peak count again from the sessions logged in now.
+    func resetPeakSessionCount() {
+        withState { $0.peakLoggedIn = $0.loggedInFds.count }
     }
 
     /// R12-F1: the REAL "abandoned logged-in session" oracle — see
@@ -722,19 +916,148 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.stalls[fragment.uppercased(), default: []].append(seconds) }
     }
 
+    /// Test seam: hold the next command containing `fragment`, before it is
+    /// answered, until `releaseHeldCommand(containing:)`. Deterministic, unlike
+    /// a timed stall: `isHoldingCommand(containing:)` reports when it is held.
+    func holdNextCommand(containing fragment: String) {
+        withState { $0.heldGates[fragment.uppercased()] = false }
+    }
+
+    func isHoldingCommand(containing fragment: String) -> Bool {
+        withState { $0.heldGates[fragment.uppercased()] == true }
+    }
+
+    func releaseHeldCommand(containing fragment: String) {
+        withState { $0.heldGateReleased.formUnion([fragment.uppercased()]) }
+    }
+
+    /// Test seam: hold the next FETCH in `mailbox` AFTER it has read the
+    /// mailbox's messages (its snapshot), before it answers: whatever changes
+    /// while it is held is invisible to that answer, the race a listing whose
+    /// FETCH is overtaken really has. Released by `releaseFetchAfterSnapshot(in:)`.
+    func holdNextFetchAfterSnapshot(in mailbox: String) {
+        holdNextCommand(containing: Self.snapshotGateKey(mailbox))
+    }
+
+    func isHoldingFetchAfterSnapshot(in mailbox: String) -> Bool {
+        isHoldingCommand(containing: Self.snapshotGateKey(mailbox))
+    }
+
+    func releaseFetchAfterSnapshot(in mailbox: String) {
+        releaseHeldCommand(containing: Self.snapshotGateKey(mailbox))
+    }
+
+    /// Test seam: hold the next UID SEARCH in `mailbox` AFTER it has read the
+    /// mailbox's messages, before it answers: the answer describes the mailbox
+    /// as it was when read, whatever changes while it is held.
+    func holdNextSearchAfterSnapshot(in mailbox: String) {
+        holdNextCommand(containing: Self.searchSnapshotGateKey(mailbox))
+    }
+
+    func isHoldingSearchAfterSnapshot(in mailbox: String) -> Bool {
+        isHoldingCommand(containing: Self.searchSnapshotGateKey(mailbox))
+    }
+
+    func releaseSearchAfterSnapshot(in mailbox: String) {
+        releaseHeldCommand(containing: Self.searchSnapshotGateKey(mailbox))
+    }
+
+    private static func searchSnapshotGateKey(_ mailbox: String) -> String { "\u{1}SEARCH-SNAPSHOT \(mailbox)" }
+
+    private static func snapshotGateKey(_ mailbox: String) -> String { "\u{1}FETCH-SNAPSHOT \(mailbox)" }
+
+    /// Wait at the armed gate `key`, if any, until released or the server stops.
+    private func passHeldGate(_ key: String) {
+        let upperKey = key.uppercased()
+        let armed: Bool = withState { state in
+            guard state.heldGates[upperKey] == false else { return false }
+            state.heldGates[upperKey] = true
+            return true
+        }
+        guard armed else { return }
+        while !withState({ $0.heldGateReleased.contains(upperKey) || $0.heldGatesAbandoned }) { usleep(2_000) }
+        withState { state in
+            state.heldGates[upperKey] = nil
+            state.heldGateReleased.remove(upperKey)
+        }
+    }
+
+    /// Test seam: like `stallNextCommand`, but while the answer is held the
+    /// server watches the connection, and ends the session the moment the client
+    /// closes it (as a real server does), instead of noticing only after the hold.
+    func stallNextCommandWatchingClient(containing fragment: String, seconds: Double) {
+        withState { $0.watchedStalls[fragment.uppercased(), default: []].append(seconds) }
+    }
+
+    /// Test seam: hold the tagged answer to the NEXT IDLE `DONE` for `seconds`
+    /// (a server slow to end IDLE). `stallNextCommand` cannot reach DONE: it is
+    /// an IDLE continuation line, never a tagged command.
+    func delayNextIdleDoneReply(seconds: Double) {
+        withState { $0.idleDoneReplyDelays.append(seconds) }
+    }
+
     func consumedInjectedFailureCount() -> Int {
         withState { $0.consumedInjectedFailureCount }
     }
 
-    func failNextCommand(containing fragment: String, message: String = "Injected test failure") {
-        failCommand(containing: fragment, onMatch: 1, message: message)
+    /// A server that answers STATUS from a cached view (some real ones do): each
+    /// connection's STATUS for a mailbox keeps answering what it answered first
+    /// until that connection sends a NOOP. A client that reads changes with
+    /// STATUS must NOOP first, or it sees an earlier state.
+    func setStatusStaleUntilNoop(_ on: Bool) {
+        withState { state in
+            state.statusStaleUntilNoop = on
+            state.staleStatusByFd = [:]
+        }
     }
 
-    func failCommand(containing fragment: String, onMatch: Int, message: String = "Injected test failure") {
+    /// A server that allows at most `max` logged-in sessions at once (Dovecot's
+    /// `mail_max_userip_connections`): a LOGIN past it is refused with
+    /// Dovecot's wording, which the provider learns the limit from. A session
+    /// leaves the count when it logs out or closes. Nil removes the limit.
+    func setMaxLoggedInSessions(_ max: Int?) {
+        withState { $0.maxLoggedInSessions = max }
+    }
+
+    /// Refuse the next `count` LOGINs with the connection-limit wording, even
+    /// with room under the limit (needs `setMaxLoggedInSessions`, whose limit
+    /// the wording names): another client took the slot an eviction freed.
+    func refuseNextLogins(_ count: Int) {
+        withState { $0.forcedLoginRefusals = count }
+    }
+
+    /// How many LOGINs `setMaxLoggedInSessions` or `refuseNextLogins` refused.
+    func refusedLoginCount() -> Int {
+        withState { $0.refusedLoginCount }
+    }
+
+    func failNextCommand(containing fragment: String, message: String = "Injected test failure", status: String = "NO") {
+        failCommand(containing: fragment, onMatch: 1, message: message, status: status)
+    }
+
+    /// `status` is the tagged answer, "NO" (default) or "BAD"; `message` is the
+    /// response text and may start with a response code such as "[LIMIT] ".
+    func failCommand(containing fragment: String, onMatch: Int, message: String = "Injected test failure", status: String = "NO") {
         withState { state in
             state.injectedFailureCountdowns[fragment.uppercased(), default: []]
-                .append(InjectedFailure(skip: max(0, onMatch - 1), message: message))
+                .append(InjectedFailure(skip: max(0, onMatch - 1), message: message, status: status))
         }
+    }
+
+    /// Answer every command containing `fragment` with NO `message` until
+    /// `stopFailingCommands(containing:)`, so a caller that splits and retries
+    /// on that answer (the date SEARCH halves its window on a too-large answer)
+    /// is refused all the way down.
+    func failEveryCommand(containing fragment: String, message: String) {
+        withState { state in
+            state.injectedFailureCountdowns[fragment.uppercased(), default: []]
+                .append(InjectedFailure(skip: 0, message: message, persistent: true))
+        }
+    }
+
+    /// Drop every failure injected for `fragment`, persistent or not.
+    func stopFailingCommands(containing fragment: String) {
+        withState { $0.injectedFailureCountdowns[fragment.uppercased()] = nil }
     }
 
     /// Apply one complete mailbox epoch replacement immediately after the
@@ -775,10 +1098,43 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// simulated failure, not a real `IMAPProvider` leak. Use this instead of
     /// `failNextCommand`/`failCommand` whenever a test wants to drive one of
     /// those four "dead connection" branches.
+    /// Server-side end of every active IDLE session, as a server going away
+    /// does it (RFC 3501 §7.1.5): an untagged BYE, then the socket is shut
+    /// down. The client's IDLE stream ends WITHOUT the client having cancelled
+    /// anything. The close is marked test-initiated (see
+    /// `testInitiatedCloseFds`), so it is not counted as an abandoned session.
+    /// `shutdown`, not `close`: the client loop still owns the fd and closes it
+    /// exactly once on its way out.
+    func endIdleSessionsFromServer() {
+        let fds = withState { state -> Set<Int32> in
+            let fds = state.idlingFds
+            state.idlingFds.removeAll()
+            for fd in fds {
+                _ = state.loggedInFds.remove(fd)
+                _ = state.testInitiatedCloseFds.insert(fd)
+            }
+            return fds
+        }
+        for fd in fds {
+            sendLine(fd: fd, "* BYE Server shutting down\r\n")
+            shutdown(fd, SHUT_RDWR)
+        }
+    }
+
     func killConnectionOnNextCommand(containing fragment: String) {
         withState { state in
             state.injectedFailureCountdowns[fragment.uppercased(), default: []]
                 .append(InjectedFailure(skip: 0, message: "", killConnection: true))
+        }
+    }
+
+    /// Like `killConnectionOnNextCommand`, but for every command containing
+    /// `fragment`, until `stopFailingCommands(containing:)`: a link that drops
+    /// each time the client asks that one thing.
+    func killConnectionOnEveryCommand(containing fragment: String) {
+        withState { state in
+            state.injectedFailureCountdowns[fragment.uppercased(), default: []]
+                .append(InjectedFailure(skip: 0, message: "", killConnection: true, persistent: true))
         }
     }
 
@@ -912,6 +1268,16 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.uidValidityByMailbox[mailbox] = value }
     }
 
+    /// A renumbered mailbox whose MODSEQ restarted: the new UIDVALIDITY's
+    /// HIGHESTMODSEQ is `highestModSeq`, which may equal the old epoch's (RFC
+    /// 7162 gives a MODSEQ meaning only under its UIDVALIDITY).
+    func setUidValidity(_ value: Int, for mailbox: String, highestModSeq: Int) {
+        withState { state in
+            state.uidValidityByMailbox[mailbox] = value
+            state.qresyncModSeqStartByMailbox[mailbox] = highestModSeq
+        }
+    }
+
     /// Test-only authority read for id-reset disposition witnesses. The
     /// production parser observes the same default (`1`) when a fixture has
     /// not overridden a mailbox, and the state lock makes the read atomic
@@ -945,13 +1311,12 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.honorsSearchDateCriteria = true }
     }
 
-    /// Test seam: make UID SEARCH answer only with the messages whose UID is in
-    /// the search's `UID <set>` key, instead of the whole mailbox. Required by a
-    /// fixture that walks a folder by UID range (the backfill UID walk), where a
-    /// server that ignores the range lets every range fetch every message. Off
-    /// by default; see `State.honorsSearchUIDSetCriterion`.
-    func honorSearchUIDSetCriterion() {
-        withState { $0.honorsSearchUIDSetCriterion = true }
+    /// Test seam (adversarial): make UID SEARCH ignore the search's `UID <set>`
+    /// key and answer with the whole mailbox, as a non-conforming server would.
+    /// Only for fixtures that pin the client's refusal of an over-broad answer;
+    /// see `State.honorsSearchUIDSetCriterion`.
+    func ignoreSearchUIDSetCriterion() {
+        withState { $0.honorsSearchUIDSetCriterion = false }
     }
 
     /// RFC 3501 §6.4.4 at DAY granularity, which is all the wire form carries
@@ -1053,6 +1418,12 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// Commit the next UID MOVE, then close its transport before the tagged
     /// response is written. Unlike `killConnectionOnNextCommand`, this fires
     /// after mutation and therefore models an ambiguous success.
+    /// Answer the next command containing `fragment` in full, then close its
+    /// connection: the session ends after that command and before the next one.
+    func closeConnectionAfterAnsweringNextCommand(containing fragment: String) {
+        withState { $0.closeAfterAnsweringFragments.append(fragment.uppercased()) }
+    }
+
     func disconnectAfterNextUIDMoveCommit() {
         withState { $0.disconnectAfterUIDMoveCommitCount += 1 }
     }
@@ -1180,6 +1551,36 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.fetchRecordSuppressedByMailbox[mailbox] = uids }
     }
 
+    /// Test seam: answer the next UID SEARCH in this mailbox, whatever it asks,
+    /// with a compact RFC 4731 `* ESEARCH (TAG ...) UID ALL <set>`, for example
+    /// `1:50000000`: a sequence set a real server may send, which the client
+    /// must not expand. Consumed by one SEARCH.
+    func answerNextUIDSearch(in mailbox: String, all set: String) {
+        withState { $0.compactUIDSearchAnswersByMailbox[mailbox, default: []].append("ALL \(set)") }
+    }
+
+    /// Test seam: answer the next UID SEARCH in this mailbox with
+    /// `* ESEARCH (TAG …) UID <data>`, whatever it asks: `""` is RFC 4731's
+    /// bare answer, `"COUNT 0"` its no-match answer to a COUNT request, and
+    /// `"COUNT 3"` or `"MIN 2 MAX 9"` without ALL a non-compliant one. Consumed
+    /// by one SEARCH; counted with the compact answers.
+    func answerNextUIDSearch(in mailbox: String, esearchData data: String) {
+        withState { $0.compactUIDSearchAnswersByMailbox[mailbox, default: []].append(data) }
+    }
+
+    /// Test seam: answer the next UID SEARCH in this mailbox with the tagged OK
+    /// alone, no untagged SEARCH or ESEARCH response: an answer that lists
+    /// nothing, not even an empty set. Consumed by one SEARCH; counted with the
+    /// compact answers.
+    func answerNextUIDSearchWithNoResult(in mailbox: String) {
+        withState { $0.compactUIDSearchAnswersByMailbox[mailbox, default: []].append(nil) }
+    }
+
+    /// How many `answerNextUIDSearch(in:all:)` answers have been sent.
+    func compactUIDSearchAnswersServed() -> Int {
+        withState { $0.compactUIDSearchAnswersServed }
+    }
+
     /// Test seam (T1.2b): make this mailbox's SELECT/EXAMINE omit the
     /// `* OK [UIDVALIDITY n]` untagged response entirely.
     ///
@@ -1246,6 +1647,28 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { state in _ = state.selectUidNextSuppressed.remove(mailbox) }
     }
 
+    /// Test seams for an incomplete or edge SELECT (#755). `suppressSelectExists`
+    /// drops `* n EXISTS` (nonconforming; SwiftMail reads it as 0);
+    /// `setSelectHighestModSeq` reports a chosen HIGHESTMODSEQ (nil: the model's);
+    /// `suppressSelectHighestModSeq` drops the HIGHESTMODSEQ line without NOMODSEQ.
+    func suppressSelectExists(_ on: Bool, for mailbox: String) {
+        withState { if on { $0.selectExistsSuppressed.insert(mailbox) } else { $0.selectExistsSuppressed.remove(mailbox) } }
+    }
+    /// Report `count` as the SELECT/EXAMINE EXISTS of `mailbox` (nil: the real count).
+    func setSelectExists(_ count: Int?, for mailbox: String) {
+        withState { $0.selectExistsOverride[mailbox] = count; $0.selectExistsOverrideUses[mailbox] = nil }
+    }
+    /// Report `count` as the EXISTS of the next `selects` SELECT/EXAMINEs of `mailbox` only; later ones report the real count.
+    func setSelectExists(_ count: Int, forNext selects: Int, of mailbox: String) {
+        withState { $0.selectExistsOverride[mailbox] = count; $0.selectExistsOverrideUses[mailbox] = selects }
+    }
+    func setSelectHighestModSeq(_ value: UInt64?, for mailbox: String) {
+        withState { $0.selectHighestModSeqOverride[mailbox] = value }
+    }
+    func suppressSelectHighestModSeq(_ on: Bool, for mailbox: String) {
+        withState { if on { $0.selectHighestModSeqSuppressed.insert(mailbox) } else { $0.selectHighestModSeqSuppressed.remove(mailbox) } }
+    }
+
     /// Test seam: replace a mailbox's entire message list. Used to simulate
     /// the renumbering half of a UIDVALIDITY reset — a previously-meaningful
     /// UID now names a completely different ("decoy") message. Flags are
@@ -1253,6 +1676,11 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// known baseline distinct from whatever UID it now occupies.
     func setMessages(_ messages: [Message], in mailbox: String) {
         withState { $0.messagesByMailbox[mailbox] = messages }
+    }
+
+    /// Test seam: the messages currently in `mailbox`, in mailbox order.
+    func messages(in mailbox: String) -> [Message] {
+        withState { $0.messagesByMailbox[mailbox] ?? [] }
     }
 
     /// Two-tier fuzzer (Testing Rule 11), tier-2 seam: every message
@@ -1460,23 +1888,10 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     func stop() {
         releaseGreetings()
+        withState { $0.heldGatesAbandoned = true }
         acceptSource?.cancel()
         acceptSource = nil
-        let fds = takeAllClientFds()
-        // R12-F1 exclusion (ii): mark these fds test-initiated BEFORE the
-        // raw `close(fd)` below — this is test teardown tearing down every
-        // still-open connection (including perfectly healthy, still-in-use
-        // ones), not an abandoned session a production leak forgot to log
-        // out. `handleClient`'s client-loop-exit path still runs
-        // `closeClientFd(fd)` asynchronously once it notices the socket
-        // closed (this only cleared `clientFds`, so that later call is a
-        // close no-op but still does the `sessionsEndedWithoutLogout`
-        // bookkeeping) — marking here, before that happens, is what lets it
-        // see the exclusion.
-        withState { state in
-            for fd in fds { _ = state.testInitiatedCloseFds.insert(fd) }
-        }
-        for fd in fds { close(fd) }
+        shutdownAllClientFds()
     }
 
     // MARK: - Message Builder
@@ -1602,11 +2017,31 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
         }
         guard clientFd >= 0 else { return }
+        // A late answer written after `stop()` shut the socket down fails with
+        // EPIPE instead of raising SIGPIPE in the test host.
+        var noSigPipe: Int32 = 1
+        setsockopt(clientFd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         trackClientFd(clientFd)
 
-        DispatchQueue.global().async { [weak self] in
-            self?.handleClient(fd: clientFd)
+        // Strong: only `handleClient` closes a connection's fd (`stop()` shuts it
+        // down), so the worker must run even if the server is released first.
+        DispatchQueue.global().async { self.handleClient(fd: clientFd) }
+    }
+
+    /// Waits `seconds` before an answer while watching the connection. False
+    /// when the client closed it meanwhile (the caller ends the session).
+    private static func holdAnswer(fd: Int32, seconds: Double) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            var watched = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let waitMs = Int32(max(1, min(50, deadline.timeIntervalSinceNow * 1_000)))
+            guard poll(&watched, 1, waitMs) > 0 else { continue }
+            var byte: UInt8 = 0
+            if recv(fd, &byte, 1, MSG_PEEK) <= 0 { return false }
+            // Bytes are waiting: they are read after the answer.
+            usleep(10_000)
         }
+        return true
     }
 
     private func handleClient(fd: Int32) {
@@ -1621,6 +2056,11 @@ final class FakeIMAPServer: @unchecked Sendable {
         var buffer = Data()
         var authenticated = false
         var selectedMailbox: String?
+        // Per connection (RFC 5161: ENABLE lasts for the session only).
+        var qresyncEnabled = false
+        // CONDSTORE switched on (RFC 7162 §3.1: ENABLE CONDSTORE or QRESYNC,
+        // or SELECT/EXAMINE (CONDSTORE)).
+        var condStoreEnabled = false
         let readBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: 65536)
         defer { readBuf.deallocate() }
 
@@ -1683,7 +2123,14 @@ final class FakeIMAPServer: @unchecked Sendable {
                     // here). Lets a test assert the "teardown sends DONE
                     // for an active IDLE session" invariant (the
                     // markDirty-IDLE fix's pin).
-                    withState { $0.commandLog.append("DONE") }
+                    let doneDelay = withState { state -> Double? in
+                        state.commandLog.append("DONE")
+                        _ = state.idlingFds.remove(fd)
+                        return state.idleDoneReplyDelays.isEmpty ? nil : state.idleDoneReplyDelays.removeFirst()
+                    }
+                    // Held like a slow server holds it: a client that closes the
+                    // connection meanwhile ends the session at once.
+                    if let doneDelay, !Self.holdAnswer(fd: fd, seconds: doneDelay) { break clientLoop }
                     sendLine(fd: fd, "\(tag) OK IDLE terminated\r\n")
                     idleTag = nil
                     continue
@@ -1701,6 +2148,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                 let recordedCommand = ([command] + (args.isEmpty ? [] : [args])).joined(separator: " ")
                 let matchedFailure: InjectedFailure? = withState { state -> InjectedFailure? in
                     state.commandLog.append(recordedCommand)
+                    state.commandLogByConnection[fd, default: []].append(recordedCommand)
                     let upper = recordedCommand.uppercased()
                     guard let key = state.injectedFailureCountdowns.keys.sorted().first(where: {
                         upper.contains($0) && !(state.injectedFailureCountdowns[$0] ?? []).isEmpty
@@ -1708,6 +2156,10 @@ final class FakeIMAPServer: @unchecked Sendable {
                     else { return nil }
                     if countdowns[0].skip == 0 {
                         let failure = countdowns[0]
+                        if failure.persistent {
+                            state.consumedInjectedFailureCount += 1
+                            return failure
+                        }
                         countdowns.removeFirst()
                         state.injectedFailureCountdowns[key] = countdowns
                         state.consumedInjectedFailureCount += 1
@@ -1739,11 +2191,12 @@ final class FakeIMAPServer: @unchecked Sendable {
                         }
                         break clientLoop
                     }
-                    sendLine(fd: fd, "\(tag) NO \(matchedFailure.message)\r\n")
+                    sendLine(fd: fd, "\(tag) \(matchedFailure.status) \(matchedFailure.message)\r\n")
                     continue
                 }
 
                 if command == "IDLE" {
+                    withState { _ = $0.idlingFds.insert(fd) }
                     sendLine(fd: fd, "+ idling\r\n")
                     idleTag = tag
                     continue
@@ -1766,9 +2219,33 @@ final class FakeIMAPServer: @unchecked Sendable {
                     return state.stalls[key]?.removeFirst()
                 }
                 if let stallSeconds { usleep(UInt32(stallSeconds * 1_000_000)) }
+                let heldGate: String? = withState { state in
+                    let upper = recordedCommand.uppercased()
+                    guard let key = state.heldGates.keys.sorted().first(where: {
+                        upper.contains($0) && state.heldGates[$0] == false
+                    }) else { return nil }
+                    state.heldGates[key] = true
+                    return key
+                }
+                if let heldGate {
+                    while !withState({ $0.heldGateReleased.contains(heldGate) || $0.heldGatesAbandoned }) { usleep(2_000) }
+                    withState { state in
+                        state.heldGates[heldGate] = nil
+                        state.heldGateReleased.remove(heldGate)
+                    }
+                }
+                let watchedSeconds: Double? = withState { state in
+                    let upper = recordedCommand.uppercased()
+                    guard let key = state.watchedStalls.keys.sorted().first(where: {
+                        upper.contains($0) && !(state.watchedStalls[$0] ?? []).isEmpty
+                    }) else { return nil }
+                    return state.watchedStalls[key]?.removeFirst()
+                }
+                if let watchedSeconds, !Self.holdAnswer(fd: fd, seconds: watchedSeconds) { break clientLoop }
                 let response = handleCommand(
                     tag: tag, command: command, args: args, fd: fd,
-                    authenticated: &authenticated, selectedMailbox: &selectedMailbox
+                    authenticated: &authenticated, selectedMailbox: &selectedMailbox,
+                    qresyncEnabled: &qresyncEnabled, condStoreEnabled: &condStoreEnabled
                 )
                 let disconnectAfterCommit = withState { state -> Bool in
                     guard recordedCommand.uppercased().hasPrefix("UID MOVE "),
@@ -1780,6 +2257,15 @@ final class FakeIMAPServer: @unchecked Sendable {
                 }
                 if disconnectAfterCommit { break clientLoop }
                 sendLine(fd: fd, response)
+                let closeAfterAnswer = withState { state -> Bool in
+                    let upper = recordedCommand.uppercased()
+                    guard let index = state.closeAfterAnsweringFragments.firstIndex(where: { upper.contains($0) }) else { return false }
+                    state.closeAfterAnsweringFragments.remove(at: index)
+                    _ = state.loggedInFds.remove(fd)
+                    _ = state.testInitiatedCloseFds.insert(fd)
+                    return true
+                }
+                if closeAfterAnswer { break clientLoop }
                 if response.uppercased().contains("\(tag.uppercased()) OK") {
                     withState { state in
                         let upper = recordedCommand.uppercased()
@@ -1818,24 +2304,75 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     // MARK: - Command Handling
 
-    private func handleCommand(tag: String, command: String, args: String, fd: Int32, authenticated: inout Bool, selectedMailbox: inout String?) -> String {
+    private func handleCommand(tag: String, command: String, args: String, fd: Int32, authenticated: inout Bool, selectedMailbox: inout String?, qresyncEnabled: inout Bool, condStoreEnabled: inout Bool) -> String {
         switch command {
         case "CAPABILITY":
             return "* CAPABILITY \(capabilities.joined(separator: " "))\r\n\(tag) OK CAPABILITY completed\r\n"
         case "LOGIN":
-            authenticated = true
-            withState { state in
+            // Admission and the session's count in ONE lock: two concurrent
+            // LOGINs can never both take the last slot under the limit.
+            let limitRefusal = withState { state -> String? in
+                if state.forcedLoginRefusals > 0, let max = state.maxLoggedInSessions {
+                    state.forcedLoginRefusals -= 1
+                    state.refusedLoginCount += 1
+                    return "[UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=\(max))"
+                }
+                if let max = state.maxLoggedInSessions, state.loggedInFds.count >= max {
+                    state.refusedLoginCount += 1
+                    return "[UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=\(max))"
+                }
                 _ = state.loggedInFds.insert(fd)
+                state.peakLoggedIn = max(state.peakLoggedIn, state.loggedInFds.count)
                 // R12-F1: recorded separately from `loggedInFds` — see that
                 // field's doc comment for why (it gets cleared early by
                 // LOGOUT/kill, so it can't answer "did this fd EVER log in").
                 _ = state.everLoggedInFds.insert(fd)
+                return nil
             }
+            if let limitRefusal { return "\(tag) NO \(limitRefusal)\r\n" }
+            authenticated = true
             return "\(tag) OK LOGIN completed\r\n"
+        case "ENABLE":
+            guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
+            // RFC 5161 §3.1: ENABLE is valid only in the authenticated state.
+            guard selectedMailbox == nil else {
+                withState { $0.enableInSelectedStateCount += 1 }
+                return "\(tag) BAD ENABLE is not allowed in the selected state\r\n"
+            }
+            let wanted = args.uppercased().split(separator: " ")
+            let wantsQResync = wanted.contains("QRESYNC")
+            if !(wantsQResync && capabilities.contains("QRESYNC")) {
+                // ENABLE CONDSTORE (RFC 7162 §3.1).
+                guard wanted.contains("CONDSTORE"), capabilities.contains("CONDSTORE") else {
+                    return "* ENABLED\r\n\(tag) OK ENABLE completed\r\n"
+                }
+                let ignored = withState { state -> Bool in
+                    state.enableCondStoreCountByConnection[fd, default: 0] += 1
+                    return state.ignoresEnableCondStore
+                }
+                if ignored { return "* ENABLED\r\n\(tag) OK ENABLE completed\r\n" }
+                condStoreEnabled = true
+                return "* ENABLED CONDSTORE\r\n\(tag) OK ENABLE completed\r\n"
+            }
+            let ignored = withState { state -> Bool in
+                state.enableQResyncCountByConnection[fd, default: 0] += 1
+                return state.ignoresEnableQResync
+            }
+            if ignored { return "* ENABLED\r\n\(tag) OK ENABLE completed\r\n" }
+            qresyncEnabled = true
+            condStoreEnabled = true
+            return "* ENABLED QRESYNC\r\n\(tag) OK ENABLE completed\r\n"
         case "SELECT", "EXAMINE":
             guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
             // Spaces inside a quoted mailbox are address bytes, not delimiters.
-            let mailbox = Self.firstQuoted(args) ?? args.trimmingCharacters(in: .whitespaces)
+            // A SELECT parameter list follows the name (RFC 4466).
+            let mailbox = Self.firstQuoted(args)
+                ?? String(args.trimmingCharacters(in: .whitespaces).split(separator: " ").first ?? "")
+            let resync = Self.qresyncParameter(args)
+            if resync != nil, !qresyncEnabled {
+                withState { $0.qresyncSelectWithoutEnableCount += 1 }
+                return "\(tag) BAD QRESYNC not enabled\r\n"
+            }
             if let includeNonexistentCode = withState({ $0.deletedMailboxes[mailbox] }) {
                 // Deliberately two distinct real-world shapes: `[NONEXISTENT]`
                 // (RFC 5530 §3) is a fast-path HINT the adapter may use, but
@@ -1850,16 +2387,60 @@ final class FakeIMAPServer: @unchecked Sendable {
                 return "\(tag) NO [NONEXISTENT] Mailbox does not exist\r\n"
             }
             selectedMailbox = mailbox
-            let (messages, uidValidity, suppressUidValidity, suppressUidNext) = withState { state in
+            if Self.parameterList(args).contains("CONDSTORE"), capabilities.contains("CONDSTORE") {
+                condStoreEnabled = true
+                withState { $0.condStoreSelectCount += 1 }
+            }
+            let reportsModSeq = condStoreEnabled
+            let (messages, uidValidity, suppressUidValidity, suppressUidNext, suppressExists, existsOverride) = withState { state in
                 (
                     state.messagesByMailbox[mailbox] ?? [],
                     state.uidValidityByMailbox[mailbox] ?? 1,
                     state.selectUidValiditySuppressed.contains(mailbox),
-                    state.selectUidNextSuppressed.contains(mailbox)
+                    state.selectUidNextSuppressed.contains(mailbox),
+                    state.selectExistsSuppressed.contains(mailbox),
+                    Self.consumeSelectExistsOverride(mailbox, state: &state)
                 )
             }
             let count = messages.count
-            let uidnext = (messages.map(\.uid).max() ?? 0) + 1
+            var uidnext = (messages.map(\.uid).max() ?? 0) + 1
+            var qresyncLines = ""
+            if modelsModSeqs {
+                qresyncLines = withState { state -> String in
+                    let model = Self.observeQResync(mailbox, state: &state)
+                    uidnext = model.maxUID + 1
+                    guard reportsModSeq else { return "" }
+                    if state.noModSeqMailboxes.contains(mailbox) { return "* OK [NOMODSEQ] No modseqs\r\n" }
+                    var lines: String
+                    if state.selectHighestModSeqSuppressed.contains(mailbox) {
+                        lines = ""
+                    } else {
+                        let reported = state.selectHighestModSeqOverride[mailbox].map(String.init) ?? String(model.highestModSeq)
+                        lines = "* OK [HIGHESTMODSEQ \(reported)] Highest\r\n"
+                    }
+                    guard let resync, resync.uidValidity == model.epoch else { return lines }
+                    state.qresyncSelectCountByConnection[fd, default: 0] += 1
+                    let vanished: [Int]
+                    if state.lossyExpungeHistoryMailboxes.contains(mailbox) {
+                        let live = Set(model.modSeqByUID.keys)
+                        vanished = model.maxUID > 0 ? (1...model.maxUID).filter { !live.contains($0) } : []
+                    } else {
+                        vanished = model.expunged.filter { $0.modSeq > resync.modSeq }.map(\.uid)
+                    }
+                    if !vanished.isEmpty {
+                        lines += "* VANISHED (EARLIER) \(Self.uidSetString(vanished))\r\n"
+                    }
+                    let sortedUIDs = messages.map(\.uid).sorted()
+                    for (index, uid) in sortedUIDs.enumerated() {
+                        guard let modSeq = model.modSeqByUID[uid], modSeq > resync.modSeq else { continue }
+                        if state.qresyncOmitsArrivalsMailboxes.contains(mailbox),
+                           (model.addedModSeq[uid] ?? 0) > resync.modSeq { continue }
+                        let flagList = (model.flagsByUID[uid] ?? []).sorted().joined(separator: " ")
+                        lines += "* \(index + 1) FETCH (UID \(uid) FLAGS (\(flagList)) MODSEQ (\(modSeq)))\r\n"
+                    }
+                    return lines
+                }
+            }
             // `suppressSelectUidValidity` drops the line entirely rather than
             // sending `UIDVALIDITY 0` — a real server never sends 0 (it is an
             // `nz-number`), so omission is the only faithful way to reach the
@@ -1872,23 +2453,23 @@ final class FakeIMAPServer: @unchecked Sendable {
             let uidNextLine = suppressUidNext
                 ? ""
                 : "* OK [UIDNEXT \(uidnext)] Predicted next UID\r\n"
+            let existsLine = suppressExists ? "" : "* \(existsOverride ?? count) EXISTS\r\n"
             return """
-            * \(count) EXISTS\r
-            * 0 RECENT\r
-            \(uidValidityLine)\(uidNextLine)* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r
+            \(existsLine)* 0 RECENT\r
+            \(uidValidityLine)\(uidNextLine)\(qresyncLines)* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r
             * OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft \\*)] Flags permitted\r
             \(tag) OK [READ-WRITE] SELECT completed\r
 
             """
         case "STATUS":
             guard authenticated else { return "\(tag) NO Not authenticated\r\n" }
-            return handleStatus(tag: tag, args: args)
+            return handleStatus(tag: tag, args: args, fd: fd)
         case "UID":
             guard let selectedMailbox else { return "\(tag) NO No mailbox selected\r\n" }
-            return handleUID(tag: tag, args: args, mailbox: selectedMailbox)
+            return handleUID(tag: tag, args: args, mailbox: selectedMailbox, condStoreEnabled: &condStoreEnabled)
         case "FETCH":
             guard let selectedMailbox else { return "\(tag) NO No mailbox selected\r\n" }
-            return handleFetch(tag: tag, args: args, uidMode: false, mailbox: selectedMailbox)
+            return handleFetch(tag: tag, args: args, uidMode: false, mailbox: selectedMailbox, condStoreEnabled: &condStoreEnabled)
         case "NAMESPACE":
             let (prefix, delimiter) = withState { ($0.personalNamespacePrefix, $0.hierarchyDelimiter) }
             return "* NAMESPACE ((\"\(prefix)\" \"\(delimiter)\")) NIL NIL\r\n\(tag) OK NAMESPACE completed\r\n"
@@ -1953,6 +2534,8 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
             return "\(tag) OK EXPUNGE completed\r\n"
         case "NOOP":
+            // A NOOP brings this connection's cached STATUS view up to date.
+            withState { _ = $0.staleStatusByFd.removeValue(forKey: fd) }
             return "\(tag) OK NOOP completed\r\n"
         case "LOGOUT":
             withState {
@@ -1996,7 +2579,145 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// with `CONDSTORE` among its capabilities does answer it, from the
     /// `highestModSeqByMailbox` model. Does NOT change the connection's selected
     /// mailbox — that is the whole point of STATUS.
-    private func handleStatus(tag: String, args: String) -> String {
+    /// Bring a mailbox's QRESYNC model up to date with its messages (see
+    /// `State.qresyncByMailbox`). Returns the current model.
+    @discardableResult
+    private static func observeQResync(_ mailbox: String, state: inout State) -> QResyncMailbox {
+        let messages = state.messagesByMailbox[mailbox] ?? []
+        let flags = state.flagsByMailbox[mailbox] ?? [:]
+        let epoch = state.uidValidityByMailbox[mailbox] ?? 1
+        let currentUIDs = Set(messages.map(\.uid))
+        let currentMax = messages.map(\.uid).max() ?? 0
+        guard var model = state.qresyncByMailbox[mailbox], model.epoch == epoch else {
+            let start = state.qresyncModSeqStartByMailbox.removeValue(forKey: mailbox)
+                ?? (state.qresyncByMailbox[mailbox]?.highestModSeq ?? 0) + 1
+            var modSeqs: [Int: Int] = [:]
+            var flagSets: [Int: Set<String>] = [:]
+            for uid in currentUIDs {
+                modSeqs[uid] = start
+                flagSets[uid] = flags[uid] ?? []
+            }
+            var model = QResyncMailbox(
+                epoch: epoch, highestModSeq: start, modSeqByUID: modSeqs, flagsByUID: flagSets,
+                maxUID: currentMax)
+            model.addedModSeq = modSeqs
+            state.qresyncByMailbox[mailbox] = model
+            return model
+        }
+        var next: Int?
+        func bump() -> Int {
+            if let next { return next }
+            let value = model.highestModSeq + 1
+            next = value
+            return value
+        }
+        for uid in currentUIDs.sorted() {
+            let current = flags[uid] ?? []
+            if model.flagsByUID[uid] != current || model.modSeqByUID[uid] == nil {
+                if model.modSeqByUID[uid] == nil { model.addedModSeq[uid] = bump() }
+                model.modSeqByUID[uid] = bump()
+                model.flagsByUID[uid] = current
+            }
+        }
+        let expungeKeepsModSeq = state.expungeKeepsHighestModSeqMailboxes.contains(mailbox)
+        for uid in model.modSeqByUID.keys.sorted() where !currentUIDs.contains(uid) {
+            model.expunged.append((uid, expungeKeepsModSeq ? model.highestModSeq : bump()))
+            model.modSeqByUID.removeValue(forKey: uid)
+            model.flagsByUID.removeValue(forKey: uid)
+        }
+        if let next { model.highestModSeq = next }
+        model.maxUID = max(model.maxUID, currentMax)
+        state.qresyncByMailbox[mailbox] = model
+        return model
+    }
+
+    private static func uidSetString(_ uids: [Int]) -> String {
+        let sorted = uids.sorted()
+        var parts: [String] = []
+        var index = 0
+        while index < sorted.count {
+            let start = sorted[index]
+            var end = start
+            while index + 1 < sorted.count && sorted[index + 1] == end + 1 {
+                index += 1
+                end = sorted[index]
+            }
+            parts.append(start == end ? "\(start)" : "\(start):\(end)")
+            index += 1
+        }
+        return parts.joined(separator: ",")
+    }
+
+    /// Test seams for the QRESYNC model.
+    func setNoModSeq(_ on: Bool, for mailbox: String) {
+        withState { if on { $0.noModSeqMailboxes.insert(mailbox) } else { $0.noModSeqMailboxes.remove(mailbox) } }
+    }
+    func setLossyExpungeHistory(_ on: Bool, for mailbox: String) {
+        withState { if on { $0.lossyExpungeHistoryMailboxes.insert(mailbox) } else { $0.lossyExpungeHistoryMailboxes.remove(mailbox) } }
+    }
+    func setStatusOmits(_ attributes: Set<String>, for mailbox: String) {
+        withState { $0.statusOmittedAttributesByMailbox[mailbox] = attributes }
+    }
+    func setQResyncOmitsArrivals(_ on: Bool, for mailbox: String) {
+        withState { if on { $0.qresyncOmitsArrivalsMailboxes.insert(mailbox) } else { $0.qresyncOmitsArrivalsMailboxes.remove(mailbox) } }
+    }
+    func setIgnoresEnableQResync(_ on: Bool) {
+        withState { $0.ignoresEnableQResync = on }
+    }
+
+    /// Test seams for CONDSTORE without QRESYNC (#755).
+    func setExpungeKeepsHighestModSeq(_ on: Bool, for mailbox: String) {
+        withState { if on { $0.expungeKeepsHighestModSeqMailboxes.insert(mailbox) } else { $0.expungeKeepsHighestModSeqMailboxes.remove(mailbox) } }
+    }
+    func setSearchOmits(_ uids: Set<Int>, in mailbox: String) {
+        withState { $0.searchOmittedUIDsByMailbox[mailbox] = uids }
+    }
+    /// Answer every UID SEARCH in this mailbox with `* ESEARCH (TAG …) UID ALL <set>`
+    /// whatever was asked (a faulty or hostile server; RFC 4731 form). Nil stops it.
+    func setSearchAnswersAll(_ set: String?, in mailbox: String) {
+        withState { $0.searchAnswerAllByMailbox[mailbox] = set }
+    }
+    /// Every FETCH in `mailbox` that returns `templateUID` also returns a copy of
+    /// its record at `sequence` with UID `uid`. Nil stops it.
+    func setConflictingFetchRecord(templateUID: Int, sequence: Int, uid: Int, in mailbox: String) {
+        withState { $0.conflictingFetchRecordByMailbox[mailbox] = (templateUID, sequence, uid) }
+    }
+    func setIgnoresEnableCondStore(_ on: Bool) {
+        withState { $0.ignoresEnableCondStore = on }
+    }
+    var enableCondStoreCountByConnection: [Int32: Int] { withState { $0.enableCondStoreCountByConnection } }
+    var enableInSelectedStateCount: Int { withState { $0.enableInSelectedStateCount } }
+    /// Every command each connection sent, in order, by connection (its fd).
+    var commandLogByConnection: [Int32: [String]] { withState { $0.commandLogByConnection } }
+    var condStoreSelectCount: Int { withState { $0.condStoreSelectCount } }
+
+    /// The oracle reads: ENABLE QRESYNC per connection, QRESYNC SELECTs per
+    /// connection, and QRESYNC SELECTs refused for want of ENABLE.
+    var enableQResyncCountByConnection: [Int32: Int] { withState { $0.enableQResyncCountByConnection } }
+    var qresyncSelectCountByConnection: [Int32: Int] { withState { $0.qresyncSelectCountByConnection } }
+    var qresyncSelectWithoutEnableCount: Int { withState { $0.qresyncSelectWithoutEnableCount } }
+    /// The current HIGHESTMODSEQ of a mailbox in the QRESYNC model (observes it).
+    func qresyncHighestModSeq(for mailbox: String) -> Int {
+        withState { Self.observeQResync(mailbox, state: &$0).highestModSeq }
+    }
+
+    private func handleStatus(tag: String, args: String, fd: Int32) -> String {
+        let response = currentStatusLine(tag: tag, args: args)
+        // `setStatusStaleUntilNoop`: an answered STATUS line is this connection's
+        // view of the mailbox until its next NOOP.
+        guard response.hasPrefix("* STATUS"), let lineEnd = response.range(of: "\r\n") else { return response }
+        let line = String(response[..<lineEnd.upperBound])
+        let cached = withState { state -> String? in
+            guard state.statusStaleUntilNoop else { return nil }
+            if let earlier = state.staleStatusByFd[fd]?[args] { return earlier }
+            state.staleStatusByFd[fd, default: [:]][args] = line
+            return nil
+        }
+        guard let cached else { return response }
+        return "\(cached)\(tag) OK STATUS completed\r\n"
+    }
+
+    private func currentStatusLine(tag: String, args: String) -> String {
         guard let openParen = args.firstIndex(of: "(") else {
             return "\(tag) BAD STATUS requires an attribute list\r\n"
         }
@@ -2011,45 +2732,58 @@ final class FakeIMAPServer: @unchecked Sendable {
             .split(separator: " ")
             .map { $0.uppercased() }
 
-        let condStore = capabilities.contains("CONDSTORE")
+        let modSeqModel = modelsModSeqs
         let (count, unseen, uidNext, uidValidity, highestModSeq) = withState { state -> (Int, Int, Int, Int, Int) in
             let messages = state.messagesByMailbox[mailbox] ?? []
             let flags = state.flagsByMailbox[mailbox] ?? [:]
             let unseen = messages.filter { !(flags[$0.uid]?.contains("\\Seen") ?? false) }.count
-            var highestModSeq = 0
-            if condStore {
-                let fingerprint = messages.map(\.uid).sorted().map { uid in
-                    "\(uid):\((flags[uid] ?? []).sorted().joined(separator: ","))"
-                }.joined(separator: ";")
-                highestModSeq = state.highestModSeqByMailbox[mailbox] ?? 1
-                if let previous = state.modSeqFingerprintByMailbox[mailbox], previous != fingerprint {
-                    highestModSeq += 1
-                }
-                state.highestModSeqByMailbox[mailbox] = highestModSeq
-                state.modSeqFingerprintByMailbox[mailbox] = fingerprint
+            if modSeqModel {
+                let model = Self.observeQResync(mailbox, state: &state)
+                return (
+                    messages.count, unseen, model.maxUID + 1,
+                    state.uidValidityByMailbox[mailbox] ?? 1, model.highestModSeq)
             }
             return (
                 messages.count,
                 unseen,
                 (messages.map(\.uid).max() ?? 0) + 1,
                 state.uidValidityByMailbox[mailbox] ?? 1,
-                highestModSeq
+                0
             )
         }
 
+        let omitted = withState { $0.statusOmittedAttributesByMailbox[mailbox] ?? [] }
         var parts: [String] = []
-        for attribute in requested {
+        for attribute in requested where !omitted.contains(attribute) {
             switch attribute {
             case "MESSAGES": parts.append("MESSAGES \(count)")
             case "RECENT": parts.append("RECENT 0")
             case "UNSEEN": parts.append("UNSEEN \(unseen)")
             case "UIDNEXT": parts.append("UIDNEXT \(uidNext)")
             case "UIDVALIDITY": parts.append("UIDVALIDITY \(uidValidity)")
-            case "HIGHESTMODSEQ" where condStore: parts.append("HIGHESTMODSEQ \(highestModSeq)")
+            case "HIGHESTMODSEQ" where modSeqModel: parts.append("HIGHESTMODSEQ \(highestModSeq)")
             default: continue // an attribute this fake does not model — never invent one
             }
         }
         return "* STATUS \"\(mailbox)\" (\(parts.joined(separator: " ")))\r\n\(tag) OK STATUS completed\r\n"
+    }
+
+    /// The top-level SELECT parameter names (RFC 4466), upper-cased: the words
+    /// that open the parenthesized list after the mailbox name.
+    private static func parameterList(_ args: String) -> Set<String> {
+        guard let open = args.firstIndex(of: "(") else { return [] }
+        return Set(args[args.index(after: open)...]
+            .split(whereSeparator: { $0 == " " || $0 == "(" || $0 == ")" })
+            .map { $0.uppercased() }
+            .filter { $0.first?.isLetter == true })
+    }
+
+    /// The `(QRESYNC (uidvalidity modseq …))` SELECT parameter, if any.
+    private static func qresyncParameter(_ args: String) -> (uidValidity: Int, modSeq: Int)? {
+        guard let range = args.range(of: "QRESYNC (", options: .caseInsensitive) else { return nil }
+        let numbers = args[range.upperBound...].split(whereSeparator: { $0 == " " || $0 == ")" })
+        guard numbers.count >= 2, let uidValidity = Int(numbers[0]), let modSeq = Int(numbers[1]) else { return nil }
+        return (uidValidity, modSeq)
     }
 
     /// RFC 3501 §6.3.11 APPEND — `mailbox [(flags)] ["date-time"] {N}<literal>`.
@@ -2163,7 +2897,49 @@ final class FakeIMAPServer: @unchecked Sendable {
         return "\(tag) OK [APPENDUID \(uidvalidity) \(newUID)] APPEND completed\r\n"
     }
 
-    private func handleUID(tag: String, args: String, mailbox: String) -> String {
+    /// A UID SEARCH answer in the form a compliant server sends. Plain SEARCH
+    /// (RFC 3501 §7.2.5): `* SEARCH` and the UIDs, nothing after the name when
+    /// none match. ESEARCH (RFC 4731 §3.1): each asked option, but MIN, MAX and
+    /// ALL are left out when nothing matches, while COUNT is always sent when
+    /// asked; with no option asked, ALL is implied.
+    /// The EXISTS override for one SELECT of `mailbox`, counting down a limited one.
+    private static func consumeSelectExistsOverride(_ mailbox: String, state: inout State) -> Int? {
+        guard let count = state.selectExistsOverride[mailbox] else { return nil }
+        if let uses = state.selectExistsOverrideUses[mailbox] {
+            if uses <= 1 {
+                state.selectExistsOverride[mailbox] = nil
+                state.selectExistsOverrideUses[mailbox] = nil
+            } else {
+                state.selectExistsOverrideUses[mailbox] = uses - 1
+            }
+        }
+        return count
+    }
+
+    static func uidSearchReply(tag: String, uids: [String], esearch: Bool, request: String) -> String {
+        let done = "\(tag) OK UID SEARCH completed\r\n"
+        guard esearch else {
+            return (uids.isEmpty ? "* SEARCH" : "* SEARCH \(uids.joined(separator: " "))") + "\r\n" + done
+        }
+        let upper = request.uppercased()
+        let options: Set<String> = {
+            guard let open = upper.range(of: "RETURN ("),
+                  let close = upper[open.upperBound...].firstIndex(of: ")") else { return [] }
+            return Set(upper[open.upperBound..<close].split(separator: " ").map(String.init))
+        }()
+        let numbers = uids.compactMap(Int.init).sorted()
+        var data: [String] = []
+        if options.contains("MIN"), let first = numbers.first { data.append("MIN \(first)") }
+        if options.contains("MAX"), let last = numbers.last { data.append("MAX \(last)") }
+        if (options.isEmpty || options.contains("ALL")), !numbers.isEmpty {
+            data.append("ALL \(numbers.map(String.init).joined(separator: ","))")
+        }
+        if options.contains("COUNT") { data.append("COUNT \(numbers.count)") }
+        let tail = data.isEmpty ? "" : " " + data.joined(separator: " ")
+        return "* ESEARCH (TAG \"\(tag)\") UID\(tail)\r\n" + done
+    }
+
+    private func handleUID(tag: String, args: String, mailbox: String, condStoreEnabled: inout Bool) -> String {
         let parts = args.split(separator: " ", maxSplits: 1).map(String.init)
         guard let subcmd = parts.first?.uppercased() else {
             return "\(tag) BAD Missing UID subcommand\r\n"
@@ -2171,45 +2947,66 @@ final class FakeIMAPServer: @unchecked Sendable {
         let subargs = parts.count > 1 ? parts[1] : ""
         switch subcmd {
         case "FETCH":
-            return handleFetch(tag: tag, args: subargs, uidMode: true, mailbox: mailbox)
+            return handleFetch(tag: tag, args: subargs, uidMode: true, mailbox: mailbox, condStoreEnabled: &condStoreEnabled)
         case "SEARCH":
-            // Honor HEADER "Message-ID" "<...>" criterion when present; otherwise
-            // return all UIDs (legacy behavior). Minimal filter to support
-            // IMAPProvider's remaining exact-identity probe paths.
+            let compact: String?? = withState { state in
+                guard var queue = state.compactUIDSearchAnswersByMailbox[mailbox], !queue.isEmpty else { return nil }
+                let next = queue.removeFirst()
+                state.compactUIDSearchAnswersByMailbox[mailbox] = queue
+                state.compactUIDSearchAnswersServed += 1
+                return next
+            }
+            if let compact {
+                guard let compact else { return "\(tag) OK UID SEARCH completed\r\n" }
+                let data = compact.isEmpty ? "" : " \(compact)"
+                return "* ESEARCH (TAG \"\(tag)\") UID\(data)\r\n\(tag) OK UID SEARCH completed\r\n"
+            }
+            // RFC 4731: a client that asked RETURN (…) of a server advertising
+            // ESEARCH gets an ESEARCH answer, never an untagged SEARCH.
+            let esearch = capabilities.contains("ESEARCH") && subargs.uppercased().contains("RETURN")
+            // Every supported search key narrows ONE answer (RFC 3501 §6.4.4: keys
+            // are ANDed): a HEADER "Message-ID" "<...>" key, the SINCE / BEFORE
+            // date keys when the fixture opted in, and every `UID <set>` key,
+            // each intersecting the others (#1076).
             let upper = subargs.uppercased()
+            var messageIDQuery: String?
+            let bracketSet = CharacterSet(charactersIn: "<>")
             if let range = upper.range(of: "HEADER \"MESSAGE-ID\"") {
-                // Next quoted string after the criterion is the Message-ID pattern.
+                // Next quoted string after the criterion is the Message-ID pattern,
+                // compared without angle brackets on either side.
                 let after = subargs[range.upperBound...]
-                let quoted = Self.firstQuoted(String(after)) ?? ""
-                // Strip any angle brackets on both sides. `messageID` comes
-                // from the raw header value and typically includes "<...>".
-                let bracketSet = CharacterSet(charactersIn: "<>")
-                let bareQuery = quoted.trimmingCharacters(in: bracketSet)
-                let matched = withState { $0.messagesByMailbox[mailbox] ?? [] }
-                    .filter {
-                        $0.messageID.trimmingCharacters(in: bracketSet).contains(bareQuery)
-                    }
-                    .map { String($0.uid) }
-                return "* SEARCH \(matched.joined(separator: " "))\r\n\(tag) OK UID SEARCH completed\r\n"
+                messageIDQuery = (Self.firstQuoted(String(after)) ?? "").trimmingCharacters(in: bracketSet)
+            }
+            // The answer-wide seams below model a mailbox's whole-scan answer;
+            // the exact-identity probe has never gone through them.
+            if messageIDQuery == nil, let answer = withState({ $0.searchAnswerAllByMailbox[mailbox] }) {
+                let data = answer.isEmpty ? "" : " ALL \(answer)"
+                return "* ESEARCH (TAG \"\(tag)\") UID\(data)\r\n\(tag) OK UID SEARCH completed\r\n"
             }
             let all = withState { $0.messagesByMailbox[mailbox] ?? [] }
+            if messageIDQuery == nil { passHeldGate(Self.searchSnapshotGateKey(mailbox)) }
             let honorsDates = withState { $0.honorsSearchDateCriteria }
-            let dateFiltered = honorsDates
-                ? all.filter { Self.matchesSearchDateCriteria($0, args: subargs) }
-                : all
-            // The `UID <set>` key, when the fixture opted in: the token after a
-            // standalone `UID` in the search arguments.
+            // Every `UID <set>` key, unless the fixture opted out: the token after
+            // each standalone `UID` in the search arguments, resolved against the
+            // SNAPSHOT `all` (not the live mailbox, which a held gate may have
+            // changed since), and intersected with one another.
             let tokens = subargs.split(separator: " ").map(String.init)
-            let uidSetKey = withState { $0.honorsSearchUIDSetCriterion }
-                ? tokens.firstIndex { $0.uppercased() == "UID" }
-                    .flatMap { $0 + 1 < tokens.count ? tokens[$0 + 1] : nil }
-                : nil
-            let uidSet = uidSetKey.map { Set(parseUIDSet($0, in: mailbox)) }
-            let uids = dateFiltered
-                .filter { uidSet?.contains($0.uid) ?? true }
+            let snapshotUIDs = all.map(\.uid)
+            let uidSets: [Set<Int>] = withState { $0.honorsSearchUIDSetCriterion }
+                ? tokens.indices
+                    .filter { tokens[$0].uppercased() == "UID" && $0 + 1 < tokens.count }
+                    .map { Set(Self.resolveUIDSet(tokens[$0 + 1], againstMailboxUIDs: snapshotUIDs)) }
+                : []
+            let omitted: Set<Int> = messageIDQuery == nil ? withState { $0.searchOmittedUIDsByMailbox[mailbox] ?? [] } : []
+            let uids = all
+                .filter { message in
+                    messageIDQuery.map { message.messageID.trimmingCharacters(in: bracketSet).contains($0) } ?? true
+                }
+                .filter { !honorsDates || Self.matchesSearchDateCriteria($0, args: subargs) }
+                .filter { message in uidSets.allSatisfy { $0.contains(message.uid) } }
+                .filter { !omitted.contains($0.uid) }
                 .map { String($0.uid) }
-                .joined(separator: " ")
-            return "* SEARCH \(uids)\r\n\(tag) OK UID SEARCH completed\r\n"
+            return Self.uidSearchReply(tag: tag, uids: uids, esearch: esearch, request: subargs)
         case "STORE":
             let components = subargs.split(separator: " ", maxSplits: 1).map(String.init)
             guard components.count == 2 else { return "\(tag) BAD Invalid UID STORE\r\n" }
@@ -2650,9 +3447,11 @@ final class FakeIMAPServer: @unchecked Sendable {
         return regex.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
     }
 
-    private func handleFetch(tag: String, args: String, uidMode: Bool, mailbox: String) -> String {
+    private func handleFetch(tag: String, args rawArgs: String, uidMode: Bool, mailbox: String, condStoreEnabled: inout Bool) -> String {
         let seqStr: String
         let itemsStr: String
+        let args = rawArgs
+        let reportsModSeq = condStoreEnabled && modelsModSeqs
 
         if let parenOpen = args.firstIndex(of: "("),
            let parenClose = args.lastIndex(of: ")") {
@@ -2665,15 +3464,22 @@ final class FakeIMAPServer: @unchecked Sendable {
             itemsStr = fetchParts[1].uppercased()
         }
 
+        let modSeqs: [Int: Int] = reportsModSeq
+            ? withState { state -> [Int: Int] in
+                Self.observeQResync(mailbox, state: &state).modSeqByUID
+            }
+            : [:]
         let snapshot = withState { state in
             (
                 messages: state.messagesByMailbox[mailbox] ?? [],
                 flags: state.flagsByMailbox[mailbox] ?? [:],
                 uidSuppressed: state.fetchUidSuppressedByMailbox[mailbox] ?? [],
                 internalDateSuppressed: state.fetchInternalDateSuppressedByMailbox[mailbox] ?? [],
-                recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? []
+                recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? [],
+                conflicting: state.conflictingFetchRecordByMailbox[mailbox]
             )
         }
+        passHeldGate(Self.snapshotGateKey(mailbox))
         let matched = parseSequenceSet(seqStr, uidMode: uidMode, messages: snapshot.messages)
         var response = ""
 
@@ -2695,6 +3501,12 @@ final class FakeIMAPServer: @unchecked Sendable {
             if itemsStr.contains("FLAGS") {
                 let flags = (snapshot.flags[msg.uid] ?? []).sorted().joined(separator: " ")
                 fetchItems.append("FLAGS (\(flags))")
+            }
+            // RFC 7162 §3.1.4.1: once CONDSTORE is enabled on the connection,
+            // EVERY untagged FETCH response carries MODSEQ, whatever items were
+            // asked for (a body fetch on a connection a listing enabled it on).
+            if reportsModSeq, let modSeq = modSeqs[msg.uid] {
+                fetchItems.append("MODSEQ (\(modSeq))")
             }
             if itemsStr.contains("ENVELOPE") {
                 fetchItems.append("ENVELOPE \(buildEnvelope(msg))")
@@ -2750,6 +3562,10 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
 
             response += "* \(seqnum) FETCH (\(fetchItems.joined(separator: " ")))\r\n"
+            if let conflict = snapshot.conflicting, conflict.templateUID == msg.uid {
+                let copied = fetchItems.map { $0 == "UID \(msg.uid)" ? "UID \(conflict.uid)" : $0 }
+                response += "* \(conflict.sequence) FETCH (\(copied.joined(separator: " ")))\r\n"
+            }
         }
 
         response += "\(tag) OK \(uidMode ? "UID " : "")FETCH completed\r\n"

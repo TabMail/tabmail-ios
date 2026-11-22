@@ -124,7 +124,7 @@ struct FolderFetchDBTests {
                 folder.unreadCount = info.unreadCount
                 folder.totalCount = info.totalCount
                 folder.lastKnownUidNext = info.uidNext
-                try folder.insert(dbConn)
+                try folder.insertWithListingCounters(dbConn)
             }
         }
 
@@ -874,7 +874,7 @@ struct E2ESyncSimulationTests {
                 var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: "acc1")
                 folder.unreadCount = info.unreadCount
                 folder.totalCount = info.totalCount
-                try folder.insert(dbConn)
+                try folder.insertWithListingCounters(dbConn)
             }
         }
 

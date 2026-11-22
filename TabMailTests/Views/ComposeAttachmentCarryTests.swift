@@ -210,7 +210,7 @@ struct ComposeAttachmentCarryTests {
             "hasAttachments: !attachments.isEmpty || attachmentLoadFailed || attachmentPreparationIsUnsettled"),
             "pending attachment work is content and must not take the empty-delete path")
         #expect(body.contains(
-            "|| attachmentPreparationIsUnsettled"),
+            "hasUnsettledWork: attachmentPreparationIsUnsettled || hasVisibleSuggestion"),
             "pending attachment work is an unsaved change and must prompt before dismissal")
     }
 

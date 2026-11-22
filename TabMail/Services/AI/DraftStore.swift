@@ -546,11 +546,27 @@ actor DraftStore {
             guard let realMessageId else {
                 return PushCompletion(applied: true, migration: nil)
             }
-            let oldHeaderId = PendingOperation.draftPlaceholderHeaderPK(
+            // Migrate the entry the save admitted: the placeholder at this
+            // generation, or, when the draft was already uploaded, the server
+            // copy's own entry under the address this attempt replaced
+            // (`AccountManager.admitDraftToDrafts`). That address is used only
+            // when the check draft deletion uses proves it names this folder's
+            // copy, so an entry that may now be another message is never moved.
+            let placeholderHeaderId = PendingOperation.draftPlaceholderHeaderPK(
                 accountId: context.accountId,
                 draftsFolderPath: draftsFolderPath,
                 draftId: context.draftId,
                 instanceEpoch: context.instanceEpoch)
+            var oldHeaderId = placeholderHeaderId
+            if try MessageHeader.fetchOne(db, key: placeholderHeaderId) == nil,
+               let previous = context.previousIdentity,
+               let address = try? AccountManager.validatedDraftAddress(
+                   previous, accountId: context.accountId, folderPath: draftsFolderPath, db: db) {
+                oldHeaderId = "\(context.accountId):\(draftsFolderPath):\(address.encodedId)"
+            }
+            guard oldHeaderId != "\(context.accountId):\(draftsFolderPath):\(realMessageId)" else {
+                return PushCompletion(applied: true, migration: nil)
+            }
             return PushCompletion(
                 applied: true,
                 migration: HeaderMigration(

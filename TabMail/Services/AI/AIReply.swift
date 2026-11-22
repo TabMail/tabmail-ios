@@ -4,16 +4,6 @@
 
 import Foundation
 
-/// A precomputed reply: the email body and its short text-message version
-/// (`MessageHeader.cachedReply` / `replyTextMessage`).
-struct ReplyResult: Sendable, Equatable {
-    let body: String
-    let textMessage: String?
-
-    /// The quality filters' sentinel: no reply wanted (an empty body), distinct from nil (error, retried).
-    static let filtered = ReplyResult(body: "", textMessage: nil)
-}
-
 extension AIService {
 
     // MARK: - Reply Generation
@@ -110,7 +100,15 @@ extension AIService {
         BackgroundSyncLogger.logDebug("[AIService] generateReply: sending to backend (disable_tools=false, timezone=\(TimeZone.current.identifier))")
         let llmT0 = CFAbsoluteTimeGetCurrent()
         BackgroundSyncLogger.logAIProcessing("Reply LLM START (body.len=\(bodyText.count))")
-        let response = try await backend.sendCompletionsWithTools(request)
+        let response: CompletionsResponse
+        do {
+            response = try await backend.sendCompletionsWithTools(request)
+        } catch is AIOffError {
+            // AI was turned off before a request of this reply (its first, a retry or a
+            // tool round) was sent: end as the check above does.
+            BackgroundSyncLogger.logAIProcessing("Reply stopped: AI turned off")
+            return nil
+        }
         let llmElapsed = Int((CFAbsoluteTimeGetCurrent() - llmT0) * 1000)
         BackgroundSyncLogger.logAIProcessing("Reply LLM END in \(llmElapsed)ms")
 
@@ -136,7 +134,7 @@ extension AIService {
         BackgroundSyncLogger.logDebug("[AIService]   text message: \(parsed.textMessage ?? "nil")")
         BackgroundSyncLogger.logDebug("[AIService] generateReply: === END PARSED BODY ===")
         #endif
-        return ReplyResult(body: parsed.body, textMessage: parsed.textMessage)
+        return parsed
     }
 
     // MARK: - Reply Processing (standalone step, called after summary+action)

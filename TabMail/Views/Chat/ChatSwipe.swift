@@ -4,6 +4,8 @@
 
 import SwiftUI
 import UIKit
+// The touch callbacks the field's pan (`ChatFieldPan.Recognizer`) overrides.
+import UIKit.UIGestureRecognizerSubclass
 
 /// What the chat's swipes act on (ADR-IOS-114 decision 12).
 enum ChatSwipe {
@@ -384,8 +386,7 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     /// The swipe's pan, asking `delegate` before it starts so a vertical drag stays the scroll
-    /// view's (`Coordinator.gestureRecognizerShouldBegin`). The reply field's drag up builds its
-    /// pan here too (`ChatFieldPan`), with its own delegate.
+    /// view's (`Coordinator.gestureRecognizerShouldBegin`).
     static func makePan(delegate: any UIGestureRecognizerDelegate) -> UIPanGestureRecognizer {
         let pan = UIPanGestureRecognizer()
         pan.delegate = delegate
@@ -528,30 +529,77 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         Coordinator()
     }
 
-    func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
+    func makeUIGestureRecognizer(context: Context) -> Recognizer {
         Self.makePan(delegate: context.coordinator, isEnabled: isEnabled)
     }
 
-    /// The swipes' pan (`ChatHorizontalPan.makePan`) asking `delegate`, cancelling the touch for
-    /// the views under it once it starts (UIKit's default, stated because the field's focus
-    /// depends on it).
-    static func makePan(delegate: Coordinator, isEnabled: Bool) -> UIPanGestureRecognizer {
-        let pan = ChatHorizontalPan.makePan(delegate: delegate)
+    /// The field's pan (`Recognizer`) asking `delegate`, as the swipes' pan does
+    /// (`ChatHorizontalPan.makePan`), cancelling the touch for the views under it once it starts
+    /// (UIKit's default, stated because the field's focus depends on it).
+    static func makePan(delegate: Coordinator, isEnabled: Bool) -> Recognizer {
+        let pan = Recognizer()
+        pan.delegate = delegate
         pan.cancelsTouchesInView = true
         pan.isEnabled = isEnabled
         return pan
     }
 
-    func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
+    func updateUIGestureRecognizer(_ recognizer: Recognizer, context: Context) {
         recognizer.isEnabled = isEnabled
     }
 
     /// The swipes' delivery (`ChatHorizontalPan.deliver`), both axes, each sample the field's
-    /// share of the drag (`Coordinator.share`).
-    func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
+    /// share of the drag (`Coordinator.share`); the let-go at rest when the finger held still
+    /// before it lifted (`ChatFieldDrag.letGo`).
+    func handleUIGestureRecognizerAction(_ recognizer: Recognizer, context: Context) {
         let coordinator = context.coordinator
         ChatHorizontalPan.deliver(recognizer, moved: { moved(coordinator.share($0)) },
-                                  ended: { ended(coordinator.share($0), $1) })
+                                  ended: {
+            coordinator.letGo()
+            ended(coordinator.share(ChatFieldDrag.letGo($0, rested: recognizer.restedBeforeLift)), $1)
+        })
+    }
+
+    /// UIKit's pan, noting when its finger last moved and when it lifted, on the touches' own
+    /// clock: UIKit reports at the let-go the speed of the finger's last move however long it then
+    /// held still, so the let-go reads how long it rested (`restedBeforeLift`).
+    final class Recognizer: UIPanGestureRecognizer {
+        private var lastMove: TimeInterval?
+        private var lift: TimeInterval?
+
+        /// How long the finger held still before it lifted; zero until it has lifted.
+        var restedBeforeLift: TimeInterval {
+            guard let lastMove, let lift else { return 0 }
+            return max(0, lift - lastMove)
+        }
+
+        /// The finger moved at `time`. A touch coming down is not a move: a pan only begins once
+        /// the finger moved, and a second finger landing during a hold leaves the hold a hold.
+        func moved(at time: TimeInterval) {
+            lastMove = time
+        }
+
+        /// The finger lifted at `time`.
+        func lifted(at time: TimeInterval) {
+            lift = time
+        }
+
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+            moved(at: event.timestamp)
+            super.touchesMoved(touches, with: event)
+        }
+
+        // Before UIKit ends the pan, so its let-go reads the lift.
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+            lifted(at: event.timestamp)
+            super.touchesEnded(touches, with: event)
+        }
+
+        override func reset() {
+            super.reset()
+            lastMove = nil
+            lift = nil
+        }
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
@@ -630,6 +678,12 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             // Debug UI tests only: how far the text went past its end (`ChatFieldDragMarker`).
             ChatFieldDragMarker.textPastEnd(offset - end)
             return ChatFieldDrag.fieldShare(of: drag, handOff: handOff)
+        }
+
+        /// The drag let go or was cut off, before the view hears of it: the drag marker watches the
+        /// text under it from here (debug UI tests only; nothing in release).
+        func letGo() {
+            ChatFieldDragMarker.textLetGo(text, lastMoved: lastOffset)
         }
 
         /// The drag's travel, both axes, where the text reached its end, within the sample that went

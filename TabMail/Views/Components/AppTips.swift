@@ -223,7 +223,7 @@ struct ChatPillTip: Tip {
 
 /// Shown once above the chat view's reply field, inline (a `TipView` in an overlay, never a popover,
 /// so it takes no touch from the field): a drag up opens the TabMail chat about the conversation
-/// (ADR-IOS-114 decision 20). Gone for good on the first drag, a tap that focuses the field, the
+/// (ADR-IOS-114 decision 22). Gone for good on the first drag, a tap that focuses the field, the
 /// panel opening, or its own close button (`invalidate`).
 struct ChatFieldDragTip: Tip {
     static let text = "Drag up to see what you asked TabMail about this conversation."

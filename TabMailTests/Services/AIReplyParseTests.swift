@@ -18,6 +18,18 @@ struct AIReplyParseTests {
         #expect(result?.textMessage == "Thanks, got it.")
     }
 
+    @Test("Extracts the change command; nil when absent or blank")
+    func changeCommand() {
+        let with = AIResponseParser.parseReplyResponse(
+            #"{"subject": "S", "body": "Thanks.", "text_message": "Thanks!", "change_command": " ask for Friday "}"#)
+        #expect(with?.changeCommand == "ask for Friday")
+        let without = AIResponseParser.parseReplyResponse(#"{"subject": "S", "body": "Thanks.", "text_message": "Thanks!"}"#)
+        #expect(without?.body == "Thanks.")
+        #expect(without?.changeCommand == nil)
+        let blank = AIResponseParser.parseReplyResponse(#"{"body": "Thanks.", "change_command": "  "}"#)
+        #expect(blank?.changeCommand == nil)
+    }
+
     @Test("A multiline body keeps its line breaks")
     func multilineBody() {
         let result = AIResponseParser.parseReplyResponse(
@@ -67,123 +79,5 @@ struct AIReplyParseTests {
         for text in ["Subject: Hello\nBody: Thanks for your email.", "", "Just a plain reply.", "[]", "null", #""body""#] {
             #expect(AIResponseParser.parseReplyResponse(text) == nil, "\(text)")
         }
-    }
-}
-
-// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "AIService.parseInlineEditResponse" — it collided
-// with `ParseInlineEditResponseTests` in `AIInlineEditTests.swift`. The run log prints DISPLAY names, so
-// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
-// two apart, and a suite that silently ran zero tests would have been covered
-// by its twin's line. `-only-testing:` was never affected: it selects by Swift
-// TYPE name, and the two types were always distinct.
-@Suite("AIService.parseInlineEditResponse — marker-section extraction")
-struct AIInlineEditParseTests {
-
-    @Test("Extracts all three sections")
-    func allSections() {
-        let input = """
-        Response: I've updated the greeting.
-        Subject: New Subject Line
-        Body: Dear Team,
-
-        Please review the attached document.
-
-        Thanks
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.response == "I've updated the greeting.")
-        #expect(result.subject == "New Subject Line")
-        #expect(result.body?.contains("Dear Team,") == true)
-        #expect(result.body?.contains("Thanks") == true)
-    }
-
-    @Test("Body only — no Response or Subject")
-    func bodyOnly() {
-        let input = """
-        Body: Just the body content here.
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.response == nil)
-        #expect(result.subject == nil)
-        #expect(result.body == "Just the body content here.")
-    }
-
-    @Test("Fallback — no markers at all")
-    func noMarkers() {
-        let input = "Plain text response from LLM without any markers."
-        let result = AIService.parseInlineEditResponse(input)
-        // No Body: or Subject: → entire text becomes body
-        #expect(result.body == input)
-        #expect(result.response == nil)
-        #expect(result.subject == nil)
-    }
-
-    @Test("Subject only — no Body triggers fallback")
-    func subjectOnlyNoFallback() {
-        let input = "Subject: Updated Title"
-        let result = AIService.parseInlineEditResponse(input)
-        // Subject found, so no fallback
-        #expect(result.subject == "Updated Title")
-        #expect(result.body == nil)
-    }
-
-    @Test("Case-insensitive markers")
-    func caseInsensitive() {
-        let input = """
-        RESPONSE: Done.
-        SUBJECT: Test
-        BODY: Content here.
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.response == "Done.")
-        #expect(result.subject == "Test")
-        #expect(result.body == "Content here.")
-    }
-
-    @Test("Empty Subject: line — regex may consume next line via \\s*")
-    func emptySubject() {
-        // When Subject: has no content on the same line, \s* in the regex
-        // can consume the newline and (.*)$ matches the next line.
-        // This is existing behavior — test documents it.
-        let input = """
-        Response: Edited.
-        Subject: Updated Title
-        Body: The body text.
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.response == "Edited.")
-        #expect(result.subject == "Updated Title")
-        #expect(result.body == "The body text.")
-    }
-
-    @Test("Body is multiline to end of text")
-    func bodyMultilineToEnd() {
-        let input = """
-        Response: Here's the edit.
-        Body: Line 1
-        Line 2
-        Line 3
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.body?.contains("Line 1") == true)
-        #expect(result.body?.contains("Line 2") == true)
-        #expect(result.body?.contains("Line 3") == true)
-    }
-
-    @Test("Raw text is preserved in result")
-    func rawPreserved() {
-        let input = "Response: Hi\nBody: World"
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.raw == input)
-    }
-
-    @Test("Empty input returns empty body fallback")
-    func emptyInput() {
-        let result = AIService.parseInlineEditResponse("")
-        // empty text, no markers → body = "" (fallback), but trimmed empty = body stays nil?
-        // Let's check: text = "", no body/subject found → body = text = "" which is empty
-        #expect(result.body == "")
-        #expect(result.response == nil)
-        #expect(result.subject == nil)
     }
 }

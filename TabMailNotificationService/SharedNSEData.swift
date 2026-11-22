@@ -64,12 +64,6 @@ enum SharedNSEData {
     // targets) — this alias keeps existing NSE-side callers compiling.
     static let badgeCountKey = NSEBadge.badgeCountKey
 
-    /// Privacy opt-out flag. Shared so NSE and main app agree — otherwise main
-    /// app's UserDefaults.standard is a separate namespace from the NSE process
-    /// and NSE never sees the toggle. Same literal key as AIService.optOutAllAIKey
-    /// so the two constants match.
-    static let aiOptOutAllKey = "privacy_opt_out_all_ai"
-
     /// Persistent NSE file-log gate. Mirrored by `NSEDataBridge.mirrorDebugLogging()`
     /// (launch + immediately on unlock/lock) from `DebugModeManager.isLoggingEnabled()`.
     /// Same literal key as `NSELogStore.debugLoggingEnabledKey` — `NSELogStore`

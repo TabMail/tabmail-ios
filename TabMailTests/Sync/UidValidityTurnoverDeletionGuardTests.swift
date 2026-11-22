@@ -209,7 +209,7 @@ struct UidValidityTurnoverDeletionGuardTests {
             folder.totalCount = totalCount
             folder.lastKnownUidNext = lastKnownUidNext
             folder.lastKnownUidValidity = storedEpoch
-            try folder.insert(db)
+            try folder.insertWithListingCounters(db)
             for i in 0..<localHeaderCount {
                 let uid = firstLocalUID + i
                 var header = MessageHeader(

@@ -100,6 +100,15 @@ enum AIWriteOutcome: Sendable, Equatable { case written, dropped }
 /// same address carries the NEW epoch, so comparing the impostor's live stamp
 /// against the live folder epoch would agree and admit the wrong write — the
 /// captured stamp is what disagrees.
+extension AIWriteTarget {
+    /// Whether the row `message` was read from is still that email: the identity guard every AI
+    /// writer uses, for a read that must not run against another email seated at its address.
+    nonisolated static func stillHolds(_ message: MessageHeader, db: Database) throws -> Bool {
+        guard let target = try capture(message: message, db: db) else { return false }
+        return try target.resolveCurrentHeader(db: db) != nil
+    }
+}
+
 struct AIWriteTarget: Sendable, Equatable {
     let headerId: String
     let accountId: String
@@ -396,6 +405,31 @@ extension AccountManager {
 }
 
 extension AccountManager {
+    /// Stores `value` as the AI Suggestion of the email `target` names, by the one rule
+    /// (`MessageHeader.replaceSuggestion`): only while that row is still the captured email and
+    /// still holds `expected`. The row and its AI cache entry are written in this one transaction,
+    /// so a header rebuilt from the cache (`MessageAICache.restoreIfCached`) gets this value.
+    /// `.dropped` when the identity moved or the stored suggestion is no longer `expected`.
+    nonisolated static func storeSuggestion(
+        _ value: ReplyResult, replacing expected: ReplyResult?, target: AIWriteTarget,
+        generatedAt: Date? = nil, db: Database
+    ) throws -> AIWriteOutcome {
+        var replaced = false
+        let outcome = try aiGuardedHeaderWrite(db, target: target) { msg, db in
+            guard msg.replaceSuggestion(with: value, ifStill: expected) else { return }
+            replaced = true
+            try msg.save(db)
+            // The filtered sentinel (an empty body) is not cached: there is nothing to restore.
+            guard !value.body.isEmpty else { return }
+            try MessageAICache.writeThrough(
+                accountId: msg.accountId, folderPath: msg.folderPath, rfc822MessageId: msg.rfc822MessageId,
+                reply: value, replyGeneratedAt: generatedAt, db: db)
+        }
+        return replaced ? outcome : .dropped
+    }
+}
+
+extension AccountManager {
 
     // MARK: - Direct Path (User-Opened Messages)
 
@@ -485,10 +519,10 @@ extension AccountManager {
             return
         }
 
-        let needsReply = current.cachedReply == nil
+        let needsReply = current.suggestion == nil
         guard needsSummary || needsAction || needsReply else { return } // already fully processed
 
-        let aiDisabled = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
+        let aiDisabled = AIService.isAIOff
         let deviceSyncEnabled = UserDefaults.standard.object(forKey: "device_sync_auto_enabled") as? Bool ?? true
         let hasSession = TabMailAuthService.hasSession()
         guard hasSession && (!aiDisabled || deviceSyncEnabled) else { return }
@@ -535,7 +569,7 @@ extension AccountManager {
         let htmlContent = body.htmlContent
         let hasExistingAction = message.actionTag != nil
         let hasSummary = message.summaryBlurb != nil && message.summaryBlurb?.isEmpty == false
-        let hasReply = message.cachedReply != nil
+        let hasReply = message.suggestion != nil
         let toRecipients = message.to
         // T4.V7: the `folderPath` job-start snapshot is GONE — every AI-cache
         // write-through below keys off the RE-RESOLVED row (`msg.folderPath`), so a
@@ -582,7 +616,7 @@ extension AccountManager {
             // Double-check: fully processed by another path?
             if let msg = try? await dbPool.read({ db in try MessageHeader.fetchOne(db, key: headerId) }),
                msg.summaryBlurb != nil, msg.summaryBlurb?.isEmpty == false,
-               msg.actionTag != nil, msg.cachedReply != nil {
+               msg.actionTag != nil, msg.suggestion != nil {
                 return
             }
 
@@ -648,9 +682,8 @@ extension AccountManager {
                                     }
                                 }
 
-                                if let peerReply, !peerReply.isEmpty, msg.cachedReply == nil {
-                                    msg.cachedReply = peerReply
-                                    msg.replyTextMessage = nil
+                                if let peerReply, !peerReply.isEmpty,
+                                   msg.replaceSuggestion(with: ReplyResult(body: peerReply, textMessage: nil), ifStill: nil) {
                                     if DebugModeManager.isLoggingEnabled() {
                                         print("[AI] Device Sync reply applied for direct path \(messageId)")
                                     }
@@ -669,8 +702,7 @@ extension AccountManager {
                                     reminderContent: summary.reminderContent,
                                     summaryTextMessage: summary.textMessage,
                                     actionTag: cacheActionTag,
-                                    cachedReply: msg.cachedReply,
-                                    replyTextMessage: msg.replyTextMessage,
+                                    reply: msg.suggestion,
                                     db: db
                                 )
                             }
@@ -793,31 +825,15 @@ extension AccountManager {
                     )
                     if let reply {
                         // T4.V7 site 7.
+                        // This path runs only for a row with no reply stored (`needsReply`), so it
+                        // stores only over none: a reply or an edit stored meanwhile wins.
                         let outcome = (try? await dbPool.write { db in
-                            try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
-                                msg.cachedReply = reply.body
-                                msg.replyTextMessage = reply.textMessage
-                                try msg.save(db)
-                                if !reply.body.isEmpty {
-                                    try MessageAICache.writeThrough(
-                                        accountId: accountId,
-                                        folderPath: msg.folderPath,
-                                        rfc822MessageId: msg.rfc822MessageId,
-                                        cachedReply: reply.body,
-                                        replyGeneratedAt: Date(),
-                                        replyTextMessage: reply.textMessage,
-                                        db: db
-                                    )
-                                    if DebugModeManager.isLoggingEnabled() {
-                                        print("[AI] Reply precomputed for direct path \(messageId)")
-                                    }
-                                } else {
-                                    if DebugModeManager.isLoggingEnabled() {
-                                        print("[AI] Reply filtered (sentinel) for direct path \(messageId)")
-                                    }
-                                }
-                            }
+                            try AccountManager.storeSuggestion(
+                                reply, replacing: nil, target: target, generatedAt: Date(), db: db)
                         }) ?? .dropped
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[AI] Reply \(reply.body.isEmpty ? "filtered (sentinel)" : "precomputed") for direct path \(messageId), stored: \(outcome == .written)")
+                        }
                         guard outcome == .written else {
                             if DebugModeManager.isLoggingEnabled() {
                                 BackgroundSyncLogger.logDebug("[AI] T4.V7 direct reply write dropped for \(messageId)")
@@ -880,11 +896,28 @@ extension AccountManager {
         // row durable first, mirroring markRead/markUnread/markFlagged/move.
         await ensureDurable([message])
 
-        // Step 1: Update GRDB state immediately (optimistic UI)
-        try? await dbPool.write { db in
-            guard var msg = try MessageHeader.fetchOne(db, key: message.id) else { return }
-            msg.setActionTag(tag)
-            try msg.save(db)
+        // Step 1: Update GRDB state immediately (optimistic UI). Refused when
+        // this gesture's view of the row predates its folder's id reset: the
+        // row at this id may be a different email, and neither the tag nor the
+        // cache and teaching steps below may be attributed to it.
+        let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
+        let allowed: Bool
+        do {
+            allowed = try await dbPool.write { db -> Bool in
+                guard !FolderResetGeneration.refuses(folderId: folderId) else { return false }
+                guard var msg = try MessageHeader.fetchOne(db, key: message.id) else { return true }
+                msg.setActionTag(tag)
+                try msg.save(db)
+                return true
+            }
+        } catch {
+            // The write never ran its check; a failed write still may not
+            // attribute the tag below to a re-seated row.
+            allowed = !FolderResetGeneration.refuses(folderId: folderId)
+        }
+        guard allowed else {
+            BackgroundSyncLogger.logDebug("[ManualTag] refused: '\(folderPath)' was reset after the gesture for \(messageId)")
+            return
         }
 
         Task { @MainActor in NotificationCenter.default.post(name: .inboxDataDidChange, object: nil) }
@@ -972,7 +1005,8 @@ extension AccountManager {
         let content = UNMutableNotificationContent()
         EmailNotificationBuilder.fill(
             content, signal: signal,
-            accountId: header.accountId, messageId: header.messageId
+            accountId: header.accountId, messageId: header.messageId,
+            observedUidValidity: header.observedUidValidity
         )
 
         try await UNUserNotificationCenter.current().add(

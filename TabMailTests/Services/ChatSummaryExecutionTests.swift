@@ -71,10 +71,7 @@ struct ChatSummaryExecutionTests {
     }
 
     static func withAIOn<T>(_ body: () async throws -> T) async rethrows -> T {
-        let saved = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
-        AIService.writeOptOutFlag(false)
-        defer { AIService.optOutStore.set(saved, forKey: AIService.optOutAllAIKey) }
-        return try await body()
+        try await AITestSetting.with(aiOff: false, body)
     }
 
     /// Indexes `header` in the search index, with `body` when given; `nil` leaves it without one.
@@ -388,7 +385,7 @@ struct ChatSummaryExecutionTests {
                 await queue.enqueueChatSummaries([email])
                 for job in await queue.takePendingIntoFlightForTesting() {
                     await queue.executeWholeJobForTesting(job, aiService: service)
-                    await queue.finishInFlightForTesting(job)
+                    await queue.finishInFlightWithNotificationsOffForTesting(job)
                 }
             }
             for _ in 0..<3 { await askAndDrain() }
@@ -448,7 +445,7 @@ struct ChatSummaryExecutionTests {
                     guard !jobs.isEmpty else { return }
                     for job in jobs {
                         await queue.executeWholeJobForTesting(job, aiService: service)
-                        await queue.finishInFlightForTesting(job)
+                        await queue.finishInFlightWithNotificationsOffForTesting(job)
                     }
                 }
             }
@@ -517,19 +514,23 @@ struct ChatSummaryExecutionTests {
             return .parked { gate.wait(); return Self.finalEvent("Done.") }
         }
         let backend = BackendClient(llmSession: http.session)
-        let held = (0..<slots).map { _ in
-            Task {
-                _ = try? await backend.sendCompletions(CompletionsRequest(
-                    messages: [CompletionsMessage(role: "system", content: background, vars: [:])],
-                    client_timezone: nil, disable_tools: true))
-            }
-        }
-        #expect(await Self.eventually { http.recordedCalls().count == slots }, "every slot is held")
         func textMessage() async -> String? {
             try? await pool.read { try MessageHeader.fetchOne($0, key: row.id) }?.summaryTextMessage
         }
 
         try await Self.withAIOn {
+            // The holders are real AI requests, so they are sent with AI on, as the app sends them:
+            // with AI off each one is refused before it reaches the backend and holds no slot.
+            let held = (0..<slots).map { _ in
+                Task {
+                    _ = try? await backend.sendCompletions(CompletionsRequest(
+                        messages: [CompletionsMessage(role: "system", content: background, vars: [:])],
+                        client_timezone: nil, disable_tools: true))
+                }
+            }
+            let allHeld = await Self.eventually { http.recordedCalls().count == slots }
+            #expect(allHeld, "every slot is held")
+
             let service = AIService(backendClient: backend, peerProbe: { _ in nil })
             let queue = ActiveAIQueue()
             await queue.setDispatchSuppressedForTesting(true)
@@ -553,5 +554,60 @@ struct ChatSummaryExecutionTests {
             // A starved chat summary never returns; only a run that finished is awaited.
             if ran { await chat.value }
         }
+    }
+
+    // MARK: - Test drains stay away from the system notification center
+
+    @Test("Every test that drains the AI queue does it with proactive notifications off, and the setting is put back")
+    func drainsKeepProactiveNotificationsOff() async throws {
+        // No test calls the plain seam: a drain that empties the queue would ask the system
+        // notification center, which the unit-test host does not always answer.
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let plainSeam = "finishInFlight" + "ForTesting("  // split, so this line is not a use
+        var plain: [String] = []
+        let files = try FileManager.default.subpathsOfDirectory(atPath: root.path)
+        #expect(files.count > 1, "the test sources are readable at \(root.path)")
+        for path in files where path.hasSuffix(".swift") {
+            let url = root.appendingPathComponent(path)
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let uses = text.components(separatedBy: plainSeam).count - 1
+            // The helper's own call is the one allowed use.
+            let allowed = url.lastPathComponent == "ChatSummaryExecutionTests.swift" ? 1 : 0
+            if uses > allowed { plain.append("\(url.lastPathComponent): \(uses - allowed)") }
+        }
+        #expect(plain.isEmpty, "drain through finishInFlightWithNotificationsOffForTesting: \(plain)")
+
+        // The setting is the user's: the helper puts back what was there, unset included.
+        let key = ProactiveNotifyService.enabledKey
+        let saved = UserDefaults.standard.object(forKey: key)
+        defer { UserDefaults.standard.set(saved, forKey: key) }
+        let job = ActiveAIQueue.AIJob(headerId: "none", accountId: "none", jobType: .summary, windowExempt: true, forChat: true)
+        for before: Bool? in [nil, true] {
+            UserDefaults.standard.set(before, forKey: key)
+            let queue = ActiveAIQueue()
+            await queue.setDispatchSuppressedForTesting(true)
+            await queue.finishInFlightWithNotificationsOffForTesting(job)
+            #expect(UserDefaults.standard.object(forKey: key) as? Bool == before, "put back: \(String(describing: before))")
+        }
+    }
+}
+
+extension ActiveAIQueue {
+    /// Finishes an in-flight job as a test's drain does (`finishInFlightForTesting`), with the
+    /// proactive notifications setting off for the call and put back as it was afterwards.
+    ///
+    /// A drain that leaves the queue empty runs `ProactiveNotifyService.onInboxUpdated()`, whose
+    /// first step asks the system notification center for its delivered notifications. In the
+    /// unit-test host that request is not always answered, and the test then waits for it forever
+    /// (observed in `textlessChatSummaryIsAskedOncePerProcess`). The setting is the hook's own gate,
+    /// so a test that drains the queue never reaches the notification center. Every test drain
+    /// goes through here (`drainsKeepProactiveNotificationsOff`).
+    func finishInFlightWithNotificationsOffForTesting(_ job: AIJob) async {
+        let defaults = UserDefaults.standard
+        let key = ProactiveNotifyService.enabledKey
+        let saved = defaults.object(forKey: key)
+        defaults.set(false, forKey: key)
+        await finishInFlightForTesting(job)
+        defaults.set(saved, forKey: key)
     }
 }

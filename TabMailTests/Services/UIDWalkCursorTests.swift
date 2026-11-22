@@ -257,3 +257,30 @@ struct UIDWalkCursorChunkRecoveryTests {
         #expect(await cursor.currentChunkSize == 250, "Should recover after 5 successes from reset")
     }
 }
+
+@Suite("UIDWalkCursor - Confirmed cursor snapshot")
+struct UIDWalkCursorSnapshotTests {
+
+    /// The progress write's snapshot is the CONFIRMED cursor: a lower empty
+    /// range confirmed while a higher range is still held must not move it
+    /// past the held range's mail.
+    @Test("The snapshot stays above a held range until it is confirmed")
+    func snapshotStaysAboveAHeldRange() async {
+        let cursor = UIDWalkCursor(startCursor: 90, chunkSize: 30)
+        let held = await cursor.nextRange()     // 61...90, its mail not loaded yet
+        let lower = await cursor.nextRange()    // 31...60, empty
+        let lowest = await cursor.nextRange()   // 1...30
+        guard let held, let lower, lowest != nil else {
+            Issue.record("Expected three ranges from nextRange()")
+            return
+        }
+
+        await cursor.confirmRange(from: lower.from, to: lower.to)
+        let whileHeld = await cursor.confirmedCursorSnapshot()
+        #expect(whileHeld >= held.to, "the snapshot \(whileHeld) moved below the held range \(held.from)...\(held.to)")
+
+        await cursor.confirmRange(from: held.from, to: held.to)
+        let afterHeld = await cursor.confirmedCursorSnapshot()
+        #expect(afterHeld == lower.from - 1, "the snapshot \(afterHeld) did not advance past the confirmed ranges")
+    }
+}

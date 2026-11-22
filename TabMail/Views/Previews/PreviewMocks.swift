@@ -122,13 +122,13 @@ enum PreviewMocks {
             // cachedReply populated on every row (even archive-tagged) so no
             // row shows the reply-loading shimmer. The shimmer is intended for
             // rows where AI hasn't finished yet, which isn't a useful preview state.
-            h.cachedReply = [
+            _ = h.replaceSuggestion(with: ReplyResult(body: [
                 "Thanks for sharing — I'll review the action items and follow up by EOW.",
                 "Agreed, let's push by a week. I'll update the tracker.",
                 "Thanks for the heads-up — archiving.",
                 "Sounds great! 7pm Friday works.",
                 "Thanks, archiving for later reading.",
-            ][i]
+            ][i], textMessage: nil), ifStill: nil)
             headers.append(h)
         }
 
@@ -165,6 +165,7 @@ enum PreviewMocks {
             try pool.write { db in
                 try account.save(db)
                 try inbox.save(db)
+                try SyncEngine.writeListingCounters(ListingCounters(messageCount: inbox.totalCount, uidNext: nil, highestModSeq: nil), folderId: inbox.id, db: db)
                 for h in headers { try h.save(db) }
                 for b in bodies { try b.save(db) }
                 for l in labels { try l.save(db) }

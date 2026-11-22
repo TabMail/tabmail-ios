@@ -255,6 +255,9 @@ final class AgentToolRouter {
         let bcc: [String]
         let subject: String?
         let body: String?
+        /// A `.reply` opened on the stored AI Suggestion: the whole stored value, so an edit in the
+        /// card compares against exactly what is stored. Nil when the card opens on `body`.
+        let suggestion: ReplyResult?
         /// A `.reply` built from the reply-all recipient set (the AI reply
         /// tool). Carried into ComposeView so the send records reply-all on
         /// the original, like the Reply All button (#915).
@@ -263,6 +266,9 @@ final class AgentToolRouter {
         /// user chose in Reply to when the request was sent (ADR-IOS-114 decision 11). Nil for
         /// every other request, whose compose keeps the recipients above.
         let fieldReply: ChatFieldReply?
+        /// The draft the card saves to; nil, the reply's usual one. An edit of the AI Suggestion
+        /// opens on the suggestion's own draft (`Draft.separateReplyKey`), as the ghost's card does.
+        let draftId: String?
 
         /// Fires once when the user's compose session reaches a terminal state
         /// (send / cancel / persist-failure). Invoked on MainActor from
@@ -283,8 +289,10 @@ final class AgentToolRouter {
             bcc: [String],
             subject: String?,
             body: String?,
+            suggestion: ReplyResult? = nil,
             isReplyAll: Bool = false,
             fieldReply: ChatFieldReply? = nil,
+            draftId: String? = nil,
             onOutcome: @escaping @MainActor (ComposeOutcome) -> Void = { _ in },
             outcomeState: ComposeOutcomeState = ComposeOutcomeState()
         ) {
@@ -295,8 +303,10 @@ final class AgentToolRouter {
             self.bcc = bcc
             self.subject = subject
             self.body = body
+            self.suggestion = suggestion
             self.isReplyAll = isReplyAll
             self.fieldReply = fieldReply
+            self.draftId = draftId
             self.onOutcome = onOutcome
             self.outcomeState = outcomeState
         }

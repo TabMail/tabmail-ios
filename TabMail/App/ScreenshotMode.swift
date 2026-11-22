@@ -94,7 +94,7 @@ enum ScreenshotMode {
         // Bypass all onboarding gates
         UserDefaults.standard.set(true, forKey: "hasLaunchedBefore")
         UserDefaults.standard.set(true, forKey: AgeAndTermsConsent.completedKey)
-        UserDefaults.standard.set(true, forKey: "hasSeenAIConsent")
+        AIService.optOutStore.set(true, forKey: AIService.aiChoiceMadeKey)
         UserDefaults.standard.set(true, forKey: "hasSeenPushConsent")
         UserDefaults.standard.set(true, forKey: "didMigrateHeaderIds_v2")
         UserDefaults.standard.set(true, forKey: "didClearBodiesForAttachmentEncoding_v1")
@@ -144,11 +144,14 @@ enum ScreenshotMode {
                 for f in folders {
                     try db.execute(
                         sql: """
-                            INSERT INTO folder (id, accountId, name, path, role, unreadCount, totalCount, backfillComplete)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT INTO folder (id, accountId, name, path, role, unreadCount, backfillComplete)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
                             """,
-                        arguments: [f.id, f.accountId, f.name, f.path, f.role, f.unread, f.total, true]
+                        arguments: [f.id, f.accountId, f.name, f.path, f.role, f.unread, true]
                     )
+                    // The synthetic count goes through the counters' one writer.
+                    try SyncEngine.writeListingCounters(
+                        ListingCounters(messageCount: f.total, uidNext: nil, highestModSeq: nil), folderId: f.id, db: db)
                 }
 
                 // --- Messages ---
@@ -169,7 +172,8 @@ enum ScreenshotMode {
                     let summaryBlurb: String?
                     let summaryTodos: String?
                     let reminderContent: String?
-                    let cachedReply: String?
+                    /// The seeded AI Suggestion's body; "" is the filtered sentinel (no reply wanted).
+                    let replyBody: String?
                 }
 
                 let messages: [DemoMessage] = [
@@ -187,7 +191,7 @@ enum ScreenshotMode {
                         summaryBlurb: "Sarah needs you to review and confirm Q1 budget allocations. Two items flagged: marketing spend is 15% over projection, and the engineering headcount line needs your sign-off.",
                         summaryTodos: "- Review Q1 budget spreadsheet\n- Confirm marketing allocation adjustment\n- Sign off on engineering headcount",
                         reminderContent: "Respond to Sarah about Q1 budget by Friday",
-                        cachedReply: "Hi Sarah,\n\nThanks for sending this over. I've reviewed the Q1 budget — the marketing adjustment looks reasonable given the campaign results. I'll sign off on the engineering headcount today.\n\nBest,\nAlex"
+                        replyBody: "Hi Sarah,\n\nThanks for sending this over. I've reviewed the Q1 budget — the marketing adjustment looks reasonable given the campaign results. I'll sign off on the engineering headcount today.\n\nBest,\nAlex"
                     ),
                     DemoMessage(
                         messageId: "msg002",
@@ -203,7 +207,7 @@ enum ScreenshotMode {
                         summaryBlurb: "David Kim requested your review on PR #247 which refactors the auth middleware to use JWT validation instead of session cookies. 12 files changed, adds rate limiting.",
                         summaryTodos: "- Review PR #247 on CodeHub",
                         reminderContent: nil,
-                        cachedReply: "Looks good overall — left a few comments on the rate limiting config. Let's discuss the JWT expiry window in standup."
+                        replyBody: "Looks good overall — left a few comments on the rate limiting config. Let's discuss the JWT expiry window in standup."
                     ),
                     DemoMessage(
                         messageId: "msg003",
@@ -219,7 +223,7 @@ enum ScreenshotMode {
                         summaryBlurb: "Flight SJ 2847 confirmed for March 22. Departs SFO 8:15 AM, arrives JFK 4:52 PM. Seat 14A (window). Check-in opens 24 hours before departure.",
                         summaryTodos: nil,
                         reminderContent: "Check in for SkyJet flight on March 21",
-                        cachedReply: ""
+                        replyBody: ""
                     ),
                     DemoMessage(
                         messageId: "msg004",
@@ -235,7 +239,7 @@ enum ScreenshotMode {
                         summaryBlurb: "Weekly team update: v2.3 shipped successfully, 2 new enterprise clients onboarded, sprint velocity up 12%. Next week: focus on mobile performance and the Q2 planning offsite.",
                         summaryTodos: nil,
                         reminderContent: nil,
-                        cachedReply: ""
+                        replyBody: ""
                     ),
                     DemoMessage(
                         messageId: "msg005",
@@ -251,7 +255,7 @@ enum ScreenshotMode {
                         summaryBlurb: "Monthly Pro plan payment of $149.00 processed. Next billing date: April 16, 2026.",
                         summaryTodos: nil,
                         reminderContent: nil,
-                        cachedReply: ""
+                        replyBody: ""
                     ),
                     DemoMessage(
                         messageId: "msg006",
@@ -267,7 +271,7 @@ enum ScreenshotMode {
                         summaryBlurb: "Lisa shared updated onboarding mockups with three variants. She's asking for your preference between the guided tour vs. progressive disclosure approaches before the design freeze on Wednesday.",
                         summaryTodos: "- Review onboarding mockups\n- Pick preferred variant by Wednesday",
                         reminderContent: "Give Lisa feedback on onboarding designs by Wednesday",
-                        cachedReply: "Hi Lisa,\n\nGreat work on these! I prefer variant B (progressive disclosure) — it feels less heavy for new users. One small note: can we add a skip option on the first screen?\n\nLet's sync tomorrow to finalize.\n\nAlex"
+                        replyBody: "Hi Lisa,\n\nGreat work on these! I prefer variant B (progressive disclosure) — it feels less heavy for new users. One small note: can we add a skip option on the first screen?\n\nLet's sync tomorrow to finalize.\n\nAlex"
                     ),
                     DemoMessage(
                         messageId: "msg007",
@@ -283,7 +287,7 @@ enum ScreenshotMode {
                         summaryBlurb: "Weekly Connectly profile views summary. No action needed.",
                         summaryTodos: nil,
                         reminderContent: nil,
-                        cachedReply: ""
+                        replyBody: ""
                     ),
                     DemoMessage(
                         messageId: "msg008",
@@ -299,7 +303,7 @@ enum ScreenshotMode {
                         summaryBlurb: "Emily's team reviewed your partnership proposal and wants to move forward. They're proposing a pilot program starting in April with 3 of their enterprise accounts. Asking for a call this week to discuss terms.",
                         summaryTodos: "- Schedule call with Emily this week\n- Prepare pilot program terms",
                         reminderContent: "Schedule partnership call with Emily Torres",
-                        cachedReply: "Hi Emily,\n\nThat's great news! A pilot with 3 accounts sounds like the right scope to start. I'm free Thursday 2-4pm or Friday morning — would either work for a 30-minute call to go over the terms?\n\nLooking forward to it,\nAlex"
+                        replyBody: "Hi Emily,\n\nThat's great news! A pilot with 3 accounts sounds like the right scope to start. I'm free Thursday 2-4pm or Friday morning — would either work for a 30-minute call to go over the terms?\n\nLooking forward to it,\nAlex"
                     ),
                 ]
 
@@ -314,17 +318,22 @@ enum ScreenshotMode {
                                 messageId, subject, "from", fromAddress, "to",
                                 date, providerDate, snippet, isRead, isFlagged, hasAttachments,
                                 actionTag, tagSortOrder,
-                                summaryBlurb, summaryTodos, reminderContent, cachedReply
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                summaryBlurb, summaryTodos, reminderContent
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                         arguments: [
                             headerId, inboxFolderId, accountId, "INBOX", true,
                             msg.messageId, msg.subject, msg.from, msg.fromAddress, "alex@tabmail.ai",
                             msgDate, msgDate, msg.snippet, msg.isRead, false, msg.hasAttachments,
                             msg.actionTag, msg.tagSortOrder,
-                            msg.summaryBlurb, msg.summaryTodos, msg.reminderContent, msg.cachedReply
+                            msg.summaryBlurb, msg.summaryTodos, msg.reminderContent
                         ]
                     )
+                    // The AI Suggestion goes in as one value, through the value's own writer.
+                    if let body = msg.replyBody, var header = try MessageHeader.fetchOne(db, key: headerId) {
+                        _ = header.replaceSuggestion(with: ReplyResult(body: body, textMessage: nil), ifStill: nil)
+                        try header.update(db)
+                    }
 
                     // Add body for the first message (for detail view screenshot)
                     if msg.messageId == "msg001" {

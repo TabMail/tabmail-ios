@@ -208,11 +208,12 @@ struct ChatSwipeTestScene: View {
     /// a late row height.
     private static func writeSuggestion() async {
         let id = headerId(count - 1)
-        _ = try? await AppDatabase.dbPool.write { db in
-            guard var header = try MessageHeader.fetchOne(db, key: id) else { return }
-            header.cachedReply = fullReply
-            header.replyTextMessage = lateSuggestion
-            try header.save(db)
+        _ = try? await AppDatabase.dbPool.write { db -> AIWriteOutcome in
+            guard let header = try MessageHeader.fetchOne(db, key: id),
+                  let target = try AIWriteTarget.capture(message: header, db: db) else { return .dropped }
+            // Through the one central writer (header and cache together), over the value stored.
+            let late = ReplyResult(body: fullReply, textMessage: lateSuggestion)
+            return try AccountManager.storeSuggestion(late, replacing: header.suggestion, target: target, db: db)
         }
         NSLog("[cv9diag] late suggestion written")
         NotificationCenter.default.post(name: .messageDataDidChange, object: id)
@@ -235,9 +236,14 @@ struct ChatSwipeTestScene: View {
     /// so its ghost still holds the reply it showed, and a tap must open the card with that one.
     private static func rewriteSuggestionQuietly() async {
         let id = headerId(count - 1)
-        _ = try? await AppDatabase.dbPool.write { db in
-            try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
-                           arguments: [rewrittenReply, id])
+        _ = try? await AppDatabase.dbPool.write { db -> AIWriteOutcome in
+            guard let header = try MessageHeader.fetchOne(db, key: id),
+                  let target = try AIWriteTarget.capture(message: header, db: db) else { return .dropped }
+            // Through the one central writer, over the value stored: only the reply's body changes.
+            let stored = header.suggestion
+            let rewritten = ReplyResult(
+                body: rewrittenReply, textMessage: stored?.textMessage, changeCommand: stored?.changeCommand)
+            return try AccountManager.storeSuggestion(rewritten, replacing: stored, target: target, db: db)
         }
     }
 
@@ -245,7 +251,9 @@ struct ChatSwipeTestScene: View {
     /// `TutorialChatViewRunTests` starts one.
     private func seedTutorial() async throws {
         UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
-        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+        // A first-launch tour starts before the AI choice: the fixture clears it (another mode may
+        // have recorded one on an earlier launch) and runs that tour, which teaches the chat view.
+        AIConsentPolicy.clearChoice(in: AIService.optOutStore)
         let coordinator = TutorialCoordinator.shared
         await coordinator.start(.reuseReply, hasTabMailSession: false)
         try await DemoModeService.shared.completeSetup()
@@ -273,9 +281,11 @@ struct ChatSwipeTestScene: View {
                 return
             }
             UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
-            // An open goes to the chat only for a subscriber (`MessageOpenView`); the gate persists
-            // across launches, so every mode opens it and runs alike.
+            // An open goes to the chat only for a subscriber with the AI choice made, AI on
+            // (`MessageOpenView`); the gate and the choice persist across launches, so every mode
+            // sets both and runs alike. Nothing is queued for AI (`resume`).
             AISubscriptionGate.shared.openGate()
+            AIService.recordAIChoice(aiEnabled: true, resume: {})
             let accountID = Self.accountID
             let now = Date()
             try await AppDatabase.dbPool.write { db in
@@ -304,24 +314,25 @@ struct ChatSwipeTestScene: View {
                         // The AI's state on the newest email, under the shared "AI is working"
                         // rule (`AIWorkingRule`): tagged with no reply yet writes; otherwise it is
                         // filtered (the empty-reply sentinel), so no working bubble shows and a
-                        // released suggestion lands with none before it.
+                        // released suggestion lands with none before it. With a saved draft the
+                        // email holds the reply from the start instead, so the ghost shows at once.
+                        // Stored through the one rule (`replaceSuggestion`) over the none read.
                         if Self.readyAtOpen {
                             header.actionTag = .reply
-                            header.cachedReply = "Hello,\n\n\(Self.lateSuggestion)\n\nThanks."
-                            header.replyTextMessage = Self.lateSuggestion
+                            _ = header.replaceSuggestion(with: ReplyResult(body: Self.fullReply, textMessage: Self.lateSuggestion), ifStill: nil)
                         } else {
                             header.actionTag = Self.writing ? .reply : ActionTag.none
-                            if !Self.writing { header.cachedReply = "" }
+                            if Self.savedDraft {
+                                _ = header.replaceSuggestion(with: ReplyResult(body: Self.fullReply, textMessage: Self.lateSuggestion), ifStill: nil)
+                            } else if !Self.writing {
+                                _ = header.replaceSuggestion(with: .filtered, ifStill: nil)
+                            }
                         }
                     }
                     header.summaryBlurb = "Note \(index)"
                     header.summaryTextMessage = index == 0 && Self.tall
                         ? "Note 0: " + String(repeating: "A long line that fills the screen. ", count: 80)
                         : "Note \(index): a short line."
-                    if Self.savedDraft, index == Self.count - 1 {
-                        header.cachedReply = Self.fullReply
-                        header.replyTextMessage = Self.lateSuggestion
-                    }
                     try header.save(db)
                     if Self.savedDraft, index == Self.count - 1 {
                         let key = Draft.draftKey(replyTo: "\(accountID):\(header.stableId)", isForward: false, newId: nil)

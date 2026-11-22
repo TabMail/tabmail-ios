@@ -35,12 +35,9 @@ struct PromptWriterIntegrationTests {
     }
 
     private func withAIEnabled<T>(_ body: () async throws -> T) async rethrows -> T {
-        let optOut = AIService.optOutStore
-        let previous = optOut.object(forKey: AIService.optOutAllAIKey)
-        defer {
-            if let previous { optOut.set(previous, forKey: AIService.optOutAllAIKey) } else { optOut.removeObject(forKey: AIService.optOutAllAIKey) }
-        }
-        AIService.writeOptOutFlag(false)
+        let restore = AITestSetting.save()
+        defer { restore() }
+        AITestSetting.set(aiOff: false)
         return try await body()
     }
 
@@ -104,6 +101,38 @@ struct PromptWriterIntegrationTests {
             #expect(ops == 1)
             #expect(persisted(.action).contains(tag))
             #expect(store.bullets(.deleteRules).contains { $0.contains(tag) })
+            await PromptStoreTestCleanup.remove(tag: tag, from: store)
+        }
+    }
+
+    @Test("A manual compaction refused after its check is skipped as with AI off at the start, and the rules stay as they were")
+    func refusedCompactionIsSkipped() async {
+        quiet()
+        await withAIEnabled {
+            let tag = PromptStoreTestCleanup.tag()
+            #expect(await store.edit("writer test edit") { try $0.addBullet(tag, to: .archiveRules) } == .saved)
+            let backend = Backend(patch("ADD\ndelete\n\(tag) merged"))
+            // The entry check reads the setting on; the backend client finds it off when it would send.
+            let off = AIService(backendClient: BackendClient(llmSession: backend.http.session, isAIOff: { true }))
+            let before = persisted(.action)
+            #expect(before.contains(tag))
+
+            let result = await off.compactActionRulesNow()
+            guard case .skipped(let reason) = result else {
+                Issue.record("not skipped: \(result)")
+                await PromptStoreTestCleanup.remove(tag: tag, from: store)
+                return
+            }
+            #expect(reason == "AI is disabled")
+            #expect(persisted(.action) == before, "the rules are unchanged")
+            #expect(backend.http.recordedCalls().isEmpty)
+
+            // Control: with the client finding AI on, the same compaction is sent and applied.
+            let on = AIService(backendClient: BackendClient(llmSession: backend.http.session, isAIOff: { false }))
+            if case .applied = await on.compactActionRulesNow() {} else { Issue.record("control not applied") }
+            #expect(backend.http.recordedCalls().count == 1)
+            #expect(persisted(.action).contains("\(tag) merged"))
+            await PromptStoreTestCleanup.remove(tag: "\(tag) merged", from: store)
             await PromptStoreTestCleanup.remove(tag: tag, from: store)
         }
     }

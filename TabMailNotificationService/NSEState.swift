@@ -138,11 +138,11 @@ enum NSEState {
         suite.string(forKey: SharedNSEData.syncBaseURLKey) ?? "https://sync.tabmail.ai"
     }
 
-    /// Privacy opt-out: skip all backend AI calls. Written by the main app's
-    /// Settings and consent flow. Default false (AI enabled) so missing key
-    /// never silently blocks AI on a fresh install.
+    /// Skip all backend AI calls: the AI choice is not made yet, or AI is opted
+    /// out (`AIConsentPolicy`, the same predicate as `AIService.isAIOff`). Both
+    /// values are written by the main app into the shared suite.
     static func isAIDisabled() -> Bool {
-        suite.bool(forKey: SharedNSEData.aiOptOutAllKey)
+        AIConsentPolicy.isDisabled(in: suite.defaults)
     }
 
     static func getLastHistoryId(for accountId: String) -> String? {

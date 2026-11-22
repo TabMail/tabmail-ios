@@ -180,6 +180,9 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// same reply result; the chat view's AI Suggestion ghost. Nil when `cachedReply` came without one (a
     /// peer, the filtered sentinel) or was edited by the user since.
     var replyTextMessage: String?
+    /// A short command that would change `cachedReply`, from the same reply result or its latest
+    /// edit; the reply field's example while the AI Suggestion shows. Nil like `replyTextMessage`.
+    var replyChangeCommand: String?
 
     /// Whether this header's FTS indexing is complete (GRDB + FTS two-phase write).
     /// Set after indexHeadersForFTS succeeds. Body queue requires headerComplete=1
@@ -578,4 +581,49 @@ struct MessageReference: Codable, FetchableRecord, PersistableRecord, Sendable {
 
     /// Foreign key back to messageHeader.
     static let messageHeaderForeignKey = ForeignKey(["messageHeaderId"])
+}
+
+// MARK: - The AI Suggestion as one value (ADR-IOS-114)
+
+extension MessageHeader {
+    /// The AI Suggestion stored for this email as one value: its body, text version and change
+    /// command together. Nil when none is stored; the filtered sentinel is an empty body.
+    var suggestion: ReplyResult? {
+        cachedReply.map { ReplyResult(body: $0, textMessage: replyTextMessage, changeCommand: replyChangeCommand) }
+    }
+
+    /// THE one rule every writer of the AI Suggestion follows: `value` replaces the stored one only
+    /// while the row still holds exactly `expected`, the value the writer read (nil: none stored).
+    /// So a late automatic reply never lands over an accepted edit or a newer reply, and an edit
+    /// never lands over a suggestion other than the one it was asked on. Applied to the row read in
+    /// the writer's own guarded transaction; the caller saves the row and the AI cache in it.
+    /// Returns whether it replaced.
+    mutating func replaceSuggestion(with value: ReplyResult, ifStill expected: ReplyResult?) -> Bool {
+        guard suggestion == expected else { return false }
+        cachedReply = value.body
+        replyTextMessage = value.textMessage
+        replyChangeCommand = value.changeCommand
+        return true
+    }
+}
+
+extension MessageHeader {
+    /// The ids among `messageIds` that the folder already stores, whatever
+    /// their epoch stamp. The one existence predicate of the backfill: the
+    /// insert skips these rows, and the IMAP UID walk does not FETCH them.
+    /// Chunked by `SyncConfig.backfillInsertChunkSize` (under SQLite's bound
+    /// variable limit).
+    static func existingMessageIds(_ db: Database, folderId: String, among messageIds: [String]) throws -> Set<String> {
+        var found = Set<String>()
+        let chunkSize = SyncConfig.backfillInsertChunkSize
+        for start in stride(from: 0, to: messageIds.count, by: chunkSize) {
+            let slice = Array(messageIds[start..<min(start + chunkSize, messageIds.count)])
+            found.formUnion(try String.fetchSet(db,
+                MessageHeader
+                    .select(Column("messageId"))
+                    .filter(Column("folderId") == folderId && slice.contains(Column("messageId")))
+            ))
+        }
+        return found
+    }
 }

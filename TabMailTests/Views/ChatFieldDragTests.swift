@@ -136,6 +136,82 @@ struct ChatFieldDragTests {
         }
     }
 
+    // UIKit's pan reports at its end the speed of the finger's last move however long the finger
+    // then held still, so a drag held before the let-go must not carry that speed into the flick.
+    @Test("A finger held still before it lifts lets go at rest; one lifted with its move keeps its speed")
+    func heldLetGoIsAtRest() {
+        let rest = ChatViewLayout.fieldFlickRest
+        // 25 up at 250 pt/s predicts 87.5: a flick that opens.
+        let flick = ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: -25), velocity: CGSize(width: 0, height: -250))
+        let atRest = ChatHorizontalPan.Sample(travel: flick.travel, velocity: .zero)
+        let lifted = ChatFieldDrag.letGo(flick, rested: 0)
+        let liftedSoon = ChatFieldDrag.letGo(flick, rested: rest / 2)
+        let justShort = ChatFieldDrag.letGo(flick, rested: rest.nextDown)
+        let heldTheRest = ChatFieldDrag.letGo(flick, rested: rest)
+        let heldLong = ChatFieldDrag.letGo(flick, rested: 0.3)
+        #expect(lifted == flick && ChatFieldDrag.opens(letGo: lifted), "lifted with its move, it is a flick")
+        #expect(liftedSoon == flick && ChatFieldDrag.opens(letGo: liftedSoon), "lifted a few frames after its move, still a flick")
+        #expect(justShort == flick, "just short of the rest, its speed is kept")
+        #expect(heldTheRest == atRest, "held still the rest, it lets go at rest, its travel kept")
+        #expect(heldLong == atRest && !ChatFieldDrag.opens(letGo: heldLong), "held still 0.3 s at 25 up, it settles back")
+        let far = ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: -70), velocity: CGSize(width: 0, height: -250))
+        let farHeld = ChatFieldDrag.letGo(far, rested: 0.3)
+        #expect(ChatFieldDrag.opens(letGo: farHeld), "held still past the open distance, it still opens")
+        // Both axes go to rest: a drag that ends more sideways than up (80 across, 65 up), held
+        // after a move back toward the middle (-160 pt/s across), would predict 40 across and 65
+        // up, and open, if its sideways speed were kept.
+        let sideways = ChatHorizontalPan.Sample(travel: CGSize(width: 80, height: -65), velocity: CGSize(width: -160, height: 0))
+        let sidewaysHeld = ChatFieldDrag.letGo(sideways, rested: 0.3)
+        #expect(ChatFieldDrag.opens(letGo: sideways), "control: lifted with that speed, it would open")
+        #expect(sidewaysHeld == ChatHorizontalPan.Sample(travel: sideways.travel, velocity: .zero), "held, its travel is kept and both speeds go to rest")
+        #expect(!ChatFieldDrag.opens(letGo: sidewaysHeld), "held, it ends more sideways than up and settles back")
+    }
+
+    @Test("The field's pan reads how long the finger held still before it lifted: from its last move, nothing before the lift")
+    @MainActor
+    func panReadsTheRest() {
+        let pan = ChatFieldPan.Recognizer()
+        #expect(pan.restedBeforeLift == 0, "nothing before the finger moves")
+        pan.moved(at: 10)
+        pan.moved(at: 10.25)
+        #expect(pan.restedBeforeLift == 0, "nothing while the finger is down")
+        pan.lifted(at: 10.75)
+        #expect(pan.restedBeforeLift == 0.5, "from the last move, not the first")
+        pan.reset()
+        #expect(pan.restedBeforeLift == 0, "a new drag starts with nothing")
+        pan.lifted(at: 11)
+        #expect(pan.restedBeforeLift == 0, "a lift with no move read is no rest")
+    }
+
+    /// A touch at a set time, as UIKit hands each new finger to the pan's delegate.
+    private final class TimedTouch: UITouch {
+        var time: TimeInterval = 0
+        override var timestamp: TimeInterval { time }
+    }
+
+    @Test("A second finger landing during a hold leaves it a hold: the held let-go still settles back")
+    @MainActor
+    func secondFingerKeepsTheRest() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true)
+        // 25 up at 250 pt/s predicts 87.5: a flick that opens when lifted with its move.
+        let flick = ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: -25), velocity: CGSize(width: 0, height: -250))
+        pan.moved(at: 10)
+        let second = TimedTouch()
+        second.time = 10.2
+        #expect(coordinator.gestureRecognizer(pan, shouldReceive: second), "control: the pan takes the second finger")
+        pan.lifted(at: 10.25)
+        let rested = pan.restedBeforeLift
+        let held = ChatFieldDrag.letGo(flick, rested: rested)
+        #expect(rested == 0.25, "the rest counts from the last move, not from the second finger")
+        #expect(!ChatFieldDrag.opens(letGo: held), "held, it settles back")
+        pan.reset()
+        pan.moved(at: 20)
+        pan.lifted(at: 20)
+        let lifted = ChatFieldDrag.letGo(flick, rested: pan.restedBeforeLift)
+        #expect(ChatFieldDrag.opens(letGo: lifted), "control: the same drag lifted with its move opens")
+    }
+
     /// A drag that started in the focused field's text, and the field's share of it, worked out by
     /// hand: the text keeps the drag until its end, the rest of the same drag is the field's, both
     /// axes counted from the hand-off (`handOff`, the drag's travel where the text reached its end;

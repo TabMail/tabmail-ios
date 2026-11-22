@@ -140,9 +140,6 @@ extension SyncEngine {
     /// change while it runs, taken once as the run's first step (root rule:
     /// snapshot settings at operation start). Every slice reads only this.
     struct CatchUpRun: Sendable {
-        /// Whether the network was expensive (cellular, a hotspot) when the run
-        /// started.
-        let isExpensiveNetwork: Bool
         /// Whether the Email Index Limit (the storage budget) was finite when the
         /// run started.
         let storageLimitInForce: Bool
@@ -164,7 +161,6 @@ extension SyncEngine {
         /// The production snapshot, taken now.
         static func snapshot(deadline: Date?) -> CatchUpRun {
             CatchUpRun(
-                isExpensiveNetwork: NetworkMonitor.checkExpensive(),
                 storageLimitInForce: StorageEstimator.budgetMB != Int.max,
                 deadline: deadline, sliceSeconds: SyncConfig.catchUpSliceSeconds,
                 intervalSeconds: SyncConfig.catchUpSliceIntervalSeconds, clock: { Date() })
@@ -181,7 +177,7 @@ extension SyncEngine {
                 end = min(end, deadline)
             }
             return CatchUpContext(
-                isExpensiveNetwork: isExpensiveNetwork, deadline: end, clock: clock,
+                deadline: end, clock: clock,
                 storageLimitInForce: storageLimitInForce, maxRequests: sliceMaxRequests)
         }
     }
@@ -393,9 +389,9 @@ extension SyncEngine {
     /// Both or neither: the changes the lost history held reach no delta, and the
     /// marker makes the provider list each folder again, in full, once the listing
     /// in progress (if any) completes. The marker never clears the state, so a
-    /// listing in progress keeps its place and a folder keeps its schedule (the
-    /// expensive-network wait is not restarted). A NULL state stays NULL: no state
-    /// already means a full check is due. A state that is not a JSON object
+    /// listing in progress keeps its place and a folder keeps its schedule. A NULL
+    /// state stays NULL: no state already means a full check is due. A state that
+    /// is not a JSON object
     /// becomes NULL, the same start. Used wherever a cursor is cleared or replaced
     /// by one the delta did not reach. Provider-blind: the cursor column and the
     /// marker are the same for every provider that has a delta cursor. It runs

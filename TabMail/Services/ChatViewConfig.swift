@@ -7,8 +7,9 @@ import Foundation
 /// Whether the chat view, and the AI work only it needs, is on.
 ///
 /// The user switches it in TabMail Settings ("Enable Chat View", on by default). It needs AI:
-/// while AI is off (opted out, or no plan) it is off everywhere, nothing requests summaries for
-/// whole threads, and the user's choice is kept for when AI comes back.
+/// while AI is off (the AI choice not made yet, opted out, or no plan) it is off everywhere,
+/// nothing requests summaries for whole threads, and the user's choice is kept for when AI comes
+/// back.
 ///
 /// Read `isActive` ONCE at the start of an operation and pass the value along; never re-read it
 /// mid-operation.
@@ -21,14 +22,14 @@ enum ChatViewConfig {
         UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
     }
 
-    /// AI is on: not opted out, and a plan (or trial) is active.
+    /// AI is on: the device's AI setting is on (`AIService.isAIOff`: the AI choice made, not opted
+    /// out), and a plan (or trial) is active.
     static var isAIOn: Bool {
-        isAIOn(optedOut: AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey),
-               subscribed: AISubscriptionGate.shared.isActive)
+        isAIOn(aiOff: AIService.isAIOff, subscribed: AISubscriptionGate.shared.isActive)
     }
 
-    static func isAIOn(optedOut: Bool, subscribed: Bool) -> Bool {
-        !optedOut && subscribed
+    static func isAIOn(aiOff: Bool, subscribed: Bool) -> Bool {
+        !aiOff && subscribed
     }
 
     static var isActive: Bool {
@@ -174,6 +175,11 @@ enum ChatViewLayout {
     /// (`ChatFieldDrag.begins`), opens the panel exactly when it did. It is not a promise that every
     /// physical flick does, since UIKit's pan and SwiftUI's drag measure a finger in their own ways.
     static let fieldFlickCarry: CGFloat = 0.25
+    /// How long the finger may hold still before it lifts and still flick (`ChatFieldDrag.letGo`),
+    /// in seconds: UIKit's pan keeps the speed of the finger's last move at its let-go, so a drag
+    /// held still this long lets go at rest. Six frames at 60 Hz; a flick lifts within a frame or
+    /// two of its last move.
+    static let fieldFlickRest: TimeInterval = 0.1
     /// The pill's spring (the panel opening and closing, the field's swell springing back): its
     /// response in seconds and its damping ratio. A drag's settle lasts this spring's own settling
     /// duration (`ChatThreadView.fieldDragSettle`).
@@ -191,6 +197,11 @@ enum ChatSuggestionConfig {
     static let label = "AI Suggestion"
     /// The line under the ghost.
     static let statusLine = "\(label) · Tap to use"
+    /// What a reply request typed or said in the field does while the AI Suggestion shows: it is
+    /// a compose edit of the suggestion (`EmailReplyTool`), and then either the ghost shows the
+    /// edit in place (true; a tap on it opens the compose card) or the compose card opens with
+    /// the edited email (false). The one place this choice is made.
+    static let fieldEditRewritesInPlace = true
     /// The line under the working bubble while the suggestion is written.
     static let writingLine = "\(label) · Writing"
     /// The working bubble growing into the ghost, the re-pin scroll in the same transaction.

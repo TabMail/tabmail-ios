@@ -1378,7 +1378,8 @@ struct BackfillOnlyFolderEpochTests {
         let after = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Receipts", pool: pool)
         #expect(after?.backfillComplete == true,
                 "an empty mailbox reporting UIDNEXT 1 must settle — it is proven empty, not unknown")
-        #expect(after?.lastKnownUidNext == 1)
+        #expect(after?.lastKnownUidNext == nil,
+                "the crawl does not write the folder's counters: only a listing that proved its window does")
         // NB3's requirement survives: the completion write stamps the epoch in
         // the same transaction, so an empty folder is still gestureable.
         #expect(after?.lastKnownUidValidity == 770_101,
@@ -1530,8 +1531,8 @@ struct BackfillOnlyFolderEpochTests {
                 write — the quarantine term must gate only the reset window, or every empty folder \
                 is re-crawled forever and the fix is strictly worse than the bug
                 """)
-        #expect(after?.lastKnownUidNext == 1,
-                "the same admitted transaction must still record the observed UIDNEXT")
+        #expect(after?.lastKnownUidNext == nil,
+                "the crawl's completion does not write UIDNEXT: only a listing that proved its window writes the folder's counters")
     }
 }
 

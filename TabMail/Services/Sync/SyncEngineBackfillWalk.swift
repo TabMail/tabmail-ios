@@ -59,6 +59,10 @@ private struct BackfillWorkerOutcome: Sendable {
     /// A write chunk of this worker's batch failed, so the range was failed
     /// rather than confirmed (`BackfillBatchOutcome.landed`'s `allLanded`).
     var insertFailed = false
+    /// This worker stopped on a SEARCH or FETCH failure (a lost connection, a
+    /// failed SELECT, or a FETCH error the walk has no retry for) and left its
+    /// range pending (`UIDWalkCursor.failRange`).
+    var stoppedOnFailure = false
 }
 
 /// The IMAP UID walk's hold on its folder's walk position: the
@@ -273,7 +277,7 @@ extension SyncEngine {
     /// `InboxView.onAppear` → `InboxViewModel.startSync()` → `performSync()` →
     /// `AccountManager.syncFolders(_:connecting:)` (in `AccountManagerFetch.swift`, which
     /// filters on `!folder.path.isEmpty` alone — no role predicate, no favourite
-    /// predicate) → `SyncEngine.syncFolderMessages` → `syncMessages` →
+    /// predicate) → `SyncEngine.syncFolderMessages` → `listFolder` → `runListing` →
     /// `runSyncMessages`, carrying T1.2b's SELECT-sourced bootstrap.
     /// `SyncEngineFullSync.swift` says so itself, three lines under the
     /// `syncableFolders` construction: *"Custom non-favorited folders sync
@@ -974,13 +978,12 @@ extension SyncEngine {
         // hold and nothing a guard could compare. That overload
         // has no refusal channel to discard (round 13 blocker 3),
         // so this call site cannot silently swallow one.
-        let (inserted, ftsRecords, ccBccUpdates, chunkFailed) = await insertBackfillBatch(
+        let (inserted, ftsRecords, chunkFailed) = await insertBackfillBatch(
             headers, folderId: folder.id, accountId: folder.accountId,
             folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
             observedEpoch: nil, catchUpReadStartedAt: catchUpReadStartedAt
         )
         if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }
-        if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }
 
         // Step 2: Write bodies to FTS for inserted messages.
         // Match body data to headerIds using ftsRecords (which have headerId + messageId).
@@ -1063,11 +1066,11 @@ extension SyncEngine {
     /// deadline (a foreground cycle of `startBackfill`) the catch-up runs one slice.
     /// The catch-up's snapshot (`CatchUpRun`) is taken when the catch-up starts,
     /// after the walk, so a long foreground walk never hands it a network state
-    /// from before the walk. `walkAllowed` false (the Wi-Fi-only setting on an
-    /// expensive network, decided by the caller) skips the walk only: the catch-up
-    /// ignores Wi-Fi-only and keeps its own network rules (ADR-IOS-107 decision 2,
-    /// 2026-11-12), because it lists ids and labels and its repairs must not wait
-    /// for a Wi-Fi network that may never come.
+    /// from before the walk. `walkAllowed` false (a download gate, decided by the
+    /// caller: Wi-Fi-only on an expensive network, Low Power Mode, low battery)
+    /// skips the walk only: the catch-up is a scan and runs under every gate
+    /// (ADR-IOS-107, #1063), because it lists ids and labels and its repairs must
+    /// not wait for a network or a charge that may never come.
     func runBackfillCycle(account: Account, deadline: Date? = nil, walkAllowed: Bool) async -> BackfillCycle {
         let walked = walkAllowed ? await runBackfillWalk(account: account, deadline: deadline) : false
         guard !Task.isCancelled else { return BackfillCycle(walked: walked, caughtUp: false) }
@@ -1081,6 +1084,11 @@ extension SyncEngine {
     /// After walking all folders, runs a cleanup pass for any remaining empty bodies.
     /// Returns true if any work was done.
     func runBackfillWalk(account: Account, deadline: Date? = nil) async -> Bool {
+        runningBackfillWalks += 1
+        defer { runningBackfillWalks -= 1 }
+        #if DEBUG
+        if let hook = Self.backfillWalkStartedHookForTesting.withLock({ $0 }) { await hook() }
+        #endif
         var didWork = false
         let fastSync = await getIsFastSync()
         let isPastDeadline: () -> Bool = {
@@ -1547,7 +1555,6 @@ extension SyncEngine {
                                     guard try Self.writeUIDWalkPosition(
                                         db, folderId: folderId, premiseEpoch: writePremise, position: position, [
                                             Column("backfillComplete").set(to: true),
-                                            Column("lastKnownUidNext").set(to: uidNext),
                                         ]
                                     ) else { return false }
                                     _ = try Self.bootstrapCrawledFolderUidValidity(
@@ -1643,7 +1650,6 @@ extension SyncEngine {
                                 guard try Self.writeUIDWalkPosition(
                                     db, folderId: folderId, premiseEpoch: writePremise, position: position, [
                                         Column("backfillUidCursor").set(to: initialCursor),
-                                        Column("lastKnownUidNext").set(to: uidNext),
                                     ]
                                 ) else { return (landed: false, stamped: false) }
                                 let stamped = try Self.bootstrapCrawledFolderUidValidity(
@@ -1707,6 +1713,7 @@ extension SyncEngine {
                     let expectedEpoch = walkEpoch
                     var epochMovedMidWalk = false
                     var insertFailedMidWalk = false
+                    var workerStoppedOnFailure = false
                     await withTaskGroup(of: BackfillWorkerOutcome.self) { group in
                         for workerIndex in 0..<workerCount {
                             group.addTask { [self] in
@@ -1728,6 +1735,44 @@ extension SyncEngine {
                                     guard let expectedEpoch else { return true }
                                     return imapProvider.lastObservedUidValidity(
                                         folderPath: folderCaptured.path) == expectedEpoch
+                                }
+                                // Confirm a range that holds nothing to load: its
+                                // SEARCH found no UID, or only UIDs the folder
+                                // stores. Advances the cursor like any confirmed
+                                // range.
+                                func confirmRangeWithNothingToLoad(_ range: (from: Int, to: Int)) async {
+                                    await cursor.confirmRange(from: range.from, to: range.to)
+                                    if await lastProgressUpdate.shouldUpdate() {
+                                        let snapshotCursor = await cursor.confirmedCursorSnapshot()
+                                        try? await AppDatabase.backgroundPool.write { db in
+                                            // NB2/NB4: guarded like every other
+                                            // bookkeeping write this walk makes,
+                                            // and re-read INSIDE the txn — the
+                                            // `storedEpoch` snapshot this pass
+                                            // gated on was taken before the
+                                            // walk-start round trip and can be
+                                            // minutes stale by now. Round 12
+                                            // (NB3): the skews are nil → stamped
+                                            // AND stamped → nil (the clearer
+                                            // `resetEmptyFolderCrawlEpoch`), and
+                                            // BOTH fail open under an
+                                            // epoch comparison — hence the CAS.
+                                            // Also compare-and-set on the walk
+                                            // position: a reset or a second walker
+                                            // landing during this range's SEARCH
+                                            // is never overwritten.
+                                            guard try Self.writeUIDWalkPosition(
+                                                db, folderId: folderCaptured.id, premiseEpoch: walkWritePremise,
+                                                position: position, [Column("backfillUidCursor").set(to: snapshotCursor)]
+                                            ) else {
+                                                if DebugModeManager.isLoggingEnabled() {
+                                                    print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder no longer holds the UIDVALIDITY this pass premised or its walk position moved")
+                                                }
+                                                return
+                                            }
+                                        }
+                                        await self.updateBackfillProgressForAccount(accountCaptured)
+                                    }
                                 }
                                 while let range = await cursor.nextRange() {
                                     guard !Task.isCancelled else {
@@ -1754,13 +1799,27 @@ extension SyncEngine {
                                             )
                                         }
                                     } catch {
-                                        // SEARCH failed — return range for retry
-                                        await cursor.failRange(from: range.from, to: range.to)
-                                        if Self.isConnectionError(error) || Self.isSelectFailedError(error) {
+                                        // A server refusal is classified first: its
+                                        // text is the server's and can read like a
+                                        // connection error ("timed out", "command failed").
+                                        if !(error is IMAPSearchRefused),
+                                           Self.isConnectionError(error) || Self.isSelectFailedError(error) {
+                                            // Return the range for retry; this worker stops,
+                                            // and the pass declines the folder for the call.
+                                            await cursor.failRange(from: range.from, to: range.to)
+                                            outcome.stoppedOnFailure = true
                                             BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH connection error: \(error)")
                                             break
                                         }
-                                        BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH error: \(error)")
+                                        // The server refused this range's SEARCH, or
+                                        // ended it without an answer. This walk does
+                                        // not ask it again (asking at once would spin
+                                        // on a server that keeps doing so) and moves
+                                        // on to the other ranges; the
+                                        // range stays pending, so the cursor never
+                                        // passes it, and the next walk asks it again.
+                                        await cursor.failRangeForThisWalk(from: range.from, to: range.to)
+                                        BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH error: \(error) — range \(range.from)...\(range.to) left for the next walk")
                                         continue
                                     }
 
@@ -1781,51 +1840,40 @@ extension SyncEngine {
                                         break
                                     }
 
-                                    if existingUIDs.isEmpty {
-                                        // No messages in this range — confirmed empty, safe to advance
-                                        await cursor.confirmRange(from: range.from, to: range.to)
-                                        if await lastProgressUpdate.shouldUpdate() {
-                                            let snapshotCursor = await cursor.currentCursor
-                                            try? await AppDatabase.backgroundPool.write { db in
-                                                // NB2/NB4: guarded like every other
-                                                // bookkeeping write this walk makes,
-                                                // and re-read INSIDE the txn — the
-                                                // `storedEpoch` snapshot this pass
-                                                // gated on was taken before the
-                                                // walk-start round trip and can be
-                                                // minutes stale by now. Round 12
-                                                // (NB3): the skews are nil → stamped
-                                                // AND stamped → nil (the clearer
-                                                // `resetEmptyFolderCrawlEpoch`), and
-                                                // BOTH fail open under an
-                                                // epoch comparison — hence the CAS.
-                                                // Also compare-and-set on the walk
-                                                // position: a reset or a second walker
-                                                // landing during this range's SEARCH
-                                                // is never overwritten.
-                                                guard try Self.writeUIDWalkPosition(
-                                                    db, folderId: folderCaptured.id, premiseEpoch: walkWritePremise,
-                                                    position: position, [Column("backfillUidCursor").set(to: snapshotCursor)]
-                                                ) else {
-                                                    if DebugModeManager.isLoggingEnabled() {
-                                                        print("[Backfill] \(folderCaptured.name) w\(workerIndex): skipping progress cursor write — the folder no longer holds the UIDVALIDITY this pass premised or its walk position moved")
-                                                    }
-                                                    return
-                                                }
-                                            }
-                                            await self.updateBackfillProgressForAccount(accountCaptured)
+                                    // Drop the UIDs the folder already stores: the
+                                    // insert would skip them, and it never reads a
+                                    // stored row's FETCH (`existingRowsAreInert`).
+                                    // Read after the epoch check above, with the
+                                    // insert's own existence predicate.
+                                    let uidsToFetch: [UInt32]
+                                    do {
+                                        // An empty SEARCH answer needs no read.
+                                        let stored: Set<String> = existingUIDs.isEmpty ? [] : try await AppDatabase.backgroundPool.read { db in
+                                            try MessageHeader.existingMessageIds(
+                                                db, folderId: folderCaptured.id, among: existingUIDs.map(String.init))
                                         }
+                                        uidsToFetch = existingUIDs.filter { !stored.contains(String($0)) }
+                                    } catch {
+                                        await cursor.failRange(from: range.from, to: range.to)
+                                        outcome.stoppedOnFailure = true
+                                        BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) stored-UID read failed: \(error)")
+                                        break
+                                    }
+
+                                    if uidsToFetch.isEmpty {
+                                        // No messages to load in this range — confirmed, safe to advance
+                                        await confirmRangeWithNothingToLoad((from: range.from, to: range.to))
                                         continue
                                     }
 
-                                    BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH found \(existingUIDs.count) UIDs in \(range.from)...\(range.to)")
+                                    BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH found \(existingUIDs.count) UIDs in \(range.from)...\(range.to), \(uidsToFetch.count) not stored")
 
                                     // FETCH only the existing UIDs
                                     let fetched: (messages: [MessageHeaderInfo], observedEpoch: UInt32?)
                                     do {
                                         fetched = try await workQueue.execute(priority: .headerFetch) {
                                             try await imapProvider.fetchMessageHeadersWithObservedEpoch(
-                                                folder: folderCaptured.path, uids: existingUIDs,
+                                                folder: folderCaptured.path, uids: uidsToFetch,
                                                 batchSize: batchSize, interBatchDelay: interBatchDelay
                                             )
                                         }
@@ -1833,29 +1881,24 @@ extension SyncEngine {
                                         let desc = "\(error)"
                                         let isPayloadError = desc.contains("PayloadTooLargeError") || desc.contains("IMAPDecoderError")
                                         let isTimeout = desc.contains("timed out")
-                                        if isPayloadError {
-                                            let currentChunk = await cursor.currentChunkSize
-                                            if currentChunk <= 1 {
-                                                // Single UID too large — confirm anyway (can't split further)
-                                                BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) single UID too large — skipping")
-                                                await cursor.confirmRange(from: range.from, to: range.to)
-                                                continue
-                                            }
-                                            await cursor.failRange(from: range.from, to: range.to)
+                                        if isPayloadError || isTimeout {
+                                            // Never ask this range again at the same
+                                            // size in this walk: its halves go back
+                                            // for retry. A one-UID range is set aside
+                                            // for the next walk, never confirmed: its
+                                            // message did not load.
+                                            await cursor.failRangeSmaller(from: range.from, to: range.to)
                                             let newChunk = await cursor.reduceChunk()
-                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) payload too large, chunk → \(newChunk)")
-                                            continue
-                                        } else if isTimeout {
-                                            await cursor.failRange(from: range.from, to: range.to)
-                                            let newChunk = await cursor.reduceChunk()
-                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) timeout, chunk → \(newChunk)")
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) \(isTimeout ? "timeout" : "payload too large") on \(range.from)...\(range.to), chunk → \(newChunk)")
                                             continue
                                         } else if Self.isConnectionError(error) || Self.isSelectFailedError(error) {
                                             await cursor.failRange(from: range.from, to: range.to)
+                                            outcome.stoppedOnFailure = true
                                             BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) connection error: \(error)")
                                             break
                                         } else {
                                             await cursor.failRange(from: range.from, to: range.to)
+                                            outcome.stoppedOnFailure = true
                                             BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) error: \(error)")
                                             BackgroundSyncLogger.logError("\(folderCaptured.name) w\(workerIndex) error: \(error)", source: "backfill")
                                             break
@@ -1906,7 +1949,7 @@ extension SyncEngine {
                                         // tuple member, so this leg cannot be skipped by
                                         // omission — `break` inside `guard else` targets
                                         // the `while` (a `switch` would have swallowed it).
-                                        guard case .landed(let inserted, let ftsRecords, let ccBccUpdates, let allLanded) =
+                                        guard case .landed(let inserted, let ftsRecords, let allLanded) =
                                             await self.insertBackfillBatch(
                                                 fetchedHeaders, folderId: folderCaptured.id, accountId: folderCaptured.accountId,
                                                 folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox,
@@ -1922,7 +1965,6 @@ extension SyncEngine {
                                             break
                                         }
                                         if !ftsRecords.isEmpty { await self.indexHeadersForFTS(ftsRecords) }
-                                        if !ccBccUpdates.isEmpty { try? await SearchIndex.shared.updateCcBcc(ccBccUpdates) }
                                         if inserted > 0 {
                                             outcome.didWork = true
                                             await BackfillBodyQueue.shared.enqueueItems(
@@ -1973,6 +2015,7 @@ extension SyncEngine {
                             if workerResult.didWork { didWork = true }
                             if workerResult.epochDisagreed { epochMovedMidWalk = true }
                             if workerResult.insertFailed { insertFailedMidWalk = true }
+                            if workerResult.stoppedOnFailure { workerStoppedOnFailure = true }
                         }
                     }
 
@@ -2073,6 +2116,23 @@ extension SyncEngine {
                     if insertFailedMidWalk {
                         epochDeclinedFolderIds.insert(folder.id)
                     }
+                    // A range this walk set aside: the next walk of this CALL
+                    // would start above it and ask it straight back, the same
+                    // spin one level up. Decline the folder for the rest of the
+                    // call; the next call asks the range again.
+                    if await cursor.hasFailedThisWalk {
+                        epochDeclinedFolderIds.insert(folder.id)
+                    }
+                    // A worker stopped on a lost connection, a failed SELECT or
+                    // a FETCH error with no retry: its range stays pending (the
+                    // cursor stays above it), and the workers' failures never
+                    // reach the call's backoff. Walking the folder again in this
+                    // call would ask the same range at network rate while the
+                    // folders behind it wait; decline it for the rest of the
+                    // call, like a refused range. The next call asks again.
+                    if workerStoppedOnFailure {
+                        epochDeclinedFolderIds.insert(folder.id)
+                    }
                     // Both final writes are guarded and re-read the folder row inside
                     // their own transaction (NB4), and both report whether they
                     // actually landed. A write that did NOT land leaves the folder
@@ -2121,7 +2181,10 @@ extension SyncEngine {
                             BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) has failed ranges — retry next cycle (cursor at \(finalCursor))")
                         }
                     }
-                    if finalWriteLanded { didWork = true }
+                    // An unchanged cursor (a range left for the next call, with
+                    // nothing new below it) is no work: it would keep the worker
+                    // on its active schedule. Inserts already set `didWork`.
+                    if finalWriteLanded && (isComplete || finalCursor != cursorValue) { didWork = true }
                     await updateBackfillProgressForAccount(account)
                     continue
 
@@ -2229,18 +2292,7 @@ extension SyncEngine {
 
                     // Dedup returned IDs against DB
                     let missingIds: [String] = try await dbPool.read { db in
-                        let sqlChunkSize = SyncConfig.sqlChunkSize
-                        var existingIds = Set<String>()
-                        for start in stride(from: 0, to: pageIds.count, by: sqlChunkSize) {
-                            let end = min(start + sqlChunkSize, pageIds.count)
-                            let chunk = Array(pageIds[start..<end])
-                            let found = try String.fetchSet(db,
-                                MessageHeader
-                                    .select(Column("messageId"))
-                                    .filter(Column("folderId") == folder.id && chunk.contains(Column("messageId")))
-                            )
-                            existingIds.formUnion(found)
-                        }
+                        let existingIds = try MessageHeader.existingMessageIds(db, folderId: folder.id, among: pageIds)
                         return pageIds.filter { !existingIds.contains($0) }
                     }
 

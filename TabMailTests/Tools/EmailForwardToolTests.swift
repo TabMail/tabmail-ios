@@ -128,3 +128,103 @@ struct EmailForwardToolTests {
         #expect(result.contains("request parameter is required"))
     }
 }
+
+/// A forward the agent asks for with a compose request, on an IMAP email whose folder's numbering
+/// is being reset (ADR-IOS-114, the one identity-checked body read).
+///
+/// THE SYSTEM PROPERTY pinned here: a forward whose email is no longer provably the row at its
+/// address (a UIDVALIDITY reset is pending, so a resync can seat another email there) never sends
+/// that row's body to the model and never opens a forward card; it reports that the email changed.
+/// The same request on an email that still holds sends the email's own primary body as a forward
+/// edit and opens the forward card with the model's draft.
+@Suite("A forward's body read refuses an email that is no longer itself")
+@MainActor
+struct EmailForwardToolBodyReadTests {
+
+    final class Calls: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [ComposeEditContext] = []
+        func add(_ context: ComposeEditContext) { lock.withLock { items.append(context) } }
+        var all: [ComposeEditContext] { lock.withLock { items } }
+    }
+
+    nonisolated static let attachedSentinel = "ATTACHED-EML-SENTINEL"
+    nonisolated static let draftBody = "Hi Pat,\n\nSam asks whether we are in for the offsite.\n\nAlex"
+
+    @Test("A pending reset refuses the forward with no model call and no card; an unchanged email sends its own body",
+          arguments: [true, false])
+    func resetRefusesTheForward(resetPending: Bool) async throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, provider: .imap)
+        try TestDatabase.insertFolder(db)
+        let inserted = try TestDatabase.insertMessageHeader(
+            db, messageId: "7", subject: "Offsite", rfc822MessageId: "<offsite@example.com>")
+        let id = inserted.id, folderId = inserted.folderId
+        try await db.write { db in
+            try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 111 WHERE id = ?", arguments: [folderId])
+            try db.execute(sql: "UPDATE messageHeader SET observedUidValidity = 111 WHERE id = ?", arguments: [id])
+            // The primary message, then an attached email (.eml) rendered inline: another person's
+            // email, never part of this email's own body.
+            let html = "<p>Are you in for the offsite?</p>" + EmlMarker.build(
+                filename: "attached.eml", partSection: "2",
+                envelope: EmlMarker.Envelope(subject: "Attached", from: "other@example.com", date: Date(),
+                                             to: ["user@example.com"], cc: []),
+                bodyHtml: "<p>\(Self.attachedSentinel)</p>")
+            try MessageBody(contentKey: ContentKey(rawValue: id), htmlContent: html).insert(db)
+            if resetPending {
+                // The reset reaction's first step: the folder is marked, the old row still sits there.
+                try db.execute(sql: "UPDATE folder SET uidValidityResetPendingAt = ? WHERE id = ?",
+                               arguments: [Date(), folderId])
+            }
+        }
+        let header = try #require(try await db.read { try MessageHeader.fetchOne($0, key: id) })
+        let translator = MockChatIdTranslator()
+        await translator.seed(header.id, as: 1)
+        let router = AgentToolRouter()
+        let calls = Calls()
+        let answer = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            response: "Done.", subject: "Fwd: Offsite", body: Self.draftBody,
+            textMessage: "Sam asks about the offsite.", changeCommand: "")))
+        let tool = EmailForwardTool(context: ToolContext(db: db, translator: translator, router: router),
+                                    composeEdit: { context, _, _, _ in
+            calls.add(context)
+            return answer
+        })
+        let arguments: [String: JSONValue] = [
+            "unique_id": .int(1),
+            "to": .array([.string("pat@example.com")]),
+            "request": .string("Tell Pat about the offsite"),
+        ]
+
+        // Bounded: a forward that wrongly opens its card is cancelled, never awaited forever.
+        let task = Task { @MainActor in try await tool.execute(arguments: arguments) }
+        var card: AgentToolRouter.ComposeRequest?
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, card == nil {
+            card = router.pendingCompose
+            if card == nil { try await Task.sleep(for: .milliseconds(10)) }
+        }
+        card?.onOutcome(.cancelled)
+        let output = try await task.value
+
+        if resetPending {
+            #expect(calls.all.isEmpty, "the row's body never goes to the model")
+            #expect(card == nil, "no forward card opens for an email that may no longer be itself")
+            #expect(router.composeQueueDepth == 0, "nothing is queued either")
+            #expect(output.hasPrefix("Failed: ") && output.contains("email changed"), "the agent is told: \(output)")
+        } else {
+            // Control: the same request on an unchanged email is edited and opens its card.
+            #expect(calls.all.count == 1)
+            let sent = try #require(calls.all.first)
+            #expect(sent.mode == "edit_forward")
+            #expect(sent.bodyText.contains("Are you in for the offsite?"), "the email's own primary body, not its snippet")
+            #expect(!sent.bodyText.contains(Self.attachedSentinel), "an attached email's text never goes as this email's body")
+            let opened = try #require(card, "control: the forward card opens")
+            #expect(opened.mode == .forward)
+            #expect(opened.replyTo?.id == header.id && opened.replyTo?.rfc822MessageId == "<offsite@example.com>")
+            #expect(opened.to == ["pat@example.com"])
+            #expect(opened.subject == "Fwd: Offsite" && opened.body == Self.draftBody, "the card holds the model's draft")
+            #expect(!output.contains("email changed"))
+        }
+    }
+}

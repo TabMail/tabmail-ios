@@ -17,7 +17,7 @@ extension Notification.Name {
 
 extension ChatViewConfig {
     /// Whether an open goes to the chat now. Demo mode with AI declined counts as AI off. A
-    /// tutorial run follows what it teaches, decided when it started (`teachesChat`).
+    /// tutorial run follows what it teaches (`followingTutorial`).
     @MainActor static var opensInChat: Bool {
         let tutorial = TutorialCoordinator.shared
         return opensInChat(active: isActive,
@@ -27,7 +27,24 @@ extension ChatViewConfig {
     }
 
     static func opensInChat(active: Bool, demoHidesAI: Bool, tutorialRunning: Bool, tutorialTeachesChat: Bool) -> Bool {
-        tutorialRunning ? tutorialTeachesChat : active && !demoHidesAI
+        followingTutorial(active && !demoHidesAI, tutorialRunning: tutorialRunning, tutorialTeachesChat: tutorialTeachesChat)
+    }
+
+    /// The chat view's one tutorial-aware gate: while a tutorial runs, what the run teaches
+    /// (`TutorialCoordinator.teachesChat`, decided when it started); otherwise `live`, the app's own
+    /// value. Opens (`opensInChat`, and `SentEmailSummary.mayRun` through it), the inbox rows' chat
+    /// preview and the Enable Chat View switch all go through it, so a run shows one view
+    /// everywhere, before the AI choice too.
+    ///
+    /// Read in a view's body, it observes the run (`TutorialCoordinator` is `@Observable`; both
+    /// `isRunning` and `teachesChat` are read), so the view repaints when a run starts or ends.
+    @MainActor static func followingTutorial(_ live: Bool) -> Bool {
+        let tutorial = TutorialCoordinator.shared
+        return followingTutorial(live, tutorialRunning: tutorial.isRunning, tutorialTeachesChat: tutorial.teachesChat)
+    }
+
+    static func followingTutorial(_ live: Bool, tutorialRunning: Bool, tutorialTeachesChat: Bool) -> Bool {
+        tutorialRunning ? tutorialTeachesChat : live
     }
 }
 
@@ -75,7 +92,7 @@ struct ChatThreadView: View {
     @State private var readyReply: ChatReadyReply?
     /// The field's "e.g." example, picked once as the chat opens.
     @State private var example = ChatSuggestionConfig.randomExample()
-    @State private var agentCompose: ChatAgentCard?
+    @State private var agentCompose: AgentToolRouter.ComposeRequest?
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet.
     @State private var fieldComposeOpened = false
@@ -94,6 +111,8 @@ struct ChatThreadView: View {
     @State private var headerBottom = -CGFloat.infinity
     @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
+    /// Whether the field's drag tip waits for room: `ViewThatFits` picked its empty stand-in.
+    @State private var tipWaitsForRoom = false
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Held only while a grow is pending: set when the AI Suggestion's row becomes Writing, cleared
@@ -120,9 +139,13 @@ struct ChatThreadView: View {
     /// freeze holds through it plus the freeze rule's cooldown.
     static let fieldDragSettle: Duration = .seconds(pillSpringModel.settlingDuration)
 
-    init(messageId: String, expectedRfc822MessageId: String? = nil, highlightsOpenedMessage: Bool = false) {
+    init(
+        messageId: String, expectedRfc822MessageId: String? = nil, expectedObservedUidValidity: Int? = nil,
+        highlightsOpenedMessage: Bool = false
+    ) {
         self._viewModel = State(initialValue: MessageDetailViewModel(
-            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId))
+            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
+            expectedObservedUidValidity: expectedObservedUidValidity))
         self.highlightsOpenedMessage = highlightsOpenedMessage
     }
 
@@ -290,7 +313,7 @@ struct ChatThreadView: View {
             // Asked for in a reply field: the agent's closing words open nothing. Who the card goes
             // to travels with the request (`fieldReply`); this chat's own state decides nothing.
             fieldComposeOpened = req.fieldReply != nil
-            agentCompose = ChatAgentCard(request: req, reply: ChatReplyCompose.make(agent: req, accounts: context.accounts))
+            agentCompose = req
             AgentToolRouter.shared.pendingCompose = nil
         }
         .sheet(item: $cardMessage) { msg in
@@ -307,7 +330,7 @@ struct ChatThreadView: View {
             // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
             // suggestion through the outbox.
             ready.compose.composeView(
-                replyTo: ready.message, suggestedBody: ready.message.cachedReply, draftId: ready.draftId,
+                replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
                 onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
@@ -329,7 +352,8 @@ struct ChatThreadView: View {
     @ViewBuilder
     private func chatContent(_ thread: ChatThread) -> some View {
         let offersArchive = viewModel.chatHasInboxCopy
-        let suggestion = thread.newest.flatMap { suggestionPhase(on: $0, thread: thread) }
+        let shown = thread.newest.flatMap { shownSuggestion(on: $0, thread: thread) }
+        let suggestion = thread.newest.flatMap { suggestionPhase(on: $0, shown: shown, thread: thread) }
         Group {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -358,8 +382,9 @@ struct ChatThreadView: View {
                         if let newest = thread.newest, let suggestion {
                             if !suggestionGrowPending, case .ready(let text) = suggestion {
                                 let move = tutorialMove(thread)
+                                // A tap opens the suggestion this ghost shows (`shown`: `.ready` comes only from it).
                                 ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) {
-                                    openSuggestion(on: newest, tutorialMove: move)
+                                    if let shown { openSuggestion(shown, on: newest, tutorialMove: move) }
                                 }
                                 .transition(.asymmetric(
                                     insertion: ghostFadesIn
@@ -846,14 +871,33 @@ struct ChatThreadView: View {
         }
     }
 
-    /// The AI Suggestion's row on the newest email (`ChatReplyField.suggestionPhase`). None on the user's turn (their email is
+    /// The ready AI Suggestion on the newest email, as one value (`ChatReplyField.shown`). None on the user's turn (their email is
     /// the newest, or a reply of theirs is still in the outbox below it), and none while the reply
     /// goes only to people chosen in Reply to: the suggestion was written for everyone, and the
     /// field has the agent write one for the people chosen. None until the thread and its accounts
     /// have loaded (the newest email and the Reply All audience, without the user's own address,
     /// are known only then), and none while the agent works on a request from the field (it may
-    /// open its own compose card).
-    private func suggestionPhase(on newest: MessageHeader, thread: ChatThread) -> ChatSuggestionPhase? {
+    /// open its own compose card), or while a compose card is open: one that became ready meanwhile
+    /// shows when the card closes without sending.
+    private func shownSuggestion(on newest: MessageHeader, thread: ChatThread) -> ReplyResult? {
+        // `isLoaded` is also set when the context read failed: the email's own account, read,
+        // is the proof the audience can leave the user out.
+        guard viewModel.hasLoadedThread, context.isLoaded,
+              context.accounts.contains(where: { $0.id == newest.accountId }) else { return nil }
+        let usersTurn = (thread.items.last?.isOwn ?? false) || !unsentReplies.isEmpty
+        let cardOpen = readyReply != nil || agentCompose != nil || forwardMessage != nil
+        return ChatReplyField.shown(
+            newest: newest, usersTurn: usersTurn, onlyTo: replyTarget.only,
+            writing: chatWorking, cardOpen: cardOpen)
+    }
+
+    /// The AI Suggestion's row on the newest email: the ghost of the suggestion the chat shows
+    /// (`shown`, from `shownSuggestion`), else the working bubble while the AI writes it
+    /// (`ChatReplyField.suggestionPhase`, the inbox row's rule). No working bubble on the user's
+    /// turn, while the reply goes only to people chosen in Reply to, before the thread and its
+    /// accounts have loaded, or while the agent works on a request from the field.
+    private func suggestionPhase(on newest: MessageHeader, shown: ReplyResult?, thread: ChatThread) -> ChatSuggestionPhase? {
+        if let text = shown?.textMessage { return .ready(text) }
         // `isLoaded` is also set when the context read failed: the email's own account, read,
         // is the proof the audience can leave the user out.
         guard viewModel.hasLoadedThread, context.isLoaded, !chatWorking,
@@ -875,14 +919,14 @@ struct ChatThreadView: View {
     /// Debug-gated: each build of the ready card's content, with the draft it names.
     static func logReadyCard(_ ready: ChatReadyReply) {
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) cachedReplyLen=\(ready.message.cachedReply?.count ?? -1)")
+            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) suggestionLen=\(ready.suggestion.body.count)")
         }
     }
 
     /// A tap on the AI Suggestion: the Reply All compose card with it written out (the suggestion
     /// shows only while the reply goes to everyone). In the tutorial only the step that asks for it
     /// opens the card.
-    private func openSuggestion(on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {
+    private func openSuggestion(_ shown: ReplyResult, on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {
         if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion {
             _ = TutorialCoordinator.shared.admits(.other)
             return
@@ -890,13 +934,13 @@ struct ChatThreadView: View {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[Chat] openSuggestion message=\(newest.id) alreadyOpen=\(readyReply != nil)")
         }
-        readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
-            replyAllTo: newest, accounts: context.accounts))
+        readyReply = ChatReadyReply(message: newest, suggestion: shown, accounts: context.accounts)
     }
 
     private func pill(on newest: MessageHeader) -> some View {
         let isOwn = thread.items.last?.isOwn ?? false
         let isNoReply = !isOwn && EmailFilter.isNoReply(newest.fromAddress)
+        let shown = shownSuggestion(on: newest, thread: thread)
         return VStack(spacing: 8) {
             if let only = replyTarget.only, !chatExpanded {
                 replyingOnlyTo(only)
@@ -915,7 +959,7 @@ struct ChatThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    example: example,
+                    example: ChatReplyField.example(shown: shown, configured: example),
                     isNoReply: isNoReply,
                     clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
@@ -924,7 +968,8 @@ struct ChatThreadView: View {
                     // The drag's VoiceOver equivalent (decision 12: every chat swipe has a named
                     // action), on the text field VoiceOver focuses; not over the panel or the tutorial.
                     showChat: chatExpanded || TutorialCoordinator.shared.isRunning
-                        ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } }),
+                        ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } },
+                    suggestion: shown),
                 onFieldSend: { _ in fieldComposeOpened = false })
             // Debug UI tests only: the glass's top, swell included (`ChatFieldDragMarker`).
             .modifier(ChatFieldDragMarker.Glass())
@@ -968,9 +1013,15 @@ struct ChatThreadView: View {
                         ViewThatFits(in: .vertical) {
                             TipView(ChatFieldDragTip(), arrowEdge: .bottom)
                                 .fixedSize(horizontal: false, vertical: true)
+                                // `ViewThatFits` keeps the candidate it did not pick in the
+                                // accessibility tree: VoiceOver must not read a card that is not
+                                // on screen while the stand-in shows.
+                                .accessibilityHidden(tipWaitsForRoom)
                                 // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop))
                             Color.clear.frame(height: 0)
+                                .onAppear { tipWaitsForRoom = true }
+                                .onDisappear { tipWaitsForRoom = false }
                                 // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipWait())
                         }
@@ -1074,25 +1125,10 @@ struct ChatThreadView: View {
         fieldClearCount += 1
     }
 
-    @ViewBuilder
-    private func composeView(for card: ChatAgentCard) -> some View {
-        let req = card.request
-        let onOutcome: @MainActor (ComposeOutcome) -> Void = { outcome in
+    private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
+        req.composeView(account: context.accounts.first { $0.id == viewModel.message?.accountId }) { outcome in
             req.onOutcome(outcome)
             composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)
-        }
-        switch req.mode {
-        case .compose:
-            ComposeView(
-                suggestedBody: req.body, account: context.accounts.first { $0.id == viewModel.message?.accountId },
-                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
-                onAgentOutcome: onOutcome)
-        case .reply:
-            card.reply.composeView(replyTo: req.replyTo, suggestedBody: req.body, onAgentOutcome: onOutcome)
-        case .forward:
-            ComposeView(
-                replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
-                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, onAgentOutcome: onOutcome)
         }
     }
 }

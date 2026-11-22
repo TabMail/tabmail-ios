@@ -92,14 +92,16 @@ struct ComposeSuggestionPersistTests {
             "let hasVisibleSuggestion = acceptedSuggestion != offeredSuggestion"))
         let content = try #require(body.range(of:
             "subject: subject, body: acceptedSuggestion.messageBody"))
-        let changes = try #require(body.range(of: "|| hasVisibleSuggestion"))
-        let decision = try #require(body.range(of: "switch ComposeDraftGuards.closeAction"))
+        let decision = try #require(body.range(of: "switch ComposeDraftGuards.closeDecision"))
+        // The same fact also reaches the decision as unsettled work, so a visible
+        // suggestion counts as an unsaved change.
+        #expect(body.contains("hasUnsettledWork: attachmentPreparationIsUnsettled || hasVisibleSuggestion"),
+                "Close must hand the visible suggestion to the decision as unsettled work")
 
         #expect(transition.lowerBound < visible.lowerBound
             && visible.lowerBound < content.lowerBound
-            && content.lowerBound < changes.lowerBound
-            && changes.lowerBound < decision.lowerBound,
-            "Close must derive one visible-suggestion fact and feed both content and change classification before deciding")
+            && content.lowerBound < decision.lowerBound,
+            "Close must derive one visible-suggestion fact and feed it into content before deciding")
     }
 
     @Test("Hidden, absent, and already accepted suggestions do not replace the draft body")
@@ -171,21 +173,33 @@ struct ComposeSuggestionPersistTests {
 
     @Test("A card opened with a suggestion shows that one, never the email row's later reply")
     func cardShowsTheTappedSuggestionNotTheRowsLaterReply() throws {
+        let tapped = ReplyResult(body: Self.cardSuggestion, textMessage: "Yes, Tuesday works for me.")
+        // A whole stored value (text version and change command too), so a body-only read of the row fails.
+        let later = ReplyResult(
+            body: Self.laterRowReply, textMessage: "Thursday works better for me.",
+            changeCommand: "Make it Thursday instead.")
         var rowRead = false
         let shown = ComposeDraftGuards.suggestionToShow(
-            suggestedBody: Self.cardSuggestion, isReply: true,
-            freshCachedReply: { rowRead = true; return Self.laterRowReply })
-        #expect(shown == Self.cardSuggestion)
+            given: tapped, isReply: true,
+            freshSuggestion: { rowRead = true; return later })
+        #expect(shown == tapped)
         #expect(!rowRead, "the row is not consulted when the card was handed a suggestion")
         let accepted = ComposeDraftGuards.acceptingVisibleSuggestion(.init(
-            messageBody: "", showingSuggestion: true, currentSuggestion: shown))
+            messageBody: "", showingSuggestion: true, currentSuggestion: shown?.body))
         #expect(accepted.messageBody == Self.cardSuggestion, "Use Suggestion uses the tapped suggestion")
 
-        // Control: with nothing handed in, a reply reads the row; a new message never does.
+        // A card that is not a reply (an agent's new email or forward) still shows the value handed in,
+        // and never reads a row.
         #expect(ComposeDraftGuards.suggestionToShow(
-            suggestedBody: nil, isReply: true, freshCachedReply: { Self.laterRowReply }) == Self.laterRowReply)
+            given: tapped, isReply: false, freshSuggestion: { rowRead = true; return later }) == tapped,
+                "a new email or forward shows the suggestion it was handed")
+        #expect(!rowRead, "a card that is not a reply never consults a row")
+
+        // Control: with nothing handed in, a reply reads the row's whole value; a new message never does.
         #expect(ComposeDraftGuards.suggestionToShow(
-            suggestedBody: "", isReply: false, freshCachedReply: { Self.laterRowReply }) == nil)
+            given: nil, isReply: true, freshSuggestion: { later }) == later)
+        #expect(ComposeDraftGuards.suggestionToShow(
+            given: nil, isReply: false, freshSuggestion: { later }) == nil)
 
         let prepopulate = try functionBody(
             "private func prepopulate() {",
@@ -193,13 +207,12 @@ struct ComposeSuggestionPersistTests {
         #expect(prepopulate.contains("ComposeDraftGuards.suggestionToShow("),
                 "prepopulate takes its suggestion from the decision")
         // A Forward never offers the parent's AI reply, and the reply read is the email compose opened for.
-        #expect(prepopulate.contains("suggestedBody: suggestedBody, isReply: replyTo != nil && !isForward,"),
+        #expect(prepopulate.contains("given: Self.givenSuggestion(suggestion, suggestedBody: suggestedBody), isReply: replyTo != nil && !isForward,"),
                 "only a reply, never a forward, reads the row's reply")
         let closure = try #require(prepopulate.range(of: "guard let reply = replyTo else { return nil }"))
-        let read = try #require(prepopulate.range(of: "try MessageHeader.fetchOne(db, key: reply.id)"))
-        let cached = try #require(prepopulate.range(of: "return freshHeader?.cachedReply"))
-        #expect(closure.lowerBound < read.lowerBound && read.lowerBound < cached.lowerBound,
-                "the closure reads cachedReply from the row at reply.id")
+        let stored = try #require(prepopulate.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
+        #expect(closure.lowerBound < stored.lowerBound,
+                "the closure reads the stored suggestion from the row at reply.id")
     }
 
     @Test("Use Suggestion then Save writes the card's own draft with the suggestion; the saved reply draft is untouched")
@@ -220,7 +233,7 @@ struct ComposeSuggestionPersistTests {
 
         // The ghost's card, as the chat opens it, then Use Suggestion, then Save.
         let card = ChatReadyReply(
-            message: email, compose: ChatReplyCompose(isReplyAll: false, to: ["sender@example.com"], cc: [], bcc: []))
+            message: email, suggestion: ReplyResult(body: Self.cardSuggestion, textMessage: nil), accounts: [account])
         let accepted = ComposeDraftGuards.acceptingVisibleSuggestion(.init(
             messageBody: "", showingSuggestion: true, currentSuggestion: Self.cardSuggestion))
         let existing = try await db.read { try Draft.fetchOne($0, key: card.draftId) }
@@ -398,6 +411,139 @@ struct ComposeSuggestionPersistTests {
         #expect(!source.contains("You have an AI suggestion that hasn't been accepted"))
     }
 
+    @Test("An edit's text version is stored with it; an edit without one clears the old one")
+    func storesTheEditsTextVersion() async throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
+
+        await ComposeView.writeOverCurrent(ReplyResult(body: "Edited body", textMessage: "Edited text", changeCommand: "ask for Friday"), replyTo: header, db: db)
+        var fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(fetched?.cachedReply == "Edited body")
+        #expect(fetched?.replyTextMessage == "Edited text", "the text version comes with the body it describes")
+        #expect(fetched?.replyChangeCommand == "ask for Friday", "the change command comes with the body it changes")
+
+        await ComposeView.writeOverCurrent(ReplyResult(body: "Earlier body", textMessage: nil, changeCommand: nil), replyTo: header, db: db)
+        fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(fetched?.cachedReply == "Earlier body")
+        #expect(fetched?.replyTextMessage == nil, "a text version never describes another body")
+        #expect(fetched?.replyChangeCommand == nil, "a change command never belongs to another body")
+    }
+
+    /// Resend and rewind put an earlier suggestion back in the card. The suggestion stored for the
+    /// chat view must keep its text version, or the ghost disappears with nothing to show.
+    @Test("A resend or rewind restore keeps the restored suggestion's text version")
+    func restoreKeepsTheTextVersion() async throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
+        await ComposeView.writeOverCurrent(ReplyResult(body: "Original body", textMessage: "Original text", changeCommand: "say no"), replyTo: header, db: db)
+
+        // The edit is requested on the suggestion shown, carried with its text version and command,
+        // then lands.
+        let shown = ReplyResult(body: "Original body", textMessage: "Original text", changeCommand: "say no")
+        let turn = InlineEditTurn(userRequest: "Make it shorter", bodyAtRequest: shown.body,
+                                  subjectAtRequest: "Subject", assistantResponse: "{}",
+                                  textMessageAtRequest: shown.textMessage,
+                                  changeCommandAtRequest: shown.changeCommand)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "Shorter body", textMessage: "Shorter text", changeCommand: "add a date"), replyTo: header, db: db)
+
+        // The edit history survives the draft round trip, as on a reopened card.
+        let draft = Self.draft(history: Draft.encodeEditHistory([turn]))
+        let restored = try #require(draft.editHistory.first)
+
+        await ComposeView.writeOverCurrent(ReplyResult(body: restored.bodyAtRequest, textMessage: restored.textMessageAtRequest, changeCommand: restored.changeCommandAtRequest), replyTo: header, db: db)
+
+        let fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(fetched?.cachedReply == "Original body")
+        #expect(fetched?.replyTextMessage == "Original text", "the restored suggestion keeps its ghost")
+        #expect(fetched?.replyChangeCommand == "say no", "and its field example")
+    }
+
+    /// Resend and rewind put an earlier draft back, then send the request again. The request must
+    /// edit that restored draft, not the card's draft from before the restore reached it.
+    @Test("A resend or rewind edits the restored draft", arguments: ["resend", "rewind"])
+    func restoreEditsTheRestoredDraft(_ restore: String) throws {
+        let source = try #require(Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift"))
+        let signature = restore == "resend"
+            ? "private func resendLastUserComposeEdit(" : "private func rewindComposeEditToMessage("
+        let start = try #require(source.range(of: signature))
+        let tail = source[start.upperBound...]
+        let end = try #require(tail.range(of: "\n    }\n"))
+        #expect(tail[..<end.lowerBound].contains("sendComposeEdit(text, agentAdmissionAcquired: true, from: anchor)"),
+                "the \(restore) sends the request on the restored turn")
+        let send = try #require(source.range(of: "private func sendComposeEdit("))
+        let body = source[send.upperBound...].prefix(4000)
+        #expect(body.contains("Self.editBase(anchor: anchor, draftSubject: draftSubject, draftBody: draftBody,"),
+                "the edit reads the draft the one choice gives")
+        // The restore and the result are both applied, awaited, inside the request's task, which
+        // holds the compose fence admission until it ends: the restore lands before the result.
+        let rest = source[send.upperBound...]
+        let task = try #require(rest.range(of: "activeChatTask = Task {\n            defer { composeAgentSendFence?.finishAgent() }"))
+        let restore = try #require(rest.range(of: "if let anchor, let onDraftUpdate {\n"))
+        let result = try #require(rest.range(of: "await onDraftUpdate?(result.subject, result.body,"))
+        #expect(task.lowerBound < restore.lowerBound && restore.lowerBound < result.lowerBound)
+        #expect(rest[restore.upperBound...].prefix(400).contains("await Self.restoreDraft(anchor, through: onDraftUpdate)"))
+        // The accepted edit records its turn with the text version and command it was requested on
+        // (the base's, read once), so a later resend or rewind restores the whole suggestion.
+        let base = try #require(rest.range(of: "let atRequest = base.atRequest\n"))
+        let record = try #require(rest.range(of: """
+            editHistory.append(Self.editTurn(
+                                instruction: instruction, subject: currentSubject, body: currentBody,
+                                atRequest: atRequest, assistantResponse: result.raw))
+            """))
+        #expect(base.lowerBound < record.lowerBound && result.lowerBound < record.lowerBound,
+                "the accepted edit records its turn with the request's text version")
+    }
+
+    /// The choice itself, without the view: a restored turn wins over the card's draft, which a
+    /// restore may not have reached yet.
+    @Test("With a restored turn the edit reads that turn's draft, not the card's stale one")
+    func editBaseTakesTheRestoredTurn() {
+        let turn = InlineEditTurn(userRequest: "Make it shorter", bodyAtRequest: "Restored body",
+                                  subjectAtRequest: "Re: Restored", assistantResponse: "{}",
+                                  textMessageAtRequest: "Restored text", changeCommandAtRequest: "say no")
+        let stale = ReplyResult(body: "Stale body", textMessage: "Stale text", changeCommand: "stale command")
+        let restored = DynamicIslandChat.editBase(
+            anchor: turn, draftSubject: "Re: Stale", draftBody: stale.body, draftSuggestion: stale)
+        #expect(restored.subject == "Re: Restored")
+        #expect(restored.body == "Restored body")
+        #expect(restored.atRequest.textMessage == "Restored text" && restored.atRequest.changeCommand == "say no")
+        // Control: no restore, the card's draft and its suggestion.
+        let current = DynamicIslandChat.editBase(
+            anchor: nil, draftSubject: "Re: Stale", draftBody: stale.body, draftSuggestion: stale)
+        #expect(current.body == "Stale body" && current.subject == "Re: Stale")
+        #expect(current.atRequest.textMessage == "Stale text" && current.atRequest.changeCommand == "stale command")
+    }
+
+    private static func source(_ path: String) -> String? {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        return try? String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+    }
+
+    @Test("Edit history saved before the text version was kept decodes it as nil")
+    func olderHistoryDecodesNil() throws {
+        let draft = Self.draft(history: #"[{"userRequest":"r","bodyAtRequest":"b","subjectAtRequest":"s","assistantResponse":"a"}]"#)
+        let turn = try #require(draft.editHistory.first)
+        #expect(turn.bodyAtRequest == "b")
+        #expect(turn.textMessageAtRequest == nil)
+        #expect(turn.changeCommandAtRequest == nil)
+    }
+
+    private static func draft(history: String?) -> Draft {
+        Draft(
+            id: "d1", accountId: "acc1",
+            toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+            subject: "Subject", body: "",
+            replyToId: nil, isForward: false,
+            editHistoryJSON: history,
+            createdAt: 0, updatedAt: 0,
+            serverDraftId: nil, serverPushStatus: nil,
+            rfc822MessageId: nil, attachmentsDirName: nil)
+    }
+
     @Test("Updates cachedReply on messageHeader for the given id")
     func updatesCachedReplyColumn() async throws {
         let db = try TestDatabase.make()
@@ -405,7 +551,7 @@ struct ComposeSuggestionPersistTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
 
-        await ComposeView.writeCachedReplyToDB("edited reply", replyTo: header, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "edited reply", textMessage: nil, changeCommand: nil), replyTo: header, db: db)
 
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(fetched?.cachedReply == "edited reply")
@@ -420,7 +566,7 @@ struct ComposeSuggestionPersistTests {
 
         var ghost = header
         ghost.id = "nonexistent"
-        await ComposeView.writeCachedReplyToDB("ghost", replyTo: ghost, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "ghost", textMessage: nil, changeCommand: nil), replyTo: ghost, db: db)
 
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(fetched?.cachedReply == nil)
@@ -433,8 +579,8 @@ struct ComposeSuggestionPersistTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
 
-        await ComposeView.writeCachedReplyToDB("first", replyTo: header, db: db)
-        await ComposeView.writeCachedReplyToDB("second", replyTo: header, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "first", textMessage: nil, changeCommand: nil), replyTo: header, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "second", textMessage: nil, changeCommand: nil), replyTo: header, db: db)
 
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(fetched?.cachedReply == "second")
@@ -453,7 +599,7 @@ struct ComposeSuggestionPersistTests {
             snippet: "Untouched snippet"
         )
 
-        await ComposeView.writeCachedReplyToDB("new reply", replyTo: header, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "new reply", textMessage: nil, changeCommand: nil), replyTo: header, db: db)
 
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(fetched?.subject == "Untouched subject")
@@ -518,7 +664,7 @@ struct ComposeSuggestionPersistTests {
             try bystander.insert(db)
         }
 
-        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "my edit", textMessage: nil, changeCommand: nil), replyTo: opened, db: db)
 
         #expect(try row(db, opened.id).cachedReply == "my edit")
         #expect(try row(db, bystander.id).cachedReply == Self.earlier, "the save touched another email")
@@ -551,7 +697,7 @@ struct ComposeSuggestionPersistTests {
                            arguments: [replacement.cachedReply, opened.id])
         }
 
-        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "my edit", textMessage: nil, changeCommand: nil), replyTo: opened, db: db)
 
         // The replacement is still there, still itself, and still holds its own suggestion.
         let after = try row(db, opened.id)
@@ -586,7 +732,7 @@ struct ComposeSuggestionPersistTests {
                            arguments: [replacement.cachedReply, opened.id])
         }
 
-        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "my edit", textMessage: nil, changeCommand: nil), replyTo: opened, db: db)
 
         let after = try row(db, opened.id)
         #expect(after.observedUidValidity == 222)
@@ -599,7 +745,7 @@ struct ComposeSuggestionPersistTests {
         let opened = header(rfc822: nil, epoch: 111)
         try await db.write { try opened.insert($0) }
 
-        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "my edit", textMessage: nil, changeCommand: nil), replyTo: opened, db: db)
 
         #expect(try row(db, opened.id).cachedReply == "my edit")
     }
@@ -610,7 +756,7 @@ struct ComposeSuggestionPersistTests {
         let opened = header(rfc822: nil, epoch: 111)
         try await db.write { try opened.insert($0) }
 
-        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "my edit", textMessage: nil, changeCommand: nil), replyTo: opened, db: db)
 
         #expect(try row(db, opened.id).cachedReply == Self.earlier)
     }
@@ -621,26 +767,109 @@ struct ComposeSuggestionPersistTests {
         let opened = header(rfc822: nil, epoch: nil)
         try await db.write { try opened.insert($0) }
 
-        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "my edit", textMessage: nil, changeCommand: nil), replyTo: opened, db: db)
 
         #expect(try row(db, opened.id).cachedReply == Self.earlier)
     }
 
     /// The edit reaches the writer: an inline edit of the visible suggestion in reply mode (not forward,
-    /// not a new message) saves through `writeCachedReplyToDB` with the message compose opened for.
-    @Test("An inline edit of the visible reply suggestion is saved with the message compose opened for")
+    /// not a new message) saves through `writeCachedReplyToDB` with the message compose opened for,
+    /// awaited inside the edit (so under the chat's compose fence), before the fade that only
+    /// presents it.
+    @Test("An inline edit of the visible reply suggestion is saved, awaited, with the message compose opened for")
     func inlineEditReachesTheWriterWithTheOpenedMessage() throws {
         let source = try composeSource()
-        let persist = try functionBody(
-            "private func persistCachedReply(", before: "static func writeCachedReplyToDB(", in: source)
-        #expect(persist.contains("guard let reply = replyTo else { return }"))
-        #expect(persist.contains("writeCachedReplyToDB(text, replyTo: reply, db: dbPool.pool)"))
+        let edit = try functionBody("private func applyInlineEdit(", before: "struct SuggestionEdit {", in: source)
+        let gate = try #require(edit.range(of: "let edit = Self.suggestionEdit("))
+        let save = try #require(edit.range(of: "await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: dbPool)"))
+        let fade = try #require(edit.range(of: "withAnimation(.easeOut(duration: 0.4)) {"))
+        #expect(gate.lowerBound < save.lowerBound && save.lowerBound < fade.lowerBound)
+        #expect(!edit.contains("Task {"), "the save is awaited by the edit, never detached")
+        // The card shows the stored whole value, so a second edit starts from (and replaces) this one.
+        let shown = try #require(edit.range(of: "if showingSuggestion {"))
+        let assign = try #require(edit[shown.upperBound...].range(of: "shownSuggestion = edit.edited\n"))
+        #expect(gate.lowerBound < assign.lowerBound && assign.lowerBound < save.lowerBound,
+                "the card's shown suggestion becomes the edited value before its save")
+        #expect(!source.contains("persistCachedReply"), "the retired second writer")
+        // The suggestion replaced is the one shown when the edit started: read before the decision
+        // and before the card shows the edited value, else the edit compares against itself.
+        let previous = try #require(edit.range(of: "let previous = shownSuggestion\n"))
+        #expect(previous.lowerBound < gate.lowerBound && previous.lowerBound < assign.lowerBound,
+                "the replaced suggestion is read before the card shows the edit")
+        #expect(edit.components(separatedBy: "shownSuggestion").count - 1 == 2,
+                "the edit reads the shown suggestion once (as previous) and assigns it once")
+    }
 
-        let edit = try functionBody("private func applyInlineEdit(", before: "private func persistCachedReply(", in: source)
-        let suggestion = try #require(edit.range(of: "if showingSuggestion {"))
-        let gate = try #require(edit.range(of: "if replyTo != nil && !isForward {"))
-        let save = try #require(edit.range(of: "persistCachedReply(b)"))
-        #expect(suggestion.lowerBound < gate.lowerBound && gate.lowerBound < save.lowerBound)
+    /// Backstop for the hosted card's pill, which no active test can drive: each compose edit's
+    /// context is read when the edit is sent, through the identity-checked read, and a nil read
+    /// refuses the edit before the model call.
+    @Test("A card's compose edit sends the context read at request time, and refuses a nil read")
+    func cardEditReadsItsContextAtRequestTime() throws {
+        let compose = try composeSource()
+        let chat = try #require(compose.range(of: "DynamicIslandChat(\n"))
+        let wiring = compose[chat.upperBound...].prefix(1200)
+        #expect(wiring.contains("composeEditContext: { await composeEditContextForRequest() },"),
+                "the card hands the chat its request-time context read")
+        let reader = try functionBody("private func composeEditContextForRequest()", before: "\n    }\n", in: compose)
+        #expect(reader.contains("ComposeEditContext.relatedBodyText(of: reply, db: db)"), "the identity-checked body read")
+        let source = try #require(Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift"))
+        let send = try functionBody("private func sendComposeEdit(", before: "private func finishAutoSave(", in: source)
+        let capture = try #require(send.range(of: "let contextSource = composeEditContext\n"))
+        let task = try #require(send.range(of: "let editTask = Task {"))
+        let read = try #require(send.range(of: "guard let read = await contextSource() else {\n"))
+        let refuse = try #require(send[read.upperBound...].range(of: "throw InlineEditFailure("))
+        let adopt = try #require(send.range(of: "requestContext = read\n"))
+        let call = try #require(send.range(of: "aiService.performInlineEdit("))
+        #expect(capture.lowerBound < task.lowerBound && task.lowerBound < read.lowerBound
+                && read.lowerBound < refuse.lowerBound && refuse.lowerBound < adopt.lowerBound
+                && adopt.lowerBound < call.lowerBound,
+                "the context is read inside the request's task, refused on nil, then used")
+        #expect(send[read.upperBound..<adopt.lowerBound].count < 300, "the refusal is the nil read's own branch")
+        #expect(send[call.upperBound...].prefix(300).contains("context: requestContext,"),
+                "the model gets the request-time context, never the render-time one")
+    }
+
+    /// Backstop for `prepopulate`'s view-private read: a reply card opened without a given
+    /// suggestion shows the stored one only while the row is still the email replied to.
+    @Test("A reply card's stored-suggestion prefill is read only while the row is the email replied to")
+    func prefillReadsTheStoredSuggestionThroughTheIdentityCheck() throws {
+        let source = try composeSource()
+        let prepopulate = try functionBody("private func prepopulate() {", before: "private func clearAttachmentPreparationFailures() {", in: source)
+        let branch = try #require(prepopulate.range(of: "freshSuggestion: {\n"))
+        let rest = prepopulate[branch.upperBound...]
+        let read = try #require(rest.range(of: "return try? dbPool.read { db -> ReplyResult? in\n"))
+        let guardLine = try #require(rest.range(of: "guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }\n"))
+        let fetch = try #require(rest.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
+        // The end of the stored-suggestion read's closure.
+        let otherwise = try #require(rest.range(of: "})\n"))
+        #expect(read.lowerBound < guardLine.lowerBound && guardLine.lowerBound < fetch.lowerBound
+                && fetch.lowerBound < otherwise.lowerBound,
+                "the identity check guards the stored-suggestion read, inside it, before the value")
+        let shown = try #require(rest.range(of: "shownSuggestion = suggested"))
+        #expect(fetch.lowerBound < shown.lowerBound, "the guarded value is the one shown")
+        #expect(rest[..<otherwise.lowerBound].components(separatedBy: "MessageHeader.fetchOne").count == 2,
+                "the branch has one read of the stored suggestion, the guarded one")
+    }
+
+    /// Backstop for what no active test can drive (the hosted card's pill and Recompute take no
+    /// accessibility activation): the card's edit decides with the card's OWN live inputs, the From
+    /// chosen in the card, its recipients after this edit's deltas and the subject after this edit,
+    /// never the email's; and the card's disappearance runs its close step. The decisions themselves
+    /// are pinned behaviourally (`cardEditReachesTheGhostOnlyFromItsEnvelope`, `cardCloseEndsTheRecompute`).
+    @Test("A card's edit decides with the card's own From, recipients after the edit and subject; its disappearance closes its Recompute")
+    func cardEditUsesTheCardsOwnInputs() throws {
+        let source = try composeSource()
+        let edit = try functionBody("private func applyInlineEdit(", before: "struct SuggestionEdit {", in: source)
+        let deltas = try #require(edit.range(of: "setRecipients(recipients.applying(to: toDelta, cc: ccDelta, bcc: bccDelta))"))
+        let gate = try #require(edit.range(of: "let edit = Self.suggestionEdit("))
+        #expect(deltas.lowerBound < gate.lowerBound, "the decision reads the recipients after this edit's deltas")
+        let call = String(edit[gate.lowerBound...].prefix(400))
+        #expect(call.contains("recipients: recipients.pendingCommitted"), "the card's recipients: \(call)")
+        #expect(call.contains("subject: newSubject ?? subject"), "the subject after this edit: \(call)")
+        #expect(call.contains("accountId: selectedAccount?.id"), "the From chosen in the card, never the email's account: \(call)")
+        #expect(!call.contains("replyTo?.accountId") && !call.contains("reply.accountId"))
+        let disappear = try functionBody("private func performDisappear()", before: "static func cardClosed(", in: source)
+        #expect(disappear.contains("Self.cardClosed(recompute: recomputeTask)"), "the card's disappearance closes its Recompute")
     }
 
     @Test("A user edit clears the reply's text message, which described the AI's body")
@@ -655,7 +884,7 @@ struct ComposeSuggestionPersistTests {
         let seeded = header
         try await db.write { try seeded.update($0) }
 
-        await ComposeView.writeCachedReplyToDB("my edit", replyTo: seeded, db: db)
+        await ComposeView.writeOverCurrent(ReplyResult(body: "my edit", textMessage: nil, changeCommand: nil), replyTo: seeded, db: db)
 
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: seeded.id) }
         #expect(fetched?.cachedReply == "my edit")

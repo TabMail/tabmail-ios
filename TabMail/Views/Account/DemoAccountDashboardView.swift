@@ -15,6 +15,10 @@ struct DemoAccountDashboardView: View {
     @Bindable private var store = DemoModeStore.shared
     @State private var showExitConfirm = false
     @State private var showAIConsent = false
+    /// The device's AI setting (the demo has none of its own), observed so the
+    /// section redraws.
+    @AppStorage(AIService.aiChoiceMadeKey, store: AIService.optOutStore) private var aiChoiceMade = false
+    @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var aiOptedOut = false
 
     var body: some View {
         Form {
@@ -68,15 +72,15 @@ struct DemoAccountDashboardView: View {
 
             // AI status toggle
             Section {
-                if store.aiEnabled {
+                if !AIConsentPolicy.isDisabled(choiceMade: aiChoiceMade, optedOut: aiOptedOut) {
                     LabeledContent("AI features") {
                         Text("Enabled")
                             .foregroundStyle(.green)
                     }
                     Button {
-                        store.aiEnabled = false
+                        AIService.recordAIChoice(aiEnabled: false, resume: {})
                     } label: {
-                        Label("Disable AI for this demo", systemImage: "xmark.circle")
+                        Label("Turn off AI", systemImage: "xmark.circle")
                     }
                 } else {
                     LabeledContent("AI features") {
@@ -121,7 +125,7 @@ struct DemoAccountDashboardView: View {
         .sheet(isPresented: $showAIConsent) {
             NavigationStack {
                 AIConsentView { aiEnabled in
-                    store.aiEnabled = aiEnabled
+                    AIService.recordAIChoice(aiEnabled: aiEnabled, resume: {})
                     showAIConsent = false
                 }
             }

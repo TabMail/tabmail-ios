@@ -194,7 +194,7 @@ struct MessageAICachePersistenceTests {
                 accountId: "acc1",
                 folderPath: "INBOX",
                 rfc822MessageId: "<msg@test.com>",
-                cachedReply: "Here is a reply",
+                reply: ReplyResult(body: "Here is a reply", textMessage: nil),
                 db: $0
             )
         }
@@ -289,7 +289,7 @@ struct MessageAICachePersistenceTests {
                 reminderTime: "14:00",
                 reminderContent: "Review meeting slides",
                 actionTag: nil,
-                cachedReply: "Will review by Friday",
+                reply: ReplyResult(body: "Will review by Friday", textMessage: nil),
                 replyGeneratedAt: now,
                 db: $0
             )
@@ -501,7 +501,7 @@ struct MessageAICachePersistenceTests {
                 accountId: "acc1",
                 folderPath: "INBOX",
                 rfc822MessageId: "<msg@test.com>",
-                cachedReply: "Cached reply text",
+                reply: ReplyResult(body: "Cached reply text", textMessage: nil),
                 db: $0
             )
         }

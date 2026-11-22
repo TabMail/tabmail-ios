@@ -896,7 +896,7 @@ struct ChatNewDraftSaveTests {
         _ = try? await DraftStore.shared.pushDraftToServer(
             draftId: model.draftId, expectedInstanceEpoch: epoch, provider: provider,
             runtimeKind: .imap, draftsFolderPath: "Drafts")
-        let sent = await provider.savedDraftMessages
+        let sent = await provider.savedDraftPayloads.map(\.draft)
         #expect(sent.count == 1, "control: the push reached the provider")
         guard sent.count == 1 else { return }
         let wireId = try #require(sent[0].messageId)

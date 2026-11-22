@@ -151,9 +151,15 @@ struct TabMailApp: App {
     }
 
     init() {
+        // The AI setting moves into the App Group suite before anything can read it. This runs
+        // first on every launch, background wakes included, so no gate or queue reads it earlier.
+        let migratedAIKeys = AIConsentPolicy.migrateLegacyValues(from: .standard, to: AIService.optOutStore)
         // First app-code mark — its `+Nms` is the pre-main (dyld / runtime /
         // static-init) cost, usually the biggest single chunk of a cold launch.
         BootProfiler.mark("TabMailApp.init enter")
+        if !migratedAIKeys.isEmpty, DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[TabMailApp] Moved AI setting to the shared suite: \(migratedAIKeys)")
+        }
         let sessionStore = TabMailSessionStore.shared
         let sessionLaunchState = Self.prepareSessionStorageForLaunch(sessionStore: sessionStore)
         let hadLaunchedBefore = sessionLaunchState.hadLaunchedBefore
