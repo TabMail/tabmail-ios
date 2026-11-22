@@ -37,10 +37,14 @@ struct OneSyncAtATimeTests {
     /// request of one kind arrived while the other kind was in flight. A full
     /// sync is seen by its Inbox window listing (`isWindowListing`): the change
     /// read also asks for the label list, so `labels` no longer marks one.
+    /// `labelsRequests` counts them all: one per change read of every folder and
+    /// one per full sync's folder discovery, which runs even when the Inbox
+    /// window listing is skipped because the Inbox is tracked.
     final class Wire: Sendable {
         struct State {
             var historyRequests = 0
             var listingRequests = 0
+            var labelsRequests = 0
             var historyInFlight = 0
             var listingsInFlight = 0
             var overlapped = false
@@ -115,8 +119,10 @@ struct OneSyncAtATimeTests {
                 return .json(raw: #"{ "historyId": "1000" }"#)
             }
         }
-        scenario.register(path: "/labels", method: "GET", response: .json(
-            raw: #"{ "labels": [ { "id": "INBOX", "name": "INBOX", "type": "system" } ] }"#))
+        scenario.register(path: "/labels", method: "GET") { _ in
+            wire.state.withLock { $0.labelsRequests += 1 }
+            return .json(raw: #"{ "labels": [ { "id": "INBOX", "name": "INBOX", "type": "system" } ] }"#)
+        }
         scenario.register(path: "/messages", method: "GET") { request in
             guard Self.isWindowListing(request.url) else { return .json(raw: #"{ "resultSizeEstimate": 0 }"#) }
             wire.state.withLock { state in
@@ -185,6 +191,10 @@ struct OneSyncAtATimeTests {
                 case .backgroundDelta: _ = try await engine.backgroundDeltaSync(account: account)
                 }
             }
+            // The second pass waits its turn while the first pass is still in its
+            // change read, so it is queued behind the whole first pass.
+            let queued = await Self.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 1 }
+            #expect(queued, "precondition: the second pass waits its turn behind the first")
             _ = try await first.value
             switch second {
             case .backgroundDelta:
@@ -204,6 +214,10 @@ struct OneSyncAtATimeTests {
             let seen = wire.snapshot
             #expect(!seen.overlapped, "a delta and a full sync of one account were in flight together")
             #expect(seen.listingRequests == 1, "the first pass ran the full sync, and only it")
+            // A second full sync lists no Inbox window (the first one left the
+            // Inbox tracked) but still discovers the folders: two change reads
+            // and one full sync ask for the label list three times.
+            #expect(seen.labelsRequests == 3, "no second full sync: \(seen.labelsRequests) label list requests")
             #expect(seen.historyRequests == 2, "both passes must run their delta (none is skipped or joined)")
             #expect(seen.historyAfterFirstListing, "the second pass's delta must start after the first pass's full sync")
             await engine.remove(accountId: Self.accountId)
@@ -259,13 +273,17 @@ struct OneSyncAtATimeTests {
     /// The server has expired cursor `1000` (its `history` answers 404) and is
     /// at `2000` now (`profile`); a `history` from any other cursor answers
     /// `2001` with no changes. With `parkFirstListing`, the first full sync's
-    /// window listing waits for the test to release it.
-    private static func cursorScenario(wire: CursorWire, parkFirstListing: Bool) -> FakeHTTP.Scenario {
+    /// window listing waits for the test to release it. A `history` from
+    /// `failingStart` fails (400): a change read that throws.
+    private static func cursorScenario(
+        wire: CursorWire, parkFirstListing: Bool, failingStart: String? = nil
+    ) -> FakeHTTP.Scenario {
         let scenario = FakeHTTP.Scenario()
         scenario.register(path: "/history", method: "GET") { request in
             let start = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first { $0.name == "startHistoryId" }?.value ?? ""
             wire.state.withLock { $0.historyStarts.append(start) }
+            if start == failingStart { return .status(400) }
             return start == "1000" ? .status(404) : .json(raw: #"{ "historyId": "2001" }"#)
         }
         scenario.register(path: "/labels", method: "GET", response: .json(
@@ -401,6 +419,9 @@ struct OneSyncAtATimeTests {
             #expect(stampedJustNow, "precondition: the change read stamped the account just now")
             #expect(wire.snapshot.historyStarts == ["1500"], "precondition: the change read ran from the stored cursor")
             #expect(wire.snapshot.listingRequests == 0, "precondition: the change read runs no full sync")
+            // Ten seconds back, still moments ago: the pass's own stamp is then
+            // seen as a later one.
+            let readStamp = try await Self.backdateLastSyncedAt(pool, seconds: 10)
 
             // The poll's foreground pass.
             _ = try await engine.sync(account: account)
@@ -415,11 +436,77 @@ struct OneSyncAtATimeTests {
                 #expect(recorded, "the due full sync was not recorded as run")
             case .aMinuteAgo:
                 let unmoved = afterPass?.lastFullSyncAt == afterRead?.lastFullSyncAt
+                // No full sync: only the pass's own change read can stamp it.
+                let readRecorded = afterPass?.lastSyncedAt.map { $0 > readStamp } == true
                 #expect(wire.snapshot.listingRequests == 0, "a full sync ran that was not due")
                 #expect(unmoved, "the last full sync time moved")
+                #expect(readRecorded, "the pass did not record its own change read")
             }
             await engine.remove(accountId: Self.accountId)
         }
+    }
+
+    /// RED on main, as above. The pass's own change read fails: the gate still
+    /// runs and records the full sync when `lastFullSyncAt` says it is due, and
+    /// the pass ends without an error. When none is due, the pass reports the
+    /// failed read and runs no full sync.
+    @Test("A pass right after a change read runs the due full sync even when its own read fails",
+          arguments: LastFullSync.allCases)
+    func failedReadRightAfterAChangeRead(lastFullSync: LastFullSync) async throws {
+        try await Self.withAppDB { pool in
+            let anHourAgo = Date().addingTimeInterval(-3600)
+            let account = try Self.makeAccount(pool: pool, lastFullSyncAt: lastFullSync.date, lastSyncedAt: anHourAgo)
+            try await pool.write { db in
+                _ = try Account.filter(Column("id") == Self.accountId)
+                    .updateAll(db, Column("lastHistoryId").set(to: "1500"))
+            }
+            let wire = CursorWire()
+            let scenario = Self.cursorScenario(wire: wire, parkFirstListing: false, failingStart: "2001")
+            defer { scenario.close() }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+            let engine = await Self.engine(provider: provider)
+
+            _ = try await engine.backgroundDeltaSync(account: account)
+            let afterRead = try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) }
+            let stampedJustNow = afterRead?.lastSyncedAt.map { Date().timeIntervalSince($0) < 15 } == true
+            #expect(stampedJustNow, "precondition: the change read stamped the account just now")
+            #expect(wire.snapshot.historyStarts == ["1500"], "precondition: the change read ran from the stored cursor")
+
+            var failed = false
+            do {
+                _ = try await engine.sync(account: account)
+            } catch {
+                failed = true
+            }
+
+            let afterPass = try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) }
+            #expect(wire.snapshot.historyStarts == ["1500", "2001"], "precondition: the pass's own change read ran, and failed")
+            switch lastFullSync {
+            case .never, .anHourAgo:
+                let recorded = afterPass?.lastFullSyncAt.map { Date().timeIntervalSince($0) < 15 } == true
+                #expect(wire.snapshot.listingRequests == 1, "the due full sync did not run after the failed read")
+                #expect(recorded, "the due full sync was not recorded as run")
+                #expect(!failed, "a pass whose due full sync ran reports no error")
+            case .aMinuteAgo:
+                let unmoved = afterPass?.lastFullSyncAt == afterRead?.lastFullSyncAt
+                #expect(wire.snapshot.listingRequests == 0, "a full sync ran that was not due")
+                #expect(unmoved, "the last full sync time moved")
+                #expect(failed, "the failed read is reported when no full sync is due")
+            }
+            await engine.remove(accountId: Self.accountId)
+        }
+    }
+
+    /// Moves the account's `lastSyncedAt` `seconds` back and returns it as stored.
+    private static func backdateLastSyncedAt(_ pool: DatabasePool, seconds: TimeInterval) async throws -> Date {
+        let backdated = Date().addingTimeInterval(-seconds)
+        try await pool.write { db in
+            _ = try Account.filter(Column("id") == Self.accountId)
+                .updateAll(db, Column("lastSyncedAt").set(to: backdated))
+        }
+        let stored = try await pool.read { db in try Account.fetchOne(db, key: Self.accountId)?.lastSyncedAt }
+        return try #require(stored, "the stamp was stored")
     }
 
     /// A foreground pass and a background delta wait behind a held turn; the
