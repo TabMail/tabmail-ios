@@ -119,6 +119,8 @@ struct ChatRecentPeopleTests {
         #expect(reader.contains("try await pool.read { db in"), "control: the reader reads")
         #expect(reader.contains("static func load( pool: DatabasePool,") && !reader.contains("PrioritizedDatabase("),
                 "GRDB's own read: never the async read that runs the staging merge first")
+        #expect(!reader.contains("NSEDataBridge") && !reader.contains("mergeIfStagingPending"),
+                "nor the staging merge itself")
         #expect(reader.contains("return try SearchView.recentHeaders(db, folderIds: sentFolderIds, budget: scanCount)"),
                 "each Sent folder's newest on its own index, then the newest of those")
         #expect(!reader.contains("write") && !reader.contains("UserDefaults") && !reader.contains("insert"), "nothing is stored")

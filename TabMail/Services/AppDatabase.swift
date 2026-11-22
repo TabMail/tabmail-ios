@@ -459,8 +459,11 @@ final class AppDatabase: Sendable {
     var writer: any DatabaseWriter { dbPool }
 
     /// The raw GRDB pool. Use ONLY for GRDB APIs that require a `DatabasePool` /
-    /// `DatabaseReader` (e.g. `ValueObservation.publisher(in:)`). For reads/writes
-    /// prefer `dbPool` so priority is applied uniformly (see `PrioritizedDatabase`).
+    /// `DatabaseReader` (e.g. `ValueObservation.publisher(in:)`), and for display reads
+    /// that must not wait for the read-through staging merge `dbPool`'s async read runs
+    /// first (`InboxListReader.fetch`, `SearchView.legacyLocalSearch`,
+    /// `ChatRecentPeople.load`). For other reads/writes prefer `dbPool` so priority is
+    /// applied uniformly (see `PrioritizedDatabase`).
     static var rawPool: DatabasePool {
         shared.withLock { $0!.dbPool }
     }
