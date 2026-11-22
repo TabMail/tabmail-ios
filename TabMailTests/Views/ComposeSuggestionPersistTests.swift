@@ -180,7 +180,7 @@ struct ComposeSuggestionPersistTests {
             changeCommand: "Make it Thursday instead.")
         var rowRead = false
         let shown = ComposeDraftGuards.suggestionToShow(
-            given: tapped, isReply: true,
+            given: tapped, isReply: true, onlyToChosen: false,
             freshSuggestion: { rowRead = true; return later })
         #expect(shown == tapped)
         #expect(!rowRead, "the row is not consulted when the card was handed a suggestion")
@@ -191,15 +191,26 @@ struct ComposeSuggestionPersistTests {
         // A card that is not a reply (an agent's new email or forward) still shows the value handed in,
         // and never reads a row.
         #expect(ComposeDraftGuards.suggestionToShow(
-            given: tapped, isReply: false, freshSuggestion: { rowRead = true; return later }) == tapped,
+            given: tapped, isReply: false, onlyToChosen: false, freshSuggestion: { rowRead = true; return later }) == tapped,
                 "a new email or forward shows the suggestion it was handed")
         #expect(!rowRead, "a card that is not a reply never consults a row")
 
         // Control: with nothing handed in, a reply reads the row's whole value; a new message never does.
         #expect(ComposeDraftGuards.suggestionToShow(
-            given: nil, isReply: true, freshSuggestion: { later }) == later)
+            given: nil, isReply: true, onlyToChosen: false, freshSuggestion: { later }) == later)
         #expect(ComposeDraftGuards.suggestionToShow(
-            given: nil, isReply: false, freshSuggestion: { later }) == nil)
+            given: nil, isReply: false, onlyToChosen: false, freshSuggestion: { later }) == nil)
+
+        // A reply only to the people chosen in the chat's Reply to never reads the row: the stored
+        // suggestion was written for everyone. What it was handed (its own words) still shows.
+        var narrowedRead = false
+        #expect(ComposeDraftGuards.suggestionToShow(
+            given: nil, isReply: true, onlyToChosen: true, freshSuggestion: { narrowedRead = true; return later }) == nil,
+                "a reply only to the people chosen offers no stored suggestion")
+        #expect(!narrowedRead, "a reply only to the people chosen never consults the row")
+        #expect(ComposeDraftGuards.suggestionToShow(
+            given: tapped, isReply: true, onlyToChosen: true, freshSuggestion: { later }) == tapped,
+                "a reply only to the people chosen shows the words it was handed")
 
         let prepopulate = try functionBody(
             "private func prepopulate() {",
@@ -209,6 +220,10 @@ struct ComposeSuggestionPersistTests {
         // A Forward never offers the parent's AI reply, and the reply read is the email compose opened for.
         #expect(prepopulate.contains("given: Self.givenSuggestion(suggestion, suggestedBody: suggestedBody), isReply: replyTo != nil && !isForward,"),
                 "only a reply, never a forward, reads the row's reply")
+        let decision = try #require(prepopulate.range(of: "ComposeDraftGuards.suggestionToShow("))
+        let fresh = try #require(prepopulate.range(of: "freshSuggestion: {"))
+        #expect(prepopulate[decision.upperBound..<fresh.lowerBound].contains("onlyToChosen: onlyToChosen,"),
+                "the card's own choice decides whether it may read the row's reply")
         let closure = try #require(prepopulate.range(of: "guard let reply = replyTo else { return nil }"))
         let stored = try #require(prepopulate.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
         #expect(closure.lowerBound < stored.lowerBound,

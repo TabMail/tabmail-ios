@@ -592,6 +592,28 @@ same AI result, kept as long as the email itself is shown.
    instead of the people chosen, and Retry re-read the field (its current choice, or a sheet send when the sheet was open). Tests:
    `ChatReplyRecoveryTests` (connection lost then resumed, and a server failure then Retry, the
    choice changed in between).
+   **The words of a reply to the people chosen are written for them (2026-11-22, tabmail-ios#1175):**
+   the email's stored AI Suggestion (`MessageHeader.suggestion`) was written for its whole Reply
+   All audience, so a reply narrowed in the field never takes it. With a request, the reply tool
+   writes for the narrowed draft (`start`, ADR-IOS-053 amendment 3). With neither a request nor a
+   body from the agent, its words are written for the people chosen as Thunderbird's `email_reply`
+   writes every reply, for the draft's recipients: the same compose edit, with an empty request
+   (`EmailReplyTool`, `onlyToChosen`). If writing fails, with or without a request, the card opens
+   with no words, never the stored suggestion. The card never reads it either: the one presenter
+   (`ComposeRequest.composeView`) sets `ComposeView.onlyToChosen` from the request's field choice,
+   and `ComposeDraftGuards.suggestionToShow` then skips the row's suggestion. Recompute on that card
+   writes for the card's people and From account as the tool writes (`ComposeView.recomputedReplyForChosen`:
+   the compose edit with an empty draft and request, in the card's identity-checked context,
+   `composeEditContextForRequest`) and stores nothing. An edit of its suggestion is never stored as
+   the email's: the card never shows the stored value, and the one writer stores an edit only over
+   the exact suggestion it edited (`MessageHeader.replaceSuggestion(with:ifStill:)`), also after the
+   card's recipients go back to everyone. A reply with nobody chosen, from the sheet or another
+   screen, or about another email is unchanged. The compose prompt's "primarily to the last sender"
+   is tabmail-backend#213. Before this, a narrowed reply with no request opened on the stored
+   suggestion ("Hi all", names of people left out), a failed writing fell back to it, and Recompute
+   wrote for everyone and stored the result. Tests: `EmailReplyWordsTests`,
+   `ComposeSuggestionPersistTests.cardShowsTheTappedSuggestionNotTheRowsLaterReply`,
+   `ComposeRecipientWiringTests.recomputeControlRunsTheRecompute`.
 
 12. **Swipes in the chat (amendment 2026-11-05).** Swiping left
    anywhere between the header and the field slides the whole chat to reveal Trash, then Archive at

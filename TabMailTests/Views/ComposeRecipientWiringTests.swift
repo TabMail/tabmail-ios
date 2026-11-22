@@ -140,5 +140,18 @@ struct ComposeRecipientWiringTests {
         // Recompute and an inline edit are admitted through one fence: one runs at a time.
         #expect(Self.count("agentSendFence.beginAgent() else { return }", in: action) == 1)
         #expect(Self.count("defer { fence.finishAgent() }", in: action) == 1)
+        // A reply only to the people chosen in the chat's Reply to: the new reply is written for the
+        // card's people from the card's own context (identity-checked), and the stored path, which
+        // writes for everyone and stores, never runs for it.
+        let chosen = try #require(action.range(of: "if onlyToChosen {"))
+        let context = try #require(action.range(of: "if let context = await composeEditContextForRequest() {"))
+        let written = try #require(action.range(
+            of: "recomputed = await Self.recomputedReplyForChosen( context: context, composeEdit: EmailReplyTool.chatComposeEdit)"))
+        let stored = try #require(action.range(of: "} else { recomputed = await Self.recomputedReply("))
+        #expect(chosen.upperBound <= context.lowerBound && context.upperBound <= written.lowerBound
+                    && written.upperBound <= stored.lowerBound,
+                "the chosen people's branch reads the card's context and writes for it before the stored path's else")
+        #expect(Self.count("recomputedReplyForChosen(", in: action) == 1 && Self.count("Self.recomputedReply(", in: action) == 1,
+                "one call each: the chosen people's recompute and the stored one")
     }
 }

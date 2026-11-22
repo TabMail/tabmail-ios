@@ -85,12 +85,14 @@ enum ComposeDraftGuards {
     /// the reply the user tapped, or an agent's text) always wins; only without one
     /// does a reply read the email row's current suggestion, which protects against
     /// caller-side staleness when background AI, P2P sync, or a prior in-place edit
-    /// updated the row after the caller's snapshot.
+    /// updated the row after the caller's snapshot. `onlyToChosen`: a reply only to the people
+    /// chosen in the chat's Reply to never reads it: the stored suggestion was written for the
+    /// email's whole Reply All audience (ADR-IOS-114 decision 11).
     static func suggestionToShow(
-        given: ReplyResult?, isReply: Bool, freshSuggestion: () -> ReplyResult?
+        given: ReplyResult?, isReply: Bool, onlyToChosen: Bool, freshSuggestion: () -> ReplyResult?
     ) -> ReplyResult? {
         if let given { return given }
-        return isReply ? freshSuggestion() : nil
+        return isReply && !onlyToChosen ? freshSuggestion() : nil
     }
 
     /// The row explicit Save persists: the existing row with the authored fields
@@ -1252,6 +1254,11 @@ struct ComposeView: View {
     /// Opened as Reply All (#915). Persisted on the draft row and the outbox row
     /// so the original is marked reply-all on the providers that record it.
     var isReplyAll: Bool = false
+    /// A reply only to the people chosen in the chat's Reply to (the agent's reply carries the
+    /// field's choice, `ComposeRequest.fieldReply`). Its words are written for them: the card never
+    /// offers the email's stored AI Suggestion, written for the whole Reply All audience, and
+    /// Recompute writes for the card's people and stores nothing (ADR-IOS-114 decision 11).
+    var onlyToChosen: Bool = false
     var prefillTo: [String]?
     var prefillCc: [String]?
     var prefillBcc: [String]?
@@ -1300,6 +1307,7 @@ struct ComposeView: View {
         account: Account? = nil,
         isForward: Bool = false,
         isReplyAll: Bool = false,
+        onlyToChosen: Bool = false,
         prefillTo: [String]? = nil,
         prefillCc: [String]? = nil,
         prefillBcc: [String]? = nil,
@@ -1319,6 +1327,7 @@ struct ComposeView: View {
         self.account = account
         self.isForward = isForward
         self.isReplyAll = isReplyAll
+        self.onlyToChosen = onlyToChosen
         self.prefillTo = prefillTo
         self.prefillCc = prefillCc
         self.prefillBcc = prefillBcc
@@ -2291,6 +2300,8 @@ struct ComposeView: View {
 
     /// Admitted through the compose agent fence, as an inline edit is: one of the two runs at a
     /// time, so the last gesture admitted lands last and neither replaces the other's newer value.
+    /// In a reply only to the people chosen (`onlyToChosen`) the new reply is written for the
+    /// card's people and stored nowhere (`recomputedReplyForChosen`).
     private func recomputeReply() {
         guard let reply = replyTo, let account = resolvedAccount, agentSendFence.beginAgent() else { return }
         isRecomputing = true
@@ -2298,12 +2309,24 @@ struct ComposeView: View {
         let fence = agentSendFence
         recomputeTask = Task {
             defer { fence.finishAgent() }
-            if let result = await Self.recomputedReply(
-                for: reply, account: account,
-                kbText: PromptStore.shared.kbText(),
-                compositionPrompt: PromptStore.shared.compositionMarkdown(),
-                aiService: ChatPillState.shared.aiService, dbPool: dbPool
-            ) {
+            let recomputed: ReplyResult?
+            if onlyToChosen {
+                // The card's people and From account as the recompute starts, with the email's body
+                // through the one identity-checked read; nil (another email at its address) asks nothing.
+                if let context = await composeEditContextForRequest() {
+                    recomputed = await Self.recomputedReplyForChosen(
+                        context: context, composeEdit: EmailReplyTool.chatComposeEdit)
+                } else {
+                    recomputed = nil
+                }
+            } else {
+                recomputed = await Self.recomputedReply(
+                    for: reply, account: account,
+                    kbText: PromptStore.shared.kbText(),
+                    compositionPrompt: PromptStore.shared.compositionMarkdown(),
+                    aiService: ChatPillState.shared.aiService, dbPool: dbPool)
+            }
+            if let result = recomputed {
                 // The card closed meanwhile.
                 guard !Task.isCancelled else { return }
                 shownSuggestion = result
@@ -2588,6 +2611,27 @@ struct ComposeView: View {
             BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")
         } catch {
             BackgroundSyncLogger.logDebug("[Compose] Recompute reply failed: \(error)")
+        }
+        return nil
+    }
+
+    /// What `recomputeReply` does in a reply only to the people chosen in the chat's Reply to
+    /// (`onlyToChosen`): a new reply written as the agent's reply tool writes one asked for with
+    /// no request (`EmailReplyTool`): the compose edit with an empty draft and an empty request, in
+    /// `context`, the card's (its people, its From account, the email's body). It is never stored:
+    /// the email's AI Suggestion is the one written for its whole Reply All audience. Nil when
+    /// none was written. Internal for testability.
+    nonisolated static func recomputedReplyForChosen(
+        context: ComposeEditContext, composeEdit: EmailReplyTool.ComposeEdit
+    ) async -> ReplyResult? {
+        do {
+            let result = try await composeEdit(context, "", "", "")
+            if let body = result.body, !body.isEmpty {
+                return ReplyResult(body: body, textMessage: result.textMessage, changeCommand: result.changeCommand)
+            }
+            BackgroundSyncLogger.logDebug("[Compose] Recompute for the people chosen returned no body")
+        } catch {
+            BackgroundSyncLogger.logDebug("[Compose] Recompute for the people chosen failed: \(error)")
         }
         return nil
     }
@@ -3396,6 +3440,7 @@ struct ComposeView: View {
         // caller's snapshot was captured.
         let suggestionToShow = ComposeDraftGuards.suggestionToShow(
             given: Self.givenSuggestion(suggestion, suggestedBody: suggestedBody), isReply: replyTo != nil && !isForward,
+            onlyToChosen: onlyToChosen,
             freshSuggestion: {
                 guard let reply = replyTo else { return nil }
                 // Only while the row is still the email replied to: another email seated at its
