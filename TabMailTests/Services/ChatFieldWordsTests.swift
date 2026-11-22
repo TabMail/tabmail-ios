@@ -599,6 +599,32 @@ struct ChatFieldWordsTests {
         }
     }
 
+    @Test("Words typed while a read runs stay when that read fails: shown, stored, and read by the next run")
+    func failedReadAfterAnEditKeepsTheNewerWords() async throws {
+        try await Self.withStore { pool, storage, store in
+            let key = ChatFieldWords.key(for: Self.header("f-2", thread: "failed-read-edit"))
+            store.apply(.put("Older stored words"), to: key)
+            await store.written()
+
+            let run = ChatFieldWords(storage: storage.storage)
+            storage.hold(readsOf: key)
+            storage.failReads(true)
+            let load = Task { await run.load(key) }
+            #expect(await storage.waitForReads(of: key), "control: the read started")
+            // The user types while the read is out; the read then fails.
+            let typed = "Typed while the read was out"
+            run.apply(.put(typed), to: key)
+            storage.release(readsOf: key)
+            await load.value
+            storage.failReads(false)
+            await run.written()
+            #expect(run.fill(for: key).words == typed, "the failed read leaves the typed words: \(run.fill(for: key).words)")
+            let stored = try Self.rows(pool).map(\.words)
+            #expect(stored == [typed], "the typed words are stored: \(stored)")
+            #expect(await Self.nextRun(storage, key) == typed, "and the next run reads them")
+        }
+    }
+
     @Test("A pill switching chats while a read runs: each chat keeps only its own words, whichever read lands first",
           arguments: [false, true])
     func readsLandOnlyOnTheirOwnChat(newerFirst: Bool) async throws {
@@ -756,6 +782,41 @@ struct ChatFieldWordsTests {
         try #require(Calendar.current.date(byAdding: .day, value: days, to: base))
     }
 
+    /// `hours` hours after `base`.
+    private static func hours(_ hours: Int, after base: Date) throws -> Date {
+        try #require(Calendar.current.date(byAdding: .hour, value: hours, to: base))
+    }
+
+    @Test("A pass that sees the thread re-stamps words still inside the grace: they survive a later pass with the email briefly gone, just past their old cutoff")
+    func passRestampsWordsInsideTheGrace() async throws {
+        try await Self.withStore { pool, _, store in
+            try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
+            let email = Self.header("g-1", thread: "inside-grace")
+            try await pool.write { try email.insert($0) }
+            let key = ChatFieldWords.key(for: email)
+            store.apply(.put("Typed almost a grace ago"), to: key)
+            await store.written()
+            let seen = Date()
+            // An hour inside the grace at the first pass.
+            let cutoff = try Self.later(-SyncConfig.aiCacheOrphanGraceDays, from: seen)
+            let typed = try Self.hours(1, after: cutoff)
+            try await pool.write {
+                try $0.execute(sql: "UPDATE chatFieldWords SET updatedAt = ? WHERE sessionId = ?", arguments: [typed, key])
+            }
+            let database = PrioritizedDatabase(pool: pool)
+
+            // A pass that sees the thread's email.
+            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: seen)
+            #expect(try Self.rows(pool).map(\.sessionId) == [key], "control: the thread's email is here")
+
+            // The email briefly gone, and the next pass two hours later, past the old stamp's cutoff.
+            try await pool.write { _ = try MessageHeader.deleteOne($0, key: email.id) }
+            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: try Self.hours(2, after: seen))
+            #expect(try Self.rows(pool).map(\.sessionId) == [key],
+                    "the grace counts from the pass that saw the thread, not from when the words were typed")
+        }
+    }
+
     @Test("Words past the grace survive a pass in which their thread's email is briefly gone, after a pass that saw it; words of a thread gone for the whole grace go")
     func wordsGoWithTheThreadsAIData() async throws {
         try await Self.withStore { pool, _, store in
@@ -791,11 +852,12 @@ struct ChatFieldWordsTests {
         }
     }
 
-    @Test("Delete All Email Index Data keeps a thread's old unsent words: after a maintenance pass and the resync, they show again")
-    func indexWipeKeepsTheWordsThroughTheResync() async throws {
+    @Test("Delete All Email Index Data keeps a thread's old unsent words, whether or not a maintenance pass saw the thread lately: after a pass and the resync, they show again",
+          arguments: [true, false])
+    func indexWipeKeepsTheWordsThroughTheResync(passSawTheThread: Bool) async throws {
         try await Self.withStore { pool, storage, store in
             try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
-            let email = Self.header("w-1", thread: "wiped")
+            let email = Self.header("w-1-\(passSawTheThread)", thread: "wiped-\(passSawTheThread)")
             try await pool.write { try email.insert($0) }
             let key = ChatFieldWords.key(for: email)
             let words = "Typed long before the wipe"
@@ -804,7 +866,11 @@ struct ChatFieldWordsTests {
             try Self.age(key, pool: pool)
             let database = PrioritizedDatabase(pool: pool)
             let seen = Date()
-            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: seen)
+            // With `passSawTheThread` false, no maintenance pass ran since the words aged past the
+            // grace (the app was not polled): only the wipe itself can mark the thread as seen.
+            if passSawTheThread {
+                SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: seen)
+            }
 
             try await pool.write { try SettingsView.localIndexWipeTxn($0) }
             #expect(try await pool.read { try MessageHeader.fetchCount($0) } == 0, "control: the wipe deleted the headers")

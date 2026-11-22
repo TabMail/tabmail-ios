@@ -67,10 +67,12 @@ struct ChatFieldWordsRuntimeTests {
     struct PillView: View {
         @Bindable var host: Host
         let replyField: Bool
+        /// The AI Suggestion the reply field shows (`ChatReplyField.suggestion`); nil: none.
+        var suggestion: ReplyResult? = nil
         var body: some View {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded,
-                replyField: replyField ? ChatReplyField(example: nil, isNoReply: false) : nil)
+                replyField: replyField ? ChatReplyField(example: nil, isNoReply: false, suggestion: suggestion) : nil)
             .environment(\.hasTabMailSession, true)
         }
     }
@@ -739,9 +741,9 @@ struct ChatFieldWordsRuntimeTests {
 
     /// The invocation the field's send builds for `email` (`DynamicIslandChat.sendAgentChat`), or, from
     /// elsewhere, none of the field's.
-    static func invocation(_ origin: ComposeOrigin, email: MessageHeader) -> ToolInvocation {
+    static func invocation(_ origin: ComposeOrigin, email: MessageHeader, suggestion: ReplyResult? = nil) -> ToolInvocation {
         guard origin != .sheet else { return ToolInvocation() }
-        return ToolInvocation(fieldReply: ChatFieldReply(email: email, onlyTo: nil),
+        return ToolInvocation(fieldReply: ChatFieldReply(email: email, onlyTo: nil, suggestion: suggestion),
                               fieldWordsKey: ChatFieldWords.key(for: email))
     }
 
@@ -933,27 +935,33 @@ struct ChatFieldWordsRuntimeTests {
         var keepsTheWords: Bool { self == .reply }
     }
 
-    @Test("A field request's reply compose closed without sending, then its answer: the sent words are the user's again, kept after a relaunch; with no compose, or a compose or forward card, the answer empties them",
-          arguments: ClosedCompose.allCases)
-    func closedComposeThenAnswerKeepsTheSend(_ closed: ClosedCompose) async throws {
+    /// The AI Suggestion a field shows in `closedComposeThenAnswerKeepsTheSend`'s suggestion cases.
+    static let shownSuggestion = ReplyResult(body: "Hi,\n\nFriday works for me.\n\nThanks", textMessage: "Friday works for me")
+
+    @Test("A field request's reply compose closed without sending, then its answer: the sent words are the user's again, kept after a relaunch; with no compose, or a compose or forward card, the answer empties them; the same whether or not the field showed an AI Suggestion at Send",
+          arguments: ClosedCompose.allCases, [false, true])
+    func closedComposeThenAnswerKeepsTheSend(_ closed: ClosedCompose, suggestionShown: Bool) async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can drive the hosted field")
         try await HostedAccessibility.withAutomation {
             try await Self.withDatabase { pool in
                 try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
-                let email = Self.header("closed-\(closed.rawValue)", thread: "closed-thread-\(closed.rawValue)")
+                let tag = "\(closed.rawValue)-\(suggestionShown)"
+                let email = Self.header("closed-\(tag)", thread: "closed-thread-\(tag)")
                 try await pool.write { try email.insert($0) }
                 let key = ChatFieldWords.key(for: email)
                 let sent = "Reply that Friday works"
+                let suggestion = suggestionShown ? Self.shownSuggestion : nil
                 let backend = ThreadChatTests.Backend(holdAnswers: true)
                 try await ThreadChatTests.withBackend(backend, chatView: true) {
                     let host = Host(email)
-                    let pill = try await Self.mount(PillView(host: host, replyField: true))
+                    let pill = try await Self.mount(PillView(host: host, replyField: true, suggestion: suggestion))
                     defer { pill.close() }
                     try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
                     let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
                     #expect(asked, "control: the request reached the backend")
                     if let producer = closed.producer {
-                        let result = try await Self.sendCompose(producer, Self.invocation(.fieldUnchanged, email: email),
+                        // The agent's call carries the field's request as sent, its suggestion included.
+                        let result = try await Self.sendCompose(producer, Self.invocation(.fieldUnchanged, email: email, suggestion: suggestion),
                                                                 email: email, pool: pool, outcome: .cancelled)
                         #expect(!result.contains("sent successfully"), "control: the compose closed unsent: \(result)")
                         #expect(ChatFieldWords.shared.fill(for: key).composing == closed.keepsTheWords,

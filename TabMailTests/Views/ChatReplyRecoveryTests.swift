@@ -423,12 +423,17 @@ struct ChatReplyRecoveryTests {
                         "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
                 #expect(backend.bodies.count == 1, "control: the request went out once and failed")
+                // A field with words offers Send; emptied, it offers Retry for the failed request.
+                // The field can be replaced while the chat settles after a send; wait for it.
+                try await Self.waitUntil { Self.type("", in: chat.view) }
+                #expect(Self.type("", in: chat.view), "control: the field is emptied")
                 try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
                 router.composePresentationDidBegin()
                 #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
                         "control: the field offers Retry: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { router.composeQueueDepth == 1 }
                 #expect(router.composeQueueDepth == 1, "control: the recovered turn opened a reply card")
+                #expect(backend.bodies.count == 2, "control: one recovery request: \(backend.bodies.dropFirst().map { $0.suffix(600) })")
 
                 let request = try #require(router.firstQueuedRequestForTesting)
                 #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == ["david@example.com"],
@@ -846,8 +851,50 @@ struct ChatReplyRecoveryTests {
         }
     }
 
+    /// A request the open sheet sends goes with no field (`sendAgentChat` without `field:`, the path
+    /// the sheet's re-sends take, fenced in `ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField`):
+    /// its recovery names no field key. The field's own request names its chat's.
+    @Test("A cut-off request's recovery names the field's words only when the field sent it",
+          arguments: [false, true])
+    func cutOffRecoveryNamesTheFieldOnlyForItsOwnRequest(fromField: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let backend = Backend(failure: .connectionLost, asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await withChat(backend, tag: "recovery-origin-\(fromField)") { chat in
+                let sent = "Tell them Friday works"
+                let key = ChatFieldWords.key(for: chat.email)
+                if !fromField {
+                    // The sheet opens, and its own input sends.
+                    NotificationCenter.default.post(name: .openMessageWithChat, object: nil, userInfo: ["messageId": chat.email.id])
+                    try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatClose") }
+                    #expect(HostedAccessibility.identifiers(in: chat.view).contains("chatClose"),
+                            "control: the sheet is open: \(HostedAccessibility.identifiers(in: chat.view))")
+                }
+                try await Self.waitUntil { Self.type(sent, in: chat.view) }
+                #expect(Self.type(sent, in: chat.view), "control: the input takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 1, "control: the request went out once and was cut off")
+                let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: chat.email))
+                try await Self.waitUntil { session.pendingResume != nil }
+                let resume = try #require(session.pendingResume, "control: the cut-off request can be resumed")
+                let expectedKey: String? = fromField ? key : nil
+                #expect(resume.fieldWordsKey == expectedKey,
+                        "the recovery names the field's words only for the field's own request: \(String(describing: resume.fieldWordsKey))")
+                // From the field the words wait in it; from the sheet they went with the request.
+                let expectedWords = fromField ? sent : ""
+                #expect(ChatFieldWords.shared.fill(for: key).words == expectedWords,
+                        "the words: \(ChatFieldWords.shared.fill(for: key).words)")
+            }
+        }
+    }
+
     /// The sheet's "Re-send message" and "Rewind and re-send" send with no field and leave the
-    /// field's sent words in place; when that request is cut off, its recovery carries no field key.
+    /// field's sent words in place; when that request is cut off, its recovery carries no field key
+    /// (`cutOffRecoveryNamesTheFieldOnlyForItsOwnRequest`). The re-sends are reached only through a
+    /// bubble's long-press menu, so this test gives the field each recovery and checks its rule.
     @Test("The field's unchanged sent words offer Send, not Retry, when the cut-off request is not the field's own",
           arguments: Failure.allCases)
     func otherRequestsCutOffLeavesTheFieldWordsOnSend(failure: Failure) async throws {

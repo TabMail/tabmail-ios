@@ -1308,10 +1308,16 @@ struct FieldReplyCardWordsTests {
         case suggestionEdit
         /// A reply to another account's copy of the email shown, where the field's audience does not apply.
         case otherAccountCopy
+        /// A reply to the email shown in another folder of the same account (its copy there), not
+        /// the row the field showed.
+        case sameAccountCopy
         /// Control: a reply to another email in the same account.
         case otherEmail
+        /// Control: a reply to an older, distinct email of the same thread: the same chat, not the
+        /// email the field showed.
+        case olderEmailInThread
         var testDescription: String { rawValue }
-        var isFieldsOwn: Bool { self != .otherEmail }
+        var isFieldsOwn: Bool { self != .otherEmail && self != .olderEmailInThread }
     }
 
     /// Field words kept in memory as the database keeps them: a new store on the same rows is the
@@ -1331,6 +1337,8 @@ struct FieldReplyCardWordsTests {
     func closedUnsentCardThenAnswer(_ card: Card) async throws {
         let routes = SuggestionRewriteRouteTests()
         let fixture = try await routes.fixture()
+        // The email the field shows (re-read when the case gives it a thread).
+        var shownEmail = fixture.header
         let number: Int
         switch card {
         case .suggestionEdit:
@@ -1343,11 +1351,35 @@ struct FieldReplyCardWordsTests {
                 rfc822MessageId: "<offsite@example.com>")
             await fixture.translator.seed(copy.id, as: 2)
             number = 2
+        case .sameAccountCopy:
+            try TestDatabase.insertFolder(fixture.db, name: "Archive", path: "Archive", role: .archive)
+            let copy = try TestDatabase.insertMessageHeader(
+                fixture.db, messageId: "s5", subject: "Offsite", folderId: "acc1:Archive", folderPath: "Archive",
+                isInInbox: false, rfc822MessageId: "<offsite@example.com>")
+            #expect(copy.id != fixture.header.id, "control: another row of the same email")
+            await fixture.translator.seed(copy.id, as: 4)
+            number = 4
         case .otherEmail:
             let other = try TestDatabase.insertMessageHeader(
                 fixture.db, messageId: "s4", subject: "Lunch", rfc822MessageId: "<lunch@example.com>")
             await fixture.translator.seed(other.id, as: 3)
             number = 3
+        case .olderEmailInThread:
+            let earlier = try #require(Calendar.current.date(byAdding: .day, value: -1, to: fixture.header.date))
+            let older = try TestDatabase.insertMessageHeader(
+                fixture.db, messageId: "s6", subject: "Offsite", date: earlier, rfc822MessageId: "<offsite-plan@example.com>")
+            let shownId = fixture.header.id, olderId = older.id
+            try await fixture.db.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET threadId = ? WHERE id IN (?, ?)",
+                               arguments: ["offsite-thread", shownId, olderId])
+            }
+            let shownRow = try await fixture.db.read { try MessageHeader.fetchOne($0, key: shownId) }
+            let olderFetched = try await fixture.db.read { try MessageHeader.fetchOne($0, key: olderId) }
+            shownEmail = try #require(shownRow)
+            let olderRow = try #require(olderFetched)
+            #expect(ChatFieldWords.key(for: olderRow) == ChatFieldWords.key(for: shownEmail), "control: one chat")
+            await fixture.translator.seed(older.id, as: 5)
+            number = 5
         }
         let rows = OSAllocatedUnfairLock<[String: String]>(initialState: [:])
         let store = ChatFieldWords(storage: Self.storage(rows))
@@ -1356,12 +1388,12 @@ struct FieldReplyCardWordsTests {
         defer { ChatFieldWords.shared = previous }
 
         // The field sends the user's words about the email it shows, its AI Suggestion showing.
-        let key = ChatFieldWords.key(for: fixture.header)
+        let key = ChatFieldWords.key(for: shownEmail)
         let sent = "Make it more formal"
         store.apply(.put(sent), to: key)
         store.apply(.sentFromField, to: key)
         let invocation = ToolInvocation(
-            fieldReply: ChatFieldReply(email: fixture.header, onlyTo: nil, suggestion: SuggestionRewriteRouteTests.shownReply),
+            fieldReply: ChatFieldReply(email: shownEmail, onlyTo: nil, suggestion: SuggestionRewriteRouteTests.shownReply),
             fieldWordsKey: key)
         let tool = routes.tool(fixture, calls: SuggestionRewriteRouteTests.Calls(),
                                answer: SuggestionRewriteRouteTests.edit(subject: "Re: New plan"))

@@ -290,37 +290,51 @@ final class ChatFieldWords {
 
     /// Delete the words of every thread with no email left on the device: a row not seen with an
     /// email of its account and thread (`ChatThreadKey.memberSQL`) for `SyncConfig.aiCacheOrphanGraceDays`,
-    /// or with no thread at all. Every row whose thread still has an email is re-stamped to `now` in
-    /// one UPDATE, so the grace counts from the last pass that saw the thread: emails briefly gone
-    /// (an index wipe or UIDVALIDITY resync re-walking, a move between folders) never cost the words.
+    /// or with no thread at all. Every row whose thread still has an email is re-stamped to `now`
+    /// first (`restampLive`), so the grace counts from the last pass that saw the thread: emails
+    /// briefly gone (a UIDVALIDITY resync re-walking, a move between folders) never cost the words.
     /// The rule the thread's AI results live by (`SyncEngine.runPurgeOrphanedAICache`), run in the
     /// same pass. Returns how many went.
     @discardableResult
     nonisolated static func purgeOrphans(db: Database, now: Date) throws -> Int {
         let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheOrphanGraceDays, to: now) ?? .distantPast
+        let live = try restampLive(db: db, now: now)
         let rows = try Row.fetchAll(db, sql: "SELECT sessionId, updatedAt FROM \(ChatFieldWordsRecord.databaseTableName)")
-        var kept: [String] = []
         var purged = 0
         for row in rows {
             let key: String = row["sessionId"]
+            guard !live.contains(key) else { continue }
             let updatedAt: Date = row["updatedAt"]
-            if let (accountId, threadId) = ChatThreadKey.parse(key),
-               try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM messageHeader WHERE \(ChatThreadKey.memberSQL))",
-                                 arguments: [accountId, threadId, threadId]) == true {
-                kept.append(key)
-                continue
-            }
             if updatedAt < cutoff {
                 purged += try ChatFieldWordsRecord.filter(key: key).deleteAll(db)
             }
         }
-        if !kept.isEmpty {
-            let marks = Array(repeating: "?", count: kept.count).joined(separator: ",")
+        return purged
+    }
+
+    /// Re-stamp to `now`, in one UPDATE, every row whose thread still has an email on the device
+    /// (`ChatThreadKey.memberSQL`), and return their keys. The orphan pass runs it first; Delete All
+    /// Email Index Data (`SettingsView.localIndexWipeTxn`) runs it in its transaction before the
+    /// headers go, so the resync's re-walk counts as emails briefly gone from that moment, however
+    /// long ago the last orphan pass ran.
+    @discardableResult
+    nonisolated static func restampLive(db: Database, now: Date) throws -> Set<String> {
+        let keys = try String.fetchAll(db, sql: "SELECT sessionId FROM \(ChatFieldWordsRecord.databaseTableName)")
+        var live: [String] = []
+        for key in keys {
+            if let (accountId, threadId) = ChatThreadKey.parse(key),
+               try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM messageHeader WHERE \(ChatThreadKey.memberSQL))",
+                                 arguments: [accountId, threadId, threadId]) == true {
+                live.append(key)
+            }
+        }
+        if !live.isEmpty {
+            let marks = Array(repeating: "?", count: live.count).joined(separator: ",")
             try db.execute(
                 sql: "UPDATE \(ChatFieldWordsRecord.databaseTableName) SET updatedAt = ? WHERE sessionId IN (\(marks))",
-                arguments: StatementArguments([now]) + StatementArguments(kept))
+                arguments: StatementArguments([now]) + StatementArguments(live))
         }
-        return purged
+        return Set(live)
     }
 
     /// Delete every row of the account `accountId`, real and demo: part of the account's

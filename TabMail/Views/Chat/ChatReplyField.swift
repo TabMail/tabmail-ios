@@ -218,7 +218,9 @@ struct ChatFieldFill: Equatable {
         case .composeOpened:
             composing = true
         case .confirmationCard:
-            if clears { words = ""; holdsSentWords = false }
+            // Same ownership as `answered`: once a compose card opened for the send, the card owns
+            // its completion, and a confirmation for another step of the request empties nothing.
+            if !composing, clears { words = ""; holdsSentWords = false }
         }
         if words != before { changes += 1 }
     }

@@ -370,6 +370,15 @@ struct ChatReplyFieldRuntimeTests {
         return String(rest[..<(rest.range(of: "private func ")?.lowerBound ?? rest.endIndex)])
     }
 
+    @Test("The sheet's re-sends send with no field, so their recovery never names the field's words")
+    func sheetResendsSendWithNoField() throws {
+        let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        for name in ["private func resendLastUserMessage(", "private func rewindToMessage("] {
+            let body = try Self.function(name, in: island)
+            #expect(body.contains("sendAgentChat(text)") && !body.contains("field:"), "\(name) sends with no field: \(body)")
+        }
+    }
+
     @Test("A sent compose card and an agent answer from the field complete on the request's own chat key, never the view's")
     func clearWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
