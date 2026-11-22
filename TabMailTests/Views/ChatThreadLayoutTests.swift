@@ -180,6 +180,32 @@ struct ChatThreadLayoutTests {
         }
     }
 
+    @Test("At the largest text size the mic and Send still centre on the field's last line, which grows with the text")
+    func fieldButtonsOnTheLastLineAtTheLargestTextSize() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosted(textSize: .accessibility5) { _, controller, _ in
+                let id = ChatThreadView.replyPillId
+                try await Self.waitFor { Self.frame(of: "chatSend", in: controller.view) != nil }
+                try await Task.sleep(for: .milliseconds(300))
+                let field = try #require(Self.frame(of: id, in: controller.view))
+                let send = try #require(Self.frame(of: "chatSend", in: controller.view))
+                let mic = try #require(HostedAccessibility.elements(under: controller.view)
+                    .first { $0.accessibilityLabel == "Dictate" }?.accessibilityFrame,
+                    "labels: \(HostedAccessibility.labels(in: controller.view).prefix(30))")
+                // One body line at this text size, scaled as the text is (ADR-IOS-114 decision 17).
+                let largest = UITraitCollection(preferredContentSizeCategory: .accessibilityExtraExtraExtraLarge)
+                let line = UIFontMetrics(forTextStyle: .body).scaledValue(
+                    for: ChatViewLayout.fieldLineHeight, compatibleWith: largest)
+                let grows = line > 2 * ChatViewLayout.fieldLineHeight
+                #expect(grows, "control: the line is far taller than at the default size: \(line)")
+                let lineMid = field.maxY - ChatViewLayout.fieldVerticalPadding - line / 2
+                #expect(abs(send.midY - lineMid) < 1, "Send \(send) on the last line at \(lineMid)")
+                #expect(abs(mic.midY - lineMid) < 1, "mic \(mic) on the last line at \(lineMid)")
+            }
+        }
+    }
+
     @Test("Signed in, the empty field shows its \"e.g.\" line: 60 tall, the mic and Send on its last line")
     func signedInEmptyField() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")

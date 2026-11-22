@@ -484,6 +484,23 @@ struct ChatReplyFieldTests {
         return String(text[start.upperBound..<end.lowerBound])
     }
 
+    /// `text` (from `source`) as a release build compiles it: each `#if DEBUG` part dropped, its
+    /// `#else` part kept. For code with no nested conditions.
+    private static func releaseView(of text: String) -> String {
+        var kept = ""
+        var rest = Substring(text)
+        while let start = rest.range(of: "#if DEBUG") {
+            kept += rest[..<start.lowerBound]
+            let after = rest[start.upperBound...]
+            guard let end = after.range(of: "#endif") else { return "unterminated #if DEBUG" }
+            let block = after[..<end.lowerBound]
+            if let otherwise = block.range(of: "#else") { kept += " " + block[otherwise.upperBound...] }
+            rest = after[end.upperBound...]
+        }
+        kept += rest
+        return kept.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
     @Test("The input shows the user's words, and every change to them goes through the one API")
     func fieldShownWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
@@ -876,6 +893,28 @@ struct ChatReplyFieldTests {
         #expect(Self.count("MaxDisplayCount(1)", in: tip) == 1, "shown once")
         #expect(Self.count("invalidate(reason: .actionPerformed)", in: tip) == 1)
         #expect(Self.count("OnboardingTipGate.$onboardingComplete", in: tip) == 1, "today's tip gate")
+    }
+
+    @Test("TipKit is configured in one place, and a release build keeps daily tips on the default datastore and none in screenshot mode")
+    func tipKitConfiguration() throws {
+        let app = try Self.source("TabMail/App/TabMailApp.swift")
+        let start = try #require(app.range(of: "@MainActor private static func configureTips() {"))
+        let end = try #require(app[start.upperBound...].range(of: " init() {"))
+        let tips = String(app[start.upperBound..<end.lowerBound])
+        #expect(Self.count("Self.configureTips()", in: app) == 1, "once, at launch")
+        #expect(Self.count("Tips.configure(", in: tips) == 3, "control: the debug, screenshot and everyday branches")
+        #expect(Self.count("Tips.configure(", in: app) == 3, "the app's launch configures TipKit only there")
+        // What a release build compiles: the debug UI tests' variants are not in it.
+        let release = Self.releaseView(of: tips)
+        #expect(Self.count("let usesFieldDragTipStore = false", in: release) == 1)
+        #expect(Self.count("if (ScreenshotMode.isActive || ScreenshotMode.isSplashMode) && !usesFieldDragTipStore { // Suppress all tips in screenshot mode try? Tips.configure([ .datastoreLocation(.applicationDefault) ]) Tips.hideAllTipsForTesting() return }", in: release) == 1,
+                "screenshot mode hides every tip")
+        #expect(Self.count("let tipStore = Tips.ConfigurationOption.DatastoreLocation.applicationDefault do { try Tips.configure([ .displayFrequency(.daily), .datastoreLocation(tipStore) ]) } catch { } }", in: release) == 1,
+                "daily pacing on the app's default datastore")
+        for debugOnly in ["showTipsForTesting", ".immediate", "resetDatastore", "fieldDragTipTestStore", "preconditionFailure", "OnboardingTipGate"] {
+            #expect(Self.count(debugOnly, in: release) == 0, "\(debugOnly) is in debug builds only")
+            #expect(Self.count(debugOnly, in: tips) > 0, "control: \(debugOnly) is in the debug build")
+        }
     }
 
     @Test("The drag is the UIKit field pan; its swell resets with the pill's spring however it ends; it holds the freeze once per drag")
