@@ -209,6 +209,10 @@ final class AgentToolRouter {
         pendingCompose = composeQueue.removeFirst()
     }
 
+    /// Whether a compose UI is presented anywhere: a `ComposeView`, a `DraftComposePresenter`, or
+    /// a new email's chat cover (`ChatNewEmailCoverView`). Read as a new-email request arrives.
+    var isComposeUp: Bool { presentationCount > 0 }
+
     /// Test-only: number of requests currently waiting in the FIFO queue.
     var composeQueueDepth: Int { composeQueue.count }
 

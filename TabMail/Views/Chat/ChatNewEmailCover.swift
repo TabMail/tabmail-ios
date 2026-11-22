@@ -39,6 +39,15 @@ struct ChatNewEmailCover: Identifiable {
             ChatNewEmailCover(content: .compose(request, account: composeAccount()))
         }
     }
+
+    /// Whether a compose, a draft or an attachment preview is up anywhere. Some are presented out
+    /// of the taking screen's sight (a compose button's draft, an email pill's draft at the
+    /// navigation's root, a preview), so no screen takes a request while one is: what is up is not
+    /// replaced.
+    @MainActor
+    static var composeOrPreviewIsUp: Bool {
+        AgentToolRouter.shared.isComposeUp || PreviewFreezeGate.shared.isFrozen
+    }
 }
 
 /// Whether the list has a sheet or cover of its own up (Search, a reply, compose, a move or label
@@ -91,6 +100,10 @@ struct ChatNewEmailCoverView: View {
             )
         case .chat(let model):
             NavigationStack { ChatNewThreadView(model: model) }
+                // ADR-IOS-030: held as compose holds it (`DraftComposePresenter` does the same for
+                // a draft's chat), so an agent's compose waits until this cover closes.
+                .onAppear { AgentToolRouter.shared.composePresentationDidBegin() }
+                .onDisappear { AgentToolRouter.shared.composePresentationDidEnd() }
         }
     }
 }

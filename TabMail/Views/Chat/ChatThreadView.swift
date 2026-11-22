@@ -312,14 +312,17 @@ struct ChatThreadView: View {
         // chat takes it while it shows and nothing is presented over it; its email card's screen
         // takes it while that card is up, and a pushed screen (`isOnScreen`) takes it itself. In
         // the detail column it takes none while the list beside it has a sheet or cover up (iPad).
+        // Nor while a compose, a draft or a preview is up anywhere (`composeOrPreviewIsUp`).
         .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
-            guard isOnScreen, !isAnyPresentation, listPresentationBesideDetail?.isUp != true else { return }
+            guard isOnScreen, !isAnyPresentation, listPresentationBesideDetail?.isUp != true,
+                  !ChatNewEmailCover.composeOrPreviewIsUp else { return }
             guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
             withAnimation(Self.pillSpring) { chatExpanded = false }
             newEmailCover = .make(
                 request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession,
                 chatAccount: Account.primary(), composeAccount: Account.primary())
-            BackgroundSyncLogger.logDebug("[ChatThread] Contact pill compose: \(request.to.first ?? "")")
+            // Without the request's recipients: the log is kept on the device and can be shared.
+            BackgroundSyncLogger.logDebug("[ChatThread] Contact pill compose")
         }
         // The queue was rebuilt from the database (every sync start, AI re-enable): what it held
         // for this chat may be gone, so the shown chat checks its rows again.

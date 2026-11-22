@@ -156,6 +156,7 @@ struct ChatNewEmailRequestTests {
         let account = try FolderEpochTestFixture.makeAccount(id: Self.accountId, provider: .imap, pool: pool)
         let recorder = QueueRecorder()
         let model = ChatNewThreadModel(account: account, request: Self.link, queueDraftSave: { recorder.queue($0, $1) })
+        let draftId = model.draftId
         let untouched = await model.saveIfNeeded()
         let before = try await pool.read { db in try Draft.fetchCount(db) }
         #expect(untouched == .saved)
@@ -163,7 +164,7 @@ struct ChatNewEmailRequestTests {
         #expect(recorder.calls.isEmpty)
         model.words = "Are you free at noon? Or one?"
         let first = await model.saveIfNeeded()
-        let firstRow = try await pool.read { db in try Draft.fetchOne(db, key: model.draftId) }
+        let firstRow = try await pool.read { db in try Draft.fetchOne(db, key: draftId) }
         let saved = try #require(firstRow, "the change is saved")
         #expect(first == .saved)
         #expect(saved.body == "Are you free at noon? Or one?")
@@ -174,14 +175,14 @@ struct ChatNewEmailRequestTests {
         #expect(saved.toArray.last == "undisclosed-recipients:;")
         model.words = "Lunch at one, then."
         let second = await model.saveIfNeeded()
-        let secondRow = try await pool.read { db in try Draft.fetchOne(db, key: model.draftId) }
+        let secondRow = try await pool.read { db in try Draft.fetchOne(db, key: draftId) }
         let resaved = try #require(secondRow)
         #expect(second == .saved)
         #expect(resaved.body == "Lunch at one, then.")
         #expect(resaved.subject == "Lunch on Friday")
         #expect(resaved.ccArray == saved.ccArray)
         #expect(resaved.bccArray == ["alex@example.com"])
-        #expect(recorder.calls == Array(repeating: "\(model.draftId)|\(Self.accountId)", count: 2))
+        #expect(recorder.calls == Array(repeating: "\(draftId)|\(Self.accountId)", count: 2))
     }
 
     @Test("A saved row's own subject, Cc and Bcc win over what the link brought, an emptied Cc included")
@@ -305,8 +306,8 @@ struct ChatNewEmailRequestTests {
         let detailPath = "TabMail/Views/Message/MessageDetailView.swift"
         let cover = ".fullScreenCover(item: $newEmailCover) { ChatNewEmailCoverView(cover: $0) }"
         let inbox = try Self.source(inboxPath)
-        #expect(Self.count("guard selectedMessageId == nil, pushedMessageId == nil, newEmail == nil, !isAnyListPresentation else { return }", in: inbox) == 1,
-                "an email opened over the list, by a row, a pill or in Search, takes it itself; the list's own new email takes none")
+        #expect(Self.count("guard selectedMessageId == nil, pushedMessageId == nil, newEmail == nil, !isAnyListPresentation, !ChatNewEmailCover.composeOrPreviewIsUp else { return }", in: inbox) == 1,
+                "an email opened over the list, by a row, a pill or in Search, takes it itself; the list's own new email takes none; none under a compose, a draft or a preview anywhere")
         #expect(Self.count("newEmailCover != nil || showSearch || viewModel.showCompose || replyMessage != nil || draftOpen != nil || agentCompose != nil || moveMessageId != nil || moveThreadGroup != nil || labelMenuMessage != nil || showLabelFilterPicker", in: inbox) == 1,
                 "every sheet and cover the list presents counts, its own new email's included")
         #expect(Self.count(".onChange(of: isAnyListPresentation, initial: true) { _, up in listPresentationWriter?.isUp = up }", in: inbox) == 1,
@@ -334,8 +335,8 @@ struct ChatNewEmailRequestTests {
         #expect(Self.count(cover, in: inbox) == 1)
         #expect(Self.count("prefillTo:", in: inbox) == 0, "compose is filled from a request only through the cover")
         let chat = try Self.source(chatPath)
-        #expect(Self.count("guard isOnScreen, !isAnyPresentation, listPresentationBesideDetail?.isUp != true else { return }", in: chat) == 1,
-                "a pushed screen, or its email card's screen, takes it instead; none while the list beside it has something up")
+        #expect(Self.count("guard isOnScreen, !isAnyPresentation, listPresentationBesideDetail?.isUp != true, !ChatNewEmailCover.composeOrPreviewIsUp else { return }", in: chat) == 1,
+                "a pushed screen, or its email card's screen, takes it instead; none while the list beside it has something up, nor under a compose, a draft or a preview anywhere")
         #expect(Self.count("|| forwardMessage != nil || showsReplyTo || showsMove || newEmailCover != nil", in: chat) == 1,
                 "its own cover counts as presented")
         #expect(Self.count("newEmailCover = .make( request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession, chatAccount: Account.primary(), composeAccount: Account.primary())", in: chat) == 1)
@@ -343,12 +344,27 @@ struct ChatNewEmailRequestTests {
         let detail = try Self.source(detailPath)
         #expect(Self.count("newEmailCover = .make( request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession, chatAccount: Account.primary(), composeAccount: nil)", in: detail) == 1)
         #expect(Self.count("askForNewEmail(request)", in: detail) == 1, "a contact pill or a link")
-        #expect(Self.count("guard viewModel.isViewVisible, !isAnyCoverPresented, listPresentationBesideDetail?.isUp != true else { return }", in: detail) == 1,
-                "none under a screen pushed over it, while something is up over it, or while the list beside it has something up")
+        #expect(Self.count("guard viewModel.isViewVisible, !isAnyCoverPresented, listPresentationBesideDetail?.isUp != true, !ChatNewEmailCover.composeOrPreviewIsUp else { return }", in: detail) == 1,
+                "none under a screen pushed over it, while something is up over it, while the list beside it has something up, or under a compose, a draft or a preview anywhere")
         #expect(Self.count("askForNewEmail(nil)", in: detail) == 1, "its compose button")
         #expect(Self.count("newEmailCover != nil || replyMessage != nil", in: detail) == 1, "counted among its presentations")
         #expect(Self.count(cover, in: detail) == 1)
         #expect(Self.count("ComposeView()", in: detail) == 0, "its compose button goes through the route")
+        // Search and the screens opened in it are in the list column: given the detail column's
+        // state there, an email opened in Search would take nothing while Search is up.
+        #expect(Self.count("listPresentationBesideDetail", in: inbox) == 0, "the list column never reads the detail column's state")
+        // A request is logged without its recipients: the debug log is kept on the device.
+        for (path, text) in [(inboxPath, inbox), (chatPath, chat), (detailPath, detail)] {
+            #expect(Self.count("request.to", in: text) == 0, "\(path) logs no recipient")
+        }
+        let coverFile = try Self.source("TabMail/Views/Chat/ChatNewEmailCover.swift")
+        #expect(Self.count("AgentToolRouter.shared.isComposeUp || PreviewFreezeGate.shared.isFrozen", in: coverFile) == 1,
+                "a compose or a draft anywhere, or a preview, holds every request")
+        #expect(Self.count("NavigationStack { ChatNewThreadView(model: model) } // ADR-IOS-030", in: coverFile) == 1)
+        #expect(Self.count(".onAppear { AgentToolRouter.shared.composePresentationDidBegin() } .onDisappear { AgentToolRouter.shared.composePresentationDidEnd() }", in: coverFile) == 1,
+                "the new email's chat cover holds the agent's compose as compose does")
+        let router = try Self.source("TabMail/Services/AI/AgentToolRouter.swift")
+        #expect(Self.count("var isComposeUp: Bool { presentationCount > 0 }", in: router) == 1)
         let view = try Self.source("TabMail/Views/Chat/ChatNewThreadView.swift")
         #expect(Self.count(".safeAreaBar(edge: .top, spacing: 0) { ChatNewEmailSubjectLine(subject: model.carried.shownSubject) }", in: view) == 1)
         // Exactly these three screens take a request: a structural check only. The hosted tests
@@ -431,9 +447,8 @@ struct ChatNewEmailRequestHostedTests {
             #expect(labels.contains("Lunch on Friday"), "the subject slot reads the link's subject: \(labels.prefix(16))")
             #expect(!labels.contains(ChatNewEmailSubjectLine.text), "not New email")
             #expect(Self.labels(of: ChatNewThreadView.ccLineId, in: shown) == ["Cc: Sam Park."])
-            let expectedBcc = [ChatNewDraft.copyLine("Bcc", ["alex@example.com"])].compactMap { $0 }
-            let bccLine = Self.labels(of: ChatNewThreadView.bccLineId, in: shown)
-            #expect(bccLine == expectedBcc)
+            // One mailbox with no name: its line names it by the address's name part.
+            #expect(Self.labels(of: ChatNewThreadView.bccLineId, in: shown) == ["Bcc: alex."])
 
             try await Self.secondLeavesItUp(screen)
             try await Self.backClosesAndSavesNothing(screen)
@@ -704,6 +719,183 @@ struct ChatNewEmailRequestHostedTests {
         }
     }
 
+    // MARK: - Something up out of the screen's sight
+
+    @Test("While a new email opened out of the screen's sight is up, or an attachment preview, an open chat or the email screen takes no link; once it closes nothing comes up, and the screen takes the next", arguments: [false, true])
+    func linkUnderSomethingOutOfSight(chat: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await linkUnderSomethingOutOfSightBody(chat: chat) }
+    }
+
+    /// A draft a compose button opens, or one an email pill opens from the navigation's root, is
+    /// presented by something other than the screen. Here a new email's chat, which is counted the
+    /// same way, is presented above the screen's navigation, out of its sight. A screen that took
+    /// the link anyway would ask for a cover UIKit cannot show while the other is up: it would come
+    /// up once the other closes, or never, and the screen would then take no other link. Both fail.
+    private func linkUnderSomethingOutOfSightBody(chat: Bool) async throws {
+        let elsewhere = Elsewhere()
+        try await withScreen { seed in
+            Beside(elsewhere: elsewhere) {
+                if chat {
+                    NavigationStack { ChatThreadView(messageId: seed.email.id) }
+                } else {
+                    NavigationStack { MessageDetailView(messageId: seed.email.id) }
+                }
+            }
+        } body: { screen in
+            if chat {
+                try await ThreadChatTests.wait { ThreadChatTests.shows("Ann Example", in: screen.view) }
+            } else {
+                try await ThreadChatTests.wait { Self.composeButton(in: screen.view) != nil }
+            }
+            try await ThreadChatTests.settle()
+            #expect(screen.topPresented() == nil, "control: nothing is presented over the screen: \(ThreadChatTests.labels(screen.view).prefix(12))")
+
+            elsewhere.cover = .make(request: Self.other, opensInChat: true, signedIn: true, chatAccount: nil, composeAccount: nil)
+            try await ThreadChatTests.wait { Self.presentedNewEmail(screen) != nil }
+            let up = screen.topPresented()
+            #expect(Self.presentedNewEmail(screen) != nil, "control: a new email is up, opened out of the screen's sight")
+            #expect(AgentToolRouter.shared.isComposeUp, "control: it is counted as a compose up")
+            NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
+            let held = try await Self.keeps { screen.topPresented() === up && Self.newEmailView(screen) == nil }
+            #expect(held, "the screen takes no link while it is up")
+            let shown = try #require(Self.presentedNewEmail(screen), "control: it is still up")
+            #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: shown), "Back takes a tap")
+            try await ThreadChatTests.wait { screen.topPresented() == nil }
+            #expect(screen.topPresented() == nil, "control: Back closed it")
+            try await ThreadChatTests.wait { !AgentToolRouter.shared.isComposeUp }
+            let nothing = try await Self.keeps { screen.topPresented() == nil }
+            #expect(nothing, "nothing comes up once it is closed")
+
+            // An attachment preview is presented by UIKit, outside every screen's sight.
+            PreviewFreezeGate.shared.begin()
+            let none: Bool
+            do {
+                NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
+                none = try await Self.keeps { screen.topPresented() == nil }
+            } catch {
+                PreviewFreezeGate.shared.end()
+                throw error
+            }
+            PreviewFreezeGate.shared.end()
+            #expect(none, "the screen takes no link while a preview is up")
+
+            _ = try await Self.postedLinkShowsNewEmail(screen)
+            try await Self.backClosesAndSavesNothing(screen)
+        }
+    }
+
+    // MARK: - The agent's compose
+
+    @Test("An agent's compose finished while a new email's chat is up waits for it, and comes up once the new email closes")
+    func agentComposeWaitsForTheNewEmail() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await agentComposeWaitsForTheNewEmailBody() }
+    }
+
+    private func agentComposeWaitsForTheNewEmailBody() async throws {
+        let router = AgentToolRouter.shared
+        try await withScreen { seed in
+            NavigationStack { MessageDetailView(messageId: seed.email.id) }
+        } body: { screen in
+            try await ThreadChatTests.wait { Self.composeButton(in: screen.view) != nil }
+            try await ThreadChatTests.settle()
+            #expect(screen.topPresented() == nil, "control: nothing is presented over the email")
+            let shown = try await Self.postedLinkShowsNewEmail(screen)
+            let newEmail = screen.topPresented()
+            #expect(router.isComposeUp, "the new email's chat counts as a compose up")
+            let request = AgentToolRouter.ComposeRequest(
+                mode: .compose, replyTo: nil, to: ["next@example.com"], cc: [], bcc: [],
+                subject: "From the agent", body: nil)
+            router.enqueueCompose(request)
+            let waited = try await Self.keeps {
+                router.composeQueueDepth == 1 && !router.composeAwaitingAppear && screen.topPresented() === newEmail
+            }
+            #expect(waited, "the agent's compose waits while the new email is up: queued \(router.composeQueueDepth)")
+            #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: shown), "Back takes a tap")
+            var fields: [String: String] = [:]
+            try await ThreadChatTests.wait {
+                fields = screen.topPresented().map { Self.composeRecipients($0.view) } ?? [:]
+                return fields["to"]?.isEmpty == false
+            }
+            #expect(Self.addresses(fields["to"]) == ["next@example.com"], "the agent's compose comes up once the new email closes: \(fields)")
+            #expect(router.composeQueueDepth == 0, "and leaves the queue")
+        }
+    }
+
+    // MARK: - What the producers post
+
+    @Test("What the producers post is taken: a contact pill's lone address, and a link naming only Cc")
+    func producersPayloads() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await producersPayloadsBody() }
+    }
+
+    private func producersPayloadsBody() async throws {
+        try await withScreen { seed in
+            NavigationStack { ChatThreadView(messageId: seed.email.id) }
+        } body: { screen in
+            try await ThreadChatTests.wait { ThreadChatTests.shows("Ann Example", in: screen.view) }
+            try await ThreadChatTests.settle()
+            #expect(screen.topPresented() == nil, "control: nothing is presented over the chat")
+
+            // A contact pill in a chat's answer posts the address alone, under `email`.
+            NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: ["email": "maria@example.com", "name": "Maria Lee"])
+            try await ThreadChatTests.wait { Self.presentedNewEmail(screen) != nil }
+            let pill = try #require(Self.presentedNewEmail(screen), "a contact pill's address opens the new email")
+            #expect(Self.labels(of: ChatNewThreadView.hintId, in: pill) == ["New email to maria."], "to that address")
+            #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: pill), "Back takes a tap")
+            try await ThreadChatTests.wait { screen.topPresented() == nil }
+            #expect(screen.topPresented() == nil, "Back closes it")
+            try await ThreadChatTests.settle()
+
+            // A `mailto:` link in an email, or from outside the app, as it is parsed and posted.
+            let url = try #require(URL(string: "mailto:?cc=Sam%20Park%20%3Csam@example.com%3E&subject=Hello%20there"))
+            let parsed = try #require(MailtoRequest.parse(url), "control: a link naming only Cc parses")
+            NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: parsed.toUserInfo())
+            try await ThreadChatTests.wait { Self.presentedNewEmail(screen) != nil }
+            let ccOnly = try #require(Self.presentedNewEmail(screen), "a link naming only Cc opens the new email")
+            #expect(Self.labels(of: ChatNewThreadView.ccLineId, in: ccOnly) == ["Cc: Sam Park."], "Sam is Cc")
+            #expect(Self.labels(of: ChatNewThreadView.bccLineId, in: ccOnly).isEmpty, "no Bcc")
+            #expect(HostedAccessibility.labels(in: ccOnly).contains("Hello there"), "the subject")
+            #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: ccOnly), "Back takes a tap")
+            try await ThreadChatTests.wait { screen.topPresented() == nil }
+            #expect(screen.topPresented() == nil, "Back closes it")
+            try await ThreadChatTests.settle()
+            let drafts = try await screen.pool.read { db in try Draft.fetchCount(db) }
+            #expect(drafts == 0, "nothing changed in either: nothing in Drafts")
+        }
+    }
+
+    // MARK: - A reopened draft
+
+    @Test("A reopened draft's chat shows the draft's own subject, Cc and Bcc")
+    func reopenedShowsItsOwn() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await reopenedShowsItsOwnBody() }
+    }
+
+    private func reopenedShowsItsOwnBody() async throws {
+        let now = Date().timeIntervalSince1970
+        let draft = Draft(
+            id: Draft.newEmailKey(), accountId: ThreadChatTests.accountA,
+            toJSON: Draft.encodeStringArray(["maria@example.com"]),
+            ccJSON: Draft.encodeStringArray(["Sam Park <sam@example.com>"]),
+            bccJSON: Draft.encodeStringArray(["alex@example.com"]), subject: "Dinner plans", body: "See you there?",
+            replyToId: nil, isForward: false, editHistoryJSON: nil, createdAt: now - 60, updatedAt: now - 60,
+            serverDraftId: nil, serverPushStatus: nil, rfc822MessageId: nil, attachmentsDirName: nil)
+        try await withScreen { seed in
+            NavigationStack { ChatNewThreadView(model: ChatNewThreadModel(reopening: draft, account: seed.account)) }
+        } body: { screen in
+            try await ThreadChatTests.wait { !Self.labels(of: ChatNewThreadView.ccLineId, in: screen.view).isEmpty }
+            #expect(Self.labels(of: ChatNewThreadView.ccLineId, in: screen.view) == ["Cc: Sam Park."], "the draft's Cc: \(ThreadChatTests.labels(screen.view).prefix(16))")
+            #expect(Self.labels(of: ChatNewThreadView.bccLineId, in: screen.view) == ["Bcc: alex."], "the draft's Bcc")
+            #expect(HostedAccessibility.labels(in: screen.view).contains("Dinner plans"), "the draft's subject")
+            #expect(!HostedAccessibility.labels(in: screen.view).contains(ChatNewEmailSubjectLine.text), "not New email")
+            #expect(Self.fieldText(in: screen.view) == "See you there?", "the draft's words")
+        }
+    }
+
     // MARK: - An email from a notification that never arrives
 
     @Test("An email opened from a notification that never arrives: with a new email up over its chat or email screen, the screen does not ask to be left and the new email stays; with nothing over it, it asks", arguments: [true, false])
@@ -771,21 +963,30 @@ struct ChatNewEmailRequestHostedTests {
 
     // MARK: - Compose, with the chat view off
 
-    @Test("A cover decided for compose shows compose filled with the link's To, Cc, Bcc, subject and body, whatever the setting is when it shows")
-    func composeFallback() async throws {
+    @Test("A cover decided for compose shows compose filled with the link's To, Cc, Bcc, subject and body, from the account it was given, whatever the setting is when it shows", arguments: [false, true])
+    func composeFallback(otherAccount: Bool) async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
-        try await HostedAccessibility.withAutomation { try await composeFallbackBody() }
+        try await HostedAccessibility.withAutomation { try await composeFallbackBody(otherAccount: otherAccount) }
     }
 
-    private func composeFallbackBody() async throws {
+    /// Run with each of the two accounts, so whichever compose would pick by itself, one run gives
+    /// it the other.
+    private func composeFallbackBody(otherAccount: Bool) async throws {
         let full = MailtoRequest(
             to: ["\"Doe, John\" <john@example.com>", "maria@example.com"], cc: ["Sam Park <sam@example.com>"],
             bcc: ["alex@example.com"], subject: "Lunch on Friday", body: "Are you free at noon?")
+        let fromId = otherAccount ? ThreadChatTests.accountB : ThreadChatTests.accountA
+        let notFromId = otherAccount ? ThreadChatTests.accountA : ThreadChatTests.accountB
         // Decided for compose (the chat view off when the request came); shown with it on.
         try await withScreen { seed in
             ChatNewEmailCoverView(cover: .make(
-                request: full, opensInChat: false, signedIn: true, chatAccount: nil, composeAccount: seed.account))
+                request: full, opensInChat: false, signedIn: true, chatAccount: nil,
+                composeAccount: otherAccount ? seed.other : seed.account))
         } body: { screen in
+            let accounts = try await screen.pool.read { db in try Account.fetchAll(db) }
+            let from = try #require(accounts.first { $0.id == fromId }?.emailAddress)
+            let notFrom = try #require(accounts.first { $0.id == notFromId }?.emailAddress)
+            #expect(from != notFrom, "control: the two accounts have their own addresses")
             var fields: [String: String] = [:]
             try await ThreadChatTests.wait {
                 fields = Self.composeRecipients(screen.view)
@@ -798,6 +999,9 @@ struct ChatNewEmailRequestHostedTests {
             let hasBody = texts.contains { $0.contains("Are you free at noon?") }
             #expect(texts.contains("Lunch on Friday"), "the subject: \(texts)")
             #expect(hasBody, "the body: \(texts)")
+            let labels = HostedAccessibility.labels(in: screen.view)
+            #expect(labels.contains(from), "from the account it was given: \(labels.prefix(16))")
+            #expect(!labels.contains(notFrom), "not the other one")
             #expect(!HostedAccessibility.identifiers(in: screen.view).contains(ChatNewThreadView.backId), "not the chat")
         }
         let router = AgentToolRouter.shared
@@ -878,6 +1082,8 @@ struct ChatNewEmailRequestHostedTests {
         let email: MessageHeader
         let inbox: [Folder]
         let account: Account?
+        /// The second account, never the one given above.
+        let other: Account?
         let state: ListPresentationState
     }
 
@@ -918,9 +1124,27 @@ struct ChatNewEmailRequestHostedTests {
         }
     }
 
+    /// A new email presented above a screen's navigation, as the navigation's root presents a
+    /// draft opened from an email pill; nil for none.
+    @MainActor @Observable
+    final class Elsewhere {
+        var cover: ChatNewEmailCover?
+    }
+
+    /// `screen`, with `elsewhere`'s new email presented from above it, out of the screen's sight.
+    struct Beside<Screen: View>: View {
+        @Bindable var elsewhere: Elsewhere
+        @ViewBuilder let screen: () -> Screen
+
+        var body: some View {
+            screen().fullScreenCover(item: $elsewhere.cover) { ChatNewEmailCoverView(cover: $0) }
+        }
+    }
+
     /// Mounts `root` on an installed app database holding one email, with the chat view on and
-    /// signed in unless told otherwise and the AI queue held, runs `body`, then takes it all down,
-    /// also when it throws.
+    /// signed in unless told otherwise, the AI queue held and no compose counted as up, runs
+    /// `body`, then takes it all down, also when the setup or `body` throws; what the screen saves
+    /// as it closes is done before the database goes.
     private func withScreen<Root: View>(
         chatView: Bool = true,
         signedIn: Bool = true,
@@ -929,43 +1153,53 @@ struct ChatNewEmailRequestHostedTests {
     ) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let (pool, directory, previous) = try ThreadChatTests.install()
-        let queue = ActiveAIQueue.shared
-        await queue.setDispatchSuppressedForTesting(true)
-        await queue.clearForTesting()
-        saved.setChatView(on: chatView)
         defer {
             ChatPillState.shared.removeAllSessions()
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
-        let email = ThreadChatTests.header("601", from: "Ann Example", rfc: "request-1@example.com", thread: "request-thread", minutesAgo: 5)
-        try ThreadChatTests.insert(email, pool: pool)
-        let accountId = ThreadChatTests.accountA
-        let accounts = try await pool.read { db in try Account.fetchAll(db) }
-        let inbox = try await pool.read { db in
-            try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.inbox.rawValue).fetchAll(db)
-        }
-        let navigationStore = NavigationStore()
-        navigationStore.accounts = accounts
-        let state = ListPresentationState()
-        let seed = Seed(email: email, inbox: inbox, account: accounts.first { $0.id == accountId }, state: state)
-        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let window = UIWindow(windowScene: scene)
-        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        let controller = UIHostingController(rootView: AnyView(
-            root(seed)
-                .environment(navigationStore)
-                .environment(\.hasTabMailSession, signedIn)))
-        window.rootViewController = controller
-        window.makeKeyAndVisible()
+        let queue = ActiveAIQueue.shared
+        let router = AgentToolRouter.shared
+        await queue.setDispatchSuppressedForTesting(true)
+        var window: UIWindow?
+        // Runs before the database goes (the `defer` above runs after it).
         func cleanUp() async {
-            controller.dismiss(animated: false)
-            window.isHidden = true
-            window.rootViewController = nil
+            window?.rootViewController?.dismiss(animated: false)
+            window?.isHidden = true
+            window?.rootViewController = nil
+            try? await ThreadChatTests.settle()
             await queue.clearForTesting()
             await queue.setDispatchSuppressedForTesting(false)
         }
         do {
+            await queue.clearForTesting()
+            saved.setChatView(on: chatView)
+            // Another suite's compose may still be counted: a count left up would hold every request.
+            router.pendingCompose = nil
+            router.resetComposeQueueForTesting()
+            let email = ThreadChatTests.header("601", from: "Ann Example", rfc: "request-1@example.com", thread: "request-thread", minutesAgo: 5)
+            try ThreadChatTests.insert(email, pool: pool)
+            let accountId = ThreadChatTests.accountA
+            let accounts = try await pool.read { db in try Account.fetchAll(db) }
+            let inbox = try await pool.read { db in
+                try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.inbox.rawValue).fetchAll(db)
+            }
+            let navigationStore = NavigationStore()
+            navigationStore.accounts = accounts
+            let state = ListPresentationState()
+            let seed = Seed(
+                email: email, inbox: inbox, account: accounts.first { $0.id == accountId },
+                other: accounts.first { $0.id != accountId }, state: state)
+            let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            let shown = UIWindow(windowScene: scene)
+            window = shown
+            shown.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+            let controller = UIHostingController(rootView: AnyView(
+                root(seed)
+                    .environment(navigationStore)
+                    .environment(\.hasTabMailSession, signedIn)))
+            shown.rootViewController = controller
+            shown.makeKeyAndVisible()
             try await body(Screen(controller: controller, pool: pool, state: state, email: email))
         } catch {
             await cleanUp()

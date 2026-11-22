@@ -789,7 +789,9 @@ struct InboxView: View {
             // chat or its email screen, and so does an email opened in Search. While the new email its
             // compose button pushed is open (`newEmail`), or with a sheet or cover of its own up
             // (`isAnyListPresentation`), the list takes none: a new email being written is not covered.
-            guard selectedMessageId == nil, pushedMessageId == nil, newEmail == nil, !isAnyListPresentation else { return }
+            // Nor while a compose, a draft or a preview is up anywhere (`composeOrPreviewIsUp`).
+            guard selectedMessageId == nil, pushedMessageId == nil, newEmail == nil, !isAnyListPresentation,
+                  !ChatNewEmailCover.composeOrPreviewIsUp else { return }
             guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                 chatExpanded = false
@@ -797,7 +799,8 @@ struct InboxView: View {
             newEmailCover = .make(
                 request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession,
                 chatAccount: viewModel.primaryAccount, composeAccount: viewModel.primaryAccount)
-            BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose: \(request.to.first ?? "")")
+            // Without the request's recipients: the log is kept on the device and can be shared.
+            BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose")
         }
         .fullScreenCover(item: $newEmailCover) { ChatNewEmailCoverView(cover: $0) }
         // The detail column beside the list is behind whatever the list has up. Written only as

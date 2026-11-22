@@ -1572,8 +1572,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        `ChatNewDraftSave.run(carried:)`); a reopened draft shows its own subject, Cc and Bcc the same
        way and keeps them.
      - *Saving.* What the link brought is the chat's starting point
-       (`ChatNewDraft.needsSave(current:saved:opened:)`): Back saves nothing until the user typed,
-       picked or attached something beyond it, so a link opened by mistake leaves nothing in Drafts
+       (`ChatNewDraft.needsSave(current:saved:opened:)`): Back, or the app going to the background,
+       saves nothing until the user typed, picked or attached something beyond it, so a link opened by mistake leaves nothing in Drafts
        and tapping it again starts over.
      - *The account.* The chat starts from the primary account (`Account.primary`: the active primary
        account, else the oldest active one), the rule the list's compose button already used, now one
@@ -1602,6 +1602,22 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        that open in the detail column read it (`listPresentationBesideDetail`: the selected email,
        `MessageDetailContainer`, and an email pill's email, `PushedMessageDestination`), so an email
        opened inside Search, which carries the list's environment, still takes the request.
+       Some covers are presented out of every taking screen's sight: a draft a compose button opens
+       (`ComposeToolbarButton`), an email pill's draft opened at the navigation's root
+       (`MailNavigationView`), and an attachment preview (`AttachmentQuickLook`). So no screen takes
+       a request while a compose or a draft is up anywhere (ADR-IOS-030's presentation count, which
+       every `ComposeView` and `DraftComposePresenter` keeps, read as `AgentToolRouter.isComposeUp`)
+       or while a preview is up (`PreviewFreezeGate`); one check, `ChatNewEmailCover.composeOrPreviewIsUp`,
+       in all three screens (review ruling 2026-11-22). Popovers and sheets a screen's own parts show
+       are not counted (the AI summaries notice and its report sheet, menus, alerts): a request from
+       outside the app while one is up is taken by the screen under it, and UIKit may refuse its
+       cover; that screen then takes no other request until it is left (ios#1259, P4).
+     - *The agent's compose waits for it.* The new email's chat cover keeps ADR-IOS-030's
+       presentation count while it is up, as `DraftComposePresenter` does for a draft's chat, so an
+       agent's compose finished meanwhile is queued and comes up once the cover closes, instead of
+       being sent to a screen that is already presenting (review ruling 2026-11-22).
+     - *Logs.* Taking a request is logged without its recipients (debug logs are kept on the device
+       and can be shared).
      - *A save whose push was refused (review ruling 2026-11-22).* A save writes the row on the
        device first and then queues its push to the server's Drafts; when only the queue refuses,
        the row still holds that version. From then on the row is what later saves compare with, not
@@ -1628,8 +1644,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    checked only in the source: the simulator has no camera), `ChatNewThreadScreenTests` (the whole
    screen hosted: Back, background, closing and their alerts, the empty field, the tray, Send's ask,
    the sheet, the chat hidden by another screen and shown again keeping what was typed, the Drafts
-   row and the opens from Drafts, and since 2026-11-22 a contact pill or link opening the chat with
-   what it brought), `ComposeDraftSaveTests` (the shared writer
+   row and the opens from Drafts, and since 2026-11-22 a link's chat saving on background only once
+   changed), `ChatNewEmailRequestTests` (every new email: the route, what a link brings and its
+   draft, the primary account, the source wiring) and `ChatNewEmailRequestHostedTests` (each screen
+   hosted taking a contact pill's or a link's request, or not, and the agent's compose waiting for
+   the cover), `ComposeDraftSaveTests` (the shared writer
    against a real database), `DraftAttachmentImportTests`.
 
 ## The longer index line (routed 2026-11-09)

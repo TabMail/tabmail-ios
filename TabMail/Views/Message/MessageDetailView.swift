@@ -213,14 +213,17 @@ struct MessageDetailView: View {
                 // Only while it shows: under a screen pushed over it (an email pill's email) it
                 // takes none, that screen does. With a sheet or cover of its own up (a new email's
                 // included), it takes none: what is up is not replaced. In the detail column it
-                // takes none while the list beside it has a sheet or cover up (iPad).
-                guard viewModel.isViewVisible, !isAnyCoverPresented, listPresentationBesideDetail?.isUp != true else { return }
+                // takes none while the list beside it has a sheet or cover up (iPad). Nor while a
+                // compose, a draft or a preview is up anywhere (`composeOrPreviewIsUp`).
+                guard viewModel.isViewVisible, !isAnyCoverPresented, listPresentationBesideDetail?.isUp != true,
+                      !ChatNewEmailCover.composeOrPreviewIsUp else { return }
                 guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
                 withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                     chatExpanded = false
                 }
                 askForNewEmail(request)
-                BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose: \(request.to.first ?? "")")
+                // Without the request's recipients: the log is kept on the device and can be shared.
+                BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose")
             }
             .task {
                 // Mark-read runs on its own unstructured Task so that
