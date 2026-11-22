@@ -13,10 +13,15 @@ import UIKit
 /// the bubble's fill is checked as drawn.
 ///
 /// THE SYSTEM PROPERTIES pinned here:
-///  1. Who offers a send's Undo is decided from the chat view setting at the Send tap. A reply sent
-///     with the chat view on (the ready AI Reply included) has it on its bubble and no toast; a reply
-///     sent with it off, and any new email, has the toast. Changing the setting right after the tap
-///     changes nothing for that send. A later bubble send leaves an earlier send's toast showing.
+///  1. Who offers a send's Undo is decided from the chat view setting at the Send tap and the screen
+///     the compose was opened on. A reply sent with the chat view on from a compose the chat opened
+///     (the ready AI Suggestion, built as the chat builds it) has it on its bubble and no toast; a
+///     reply sent with it off, and any new email, has the toast. Changing the setting right after
+///     the tap changes nothing for that send. A later bubble send leaves an earlier send's toast
+///     showing.
+///  1b. A reply from a compose another screen opened keeps the toast with the chat view on: sent
+///     again from the compose an Undo reopened (after an Undo in the chat or in Search), or opened
+///     from Drafts and sent. No screen there shows its bubble.
 ///  2. Drawn: the solid blue rises from the bottom edge, inside the bubble's shape; in light mode the
 ///     text is the pending text colour over the tint and white over the solid; under Reduce Motion
 ///     there is no rising fill; a mounted bubble drops its Undo when its deadline passes.
@@ -43,6 +48,8 @@ struct ChatUndoSendRoutingTests {
         let account = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "Sent", role: .sent, pool: pool)
+        // Where an undone send returns (`AccountManager.admitDraftToDrafts`).
+        try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "Drafts", role: .drafts, pool: pool)
         var parent = MessageHeader(
             messageId: "routing-parent", subject: "Lunch plans", from: "sender@example.com", fromAddress: "sender@example.com",
             to: account.emailAddress, date: Date().addingTimeInterval(-600), snippet: "Note",
@@ -57,9 +64,14 @@ struct ChatUndoSendRoutingTests {
         return Fixture(pool: pool, account: account, parent: parent)
     }
 
-    /// Hosts `root` as the app does (with the accounts in the navigation store), taps its Send,
-    /// runs `afterTap` at once (before the send has suspended anywhere), and returns the outbox row
-    /// the send queued.
+    /// Polls (of 100 ms) between taps on a Send the compose ignored.
+    private static let retapEvery = 20
+
+    /// Hosts `root` as the app does (with the accounts in the navigation store), taps its Send once
+    /// it is enabled, runs `afterTap` at once (before the send has suspended anywhere), and returns
+    /// the outbox row the send queued. A compose still binding the draft it opened with ignores the
+    /// tap and keeps its Send button, so Send is tapped again while no row has come and Send still
+    /// shows enabled; an admitted send swaps Send for a spinner for good, so nothing is sent twice.
     private static func send(
         _ root: some View, fixture: Fixture, afterTap: () -> Void = {}
     ) async throws -> OutboxMessage {
@@ -76,15 +88,23 @@ struct ChatUndoSendRoutingTests {
             window.isHidden = true
             window.rootViewController = nil
         }
-        func ids() -> [String] { HostedAccessibility.identifiers(in: controller.view) }
-        for _ in 0..<80 where !ids().contains(ComposeView.sendButtonId) { try await Task.sleep(for: .milliseconds(100)) }
+        func sendEnabled() -> Bool {
+            HostedAccessibility.elements(under: controller.view).contains {
+                HostedAccessibility.identifier(of: $0) == ComposeView.sendButtonId
+                    && !$0.accessibilityTraits.contains(.notEnabled)
+            }
+        }
+        for _ in 0..<80 where !sendEnabled() { try await Task.sleep(for: .milliseconds(100)) }
         #expect(HostedAccessibility.activate(ComposeView.sendButtonId, in: controller.view), "control: Send was tapped")
         afterTap()
         var queued: OutboxMessage?
-        for _ in 0..<100 where queued == nil {
+        for poll in 1...100 where queued == nil {
             try await Task.sleep(for: .milliseconds(100))
             queued = try await fixture.pool.read { db in
                 try OutboxMessage.order(Column("createdAt")).fetchAll(db).last { !before.contains($0.id) }
+            }
+            if queued == nil, poll.isMultiple(of: Self.retapEvery), sendEnabled() {
+                _ = HostedAccessibility.activate(ComposeView.sendButtonId, in: controller.view)
             }
         }
         let row = try #require(queued, "the send queued its email")
@@ -95,9 +115,15 @@ struct ChatUndoSendRoutingTests {
         return row
     }
 
+    /// The ready AI Suggestion's compose card, built as the chat builds it (`ChatThreadView`): a
+    /// Reply All to the email's people, saving to the suggestion's own draft (`ChatReadyReply.draftId`).
     private static func readyAIReply(_ fixture: Fixture) -> some View {
-        ChatReplyCompose.make(replyAllTo: fixture.parent, accounts: [fixture.account])
-            .composeView(replyTo: fixture.parent, suggestedBody: "Tuesday works for me.", onAgentOutcome: { _ in })
+        let ready = ChatReadyReply(
+            message: fixture.parent,
+            compose: ChatReplyCompose.make(replyAllTo: fixture.parent, accounts: [fixture.account]))
+        return ready.compose.composeView(
+            replyTo: ready.message, suggestedBody: "Tuesday works for me.", draftId: ready.draftId,
+            onAgentOutcome: { _ in })
     }
 
     private static func newEmail(_ fixture: Fixture) -> some View {
@@ -114,10 +140,12 @@ struct ChatUndoSendRoutingTests {
         defer {
             service.dismiss()
             service.resetUndoOwnersForTesting()
+            while service.reopenSnapshot != nil { service.finishReopen() }
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
         service.dismiss()
+        while service.reopenSnapshot != nil { service.finishReopen() }
         try await HostedAccessibility.withAutomation { @MainActor in
             try await body(try await Self.makeFixture(pool), saved)
         }
@@ -130,6 +158,8 @@ struct ChatUndoSendRoutingTests {
             saved.setChatView(on: true)
             let row = try await Self.send(Self.readyAIReply(fixture), fixture: fixture) { saved.setChatView(on: false) }
             #expect(row.inReplyTo != nil, "control: a reply")
+            let ownDraft = row.draftId?.hasPrefix(Draft.separateReplyPrefix) == true
+            #expect(ownDraft, "control: sent from the AI Suggestion's own draft, as the chat opens it")
             #expect(PendingSendService.shared.undoOwner(for: row.id) == .bubble, "the setting at the tap decided")
             #expect(PendingSendService.shared.visibleToast?.id != row.id, "no toast for it")
         }
@@ -158,6 +188,61 @@ struct ChatUndoSendRoutingTests {
             let reply = try await Self.send(Self.readyAIReply(fixture), fixture: fixture)
             #expect(PendingSendService.shared.undoOwner(for: reply.id) == .bubble)
             #expect(PendingSendService.shared.visibleToast?.id == email.id, "the email keeps its toast, its only Undo")
+        }
+    }
+
+    // MARK: - 1b. A compose another screen opened
+
+    /// Sends the AI Suggestion from the chat, then taps Undo on its Sending bubble as the chat does
+    /// (`ChatUnsentReply.undo()` on the row the chat reads). Returns the compose the Undo queued to
+    /// reopen, which RootView presents at the top level after an Undo in the chat or in Search alike.
+    private static func sendFromTheChatAndUndoOnTheBubble(_ fixture: Fixture) async throws -> PendingSendService.ReopenSnapshot {
+        let service = PendingSendService.shared
+        let first = try await Self.send(Self.readyAIReply(fixture), fixture: fixture)
+        #expect(service.undoOwner(for: first.id) == .bubble, "control: sent from the chat, Undo on its bubble")
+        // The test, not the clock, ends the window.
+        let hold = Date().addingTimeInterval(3600)
+        try await fixture.pool.write { db in
+            try db.execute(sql: "UPDATE outboxMessage SET holdUntil = ? WHERE id = ?", arguments: [hold, first.id])
+        }
+        let chat: Set<String> = [EmailFilter.normalizeMessageId(try #require(fixture.parent.rfc822MessageId))]
+        let bubbles = try await fixture.pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
+        let shown = bubbles.first { $0.id == first.id }
+        let bubble = try #require(shown, "control: the chat shows the reply's bubble")
+        bubble.undo()
+        let reopen = try #require(service.reopenSnapshot, "the bubble's Undo reopens the compose")
+        let cancelled = try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: first.id) } == nil
+        #expect(cancelled, "control: the first send is cancelled")
+        return reopen
+    }
+
+    @Test("A reply undone on its bubble and sent again from the compose the Undo reopened has the toast: that compose is not the chat's")
+    func reopenedComposeSendsWithTheToast() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
+        try await withSendEnvironment { fixture, saved in
+            saved.setChatView(on: true)
+            let reopen = try await Self.sendFromTheChatAndUndoOnTheBubble(fixture)
+            let again = try await Self.send(UndoReopenCompose(snapshot: reopen), fixture: fixture)
+            #expect(again.inReplyTo != nil, "control: still a reply to the chat's email")
+            #expect(PendingSendService.shared.undoOwner(for: again.id) == .toast, "its Undo is on the toast")
+            #expect(PendingSendService.shared.visibleToast?.id == again.id, "RootView shows its toast, its one Undo")
+        }
+    }
+
+    @Test("A reply undone on its bubble, then opened from Drafts and sent, has the toast")
+    func draftsSendKeepsTheToast() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
+        try await withSendEnvironment { fixture, saved in
+            saved.setChatView(on: true)
+            let reopen = try await Self.sendFromTheChatAndUndoOnTheBubble(fixture)
+            #expect(reopen.returnedToDrafts, "control: the Undo put the reply back in Drafts")
+            // The reopened compose is closed without typing; the reply waits in Drafts.
+            PendingSendService.shared.finishReopen()
+            let again = try await Self.send(
+                DraftComposePresenter(source: .draftId(reopen.authority.draftId)), fixture: fixture)
+            #expect(again.inReplyTo != nil, "control: still a reply to the chat's email")
+            #expect(PendingSendService.shared.undoOwner(for: again.id) == .toast, "its Undo is on the toast")
+            #expect(PendingSendService.shared.visibleToast?.id == again.id, "RootView shows its toast, its one Undo")
         }
     }
 

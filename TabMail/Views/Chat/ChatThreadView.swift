@@ -313,7 +313,7 @@ struct ChatThreadView: View {
                 onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
-        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
+        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: .chat) }
         .sheet(isPresented: $showsReplyTo) {
             ChatReplyToSheet(
                 replyPeople: thread.replyPeople, target: replyTarget,
@@ -952,13 +952,13 @@ struct ChatThreadView: View {
             ComposeView(
                 suggestedBody: req.body, account: context.accounts.first { $0.id == viewModel.message?.accountId },
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
-                onAgentOutcome: onOutcome)
+                openedOn: .chat, onAgentOutcome: onOutcome)
         case .reply:
             card.reply.composeView(replyTo: req.replyTo, suggestedBody: req.body, onAgentOutcome: onOutcome)
         case .forward:
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
-                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, onAgentOutcome: onOutcome)
+                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, openedOn: .chat, onAgentOutcome: onOutcome)
         }
     }
 }

@@ -20,7 +20,9 @@ import UIKit
 ///  3. Leaving the chat and opening it again shows Undo again while time is left, and not after.
 ///  4. Tapping the bubble's Undo runs the toast's own undo-and-reopen path: the outbox row is gone,
 ///     the reopen names the send's own draft generation, and another send's toast stays.
-///  5. A reply sent with the chat view on has no toast; any other send keeps it.
+///  5. A reply sent with the chat view on from a compose the chat opened has no toast; any other
+///     send keeps it, a reply from a compose opened on another screen included. Only the chat's own
+///     composes record that the chat opened them.
 @Suite("Undo send on the chat bubble", .serialized, .processGlobalState)
 @MainActor
 struct ChatUndoSendTests {
@@ -257,12 +259,26 @@ struct ChatUndoSendTests {
 
     // MARK: - 5. Toast or bubble
 
-    @Test("A reply sent with the chat view on has its Undo on the bubble; any other send keeps the toast")
+    @Test("A reply sent with the chat view on from a compose the chat opened has its Undo on the bubble; any other send keeps the toast")
     func toastOrBubble() {
-        #expect(PendingSendService.sendHasBubbleUndo(chatViewActive: true, inReplyTo: "<p@example.com>"))
-        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: false, inReplyTo: "<p@example.com>"))
-        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, inReplyTo: nil))
-        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: false, inReplyTo: nil))
+        let reply = "<p@example.com>"
+        #expect(PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, inReplyTo: reply))
+        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: nil, inReplyTo: reply),
+                "a reply from a compose another screen opened (the Drafts list, the compose an Undo reopens)")
+        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: false, openedOn: .chat, inReplyTo: reply))
+        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, inReplyTo: nil))
+        // Of all eight combinations, only the first has the bubble.
+        var bubbles = 0
+        for chatView in [true, false] {
+            for openedOn in [ComposeScreen.chat, nil] {
+                for inReplyTo in [reply, nil] {
+                    let bubble = PendingSendService.sendHasBubbleUndo(
+                        chatViewActive: chatView, openedOn: openedOn, inReplyTo: inReplyTo)
+                    if bubble { bubbles += 1 }
+                }
+            }
+        }
+        #expect(bubbles == 1, "the bubble needs the chat view, a compose the chat opened, and a reply")
     }
 
     /// The presenters that offer a send's Undo right now, read as the app reads them: the toast
@@ -277,7 +293,7 @@ struct ChatUndoSendTests {
         return (toast ? 1 : 0) + (bubble ? 1 : 0)
     }
 
-    @Test("Every send has exactly one Undo presenter through its window, a reply and a new email, whatever the chat view does after Send")
+    @Test("Every send has exactly one Undo presenter through its window, a reply and a new email, from the chat or another screen, whatever the chat view does after Send")
     func exactlyOnePresenterAcrossChatViewFlips() async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -293,24 +309,28 @@ struct ChatUndoSendTests {
         var n = 0
         for atSend in [true, false] {
             for isReply in [true, false] {
-                n += 1
-                let row = try await Self.queueReply(fixture, draftId: "draft-flip-\(n)", newEmail: !isReply)
-                let hold = Date().addingTimeInterval(3600)
-                try await Self.setHold(pool, row.id, hold)
-                // Send as ComposeView does: the owner from the setting read at the Send tap.
-                saved.setChatView(on: atSend)
-                let owner: PendingSendService.UndoOwner = PendingSendService.sendHasBubbleUndo(
-                    chatViewActive: ChatViewConfig.isActive, inReplyTo: row.inReplyTo) ? .bubble : .toast
-                service.present(outboxId: row.id, draftId: "draft-flip-\(n)", instanceEpoch: "E1",
-                                toSummary: "To: sender@example.com", holdUntil: hold, owner: owner)
-                let what = "chat view \(atSend) at Send, \(isReply ? "reply" : "new email")"
-                #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "\(what), no flip")
-                // The chat view flips during the window, then flips back.
-                saved.setChatView(on: !atSend)
-                #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "\(what), flipped")
-                saved.setChatView(on: atSend)
-                #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "\(what), flipped back")
-                service.dismiss()
+                for openedOn in [ComposeScreen.chat, nil] {
+                    n += 1
+                    let row = try await Self.queueReply(fixture, draftId: "draft-flip-\(n)", newEmail: !isReply)
+                    let hold = Date().addingTimeInterval(3600)
+                    try await Self.setHold(pool, row.id, hold)
+                    // Send as ComposeView does: the owner from the setting read at the Send tap and
+                    // the screen the compose was opened on.
+                    saved.setChatView(on: atSend)
+                    let owner: PendingSendService.UndoOwner = PendingSendService.sendHasBubbleUndo(
+                        chatViewActive: ChatViewConfig.isActive, openedOn: openedOn, inReplyTo: row.inReplyTo) ? .bubble : .toast
+                    service.present(outboxId: row.id, draftId: "draft-flip-\(n)", instanceEpoch: "E1",
+                                    toSummary: "To: sender@example.com", holdUntil: hold, owner: owner)
+                    let screen = openedOn == .chat ? "the chat" : "another screen"
+                    let what = "chat view \(atSend) at Send, \(isReply ? "reply" : "new email") opened on \(screen)"
+                    #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "\(what), no flip")
+                    // The chat view flips during the window, then flips back.
+                    saved.setChatView(on: !atSend)
+                    #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "\(what), flipped")
+                    saved.setChatView(on: atSend)
+                    #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "\(what), flipped back")
+                    service.dismiss()
+                }
             }
         }
     }
@@ -399,6 +419,21 @@ struct ChatUndoSendTests {
         let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
         #expect(inbox.contains(".chatModalSheet(isPresented: $showSearch) {"),
                 "the Search sheet, which can hold a chat, closes for an Undo's outcome")
+    }
+
+    @Test("Every compose the chat view opens records that the chat opened it, and no other screen's compose does")
+    func onlyTheChatsComposesRecordTheChat() throws {
+        let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        let built = chat.components(separatedBy: "ComposeView(").count - 1
+        let recorded = chat.components(separatedBy: "openedOn: .chat").count - 1
+        #expect(built > 0, "control: the chat builds composes of its own (agent cards, Forward)")
+        #expect(recorded == built, "each of them records the chat: \(recorded) of \(built)")
+        let builder = try Self.source("TabMail/Views/Chat/ChatReplyField.swift")
+        #expect(builder.contains("prefillDraftId: draftId, openedOn: .chat,"),
+                "the chat's reply builder (AI Suggestion, agent reply) records it")
+        let recorders = try Self.appSourceFiles(containing: "openedOn: .chat")
+        #expect(recorders == ["ChatReplyField.swift", "ChatThreadView.swift"],
+                "no other screen's compose records the chat: \(recorders)")
     }
 
     // MARK: - 6. Owner kept, retry, hand-back
@@ -918,6 +953,7 @@ struct ChatUndoSendTests {
 
     /// The app's wiring in small: a chat in a sheet that closes for an Undo's outcome (Search's
     /// `chatModalSheet`), under the one presenter of the reopen (RootView's `UndoReopenPresenter`).
+    /// Hosted with the app's navigation store (`navigationStore(_:)`), which the reopened compose reads.
     private struct ChatInSheetHost: View {
         let messageId: String
         @State private var showsSheet = true
@@ -963,7 +999,8 @@ struct ChatUndoSendTests {
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        window.rootViewController = UIHostingController(rootView: ChatInSheetHost(messageId: fixture.parent.id))
+        window.rootViewController = UIHostingController(
+            rootView: ChatInSheetHost(messageId: fixture.parent.id).environment(Self.navigationStore(fixture)))
         window.makeKeyAndVisible()
         defer {
             window.rootViewController?.dismiss(animated: false)
@@ -1020,7 +1057,8 @@ struct ChatUndoSendTests {
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        window.rootViewController = UIHostingController(rootView: ChatInSheetHost(messageId: fixture.parent.id))
+        window.rootViewController = UIHostingController(
+            rootView: ChatInSheetHost(messageId: fixture.parent.id).environment(Self.navigationStore(fixture)))
         window.makeKeyAndVisible()
         defer {
             window.rootViewController?.dismiss(animated: false)
@@ -1070,6 +1108,7 @@ struct ChatUndoSendTests {
     private struct Fixture {
         let pool: DatabasePool
         let parent: MessageHeader
+        let account: Account
     }
 
     @MainActor private struct HostedChat {
@@ -1103,8 +1142,25 @@ struct ChatUndoSendTests {
         return try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
     }
 
+    /// The names of the app's Swift files whose text contains `text`, sorted.
+    private static func appSourceFiles(containing text: String) throws -> [String] {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let files = FileManager.default.enumerator(at: root.appendingPathComponent("TabMail"), includingPropertiesForKeys: nil)?
+            .compactMap { $0 as? URL }.filter { $0.pathExtension == "swift" } ?? []
+        return try files.filter { try String(contentsOf: $0, encoding: .utf8).contains(text) }
+            .map(\.lastPathComponent).sorted()
+    }
+
+    /// The navigation store the app puts at its root, holding the test account: a compose that
+    /// opens reads it (its From field).
+    private static func navigationStore(_ fixture: Fixture) -> NavigationStore {
+        let store = NavigationStore()
+        store.accounts = [fixture.account]
+        return store
+    }
+
     private static func makeFixture(_ pool: DatabasePool) async throws -> Fixture {
-        _ = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
+        let account = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "Sent", role: .sent, pool: pool)
         var parent = MessageHeader(
@@ -1118,7 +1174,7 @@ struct ChatUndoSendTests {
         parent.isRead = true
         let stored = parent
         try await pool.write { db in try stored.insert(db) }
-        return Fixture(pool: pool, parent: parent)
+        return Fixture(pool: pool, parent: parent, account: account)
     }
 
     /// Queues a reply as the compose card does, with an undo hold, and returns its outbox row.

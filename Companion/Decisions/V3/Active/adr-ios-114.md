@@ -457,6 +457,30 @@ same AI result, kept as long as the email itself is shown.
    ids, which restarts the summary observation (decision 9), and its first value asks for the
    newest emails, the joining one first. The summary at Send (`SentEmailSummary`) and the
    Message-ID at the queue write are unchanged.
+   **Undo on the Sending bubble (tabmail-ios #986, 2026-11-21):** a reply sent from a compose the
+   chat opened offers its Undo on its Sending bubble ("Sending · Undo", the seconds left under it)
+   instead of the undo-send toast, which is not shown for it. Who offers a send's Undo
+   (`PendingSendService.UndoOwner`) is decided once, at Send, from what was read as the operation
+   started, never from what is on screen later: the chat view setting read at the Send tap; the
+   screen the compose was opened on (`ComposeView.openedOn`, given by that screen as the compose
+   opens: `ComposeScreen.chat` for the chat view's AI Suggestion, the agent's compose cards it opens
+   and its Forward); and whether the send has an In-Reply-To, by which the chat finds its bubble
+   (`PendingSendService.sendHasBubbleUndo`). Every other send keeps the toast: a new email, and a
+   reply from a compose opened anywhere else (the Drafts list, the inbox, an email screen, the
+   compose an Undo reopens), whose screen shows no bubble; such a reply still shows in its chat as a
+   Sending bubble, without Undo. Both presenters count down to one deadline,
+   `OutboxCancellationPolicy.undoDeadline` (the row's durable `holdUntil` less the claim buffer), with
+   no timer or time of their own, and both Undos take one path (`PendingSendService.undoAndReopen`,
+   then RootView's `UndoReopenPresenter`), so a confirmed Undo returns the message to Drafts and
+   reopens its compose the same way from either. A toast that stops showing a send still in its
+   window hands its Undo to the bubble (`releaseToast`); a send not made in this run of the app (a
+   relaunch) has its Undo on the bubble only. A chat in the Search sheet closes the sheet once an
+   Undo's outcome is known, so RootView alone presents the reopen or the "Couldn't undo" notice.
+   *Amended 2026-11-21:* the first rule read only the setting and the In-Reply-To, so a reply opened
+   from the Drafts list, or sent again from the compose an Undo reopened, put its Undo on a bubble
+   that no screen showed; the screen the compose was opened on now decides as well. Tests:
+   `ChatUndoSendTests`, `ChatUndoSendRoutingTests` (the real Send of each kind of compose),
+   `UndoSendReturnsToDraftsTests` (the return to Drafts from the toast and from the bubble).
    **Superseded by the rebuild (2026-11-09), kept for history:**
    **The Sending bubble follows its queued email (decided 2026-11-07):** a reply sent from
    the chat (the ready AI Reply, or an agent compose) reports its queued email's outbox row

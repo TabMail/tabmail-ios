@@ -8,6 +8,16 @@ import Synchronization
 import Testing
 @testable import TabMail
 
+/// Where the user taps Undo: the undo-send toast, or the chat's Sending bubble. Both run
+/// `PendingSendService.undoAndReopen`, so both must return the message to Drafts the same way.
+enum UndoSendPresenterTap: String, Sendable {
+    case toast
+    case bubble
+
+    /// The presenter the send's Undo belongs to, given at Send.
+    var owner: PendingSendService.UndoOwner { self == .toast ? .toast : .bubble }
+}
+
 /// After Undo Send, Close without typing never drops the words (ADR-IOS-065, as
 /// superseded on v3). The confirmed Undo returns the message to Drafts in the
 /// cancellation's own write: a Drafts entry and a queued server save exist at
@@ -20,9 +30,10 @@ import Testing
 /// through a `ComposeGenerationCursor`), the real held Outbox row,
 /// `PendingSendService.present` and `undoAndReopen()` (what the toast's Undo
 /// button calls, synchronously; through `tapToastUndo()`, which returns the
-/// compose it queued to reopen), `UndoReopenCompose.composeView(for:)`, and the close
-/// decision Close calls (`ComposeDraftGuards.closeDecision`, with
-/// `.hasContent`).
+/// compose it queued to reopen), the chat's Sending bubble's Undo
+/// (`ChatUnsentReply.undo()`, the same path with the bubble's own row),
+/// `UndoReopenCompose.composeView(for:)`, and the close decision Close calls
+/// (`ComposeDraftGuards.closeDecision`, with `.hasContent`).
 ///
 /// `.serialized` + `.processGlobalState`: rebinds `AppDatabase.shared` and uses
 /// `PendingSendService.shared`. example.com addresses only; every instant
@@ -86,8 +97,11 @@ struct UndoSendReturnsToDraftsTests {
     }
 
     /// Send: the row written through the compose's cursor, then the held Outbox
-    /// row and its Undo toast. Returns the Outbox row's id.
-    private func send(_ fixture: Fixture, _ sent: Draft, cursor: ComposeGenerationCursor) async throws -> String {
+    /// row and its Undo on `owner` (the toast unless given). Returns the Outbox row's id.
+    private func send(
+        _ fixture: Fixture, _ sent: Draft, cursor: ComposeGenerationCursor,
+        owner: PendingSendService.UndoOwner = .toast
+    ) async throws -> String {
         _ = try await cursor.admit { epoch, predecessor in
             try await DraftStore.shared.saveAsync(sent, epoch: epoch, expectedPredecessor: predecessor)
         }
@@ -102,8 +116,33 @@ struct UndoSendReturnsToDraftsTests {
         try await fixture.pool.write { db in try held.insert(db) }
         PendingSendService.shared.present(
             outboxId: held.id, draftId: sent.id, instanceEpoch: cursor.newEpoch,
-            toSummary: "To: recipient@example.com", holdUntil: held.holdUntil)
+            toSummary: "To: recipient@example.com", holdUntil: held.holdUntil, owner: owner)
         return held.id
+    }
+
+    /// The user's Undo on `tap`'s presenter; returns the compose it queued to reopen, or nil.
+    /// The toast's is `tapToastUndo()`. The bubble's is `ChatUnsentReply.undo()` on the held row,
+    /// built from its columns as `ChatUnsentReply.fetch` builds it, with the reopen queue emptied
+    /// before and after as `tapToastUndo()` does.
+    private func tapUndo(
+        _ tap: UndoSendPresenterTap, _ fixture: Fixture, outboxId: String
+    ) async throws -> PendingSendService.ReopenSnapshot? {
+        let service = PendingSendService.shared
+        switch tap {
+        case .toast:
+            return service.tapToastUndo()
+        case .bubble:
+            let row = try await outboxRow(fixture, outboxId)
+            let held = try #require(row, "control: the send is held")
+            let bubble = ChatUnsentReply(
+                outboxId: held.id, status: held.outboxStatus, sentAt: held.sentAt, holdUntil: held.holdUntil,
+                draftId: held.draftId, instanceEpoch: held.instanceEpoch, filed: false, textMessage: nil)
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            bubble.undo()
+            let snapshot = service.reopenSnapshot
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            return snapshot
+        }
     }
 
     private func outboxRow(_ fixture: Fixture, _ id: String) async throws -> OutboxMessage? {
@@ -166,22 +205,29 @@ struct UndoSendReturnsToDraftsTests {
 
     // MARK: - The confirmed Undo returns the message to Drafts
 
-    @Test("Undo of a message never saved to the server puts it in Drafts and queues the server copy, and Close just closes")
-    func undoReturnsNeverSavedMessageToDrafts() async throws {
+    @Test("Undo of a message never saved to the server, from the toast or the chat's Sending bubble, puts it in Drafts and queues the server copy, and Close just closes",
+          arguments: [UndoSendPresenterTap.toast, .bubble])
+    func undoReturnsNeverSavedMessageToDrafts(tap: UndoSendPresenterTap) async throws {
         let fixture = try makeFixture()
-        defer { finish(fixture) }
+        defer {
+            PendingSendService.shared.resetUndoOwnersForTesting()
+            finish(fixture)
+        }
         let draftId = "draft-\(UUID().uuidString)"
         let words = "Here are the numbers for next quarter."
         let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
-        let outboxId = try await send(fixture, draft(draftId, fixture, body: words), cursor: cursor)
+        let outboxId = try await send(fixture, draft(draftId, fixture, body: words), cursor: cursor, owner: tap.owner)
 
-        let snapshot = try #require(PendingSendService.shared.tapToastUndo(), "the Undo was not confirmed")
+        let undone = try await tapUndo(tap, fixture, outboxId: outboxId)
+        let snapshot = try #require(undone, "the Undo was not confirmed")
 
         #expect(try await outboxRow(fixture, outboxId) == nil)
         #expect(snapshot.returnedToDrafts)
         #expect(try await row(fixture, draftId).instanceEpoch == cursor.newEpoch,
                 "the return to Drafts must keep the row's generation")
         try await expectInDraftsAndQueuedForServer(fixture, draftId: draftId, words: words)
+        let saves = try await serverSaves(fixture, draftId)
+        #expect(saves.count == 1, "one server save, got \(saves.count)")
         let compose = UndoReopenCompose.composeView(for: snapshot)
         #expect(closeWithoutTyping(compose, loaded: try await row(fixture, draftId)) == .dismiss)
     }
@@ -230,14 +276,18 @@ struct UndoSendReturnsToDraftsTests {
 
     // MARK: - A failed return keeps the words reachable
 
-    @Test("If the return to Drafts fails, the Undo still stands and Close asks to save the message")
-    func failedReturnOpensUnsavedAndCloseAsksToSave() async throws {
+    @Test("If the return to Drafts fails, the Undo from the toast or the chat's Sending bubble still stands and Close asks to save the message",
+          arguments: [UndoSendPresenterTap.toast, .bubble])
+    func failedReturnOpensUnsavedAndCloseAsksToSave(tap: UndoSendPresenterTap) async throws {
         let fixture = try makeFixture()
-        defer { finish(fixture) }
+        defer {
+            PendingSendService.shared.resetUndoOwnersForTesting()
+            finish(fixture)
+        }
         let draftId = "draft-\(UUID().uuidString)"
         let words = "Words that must not be lost."
         let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
-        let outboxId = try await send(fixture, draft(draftId, fixture, body: words), cursor: cursor)
+        let outboxId = try await send(fixture, draft(draftId, fixture, body: words), cursor: cursor, owner: tap.owner)
         let before = try await row(fixture, draftId)
         // The admission's server save cannot be written.
         try await fixture.pool.write { db in
@@ -247,7 +297,8 @@ struct UndoSendReturnsToDraftsTests {
                 """)
         }
 
-        let snapshot = try #require(PendingSendService.shared.tapToastUndo(), "the cancellation must still stand")
+        let undone = try await tapUndo(tap, fixture, outboxId: outboxId)
+        let snapshot = try #require(undone, "the cancellation must still stand")
 
         #expect(!snapshot.returnedToDrafts)
         #expect(try await outboxRow(fixture, outboxId) == nil)

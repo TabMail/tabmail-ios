@@ -1109,7 +1109,8 @@ struct ComposeView: View {
         /// The guided tutorial's practice reply: sent with no undo hold.
         let isTutorialPracticeReply: Bool
         /// Undo shows on the chat's "Sending" bubble, not the toast
-        /// (`PendingSendService.sendHasBubbleUndo`), from the setting read at the Send tap.
+        /// (`PendingSendService.sendHasBubbleUndo`), from the setting read at the Send tap and the
+        /// screen this compose was opened on (`openedOn`).
         let sendHasBubbleUndo: Bool
         let outbound: DraftMessage
     }
@@ -1276,6 +1277,10 @@ struct ComposeView: View {
     /// PORT — process-local Undo reopens only the retained exact Draft
     /// owner/generation reconstructed before confirmed Outbox cancellation.
     var retainedDraftAuthority: PendingSendService.RetainedDraftAuthority?
+    /// The screen this compose was opened on, given as it opens and never changed (nil: a screen
+    /// that names none). Read at Send to decide who offers the send's Undo
+    /// (`PendingSendService.sendHasBubbleUndo`).
+    var openedOn: ComposeScreen?
     /// Fires when the user either sends, fails to persist, or dismisses —
     /// exactly once per compose session, via `ComposeOutcomeState.tryResolve`
     /// upstream. Non-agent compose entry points leave this `nil` and the
@@ -1305,6 +1310,7 @@ struct ComposeView: View {
         openAuthority: LocallyAuthoredDraftOpenAuthority? = nil,
         preparedDraft: Draft? = nil,
         retainedDraftAuthority: PendingSendService.RetainedDraftAuthority? = nil,
+        openedOn: ComposeScreen? = nil,
         onAgentOutcome: (@MainActor (ComposeOutcome) -> Void)? = nil
     ) {
         self.replyTo = replyTo
@@ -1323,6 +1329,7 @@ struct ComposeView: View {
         self.openAuthority = openAuthority
         self.preparedDraft = preparedDraft
         self.retainedDraftAuthority = retainedDraftAuthority
+        self.openedOn = openedOn
         self.onAgentOutcome = onAgentOutcome
         if let preparedDraft {
             var recipients = ComposeDraftGuards.Recipients()
@@ -3586,7 +3593,8 @@ struct ComposeView: View {
     }
 
     /// `chatViewActive` is the chat view setting read at the Send tap, before anything suspends
-    /// (snapshot settings at operation start); it decides who offers this send's Undo.
+    /// (snapshot settings at operation start); with `openedOn`, given as this compose opened, it
+    /// decides who offers this send's Undo.
     private func send(chatViewActive: Bool) async {
         // An explicit Save may be suspended while settling forwarded attachments.
         // Sending concurrently would race two durable dispositions of one compose.
@@ -3711,7 +3719,7 @@ struct ComposeView: View {
             isReplyAll: isReplyAll,
             isTutorialPracticeReply: isPracticeReply,
             sendHasBubbleUndo: PendingSendService.sendHasBubbleUndo(
-                chatViewActive: chatViewActive, inReplyTo: outbound.inReplyTo),
+                chatViewActive: chatViewActive, openedOn: openedOn, inReplyTo: outbound.inReplyTo),
             outbound: outbound)
 
         // Capture existing draft (server-side metadata preserved through save-before-send).

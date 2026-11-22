@@ -251,8 +251,8 @@ struct ChatReplyCompose: Equatable {
         return ChatReplyCompose(isReplyAll: isReplyAll, to: req.to, cc: req.cc, bcc: req.bcc)
     }
 
-    /// The compose card, opened in this kind, as main's Reply All entries open it.
-    /// `draftId`: the draft it saves to; nil, the reply's usual one.
+    /// The compose card, opened in this kind, as main's Reply All entries open it, on the chat
+    /// (`ComposeScreen.chat`). `draftId`: the draft it saves to; nil, the reply's usual one.
     @MainActor
     func composeView(
         replyTo message: MessageHeader?, suggestedBody: String? = nil, draftId: String? = nil,
@@ -261,7 +261,8 @@ struct ChatReplyCompose: Equatable {
         ComposeView(
             replyTo: message, suggestedBody: suggestedBody, isReplyAll: isReplyAll,
             prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,
-            prefillBcc: bcc.isEmpty ? nil : bcc, prefillDraftId: draftId, onAgentOutcome: onAgentOutcome)
+            prefillBcc: bcc.isEmpty ? nil : bcc, prefillDraftId: draftId, openedOn: .chat,
+            onAgentOutcome: onAgentOutcome)
     }
 }
 
