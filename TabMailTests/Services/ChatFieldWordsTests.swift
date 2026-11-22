@@ -424,6 +424,36 @@ struct ChatFieldWordsTests {
         }
     }
 
+    @Test("Sent words a confirmation card took come back when the field's own card closes unsent, unless a live transcript wrote newer words since: the field, the device and the next run keep what the user last had",
+          arguments: [false, true])
+    func takenWordsComeBackUnlessDictatedOver(dictated: Bool) async throws {
+        try await Self.withStore { pool, storage, store in
+            let key = ChatFieldWords.key(for: Self.header("ct-1", thread: "confirmation-taken-\(dictated)"))
+            let sent = "Reply that Friday works and archive the rest"
+            let said = "Ask about lunch instead"
+            store.apply(.put(sent), to: key)
+            store.apply(.sentFromField, to: key)
+            // The request's confirmation card takes the sent words off the field, then its own
+            // reply card opens.
+            store.apply(.confirmationCard, to: key)
+            #expect(store.fill(for: key).words == "", "control: the card took the sent words off the field")
+            store.apply(.composeOpened, to: key)
+            if dictated {
+                // The user dictates into the field while the card is open.
+                store.apply(.startHearing, to: key)
+                store.apply(.heard(said), to: key)
+            }
+            // The card closes unsent, then the request's answer.
+            store.apply(.answered, to: key)
+            await store.written()
+            let expected = dictated ? DictationController.appending(said, to: "") : sent
+            #expect(store.fill(for: key).words == expected, "the field: \(store.fill(for: key).words)")
+            let stored = try Self.storedWords(pool)
+            #expect(stored == [key: expected], "the device: \(stored)")
+            #expect(await Self.nextRun(storage, key) == expected, "the next run")
+        }
+    }
+
     @Test("An emptied field leaves no words stored")
     func emptiedFieldClearsTheWords() async throws {
         try await Self.withStore { pool, storage, store in
@@ -758,10 +788,19 @@ struct ChatFieldWordsTests {
     @Test("A read or write failure logs the error's type, never the words")
     func failuresNeverLogTheWords() throws {
         let text = try Self.source("TabMail/Services/AI/ChatFieldWords.swift")
-        let logs = text.components(separatedBy: "BackgroundSyncLogger.logDebug(").dropFirst().map { call in call.prefix { $0 != ")" } }
-        #expect(logs.count == 2, "control: the read and the write log: \(logs)")
-        for log in logs {
-            #expect(log.components(separatedBy: "\\(").count == 2 && log.contains("\\(type(of: error"), "\(log)")
+        // Every log statement of the store, whole: exactly these two, each naming only the error's type.
+        let allowed = [
+            #"BackgroundSyncLogger.logDebug("[ChatFieldWords] read failed: \(type(of: error))")"#,
+            #"BackgroundSyncLogger.logDebug("[ChatFieldWords] write failed: \(type(of: error))")"#,
+        ]
+        let calls = text.components(separatedBy: "BackgroundSyncLogger.").count - 1
+        #expect(calls == allowed.count, "the store logs only a failed read and a failed write: \(calls)")
+        for statement in allowed {
+            let found = text.components(separatedBy: statement).count - 1
+            #expect(found == 1, "logged whole, with the error's type only: \(statement)")
+        }
+        for other in ["print(", "NSLog(", "os_log(", "Logger(", "logger."] {
+            #expect(!text.contains(other), "no other log in the store: \(other)")
         }
     }
 

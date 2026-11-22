@@ -549,10 +549,13 @@ struct ChatReplyFieldTests {
         // A confirmation card first (an archive), then the field's own reply card, closed unsent:
         // the answer hands the words back as it does when they stayed in the field.
         let taken = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard)
-        #expect(taken.words == "" && taken.unsent == "" && taken.sentWordsTaken, "the card took them: \(taken)")
+        #expect(taken.words == "" && taken.unsent == "" && taken.atSend == "Ask", "the card took them: \(taken)")
         let handedBack = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .answered)
         #expect(handedBack.words == "Ask" && handedBack.unsent == "Ask" && handedBack.atSend == nil
-                    && !handedBack.composing && !handedBack.sentWordsTaken, "\(handedBack)")
+                    && !handedBack.composing, "\(handedBack)")
+        // Once handed back the send is over: a later answer or completion leaves them.
+        let after = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .answered, .completed, .answered)
+        #expect(after.words == "Ask", "\(after)")
         // A second confirmation before the card finds them taken already.
         let twice = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .confirmationCard, .composeOpened, .answered)
         #expect(twice.words == "Ask", "\(twice)")
@@ -563,6 +566,13 @@ struct ChatReplyFieldTests {
         #expect(newer.words == "Newer", "\(newer)")
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .said("more"), .composeOpened, .answered).words
                     == DictationController.appending("more", to: ""))
+        // A live transcript is the user's too, also when it writes while the card is open.
+        let heard = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .startHearing, .heard("Lunch instead"),
+                              .composeOpened, .answered)
+        #expect(heard.words == DictationController.appending("Lunch instead", to: ""), "\(heard)")
+        let heardWhileOpen = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .startHearing,
+                                       .heard("Lunch instead"), .answered)
+        #expect(heardWhileOpen.words == DictationController.appending("Lunch instead", to: ""), "\(heardWhileOpen)")
         // With no card of the field's own the answer completes the send; a card's Send completes it.
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .answered).words == "")
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .completed, .answered).words == "")
