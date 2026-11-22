@@ -695,6 +695,12 @@ struct ExchangeProviderSelectionWiringTests {
     private static let metadataFields = "\(headerFields),parentFolderId"
     private static let backfillFields = "\(headerFields),body"
     private static let fullFields = "\(headerFields),body,parentFolderId"
+    // The listings, the header reads and the details batch also expand Outlook's
+    // last verb, right after their `$select` (`ExchangeGraphMessageRequest.selection`);
+    // search, backfill, the full read and the message delta do not. The expansion
+    // is the provider's own constant: it names one Graph property, whose wire form
+    // `OutlookLastVerbTests` pins.
+    private static let lastVerb = GraphAPI.lastVerbExpandParameter
 
     private func provider(_ http: FakeHTTP.Scenario) -> ExchangeProvider {
         ExchangeProvider(
@@ -847,10 +853,10 @@ struct ExchangeProviderSelectionWiringTests {
         let h = Self.headerFields
         let expected = try [
             normalizedURL(
-                "\(Self.graphBase)/mailFolders/fetch-route/messages?$select=\(h)"
+                "\(Self.graphBase)/mailFolders/fetch-route/messages?$select=\(h)&\(Self.lastVerb)"
                     + "&$top=10&$orderby=receivedDateTime desc"),
             normalizedURL(
-                "\(Self.graphBase)/mailFolders/fetch-route/messages?$select=\(h)"
+                "\(Self.graphBase)/mailFolders/fetch-route/messages?$select=\(h)&\(Self.lastVerb)"
                     + "&$top=5&$orderby=receivedDateTime desc&$skip=3"),
             normalizedURL("\(Self.graphBase)/messages/full-route?$select=\(Self.fullFields)"),
             normalizedURL(
@@ -859,9 +865,9 @@ struct ExchangeProviderSelectionWiringTests {
             normalizedURL(
                 "\(Self.graphBase)/mailFolders/search-route/messages?$select=\(h)"
                     + "&$search=%22route%22&$top=20"),
-            normalizedURL("\(Self.graphBase)/messages/headers-route?$select=\(h)"),
+            normalizedURL("\(Self.graphBase)/messages/headers-route?$select=\(h)&\(Self.lastVerb)"),
             normalizedURL(
-                "\(Self.graphBase)/mailFolders/older-route/messages?$select=\(h)"
+                "\(Self.graphBase)/mailFolders/older-route/messages?$select=\(h)&\(Self.lastVerb)"
                     + "&$filter=receivedDateTime lt 2020-09-13T12:26:40Z"
                     + "&$top=10&$orderby=receivedDateTime desc"),
             normalizedURL(GraphAPI.batchURL),
@@ -875,7 +881,9 @@ struct ExchangeProviderSelectionWiringTests {
         #expect(items.count == 1)
         guard items.count == 1 else { return }
         #expect(items[0]["method"] as? String == "GET")
-        #expect(items[0]["url"] as? String == "/me/messages/details-route?$select=\(Self.metadataFields)")
+        // A batch item's URL is encoded where it is built, so its spaces go as `%20`.
+        let batchLastVerb = Self.lastVerb.replacingOccurrences(of: " ", with: "%20")
+        #expect(items[0]["url"] as? String == "/me/messages/details-route?$select=\(Self.metadataFields)&\(batchLastVerb)")
     }
 
     /// The user's search text must reach Graph as exactly what they typed.
