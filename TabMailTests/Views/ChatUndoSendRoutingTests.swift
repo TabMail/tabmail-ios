@@ -557,7 +557,7 @@ struct ChatUndoSendRoutingTests {
                 let view: UIView = chat.controller.view
                 switch gesture {
                 case .aiSuggestion:
-                    func showsSuggestion() -> Bool { HostedAccessibility.identifiers(in: view).contains(ChatSuggestionBubble.bubbleId) }
+                    @MainActor func showsSuggestion() -> Bool { HostedAccessibility.identifiers(in: view).contains(ChatSuggestionBubble.bubbleId) }
                     for _ in 0..<50 where !showsSuggestion() { try await Task.sleep(for: .milliseconds(100)) }
                     #expect(HostedAccessibility.activate(ChatSuggestionBubble.bubbleId, in: view), "the user taps the AI Suggestion")
                 case .toolbarForward:
@@ -567,7 +567,7 @@ struct ChatUndoSendRoutingTests {
                 let compose = try #require(chat.controller.presentedViewController?.view, "the chat opened its compose")
                 if gesture == .toolbarForward {
                     // A recipient, committed by its separator, and the user's own words.
-                    func toField() -> UITextField? {
+                    @MainActor func toField() -> UITextField? {
                         Self.firstView(UITextField.self, in: compose) { HostedAccessibility.identifier(of: $0) == "recipientInput-to" }
                             ?? Self.firstView(UITextField.self, in: compose)
                     }
@@ -600,7 +600,7 @@ struct ChatUndoSendRoutingTests {
 
     /// A screen's origin for the compose it shows, which can change while the compose is open (a
     /// chat whose emails changed: a merge brings in, or takes out, the email the compose answers).
-    @MainActor @Observable private final class LiveOrigin {
+    @MainActor @Observable final class LiveOrigin {
         var screen: ComposeScreen?
         /// Each origin the compose was built with, in order. Not observed: recording one never
         /// builds the compose again.
@@ -640,7 +640,7 @@ struct ChatUndoSendRoutingTests {
             defer { hosted.close() }
             for _ in 0..<50 where origin.built.isEmpty { try await Task.sleep(for: .milliseconds(100)) }
             origin.screen = later
-            func rebuilt() -> Bool { origin.built.count > 1 && origin.built.last == .some(later) }
+            @MainActor func rebuilt() -> Bool { origin.built.count > 1 && origin.built.last == .some(later) }
             for _ in 0..<50 where !rebuilt() { try await Task.sleep(for: .milliseconds(100)) }
             #expect(rebuilt(), "control: the open compose was built again with the other origin")
             let row = try await Self.tapSend(in: hosted.controller, fixture: fixture)
