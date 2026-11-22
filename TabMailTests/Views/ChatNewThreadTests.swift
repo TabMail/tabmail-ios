@@ -514,6 +514,10 @@ struct ChatNewThreadTests {
         let bare = pill.filter { !$0.isWhitespace && $0 != "(" && $0 != ")" }
         #expect(Self.count("!isComposeMode&&message==nil", in: bare) == 0, "nor in another spelling")
         #expect(Self.count("message==nil&&!isComposeMode", in: bare) == 0, "nor turned around")
+        // Nor a new gate on the compose context and message alone, which a new email also passes:
+        // the one such test is isInboxChat's own.
+        #expect(Self.count("composeContext==nil&&message==nil", in: bare) == 1, "only isInboxChat tests these two")
+        #expect(Self.count("message==nil&&composeContext==nil", in: bare) == 0, "nor turned around")
         let sessionAt = try #require(pill.range(of: "if let newEmail = replyField?.newEmail { return newEmail.sessionKey }"))
         let inboxAt = try #require(pill.range(of: "return \"inbox\""))
         #expect(sessionAt.lowerBound < inboxAt.lowerBound, "its own session, before the inbox's")

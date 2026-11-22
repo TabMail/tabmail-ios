@@ -11,7 +11,9 @@ import UIKit
 
 /// A new email's chat on screen, signed in, pushed in a navigation as the mailbox list pushes it,
 /// against a real database: what the field shows of a reopened draft and of an empty one (focus,
-/// mic, paperclip, the "e.g." line), the attachments waiting above it, Send's ask, its Cancel and
+/// mic, paperclip, the "e.g." line, the row's order and places), the typed words kept when a cover
+/// hides the chat and it shows again, the attachments waiting above it and the files that could
+/// not be added, Send's ask, its Cancel and
 /// the way from it to "Add recipient", Send with someone picked, the header's sheet, the alert a
 /// reopened draft with unreadable attachments shows, and what the app going to the background,
 /// Back, "Leave without saving" and the screen going away any other way save, end, give back and
@@ -50,6 +52,8 @@ struct ChatNewThreadScreenTests {
         var phase: ScenePhase = .active
         var pushed: ChatNewThreadModel?
         var shown = true
+        /// A full-screen cover over the navigation, as the camera's hides the chat.
+        var covered = false
         /// Pushed once: the root appearing again after Back does not push the chat again.
         var didPush = false
     }
@@ -71,6 +75,7 @@ struct ChatNewThreadScreenTests {
                             stage.pushed = model
                         }
                 }
+                .fullScreenCover(isPresented: $stage.covered) { Color.black }
                 .environment(\.scenePhase, stage.phase)
                 .environment(\.hasTabMailSession, true)
             } else {
@@ -226,6 +231,65 @@ struct ChatNewThreadScreenTests {
             #expect(hasMic, "the field has its mic: \(labels.prefix(24))")
             let ids = HostedAccessibility.identifiers(in: screen.view)
             #expect(ids.contains(ChatPaperclipButton.id), "and the paperclip: \(ids.prefix(24))")
+            // The row keeps its places: the mic at its start, then the words, the paperclip at
+            // their end, and Send at the row's end; the mic and Send keep their widths.
+            let rowFrame = Self.elements(ChatNewThreadView.fieldId, in: screen.view).first?.accessibilityFrame
+            let micFrame = HostedAccessibility.elements(under: screen.view)
+                .first { $0.accessibilityLabel == "Dictate" }?.accessibilityFrame
+            let clipFrame = Self.elements(ChatPaperclipButton.id, in: screen.view).first?.accessibilityFrame
+            let sendFrame = Self.elements("chatSend", in: screen.view).first?.accessibilityFrame
+            let textFrame = Self.editableField(in: screen.view).map { UIAccessibility.convertToScreenCoordinates($0.bounds, in: $0) }
+            let row = try #require(rowFrame, "the field's row is on screen")
+            let mic = try #require(micFrame, "the mic is on screen")
+            let clip = try #require(clipFrame, "the paperclip is on screen")
+            let send = try #require(sendFrame, "Send is on screen")
+            let text = try #require(textFrame, "the words are on screen")
+            let inOrder = mic.midX < text.minX && text.maxX < clip.midX && clip.midX < send.midX
+            #expect(inOrder, "mic, words, paperclip, Send, in that order: \(mic) \(text) \(clip) \(send)")
+            let sendAtEnd = row.maxX - ChatViewLayout.fieldSendInset - ChatViewLayout.fieldSendSize / 2
+            let micAtStart = row.minX + ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2
+            #expect(abs(send.midX - sendAtEnd) < 1, "Send keeps its place at the row's end: \(send), row \(row)")
+            #expect(abs(mic.midX - micAtStart) < 1, "the mic keeps its place at the row's start: \(mic), row \(row)")
+            #expect(abs(send.width - ChatViewLayout.fieldTapSize) < 1, "Send keeps its width: \(send.width)")
+            #expect(abs(mic.width - ChatViewLayout.fieldMicTapWidth) < 1, "the mic keeps its width: \(mic.width)")
+        }
+    }
+
+    @Test("A reopened draft's chat hidden by a full-screen cover and shown again keeps the words typed since it opened, and Back saves them")
+    func hiddenAndShownKeepsTyping() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await hiddenAndShownKeepsTypingBody() }
+    }
+
+    /// The camera's cover hides the chat the same way (the simulator has no camera): the field
+    /// puts the draft's saved words in once, as the chat first opens, never again as it shows.
+    private func hiddenAndShownKeepsTypingBody() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let draft = try await savedDraft(fixture, body: "Lunch on Friday?")
+        let model = ChatNewThreadModel(reopening: draft, account: fixture.account, queueDraftSave: { _, _ in true })
+        let typed = "Lunch on Friday? Bring the menu"
+        try await withScreen(model) { screen in
+            try await Self.waitUntil { Self.fieldText(in: screen.view) == "Lunch on Friday?" }
+            #expect(Self.fieldText(in: screen.view) == "Lunch on Friday?", "control: the reopened words are in the field")
+            #expect(ThreadChatTests.type(typed, in: screen.view))
+            try await Self.waitUntil { model.words == typed }
+            screen.stage.covered = true
+            try await Self.waitUntil { !DraftSessionRegistry.shared.isActive(model.draftId) }
+            let hidden = !DraftSessionRegistry.shared.isActive(model.draftId)
+            #expect(hidden, "control: the cover hid the chat (it went away and gave its draft back)")
+            screen.stage.covered = false
+            try await Self.waitUntil { DraftSessionRegistry.shared.isActive(model.draftId) && Self.fieldText(in: screen.view) != nil }
+            let shown = DraftSessionRegistry.shared.isActive(model.draftId)
+            #expect(shown, "control: the chat is shown again")
+            try await Self.settle()
+            #expect(Self.fieldText(in: screen.view) == typed, "the field keeps what was typed")
+            #expect(model.words == typed, "and so do the draft's words")
+            #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: screen.view), "Back takes a tap")
+            try await Self.waitUntil { screen.stage.pushed == nil && !DraftSessionRegistry.shared.isActive(model.draftId) }
+            let savedRow = try await row(fixture, model.draftId)
+            let saved = try #require(savedRow, "the draft is saved")
+            #expect(saved.body == typed, "Back saved the words typed")
         }
     }
 

@@ -514,7 +514,7 @@ struct ChatReplyFieldTests {
                 == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text),
                 "nothing else touches the field's state")
         // Each change, where it happens: typing (above), both dictations, both sends, the
-        // completion, a confirmation card, and an Edit.
+        // completion, a confirmation card, an Edit, the e.g. line, and a new email's saved words.
         #expect(Self.count("fieldFill.apply(.startHearing) speech.start(locale: speechLocale, auto: auto) { transcript in fieldFill.apply(.heard(transcript))", in: text) == 1)
         #expect(Self.count("{ text in fieldFill.apply(.said(text))", in: text) == 1)
         #expect(Self.count("fieldSentText = nil // Words written after the send this completes are newer, and stay (`ChatFieldFill`). fieldFill.apply(.completed)", in: text) == 1)
@@ -527,7 +527,10 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldFill.apply(.put(text)) isTextFieldFocused = true", in: text) == 1)
         // The "e.g." line's change goes in as words and is never sent from here.
         #expect(Self.count("func putExample(_ example: String) { fieldFill.apply(.put(example)) inputSelection = .init(insertionPoint: inputText.endIndex) }", in: text) == 1)
-        #expect(Self.count("fieldFill.apply(", in: text) == 10)
+        // A new email's saved words go in once, as its chat first opens; the screen hidden and
+        // shown again (the camera's cover) keeps what was typed since.
+        #expect(Self.count("guard let newEmail = replyField?.newEmail, !newEmailStarted else { return } newEmailStarted = true if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) }", in: text) == 1)
+        #expect(Self.count("fieldFill.apply(", in: text) == 11)
     }
 
     @Test("The field's Send sends the words to the agent; nothing in the field opens compose")
