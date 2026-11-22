@@ -611,16 +611,22 @@ struct ChatFieldWordsTests {
             storage.failReads(true)
             let load = Task { await run.load(key) }
             #expect(await storage.waitForReads(of: key), "control: the read started")
-            // The user types while the read is out; the read then fails.
+            // The user types while the read is out, and the typed words are written; the read then fails.
             let typed = "Typed while the read was out"
             run.apply(.put(typed), to: key)
+            await run.written()
+            let typedRows = try Self.rows(pool)
+            #expect(typedRows.map(\.words) == [typed], "control: the typed words are stored before the read fails")
+            let batches = storage.batchCount
             storage.release(readsOf: key)
             await load.value
             storage.failReads(false)
             await run.written()
             #expect(run.fill(for: key).words == typed, "the failed read leaves the typed words: \(run.fill(for: key).words)")
-            let stored = try Self.rows(pool).map(\.words)
-            #expect(stored == [typed], "the typed words are stored: \(stored)")
+            let stored = try Self.rows(pool)
+            #expect(stored == typedRows, "the failed read writes nothing: the typed words' row, its stamp unchanged")
+            let laterBatches = storage.batchCount
+            #expect(laterBatches == batches, "no write after the failed read")
             #expect(await Self.nextRun(storage, key) == typed, "and the next run reads them")
         }
     }
@@ -852,30 +858,68 @@ struct ChatFieldWordsTests {
         }
     }
 
-    @Test("Delete All Email Index Data keeps a thread's old unsent words, whether or not a maintenance pass saw the thread lately: after a pass and the resync, they show again",
-          arguments: [true, false])
-    func indexWipeKeepsTheWordsThroughTheResync(passSawTheThread: Bool) async throws {
+    /// The ways the app deletes a thread's emails to download them again.
+    enum Resync: String, CaseIterable, Sendable {
+        /// Settings' Delete All Email Index Data (`SettingsView.localIndexWipeTxn`).
+        case indexWipe
+        /// An account's Reset Message Data (`AccountDetailView.resetMessageDataTxn`).
+        case accountReset
+        /// A folder's UIDVALIDITY change (`AccountManager.uidValidityResetPurgeTxn`).
+        case uidValidity
+
+        /// Deletes the emails of `account`'s INBOX in `pool` as this resync does.
+        @MainActor
+        func run(_ pool: DatabasePool, account: String) async throws {
+            switch self {
+            case .indexWipe:
+                try await pool.write { try SettingsView.localIndexWipeTxn($0) }
+            case .accountReset:
+                try await pool.write { try AccountDetailView.resetMessageDataTxn($0, accountId: account) }
+            case .uidValidity:
+                let purged = await AccountManager.shared.uidValidityResetPurgeTxn(
+                    accountId: account, folderPath: "INBOX",
+                    folderId: MessageIdentity.folderId(accountId: account, folderPath: "INBOX"))
+                let committed = purged != nil
+                #expect(committed, "control: the folder's purge committed")
+            }
+        }
+    }
+
+    @Test("Every resync (Delete All Email Index Data, Reset Message Data, a UIDVALIDITY change) keeps a thread's old unsent words for the full grace from the reset, whether or not a maintenance pass saw the thread lately; an orphan already past the grace goes; after the resync the words show again",
+          arguments: Resync.allCases, [true, false])
+    func resyncKeepsTheWordsForTheFullGrace(_ resync: Resync, passSawTheThread: Bool) async throws {
         try await Self.withStore { pool, storage, store in
             try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
-            let email = Self.header("w-1-\(passSawTheThread)", thread: "wiped-\(passSawTheThread)")
+            let tag = "\(resync.rawValue)-\(passSawTheThread)"
+            let email = Self.header("w-1-\(tag)", thread: "wiped-\(tag)")
             try await pool.write { try email.insert($0) }
             let key = ChatFieldWords.key(for: email)
-            let words = "Typed long before the wipe"
+            // A thread with no email on the device.
+            let orphan = ChatFieldWords.key(for: Self.header("w-2-\(tag)", thread: "gone-\(tag)"))
+            let words = "Typed long before the reset"
             store.apply(.put(words), to: key)
+            store.apply(.put("Words of a thread long gone"), to: orphan)
             await store.written()
             try Self.age(key, pool: pool)
             let database = PrioritizedDatabase(pool: pool)
-            let seen = Date()
             // With `passSawTheThread` false, no maintenance pass ran since the words aged past the
-            // grace (the app was not polled): only the wipe itself can mark the thread as seen.
+            // grace (the app was not polled): only the reset itself can mark the thread as seen.
             if passSawTheThread {
-                SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: seen)
+                SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: Date())
             }
+            // The orphan is past the grace when the reset runs.
+            try Self.age(orphan, pool: pool)
 
-            try await pool.write { try SettingsView.localIndexWipeTxn($0) }
-            #expect(try await pool.read { try MessageHeader.fetchCount($0) } == 0, "control: the wipe deleted the headers")
-            // The first poll after the wipe runs maintenance before the thread is back.
-            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: try Self.later(1, from: seen))
+            let reset = Date()
+            try await resync.run(pool, account: Self.account)
+            let left = try await pool.read { try MessageHeader.fetchCount($0) }
+            #expect(left == 0, "control: the reset deleted the thread's email")
+            // The first poll after the reset runs maintenance before the thread is back, an hour
+            // inside the full grace counted from the reset.
+            let inside = try Self.hours(-1, after: try Self.later(SyncConfig.aiCacheOrphanGraceDays, from: reset))
+            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: inside)
+            #expect(try Self.rows(pool).map(\.sessionId) == [key],
+                    "the live thread's words wait out the full grace from the reset; the orphan past the grace went")
 
             // The resync restores the thread.
             try await pool.write { try email.insert($0) }

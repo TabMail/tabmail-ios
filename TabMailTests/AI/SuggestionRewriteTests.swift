@@ -1369,9 +1369,10 @@ struct FieldReplyCardWordsTests {
             let older = try TestDatabase.insertMessageHeader(
                 fixture.db, messageId: "s6", subject: "Offsite", date: earlier, rfc822MessageId: "<offsite-plan@example.com>")
             let shownId = fixture.header.id, olderId = older.id
+            // The chat's key reads the thread the inbox groups by (`computedThreadId`).
             try await fixture.db.write { db in
-                try db.execute(sql: "UPDATE messageHeader SET threadId = ? WHERE id IN (?, ?)",
-                               arguments: ["offsite-thread", shownId, olderId])
+                try db.execute(sql: "UPDATE messageHeader SET threadId = ?, computedThreadId = ? WHERE id IN (?, ?)",
+                               arguments: ["offsite-thread", "offsite-thread", shownId, olderId])
             }
             let shownRow = try await fixture.db.read { try MessageHeader.fetchOne($0, key: shownId) }
             let olderFetched = try await fixture.db.read { try MessageHeader.fetchOne($0, key: olderId) }

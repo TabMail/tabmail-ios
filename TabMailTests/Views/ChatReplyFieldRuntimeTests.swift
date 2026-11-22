@@ -377,6 +377,14 @@ struct ChatReplyFieldRuntimeTests {
             let body = try Self.function(name, in: island)
             #expect(body.contains("sendAgentChat(text)") && !body.contains("field:"), "\(name) sends with no field: \(body)")
         }
+        // A send names the field's words only from the field's own send, never from what the field
+        // holds: the re-sends are reached only through a bubble's context menu, which takes no
+        // activation in a hosted test, so the one place a send's field key is decided is fenced.
+        let send = try Self.function("func sendAgentChat(", in: island)
+        #expect(send.components(separatedBy: "fieldWordsKey = ").count == 2
+                    && send.contains("let fieldWordsKey = field.map { ChatFieldWords.key(for: $0.message) }"),
+                "a send's field key comes from its field alone")
+        #expect(!send.contains("holdsSentWords"), "what the field holds never names a send's field key")
     }
 
     @Test("A sent compose card and an agent answer from the field complete on the request's own chat key, never the view's")

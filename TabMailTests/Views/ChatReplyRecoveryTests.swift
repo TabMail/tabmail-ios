@@ -23,6 +23,9 @@ import UIKit
 /// Each case opens the chat for real in a window with its requests going to a fake backend, picks
 /// "only David" in Reply to as the user does, sends from the field, fails the first request, changes
 /// Reply to, recovers with the field's Retry, and reads the reply the agent's `email_reply` opens.
+///
+/// The field's words through the same real route (ADR-IOS-117): a field edit of the AI Suggestion
+/// whose card the agent's `email_reply` opens, closed unsent, hands the words back to the user.
 @Suite("Who gets the agent's reply after a recovered field request", .serialized, .processGlobalState)
 @MainActor
 struct ChatReplyRecoveryTests {
@@ -54,9 +57,9 @@ struct ChatReplyRecoveryTests {
         case serverError
     }
 
-    /// The fake backend: the first request fails as `failure`; a later request with no saved state
-    /// asks for `email_reply` on the email it names (unless `asksForReply` is false); one carrying
-    /// the tool's result is answered "Done".
+    /// The fake backend: the first request fails as `failure` (nil: it does not fail); a request
+    /// with no saved state that does not fail asks for `email_reply` on the email it names (unless
+    /// `asksForReply` is false); one carrying the tool's result is answered "Done".
     final class Backend: @unchecked Sendable {
         let http = FakeHTTP.Scenario()
         final class Record: Sendable {
@@ -69,7 +72,7 @@ struct ChatReplyRecoveryTests {
         /// these words, instead of writing a reply. `recompute`: a reply asked for by a card's
         /// Recompute is answered with `recomputed`, held until the gate is released.
         /// `cardEdit`: the compose edit a card's own pill asks for is answered with this JSON.
-        init(failure: Failure, asksForReply: Bool = true, editRequest: String? = nil, recompute: ReplyGate? = nil,
+        init(failure: Failure?, asksForReply: Bool = true, editRequest: String? = nil, recompute: ReplyGate? = nil,
              cardEdit: String? = nil) {
             http.register(path: "/completions/chat", method: "POST") { [record] request in
                 if let recompute, AITextMessageCallerTests.Backend.prompt(request.body) == "system_prompt_compose" {
@@ -86,7 +89,7 @@ struct ChatReplyRecoveryTests {
                     bodies.append(body)
                     return bodies.count
                 }
-                if count == 1 {
+                if count == 1, let failure {
                     switch failure {
                     case .connectionLost: return .transportError(.networkConnectionLost)
                     case .serverError: return .status(500)
@@ -690,6 +693,67 @@ struct ChatReplyRecoveryTests {
                 #expect(Self.addresses(card["to"]).union(Self.addresses(card["cc"])) == ["alex@example.com", "david@example.com", "sam@example.com"],
                         "the card goes to everyone on the email: \(card)")
                 #expect(Self.addresses(card["bcc"]).isEmpty, "nobody in Bcc: \(card)")
+            }
+        }
+    }
+
+    @Test("A field edit of the AI Suggestion that changes its envelope opens the field's own card through the agent's email_reply; closed unsent, the answer hands the words back: in the field, on the device, and in the chat opened again after a relaunch")
+    func fieldEditCardClosedUnsentKeepsTheWords() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let sent = "Make it formal"
+        let backend = Backend(failure: nil, editRequest: sent)
+        let edited = Self.editedSuggestion
+        // The edit changes the envelope (a new subject), so it opens a card instead of landing in place.
+        let composeEdit: EmailReplyTool.ComposeEdit = { _, _, _, _ in
+            try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+                response: "Done.", subject: "Re: New plan", body: edited.body,
+                textMessage: edited.textMessage ?? "", changeCommand: sent)))
+        }
+        try await HostedAccessibility.withAutomation {
+            try await withChat(backend, tag: "edit-card-words", suggestion: Self.shownSuggestion, composeEdit: composeEdit) { chat in
+                let router = AgentToolRouter.shared
+                let key = ChatFieldWords.key(for: chat.email)
+                try await Self.waitUntil { Self.ghosts(in: chat.view).contains { $0.text == Self.shownSuggestion.textMessage } }
+                #expect(Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage],
+                        "control: the chat shows the AI Suggestion: \(Self.ghosts(in: chat.view).map(\.text))")
+
+                // The field asks for the edit; the card the agent's email_reply opens is held in the queue.
+                try await Self.waitUntil { Self.type(sent, in: chat.view) }
+                #expect(Self.type(sent, in: chat.view), "control: the field takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                router.composePresentationDidBegin()
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { router.composeQueueDepth == 1 }
+                let request = try #require(router.firstQueuedRequestForTesting,
+                                           "control: the agent's email_reply opened a card: \(backend.bodies.count) requests")
+                let onOwnDraft = request.draftId != nil
+                #expect(onOwnDraft, "control: the card is the suggestion edit's own")
+                let composing = ChatFieldWords.shared.fill(for: key).composing
+                #expect(composing, "the field's own card owns the send")
+
+                // The user closes the card unsent; the agent then answers.
+                request.onOutcome(.cancelled)
+                router.composePresentationDidEnd()
+                try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 2, "control: the tool's result went back and was answered")
+                try await Task.sleep(for: .milliseconds(300))
+                let fill = ChatFieldWords.shared.fill(for: key)
+                #expect(fill.words == sent && fill.unsent == sent && !fill.composing, "the words are the user's again: \(fill)")
+                let texts = ChatFieldWordsRuntimeTests.fieldTexts(chat.view)
+                #expect(texts.contains(sent), "the words stay in the field: \(texts)")
+                await ChatFieldWords.shared.written()
+                let stored = try await chat.pool.read { try ChatFieldWordsRecord.fetchAll($0) }
+                let byKey = Dictionary(uniqueKeysWithValues: stored.map { ($0.sessionId, $0.words) })
+                #expect(byKey == [key: sent], "kept on the device: \(byKey)")
+
+                // A relaunch (a fresh store on the same database), then the chat opened again.
+                ChatFieldWords.shared = ChatFieldWords()
+                try await ChatFieldWordsRuntimeTests.open(chat.email) { view in
+                    try await Self.waitUntil { ChatFieldWordsRuntimeTests.fieldTexts(view).contains(sent) }
+                    let reopened = ChatFieldWordsRuntimeTests.fieldTexts(view)
+                    #expect(reopened.contains(sent), "the field opened again after a relaunch: \(reopened)")
+                }
             }
         }
     }

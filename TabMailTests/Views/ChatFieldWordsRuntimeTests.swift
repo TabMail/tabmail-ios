@@ -994,6 +994,63 @@ struct ChatFieldWordsRuntimeTests {
         }
     }
 
+    @Test("A field request's own reply card closed unsent, then a confirmation card of the same request, then its answer: the sent words are the user's again, in the field, on the device and after a relaunch")
+    func closedOwnCardThenConfirmationKeepsTheSend() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can drive the hosted field")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withDatabase { pool in
+                try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
+                let email = Self.header("closed-confirm", thread: "closed-confirm-thread")
+                try await pool.write { try email.insert($0) }
+                let key = ChatFieldWords.key(for: email)
+                let sent = "Reply that Friday works and archive the rest"
+                // One invocation for the whole request: its card and its confirmation carry the same field key.
+                let invocation = Self.invocation(.fieldUnchanged, email: email)
+                let backend = ThreadChatTests.Backend(holdAnswers: true)
+                try await ThreadChatTests.withBackend(backend, chatView: true) {
+                    let host = Host(email)
+                    let pill = try await Self.mount(PillView(host: host, replyField: true))
+                    defer { pill.close() }
+                    try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
+                    let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
+                    #expect(asked, "control: the request reached the backend")
+
+                    // The field's own reply card opens and closes unsent.
+                    let result = try await Self.sendCompose(.reply, invocation, email: email, pool: pool, outcome: .cancelled)
+                    #expect(!result.contains("sent successfully"), "control: the card closed unsent: \(result)")
+                    let composing = ChatFieldWords.shared.fill(for: key).composing
+                    #expect(composing, "control: the field's own card owns the send")
+
+                    // The same request then raises a confirmation card (an archive).
+                    let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: email))
+                    let card = AgentToolRouter.ActionConfirmation(
+                        action: .archive, emails: [], contacts: [], calendarEvents: [], templates: [], onRespond: { _ in })
+                    SessionUISink(session: session, fieldWordsKey: invocation.fieldWordsKey).deliverConfirmation(card)
+                    try await Self.settle()
+                    let afterCard = ChatFieldWords.shared.fill(for: key)
+                    #expect(afterCard.words == sent, "the confirmation empties nothing: \(afterCard)")
+
+                    // The request's answer.
+                    backend.proceed.signal()
+                    try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
+                    try await Self.settle()
+                    let fill = ChatFieldWords.shared.fill(for: key)
+                    #expect(fill.words == sent && fill.unsent == sent && fill.atSend == nil && !fill.composing,
+                            "the words are the user's again: \(fill)")
+                    let texts = Self.fieldTexts(pill.view)
+                    #expect(texts.contains(sent), "the words stay in the field: \(texts)")
+                }
+                await ChatFieldWords.shared.written()
+                #expect(try Self.stored(pool) == [key: sent], "kept on the device")
+                // A relaunch: a fresh store on the same database.
+                await Self.newRun { PrioritizedDatabase(pool: pool) }
+                await ChatFieldWords.shared.load(key)
+                #expect(ChatFieldWords.shared.fill(for: key).words == sent,
+                        "after a relaunch: \(ChatFieldWords.shared.fill(for: key).words)")
+            }
+        }
+    }
+
     @Test("A compose card from the field empties the field on its Send; a compose card from elsewhere keeps the typed words: in the field, on the device and in a fresh store")
     func fieldCardEmptiesElsewhereCardKeeps() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")

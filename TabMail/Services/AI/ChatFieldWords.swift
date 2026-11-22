@@ -313,10 +313,12 @@ final class ChatFieldWords {
     }
 
     /// Re-stamp to `now`, in one UPDATE, every row whose thread still has an email on the device
-    /// (`ChatThreadKey.memberSQL`), and return their keys. The orphan pass runs it first; Delete All
-    /// Email Index Data (`SettingsView.localIndexWipeTxn`) runs it in its transaction before the
-    /// headers go, so the resync's re-walk counts as emails briefly gone from that moment, however
-    /// long ago the last orphan pass ran.
+    /// (`ChatThreadKey.memberSQL`), and return their keys. The orphan pass runs it first; every
+    /// transaction that deletes emails for a resync runs it before the headers go (Delete All Email
+    /// Index Data, `SettingsView.localIndexWipeTxn`; an account's Reset Message Data,
+    /// `AccountDetailView.resetMessageDataTxn`; a folder's UIDVALIDITY change,
+    /// `AccountManager.uidValidityResetPurgeTxn`), so the resync's re-walk counts as emails briefly
+    /// gone from that moment, however long ago the last orphan pass ran.
     @discardableResult
     nonisolated static func restampLive(db: Database, now: Date) throws -> Set<String> {
         let keys = try String.fetchAll(db, sql: "SELECT sessionId FROM \(ChatFieldWordsRecord.databaseTableName)")
