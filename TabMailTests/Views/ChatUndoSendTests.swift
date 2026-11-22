@@ -530,15 +530,27 @@ struct ChatUndoSendTests {
     @Test("Every compose the chat view opens for a reply or forward records the chat only for its own email, and no other screen's compose records it")
     func onlyTheChatsComposesRecordTheChat() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        // Its builders: the agent's new email, its Forward card and the toolbar Forward (`ComposeView(`);
-        // the AI Suggestion and the agent's reply card (`.composeView(`).
+        // Its builders: the toolbar Forward (`ComposeView(`); the AI Suggestion and the agent's cards,
+        // the agent's through its one presenter (`.composeView(`).
         let built = chat.components(separatedBy: "ComposeView(").count - 1 + chat.components(separatedBy: ".composeView(").count - 1
         let decided = chat.components(separatedBy: "openedOn: composeScreen(answering: ").count - 1
-        #expect(built == 5, "control: the chat's compose builders: \(built)")
-        #expect(decided == 4, "every reply or forward it opens records the chat only for its own email: \(decided) of 4")
+        #expect(built == 3, "control: the chat's compose builders: \(built)")
+        #expect(decided == 3, "every compose it opens records the chat only for its own email: \(decided) of 3")
         let builder = try Self.source("TabMail/Views/Chat/ChatReplyField.swift")
         #expect(builder.contains("prefillDraftId: draftId, openedOn: openedOn,"),
                 "the chat's reply builder (AI Suggestion, agent reply) records what the chat decided")
+        // The AI Suggestion's card and the agent's reply and forward cards record what their host
+        // decided; the agent's new email records nothing.
+        let recorded = builder.components(separatedBy: "openedOn: openedOn,").count - 1
+        #expect(recorded == 3, "the AI Suggestion's card and the agent's reply and forward cards: \(recorded) of 3")
+        // The agent's cards on the inbox and the email's screen open through the same presenter and
+        // record no screen.
+        for path in ["TabMail/Views/Inbox/InboxView.swift", "TabMail/Views/Message/MessageDetailView.swift"] {
+            let host = try Self.source(path)
+            let presents = host.contains("req.composeView(account:")
+            let records = host.contains("openedOn:")
+            #expect(presents && !records, "\(path): the agent's card records no screen")
+        }
         let unconditional = try Self.appSourceFiles(containing: "openedOn: .chat")
         #expect(unconditional.isEmpty, "no compose records the chat whatever its target: \(unconditional)")
     }

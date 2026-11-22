@@ -66,7 +66,7 @@ struct MessageAICacheFullTests {
                 accountId: "acc1",
                 folderPath: "INBOX",
                 rfc822MessageId: "<reply@test.com>",
-                cachedReply: "Thanks for the update, I will review by Friday.",
+                reply: ReplyResult(body: "Thanks for the update, I will review by Friday.", textMessage: nil),
                 replyGeneratedAt: now,
                 db: $0
             )
@@ -157,7 +157,7 @@ struct MessageAICacheFullTests {
                 accountId: "acc1",
                 folderPath: "INBOX",
                 rfc822MessageId: "<keep@test.com>",
-                cachedReply: "New reply text",
+                reply: ReplyResult(body: "New reply text", textMessage: nil),
                 db: $0
             )
         }
@@ -257,7 +257,7 @@ struct MessageAICacheFullTests {
                 reminderTime: "10:00",
                 reminderContent: "Submit quarterly report",
                 actionTag: .reply,
-                cachedReply: "I will submit by Friday.",
+                reply: ReplyResult(body: "I will submit by Friday.", textMessage: nil),
                 db: $0
             )
         }

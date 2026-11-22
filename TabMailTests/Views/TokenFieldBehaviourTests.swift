@@ -230,11 +230,11 @@ struct TokenFieldBehaviourTests {
         #expect(empty.filling(bcc: RecipientEntry("a@example.com")).revealsCcOrBcc(comparedTo: empty))
         #expect(empty.filling(bcc: RecipientEntry("nobody")).revealsCcOrBcc(comparedTo: empty))
         #expect(empty.committing("nobody,", typing: "", to: .bcc).revealsCcOrBcc(comparedTo: empty))
-        let aiAdd = empty.applying(to: nil, cc: nil, bcc: RecipientEntryTests.delta(add: "Jane"))
+        let aiAdd = empty.applying(to: nil, cc: nil, bcc: RecipientEntryTests.delta(add: ["jane@example.com"]))
         #expect(aiAdd.revealsCcOrBcc(comparedTo: empty))
         let full = empty.filling(bcc: RecipientEntry("a@example.com"))
         #expect(!full.revealsCcOrBcc(comparedTo: full))
-        let cleared = full.applying(to: nil, cc: nil, bcc: RecipientEntryTests.delta(remove: "*"))
+        let cleared = full.applying(to: nil, cc: nil, bcc: RecipientEntryTests.delta(remove: ["*"]))
         #expect(!cleared.revealsCcOrBcc(comparedTo: full))
 
         // The write every change makes: it stores the change and shows Cc and

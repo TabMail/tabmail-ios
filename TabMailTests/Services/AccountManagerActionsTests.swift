@@ -559,7 +559,7 @@ struct AccountManagerActionsTests {
                 rfc822MessageId: message.rfc822MessageId,
                 summaryBlurb: "Already computed",
                 actionTag: .archive,
-                cachedReply: "Already drafted",
+                reply: ReplyResult(body: "Already drafted", textMessage: nil),
                 db: db)
             try MessageHeader.filter(Column("id") == message.id).updateAll(
                 db,

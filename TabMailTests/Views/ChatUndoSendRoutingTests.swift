@@ -219,14 +219,16 @@ struct ChatUndoSendRoutingTests {
         afterTap()
     }
 
-    /// The ready AI Suggestion's compose card, built as the chat builds it (`ChatThreadView`): a
-    /// Reply All to the email's people, saving to the suggestion's own draft (`ChatReadyReply.draftId`).
+    /// The AI Suggestion the tests' ready reply holds.
+    nonisolated private static let readySuggestion = ReplyResult(body: "Tuesday works for me.", textMessage: nil)
+
+    /// The ready AI Suggestion's compose card, built as the chat builds it (`ChatThreadView`): the
+    /// suggestion's envelope for the email's people, saving to the suggestion's own draft
+    /// (`ChatReadyReply.draftId`).
     private static func readyAIReply(_ fixture: Fixture) -> some View {
-        let ready = ChatReadyReply(
-            message: fixture.parent,
-            compose: ChatReplyCompose.make(replyAllTo: fixture.parent, accounts: [fixture.account]))
+        let ready = ChatReadyReply(message: fixture.parent, suggestion: Self.readySuggestion, accounts: [fixture.account])
         return ready.compose.composeView(
-            replyTo: ready.message, suggestedBody: "Tuesday works for me.", draftId: ready.draftId,
+            replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
             openedOn: ChatThreadView.composeScreen(answering: ready.message, chatMessageIds: fixture.chatMessageIds),
             onAgentOutcome: { _ in })
     }
@@ -629,7 +631,7 @@ struct ChatUndoSendRoutingTests {
             let screen = origin.screen
             let _ = origin.built.append(screen)
             ready.compose.composeView(
-                replyTo: ready.message, suggestedBody: "Tuesday works for me.", draftId: ready.draftId,
+                replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
                 openedOn: screen, onAgentOutcome: { _ in })
         }
     }
@@ -643,9 +645,7 @@ struct ChatUndoSendRoutingTests {
             let first: ComposeScreen? = openedOnTheChat ? .chat : nil
             let later: ComposeScreen? = openedOnTheChat ? nil : .chat
             let origin = LiveOrigin(first)
-            let ready = ChatReadyReply(
-                message: fixture.parent,
-                compose: ChatReplyCompose.make(replyAllTo: fixture.parent, accounts: [fixture.account]))
+            let ready = ChatReadyReply(message: fixture.parent, suggestion: Self.readySuggestion, accounts: [fixture.account])
             let hosted = try Self.host(RebuiltReadyReply(ready: ready, origin: origin), fixture: fixture)
             defer { hosted.close() }
             for _ in 0..<50 where origin.built.isEmpty { try await Task.sleep(for: .milliseconds(100)) }

@@ -405,22 +405,24 @@ struct ExchangeLastVerbMarkTests {
         }
     }
 
-    /// Both agent compose hosts carry the request's reply-all flag into
-    /// ComposeView for `.reply`, so an AI reply-all records 103 (#915).
-    @Test("Every agent compose host passes the request's reply-all flag")
+    /// The agent's compose card opens through one presenter for every host
+    /// (`AgentToolRouter.ComposeRequest.composeView(account:openedOn:onOutcome:)`), which
+    /// carries the request's reply-all flag into ComposeView for `.reply`, so an
+    /// AI reply-all records 103 (#915).
+    @Test("The agent compose presenter passes the request's reply-all flag")
     func agentComposeHostsPassReplyAll() throws {
         let files = try DiagnosticPrintGateTests.appTargetSources()
         let bodies = files.flatMap { file -> [String] in
             // Comments masked: a commented-out argument must not satisfy the fence.
             DiagnosticPrintGateTests.codeOnly(file.source)
-                .components(separatedBy: "func composeViewForAgentRequest(_ req: AgentToolRouter.ComposeRequest)").dropFirst()
+                .components(separatedBy: "func composeView(account: Account?, openedOn: ComposeScreen? = nil, onOutcome: @escaping @MainActor (ComposeOutcome) -> Void) -> ComposeView").dropFirst()
                 .map { String($0) }
         }
-        #expect(bodies.count == 2, "expected the inbox and message-detail hosts, found \(bodies.count)")
+        #expect(bodies.count == 1, "expected the one agent compose presenter, found \(bodies.count)")
         for body in bodies {
             let reply = try #require(body.range(of: "case .reply:"))
             let forward = try #require(body.range(of: "case .forward:", range: reply.upperBound..<body.endIndex))
-            #expect(body[reply.upperBound..<forward.lowerBound].contains("isReplyAll: req.isReplyAll"))
+            #expect(body[reply.upperBound..<forward.lowerBound].contains("isReplyAll: isReplyAll"))
         }
     }
 

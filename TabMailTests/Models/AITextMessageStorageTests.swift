@@ -30,9 +30,50 @@ struct AITextMessageStorageTests {
         let order = [
             "v103_addFolderChangeCursor", "v104_addReplyAllAndMarkSentAt",
             "v105_addAITextMessages", "v106_repairAICacheMessageIds",
-            "v107_rekeyChatSessionsByThread",
+            "v107_rekeyChatSessionsByThread", "v108_addReplyChangeCommand",
         ]
         #expect(applied.filter { order.contains($0) } == order)
+    }
+
+    @Test("v109 (the chat field's words) registers right after v108: an install at v108 with a stored change command upgrades to the words table and keeps the command")
+    func chatFieldWordsFollowsReplyChangeCommand() throws {
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        // Registration order, which is the order an upgrade runs them (the ledger's own listing is
+        // not: it can come back sorted by name).
+        let identifiers = migrator.migrations
+        let v108 = try #require(identifiers.firstIndex(of: "v108_addReplyChangeCommand"))
+        let v109 = try #require(identifiers.firstIndex(of: "v109_addChatFieldWords"))
+        #expect(v109 == v108 + 1, "v109 registers right after v108: \(identifiers.suffix(4))")
+
+        // A device on the release with v108: a reply's change command is stored.
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        try migrator.migrate(db, upTo: "v108_addReplyChangeCommand")
+        let wordsAtV108 = try db.read { try $0.tableExists("chatFieldWords") }
+        #expect(!wordsAtV108, "control: the words table is not there before v109")
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "1", rfc822MessageId: "cmd@example.com")
+        try db.write {
+            try $0.execute(sql: "UPDATE messageHeader SET replyChangeCommand = ? WHERE id = ?",
+                           arguments: ["ask for the agenda", header.id])
+        }
+
+        // The upgrade.
+        try migrator.migrate(db)
+        let wordsAfter = try db.read { try $0.tableExists("chatFieldWords") }
+        #expect(wordsAfter, "the upgrade adds the words table")
+        let command = try db.read {
+            try String.fetchOne($0, sql: "SELECT replyChangeCommand FROM messageHeader WHERE id = ?", arguments: [header.id])
+        }
+        #expect(command == "ask for the agenda", "the stored change command is kept")
+        try db.write {
+            try ChatFieldWordsRecord(sessionId: "thread:acc1:t1", words: "Unsent words", updatedAt: Date()).insert($0)
+        }
+        let words = try db.read { try ChatFieldWordsRecord.fetchOne($0, key: "thread:acc1:t1")?.words }
+        #expect(words == "Unsent words", "the new table takes a chat's words")
     }
 
     @Test("The header round-trips both text messages")
@@ -80,12 +121,51 @@ struct AITextMessageStorageTests {
         #expect(after?.actionTag == .reply)
     }
 
+    @Test("v108 adds the change command column to messageHeader and messageAICache")
+    func migrationAddsChangeCommand() throws {
+        let db = try TestDatabase.make()
+        for table in ["messageHeader", "messageAICache"] {
+            #expect(try columns(db, table).contains("replyChangeCommand"), "\(table)")
+        }
+    }
+
+    @Test("The change command follows its reply through the cache: stored, kept, replaced, restored")
+    func changeCommandFollowsReply() throws {
+        let db = try TestDatabase.make()
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "c@example.com",
+                                            reply: ReplyResult(body: "Body one", textMessage: "Text one", changeCommand: "say no"), db: $0)
+        }
+        #expect(try entry(db, "c@example.com")?.replyChangeCommand == "say no")
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "c@example.com",
+                                            summaryBlurb: "Summary", db: $0)
+        }
+        #expect(try entry(db, "c@example.com")?.replyChangeCommand == "say no", "a summary leaves the reply's command")
+
+        var header = MessageHeader(
+            messageId: "9", subject: "S", from: "a@example.com", fromAddress: "a@example.com",
+            to: "b@example.com", date: Date(), snippet: "", folderId: "acc1:INBOX",
+            accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        header.rfc822MessageId = "c@example.com"
+        try db.write { try MessageAICache.restoreIfCached(into: &header, accountId: "acc1", folderPath: "INBOX", db: $0) }
+        #expect(header.cachedReply == "Body one")
+        #expect(header.replyChangeCommand == "say no")
+
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "c@example.com",
+                                            reply: ReplyResult(body: "Body two", textMessage: nil), db: $0)
+        }
+        #expect(try entry(db, "c@example.com")?.replyChangeCommand == nil, "a new reply never keeps an older reply's command")
+    }
+
     @Test("writeThrough stores the text message with its reply and replaces it with the next reply")
     func replyTextMessageFollowsReply() throws {
         let db = try TestDatabase.make()
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "r@example.com",
-                                            cachedReply: "Body one", replyTextMessage: "Text one", db: $0)
+                                            reply: ReplyResult(body: "Body one", textMessage: "Text one"), db: $0)
         }
         #expect(try entry(db, "r@example.com")?.replyTextMessage == "Text one")
 
@@ -97,7 +177,7 @@ struct AITextMessageStorageTests {
 
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "r@example.com",
-                                            cachedReply: "Body two", db: $0)
+                                            reply: ReplyResult(body: "Body two", textMessage: nil), db: $0)
         }
         let after = try entry(db, "r@example.com")
         #expect(after?.cachedReply == "Body two")
@@ -110,7 +190,7 @@ struct AITextMessageStorageTests {
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "x@example.com",
                                             summaryBlurb: "Summary", summaryTextMessage: "Summary text",
-                                            cachedReply: "Reply", replyTextMessage: "Reply text", db: $0)
+                                            reply: ReplyResult(body: "Reply", textMessage: "Reply text"), db: $0)
         }
         var header = MessageHeader(
             messageId: "7", subject: "S", from: "a@example.com", fromAddress: "a@example.com",
@@ -131,7 +211,7 @@ struct AITextMessageStorageTests {
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "y@example.com",
                                             summaryBlurb: "Cached", summaryTextMessage: "Cached text",
-                                            cachedReply: "Cached reply", replyTextMessage: "Cached reply text", db: $0)
+                                            reply: ReplyResult(body: "Cached reply", textMessage: "Cached reply text"), db: $0)
         }
         var header = MessageHeader(
             messageId: "8", subject: "S", from: "a@example.com", fromAddress: "a@example.com",
@@ -163,17 +243,6 @@ struct AITextMessageStorageTests {
         return (pool, dir)
     }
 
-    /// Insert `record` with only the columns the table has at this (older) schema.
-    private static func insertAtOldSchema<R: EncodableRecord & TableRecord>(_ record: R, _ db: Database) throws {
-        let table = R.databaseTableName
-        let columns = Set(try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))").map { $0["name"] as String })
-        let values = try record.databaseDictionary.filter { columns.contains($0.key) }
-        let names = values.keys.sorted()
-        try db.execute(
-            sql: "INSERT INTO \(table) (\(names.map { "\"\($0)\"" }.joined(separator: ", "))) VALUES (\(names.map { _ in "?" }.joined(separator: ", ")))",
-            arguments: StatementArguments(names.map { values[$0]! }))
-    }
-
     private static func header(_ uid: String, folder: String, rfc: String) -> MessageHeader {
         var header = MessageHeader(
             messageId: uid, subject: "Plans", from: "Sender", fromAddress: "sender@example.com",
@@ -200,10 +269,10 @@ struct AITextMessageStorageTests {
         try pool.write { db in
             var account = Account(emailAddress: "acc1@example.com", displayName: "A", provider: .imap)
             account.id = "acc1"
-            try Self.insertAtOldSchema(account, db)
-            try Self.insertAtOldSchema(Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1"), db)
-            try Self.insertAtOldSchema(Self.header("1", folder: "INBOX", rfc: "plans@example.com"), db)
-            try Self.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:plans@example.com", rfc: "plans@example.com", daysAgo: 0), db)
+            try TestDatabase.insertAtOldSchema(account, db)
+            try TestDatabase.insertAtOldSchema(Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1"), db)
+            try TestDatabase.insertAtOldSchema(Self.header("1", folder: "INBOX", rfc: "plans@example.com"), db)
+            try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:plans@example.com", rfc: "plans@example.com", daysAgo: 0), db)
         }
 
         try AppDatabase.runMigrations(on: pool)
@@ -231,12 +300,12 @@ struct AITextMessageStorageTests {
             try account.insert(db)
             try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
             try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1").insert(db)
-            try Self.header("1", folder: "INBOX", rfc: "stayed@example.com").insert(db)
-            try Self.header("2", folder: "Archive", rfc: "moved@example.com").insert(db)
+            try TestDatabase.insertAtOldSchema(Self.header("1", folder: "INBOX", rfc: "stayed@example.com"), db)
+            try TestDatabase.insertAtOldSchema(Self.header("2", folder: "Archive", rfc: "moved@example.com"), db)
             // Written by an older extension, without the Message-ID.
-            try Self.cacheEntry("acc1:INBOX:stayed@example.com", rfc: nil, daysAgo: aged).insert(db)
-            try Self.cacheEntry("acc1:INBOX:moved@example.com", rfc: nil, daysAgo: aged).insert(db)
-            try Self.cacheEntry("acc1:INBOX:gone@example.com", rfc: nil, daysAgo: aged).insert(db)
+            try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:stayed@example.com", rfc: nil, daysAgo: aged), db)
+            try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:moved@example.com", rfc: nil, daysAgo: aged), db)
+            try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:gone@example.com", rfc: nil, daysAgo: aged), db)
         }
 
         try AppDatabase.runMigrations(on: pool)
@@ -287,16 +356,16 @@ struct AITextMessageStorageTests {
             try account.insert(db)
             try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
             for i in 1...headers {
-                try Self.header("\(i)", folder: "INBOX", rfc: "m\(i)@example.com").insert(db)
+                try TestDatabase.insertAtOldSchema(Self.header("\(i)", folder: "INBOX", rfc: "m\(i)@example.com"), db)
             }
             // The first `withoutId` entries were written by an older extension, without the
             // Message-ID; the rest carry it.
             for i in 1...entries {
-                try Self.cacheEntry("acc1:INBOX:m\(i)@example.com", rfc: i <= withoutId ? nil : "m\(i)@example.com", daysAgo: 0).insert(db)
+                try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:m\(i)@example.com", rfc: i <= withoutId ? nil : "m\(i)@example.com", daysAgo: 0), db)
             }
             // Entries without a Message-ID whose email is not on the device.
             for i in 1...gone {
-                try Self.cacheEntry("acc1:INBOX:gone\(i)@example.com", rfc: nil, daysAgo: 0).insert(db)
+                try TestDatabase.insertAtOldSchema(Self.cacheEntry("acc1:INBOX:gone\(i)@example.com", rfc: nil, daysAgo: 0), db)
             }
         }
         // Planned on the writer, the connection the migration runs on, right after its ANALYZE

@@ -4,16 +4,6 @@
 
 import Foundation
 
-/// A precomputed reply: the email body and its short text-message version
-/// (`MessageHeader.cachedReply` / `replyTextMessage`).
-struct ReplyResult: Sendable, Equatable {
-    let body: String
-    let textMessage: String?
-
-    /// The quality filters' sentinel: no reply wanted (an empty body), distinct from nil (error, retried).
-    static let filtered = ReplyResult(body: "", textMessage: nil)
-}
-
 extension AIService {
 
     // MARK: - Reply Generation
@@ -144,7 +134,7 @@ extension AIService {
         BackgroundSyncLogger.logDebug("[AIService]   text message: \(parsed.textMessage ?? "nil")")
         BackgroundSyncLogger.logDebug("[AIService] generateReply: === END PARSED BODY ===")
         #endif
-        return ReplyResult(body: parsed.body, textMessage: parsed.textMessage)
+        return parsed
     }
 
     // MARK: - Reply Processing (standalone step, called after summary+action)

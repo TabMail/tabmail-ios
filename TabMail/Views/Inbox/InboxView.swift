@@ -876,7 +876,7 @@ struct InboxView: View {
             DraftComposePresenter(source: open.source)
         }
         .fullScreenCover(item: $agentCompose) { req in
-            composeViewForAgentRequest(req)
+            req.composeView(account: viewModel.primaryAccount, onOutcome: req.onOutcome)
         }
         .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
             if newId != nil {
@@ -2118,44 +2118,6 @@ struct InboxView: View {
             prefillTo: recipients.to.isEmpty ? nil : recipients.to,
             prefillCc: recipients.cc.isEmpty ? nil : recipients.cc
         )
-    }
-
-    // MARK: - Agent Tool Compose
-
-    @ViewBuilder
-    private func composeViewForAgentRequest(_ req: AgentToolRouter.ComposeRequest) -> some View {
-        switch req.mode {
-        case .compose:
-            ComposeView(
-                suggestedBody: req.body,
-                account: viewModel.primaryAccount,
-                prefillTo: req.to,
-                prefillCc: req.cc,
-                prefillBcc: req.bcc,
-                prefillSubject: req.subject,
-                onAgentOutcome: req.onOutcome
-            )
-        case .reply:
-            ComposeView(
-                replyTo: req.replyTo,
-                suggestedBody: req.body,
-                isReplyAll: req.isReplyAll,
-                prefillTo: req.to.isEmpty ? nil : req.to,
-                prefillCc: req.cc.isEmpty ? nil : req.cc,
-                prefillBcc: req.bcc.isEmpty ? nil : req.bcc,
-                onAgentOutcome: req.onOutcome
-            )
-        case .forward:
-            ComposeView(
-                replyTo: req.replyTo,
-                suggestedBody: req.body,
-                isForward: true,
-                prefillTo: req.to,
-                prefillCc: req.cc,
-                prefillBcc: req.bcc,
-                onAgentOutcome: req.onOutcome
-            )
-        }
     }
 }
 

@@ -674,18 +674,30 @@ struct AICachePurgeTests {
         #expect(try cache(f, "acc2:Work:Projects:shared@example.com") != nil)
     }
 
-    @Test("Storage maintenance runs the purge: an aged orphan goes, an entry whose email is here stays")
+    @Test("Storage maintenance runs the purge: an aged orphan goes, an entry whose email is here stays; the same for a chat's unsent words")
     func maintenanceRunsThePurge() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         try insertHeader(f, uid: "3", folderPath: "Archive", rfc: "live@example.com")
         try insertCache(f, key: "acc1:Archive:live@example.com", rfc: "live@example.com", daysAgo: pastGrace)
         try insertCache(f, key: "acc1:INBOX:gone@example.com", rfc: "gone@example.com", daysAgo: pastGrace)
+        // A chat's unsent words (ADR-IOS-117): one of the live email's thread (it has no thread
+        // id, so its chat is its own header id) and one of a thread with no email; both past the grace.
+        let liveWords = ChatThreadKey.key(accountId: "acc1", threadId: MessageIdentity.headerId(accountId: "acc1", folderPath: "Archive", messageId: "3"))
+        let goneWords = ChatThreadKey.key(accountId: "acc1", threadId: "gone-thread")
+        let aged = try #require(Calendar.current.date(byAdding: .day, value: -pastGrace, to: Date()))
+        try await f.pool.write { db in
+            for key in [liveWords, goneWords] {
+                try ChatFieldWordsRecord(sessionId: key, words: "Unsent words", updatedAt: aged).insert(db)
+            }
+        }
 
         await SyncEngine.runWALMaintenance(dbPool: f.db, includePrune: false, undoProtectedBodyIds: [])
 
         #expect(try cache(f, "acc1:INBOX:gone@example.com") == nil)
         #expect(try cache(f, "acc1:Archive:live@example.com") != nil)
+        let words = try await f.pool.read { try String.fetchAll($0, sql: "SELECT sessionId FROM chatFieldWords") }
+        #expect(words == [liveWords], "the live email's chat keeps its words; the gone thread's go")
     }
 
     @Test("More entries than one chunk: every kept entry kept, every orphan purged, the pass ends")

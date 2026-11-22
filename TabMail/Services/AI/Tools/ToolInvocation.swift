@@ -25,11 +25,20 @@ struct ToolInvocation: Sendable {
     /// The agent's reply to that email carries it (`ComposeRequest.fieldReply`); nil for every
     /// other request.
     let fieldReply: ChatFieldReply?
+    /// Set when the request was sent from the chat's reply field: the chat key its words were sent
+    /// under (`ChatFieldWords.key(for:)`), captured as it was sent. The request's own transitions of
+    /// the field (a compose card opening, its reply going out) land on this key in
+    /// `ChatFieldWords`, never on whichever chat a pill shows by then (ADR-IOS-117).
+    let fieldWordsKey: String?
 
-    init(uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil, fieldReply: ChatFieldReply? = nil) {
+    init(
+        uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil, fieldReply: ChatFieldReply? = nil,
+        fieldWordsKey: String? = nil
+    ) {
         self.uiSink = uiSink
         self.sessionKey = sessionKey
         self.fieldReply = fieldReply
+        self.fieldWordsKey = fieldWordsKey
     }
 
     /// The no-UI invocation used by every non-interactive completion caller and
@@ -54,8 +63,14 @@ protocol AgentUISink: Sendable {
 /// implicitly `Sendable`, so this value type is `Sendable`.
 struct SessionUISink: AgentUISink {
     let session: ChatPillState.Session
+    /// The request was sent from the reply field: the chat key its words were sent under
+    /// (`ToolInvocation.fieldWordsKey`). Its card's transition of the field lands there.
+    var fieldWordsKey: String? = nil
 
     @MainActor func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
+        // The request's own chat: a card empties the words it sent there (unless newer words were
+        // typed), whichever chat the pill shows when the card arrives.
+        if let fieldWordsKey { ChatFieldWords.shared.apply(.confirmationCard, to: fieldWordsKey) }
         // Appending is SwiftUI-mutation-safe (new rows don't invalidate existing
         // layout) and drives the pill's `ChatBubble` → `ActionConfirmationCard`
         // renderer declaratively. Content is empty; the card IS the row.
