@@ -40,9 +40,9 @@ import UIKit
 ///  1f. The agent's cards the inbox and the email's screen open, about the chat's own email (a
 ///     reply on the agent's words, a reply on the stored AI Suggestion, a Forward), sent with the
 ///     chat view on, show the toast's Undo, their one Undo: no chat opened them.
-///  1g. The reply card the chat's field asked for: its request hears its send once, the field's sent
+///  1g. The reply card the chat's field asked for: its request hears its send, the field's sent
 ///     words go and the answer hands nothing back; the bubble's Undo and the send again from the
-///     compose it reopens tell the request nothing more and keep the words typed since.
+///     compose it reopens keep the words typed since.
 ///  2. Drawn: the solid blue rises from the bottom edge, inside the bubble's shape; in light mode the
 ///     text is the pending text colour over the tint and white over the solid; under Reduce Motion
 ///     there is no rising fill; a mounted bubble drops its Undo when its deadline passes.
@@ -744,7 +744,9 @@ struct ChatUndoSendRoutingTests {
 
     // MARK: - 1g. The field's own reply card: its send, then its Undo
 
-    /// The outcomes a compose request heard, in order.
+    /// The outcomes a compose request heard, in order: what the router's wait returned to it. The
+    /// card itself reports `.cancelled` on every close, after a send too (`ComposeView`'s disappear);
+    /// the router keeps only the first outcome (`ComposeOutcomeState`), so a request hears one.
     @MainActor final class HeardOutcomes {
         private(set) var names: [String] = []
 
@@ -757,7 +759,7 @@ struct ChatUndoSendRoutingTests {
         }
     }
 
-    @Test("The reply card the chat's field asked for, sent with the chat view on: its request hears the send once, and the sent words go and do not come back with the answer; the bubble's Undo and the send again from the compose it reopens tell the request nothing more and keep the words typed since")
+    @Test("The reply card the chat's field asked for, sent with the chat view on: its request hears the send, and the sent words go and do not come back with the answer; the bubble's Undo and the send again from the compose it reopens keep the words typed since")
     func fieldCardSendThenUndoKeepsTheFieldsWords() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can tap the chat's compose")
         try await withSendEnvironment { fixture, saved in
@@ -779,16 +781,12 @@ struct ChatUndoSendRoutingTests {
                 store.apply(.sentFromField, to: key)
                 let fieldReply = ChatFieldReply(email: parent, onlyTo: nil)
                 let request = Task { @MainActor in
-                    await AgentToolRouter.shared.enqueueComposeAndAwaitOutcome(fieldWordsKey: key, isFieldsOwnReply: true) { onOutcome, state in
+                    let outcome = await AgentToolRouter.shared.enqueueComposeAndAwaitOutcome(fieldWordsKey: key, isFieldsOwnReply: true) { onOutcome, state in
                         AgentToolRouter.ComposeRequest(
                             mode: .reply, replyTo: parent, to: ["sender@example.com"], cc: [], bcc: [], subject: nil,
-                            body: "Tuesday works for me.", fieldReply: fieldReply,
-                            onOutcome: { outcome in
-                                heard.record(outcome)
-                                onOutcome(outcome)
-                            },
-                            outcomeState: state)
+                            body: "Tuesday works for me.", fieldReply: fieldReply, onOutcome: onOutcome, outcomeState: state)
                     }
+                    heard.record(outcome)
                 }
                 defer { request.cancel() }
                 let row = try await Self.tapSend(in: chat.controller, presented: true, fixture: fixture)
@@ -817,13 +815,11 @@ struct ChatUndoSendRoutingTests {
             let bubble = try #require(shown, "control: the chat shows the reply's bubble")
             bubble.undo()
             let reopen = try #require(PendingSendService.shared.reopenSnapshot, "the bubble's Undo reopens the compose")
-            #expect(heard.names == ["sent"], "the Undo tells the request nothing: \(heard.names)")
             let afterUndo = store.fill(for: key).words
             #expect(afterUndo == since, "the Undo keeps the words typed since: \(afterUndo)")
             // Sent again from the compose the Undo reopened: the user's own compose, not the request's.
             let again = try await Self.send(UndoReopenCompose(snapshot: reopen), fixture: fixture)
             #expect(PendingSendService.shared.undoOwner(for: again.id) == .toast, "control: that compose is not the chat's")
-            #expect(heard.names == ["sent"], "the send again tells the request nothing: \(heard.names)")
             let afterResend = store.fill(for: key).words
             #expect(afterResend == since, "and keeps the words typed since: \(afterResend)")
         }
