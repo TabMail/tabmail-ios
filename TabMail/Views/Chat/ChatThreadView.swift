@@ -1013,10 +1013,6 @@ struct ChatThreadView: View {
                         ViewThatFits(in: .vertical) {
                             TipView(ChatFieldDragTip(), arrowEdge: .bottom)
                                 .fixedSize(horizontal: false, vertical: true)
-                                // `ViewThatFits` keeps the candidate it did not pick in the
-                                // accessibility tree: VoiceOver must not read a card that is not
-                                // on screen while the stand-in shows.
-                                .accessibilityHidden(tipWaitsForRoom)
                                 // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop))
                             Color.clear.frame(height: 0)
@@ -1025,6 +1021,11 @@ struct ChatThreadView: View {
                                 // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipWait())
                         }
+                        // `ViewThatFits` keeps the candidate it did not pick in the accessibility
+                        // tree, and does not apply a later change to that candidate's own modifiers:
+                        // VoiceOver must not read a card that is not on screen while the stand-in
+                        // shows. The stand-in has nothing to read, so the whole choice is hidden.
+                        .accessibilityHidden(tipWaitsForRoom)
                         .frame(height: tipRoom, alignment: .bottom)
                     }
             }

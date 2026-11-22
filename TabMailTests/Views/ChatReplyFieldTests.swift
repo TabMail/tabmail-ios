@@ -1125,9 +1125,11 @@ struct ChatReplyFieldTests {
         // the no-reply notice rather than over them: hung by its bottom from the stack's top edge.
         // Only while the whole card fits between the header and the stack: otherwise nothing, so
         // the tip waits for room and keeps its one showing.
-        // While it waits, the card `ViewThatFits` did not pick is hidden from VoiceOver, which would
-        // otherwise read a card that is not on screen.
-        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) // `ViewThatFits` keeps the candidate it did not pick in the // accessibility tree: VoiceOver must not read a card that is not // on screen while the stand-in shows. .accessibilityHidden(tipWaitsForRoom) // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop)) Color.clear.frame(height: 0) .onAppear { tipWaitsForRoom = true } .onDisappear { tipWaitsForRoom = false } // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipWait()) } .frame(height: tipRoom, alignment: .bottom) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
+        // While it waits, the whole `ViewThatFits` is hidden from VoiceOver: it keeps the card it did
+        // not pick in the accessibility tree, and a later change to that card's own modifiers does
+        // not take, so VoiceOver would otherwise read a card that is not on screen.
+        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop)) Color.clear.frame(height: 0) .onAppear { tipWaitsForRoom = true } .onDisappear { tipWaitsForRoom = false } // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipWait()) } // `ViewThatFits` keeps the candidate it did not pick in the accessibility // tree, and does not apply a later change to that candidate's own modifiers: // VoiceOver must not read a card that is not on screen while the stand-in // shows. The stand-in has nothing to read, so the whole choice is hidden. .accessibilityHidden(tipWaitsForRoom) .frame(height: tipRoom, alignment: .bottom) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
+        #expect(Self.count(".accessibilityHidden(tipWaitsForRoom)", in: chat) == 1, "on the whole choice only")
         let room = try Self.body(of: "private var tipRoom: CGFloat {", in: chat)
         #expect(Self.count("let room = pillTop - headerBottom return room.isFinite ? max(0, room) : 0", in: room) == 1,
                 "the measured space between the header's bottom and the stack's top; none until measured")
@@ -1212,7 +1214,7 @@ struct ChatReplyFieldTests {
         // One bridge for every chat pan: the field's drag reads the swipes' sample and outcome, with
         // no delivery of its own.
         let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
-        #expect(Self.count("ChatHorizontalPan.deliver(recognizer, moved: { moved(coordinator.share($0)) }, ended: { coordinator.letGo() ended(coordinator.share(ChatFieldDrag.letGo($0, rested: recognizer.restedBeforeLift)), $1) })", in: swipe) == 1,
+        #expect(Self.count("ChatHorizontalPan.deliver(recognizer, moved: { moved(coordinator.share($0)) }, ended: { coordinator.letGo() ended(coordinator.share(ChatFieldDrag.letGo($0, rested: recognizer.restedBeforeLift), atLetGo: true), $1) })", in: swipe) == 1,
                 "the field's pan hands on only the field's share of each sample (`ChatFieldPan.Coordinator.share`), its let-go at rest after a hold (`ChatFieldDrag.letGo`)")
         // The rest is read on the touches' clock from the last move to the lift; a touch coming
         // down is not a move (a second finger landing during a hold leaves it a hold), and each

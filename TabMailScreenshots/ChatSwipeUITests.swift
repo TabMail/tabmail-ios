@@ -391,7 +391,16 @@ final class ChatSwipeUITests: XCTestCase {
         let landscape = try XCTUnwrap(decidedTipMarker(in: app), "control: the tip's place is decided")
         XCTAssertEqual(landscape.tipWaiting, true, "control: the tip is eligible and its whole card has no room, so it waits")
         XCTAssertNil(landscape.tip, "no card shows without room")
-        XCTAssertFalse(app.staticTexts[Self.fieldDragTipText].exists, "and none of its words")
+        let words = app.staticTexts[Self.fieldDragTipText].firstMatch
+        if words.exists {
+            // What the accessibility tree holds while nothing is drawn: where the words are, and
+            // whether a touch could reach them.
+            let found = XCTAttachment(string: "frame=\(words.frame) hittable=\(words.isHittable)\n\n\(app.debugDescription)")
+            found.name = "waiting tip words"
+            found.lifetime = .keepAlways
+            add(found)
+        }
+        XCTAssertFalse(words.exists, "and none of its words")
         app.terminate()
 
         XCUIDevice.shared.orientation = .portrait
@@ -644,11 +653,12 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertGreaterThan(Self.acrossTheTextsEnd, Self.openDistance, "control: the whole drag goes past the open distance")
         textScroll(long, by: -Self.acrossTheTextsEnd, in: app)
         let marker = try XCTUnwrap(dragMarker(afterDrags: 1, in: app), "control: the field's pan saw the drag")
-        XCTAssertGreaterThan(marker.rise, 1, "past the text's end the rest of the drag swelled the field: \(marker.rise)")
-        XCTAssertLessThan(marker.rise, Self.openDistance, "only the rest past the text's end: \(marker.rise)")
-        let pastEnd = try XCTUnwrap(marker.textPastEnd, "control: the field's pan read the text's place while the drag moved")
-        XCTAssertGreaterThan(pastEnd, -1, "control: the text reached its end under the drag: \(pastEnd)")
-        XCTAssertLessThan(pastEnd, 1, "the text stopped at its end and did not bounce past it while the field swelled: \(pastEnd)")
+        let watched = dragMarkerLabel(afterDrags: 1, in: app)
+        XCTAssertGreaterThan(marker.rise, 1, "past the text's end the rest of the drag swelled the field: \(marker.rise) (marker: \(watched))")
+        XCTAssertLessThan(marker.rise, Self.openDistance, "only the rest past the text's end: \(marker.rise) (marker: \(watched))")
+        let pastEnd = try XCTUnwrap(marker.textPastEnd, "control: the field's pan read the text's place while the drag moved (marker: \(watched))")
+        XCTAssertGreaterThan(pastEnd, -1, "control: the text reached its end under the drag: \(pastEnd) (marker: \(watched))")
+        XCTAssertLessThan(pastEnd, 1, "the text stopped at its end and did not bounce past it while the field swelled: \(pastEnd) (marker: \(watched))")
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
         XCTAssertEqual(long.value as? String, Self.overflowingText, "control: the draft is unchanged")
@@ -683,8 +693,12 @@ final class ChatSwipeUITests: XCTestCase {
     }
 
     /// A slow vertical drag in the text from its middle, held at the end so it does not coast.
+    /// Both ends come from one read of the text's frame, in screen points: an element's coordinate
+    /// is resolved again for each end, so a field that moves with the keyboard in between would
+    /// give a press where it was and a lift where it is.
     private func textScroll(_ text: XCUIElement, by travel: CGFloat, in app: XCUIApplication) {
-        let start = text.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let frame = text.frame
+        let start = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: frame.midX, dy: frame.midY))
         start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: travel)),
                     withVelocity: .slow, thenHoldForDuration: Self.scrollSettleHold)
     }
@@ -774,7 +788,10 @@ final class ChatSwipeUITests: XCTestCase {
         let typed = typedField(containing: Self.shortQuestion, in: app)
         XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
         waitForTheKeyboardBack(under: typed, in: app)
-        let onTheWords = typed.coordinate(withNormalizedOffset: CGVector(dx: Self.onTheWordsDx, dy: 0.5))
+        // Both ends from one read of the field's frame (`textScroll`).
+        let frame = typed.frame
+        let onTheWords = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: frame.minX + frame.width * Self.onTheWordsDx, dy: frame.midY))
         onTheWords.press(forDuration: Self.textLongPressHold,
                          thenDragTo: onTheWords.withOffset(CGVector(dx: 0, dy: -Self.pastTheOpenDistance)))
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2),
@@ -1461,8 +1478,10 @@ final class ChatSwipeUITests: XCTestCase {
             if frame != last {
                 last = frame
                 stillSince = Date()
-            } else if keyboard.exists, keyboard.frame.height > app.frame.height * Self.keyboardMinShare,
+            } else if keyboard.exists, app.frame.intersection(keyboard.frame).height > app.frame.height * Self.keyboardMinShare,
                       frame.maxY <= keyboard.frame.minY + 1 {
+                // On screen only: while it is away the keyboard still exists, parked below the
+                // screen, and a field resting at the bottom is above that too.
                 return
             } else if Date().timeIntervalSince(stillSince) > Self.keyboardReturnWindow {
                 return
