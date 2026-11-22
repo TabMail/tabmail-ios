@@ -1039,7 +1039,8 @@ struct ChatThreadView: View {
                     showChat: chatExpanded || TutorialCoordinator.shared.isRunning
                         ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } },
                     suggestion: shown,
-                    attach: knowsAudience ? attachFromField : nil),
+                    // A closure, as `showChat`'s: the method itself is MainActor-isolated.
+                    attach: knowsAudience ? { attachFromField($0) } : nil),
                 onFieldSend: { _ in fieldComposeOpened = false },
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: viewModel.message?.accountId,

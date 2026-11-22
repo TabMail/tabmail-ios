@@ -183,7 +183,7 @@ struct ChatReplyAttachTests {
     func chatWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         // The paperclip shows only once the chat can tell the user's own addresses from the others.
-        #expect(Self.count("suggestion: shown, attach: knowsAudience ? attachFromField : nil),", in: chat) == 1, "the field shows the paperclip")
+        #expect(Self.count("attach: knowsAudience ? { attachFromField($0) } : nil),", in: chat) == 1, "the field shows the paperclip")
         #expect(Self.count("let knowsAudience = viewModel.hasLoadedThread && context.isLoaded && context.accounts.contains(where: { $0.id == newest.accountId })", in: chat) == 1)
         #expect(Self.count("private func attachFromField(_ source: ChatNewEmailField.AttachSource) { guard TutorialCoordinator.shared.admits(.other) else { return } paperclipPickerOpen = true switch source { case .photos: showsPhotoPicker = true case .camera: showsCamera = true case .files: showsFilePicker = true } }", in: chat) == 1,
                 "each choice opens its own picker; the tutorial's mail actions are off")
