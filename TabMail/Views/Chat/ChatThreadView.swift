@@ -77,8 +77,9 @@ struct ChatThreadView: View {
     /// The collapsed field's height, notices and chips included: the height of the bottom bar,
     /// whose inset keeps the last bubble and the jump button above the field. The field grows to six
     /// lines, so it is measured; the open panel keeps the last resting height, and a drag's swell
-    /// never reaches it (`pill(on:)` takes the swell back out of the layout), so the chat does not
-    /// move under either.
+    /// never reaches it (`pill(on:)` takes the swell back out of the layout, and a floating-point
+    /// remainder of that is the same height, `pillHeightMoved`), so the chat does not move under
+    /// either.
     @State private var pillHeight = ChatViewLayout.pillStartHeight
     /// The chat's own height: the opened pill grows upward out of the bottom bar into it.
     @State private var chatAreaHeight: CGFloat = 0
@@ -535,7 +536,7 @@ struct ChatThreadView: View {
                         .overlay(alignment: .bottom) {
                             pill(on: newest)
                                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                                    if !chatExpanded { pillHeight = height }
+                                    if !chatExpanded, Self.pillHeightMoved(from: pillHeight, to: height) { pillHeight = height }
                                 }
                                 // ...and above the reply field.
                                 .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
@@ -1029,6 +1030,16 @@ struct ChatThreadView: View {
         .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)
         .padding(.bottom, ChatViewLayout.fieldBottomGap)
         .animation(Self.pillSpring, value: chatExpanded)
+    }
+
+    /// Whether the collapsed field's measured height moved from `old` to `new`: by at least
+    /// `ChatViewLayout.fieldHeightTolerance`. A drag's swell is added inside the field's glass and
+    /// taken back out here, which floating point does not always cancel exactly; that remainder
+    /// once set the bar's height under a held drag, ran the chat's body and built the reply field
+    /// again, and UIKit then scrolled the field's text to its caret (UI run 2026-11-22). The swell
+    /// never moves the field's height (`pill(on:)`), so a remainder that small is the same height.
+    static func pillHeightMoved(from old: CGFloat, to new: CGFloat) -> Bool {
+        abs(new - old) >= ChatViewLayout.fieldHeightTolerance
     }
 
     /// The room above the field stack for its tip: from the header's bottom to the stack's top,

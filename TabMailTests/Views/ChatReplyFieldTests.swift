@@ -1198,6 +1198,11 @@ struct ChatReplyFieldTests {
         #expect(Self.count("drag: fieldDrag,", in: chat) == 1, "the field gets the model, not a swell")
         #expect(Self.count(".modifier(ChatFieldDrag.Swell(model: fieldDrag, sign: -1))", in: chat) == 1,
                 "the swell taken back out of the layout")
+        // Taking the swell back out leaves a floating-point remainder at some swells (UI run
+        // 2026-11-22): the bar's height moves only by a change a screen can show.
+        #expect(Self.count("if !chatExpanded, Self.pillHeightMoved(from: pillHeight, to: height) { pillHeight = height }", in: chat) == 1,
+                "the measured height sets the bar's height only once it really moved")
+        #expect(Self.count("pillHeight = height", in: chat) == 1, "and nothing else sets it from a measurement")
         let fieldBar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
         #expect(Self.count(".modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))", in: fieldBar) == 1, "the swell on the glass")
         let editor = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")

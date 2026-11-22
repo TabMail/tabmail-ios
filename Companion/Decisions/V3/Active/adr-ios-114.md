@@ -1267,7 +1267,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `.padding(.top, -fieldDragProgress.swell)`), so the field's glass grows upward while its
    measured height, the bar, its inset and the chat stay put; the two paddings read the same drag
    state and spring back in the same reset transaction, so they cancel through the settle too.
-   **The drag state is read only in modifiers (amended 2026-11-22):** it lives in an observable
+   They cancel only up to floating point (amended 2026-11-22): at some swells the measured height
+   reads an ulp off (a UI run: 158.287109375 as 158.28710937500003 under a 125 pt swell), which set
+   the bar's height, ran the chat's body and built the reply field again under a held drag; the
+   bar takes a measured height only once it moved by `ChatViewLayout.fieldHeightTolerance` (0.1 pt,
+   `ChatThreadView.pillHeightMoved`). **The drag state is read only in modifiers (amended 2026-11-22):** it lives in an observable
    model (`ChatFieldDrag.Model`, held by `ChatThreadView.fieldDrag`) that only the two `Swell`
    paddings, the drag's start and end watch (`ChatFieldDrag.Watch`) and the debug marker read, so a
    moving finger redraws those modifiers and never rebuilds the chat's body or the reply field
@@ -1306,7 +1310,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    second origin (where the touch found the text) remains, so an axis cannot keep counting from an
    earlier crossing after a reversal. Sideways
    travel made while the text had the drag is not the field's, and a drag that reverses until the
-   text scrolls again drops the hand-off and takes a new one when the text is back at its end; the
+   text scrolls again drops the hand-off and takes a new one when the text is back at its end. Only
+   the finger takes the drag back (amended 2026-11-22): a sample that moved down with the text short
+   of its end drops the hand-off; a move of the text the finger did not make keeps it, so the rest of
+   the drag stays the field's. UIKit scrolls the field's text to its caret on the first layout after
+   the field is built again, and a UI run showed that under a held drag past the end (the text back
+   at its caret at its start, the let-go reading no share and the panel staying shut); the
    field's segment keeps the more-up-than-sideways rule, and whether the pan begins at all is
    still decided on the drag's first movement. UIKit cannot
    start a recognizer that failed earlier in the same touch, so waiting for the scroll could never
@@ -1379,7 +1388,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    overflowing draft: the typed word replaces the double-tapped one),
    `ChatFieldDragTests.fieldShareOfATextDrag` and `panSharesWithTheTextUnderTheTouch` (the field's
    share, from a touch-down offset that is not zero; `handOffClearsOnAReversal` and
-   `diagonalThenStraightUp` the hand-off's state, both axes; `handOffInsideACrossingSample` and
+   `diagonalThenStraightUp` the hand-off's state, both axes; `handOffSurvivesATextScrollTheFingerDidNotMake`
+   the hand-off kept through a scroll of the text the finger did not make, and dropped by the finger
+   coming back down; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
+   floating-point remainder; `handOffInsideACrossingSample` and
    `handOffInsideACrossingSampleAfterAReversal` the hand-off inside a sample that crosses the end, where
    the text reached it; `upwardShareCountsFromTheSecondHandOff` the upward share after a reversal,
    `handOffWithNoUpwardMove` a crossing with no upward move, `noShareWhileTheTextHasTheDrag` no

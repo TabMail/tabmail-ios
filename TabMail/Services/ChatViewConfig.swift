@@ -166,6 +166,12 @@ enum ChatViewLayout {
     /// text held at its end read a hair short of it (UI run 2026-11-22: `over=-0.0`, under 0.05)
     /// and the field never got its share. Well under a pixel at any scale.
     static let fieldTextEndTolerance: CGFloat = 0.1
+    /// How far the collapsed field's measured height must move to be a new height
+    /// (`ChatThreadView.pillHeightMoved`), in points: a drag's swell is added inside the field's
+    /// glass and taken back out around it, which floating point does not always cancel exactly
+    /// (UI run 2026-11-22: 158.287109375 read as 158.28710937500003 under a 125 pt swell). Well
+    /// under a pixel at any scale.
+    static let fieldHeightTolerance: CGFloat = 0.1
     /// The pill's spring (the panel opening and closing, the field's swell springing back): its
     /// response in seconds and its damping ratio. A drag's settle lasts this spring's own settling
     /// duration (`ChatThreadView.fieldDragSettle`).

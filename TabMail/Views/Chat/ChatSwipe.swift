@@ -662,8 +662,8 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         }
 
         /// The text the drag's first touch landed in, and the drag's travel, both axes, where the
-        /// text last reached its end (nil while it can still scroll): the field's share counts from
-        /// that one point. The previous sample's travel and the text's place then, to find where in
+        /// text last reached its end (nil until it does, and again once the finger brings it back
+        /// from its end): the field's share counts from that one point. The previous sample's travel and the text's place then, to find where in
         /// the next sample the text reached its end.
         private weak var text: UIScrollView?
         private var handOff: CGSize?
@@ -700,16 +700,20 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         /// The field's share of `drag` (`ChatFieldDrag.fieldShare`): the drag's travel, both axes,
         /// from the point where the text under it reached its end; none while the text can still
         /// scroll. The hand-off is found in the first sample with the text at its end, at the point
-        /// of that sample where the text reached it (`crossing`), and dropped when the text scrolls
-        /// back from it, so a drag that reverses into the text and reaches the end again hands off
-        /// afresh. Off the text, all of it. `atLetGo`: the let-go's sample (for the debug marker).
+        /// of that sample where the text reached it (`crossing`), and dropped when the finger brings
+        /// the text back from it (a sample that moved down with the text short of its end), so a
+        /// drag that reverses into the text and reaches the end again hands off afresh. A move of
+        /// the text the finger did not make keeps the hand-off: UIKit scrolls the field's text to its
+        /// caret on a layout after the field is built again, which can happen while the finger is
+        /// down (UI run 2026-11-22), and the rest of the drag stays the field's. Off the text, all
+        /// of it. `atLetGo`: the let-go's sample (for the debug marker).
         func share(_ drag: ChatHorizontalPan.Sample, atLetGo: Bool = false) -> ChatHorizontalPan.Sample {
             guard let text else { return drag }
             let end = Self.end(of: text)
             let offset = text.contentOffset.y
             let wasHandedOff = handOff != nil
             if !Self.isAtEnd(offset, end: end) {
-                handOff = nil
+                if drag.travel.height > lastTravel.height { handOff = nil }
             } else if handOff == nil {
                 handOff = Self.crossing(from: lastTravel, textAt: lastOffset, to: drag.travel, end: end)
             }

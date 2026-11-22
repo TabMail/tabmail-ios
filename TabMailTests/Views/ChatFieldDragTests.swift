@@ -21,6 +21,40 @@ struct ChatFieldDragTests {
         #expect(ChatFieldDrag.swell(translation: CGSize(width: 0, height: -10_000)) == ChatViewLayout.fieldDragMaxSwell)
     }
 
+    // UI run 2026-11-22: under a 125 pt swell the collapsed field's measured height read one ulp
+    // over its own (158.287109375 as 158.28710937500003). That set the bar's height, ran the chat's
+    // body, built the reply field again under the finger, and UIKit scrolled its text to its caret.
+    @Test("A swell's floating-point remainder is not a new field height; a change a screen can show is")
+    @MainActor
+    func pillHeightIgnoresTheSwellsRemainder() {
+        let measured: CGFloat = 158.287109375
+        let runRemainder = ChatThreadView.pillHeightMoved(from: measured, to: 158.28710937500003)
+        #expect(!runRemainder, "the UI run's remainder is the same height")
+        // The swell's round trip as the layout makes it: added inside the glass under the field's
+        // chrome, taken back out around it, for every swell a drag reaches in thirds of a point.
+        let text: CGFloat = 130.33333333333334
+        let chrome = measured - text
+        var remainders = 0
+        var moved: [CGFloat] = []
+        for step in 0...Int(ChatViewLayout.fieldDragMaxSwell * 3) {
+            let swell = CGFloat(step) / 3
+            let roundTrip = ((text + swell) + chrome) - swell
+            if roundTrip != text + chrome { remainders += 1 }
+            if ChatThreadView.pillHeightMoved(from: text + chrome, to: roundTrip) { moved.append(swell) }
+        }
+        #expect(remainders > 0, "control: the round trip does leave remainders")
+        #expect(moved.isEmpty, "no swell reads as a new height: \(moved.prefix(5))")
+        let pixelUpAt3x = ChatThreadView.pillHeightMoved(from: measured, to: measured + 1.0 / 3)
+        let pixelDownAt2x = ChatThreadView.pillHeightMoved(from: measured, to: measured - 0.5)
+        #expect(pixelUpAt3x, "a pixel more at 3x is a new height")
+        #expect(pixelDownAt2x, "a pixel less at 2x is a new height")
+        let tolerance = ChatViewLayout.fieldHeightTolerance
+        let atTheTolerance = ChatThreadView.pillHeightMoved(from: 0, to: tolerance)
+        let underTheTolerance = ChatThreadView.pillHeightMoved(from: 0, to: tolerance.nextDown)
+        #expect(atTheTolerance, "exactly the tolerance is a new height")
+        #expect(!underTheTolerance, "any less is not")
+    }
+
     @Test("A drag down, or one more sideways than up, does not swell the field",
           arguments: [CGSize(width: 0, height: 40), CGSize(width: 80, height: -40), CGSize(width: -80, height: -40), .zero])
     func onlyAnUpwardDragSwells(_ translation: CGSize) {
@@ -345,6 +379,44 @@ struct ChatFieldDragTests {
         #expect(up == Self.sample(0, -65), "the sideways travel made in the text is not the field's")
         let opens = ChatFieldDrag.opens(letGo: up)
         #expect(opens, "65 straight up past the end opens the panel")
+    }
+
+    // UI run 2026-11-22: the reply field was built again while the finger was down past the text's
+    // end, UIKit then scrolled the text back to its caret at its start, and the let-go read the
+    // text short of its end, gave the field nothing and did not open the panel.
+    @Test("Once the text has handed the drag on, a scroll of the text the finger did not make keeps the field's share; the finger coming back down ends it")
+    @MainActor
+    func handOffSurvivesATextScrollTheFingerDidNotMake() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        text.contentOffset = CGPoint(x: 0, y: end / 2)
+        coordinator.touchDown(on: inner)
+
+        text.contentOffset = CGPoint(x: 0, y: end)
+        let crossed = coordinator.share(Self.sample(0, -130))
+        #expect(crossed == Self.sample(0, -30), "control: past the end the field has the rest")
+        // The text scrolls back to its caret at its start; the finger holds still.
+        text.contentOffset = .zero
+        let held = coordinator.share(Self.sample(0, -130))
+        #expect(held == Self.sample(0, -30), "the finger did not move: the field keeps its share")
+        // The finger goes on up; the text's own scroll takes it along.
+        text.contentOffset = CGPoint(x: 0, y: 40)
+        let further = coordinator.share(Self.sample(0, -170, speed: -200))
+        #expect(further == Self.sample(0, -70, speed: -200), "the finger went on up: the rest is still the field's")
+        let letGo = coordinator.share(ChatFieldDrag.letGo(Self.sample(0, -170, speed: -200), rested: 0), atLetGo: true)
+        let opens = ChatFieldDrag.opens(letGo: letGo)
+        #expect(opens, "and its let-go opens the panel")
+
+        // The same drag again, but the finger comes back down with the text short of its end.
+        text.contentOffset = CGPoint(x: 0, y: end / 2)
+        coordinator.touchDown(on: inner)
+        text.contentOffset = CGPoint(x: 0, y: end)
+        let again = coordinator.share(Self.sample(0, -130))
+        #expect(again == Self.sample(0, -30), "control: past the end the field has the rest")
+        text.contentOffset = CGPoint(x: 0, y: end - 10)
+        let back = coordinator.share(Self.sample(0, -120, speed: 300))
+        #expect(back == Self.sample(0, 0), "the finger brought the text back: the text has the drag again")
     }
 
     // UIKit holds a text at its end on its own value, which can read a hair under the end its sizes
