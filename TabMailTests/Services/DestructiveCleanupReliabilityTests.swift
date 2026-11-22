@@ -204,6 +204,9 @@ struct DestructiveCleanupReliabilityTests {
         return await condition()
     }
 
+    /// How long a removal test's teardown waits for its removal and its tool to finish.
+    private static let cleanupLimit: Duration = .seconds(10)
+
     /// INVARIANT (ADR-IOS-053): a committed account removal ends every agent compose card that
     /// depends on the account while the account's teardown is still on the wire. The tool waiting
     /// on one hears of the removal before the provider's disconnect returns; a card of the other
@@ -250,9 +253,13 @@ struct DestructiveCleanupReliabilityTests {
         let cleanup: () async -> Void = {
             // Never leave the removal parked or the tool waiting: both finish before teardown.
             await parked.release()
-            _ = await removal?.result
+            if let removal, await BoundedWait.result(of: removal, within: Self.cleanupLimit) == nil {
+                Issue.record("the removal did not finish after its disconnect was released")
+            }
             toolRun?.cancel()
-            _ = await toolRun?.value
+            if let toolRun, await BoundedWait.result(of: toolRun, within: Self.cleanupLimit) == nil {
+                Issue.record("the compose tool did not return after it was cancelled")
+            }
             await AccountManager.shared.unregisterProviderForTesting(accountId: gone.id)
             router.resetComposeQueueForTesting()
             // The removal's own push cleanup pass runs against the offline client; let it

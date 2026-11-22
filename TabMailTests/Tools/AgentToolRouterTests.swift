@@ -14,16 +14,52 @@ enum ComposeTestOrigin {
     static let inboxHost = AgentToolRouter.ComposeHost(screen: .inbox, sessionKeys: ["inbox"])
     static let invocation = ToolInvocation(composeOrigin: inbox)
 
-    /// Runs `tool` with no compose origin, cancelled after five seconds: a tool that waited for a
-    /// card no screen can take is stopped, so a regression fails instead of hanging the run.
+    /// Runs `tool` with no compose origin for at most five seconds: a tool that waits for a card no
+    /// screen can take throws `BoundedWait.DeadlineExpired`, so a regression fails instead of
+    /// hanging the run.
     static func runWithoutOrigin(_ tool: any AgentTool, arguments: [String: JSONValue]) async throws -> String {
         let run = Task { try await tool.execute(arguments: arguments, invocation: .noninteractive) }
-        let watchdog = Task {
-            try? await Task.sleep(for: .seconds(5))
-            run.cancel()
+        guard let result = await BoundedWait.result(of: run, within: .seconds(5)) else {
+            throw BoundedWait.DeadlineExpired()
         }
-        defer { watchdog.cancel() }
-        return try await run.value
+        return try result.get()
+    }
+}
+
+/// Awaits a task for a bounded time. The task is cancelled at the deadline and the wait returns
+/// nil even when the task ignores the cancellation, so a waiter left unresolved fails its test
+/// instead of hanging the whole run.
+enum BoundedWait {
+    struct DeadlineExpired: Error {}
+
+    static func result<T: Sendable, Failure: Error>(of task: Task<T, Failure>, within limit: Duration) async -> Result<T, Failure>? {
+        let once = ResumeOnce<Result<T, Failure>?>()
+        return await withCheckedContinuation { continuation in
+            once.store(continuation)
+            Task { once.resume(await task.result) }
+            Task {
+                try? await Task.sleep(for: limit)
+                task.cancel()
+                once.resume(nil)
+            }
+        }
+    }
+
+    private final class ResumeOnce<Value: Sendable>: @unchecked Sendable {
+        private var continuation: CheckedContinuation<Value, Never>?
+        private let lock = NSLock()
+
+        func store(_ continuation: CheckedContinuation<Value, Never>) {
+            lock.withLock { self.continuation = continuation }
+        }
+
+        func resume(_ value: Value) {
+            let continuation: CheckedContinuation<Value, Never>? = lock.withLock {
+                defer { self.continuation = nil }
+                return self.continuation
+            }
+            continuation?.resume(returning: value)
+        }
     }
 }
 
@@ -1074,7 +1110,7 @@ struct AgentToolRouterBlockingComposeTests {
         }
     }
 
-    @Test("Task cancellation resumes with .cancelled and flips outcomeState")
+    @Test("A request stopped while it waits leaves the queue with its outcome, though no screen looks again")
     func composeOutcomeOnTaskCancellation() async {
         let router = AgentToolRouter()
 
@@ -1084,23 +1120,31 @@ struct AgentToolRouterBlockingComposeTests {
         case .cancelled: break  // expected
         default: Issue.record("Expected .cancelled, got \(outcome)")
         }
-        // Request is still in the queue (the presentation held it), and
-        // the onCancel handler flipped its resolved flag via tryResolve.
-        #expect(router.composeQueueDepth == 1)
-        #expect(router.firstQueuedRequestResolvedForTesting == true)
+        // The window still holds the queue and nothing takes, yet the stopped request (its
+        // recipients and body) is gone: nothing keeps it until some later take.
+        #expect(router.composeQueueDepth == 0)
+        #expect(router.composePresentationCount == 1)
     }
 
     @Test("A request cancelled before it was taken is dropped, never taken")
     func staleCancelledRequestSkippedOnDispatch() async {
         let router = AgentToolRouter()
 
-        // Same setup as the previous test — leaves a resolved request in queue.
-        _ = await enqueueAndCancelTaskForTesting(router: router)
+        // A request whose tool was cancelled but which is still queued: the cancellation has
+        // resolved it on another thread and its wait has not ended yet.
+        let state = ComposeOutcomeState()
+        _ = state.tryResolve(.cancelled)
+        router.enqueueCompose(AgentToolRouter.ComposeRequest(
+            mode: .compose, replyTo: nil,
+            to: ["t@example.com"], cc: [], bcc: [],
+            subject: "Queued", body: nil,
+            origin: ComposeTestOrigin.inbox,
+            onOutcome: { _ in }, outcomeState: state
+        ))
         #expect(router.composeQueueDepth == 1)
+        #expect(router.firstQueuedRequestResolvedForTesting == true)
 
-        // Now drop presentationCount to 0. The asking screen looks: the
-        // resolved request is dropped, not taken.
-        router.composePresentationDidEnd()
+        // The asking screen looks: the resolved request is dropped, not taken.
         let taken = router.takeCompose(for: ComposeTestOrigin.inboxHost)
 
         #expect(taken == nil)

@@ -34,10 +34,12 @@ import UIKit
 ///  8. A field reply narrowed in Reply to opens to the people chosen even when a Reply All draft is
 ///     saved for that email, and leaves that draft as it was; the open card holds a draft of its own.
 ///  9. The inbox takes its cards as its navigation says it shows (no email pushed over it), not as
-///     its pill's appearance says, and takes none while one of its own sheets is up.
+///     its pill's appearance says, takes none while one of its own sheets is up, and takes a card
+///     already waiting when it is entered again.
 /// 10. A new email asked in the chat view or on the email screen opens from the account bound when
 ///     its turn started; one whose bound account is gone ends plainly and holds no card.
-/// 11. A turn cut off on one screen and resumed from another keeps the screen that asked.
+/// 11. A turn cut off on one screen and resumed from another keeps the screen that asked, and its
+///     bound account, also when the resume is cut off again.
 ///
 /// Each case mounts the real screens in a window: a NavigationStack with the inbox (or the email
 /// screen) at its root and the chat pushed over it, both mounted as in the app (case 5 mounts the
@@ -110,8 +112,9 @@ struct ChatComposeRoutingTests {
 
     /// The fake backend: a request with no saved state asks for `email_reply` on the email it names
     /// (unless `asksForReply` is false), or on the email set with `reply(to:)` for a request that
-    /// names none (the inbox's chat); one carrying the tool's result is answered "Done". With
-    /// `failsFirst`, the first request fails that way.
+    /// names none (the inbox's chat), or for `email_compose` of a new email with `asksForNewEmail`;
+    /// one carrying the tool's result is answered "Done". With `failsFirst`, the first `failures`
+    /// requests fail that way.
     final class Backend: @unchecked Sendable {
         let http = FakeHTTP.Scenario()
         final class Record: Sendable {
@@ -120,14 +123,17 @@ struct ChatComposeRoutingTests {
         }
         private let record = Record()
 
-        init(asksForReply: Bool = true, failsFirst: ChatReplyRecoveryTests.Failure? = nil) {
+        static let newEmailTo = "sam@example.com"
+
+        init(asksForReply: Bool = true, asksForNewEmail: Bool = false,
+             failsFirst: ChatReplyRecoveryTests.Failure? = nil, failures: Int = 1) {
             http.register(path: "/completions/chat", method: "POST") { [record] request in
                 let body = String(decoding: request.body ?? Data(), as: UTF8.self)
                 let count = record.bodies.withLock { bodies in
                     bodies.append(body)
                     return bodies.count
                 }
-                if count == 1, let failsFirst {
+                if count <= failures, let failsFirst {
                     switch failsFirst {
                     case .connectionLost: return .transportError(.networkConnectionLost)
                     case .serverError: return .status(500)
@@ -136,6 +142,14 @@ struct ChatComposeRoutingTests {
                 let final: [String: Any]
                 if body.contains("conversation_state") || !asksForReply {
                     final = ["assistant": "Done"]
+                } else if asksForNewEmail {
+                    let arguments: [String: Any] = ["to": [Backend.newEmailTo], "subject": "Lunch", "body": "Lunch on Friday?"]
+                    let argumentsText = String(decoding: try! JSONSerialization.data(withJSONObject: arguments), as: UTF8.self)
+                    final = [
+                        "assistant": "",
+                        "tool_calls": [["id": "tc-compose", "function": ["name": "email_compose", "arguments": argumentsText]]],
+                        "conversation_state": ["harmony_messages": [], "current_round": 1],
+                    ]
                 } else {
                     let number = ChatReplyRecoveryTests.Backend.emailNumber(in: body)
                         ?? record.emailNumber.withLock { $0 } ?? 0
@@ -174,6 +188,9 @@ struct ChatComposeRoutingTests {
         /// appearance callbacks do (ADR-IOS-054).
         var inboxNavigationSaysPushed: Bool?
         var inboxSaysPushed: Bool { inboxNavigationSaysPushed ?? chatShown }
+        /// The email the pushed chat is opened on; nil: the root's email. The chat shows its
+        /// thread's newest email either way, and binds a new email's From to the email it opened on.
+        var chatOpenedOn: String?
     }
 
     /// The root screen with the chat pushed over it while `route.chatShown`.
@@ -186,7 +203,7 @@ struct ChatComposeRoutingTests {
             let _ = route.chatShown
             NavigationStack {
                 root.navigationDestination(isPresented: $route.chatShown) {
-                    ChatThreadView(messageId: chatId)
+                    ChatThreadView(messageId: route.chatOpenedOn ?? chatId)
                 }
             }
         }
@@ -218,9 +235,12 @@ struct ChatComposeRoutingTests {
 
     /// Mounts `root` with the chat on `groupEmail(tag)` pushed over it (unless `chat` is false), its
     /// requests going to `backend`, and runs `body`. With `earlier`, the thread also has
-    /// `earlierEmail(tag)` in the user's other account.
+    /// `earlierEmail(tag)` in the user's other account. `waiting` is queued before the screens
+    /// mount, as a request whose screen is entered again; the root's pill is then not awaited,
+    /// since the card can cover it at once.
     private func withScreens(
         _ root: Root, _ backend: Backend, tag: String, chat: Bool = true, earlier: Bool = false,
+        waiting: AgentToolRouter.ComposeRequest? = nil,
         _ body: @MainActor (Screens) async throws -> Void
     ) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -271,6 +291,7 @@ struct ChatComposeRoutingTests {
         let stored = try #require(storedEmail, "control: the email is stored")
         let threadKey = ChatThreadKey.key(for: stored)
 
+        if let waiting { router.enqueueCompose(waiting) }
         let route = Route()
         let chatId = email.id
         let rootView: AnyView
@@ -322,7 +343,9 @@ struct ChatComposeRoutingTests {
         let screens = Screens(controller: controller, route: route, email: email, threadKey: threadKey, earlier: earlierEmail)
         do {
             // The root screen shows first, with its pill, then the chat is pushed over it.
-            try await Self.waitUntil { HostedAccessibility.identifiers(in: screens.view).contains("chatPill") }
+            if waiting == nil {
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: screens.view).contains("chatPill") }
+            }
             if chat {
                 route.chatShown = true
                 try await Self.waitForChat(in: screens)
@@ -1067,6 +1090,27 @@ struct ChatComposeRoutingTests {
         }
     }
 
+    @Test("A card waiting when the inbox is entered again opens once, though nothing changes after the inbox shows")
+    func enteredInboxTakesItsWaitingCard() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted screens")
+        let backend = Backend(asksForReply: false)
+        // The inbox's request was queued while another sidebar page replaced the inbox, so its
+        // offer has moved already; the inbox is entered again and says from its first frame that it
+        // shows.
+        let waiting = AgentToolRouter.ComposeRequest(
+            mode: .compose, replyTo: nil, to: [Self.ownCardAddress], cc: [], bcc: [],
+            subject: "Lunch", body: "Lunch on Friday?", origin: ComposeOrigin(sessionKey: "inbox", screen: .inbox))
+        try await HostedAccessibility.withAutomation {
+            try await withScreens(.inbox, backend, tag: "inbox-entered", chat: false, waiting: waiting) { screens in
+                let router = AgentToolRouter.shared
+                let card = try await Self.openedCard(in: screens)
+                #expect(Self.addresses(card["to"]) == [Self.ownCardAddress], "the inbox opens its waiting card: \(card)")
+                #expect(router.composeQueueDepth == 0)
+                #expect(router.composePresentationCount == 1, "one card for the one request")
+            }
+        }
+    }
+
     // MARK: - 10. A new email opens from the account bound when its turn started
 
     @Test("A new email bound to the user's other account opens from that account, in the chat view and on the email screen",
@@ -1183,6 +1227,62 @@ struct ChatComposeRoutingTests {
                     let card = try await Self.openedCard(in: screens)
                     #expect(Self.addresses(card["to"]) == ["alex@example.com", "david@example.com"], "the email screen's Reply All: \(card)")
                     #expect(Self.addresses(card["cc"]) == ["sam@example.com"], "\(card)")
+                    #expect(router.composeQueueDepth == 0)
+                }
+            }
+        }
+    }
+
+    @Test("A new email cut off twice, resumed from a chat bound to the other account, keeps the email screen's origin and opens there from its account")
+    func secondInterruptionKeepsTheOrigin() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted pill")
+        let backend = Backend(asksForNewEmail: true, failsFirst: .connectionLost, failures: 2)
+        try await HostedAccessibility.withAutomation {
+            try await Self.withOpenablePill {
+                try await withScreens(.email, backend, tag: "resume-twice", chat: false, earlier: true) { screens in
+                    let router = AgentToolRouter.shared
+                    let earlier = try #require(screens.earlier, "control: the thread has an email in the other account")
+                    // The email screen's own pill asks, bound to the email's account; the request
+                    // is cut off in transit.
+                    try await Self.openPill(in: screens)
+                    #expect(Self.type("Ask Sam to lunch", in: screens.view), "control: the pill takes words")
+                    try await Task.sleep(for: .milliseconds(300))
+                    #expect(HostedAccessibility.activate("chatSend", in: screens.view),
+                            "control: the pill's Send takes a tap: \(HostedAccessibility.identifiers(in: screens.view))")
+                    try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                    #expect(backend.bodies.count == 1, "control: the request went out once and was cut off")
+
+                    // The chat opened on the thread's email in the other account shows the same chat,
+                    // and binds a new email to that account. It resumes, and is cut off again.
+                    screens.route.chatOpenedOn = earlier.id
+                    screens.route.chatShown = true
+                    try await Self.waitForChat(in: screens)
+                    try await Self.waitUntil { HostedAccessibility.identifiers(in: screens.view).contains("chatRetry") }
+                    #expect(HostedAccessibility.activate("chatRetry", in: screens.view),
+                            "control: the chat offers the cut-off turn: \(HostedAccessibility.identifiers(in: screens.view))")
+                    try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
+                    #expect(backend.bodies.count == 2, "control: the resume went out and was cut off")
+
+                    // The second resume asks for the new email: it keeps the screen and account the
+                    // turn started with, so it waits for the email screen under the chat.
+                    try await Self.waitUntil { HostedAccessibility.identifiers(in: screens.view).contains("chatRetry") }
+                    #expect(HostedAccessibility.activate("chatRetry", in: screens.view),
+                            "control: the chat offers the turn again: \(HostedAccessibility.identifiers(in: screens.view))")
+                    try await Self.waitUntil { router.composeQueueDepth == 1 }
+                    let request = try #require(router.firstQueuedRequestForTesting, "control: the resumed turn asked for a new email")
+                    #expect(request.origin == Self.rootOrigin(.email, screens),
+                            "the twice-resumed turn keeps the email screen that asked, and its account: \(request.origin)")
+                    #expect(Self.card(in: screens).isEmpty, "the chat opens no card for the email screen")
+
+                    // The email screen shows again and opens the new email, from the email's account.
+                    screens.route.chatShown = false
+                    let card = try await Self.openedCard(in: screens)
+                    #expect(Self.addresses(card["to"]) == [Backend.newEmailTo], "the email screen's new email: \(card)")
+                    let labels = Self.cardLabels(in: screens)
+                    let fromBound = labels.contains { $0.contains(Self.me) }
+                    let fromChat = labels.contains { $0.contains(Self.other) }
+                    #expect(fromBound, "the card sends from the account bound when the turn started: \(labels)")
+                    #expect(!fromChat, "never from the account of the chat that resumed it: \(labels)")
                     #expect(router.composeQueueDepth == 0)
                 }
             }

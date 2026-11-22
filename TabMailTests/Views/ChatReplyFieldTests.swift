@@ -880,7 +880,10 @@ struct ChatReplyFieldTests {
         #expect(Self.count("onAgentCompose: { agentCompose = $0 }, composeHostCovered: isAnyPresentation, composeHostShown: composeHostShown)", in: inbox) == 1,
                 "the inbox says from its navigation whether it shows, and passes its own sheets, covers and alert")
         #expect(Self.count("private var composeHostShown: Bool { selectedMessageId == nil && pushedMessageId == nil }", in: inbox) == 1)
-        #expect(Self.count("showSearch || labelMenuMessage != nil || showLabelFilterPicker || moveMessageId != nil || moveThreadGroup != nil", in: inbox) == 1)
+        #expect(Self.count("showSearch || labelMenuMessage != nil || showLabelFilterPicker || moveMessageId != nil || moveThreadGroup != nil || replyMessage != nil || draftOpen != nil || agentCompose != nil || contactComposeRequest != nil || viewModel.showCompose || showUndoAlert }", in: inbox) == 1,
+                "every sheet, cover and alert of the inbox holds a compose card")
+        #expect(Self.count("showCompose || contactComposeRequest != nil || replyMessage != nil || replyAllMessage != nil || forwardMessage != nil || agentCompose != nil || moveMessage != nil || labelMenuMessage != nil }", in: detail) == 1,
+                "every sheet and cover of the email screen holds a compose card")
         #expect(Self.count("onAgentCompose: openAgentCompose, composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)", in: detail) == 1)
         let detailActions = try Self.source("TabMail/Views/Message/MessageDetailView+Actions.swift")
         #expect(Self.count("account: fromAccount(of: req),", in: detailActions) == 1, "the email screen's new message opens from its bound account")
@@ -927,8 +930,10 @@ struct ChatReplyFieldTests {
         #expect(Self.count("guard onAgentCompose != nil, composeContext == nil else { return nil }", in: island) == 1,
                 "a compose editor's pill has no compose screen")
         // Every turn of the pill starts in one of the two.
-        #expect(Self.count("let origin = composeOrigin(", in: island) == 2)
-        #expect(Self.count("activeChatTask = Task {", in: island) == Self.count("let origin = composeOrigin(", in: island) + 1,
-                "one turn task per named start, and the compose editor's")
+        // A fresh send names its screen; a resume reuses the origin its turn started with.
+        #expect(Self.count("let origin = composeOrigin(", in: island) == 1)
+        #expect(Self.count("let origin = resume.origin", in: island) == 1)
+        #expect(Self.count("activeChatTask = Task {", in: island) == Self.count("let origin = composeOrigin(", in: island) + Self.count("let origin = resume.origin", in: island) + 1,
+                "one turn task per send and per resume, and the compose editor's")
     }
 }
