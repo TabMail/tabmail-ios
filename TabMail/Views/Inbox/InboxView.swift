@@ -1262,7 +1262,8 @@ struct InboxView: View {
                                 viewModel.toggleThreadExpansion(group.id)
                             }
                         },
-                        showsRecipientInsteadOfSender: isUserAuthoredFolder
+                        showsRecipientInsteadOfSender: isUserAuthoredFolder,
+                        isDraftsFolder: isDraftsContext
                     )
                 }
                 .compositingGroup()

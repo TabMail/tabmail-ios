@@ -61,8 +61,10 @@ struct ChatNewThreadView: View {
             .frame(maxWidth: .infinity)
         }
         .defaultScrollAnchor(.bottom)
+        .scrollDismissesKeyboard(.interactively)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Palette.previewPaneBg)
+        .dismissKeyboardOnTap()
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         // Back saves first, so the system's Back (and its swipe) is replaced by this chat's own.
@@ -352,7 +354,8 @@ private struct ChatTrayThumbnail: View {
         .frame(width: ChatViewLayout.trayThumbnailSize, height: ChatViewLayout.trayThumbnailSize)
         .clipShape(RoundedRectangle(cornerRadius: ChatViewLayout.trayCornerRadius))
         .accessibilityLabel(AttachmentFilename.displayLabel(attachment.filename))
-        .task(id: ChatNewDraft.fingerprint(attachment)) {
+        // Keyed by the attachment itself, bytes included, as the chat tells a change.
+        .task(id: attachment) {
             let side = ChatViewLayout.trayThumbnailSize * displayScale
             image = await UIImage(data: attachment.data)?
                 .byPreparingThumbnail(ofSize: CGSize(width: side, height: side))

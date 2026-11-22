@@ -71,7 +71,8 @@ struct ChatNewThreadTests {
         let spaces = ChatNewDraft.Content(words: "  \n\t ", recipients: [], attachments: [])
         let peopleOnly = ChatNewDraft.Content(words: "", recipients: ["maria@example.com"], attachments: [])
         let words = ChatNewDraft.Content(words: "Lunch?", recipients: [], attachments: [])
-        let attachment = ChatNewDraft.Content(words: "", recipients: [], attachments: ["a.pdf|3|application/pdf|false"])
+        let file = DraftAttachment(filename: "a.pdf", mimeType: "application/pdf", data: Data([1, 2, 3]))
+        let attachment = ChatNewDraft.Content(words: "", recipients: [], attachments: [file])
         #expect(!empty.isWaiting)
         #expect(!spaces.isWaiting)
         #expect(!peopleOnly.isWaiting, "people alone are not kept")
@@ -95,18 +96,34 @@ struct ChatNewThreadTests {
         #expect(ChatNewDraft.needsSave(current: empty, saved: words), "an emptied draft is saved empty, never deleted here")
     }
 
-    @Test("An attachment's fingerprint changes with its name, size, type or kind")
-    func fingerprint() {
+    @Test("A file replaced by another with the same name, size and type is a change; the same file again is not")
+    func attachmentChangeIsTheBytes() {
         let base = DraftAttachment(filename: "a.pdf", mimeType: "application/pdf", data: Data([1, 2, 3]))
+        let sameBytes = DraftAttachment(filename: "a.pdf", mimeType: "application/pdf", data: Data([1, 2, 3]))
+        let otherBytes = DraftAttachment(filename: "a.pdf", mimeType: "application/pdf", data: Data([1, 2, 4]))
         let renamed = DraftAttachment(filename: "b.pdf", mimeType: "application/pdf", data: Data([1, 2, 3]))
-        let resized = DraftAttachment(filename: "a.pdf", mimeType: "application/pdf", data: Data([1, 2]))
         let retyped = DraftAttachment(filename: "a.pdf", mimeType: "text/plain", data: Data([1, 2, 3]))
         let alternative = DraftAttachment(filename: "a.pdf", mimeType: "application/pdf", data: Data([1, 2, 3]), isAlternative: true)
-        let fingerprints = [base, renamed, resized, retyped, alternative].map(ChatNewDraft.fingerprint)
-        let distinct = Set(fingerprints)
-        #expect(distinct.count == fingerprints.count)
-        let again = ChatNewDraft.fingerprint(base)
-        #expect(again == fingerprints.first)
+        let saved = ChatNewDraft.Content(words: "Lunch?", recipients: [], attachments: [base])
+        func content(_ file: DraftAttachment) -> ChatNewDraft.Content {
+            ChatNewDraft.Content(words: "Lunch?", recipients: [], attachments: [file])
+        }
+        let unchanged = content(sameBytes)
+        let replaced = content(otherBytes)
+        let others = [renamed, retyped, alternative].map(content)
+        #expect(!ChatNewDraft.needsSave(current: unchanged, saved: saved), "the same file again writes nothing")
+        #expect(ChatNewDraft.needsSave(current: replaced, saved: saved), "same name, size and type, other bytes")
+        for other in others {
+            #expect(ChatNewDraft.needsSave(current: other, saved: saved))
+        }
+    }
+
+    @Test("The thumbnail is redrawn when the file's bytes change, as the save is")
+    func thumbnailKeyedByBytes() throws {
+        let view = try Self.source("TabMail/Views/Chat/ChatNewThreadView.swift")
+        #expect(Self.count(".task(id: attachment)", in: view) == 1)
+        let model = try Self.source("TabMail/Models/DraftMessage.swift")
+        #expect(Self.count("struct DraftAttachment: Sendable, Equatable {", in: model) == 1)
     }
 
     @Test("Send with nobody picked asks who it is to; with people, it is for them")
@@ -146,6 +163,23 @@ struct ChatNewThreadTests {
         #expect(!today.contains(earlierToday.formatted(date: .abbreviated, time: .omitted)))
     }
 
+    @Test("In Drafts a draft with no subject reads 'Draft (no subject yet)'; a subject, or any other folder, shows as stored")
+    func draftRowSubject() throws {
+        let blank = MessageRowView.subjectLine("", isDraftsFolder: true)
+        let spaces = MessageRowView.subjectLine(" \n\t", isDraftsFolder: true)
+        let titled = MessageRowView.subjectLine("Plans", isDraftsFolder: true)
+        let elsewhere = MessageRowView.subjectLine("", isDraftsFolder: false)
+        #expect(blank == "Draft (no subject yet)")
+        #expect(spaces == "Draft (no subject yet)")
+        #expect(titled == "Plans")
+        #expect(elsewhere == "", "only Drafts gets the fallback")
+        let row = try Self.source("TabMail/Views/Inbox/MessageRowView.swift")
+        #expect(Self.count("Text(Self.subjectLine(message.subject, isDraftsFolder: isDraftsFolder))", in: row) == 1)
+        #expect(Self.count("Text(message.subject)", in: row) == 0, "the row's subject goes through the fallback")
+        let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
+        #expect(Self.count("showsRecipientInsteadOfSender: isUserAuthoredFolder, isDraftsFolder: isDraftsContext )", in: inbox) == 1)
+    }
+
     @Test("A saved To becomes the people, by name or the address's own; text that is no address is kept apart")
     func peopleFromTo() {
         let result = ChatNewDraft.people(fromTo: ["Maria Lee <Maria@Example.com>", "sam@example.com", "not an address"])
@@ -154,6 +188,27 @@ struct ChatNewThreadTests {
         #expect(addresses == ["maria@example.com", "sam@example.com"])
         #expect(names == ["Maria Lee", "sam"])
         #expect(result.leftovers == ["not an address"])
+    }
+
+    @Test("A save writes each person with their name: a reopened draft's as it wrote them, a new pick by the name picked")
+    func toEntries() {
+        let reopened = ChatNewDraft.people(fromTo: ["Maria Lee <Maria@Example.com>", "sam@example.com", "not an address"])
+        #expect(reopened.people.count == 2)
+        guard reopened.people.count == 2 else { return }
+        let picked = ChatThread.Person(address: "lee@example.com", name: "Lee Park")
+        let plain = ChatThread.Person(address: "kim@example.com", name: ChatThread.fallbackName("kim@example.com"))
+        let written = ChatNewDraft.toEntries(
+            people: reopened.people + [picked, plain], authored: reopened.authored, leftovers: reopened.leftovers)
+        #expect(written == [
+            "\"Maria Lee\" <Maria@Example.com>", "sam@example.com", "\"Lee Park\" <lee@example.com>",
+            "kim@example.com", "not an address",
+        ])
+        let readBack = ChatNewDraft.people(fromTo: written)
+        let names = readBack.people.map(\.name)
+        #expect(names == ["Maria Lee", "sam", "Lee Park", "kim"], "every entry reads back as itself")
+        #expect(readBack.leftovers == ["not an address"])
+        let removed = ChatNewDraft.toEntries(people: [reopened.people[1]], authored: reopened.authored, leftovers: [])
+        #expect(removed == ["sam@example.com"], "a person taken off is not written")
     }
 
     @Test("Add recipient starts from nobody, needs someone, and its Done replaces the people picked")
@@ -380,6 +435,9 @@ struct ChatNewThreadTests {
         #expect(Self.count(".onAppear { DraftSessionRegistry.shared.register(model.draftId) }", in: view) == 1)
         #expect(Self.count(".onDisappear { DraftSessionRegistry.shared.unregister(model.draftId) }", in: view) == 1)
         #expect(Self.count("model.setPeople(ChatNewDraft.people(after: done, current: model.people))", in: view) == 1)
+        // The keyboard rule, on this screen itself, as the chat's own thread installs it.
+        #expect(Self.count(".defaultScrollAnchor(.bottom) .scrollDismissesKeyboard(.interactively) .frame(maxWidth: .infinity, maxHeight: .infinity) .background(Palette.previewPaneBg) .dismissKeyboardOnTap()", in: view) == 1,
+                "a tap on the stream, or a drag, dismisses the keyboard")
         let registry = try Self.source("TabMail/Services/AI/DraftSessionRegistry.swift")
         #expect(registry.contains("(5 production files:"), "the registry's census names the chat as a producer")
     }
@@ -653,7 +711,7 @@ struct ChatNewDraftSaveTests {
         #expect(Draft.isNewEmailKey(saved.id))
         #expect(saved.accountId == Self.accountId)
         #expect(saved.body == "Lunch on Friday?")
-        #expect(saved.toArray == ["maria@example.com"])
+        #expect(saved.toArray == ["\"Maria\" <maria@example.com>"], "written with the name picked")
         #expect(saved.ccArray.isEmpty)
         #expect(saved.subject.isEmpty)
         #expect(saved.replyToId == nil)
@@ -815,7 +873,52 @@ struct ChatNewDraftSaveTests {
         #expect(after.subject == "Plans")
         #expect(after.ccArray == ["cc@example.com"])
         #expect(after.bccArray == ["bcc@example.com"])
-        #expect(after.toArray == ["maria@example.com", "sam@example.com"])
+        #expect(after.toArray == ["\"Maria Lee\" <maria@example.com>", "sam@example.com"], "a body change keeps the names compose wrote")
+    }
+
+    @Test("Named people and a long message survive a save and a reopen, and the reopened draft is not written again")
+    func namesAndWordsRoundTrip() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let recorder = QueueRecorder()
+        let model = makeModel(fixture, recorder)
+        let words = (1...400).map { "Line \($0) of what I want to say, with a comma, and \"quotes\"." }.joined(separator: "\n")
+        model.setPeople([
+            ChatThread.Person(address: "maria@example.com", name: "Lee, Maria"),
+            ChatThread.Person(address: "sam@example.com", name: "sam"),
+        ])
+        model.words = words
+        _ = await model.saveIfNeeded()
+        let savedRow = try await row(fixture, model.draftId)
+        let saved = try #require(savedRow)
+        #expect(saved.toArray == ["\"Lee, Maria\" <maria@example.com>", "sam@example.com"])
+        #expect(saved.body == words, "the whole message, never cut")
+        let reopened = ChatNewThreadModel(reopening: saved, account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
+        let names = reopened.people.map(\.name)
+        let addresses = reopened.people.map(\.address)
+        #expect(names == ["Lee, Maria", "sam"])
+        #expect(addresses == ["maria@example.com", "sam@example.com"])
+        #expect(reopened.words == words)
+        let again = await reopened.saveIfNeeded()
+        #expect(again == .saved)
+        #expect(recorder.calls.count == 1, "the reopened draft, unchanged, is not written again")
+    }
+
+    @Test("A reopened draft keeps an address as compose wrote it, and text that is no address")
+    func reopenKeepsAddressTextAndLeftovers() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let draft = try await savedDraft(fixture, to: ["Maria Lee <Maria@Example.com>", "not an address"], attachments: [])
+        let recorder = QueueRecorder()
+        let model = ChatNewThreadModel(reopening: draft, account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
+        let addresses = model.people.map(\.address)
+        #expect(addresses == ["maria@example.com"], "matched by the address in lower case")
+        model.words = "Changed words"
+        let outcome = await model.saveIfNeeded()
+        let afterRow = try await row(fixture, draft.id)
+        let after = try #require(afterRow)
+        #expect(outcome == .saved)
+        #expect(after.toArray == ["\"Maria Lee\" <Maria@Example.com>", "not an address"])
     }
 
     @Test("A reopened draft whose attachments cannot be read is never saved from the chat")

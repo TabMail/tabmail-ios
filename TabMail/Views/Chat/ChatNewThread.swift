@@ -31,20 +31,16 @@ enum ChatNewDraft {
     /// The chat's words, recipients and attachments as its draft stores them.
     struct Content: Equatable {
         var words: String
+        /// The To entries a save writes (`toEntries`).
         var recipients: [String]
-        /// One entry per attachment (`fingerprint`), never the bytes.
-        var attachments: [String]
+        /// The attachments themselves: a change is told by their bytes, never by name and size alone.
+        var attachments: [DraftAttachment]
 
         /// Something the user would lose by leaving: words that are not only spaces, or an
         /// attachment. Recipients alone are not kept.
         var isWaiting: Bool {
             !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
         }
-    }
-
-    /// An attachment's identity for telling whether the attachments changed.
-    static func fingerprint(_ attachment: DraftAttachment) -> String {
-        "\(attachment.filename)|\(attachment.data.count)|\(attachment.mimeType)|\(attachment.isAlternative)"
     }
 
     /// Whether leaving (Back) or the app going to the background writes the draft. Nothing is
@@ -93,16 +89,37 @@ enum ChatNewDraft {
         return "Draft, saved \(time)"
     }
 
-    /// The people a saved draft's To names, in order, each under the name its address gives.
-    /// Entries that name no address are kept apart (`toLeftovers`) so a save writes them back.
-    static func people(fromTo to: [String]) -> (people: [ChatThread.Person], leftovers: [String]) {
+    /// The people a saved draft's To names, in order, each under the name its address gives, and
+    /// the mailboxes as the draft wrote them (`authored`, for `toEntries`). Entries that name no
+    /// address are kept apart (`leftovers`) so a save writes them back.
+    static func people(fromTo to: [String]) -> (people: [ChatThread.Person], authored: [RecipientEntry.Recipient], leftovers: [String]) {
         let entry = RecipientEntry(to)
         let people = entry.recipients.map { recipient in
             let address = recipient.address.lowercased()
             let name = recipient.name.flatMap { $0.isEmpty ? nil : $0 } ?? ChatThread.fallbackName(address)
             return ChatThread.Person(address: address, name: name)
         }
-        return (people, entry.leftovers)
+        return (people, entry.recipients, entry.leftovers)
+    }
+
+    /// The To entries a save writes, each a mailbox that reads back as itself
+    /// (`RecipientEntry.text`, as compose stores them). A person the reopened draft named keeps
+    /// that draft's own name and address as written (`authored`); a person picked here is
+    /// written under the name picked, or as the bare address when that name is only the
+    /// address's own (`ChatThread.fallbackName`). The entries that name no address follow, as written.
+    static func toEntries(people: [ChatThread.Person], authored: [RecipientEntry.Recipient], leftovers: [String]) -> [String] {
+        var written: [String: RecipientEntry.Recipient] = [:]
+        for mailbox in authored where written[mailbox.address.lowercased()] == nil {
+            written[mailbox.address.lowercased()] = mailbox
+        }
+        let mailboxes = people.map { person -> String in
+            if let mailbox = written[person.address.lowercased()] {
+                return RecipientEntry.text(name: mailbox.name, address: mailbox.address)
+            }
+            let name = person.name == ChatThread.fallbackName(person.address) ? nil : person.name
+            return RecipientEntry.text(name: name, address: person.address)
+        }
+        return mailboxes + leftovers
     }
 }
 
@@ -244,6 +261,8 @@ final class ChatNewThreadModel: Hashable {
     @ObservationIgnored private var saved: ChatNewDraft.Content?
     /// To entries of a reopened draft that name no address, written back on every save.
     private let toLeftovers: [String]
+    /// The reopened draft's To mailboxes as it wrote them (`ChatNewDraft.toEntries`).
+    private let authoredTo: [RecipientEntry.Recipient]
     @ObservationIgnored private var inFlight: Task<ChatNewDraftSave.Outcome, Never>?
     /// Queues each saved draft's push to the server (`ChatNewDraftSave.queueThroughAccounts`).
     private let queueDraftSave: ChatNewDraftSave.QueueDraftSave
@@ -262,6 +281,7 @@ final class ChatNewThreadModel: Hashable {
         attachments = []
         attachmentLoadFailed = false
         toLeftovers = []
+        authoredTo = []
         cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
     }
 
@@ -280,6 +300,7 @@ final class ChatNewThreadModel: Hashable {
         let to = ChatNewDraft.people(fromTo: draft.toArray)
         people = to.people
         toLeftovers = to.leftovers
+        authoredTo = to.authored
         var loaded: [DraftAttachment] = []
         var loadFailed = false
         do {
@@ -296,14 +317,16 @@ final class ChatNewThreadModel: Hashable {
         let observed = draft.instanceEpoch.flatMap { $0.isEmpty ? nil : $0 }
         cursor = ComposeGenerationCursor(newEpoch: observed ?? UUID().uuidString, initialExpectedPredecessor: observed)
         saved = ChatNewDraft.Content(
-            words: draft.body, recipients: to.people.map(\.address) + to.leftovers,
-            attachments: loaded.map(ChatNewDraft.fingerprint))
+            words: draft.body,
+            recipients: ChatNewDraft.toEntries(people: to.people, authored: to.authored, leftovers: to.leftovers),
+            attachments: loaded)
     }
 
     var content: ChatNewDraft.Content {
         ChatNewDraft.Content(
-            words: words, recipients: people.map(\.address) + toLeftovers,
-            attachments: attachments.map(ChatNewDraft.fingerprint))
+            words: words,
+            recipients: ChatNewDraft.toEntries(people: people, authored: authoredTo, leftovers: toLeftovers),
+            attachments: attachments)
     }
 
     var sendAction: ChatNewDraft.SendAction { ChatNewDraft.send(people: people) }
@@ -386,9 +409,9 @@ final class ChatNewThreadModel: Hashable {
         guard ChatNewDraft.needsSave(current: snapshot, saved: saved) else { return .saved }
         guard !attachmentLoadFailed else { return .refused(Self.attachmentLoadMessage) }
         guard let account else { return .refused(Self.noAccountMessage) }
-        let to = people.map(\.address) + toLeftovers
-        let body = words
-        let files = attachments
+        let to = snapshot.recipients
+        let body = snapshot.words
+        let files = snapshot.attachments
         let id = draftId
         let generation = cursor
         let queue = queueDraftSave
