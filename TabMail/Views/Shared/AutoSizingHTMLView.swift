@@ -1644,7 +1644,8 @@ private struct HTMLWebView: UIViewRepresentable {
         /// `sanitize` closes on the JS side.
         private static func loggableURL(_ url: URL?) -> String {
             guard let url else { return "(nil)" }
-            let raw = url.absoluteString
+            // A link in a message: its origin only (`LoggableURL.origin`).
+            let raw = LoggableURL.origin(url)
             let capped = raw.count > 120 ? String(raw.prefix(117)) + "..." : raw
             return DebugModeManager.escapedForLogLine(capped)
         }

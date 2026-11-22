@@ -633,7 +633,7 @@ struct MarkdownChatText: View {
     // MARK: - URL Handling
 
     private func handleExternalURL(_ url: URL) {
-        BackgroundSyncLogger.logDebug("[AIChatDebug] External URL tapped: \(url)")
+        BackgroundSyncLogger.logDebug("[AIChatDebug] External URL tapped: \(LoggableURL.origin(url))")
         // Safety net: pills should be intercepted by the sentinel pipeline before
         // they ever reach AttributedString as a markdown link. If one slips through
         // (e.g., a future block context that bypasses extractPills), absorb it here

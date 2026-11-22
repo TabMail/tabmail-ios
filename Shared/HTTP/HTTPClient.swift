@@ -140,7 +140,7 @@ func performHTTPRequest(
         // Debug-gated with `#if DEBUG` rather than `DebugModeManager` because
         // `Shared/` also compiles into the NSE, where that type does not exist.
         #if DEBUG
-        print("[\(logLabel)] HTTP \(statusCode) \(method) \(url): \(errorBodyText.prefix(500))")
+        print("[\(logLabel)] HTTP \(statusCode) \(method) \(LoggableURL.address(url)): \(errorBodyText.prefix(500))")
         #endif
     }
 

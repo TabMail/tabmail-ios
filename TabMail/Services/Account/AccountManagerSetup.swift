@@ -493,7 +493,7 @@ extension AccountManager {
             )
             calendarProviders[accountId] = provider
 
-            BackgroundSyncLogger.logDebug("[AccountManager] CalDAV set up for account \(accountId): home=\(discovery.calendarHomeURL)")
+            BackgroundSyncLogger.logDebug("[AccountManager] CalDAV set up for account \(accountId): home=\(LoggableURL.address(discovery.calendarHomeURL))")
         } catch {
             // Calendar setup failed after the password was written to the
             // Keychain but before a CalDAVConfig row exists to own it. config.id
