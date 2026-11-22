@@ -879,7 +879,12 @@ struct ChatReplyFieldTests {
         let detail = try Self.source("TabMail/Views/Message/MessageDetailView.swift")
         #expect(Self.count("onAgentCompose: { agentCompose = $0 }, composeHostCovered: isAnyPresentation, composeHostShown: composeHostShown)", in: inbox) == 1,
                 "the inbox says from its navigation whether it shows, and passes its own sheets, covers and alert")
-        #expect(Self.count("private var composeHostShown: Bool { selectedMessageId == nil && pushedMessageId == nil }", in: inbox) == 1)
+        #expect(Self.count("private var composeHostShown: Bool { emailsOpenBeside || (selectedMessageId == nil && pushedMessageId == nil) }", in: inbox) == 1)
+        // Whether an opened email shows beside the inbox comes from the split view's own width, read
+        // outside its columns, and reaches the inbox through the content column.
+        let navigation = try Self.source("TabMail/Views/MailNavigationView.swift")
+        #expect(Self.count("emailsOpenBeside: sizeClass == .regular)", in: navigation) == 1, "the expanded split view opens an email beside the inbox")
+        #expect(Self.count("emailsOpenBeside: emailsOpenBeside)", in: navigation) == 2, "through the content column to the inbox")
         #expect(Self.count("showSearch || labelMenuMessage != nil || showLabelFilterPicker || moveMessageId != nil || moveThreadGroup != nil || replyMessage != nil || draftOpen != nil || agentCompose != nil || contactComposeRequest != nil || viewModel.showCompose || showUndoAlert }", in: inbox) == 1,
                 "every sheet, cover and alert of the inbox holds a compose card")
         #expect(Self.count("showCompose || contactComposeRequest != nil || replyMessage != nil || replyAllMessage != nil || forwardMessage != nil || agentCompose != nil || moveMessage != nil || labelMenuMessage != nil }", in: detail) == 1,
