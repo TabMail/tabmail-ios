@@ -90,7 +90,11 @@ struct ChatNewThreadView: View {
         }
         .safeAreaBar(edge: .top, spacing: 0) { ChatNewEmailSubjectLine() }
         .safeAreaBar(edge: .bottom, spacing: 0) { bottomBar }
-        .sheet(isPresented: $showsAddRecipient) {
+        // The user's addresses are captured as the body runs, so the body depends on them and runs
+        // again when `loadOwnAddresses` fills them in. Read only inside the sheet's closure, they
+        // were not a dependency: the sheet opened with the value from before that read, empty, and
+        // added the user's own address.
+        .sheet(isPresented: $showsAddRecipient) { [ownAddresses] in
             ChatReplyToSheet(replyPeople: model.people, target: .replyAll, ownAddresses: ownAddresses,
                              title: ChatReplyToSheet.addRecipientTitle) { done in
                 model.setPeople(ChatNewDraft.people(after: done, current: model.people))
