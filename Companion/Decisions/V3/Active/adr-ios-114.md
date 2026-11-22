@@ -1491,7 +1491,18 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      addresses (every account's address, read as the chat opens) are never added
      (`ChatReplyToChoice.add(_:name:ownAddresses:)`), as in the "Reply to" sheet. Cancel closes the
      sheet and leaves the picked people as they were. No "Recent" section: a recent-people source is
-     separate work.
+     separate work. **Amended 2026-11-22 (ios#1177):** the sheet now has it.
+   - *Recent people.* Below "Add someone", a "Recent" section lists the people the user recently
+     sent email to (`ChatReplyToSheet(recentPeople:)`, read by `ChatRecentPeople.load` as the sheet
+     opens): the To then Cc people of the newest `ChatViewConfig.recentPeopleScanCount` emails in
+     every account's Sent folder, newest first, each once, at most `ChatViewConfig.recentPeopleCount`,
+     each under the newest name an email gives them (else the part of the address before the @),
+     never the user's own addresses. It is computed from the stored headers each time and nothing new
+     is stored (ADR-004). A row shows only someone not in the list above
+     (`ChatReplyToChoice.unlisted`); a tap adds them there, ticked, as a search result does. A read
+     that fails shows no Recent section. The "Reply to" sheet of an email's chat has no Recent
+     section. Tests: `ChatRecentPeopleTests.swift` (the people and their order, the Sent-folder
+     read against a real database, the section on screen).
    - *Attachments.* Picked photos and videos, a camera photo and files wait above the field
      (`ChatAttachmentTray`: photos as thumbnails, files as chips, each with an x). They are named and
      typed by the rules compose uses (`DraftAttachmentImport`, moved out of `ComposeView` with tests
