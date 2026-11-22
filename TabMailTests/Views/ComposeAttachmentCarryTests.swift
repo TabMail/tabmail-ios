@@ -220,21 +220,41 @@ struct ComposeAttachmentCarryTests {
             "private func saveDraftAndDismiss() async {",
             before: "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
             in: composeSource())
-        let steps = [
-            "try Draft.fetchOne(db, key: capDraftId)",
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let writer = try String(
+            contentsOf: root.appendingPathComponent("TabMail/Views/Compose/ComposeDraftSave.swift"), encoding: .utf8)
+        let chat = try String(
+            contentsOf: root.appendingPathComponent("TabMail/Views/Chat/ChatNewThread.swift"), encoding: .utf8)
+        let writerSteps = [
+            "try Draft.fetchOne(db, key: draftId)",
             "ComposeDraftGuards.saveMayMutate(",
-            "DraftAttachmentStorage.saveAttachments(capAttachments, dirName: staging)",
+            "DraftAttachmentStorage.saveAttachments(attachments, dirName: staging)",
             "ComposeDraftGuards.draftToSave(",
-            "try await saveThroughGeneration(draftToSave)",
+            "saveResult = try await admit(draft)",
             "saveApplied: saveResult == .applied",
             "guard saveResult == .applied else {",
+            "return .committed(previousPushStatus:",
+        ]
+        let composeSteps = [
+            "await ComposeDraftSave.run(",
+            "admit: { draft in try await saveThroughGeneration(draft) })",
+            "case .committed(let previousPushStatus):",
             "AccountManager.shared.queueDraftSave(",
         ]
-        let positions = steps.map { body.range(of: $0)?.lowerBound }
-        let found = positions.compactMap { $0 }
-        #expect(found.count == steps.count, "every step of Save is present")
-        guard found.count == steps.count else { return }
-        #expect(found == found.sorted(), "Save's steps run in this order")
+        let chatSteps = [
+            "await ComposeDraftSave.run(",
+            "case .committed:",
+            "guard await queueDraftSave(draftId, accountId) else {",
+        ]
+        for (name, source, steps) in [("writer", writer[...], writerSteps), ("compose", body, composeSteps), ("chat", chat[...], chatSteps)] {
+            let found = steps.compactMap { source.range(of: $0)?.lowerBound }
+            #expect(found.count == steps.count, "every step of the \(name)'s save is present")
+            guard found.count == steps.count else { continue }
+            #expect(found == found.sorted(), "the \(name)'s steps run in this order")
+        }
+        #expect(!body.contains("DraftAttachmentStorage.saveAttachments"), "compose writes only through the shared writer")
+        #expect(!chat.contains("DraftAttachmentStorage.saveAttachments"), "the chat writes only through the shared writer")
     }
 
     @Test("Photos-picker work joins the same attachment completion boundary")

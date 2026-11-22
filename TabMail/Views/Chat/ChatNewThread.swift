@@ -123,11 +123,11 @@ enum ChatNewDraft {
     }
 }
 
-/// Writes a new email's draft, as compose's Save does: one fail-closed read of the row, the
-/// attachments staged in a fresh directory, the row saved through this chat's generation
-/// (`ComposeGenerationCursor`), the staged or superseded directory removed only after the save
-/// committed, then the push to the server's Drafts queued (`queueDraftSave`). Every refusal leaves
-/// the saved row and its attachments as they were.
+/// Writes a new email's draft through compose's own writer (`ComposeDraftSave.run`: one
+/// fail-closed read of the row, the attachments staged in a fresh directory, the row saved
+/// through this chat's generation (`ComposeGenerationCursor`), the staged or superseded directory
+/// removed only after the save committed), then queues the push to the server's Drafts
+/// (`queueDraftSave`). Every refusal leaves the saved row and its attachments as they were.
 @MainActor
 enum ChatNewDraftSave {
     enum Outcome: Equatable {
@@ -158,64 +158,29 @@ enum ChatNewDraftSave {
         now: Double,
         queueDraftSave: QueueDraftSave = queueThroughAccounts
     ) async -> Outcome {
-        // A thrown read is not absence: nothing is written.
-        let readResult: Result<Draft?, Error>
-        do {
-            readResult = .success(try await AppDatabase.dbPool.read { db in
-                try Draft.fetchOne(db, key: draftId)
+        let written = await ComposeDraftSave.run(
+            draftId: draftId, accountId: accountId, attachments: attachments, now: now,
+            fields: { existing in
+                ComposeDraftSave.Fields(
+                    to: to, cc: existing?.ccArray ?? [], bcc: existing?.bccArray ?? [],
+                    subject: existing?.subject ?? "", body: body, replyTo: nil,
+                    isForward: false, isReplyAll: false)
+            },
+            admit: { draft in
+                try await cursor.admit { epoch, expectedPredecessor in
+                    try await DraftStore.shared.saveAsync(draft, epoch: epoch, expectedPredecessor: expectedPredecessor)
+                }
             })
-        } catch {
-            readResult = .failure(error)
-        }
-        guard ComposeDraftGuards.saveMayMutate(readState: ComposeDraftGuards.readState(readResult)),
-              case .success(let existing) = readResult else {
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[ChatNewDraft] draft read threw for \(draftId); nothing written")
-            }
-            return .refused(busyMessage)
-        }
-        let previousDirName = existing?.attachmentsDirName
-
-        let stagingDirName: String?
-        if attachments.isEmpty {
-            stagingDirName = nil
-        } else {
-            let staging = DraftAttachmentStorage.newStagingDirName()
-            do {
-                try DraftAttachmentStorage.saveAttachments(attachments, dirName: staging)
-            } catch {
-                DraftAttachmentStorage.deleteAttachments(dirName: staging)
-                return .refused("The attachments couldn't be saved: \(error.localizedDescription)")
-            }
-            stagingDirName = staging
-        }
-
-        let draft = ComposeDraftGuards.draftToSave(
-            existing: existing, id: draftId, accountId: accountId,
-            recipients: (to, existing?.ccArray ?? [], existing?.bccArray ?? []),
-            subject: existing?.subject ?? "", body: body, replyTo: nil,
-            isForward: false, isReplyAll: false, attachmentsDirName: stagingDirName, now: now)
-
-        let result: DraftStore.SaveResult
-        do {
-            result = try await cursor.admit { epoch, expectedPredecessor in
-                try await DraftStore.shared.saveAsync(draft, epoch: epoch, expectedPredecessor: expectedPredecessor)
-            }
-        } catch {
-            if case .deleteStaging(let dir) = ComposeDraftGuards.attachmentDisposition(
-                saveApplied: false, stagingDir: stagingDirName, previousDir: previousDirName) {
-                DraftAttachmentStorage.deleteAttachments(dirName: dir)
-            }
-            return .refused("This draft couldn't be saved: \(error.localizedDescription)")
-        }
-        switch ComposeDraftGuards.attachmentDisposition(
-            saveApplied: result == .applied, stagingDir: stagingDirName, previousDir: previousDirName) {
-        case .deleteSuperseded(let dir), .deleteStaging(let dir):
-            DraftAttachmentStorage.deleteAttachments(dirName: dir)
-        case .noCleanup:
+        switch written {
+        case .committed:
             break
-        }
-        guard result == .applied else {
+        case .readFailed:
+            return .refused(busyMessage)
+        case .attachmentsNotStaged(let reason):
+            return .refused("The attachments couldn't be saved: \(reason)")
+        case .saveFailed(let reason):
+            return .refused("This draft couldn't be saved: \(reason)")
+        case .superseded:
             return .refused("This draft couldn't be saved: \(DraftStore.DraftEpochAdmissionError.staleOrReserved.localizedDescription)")
         }
         guard await queueDraftSave(draftId, accountId) else {
