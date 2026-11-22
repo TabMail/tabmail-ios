@@ -1200,6 +1200,9 @@ struct ChatReplyFieldTests {
                 "the swell taken back out of the layout")
         let fieldBar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
         #expect(Self.count(".modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))", in: fieldBar) == 1, "the swell on the glass")
+        let replyField = try Self.source("TabMail/Views/Chat/ChatReplyField.swift")
+        #expect(Self.count(".progress", in: fieldBar) == 0 && Self.count(".progress", in: replyField) == 0,
+                "the reply field passes the model on and never reads the drag's progress, so a moving finger does not rebuild its editor")
         #expect(Self.count(".modifier(ChatFieldDragMarker.Field(model: fieldDrag))", in: chat) == 1)
         let moved = try Self.body(of: "private func fieldDragMoved(_ drag: ChatHorizontalPan.Sample) {", in: chat)
         #expect(Self.count("fieldDrag.progress = ChatFieldDrag.progress(translation: drag.travel) }", in: moved) == 1)

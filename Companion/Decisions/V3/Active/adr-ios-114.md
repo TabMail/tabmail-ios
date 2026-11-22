@@ -1281,8 +1281,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (`fieldDragProgress.isDragging`): the drag's start queues the bar's geometry action and the
    `onChange` that sets the settle token together, and SwiftUI runs deferred actions in an
    unspecified order." The drag is a UIKit pan (`ChatFieldPan`, amended 2026-11-21), the
-   swipes' pan bridge (`ChatHorizontalPan`) turned vertical: it builds its pan with
-   `ChatHorizontalPan.makePan` and takes its events through the same delivery
+   swipes' pan bridge (`ChatHorizontalPan`) turned vertical: it builds its pan as the swipes do
+   (`ChatFieldPan.makePan`, after `ChatHorizontalPan.makePan`) and takes its events through the same delivery
    (`ChatHorizontalPan.deliver(_:moved:ended:)`: one two-axis `Sample` while it moves, then its last
    sample and one outcome, finished or not), while its own rules (when it begins, what it waits
    for) stay in its delegate and what it does with a sample stays in `ChatThreadView`. It starts only on a first movement more
@@ -1322,9 +1322,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    selection), and its taps wait for the pan." Its state (`ChatFieldDrag.Progress`) is
    reset with the pill's spring however the drag ends (`fieldDragEnded`), so a cancelled drag (the
    panel opening on an agent answer mid-drag, or a system interruption) springs back too. **The
-   panel opening cuts a held drag off itself (amended 2026-11-22):** turning the pan off
-   (`isEnabled`) did not end a drag already held (a UI run showed it running on to its let-go with
-   the swell held), so the chat's `onChange(of: chatExpanded)` calls `ChatFieldPan.Cut`, which sets
+   panel opening cuts a held drag off itself (amended 2026-11-22):** UIKit cancels an active pan once
+   it is actually turned off, but the configuration update turning the pan off (`isEnabled`) did not
+   end a drag already held (a UI run showed it running on to its let-go with the swell held), so the chat's `onChange(of: chatExpanded)` calls `ChatFieldPan.Cut`, which sets
    the held pan to cancelled (`Recognizer.cut`; a pan with no drag held is left as it is). The text
    counts as at its end within `ChatViewLayout.fieldTextEndTolerance` (0.1 pt) of the end its sizes
    give (`ChatFieldPan.Coordinator.isAtEnd`, amended 2026-11-22): UIKit holds the text on its own

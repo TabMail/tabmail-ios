@@ -27,6 +27,8 @@ import UIKit
 ///   when a text is watched;
 /// - a pan or back-swipe note never updates the marker inside the call that notes it, and shows
 ///   after it;
+/// - the reply field's build counts belong to their own drag: the finger-down count shows from that
+///   drag's let-go, a new drag's shows as pending until its own let-go;
 /// - the back swipe's watch records only real turnings on or off, each binding timed from that
 ///   binding and starting empty, ignores a stop by an owner it no longer has, and records nothing
 ///   once its own owner stops it.
@@ -58,6 +60,11 @@ struct ChatFieldDragMarkerTextCallsTests {
         let field = label.split(separator: " ").first { $0.hasPrefix("calls=") }.map { String($0.dropFirst("calls=".count)) }
         guard let field, field != "none" else { return [] }
         return field.split(separator: ",").map { String($0.split(separator: "@").first ?? "") }
+    }
+
+    /// The marker's `builds=<down>:<after>` value.
+    private static func builds(in label: String) -> String? {
+        label.split(separator: " ").first { $0.hasPrefix("builds=") }.map { String($0.dropFirst("builds=".count)) }
     }
 
     /// The milliseconds a back-swipe entry (`<name>@+<ms>ms…`) is timed at; nil when it has none.
@@ -247,6 +254,31 @@ struct ChatFieldDragMarkerTextCallsTests {
         let shown = await Self.published { probe.panEvents == ["off:began", "cancelled"] }
         #expect(shown, "the notes show, in order, after the call: \(probe.panEvents)")
         #expect(changed.fired, "control: the marker is updated once they show")
+    }
+
+    @Test("The reply field's builds count for their own drag: while the finger is down, from its let-go, and never the last drag's")
+    func buildCountsBelongToTheirDrag() {
+        let probe = ChatFieldDragMarker.Probe()
+        let before = Self.builds(in: probe.label)
+        #expect(before == "pending:0", "control: no drag yet: \(probe.label)")
+        probe.textTouchDown(end: nil, handedOff: false)
+        probe.dragChanged(true)
+        probe.inputFieldBuilt()
+        probe.inputFieldBuilt()
+        let held = Self.builds(in: probe.label)
+        #expect(held == "pending:0", "the finger is still down: its count is not shown yet")
+        probe.watchText(UITextView(frame: Self.frame), lastMoved: 0)
+        probe.inputFieldBuilt()
+        let afterLetGo = Self.builds(in: probe.label)
+        #expect(afterLetGo == "2:1", "two builds while the finger was down, one after its let-go")
+        probe.dragChanged(false)
+        probe.textTouchDown(end: nil, handedOff: false)
+        probe.dragChanged(true)
+        let next = Self.builds(in: probe.label)
+        #expect(next == "pending:0", "a new drag never shows the last one's counts")
+        probe.watchText(nil, lastMoved: 0)
+        let nextLetGo = Self.builds(in: probe.label)
+        #expect(nextLetGo == "0:0", "the new drag's own count, from its first touch")
     }
 
     @Test("The back swipe's watch records real turnings on or off, each binding timed from itself, until its own owner stops it")

@@ -37,10 +37,10 @@ import UIKit
 /// hand=<travel>@<down|move|letgo>|none share=<points>`, the field's pan's own reads of the text
 /// under the last drag (its end, the furthest place read while the drag moved, where the rest of the
 /// drag became the field's and in which read, the largest upward share the field got);
-/// `calls=<name>@+<ms>,…|none callStack=<frame>|…|none builds=<down>:<after> textClass=<class>|none`,
+/// `calls=<name>@+<ms>,…|none callStack=<frame>|…|none builds=<down>|pending:<after> textClass=<class>|none`,
 /// what the text was asked to do from the let-go until the watch ended (`TextCalls`), the stack of
 /// the first such call that scrolls it, how often the reply field's `inputField` was built while the
-/// finger was down and from the let-go until the watch ended, and the text view's class; and `pop=<entry>,…|none`, the back swipe since it last began (`PopWatch`).
+/// finger was down (`pending` from a drag's start until its let-go) and from the let-go until the watch ended, and the text view's class; and `pop=<entry>,…|none`, the back swipe since it last began (`PopWatch`).
 /// `pan=<event>,…|none` (after `share`) holds `on:<state>`/`off:<state>` when the field's pan was
 /// turned on or off during the last drag, and `cancelled` when it was cancelled.
 enum ChatFieldDragMarker {
@@ -410,10 +410,11 @@ enum ChatFieldDragMarker {
         @ObservationIgnored private var inputFieldBuilds = 0
         @ObservationIgnored private var callWatchOpen = false
         /// The `inputField` builds while the finger was down: counted from the drag's first touch
-        /// (`touchBuilds`, while `touchWatchOpen`) and kept at its let-go (`downBuilds`).
+        /// (`touchBuilds`, while `touchWatchOpen`) and kept at its let-go (`downBuilds`); nil from a
+        /// drag's start until that let-go, so a drag never shows the last one's count.
         @ObservationIgnored private var touchBuilds = 0
         @ObservationIgnored private var touchWatchOpen = false
-        @ObservationIgnored private var downBuilds = 0
+        @ObservationIgnored private var downBuilds: Int?
         @ObservationIgnored private var letGoTime: CFTimeInterval = 0
         @ObservationIgnored private var textClass: String?
         /// The most calls kept, and the most stack frames kept for the call that scrolls.
@@ -555,6 +556,7 @@ enum ChatFieldDragMarker {
             self.dragging = dragging
             if dragging {
                 drags += 1
+                downBuilds = nil
                 watching = true
                 watchToken = nil
                 baseline = newestMinY
@@ -606,7 +608,7 @@ enum ChatFieldDragMarker {
         }
 
         private var callsLabel: String {
-            "calls=\(textCalls.isEmpty ? "none" : textCalls.joined(separator: ",")) callStack=\(textCallStack ?? "none") builds=\(downBuilds):\(inputFieldBuilds) textClass=\(textClass ?? "none")"
+            "calls=\(textCalls.isEmpty ? "none" : textCalls.joined(separator: ",")) callStack=\(textCallStack ?? "none") builds=\(downBuilds.map(String.init) ?? "pending"):\(inputFieldBuilds) textClass=\(textClass ?? "none")"
         }
     }
 

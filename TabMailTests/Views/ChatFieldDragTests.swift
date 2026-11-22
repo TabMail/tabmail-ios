@@ -361,6 +361,11 @@ struct ChatFieldDragTests {
         let pointShortEnd = ChatFieldPan.Coordinator.isAtEnd(end - 1, end: end)
         #expect(nearEnd)
         #expect(!pointShortEnd)
+        let tolerance = ChatViewLayout.fieldTextEndTolerance
+        let atTheTolerance = ChatFieldPan.Coordinator.isAtEnd(end - tolerance, end: end)
+        let pastTheTolerance = ChatFieldPan.Coordinator.isAtEnd((end - tolerance).nextDown, end: end)
+        #expect(atTheTolerance, "exactly the tolerance short is at its end")
+        #expect(!pastTheTolerance, "any further short is not")
 
         text.contentOffset = CGPoint(x: 0, y: end - hair)
         coordinator.touchDown(on: inner)
@@ -396,6 +401,37 @@ struct ChatFieldDragTests {
         #expect(pan.state == .cancelled, "a held drag ends as an interrupted one")
         let other = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: cut)
         #expect(cut.recognizer === other, "a rebuilt pan takes the cut over")
+        other.state = .began
+        cut()
+        #expect(other.state == .cancelled, "a drag cut as it begins, before it moves, ends as an interrupted one")
+        let finished = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: cut)
+        finished.state = .began
+        finished.state = .changed
+        finished.state = .ended
+        cut()
+        #expect(finished.state == .ended, "control: a finished drag is left as it ended")
+    }
+
+    @Test("The cut holds its pan weakly, and each chat's cut ends only its own pan's drag")
+    @MainActor
+    func cutIsWeakAndPerChat() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let released = ChatFieldPan.Cut()
+        autoreleasepool {
+            _ = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: released)
+        }
+        #expect(released.recognizer == nil, "a pan SwiftUI has let go of is not kept alive by the cut")
+        let first = ChatFieldPan.Cut()
+        let second = ChatFieldPan.Cut()
+        let firstPan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: first)
+        let secondPan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: second)
+        for pan in [firstPan, secondPan] {
+            pan.state = .began
+            pan.state = .changed
+        }
+        first()
+        #expect(firstPan.state == .cancelled, "the first chat's held drag is cut")
+        #expect(secondPan.state == .changed, "the other chat's held drag is not")
     }
 
     @Test("Sideways travel made while the text scrolled does not turn the field's straight pull sideways")

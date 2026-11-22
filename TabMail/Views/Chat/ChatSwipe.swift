@@ -516,8 +516,9 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
 /// v15 H2). That text never bounces vertically (`Coordinator.touchDown`), so past its end it stays
 /// at its end while the field swells.
 struct ChatFieldPan: UIGestureRecognizerRepresentable {
-    /// Off over the open panel and in the tutorial, so no new drag starts there. A drag already
-    /// held when it turns off is cut by `cut`, not by this.
+    /// Off over the open panel and in the tutorial, so no new drag starts there. UIKit cancels an
+    /// active pan once it is actually turned off, but in a UI run the update turning it off did not
+    /// end a drag already held, so the panel opening cuts that drag with `cut`.
     let isEnabled: Bool
     /// Cuts the drag held on the field off (`Cut`): the chat calls it when the panel opens.
     let cut: Cut

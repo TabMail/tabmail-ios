@@ -672,6 +672,9 @@ final class ChatSwipeUITests: XCTestCase {
         let pastEnd = try XCTUnwrap(marker.textPastEnd, "control: the field's pan read the text's place while the drag moved (marker: \(watched))")
         XCTAssertGreaterThan(pastEnd, -1, "control: the text reached its end under the drag: \(pastEnd) (marker: \(watched))")
         XCTAssertLessThan(pastEnd, 1, "the text stopped at its end and did not bounce past it while the field swelled: \(pastEnd) (marker: \(watched))")
+        let downBuilds = try XCTUnwrap(marker.downBuilds, "control: the marker counted the field's builds while the finger was down (marker: \(watched))")
+        XCTAssertLessThanOrEqual(downBuilds, Self.dragStartBuildAllowance,
+                                 "the moving finger and the changing swell did not rebuild the field's editor: \(downBuilds) builds while it was down (marker: \(watched))")
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
         XCTAssertEqual(long.value as? String, Self.overflowingText, "control: the draft is unchanged")
@@ -679,6 +682,10 @@ final class ChatSwipeUITests: XCTestCase {
 
     /// The text's scroll room (three lines, about 60 points) plus well past the open distance.
     private static let pastTheTextsEnd: CGFloat = 220
+    /// The editor builds a drag may cause while its finger is down: one each as the drag starts and
+    /// as the field's freeze begins. A build per movement of the finger (the drag's state read in the
+    /// chat's body) gives one for each of the drag's many moves.
+    private static let dragStartBuildAllowance = 2
     /// Past the open distance in all, yet past the nine-line draft's end (its scroll room, more
     /// than `withinTheScrollRoom`) by less than the open distance.
     private static let acrossTheTextsEnd: CGFloat = 90
@@ -1629,6 +1636,9 @@ final class ChatSwipeUITests: XCTestCase {
         /// The field's pan turned on or off (`on:<state>`, `off:<state>`) or cancelled during the
         /// last drag and since, in order; nil when the marker does not say.
         let pan: [String]?
+        /// How often the reply field's editor was built while the last drag's finger was down; nil
+        /// while that drag has not let go or when the marker does not say.
+        let downBuilds: Int?
     }
 
     /// `<top>:<bottom>`, or nil for "none".
@@ -1657,7 +1667,8 @@ final class ChatSwipeUITests: XCTestCase {
                           textPastEnd: fields["over"].flatMap(Double.init).map { CGFloat($0) },
                           events: fields["events"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) },
                           tipWaiting: fields["wait"].map { $0 == "1" },
-                          pan: fields["pan"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) })
+                          pan: fields["pan"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) },
+                          downBuilds: fields["builds"]?.split(separator: ":").first.flatMap { Int($0) })
     }
 
     /// The marker once it has seen `drags` drags and stopped watching the last one.
