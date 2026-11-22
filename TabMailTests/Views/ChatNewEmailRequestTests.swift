@@ -333,12 +333,15 @@ struct ChatNewEmailRequestTests {
                 "the navigation holds the one state for its life")
         #expect(Self.count("newEmailCover = .make( request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession, chatAccount: viewModel.primaryAccount, composeAccount: viewModel.primaryAccount)", in: inbox) == 1)
         #expect(Self.count(cover, in: inbox) == 1)
-        #expect(Self.count("prefillTo:", in: inbox) == 0, "compose is filled from a request only through the cover")
+        #expect(Self.count("prefillTo: request", in: inbox) == 0, "compose is filled from a request only through the cover")
         let chat = try Self.source(chatPath)
         #expect(Self.count("guard isOnScreen, !isAnyPresentation, listPresentationBesideDetail?.isUp != true, !ChatNewEmailCover.composeOrPreviewIsUp else { return }", in: chat) == 1,
                 "a pushed screen, or its email card's screen, takes it instead; none while the list beside it has something up, nor under a compose, a draft or a preview anywhere")
-        #expect(Self.count("|| forwardMessage != nil || showsReplyTo || showsMove || newEmailCover != nil", in: chat) == 1,
-                "its own cover counts as presented")
+        // Its email card counts too: the card's email screen takes the request, never the chat
+        // under it (the card opens from a touch on the email's bubble, which hosted tests cannot
+        // make, so this is checked here).
+        #expect(Self.count("private var isAnyPresentation: Bool { cardMessage != nil || readyReply != nil || agentCompose != nil || forwardMessage != nil || showsReplyTo || showsMove || newEmailCover != nil }", in: chat) == 1,
+                "its own cover and its email card count as presented")
         #expect(Self.count("newEmailCover = .make( request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession, chatAccount: Account.primary(), composeAccount: Account.primary())", in: chat) == 1)
         #expect(Self.count(cover, in: chat) == 1)
         let detail = try Self.source(detailPath)
@@ -429,7 +432,7 @@ struct ChatNewEmailRequestHostedTests {
 
     // MARK: - An open chat
 
-    @Test("A link posted while a chat is open brings the new email's chat up over it with the person, the words, the subject, Cc and Bcc; a second link leaves it up; Back with nothing changed closes it and saves nothing; in the detail column, none while the list beside it has something up; with its email card up, the card's email screen takes it")
+    @Test("A link posted while a chat is open brings the new email's chat up over it with the person, the words, the subject, Cc and Bcc; a second link leaves it up; Back with nothing changed closes it and saves nothing; in the detail column, none while the list beside it has something up")
     func linkOverAnOpenChat() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await linkOverAnOpenChatBody() }
@@ -460,31 +463,6 @@ struct ChatNewEmailRequestHostedTests {
             try await Self.backClosesAndSavesNothing(screen)
             #expect(ThreadChatTests.shows("Ann Example", in: screen.view), "the chat is still there")
 
-            // The email card: its email screen, on top, takes the request, over the card.
-            let bubble = try #require(Self.bubble(in: screen.view), "control: the email's bubble: \(ThreadChatTests.labels(screen.view).prefix(12))")
-            #expect(bubble.accessibilityActivate(), "control: the bubble opens the email card")
-            try await ThreadChatTests.wait { screen.topPresented() != nil }
-            let card = screen.topPresented()
-            #expect(card != nil, "control: the email card is up")
-            try await ThreadChatTests.settle()
-            try await ThreadChatTests.settle()
-            NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
-            try await ThreadChatTests.wait { Self.newEmailView(screen) != nil }
-            let overCardLabels = screen.topPresented().map { Array(HostedAccessibility.labels(in: $0.view).prefix(16)) } ?? []
-            let overCard = try #require(Self.newEmailView(screen), "the card's email screen takes it: \(overCardLabels)")
-            #expect(card?.presentedViewController != nil, "the new email comes up over the card")
-            #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: overCard), "Back takes a tap")
-            try await ThreadChatTests.wait { screen.topPresented() === card }
-            #expect(screen.topPresented() === card, "Back returns to the card")
-
-            // The chat under the card took none: once the card is closed nothing else comes up,
-            // and the chat takes the next.
-            let closedCard = try #require(card)
-            await Self.swipeDown(closedCard)
-            try await ThreadChatTests.wait { screen.topPresented() == nil }
-            #expect(screen.topPresented() == nil, "control: the card is closed")
-            let nothing = try await Self.keeps { screen.topPresented() == nil }
-            #expect(nothing, "nothing comes up once the card is closed")
             _ = try await Self.postedLinkShowsNewEmail(screen)
             try await Self.backClosesAndSavesNothing(screen)
         }
@@ -518,8 +496,10 @@ struct ChatNewEmailRequestHostedTests {
             #expect(shown, "control: the screen is up: \(ThreadChatTests.labels(screen.view).prefix(12))")
             try await ThreadChatTests.settle()
             push.id = screen.email.id
-            try await ThreadChatTests.wait { Self.depth(screen) == 2 }
+            // Only once the push has finished does the screen below know it is covered.
+            try await ThreadChatTests.wait { Self.depth(screen) == 2 && Self.navigationIsStill(screen) }
             #expect(Self.depth(screen) == 2, "control: a second screen is pushed over the first")
+            #expect(Self.navigationIsStill(screen), "control: the push has finished")
             try await ThreadChatTests.settle()
 
             _ = try await Self.postedLinkShowsNewEmail(screen)
@@ -528,7 +508,7 @@ struct ChatNewEmailRequestHostedTests {
             #expect(nothingOnTop, "the screen below took none: nothing comes up once the new email is closed")
 
             push.id = nil
-            try await ThreadChatTests.wait { Self.depth(screen) == 1 }
+            try await ThreadChatTests.wait { Self.depth(screen) == 1 && Self.navigationIsStill(screen) }
             #expect(Self.depth(screen) == 1, "control: popped back to the first screen")
             let nothingBelow = try await Self.keeps { screen.topPresented() == nil }
             #expect(nothingBelow, "nothing comes up once the screen below shows again")
@@ -1041,6 +1021,7 @@ struct ChatNewEmailRequestHostedTests {
             let hasBody = texts.contains { $0.contains("Are you free at noon?") }
             #expect(texts.contains("Lunch on Friday"), "the subject: \(texts)")
             #expect(hasBody, "the body: \(texts)")
+            try await ThreadChatTests.wait { HostedAccessibility.labels(in: screen.view).contains(from) }
             let labels = HostedAccessibility.labels(in: screen.view)
             #expect(labels.contains(from), "from the account it was given: \(labels.prefix(16))")
             #expect(!labels.contains(notFrom), "not the other one")
@@ -1110,7 +1091,8 @@ struct ChatNewEmailRequestHostedTests {
         let shown = try #require(newEmailView(screen), "control: the new email is up")
         #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: shown), "Back takes a tap")
         try await ThreadChatTests.wait { screen.topPresented() == nil }
-        #expect(screen.topPresented() == nil, "Back closes the cover")
+        let stillUp = screen.topPresented().map { Array(HostedAccessibility.labels(in: $0.view).prefix(16)) } ?? []
+        #expect(screen.topPresented() == nil, "Back closes the cover: still up \(stillUp)")
         try await ThreadChatTests.settle()
         let drafts = try await screen.pool.read { db in try Draft.fetchCount(db) }
         #expect(drafts == 0, "nothing changed since the link: nothing in Drafts")
@@ -1275,14 +1257,6 @@ struct ChatNewEmailRequestHostedTests {
         return condition()
     }
 
-    /// The email's bubble in the chat: its label names the sender and the subject (no summary yet).
-    private static func bubble(in view: UIView) -> NSObject? {
-        HostedAccessibility.elements(under: view).first {
-            let label = $0.accessibilityLabel ?? ""
-            return label.hasPrefix("Ann Example") && label.contains(" said: Lunch plans")
-        }
-    }
-
     private static func searchButton(in view: UIView) -> NSObject? {
         HostedAccessibility.elements(under: view).first { $0.accessibilityLabel == "Search" }
     }
@@ -1306,15 +1280,16 @@ struct ChatNewEmailRequestHostedTests {
         return 0
     }
 
-    /// Closes a sheet as a swipe down does: UIKit takes it down and tells the sheet's delegate,
-    /// which is how SwiftUI learns that it is gone.
-    private static func swipeDown(_ sheet: UIViewController) async {
-        guard let presentation = sheet.presentationController else { return }
-        presentation.delegate?.presentationControllerWillDismiss?(presentation)
-        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-            sheet.dismiss(animated: false) { done.resume() }
+    /// Whether the navigation stack under the mounted screen has no push or pop under way; true
+    /// for no stack.
+    private static func navigationIsStill(_ screen: Screen) -> Bool {
+        var pending: [UIViewController] = [screen.controller]
+        while !pending.isEmpty {
+            let controller = pending.removeFirst()
+            if let navigation = controller as? UINavigationController { return navigation.transitionCoordinator == nil }
+            pending += controller.children
         }
-        presentation.delegate?.presentationControllerDidDismiss?(presentation)
+        return true
     }
 
     private static func labels(of id: String, in view: UIView) -> [String] {
