@@ -1229,6 +1229,68 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    ends at the bar, on screen, as far above the field as the newest email was before it; it
    measures the chat's motion, not the row's own transition).
 
+22. **A new email starts as an empty chat (amendment 2026-11-21).** With the chat view on, the inbox
+   compose button pushes an empty chat (`ChatNewThreadView`, `ChatNewThreadModel`) instead of
+   presenting compose; off, compose opens as before (`ChatNewThreadRoute.composeButton`, the setting
+   read once at the tap). This amendment covers the inbox compose button only; other ways of
+   starting an email (a contact, the email screen, links, the iPad split view) still open compose.
+   - *The chat.* The header sits where every chat's header is, with one empty avatar and "Add
+     recipient" until people are picked (`ChatHeaderView(people:emptyTitle:hint:)`); the line under
+     it reads "New email"; the chat area says "New email. Type what you want to say, or ask TabMail
+     to write it.", then "New email to Maria and Sam." once people are picked
+     (`ChatNewDraft.recipientsLine`). The field is the chat's reply field (`ChatReplyField.newEmail`,
+     `ChatNewEmailField`) with "Message or ask anything", an "e.g." line from its own config set
+     (`ChatSuggestionConfig.newEmailExamples`), focus as it opens, and a paperclip at the end of the
+     text (Photos, Camera, Files; `ChatPaperclipButton`, sized by `FieldButtonSlot`); the row's mic,
+     text and Send keep their places. `DynamicIslandChat.isInboxChat` is false for it, so none of
+     the inbox chat's history, reminders or idle clear applies.
+   - *Add recipient.* The header's tap opens the "Reply to" sheet titled "Add recipient"
+     (`ChatReplyToSheet(title:)`), starting from the people already picked (none at first) with its
+     contact search and typed address; Done needs someone ticked (`ChatReplyToChoice.canFinish`), and
+     its result replaces the picked people (`ChatNewDraft.people(after:current:)`). No "Recent"
+     section: a recent-people source is separate work.
+   - *Attachments.* Picked photos and videos, a camera photo and files wait above the field
+     (`ChatAttachmentTray`: photos as thumbnails, files as chips, each with an x). They are named and
+     typed by the rules compose uses (`DraftAttachmentImport`, moved out of `ComposeView` with tests
+     pinning its behaviour first); a save waits for photos still loading
+     (`ComposeAttachmentCarryGate`); items that do not load are listed in "Couldn't add".
+   - *Send.* With nobody picked, Send asks "Who is this to?" ("Add at least one recipient to send
+     this email.", Add recipient / Cancel) and the words and attachments stay
+     (`ChatNewDraft.send(people:)`). Writing the email for its recipients, the compose card that
+     follows, and the Sending bubble after the card's Send are later work; until then Send with
+     people picked does nothing.
+   - *The agent chat.* Each new email's chat has its own session key, in memory only
+     (`ChatNewEmailField.newSessionKey`), never carried into another chat; no chat turn is stored for
+     it (ADR-004).
+   - *The draft.* Its key is `chat-new:<uuid>` (`Draft.newEmailKey`, `Draft.isNewEmailKey`): local to
+     the device, like every draft key, and never written to a provider or a header (the placeholder
+     header's id is made colon-safe from it as for every key); no migration. Nothing is asked when
+     leaving: Back and the app going to the background save the draft silently when there is
+     something to keep (`ChatNewDraft.needsSave`): a chat with no saved draft saves only words or
+     attachments (people alone are not kept, and an empty chat leaves nothing in Drafts); a saved
+     draft is saved whenever what the chat holds changed, emptied included. Nothing here deletes a
+     draft: an emptied draft is removed only by compose's Discard. The save is compose's
+     (`ChatNewDraftSave.run`: a fail-closed read, the attachments staged, the row saved through the
+     chat's generation (`ComposeGenerationCursor`), staged or superseded files removed only after the
+     commit, then `queueDraftSave`); a subject, Cc or Bcc the row already holds is kept. Back leaves
+     only once the save is durable; a refused save keeps the chat open and offers "Leave without
+     saving" or "Stay". Back replaces the system Back, so the edge swipe back is off in this chat.
+     While the chat is open its draft is exempt from eviction (`DraftSessionRegistry`).
+   - *Reopening.* A `chat-new:` draft opened from any path while the chat view is on reopens as its
+     chat (`ChatNewThreadRoute.savedDraft`, decided in `DraftComposePresenter` once its preparation
+     has checked the row), with the words in the field, the attachments above it, the people its To
+     names (an address without a saved name shows its fallback name) and "Draft, saved <time>"
+     (`ChatNewDraft.savedLine`). With the chat view off, or for any other key, the draft opens in
+     compose as before. A draft with no local row (another device, a reinstall) has no `chat-new:`
+     key to find, so it is adopted as any server draft is and opens in compose. Attachments that cannot
+     be read block saving from the chat, so the saved files are never replaced by an empty set. The
+     saved-draft path of decision 9's 2026-11-15 amendment is unchanged for every other draft.
+   - *Later, with the compose card.* The compose card stays today's compose; the chat's draft is
+     deleted only once the card's Send has a durable outbox row (never-drop). The card's delivery and
+     the Sending bubble, found by the email's own Message-ID, come with that work.
+   Tests: `ChatNewThreadTests` (routing, the pure decisions, the saves against a real database, the
+   reopen route, the source wiring), `DraftAttachmentImportTests`.
+
 ## The longer index line (routed 2026-11-09)
 
 The DECISIONS.md row grew with each decision of the chat view; it moved here when the index went
