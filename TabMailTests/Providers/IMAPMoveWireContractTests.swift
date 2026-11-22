@@ -1391,12 +1391,20 @@ struct IMAPMoveWireContractTests {
             try await provider.move(
                 ids: ["71"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
         }
-        let waitUntil = Date().addingTimeInterval(10)
-        while Date() < waitUntil, !server.isHoldingCommand(containing: "UID COPY") {
+        let clock = ContinuousClock()
+        let waitUntil = clock.now.advanced(by: .seconds(10))
+        while clock.now < waitUntil, !server.isHoldingCommand(containing: "UID COPY") {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         let held = server.isHoldingCommand(containing: "UID COPY")
         #expect(held, "precondition: the move's UID COPY is held on the wire")
+        // The held COPY is this move's: UID 71, sent while Work was selected, to Archive.
+        let copies = server.recordedCommandsWithMailbox().filter { $0.command.uppercased().contains("UID COPY") }
+        #expect(copies.count == 1)
+        if let copy = copies.first {
+            #expect(copy.mailbox == "Work", "the COPY was sent from the source folder: \(copy)")
+            #expect(copy.command.contains("UID COPY 71 ") && copy.command.contains("Archive"), "it copies UID 71 to Archive: \(copy.command)")
+        }
         task.cancel()
         server.releaseHeldCommand(containing: "UID COPY")
         let outcome = await task.result
@@ -1417,6 +1425,14 @@ struct IMAPMoveWireContractTests {
         #expect(server.flags(in: "Work", uid: 71).isEmpty)
         #expect(server.messageIDs(in: "Work") == ["<\(target)>"])
         #expect(server.wrongMessageViolations().isEmpty)
+        // The cancel released the action connection, so the next action on this provider gets
+        // it (a connection left checked out would queue that action until teardown).
+        let actionHeld = await provider.actionInUseForTesting()
+        #expect(!actionHeld, "the cancelled move released the action connection")
+        if !actionHeld {
+            let next = try await provider.fetchMessage(id: "71", folder: "Work")
+            #expect(next.header.messageId == "71", "the next action on the provider completes")
+        }
     }
 
     // MARK: - T3.14 — the DESTINATION epoch must be recorded and asserted

@@ -49,11 +49,12 @@ struct SearchAnswerRefusalCallerTests {
             switch answer {
             case "unlisted": server.answerNextUIDSearch(in: "INBOX", esearchData: Self.unlisted)
             case "outOfScope": server.answerNextUIDSearch(in: "INBOX", esearchData: Self.outOfScope)
-            default: server.answerNextUIDSearch(in: "INBOX", esearchData: "COUNT 2 MIN 5 MAX 6 ALL 5:6")
+            // The mailbox holds 5, 6 and 7, all inside 1...10: the control's answer lists them all.
+            default: server.answerNextUIDSearch(in: "INBOX", esearchData: "COUNT 3 MIN 5 MAX 7 ALL 5:7")
             }
             if answer == "control" {
                 let found = try await provider.searchExistingUIDs(folder: "INBOX", from: 1, to: 10)
-                #expect(Set(found) == [5, 6])
+                #expect(Set(found) == [5, 6, 7])
             } else {
                 await #expect(throws: (any Error).self) {
                     _ = try await provider.searchExistingUIDs(folder: "INBOX", from: 1, to: 10)
@@ -70,14 +71,15 @@ struct SearchAnswerRefusalCallerTests {
             switch answer {
             case "unlisted": server.answerNextUIDSearch(in: "INBOX", esearchData: Self.unlisted)
             case "outOfScope": server.answerNextUIDSearch(in: "INBOX", esearchData: Self.outOfScope)
-            default: server.answerNextUIDSearch(in: "INBOX", esearchData: "COUNT 1 MIN 5 MAX 5 ALL 5")
+            // Of 5, 6 and 8 the mailbox holds 5 and 6: the control's answer lists those, 8 is missing.
+            default: server.answerNextUIDSearch(in: "INBOX", esearchData: "COUNT 2 MIN 5 MAX 6 ALL 5:6")
             }
             if answer == "control" {
-                let result = try await provider.searchExistingUIDs(folder: "INBOX", uids: [5, 6])
-                #expect(result.found == [5])
+                let result = try await provider.searchExistingUIDs(folder: "INBOX", uids: [5, 6, 8])
+                #expect(result.found == [5, 6])
             } else {
                 await #expect(throws: (any Error).self) {
-                    _ = try await provider.searchExistingUIDs(folder: "INBOX", uids: [5, 6])
+                    _ = try await provider.searchExistingUIDs(folder: "INBOX", uids: [5, 6, 8])
                 }
             }
             #expect(server.compactUIDSearchAnswersServed() == 1, "precondition: the answer under test was served")
@@ -108,17 +110,33 @@ struct SearchAnswerRefusalCallerTests {
         }
     }
 
-    @Test("Message-ID lookup in the app: an unlisted answer fails it, to the bracketed search or (after an empty bracketed answer) to the bare one",
-          arguments: ["bracketed", "bare"])
+    @Test("Message-ID lookup in the app: an unlisted answer fails it, to the bracketed search or (after an empty bracketed answer) to the bare one; a bare answer that lists its match is read",
+          arguments: ["bracketed", "bare", "bareMatch"])
     func appMessageIdLookup(_ which: String) async throws {
         try await Self.withProvider { server, provider in
-            if which == "bare" { server.answerNextUIDSearch(in: "INBOX", esearchData: Self.noMatch) }
-            server.answerNextUIDSearch(in: "INBOX", esearchData: Self.unlisted)
-            await #expect(throws: (any Error).self) {
-                _ = try await provider.currentUIDs(rfc822MessageId: "lookup@example.com", folderPath: "INBOX")
+            // UID 5's own Message-ID, so the bare search's listed match is the mailbox's answer.
+            let messageId = "change-5@example.com"
+            if which != "bracketed" { server.answerNextUIDSearch(in: "INBOX", esearchData: Self.noMatch) }
+            server.answerNextUIDSearch(in: "INBOX", esearchData: which == "bareMatch" ? "COUNT 1 MIN 5 MAX 5 ALL 5" : Self.unlisted)
+            if which == "bareMatch" {
+                let found = try await provider.currentUIDs(rfc822MessageId: messageId, folderPath: "INBOX")
+                #expect(found == ["5"], "the bare answer's match is the lookup's result")
+            } else {
+                await #expect(throws: (any Error).self) {
+                    _ = try await provider.currentUIDs(rfc822MessageId: messageId, folderPath: "INBOX")
+                }
             }
-            #expect(server.compactUIDSearchAnswersServed() == (which == "bare" ? 2 : 1),
-                    "precondition: every answer under test was served")
+            let searchCount = which == "bracketed" ? 1 : 2
+            #expect(server.compactUIDSearchAnswersServed() == searchCount, "precondition: every answer under test was served")
+            // The answers above are served whatever a search asks, so each search's own Message-ID is checked.
+            let searches = server.recordedCommands().filter { $0.uppercased().contains("UID SEARCH") }
+            #expect(searches.count == searchCount)
+            guard searches.count == searchCount else { return }
+            #expect(searches[0].contains("<\(messageId)>"), "the first search asks for the bracketed Message-ID: \(searches[0])")
+            if searchCount == 2 {
+                #expect(searches[1].contains(messageId) && !searches[1].contains("<\(messageId)>"),
+                        "the second asks for the bare one: \(searches[1])")
+            }
         }
     }
 
@@ -135,5 +153,7 @@ struct SearchAnswerRefusalCallerTests {
             username: server.username, password: server.password, rfc822MessageId: "lookup@example.com")
         #expect(result == nil, "an unlisted answer is not read as a match or as absence")
         #expect(server.compactUIDSearchAnswersServed() == 2, "precondition: both searches got the answer under test")
+        let fetches = server.recordedCommands().filter { $0.uppercased().contains("UID FETCH") }
+        #expect(fetches.isEmpty, "nothing is fetched on an answer that lists nothing: \(fetches)")
     }
 }
