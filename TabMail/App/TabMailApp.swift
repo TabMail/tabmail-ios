@@ -91,6 +91,65 @@ struct TabMailApp: App {
     static let fieldDragTipTestStoreName = "chat-field-drag-tip-ui-test"
     #endif
 
+    /// Configures TipKit for the onboarding hints, once, at launch: daily pacing on the app's default
+    /// datastore, or every tip hidden in screenshot mode. The debug UI tests' variants are compiled
+    /// into debug builds only, so a release build has exactly these two branches.
+    @MainActor private static func configureTips() {
+        #if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("--chat-field-drag-tip") {
+            // Debug UI tests only: a fresh datastore with the chat field's drag tip forced on, so
+            // every launch shows it as a first-time user sees it.
+            try? Tips.resetDatastore()
+            Tips.showTipsForTesting([ChatFieldDragTip.self])
+            try? Tips.configure([
+                .displayFrequency(.immediate),
+                .datastoreLocation(.applicationDefault)
+            ])
+            return
+        }
+        let usesFieldDragTipStore = arguments.contains("--chat-swipe-ui-test")
+            && arguments.contains("--chat-field-drag-tip-store")
+        #else
+        let usesFieldDragTipStore = false
+        #endif
+        if (ScreenshotMode.isActive || ScreenshotMode.isSplashMode) && !usesFieldDragTipStore {
+            // Suppress all tips in screenshot mode
+            try? Tips.configure([
+                .datastoreLocation(.applicationDefault)
+            ])
+            Tips.hideAllTipsForTesting()
+            return
+        }
+        #if DEBUG
+        // Debug UI tests only: these same tip rules, nothing forced, on the swipe fixture's own
+        // datastore, which outlives a relaunch (`fieldDragTipTestStore`).
+        let tipStore: Tips.ConfigurationOption.DatastoreLocation = usesFieldDragTipStore
+            ? .url(fieldDragTipTestStore()) : .applicationDefault
+        #else
+        let tipStore = Tips.ConfigurationOption.DatastoreLocation.applicationDefault
+        #endif
+        do {
+            try Tips.configure([
+                .displayFrequency(.daily),
+                .datastoreLocation(tipStore)
+            ])
+        } catch {
+            #if DEBUG
+            // The drag tip's lifecycle UI test depends on this store; a launch without it would
+            // pass or fail for the wrong reason.
+            if usesFieldDragTipStore {
+                preconditionFailure("The drag tip test's datastore could not be opened: \(error)")
+            }
+            #endif
+        }
+        #if DEBUG
+        // The swipe fixture has no RootView to open the onboarding gate: opened here, as for a
+        // user past onboarding.
+        if usesFieldDragTipStore { OnboardingTipGate.onboardingComplete = true }
+        #endif
+    }
+
     init() {
         // First app-code mark — its `+Nms` is the pre-main (dyld / runtime /
         // static-init) cost, usually the biggest single chunk of a cold launch.
@@ -193,59 +252,7 @@ struct TabMailApp: App {
         // promptly without racing the first render.
 
         // Configure TipKit for onboarding hints
-        #if DEBUG
-        let arguments = ProcessInfo.processInfo.arguments
-        let showsFieldDragTip = arguments.contains("--chat-field-drag-tip")
-        let usesFieldDragTipStore = arguments.contains("--chat-swipe-ui-test")
-            && arguments.contains("--chat-field-drag-tip-store")
-        #else
-        let showsFieldDragTip = false
-        let usesFieldDragTipStore = false
-        #endif
-        if showsFieldDragTip {
-            // Debug UI tests only: a fresh datastore with the chat field's drag tip forced on, so
-            // every launch shows it as a first-time user sees it.
-            try? Tips.resetDatastore()
-            Tips.showTipsForTesting([ChatFieldDragTip.self])
-            try? Tips.configure([
-                .displayFrequency(.immediate),
-                .datastoreLocation(.applicationDefault)
-            ])
-        } else if (ScreenshotMode.isActive || ScreenshotMode.isSplashMode) && !usesFieldDragTipStore {
-            // Suppress all tips in screenshot mode
-            try? Tips.configure([
-                .datastoreLocation(.applicationDefault)
-            ])
-            Tips.hideAllTipsForTesting()
-        } else {
-            #if DEBUG
-            // Debug UI tests only: these same tip rules, nothing forced, on the swipe fixture's own
-            // datastore, which outlives a relaunch (`Self.fieldDragTipTestStore`).
-            let tipStore: Tips.ConfigurationOption.DatastoreLocation = usesFieldDragTipStore
-                ? .url(Self.fieldDragTipTestStore()) : .applicationDefault
-            #else
-            let tipStore = Tips.ConfigurationOption.DatastoreLocation.applicationDefault
-            #endif
-            do {
-                try Tips.configure([
-                    .displayFrequency(.daily),
-                    .datastoreLocation(tipStore)
-                ])
-            } catch {
-                #if DEBUG
-                // The drag tip's lifecycle UI test depends on this store; a launch without it would
-                // pass or fail for the wrong reason.
-                if usesFieldDragTipStore {
-                    preconditionFailure("The drag tip test's datastore could not be opened: \(error)")
-                }
-                #endif
-            }
-            #if DEBUG
-            // The swipe fixture has no RootView to open the onboarding gate: opened here, as for a
-            // user past onboarding.
-            if usesFieldDragTipStore { OnboardingTipGate.onboardingComplete = true }
-            #endif
-        }
+        Self.configureTips()
 
         // Enable battery monitoring for power-aware backfill (BackfillProfile).
         UIDevice.current.isBatteryMonitoringEnabled = true

@@ -910,12 +910,12 @@ struct DynamicIslandChat: View {
                 Image(systemName: "stop.circle.fill")
                     .font(.title2)
                     .foregroundStyle(.red.opacity(0.8))
-                    .frame(width: 44, height: 44)
+                    .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                     .contentShape(Rectangle())
             }
         } else if dictation.phase == .transcribing {
             DictationSpinner(isRetrying: dictation.isRetrying)
-                .frame(width: 44, height: 44)
+                .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                 .accessibilityLabel("Transcribing")
         } else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil) && isOnLiveSession && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
             // Retry button. Reverts to the send button as soon as the user types
@@ -935,7 +935,7 @@ struct DynamicIslandChat: View {
                 Image(systemName: "arrow.clockwise.circle.fill")
                     .font(.title2)
                     .foregroundStyle(Theme.accent)
-                    .frame(width: 44, height: 44)
+                    .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                     .contentShape(Rectangle())
             }
             .accessibilityLabel("Retry")
@@ -955,7 +955,7 @@ struct DynamicIslandChat: View {
                     .resizable()
                     .frame(width: ChatViewLayout.fieldSendSize, height: ChatViewLayout.fieldSendSize)
                     .foregroundStyle(canTapSend ? Theme.accent : .secondary.opacity(0.3))
-                    .frame(width: 44, height: 44)
+                    .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                     .contentShape(Rectangle())
             }
             .disabled(!canTapSend)
