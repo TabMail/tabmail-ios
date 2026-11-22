@@ -81,6 +81,50 @@ struct BackendErrorExtendedTests {
         #expect(!desc.isEmpty)
     }
 
+    /// A connection-lost error's round request, with marker values in every place a
+    /// request holds text: the message, its variables and each tier's settings.
+    private static func connectionLostRequest(marker: String) -> CompletionsRequest {
+        let tier = BYOKTierConfig(provider: "openai", api_key: "fixture-key-\(marker)", model: "fixture-model-\(marker)")
+        return CompletionsRequest(
+            messages: [CompletionsMessage(role: "user", content: "fixture prompt \(marker)",
+                                          vars: ["email_body": .string("fixture body \(marker)")])],
+            client_timezone: "UTC", disable_tools: nil,
+            byok: BYOKConfig(background: tier, interactive: tier))
+    }
+
+    @Test("Connection-lost error descriptions stay short and fixed")
+    func connectionLostDescriptionsStayFixed() {
+        let marker = "Qz7k"
+        let error = ChatConnectionLostError(resumeRequest: Self.connectionLostRequest(marker: marker))
+        // Control: the error keeps the whole request, and the request's own text holds the markers.
+        let requestText = String(describing: error.resumeRequest)
+        #expect(requestText.contains("fixture-key-\(marker)") && requestText.contains("fixture prompt \(marker)"),
+                "control: the fixture's markers are in the request the error keeps")
+
+        let asError: any Error = error
+        let renderings = [
+            "\(error)",
+            String(describing: error),
+            String(reflecting: error),
+            "\(asError)",
+            String(describing: asError),
+            String(reflecting: asError),
+            error.localizedDescription,
+            asError.localizedDescription,
+            "\(asError as NSError)",
+            (asError as NSError).debugDescription,
+        ]
+        for text in renderings {
+            let holdsMarker = text.contains(marker)
+            #expect(!holdsMarker, "an error's text names no part of its request: \(text.prefix(160))")
+        }
+
+        // Fixed: another request gives the same text.
+        let other = ChatConnectionLostError(resumeRequest: Self.connectionLostRequest(marker: "Wx9m"))
+        #expect(String(describing: other) == String(describing: error))
+        #expect(String(reflecting: other) == String(reflecting: error))
+    }
+
     // MARK: - Error conformance
 
     @Test("BackendError conforms to LocalizedError")
