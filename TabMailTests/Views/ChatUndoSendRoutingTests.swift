@@ -566,6 +566,16 @@ struct ChatUndoSendRoutingTests {
                 for _ in 0..<50 where chat.controller.presentedViewController == nil { try await Task.sleep(for: .milliseconds(100)) }
                 let compose = try #require(chat.controller.presentedViewController?.view, "the chat opened its compose")
                 if gesture == .toolbarForward {
+                    // The compose fills a forward (an empty To, its "Fwd:" subject) when its draft
+                    // load ends, so a recipient typed before that is replaced. Type only once the
+                    // fill shows.
+                    let forwardSubject = ThreadUtils.forwardSubject(for: fixture.parent.subject)
+                    @MainActor func filled() -> Bool {
+                        Self.firstView(UITextField.self, in: compose) { $0.text == forwardSubject } != nil
+                    }
+                    for _ in 0..<50 where !filled() { try await Task.sleep(for: .milliseconds(100)) }
+                    let didFill = filled()
+                    #expect(didFill, "control: the forward finished its fill (its subject)")
                     // A recipient, committed by its separator, and the user's own words.
                     @MainActor func toField() -> UITextField? {
                         Self.firstView(UITextField.self, in: compose) { HostedAccessibility.identifier(of: $0) == "recipientInput-to" }
