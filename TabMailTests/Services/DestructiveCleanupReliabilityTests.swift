@@ -340,8 +340,12 @@ struct DestructiveCleanupReliabilityTests {
             #expect(router.composeQueueDepth == 1)
 
             await parked.release()
-            if let outcome = await removal?.result, case .failure(let error) = outcome {
-                Issue.record("the removal failed after its commit: \(error)")
+            if let removal {
+                switch await BoundedWait.result(of: removal, within: Self.cleanupLimit) {
+                case .failure(let error)?: Issue.record("the removal failed after its commit: \(error)")
+                case nil: Issue.record("the removal did not finish after its disconnect was released")
+                case .success?: break
+                }
             }
             let survivor = try await pool.read { try Account.fetchOne($0, key: keptAccount.id) }
             #expect(survivor != nil)

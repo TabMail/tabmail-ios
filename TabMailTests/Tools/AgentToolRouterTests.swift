@@ -1043,11 +1043,9 @@ struct AgentToolRouterRemovedAccountTests {
 @MainActor
 struct AgentToolRouterBlockingComposeTests {
 
-    /// Shared helper: wraps the cancellation-before-dispatch setup used by
-    /// `composeOutcomeOnTaskCancellation` and `staleCancelledRequestSkippedOnDispatch`.
-    /// Returns only after the cancellation has propagated and the task has
-    /// completed — leaves the router with a resolved request sitting at the
-    /// head of the queue and `presentationCount == 1`.
+    /// Shared helper: queues a request behind a compose window on screen
+    /// (`presentationCount == 1`), waits until it is in the queue, then cancels its task.
+    /// Returns the outcome after the cancellation has propagated and the task has completed.
     private func enqueueAndCancelTaskForTesting(router: AgentToolRouter) async -> ComposeOutcome {
         // Block the queue so the helper's request stays queued, not dispatched.
         router.composePresentationDidBegin()
@@ -1063,10 +1061,14 @@ struct AgentToolRouterBlockingComposeTests {
                 )
             }
         }
-        // Let the helper reach the withCheckedContinuation suspension and
-        // enqueue its request before we cancel.
-        await Task.yield()
-        await Task.yield()
+        // Wait, for a bounded time, until the helper has queued its request, so the cancel stops
+        // a request that really waits in the queue, never a task cancelled before it ran.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while router.composeQueueDepth == 0, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(router.composeQueueDepth == 1, "control: the request waits in the queue before it is stopped")
+        #expect(router.firstQueuedRequestForTesting?.subject == "Queued", "control: the waiting request is the helper's")
         task.cancel()
         return await task.value
     }

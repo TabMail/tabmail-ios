@@ -319,12 +319,14 @@ struct ComposeToolGenerationBoundaryTests {
             let (tool, arguments) = try await Self.tool(kind, backend: backend, router: router)
             let noScreen = ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM
             for invocation in [ToolInvocation.noninteractive, Self.editorInvocation()] {
-                // Bounded: a tool that waited for a card is cancelled after five seconds and
-                // returns no failure, so a regression fails here instead of hanging the run.
+                // Bounded: a tool that waits for a card is cancelled after five seconds and the wait
+                // ends even if the tool ignores that, so a regression fails here instead of hanging the run.
                 let run = Task { @MainActor in try await tool.execute(arguments: arguments, invocation: invocation) }
-                let watchdog = Task { try? await Task.sleep(for: .seconds(5)); run.cancel() }
-                let result = try await run.value
-                watchdog.cancel()
+                guard let finished = await BoundedWait.result(of: run, within: .seconds(5)) else {
+                    Issue.record("\(kind.rawValue): the tool did not return within five seconds")
+                    continue
+                }
+                let result = try finished.get()
                 #expect(result == noScreen, "\(kind.rawValue): the plain no-screen failure: \(result)")
             }
             let calls = backend.bodies.count
@@ -378,8 +380,8 @@ struct ComposeToolGenerationBoundaryTests {
                 senderName: "Me", senderEmail: "me@example.com", mode: "edit_new",
                 compositionPrompt: "", kbText: "", relatedDate: "", relatedSubject: "",
                 relatedFrom: "", relatedTo: "", relatedCc: "", bodyText: "")
-            // Bounded: a tool that waited for a card is cancelled after five seconds, which ends the
-            // edit with an error, so a regression fails here instead of hanging the run.
+            // Bounded: a tool that waits for a card is cancelled after five seconds and the wait ends
+            // even if the edit ignores that, so a regression fails here instead of hanging the run.
             let service = backend.service
             let invocation = Self.editorInvocation()
             let run = Task { @MainActor in
@@ -387,15 +389,13 @@ struct ComposeToolGenerationBoundaryTests {
                     currentSubject: "Friday", currentBody: "", context: context,
                     instruction: Backend.editorInstruction, chatHistory: [], invocation: invocation)
             }
-            let watchdog = Task { try? await Task.sleep(for: .seconds(5)); run.cancel() }
-            defer { watchdog.cancel() }
-            do {
-                _ = try await run.value
-            } catch {
-                if let registered { await registry.register(registered) }
-                throw error
-            }
+            let finished = await BoundedWait.result(of: run, within: .seconds(5))
             if let registered { await registry.register(registered) }
+            guard let finished else {
+                Issue.record("the editor's edit did not return within five seconds")
+                return
+            }
+            _ = try finished.get()
 
             let bodies = backend.bodies
             #expect(bodies.count == 2, "the editor's request and the round with the tool's result, nothing else: \(bodies.count)")

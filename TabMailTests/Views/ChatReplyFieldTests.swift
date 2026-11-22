@@ -896,6 +896,11 @@ struct ChatReplyFieldTests {
         // the menu passes it on (ChatComposeRoutingTests checks the bubble keeps it).
         #expect(Self.count("chatMessages.append(ChatMessage(role: .user, content: text, timestamp: Date(), fieldSend: field))", in: island) == 1)
         #expect(Self.count("resendLastUserMessage(text: msg.content, field: msg.fieldSend, afterIndex: index)", in: island) == 1)
+        // Rewind trims the later turns and sends the chosen turn again as a fresh turn, which names
+        // the screen that asked (an earlier field turn's recipients choice is not kept with it).
+        #expect(Self.count("rewindToMessage(text: msg.content, atIndex: index)", in: island) >= 1, "the menu's Rewind reaches the rewind")
+        #expect(Self.count("private func rewindToMessage(text: String, atIndex index: Int) { trimForRewind(atIndex: index) lastFailedSend = nil sendAgentChat(text) }", in: island) == 1,
+                "Rewind sends the turn again through the send that names the screen")
         #expect(Self.count("trimForResendLast(atIndex: index) lastFailedSend = nil sendAgentChat(text, field: field)", in: island) == 1)
         #expect(Self.count("replyField?.onlyTo", in: island) == 0 && Self.count("replyField?.isNoReply", in: island) == 0,
                 "no send reads the field's choice later")

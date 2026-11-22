@@ -37,7 +37,8 @@ import UIKit
 ///     its pill's appearance says, takes none while one of its own sheets is up, and takes a card
 ///     already waiting when it is entered again.
 /// 10. A new email asked in the chat view or on the email screen opens from the account bound when
-///     its turn started; one whose bound account is gone ends plainly and holds no card.
+///     its turn started (in the chat, the account of the email it was opened on); one whose bound
+///     account is gone ends plainly and holds no card.
 /// 11. A turn cut off on one screen and resumed from another keeps the screen that asked, and its
 ///     bound account, also when the resume is cut off again.
 ///
@@ -1131,6 +1132,42 @@ struct ChatComposeRoutingTests {
                 let fromFirst = labels.contains { $0.contains(Self.me) }
                 #expect(fromBound, "the card sends from the account bound when the turn started: \(labels)")
                 #expect(!fromFirst, "never from the app's first account: \(labels)")
+            }
+        }
+    }
+
+    @Test("A new email asked in a chat opened on the other account's email opens from that account, not from the newest email's")
+    func chatNewEmailBindsItsOpenersAccount() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let backend = Backend(asksForNewEmail: true)
+        try await HostedAccessibility.withAutomation {
+            try await Self.withOpenablePill {
+                try await withScreens(.inbox, backend, tag: "from-opener", chat: false, earlier: true) { screens in
+                    let router = AgentToolRouter.shared
+                    let earlier = try #require(screens.earlier, "control: the thread has an email in the other account")
+                    // The chat is opened on the thread's email in the other account; its newest email,
+                    // whose key the chat's turns use, is in the user's first account.
+                    screens.route.chatOpenedOn = earlier.id
+                    screens.route.chatShown = true
+                    try await Self.waitForChat(in: screens)
+                    NotificationCenter.default.post(name: .openMessageWithChat, object: nil, userInfo: ["messageId": earlier.id])
+                    try await Self.waitUntil { HostedAccessibility.identifiers(in: screens.view).contains("chatClose") }
+                    #expect(HostedAccessibility.identifiers(in: screens.view).contains("chatClose"),
+                            "control: the chat's sheet is open: \(HostedAccessibility.identifiers(in: screens.view))")
+                    try await Task.sleep(for: .milliseconds(600))
+                    let request = try await Self.askHeld(in: screens, backend: backend)
+                    let asked = ComposeOrigin(sessionKey: screens.threadKey, screen: .chat, fromAccountId: Self.otherAccount)
+                    #expect(request.origin == asked, "the new email binds the account of the email the chat was opened on: \(request.origin)")
+
+                    router.composePresentationDidEnd()
+                    let card = try await Self.openedCard(in: screens)
+                    #expect(Self.addresses(card["to"]) == [Backend.newEmailTo], "the chat's new email: \(card)")
+                    let labels = Self.cardLabels(in: screens)
+                    let fromOpener = labels.contains { $0.contains(Self.other) }
+                    let fromNewest = labels.contains { $0.contains(Self.me) }
+                    #expect(fromOpener, "the card sends from the opener's account: \(labels)")
+                    #expect(!fromNewest, "never from the newest email's account: \(labels)")
+                }
             }
         }
     }
