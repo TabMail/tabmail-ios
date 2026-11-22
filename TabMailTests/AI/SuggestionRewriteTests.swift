@@ -1065,7 +1065,7 @@ struct SuggestionRewriteRouteTests {
         let output = await EmailReplyTool.finishSuggestionEdit(
             answer, shown: Self.shownReply, start: envelope, suggestionEnvelope: envelope, email: email,
             rewritesInPlace: true, store: Self.store(fixture.db),
-            openCard: { opening, _ in
+            openCard: { @Sendable opening, _ in
                 card.withLock { $0 = opening }
                 return "cancelled"
             })
