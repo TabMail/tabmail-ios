@@ -644,13 +644,15 @@ struct TutorialChatViewRunTests {
     }
 
     // A first-launch tour starts before the AI choice and teaches the chat view, so its sample email
-    // opens as a chat: a real open (`MessageOpenView`, routed as its body routes it) made during the
-    // run goes to the chat. Neither the tour, its demo setup nor the open records an AI choice or an
-    // opt-out on the device: both values stay absent throughout. Once the run has ended, still
-    // before the choice, an open of a real email (the tour's sample is removed with the demo) goes
-    // to today's detail: outside a tour, AI is off until the choice is made.
+    // opens as a chat: a real open (`MessageOpenView`, routed as its body routes it, then hosted on
+    // screen as a navigation stack shows it) made during the run shows the chat. Neither the tour,
+    // its demo setup nor the open, routed or on screen, records an AI choice or an opt-out on the
+    // device: both values stay absent throughout. Once the run has ended, still before the choice,
+    // an open of a real email (the tour's sample is removed with the demo) goes to today's detail:
+    // outside a tour, AI is off until the choice is made.
     @Test("Before the AI choice, the tour opens its sample email as a chat and records no AI choice; after the tour, still before the choice, an open of a real email is today's detail")
     func openBeforeTheAIChoice() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted open")
         let fixture = try install()
         defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
         /// The device AI values (the AI choice and Opt Out of AI) that are stored.
@@ -675,7 +677,33 @@ struct TutorialChatViewRunTests {
                 let route = MessageOpenView(messageId: priya.id).route(pool: database)
                 #expect(route == .chat, "the tour opens its sample email as a chat before the AI choice")
                 let afterOpen = storedAIValues()
-                #expect(afterOpen.isEmpty, "the open stores no AI value: \(afterOpen)")
+                #expect(afterOpen.isEmpty, "the routed open stores no AI value: \(afterOpen)")
+
+                // The same open on screen: the chat shows its bubbles, and still no AI value is stored.
+                try await HostedAccessibility.withAutomation {
+                    let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+                    let window = UIWindow(windowScene: scene)
+                    let controller = UIHostingController(rootView: NavigationStack { MessageOpenView(messageId: priya.id) })
+                    window.rootViewController = controller
+                    window.makeKeyAndVisible()
+                    defer {
+                        window.isHidden = true
+                        window.rootViewController = nil
+                    }
+                    @MainActor func bubbleLabels() -> [String] {
+                        HostedAccessibility.labels(in: controller.view).filter { $0.contains(" said: ") }
+                    }
+                    @MainActor func showsDetail() -> Bool {
+                        HostedAccessibility.identifiers(in: controller.view).contains("replyMenu")
+                    }
+                    for _ in 0..<80 where bubbleLabels().isEmpty && !showsDetail() { try await Task.sleep(for: .milliseconds(100)) }
+                    let bubbles = bubbleLabels()
+                    #expect(!bubbles.isEmpty, "the sample email opens on screen as a chat, with its bubbles")
+                    let detail = showsDetail()
+                    #expect(!detail, "no detail reply menu")
+                    let afterShown = storedAIValues()
+                    #expect(afterShown.isEmpty, "the open on screen stores no AI value: \(afterShown)")
+                }
             }
             #expect(!coordinator.isRunning, "control: the run ended")
             #expect(ChatViewConfig.isEnabledByUser, "control: Chat View is still on")

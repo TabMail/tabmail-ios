@@ -21,7 +21,8 @@ import UIKit
 ///     opt-out, so only the preview's own reading of the setting can repaint it.
 ///
 /// Each test puts back the Chat View choice, the AI setting and the subscription gate it found
-/// (`AIGateTestState`: the gate's open state, its checked bit and both stored values).
+/// (`AIGateTestState`: the gate's open state, its checked bit and both stored values, which
+/// `gateStateComesBackAsFound` checks).
 @Suite("Chat View switch", .serialized, .processGlobalState)
 @MainActor
 struct ChatViewToggleRowTests {
@@ -142,6 +143,46 @@ struct ChatViewToggleRowTests {
             let afterShowsText = rowShows(textMessage)
             #expect(!afterShowsText, "opted out: the row no longer shows the text message")
         }
+    }
+
+    // The fixture every test here puts the subscription gate back with (`AIGateTestState`): what a
+    // test changes when it opens the gate (the open state, the checked bit and both stored values)
+    // is back as found after `restore()`, a stored false and an absent value included.
+    @Test("Putting the subscription gate back restores its open state, its checked bit, a stored false and an absent value")
+    func gateStateComesBackAsFound() {
+        let activeKey = "ai_subscription_last_known_active"
+        let checkedKey = "ai_subscription_has_checked_once"
+        let defaults = UserDefaults.standard
+        let gate = AISubscriptionGate.shared
+        let asTheTestFoundIt = AIGateTestState()
+        defer { asTheTestFoundIt.restore() }
+
+        // The state to come back to: the gate closed and never checked, one value stored as false
+        // and the other absent.
+        gate.restoreForTesting(isActive: false, hasCheckedOnce: false)
+        defaults.set(false, forKey: activeKey)
+        defaults.removeObject(forKey: checkedKey)
+        let found = AIGateTestState()
+
+        gate.openGate()
+        let openedActive = gate.isActive
+        let openedChecked = gate.hasCheckedOnce
+        let openedActiveValue = defaults.object(forKey: activeKey) as? Bool
+        let openedCheckedValue = defaults.object(forKey: checkedKey) as? Bool
+        #expect(openedActive, "control: opening the gate opens it")
+        #expect(openedChecked, "control: opening the gate stamps it checked")
+        #expect(openedActiveValue == true, "control: opening the gate stores the open state")
+        #expect(openedCheckedValue == true, "control: opening the gate stores the checked bit")
+
+        found.restore()
+        let isActive = gate.isActive
+        let hasCheckedOnce = gate.hasCheckedOnce
+        let activeValue = defaults.object(forKey: activeKey) as? Bool
+        let checkedAbsent = defaults.object(forKey: checkedKey) == nil
+        #expect(!isActive, "the gate is closed again")
+        #expect(!hasCheckedOnce, "the gate's checked bit is clear again")
+        #expect(activeValue == false, "the stored false is back")
+        #expect(checkedAbsent, "the absent value is absent again")
     }
 
     // MARK: - Hosting

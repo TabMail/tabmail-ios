@@ -516,7 +516,9 @@ struct ChatThreadViewLifecycleTests {
             let lit = Set(now.filter(\.glows).map(\.index))
             glowed.formUnion(lit)
             if lit.contains(target) { plainWhileTargetGlowed.formUnion(now.filter { !$0.glows }.map(\.index)) }
-            if !glowed.isEmpty && lit.isEmpty {
+            // The glow has ended once the email that glowed is on screen again without it; a
+            // sample that misses its bubble says nothing.
+            if glowed.contains(target) && now.contains(where: { $0.index == target && !$0.glows }) {
                 glowEnded = true
                 break
             }
@@ -526,7 +528,7 @@ struct ChatThreadViewLifecycleTests {
         #expect(glowed == onlyTarget, "only the email search found glows: \(glowed.sorted())")
         let neighboursPlain = plainWhileTargetGlowed.isSuperset(of: [target - 1, target + 1])
         #expect(neighboursPlain, "its neighbours are on screen without the glow: \(plainWhileTargetGlowed.sorted())")
-        #expect(glowEnded, "the glow ends")
+        #expect(glowEnded, "the glow ends: the email search found is on screen again without it")
         let shown = identifiers()
         #expect(shown.contains(pill), "the chat shows its reply pill: \(shown)")
         #expect(!shown.contains(replyMenu), "no detail reply menu: \(shown)")

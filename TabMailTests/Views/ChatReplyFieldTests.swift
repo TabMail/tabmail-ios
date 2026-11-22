@@ -803,14 +803,15 @@ struct ChatReplyFieldTests {
     }
 
     /// The audience is compared as compose reads its fields: each mailbox by its address in any
-    /// case, wherever the agent puts it (To or Cc, by name, the same person in both), and an entry
-    /// that names no sendable address (a Reply-To's `undisclosed-recipients:;`) as the text
-    /// written, so a reply that leaves that entry out leaves part of the audience out. The valid
-    /// recipients stay the same in the two cases that differ only in that entry.
+    /// case, wherever the agent puts it (To, Cc or Bcc alone, by name, the same person in both To
+    /// and Cc), and an entry that names no sendable address (a Reply-To's
+    /// `undisclosed-recipients:;`) as the text written, so a reply that leaves that entry out
+    /// leaves part of the audience out. The valid recipients stay the same in the two cases that
+    /// differ only in that entry.
     @Test("""
     A reply the agent writes to mixed-case named mailboxes is Reply All exactly when it holds the \
-    whole audience, a Reply-To entry with no address included, from the field and the sheet; the \
-    card keeps the To and Cc as written
+    whole audience, a Reply-To entry with no address included and someone moved to Bcc alone, \
+    from the field and the sheet; the card keeps the To, Cc and Bcc as written
     """)
     func agentReplyAudienceIsComparedAsComposeReadsIt() {
         var email = Self.header("n1")
@@ -826,16 +827,19 @@ struct ChatReplyFieldTests {
         let davidTo = "\"David Roe\" <DAVID@example.com>"
         let davidCc = "\"David Roe\" <david@EXAMPLE.com>"
         let sam = "\"Sam Poe\" <Sam@Example.COM>"
+        let davidBcc = "\"David Roe\" <David@EXAMPLE.com>"
         let written = RecipientEntry([alex, noAddress, davidTo, sam, davidCc])
         #expect(written.addresses == ["Alex@Example.com", "DAVID@example.com", "Sam@Example.COM"] && written.leftovers == [noAddress],
                 "control: the agent's mailboxes keep their mixed case, David counts once, the entry stays as written")
 
-        // Each case: the agent's To and Cc, and whether they hold the whole audience. The first two
-        // differ only in the entry with no address; Alex is in To alone.
-        let cases: [(name: String, to: [String], cc: [String], whole: Bool)] = [
-            ("everyone, David in To and in Cc", [alex, noAddress, davidTo], [sam, davidCc], true),
-            ("the entry with no address left out", [alex, davidTo], [sam, davidCc], false),
-            ("David left out", [alex, noAddress], [sam], false),
+        // Each case: the agent's To, Cc and Bcc, and whether they hold the whole audience. The first
+        // two differ only in the entry with no address; Alex is in To alone. In the last, the agent
+        // moved David from To to Bcc and nowhere else: he still gets the reply, so it is Reply All.
+        let cases: [(name: String, to: [String], cc: [String], bcc: [String], whole: Bool)] = [
+            ("everyone, David in To and in Cc", [alex, noAddress, davidTo], [sam, davidCc], [], true),
+            ("the entry with no address left out", [alex, davidTo], [sam, davidCc], [], false),
+            ("David left out", [alex, noAddress], [sam], [], false),
+            ("everyone, David moved to Bcc alone", [alex, noAddress], [sam], [davidBcc], true),
         ]
         for origin in [Origin.field(onlyTo: nil), .sheet] {
             var fieldReply: ChatFieldReply?
@@ -843,12 +847,13 @@ struct ChatReplyFieldTests {
             for item in cases {
                 // As the AI reply tool builds it: a reply from the Reply All set, as the agent edited it.
                 let request = AgentToolRouter.ComposeRequest(
-                    mode: .reply, replyTo: email, to: item.to, cc: item.cc, bcc: [],
+                    mode: .reply, replyTo: email, to: item.to, cc: item.cc, bcc: item.bcc,
                     subject: "Re: Plans", body: "Friday works", isReplyAll: true, fieldReply: fieldReply)
                 let compose = Self.card(agent: request, accounts: [Self.me])
+                let expectedBcc: [String]? = item.bcc.isEmpty ? nil : item.bcc
                 #expect(compose.isReplyAll == item.whole, "\(origin), \(item.name): Reply All is \(item.whole)")
-                #expect(compose.prefillTo == item.to && compose.prefillCc == item.cc && compose.prefillBcc == nil,
-                        "\(origin), \(item.name): the card keeps the agent's To and Cc as written")
+                #expect(compose.prefillTo == item.to && compose.prefillCc == item.cc && compose.prefillBcc == expectedBcc,
+                        "\(origin), \(item.name): the card keeps the agent's To, Cc and Bcc as written")
             }
         }
     }
