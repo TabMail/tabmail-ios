@@ -204,12 +204,13 @@ extension IMAPProvider {
     ///   `Folder.lastKnownUidNext`), a new listing's `firstCounters` (#1109).
     /// - `accessed`: a user action just landed in the folder
     ///   (`CatchUpContext.accessedFolderIds`, #1109). An untracked folder with no
-    ///   MODSEQ freshness (a server or session without CONDSTORE) has no cheap
-    ///   check, so it is listed at that access when its counters differ from the
-    ///   last completed listing's, or that listing completed longer ago than
-    ///   `SyncConfig.catchUpAccessCheckAgeSeconds`. With MODSEQ, the cheap check
-    ///   already lists a folder that changed; a tracked folder's changes come
-    ///   through its change read.
+    ///   MODSEQ pair to compare (a server or session without CONDSTORE, or a last
+    ///   completed listing that started with no MODSEQ) has no cheap check, so it
+    ///   is listed at that access when its counters differ from the last
+    ///   completed listing's, or that listing completed longer ago than
+    ///   `SyncConfig.catchUpAccessCheckAgeSeconds`. With a MODSEQ pair, the cheap
+    ///   check already lists a folder that changed; a tracked folder's changes
+    ///   come through its change read.
     nonisolated static func catchUpPlan(
         state: IMAPCatchUpState?, freshModSeq: Int?, now: Date, isTracked: Bool = false,
         rawLapseCount: Int? = nil, counters: IMAPCatchUpState.Counters? = nil, accessed: Bool = false
@@ -223,7 +224,8 @@ extension IMAPProvider {
             : CatchUpSchedule.fullCheckDue(
                 lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.catchUpFullCheckIntervalSeconds)
                 || state?.lapsedSinceLastListing == true
-        let accessCheckDue = accessed && !isTracked && freshModSeq == nil
+        let modSeqComparable = freshModSeq != nil && state?.completionStamp != nil
+        let accessCheckDue = accessed && !isTracked && !modSeqComparable
             && (state?.completionCounters != counters
                 || CatchUpSchedule.fullCheckDue(
                     lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.catchUpAccessCheckAgeSeconds))

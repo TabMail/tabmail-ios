@@ -98,7 +98,16 @@ struct ListingRouteFenceTests {
                 "the column is set by markFollowed alone")
         #expect(Self.hits("\"isFollowed\"", in: sources) == ["TabMail/Models/Folder.swift": 1, "TabMail/Services/AppDatabase.swift": 1],
                 "the column's name appears only as its constant and in its migration")
-        #expect(Self.hits(".isFollowed =", in: sources).isEmpty, "no production code sets the record's mark")
+        // Every mention of the field or column, however it is spelled (a Swift
+        // assignment, SQL `SET isFollowed = 0`, `isFollowed=1`): its declaration,
+        // its column constant, its migration and the one read, in `isSyncable`.
+        // A new mention is reviewed against the one writer.
+        let mentions = Self.hits("isFollowed", in: sources)
+        #expect(mentions == [
+            "TabMail/Models/Folder.swift": 2,
+            "TabMail/Services/AppDatabase.swift": 1,
+            Self.engineFile: 1,
+        ], "no production code sets the record's mark or writes the column by name: \(mentions)")
         let follow = try #require(sources.first { $0.path == followFile }?.text)
         #expect(!follow.contains("set(to: false)"), "the mark is never cleared")
     }

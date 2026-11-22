@@ -726,8 +726,8 @@ private actor HeldWorkLatch {
     }
 }
 
-/// A flag set once from any context.
-private final class HeldWorkFlag: Sendable {
+/// A flag set once from any context. Also used by `FollowedFolderIMAPTests`.
+final class HeldWorkFlag: Sendable {
     private let value = Mutex(false)
     /// Sets the flag; returns whether it was already set.
     func set() -> Bool { value.withLock { let was = $0; $0 = true; return was } }

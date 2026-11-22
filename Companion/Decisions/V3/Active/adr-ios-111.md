@@ -1244,13 +1244,17 @@ on the re-drive.
      (`SettingsSyncStateResetTests`). A renamed or re-created IMAP folder is a new row and starts
      unfollowed.
 2. **The access points** (`SyncEngine.folderAccessed`: the mark, then an access catch-up run):
-   - opening a folder or pulling to refresh it (`AccountManager.syncFolders`): the mark is written before
-     the listings, so a listing that fails still follows the folder, and the run starts after the change
-     read, so a folder the reader has just baselined may be listed;
+   - opening a folder or pulling to refresh it (`AccountManager.syncFolders`): the mark is written first,
+     before the connect and the listings, so an open while offline, or a listing that fails, still follows
+     the folder; the run starts after the change read, so a folder the reader has just baselined may be
+     listed;
    - a drained move, archive or delete: its source and its destination (`AccountOperationExecutor.finishDrain`,
      `DrainContext.foldersAccessed`);
    - opening a message, from a folder, a search result, or a chat or AI answer alike
-     (`MessageDetailViewModel.loadBody`, on a detached task: the open never waits for it).
+     (`MessageDetailViewModel.loadBody`): started when the body load ends, whichever way it ends, on a
+     detached task, so the open never waits for it and the folder's catch-up requests never queue ahead
+     of the message's body request on a provider's shared request slots (Graph's per-mailbox
+     `HTTPConcurrencyGate`).
    The trigger is not `syncFolderMessages`, the place the issue first proposed: that route also serves
    the post-send Sent listing and step 6 of the epoch rebuild, which are not user actions in the folder.
 3. **The access catch-up run** (`SyncEngine.startAccessCatchUp`): one per account, detached; folders that
@@ -1263,7 +1267,8 @@ on the re-drive.
    `SyncEngine.remove(accountId:)` cancels the run.
 4. **IMAP with no mod-sequences** (`IMAPProvider.catchUpPlan`, `counters:`, `accessed:`). Such a folder has
    no cheap check, so the daily full check alone would leave an accessed folder stale for up to a day. An
-   accessed, untracked folder with no MODSEQ freshness is listed when its stored counters (`totalCount`,
+   accessed, untracked folder with no MODSEQ pair to compare (no fresh MODSEQ from the server or session,
+   or a last completed listing that started with none, so no `completionStamp`) is listed when its stored counters (`totalCount`,
    the listing's EXISTS, and `lastKnownUidNext`) differ from those its last completed listing started
    from (`IMAPCatchUpState.completionCounters`, taken from `Listing.firstCounters` before the first range,
    as `firstStamp` is; inside the opaque state, no column), or when that listing completed longer ago than
@@ -1278,14 +1283,16 @@ on the re-drive.
 
 **Why a new column, and why no index.** Every existing field was checked first:
 1. `changeState` is sync progress. The UIDVALIDITY reaction sets it NULL (`AccountManagerUidValidityReset`)
-   and its re-drive loops over the syncable set (`SyncEngineFullSync`), so a mark kept there would take the
-   folder out of the syncable set inside its own epoch reaction: after a success it would lose its change
-   read and catch-up, and after an abort it would not be re-driven (Memory 114). Both Settings resets
+   and the full sync's re-drive loops over the syncable set (`SyncEngineFullSync`), so a mark kept there
+   would take the folder out of the syncable set inside its own epoch reaction: it would lose its full
+   sync listing, change read and catch-up, and after an abort only the change pass's re-drive
+   (`redriveArmedTurnovers`, every armed folder) would still reach it (Memory 114). Both Settings resets
    clear it (`resetSyncStateTxn`), and `FolderChangeState.encoded` stores NULL for a state with nothing in
    it. Keeping the mark there would mean carving it out of the epoch reaction and both resets.
-2. `catchUpState` and `changeCursor` are provider-opaque JSON the engine cannot read above the boundary;
-   both are dropped on an epoch change, a lapse, the exit rule or a reset, and nil already means "first
-   listing" and "baseline needed".
+2. `catchUpState` and `changeCursor` are provider-opaque JSON the engine cannot read above the boundary,
+   and both are provider progress with their own lifetimes: an epoch change, the exit rule and both
+   resets drop them, and a lapse rewrites the catch-up state (it adds the lapse it owes); nil already
+   means "first listing" and "baseline needed".
 3. `isFavorite` is the user's visible favourites list: setting it would add folders to the sidebar.
 4. A per-folder "last synced" time does not exist; `Account.lastSyncedAt` is account-wide.
 5. The listing counters and the walk's columns (`totalCount`, `lastKnownUidNext`, `lastKnownHighestModSeq`,
@@ -1296,16 +1303,33 @@ read by `accountId`, tens per account); no query selects by the mark alone.
 
 **Consequences.** A folder the user has acted in is kept current like a favourite, at the cost of its change
 read and catch-up from then on. The set only grows; a folder the user stops using stays followed.
-Limits: an access that comes inside an open slice window waits for it (at most
-`catchUpSliceIntervalSeconds`); on IMAP with no mod-sequences, a flag change made elsewhere below the
-newest listing within an hour of the last completed listing waits for the next access after that hour,
-or the daily check.
+Limits (each recovers through the ordinary schedule, because the folder is followed from then on):
+- An access that comes inside an open slice window waits for it (at most `catchUpSliceIntervalSeconds`).
+- A visit shorter than the folder view's start delay before its sync is not an access: no sync starts,
+  so the folder is not marked.
+- An access with no change evidence waits for the ordinary schedule: on Outlook a first access by a
+  drained action or a message open waits until the change read baselines the folder (decision 5); on IMAP
+  with no mod-sequences, a flag change made elsewhere below the newest listing within an hour of the last
+  completed listing waits for the next access after that hour, or the daily check, and so does a message
+  open or a move's source whose counters did not move; a tracked folder's changes wait for its next change
+  read; a listing that throws ends that run.
+- Rare timing windows where one action's mark is missed (an app kill or a replay between a drained
+  action's commit and its mark; a message load cancelled during its first read): the next action in the
+  folder marks it (#1263).
+- Pre-existing, not changed here: an IMAP folder the reader can no longer track keeps its bookmark on
+  purpose, so the catch-up plan counts it as tracked and it gets neither the daily nor the access check
+  (#1264).
 
-Tests: `FollowedFolderTests` (`FollowedFolderMarkTests`: the mark, the order, the access plan;
-`FollowedFolderIMAPTests`: the wire oracle for opening the folder, a move into it and opening one of its
-messages, on a server with no mod-sequences and on a QRESYNC server; `FollowedFolderOutlookTests`: the
-baseline, then the listing), `ReleaseBoundaryRecheckTests.applyOverflowInAFollowedFolderArmsTheCatchUp`,
-`FolderIsFollowedMigrationTests`.
+Tests: `FollowedFolderTests` (`FollowedFolderMarkTests`: the mark, the order, the access plan, including a
+folder with no MODSEQ pair to compare; `FollowedFolderIMAPTests`: the wire oracle for opening the folder,
+a move into it and opening one of its messages, on a server with no mod-sequences and on a QRESYNC server,
+each run asking only the accessed folders and a quiet re-open listing nothing, the message's body
+requested before any catch-up slice, a second access during a run taken by the next run, an open while
+offline that still follows the folder, and a completion that keeps the counters its listing started from
+across slices; `FollowedFolderOutlookTests`: the gated access writes no listing, then the baseline, then
+the listing), `ReleaseBoundaryRecheckTests.applyOverflowInAFollowedFolderArmsTheCatchUp` (the first ids
+are kept), `FolderIsFollowedMigrationTests`, `ListingRouteFenceTests.followMarkHasOneWriter` (every
+production mention of the mark).
 
 Keywords: isFollowed, followed folder, follow mark, markFollowed, followedColumn, folderAccessed,
 followFolders, startAccessCatchUp, access catch-up run, accessedFolderIds, accessCatchUpRunSeconds,

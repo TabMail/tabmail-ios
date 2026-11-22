@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -73,7 +74,7 @@ struct FollowedFolderMarkTests {
         #expect(order == ["INBOX", "Starred", "Sent", "Projects"])
     }
 
-    @Test("IMAP with no mod-sequences: an access lists an untracked folder when its counters moved since its last completed listing started, or that listing is older than the access age; nothing else does")
+    @Test("IMAP with no MODSEQ pair to compare: an access lists an untracked folder when its counters moved since its last completed listing started, or that listing is older than the access age; nothing else does")
     func accessCheckPlan() {
         typealias P = IMAPProvider
         typealias Counters = IMAPCatchUpState.Counters
@@ -99,8 +100,13 @@ struct FollowedFolderMarkTests {
         #expect(P.catchUpPlan(state: state(old, counters), freshModSeq: nil, now: now, counters: counters, accessed: true) == list(counters))
         // A listing completed with no counters recorded is listed at the first access.
         #expect(P.catchUpPlan(state: state(recent, nil), freshModSeq: nil, now: now, counters: counters, accessed: true) == list(counters))
-        // With mod-sequences the MODSEQ check decides: unchanged lists nothing, whatever the counters.
+        // With a MODSEQ pair the MODSEQ check decides: unchanged lists nothing, whatever the counters.
         #expect(P.catchUpPlan(state: state(recent, counters, stamp: 9), freshModSeq: 9, now: now, counters: fewer, accessed: true) == .none)
+        // A MODSEQ now, but none when the last completed listing started: no pair, so the counters decide.
+        let noPair = P.catchUpPlan(state: state(recent, counters), freshModSeq: 9, now: now, counters: fewer, accessed: true)
+        #expect(noPair == .list(.init(firstStamp: 9, firstCounters: fewer, nextUid: 1)))
+        let noPairUnmoved = P.catchUpPlan(state: state(recent, counters), freshModSeq: 9, now: now, counters: counters, accessed: true)
+        #expect(noPairUnmoved == .none)
         // A tracked folder's changes come through its change read.
         #expect(P.catchUpPlan(state: state(recent, counters), freshModSeq: nil, now: now, isTracked: true, counters: fewer, accessed: true) == .none)
         // A first listing records the counters it starts from.
@@ -143,6 +149,9 @@ struct FollowedFolderIMAPTests {
     static let inboxMessage = "followed-inbox"
     /// Bounded waits for the access run a message open starts on its own task.
     static let openPolls = 300
+    /// How long (in 50 ms polls) a message's body request waits for an access
+    /// run that may have started with the open: 2 s.
+    static let bodyRequestPolls = 40
 
     enum Server: String, CaseIterable, Sendable {
         /// No CONDSTORE: no change read; the access check compares counters.
@@ -173,12 +182,57 @@ struct FollowedFolderIMAPTests {
         """)
     }
 
+    /// Every catch-up slice the account's engine starts: the folders it asks,
+    /// and how many commands the server had seen when it started.
+    final class SliceRecorder: Sendable {
+        struct Slice: Sendable {
+            let folderIds: [String]
+            let commandsBefore: Int
+        }
+        private let slices = Mutex<[Slice]>([])
+        func record(_ folderIds: [String], commandsBefore: Int) {
+            slices.withLock { $0.append(Slice(folderIds: folderIds, commandsBefore: commandsBefore)) }
+        }
+        var all: [Slice] { slices.withLock { $0 } }
+        func reset() { slices.withLock { $0 = [] } }
+    }
+
     struct World {
         let server: FakeIMAPServer
+        let provider: IMAPProvider
         let pool: DatabasePool
         let accountId: String
+        let recorder = SliceRecorder()
         var folderId: String { "\(accountId):\(FollowedFolderIMAPTests.path)" }
         var inboxId: String { "\(accountId):INBOX" }
+
+        /// Installs the account engine's slice hook: each slice is recorded,
+        /// then `action` runs, and the slice waits for it.
+        func watchSlices(_ action: (@Sendable ([String]) async -> Void)? = nil) async {
+            let recorder = recorder
+            let server = server
+            await AccountManager.shared.syncEngine.setCatchUpSliceStartHookForTesting { folderIds in
+                recorder.record(folderIds, commandsBefore: server.recordedCommandsWithMailbox().count)
+                await action?(folderIds)
+            }
+        }
+
+        /// The listing commands (`UID FETCH`, `UID SEARCH`) sent to the folder's
+        /// mailbox from position `index` of the server's log on.
+        func folderListingCommands(since index: Int) -> [String] {
+            server.recordedCommandsWithMailbox().dropFirst(index)
+                .filter { $0.mailbox == FollowedFolderIMAPTests.path }
+                .map(\.command)
+                .filter { $0.uppercased().hasPrefix("UID FETCH") || $0.uppercased().hasPrefix("UID SEARCH") }
+        }
+
+        /// Every command the server has seen that changes a mailbox.
+        func mutatingCommands() -> [String] {
+            server.recordedCommands().filter { command in
+                let upper = command.uppercased()
+                return ["STORE ", "EXPUNGE", "COPY ", "MOVE ", "APPEND "].contains { upper.contains($0) }
+            }
+        }
 
         func account() throws -> Account {
             let accountId = accountId
@@ -243,6 +297,36 @@ struct FollowedFolderIMAPTests {
             #expect(extra.isEmpty, "\(label): rows the server no longer holds: \(extra)", sourceLocation: sourceLocation)
             #expect(wrong.isEmpty, "\(label): rows whose read or flag state is not the server's: \(wrong)", sourceLocation: sourceLocation)
             #expect(server.wrongMessageViolations().isEmpty, sourceLocation: sourceLocation)
+        }
+
+        /// The same property against the scenario itself (`changeBelowTheNewest`),
+        /// not the server's current state: exactly the messages the other client
+        /// left, one row each, with the read and flag state it set, on the device
+        /// and still on the server; and the open sent the server no change.
+        func expectScenarioReconciled(_ label: String, sourceLocation: SourceLocation = #_sourceLocation) throws {
+            let t = FollowedFolderIMAPTests.self
+            let expected = Set(t.serverUIDs).subtracting(t.deleted).subtracting(t.movedAway).sorted()
+            let held = try local()
+            let heldUIDs = held.keys.sorted()
+            let folderId = folderId
+            let rowCount = try pool.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader WHERE folderId = ?", arguments: [folderId]) ?? 0
+            }
+            #expect(heldUIDs == expected, "\(label): the device holds what the other client left", sourceLocation: sourceLocation)
+            #expect(rowCount == expected.count, "\(label): one row per message, \(rowCount) rows", sourceLocation: sourceLocation)
+            #expect(serverHeld() == expected, "\(label): the server still holds what the other client left", sourceLocation: sourceLocation)
+            for uid in t.readElsewhere {
+                let isRead = held[uid]?.isRead
+                let seen = server.flags(in: t.path, uid: uid).contains("\\Seen")
+                #expect(isRead == true && seen, "\(label): \(uid), read elsewhere, is read here and there", sourceLocation: sourceLocation)
+            }
+            for uid in t.flaggedElsewhere {
+                let isFlagged = held[uid]?.isFlagged
+                let flagged = server.flags(in: t.path, uid: uid).contains("\\Flagged")
+                #expect(isFlagged == true && flagged, "\(label): \(uid), flagged elsewhere, is flagged here and there", sourceLocation: sourceLocation)
+            }
+            let mutating = mutatingCommands()
+            #expect(mutating.isEmpty, "\(label): an open changes nothing on the server: \(mutating)", sourceLocation: sourceLocation)
         }
 
         func expectFollowed(_ folderIds: [String], _ label: String, sourceLocation: SourceLocation = #_sourceLocation) throws {
@@ -360,8 +444,10 @@ struct FollowedFolderIMAPTests {
         // world's downloads (the loaded message's body) until its items are dropped.
         await BackfillBodyQueue.shared.emptyForTesting()
         await BackfillBodyQueue.shared.setDispatchSuppressedForTesting(true)
-        let world = World(server: server, pool: pool, accountId: accountId)
+        let world = World(server: server, provider: provider, pool: pool, accountId: accountId)
+        await world.watchSlices()
         func teardown() async {
+            await AccountManager.shared.syncEngine.setCatchUpSliceStartHookForTesting(nil)
             await AccountManager.shared.disconnectProviderForTesting(accountId: accountId)
             await BackfillBodyQueue.shared.emptyForTesting()
             await BackfillBodyQueue.shared.setDispatchSuppressedForTesting(false)
@@ -392,6 +478,12 @@ struct FollowedFolderIMAPTests {
             try await w.open()
             try w.expectFollowed([w.folderId], "open")
             try w.expectReconciled("open")
+            try w.expectScenarioReconciled("open")
+            let firstSlices = w.recorder.all.map(\.folderIds)
+            let openedId = w.folderId
+            let onlyOpened = firstSlices.allSatisfy { $0 == [openedId] }
+            #expect(!firstSlices.isEmpty, "the open started an access run")
+            #expect(onlyOpened, "the access run asks the opened folder alone: \(firstSlices)")
 
             // Later changes elsewhere, below the newest 50.
             w.deleteElsewhere([25])
@@ -399,12 +491,100 @@ struct FollowedFolderIMAPTests {
             try await w.open()
             try w.expectReconciled("second open")
 
-            // Nothing changed: the access lists nothing again.
-            let state = try w.folder(w.folderId).catchUpState
+            // Nothing changed: the access run sends the folder no listing request.
+            w.recorder.reset()
             try await w.open()
-            let stateAfter = try w.folder(w.folderId).catchUpState
-            #expect(stateAfter == state, "an open with nothing changed lists nothing")
+            let quietSlices = w.recorder.all
+            #expect(!quietSlices.isEmpty, "the quiet open started an access run too")
+            guard let quietStart = quietSlices.first?.commandsBefore else { return }
+            let listed = w.folderListingCommands(since: quietStart)
+            #expect(listed.isEmpty, "an open with nothing changed lists nothing: \(listed)")
             try w.expectReconciled("third open")
+        }
+    }
+
+    @Test("An access that comes while the account's access run is going is taken by its next run")
+    @MainActor
+    func aSecondAccessDuringARunIsTakenByTheNext() async throws {
+        try await Self.withWorld("second-access", .plain) { w in
+            let engine = AccountManager.shared.syncEngine
+            let accountId = w.accountId
+            let folderId = w.folderId
+            let inboxId = w.inboxId
+            let handedOver = HeldWorkFlag()
+            await w.watchSlices { folderIds in
+                // While the open's run is in its first slice, a drained action lands in the Inbox.
+                guard folderIds == [folderId], !handedOver.set() else { return }
+                await engine.startAccessCatchUp(accountId: accountId, folderIds: [inboxId])
+            }
+            try await w.open()
+
+            let asked = w.recorder.all.map(\.folderIds)
+            #expect(handedOver.isSet, "setup: the Inbox was handed over during the run")
+            #expect(asked.first == [folderId], "the open's run asked the opened folder: \(asked)")
+            #expect(asked.contains([inboxId]), "the next run asked the Inbox handed over meanwhile: \(asked)")
+        }
+    }
+
+    @Test("Opening a folder while its account cannot connect still follows it")
+    @MainActor
+    func openingAFolderOfflineFollowsIt() async throws {
+        try await Self.withWorld("offline-open", .plain) { w in
+            // The account is not connected, and connecting it fails (this fixture
+            // account has no server settings), as on a device that is offline.
+            await AccountManager.shared.disconnectProviderForTesting(accountId: w.accountId)
+            let opened = try w.folder(w.folderId)
+            let account = try w.account()
+            var failed = false
+            do {
+                try await AccountManager.shared.syncFolders([opened], connecting: [account])
+            } catch {
+                failed = true
+            }
+            #expect(failed, "setup: the account could not connect")
+            try w.expectFollowed([w.folderId], "open while offline")
+        }
+    }
+
+    @Test("A listing that spans runs records the counters it started from, so a change made during it is listed at the next access")
+    @MainActor
+    func completionKeepsTheCountersItsListingStartedFrom() async throws {
+        try await Self.withWorld("counters", .plain) { w in
+            w.changeBelowTheNewest()
+            let engine = SyncEngine()
+            let folderId = w.folderId
+            let start = try w.folder(folderId)
+            let first = IMAPCatchUpState.Counters(exists: start.totalCount, uidNext: start.lastKnownUidNext)
+            func access(maxRequests: Int) async {
+                var context = CatchUpContext(deadline: .distantFuture, clock: { Date() })
+                context.maxRequests = maxRequests
+                context.accessedFolderIds = [folderId]
+                await engine.runCatchUp(provider: w.provider, folderIds: [folderId], context: context)
+            }
+            func state() throws -> IMAPCatchUpState? {
+                IMAPCatchUpState.decode(try w.folder(folderId).catchUpState)
+            }
+            func fetches() -> Int {
+                w.server.recordedCommands().filter { $0.uppercased().hasPrefix("UID FETCH") }.count
+            }
+
+            // One request: the listing starts from the stored counters and does not finish.
+            await access(maxRequests: 1)
+            let begun = try state()
+            #expect(begun?.listing?.firstCounters == first, "precondition: the listing is under way, from the stored counters")
+            // Meanwhile a window listing stores new counters: a message went elsewhere.
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET totalCount = totalCount - 1 WHERE id = ?", arguments: [folderId])
+            }
+            await access(maxRequests: .max)
+            let completed = try state()
+            #expect(completed?.listing == nil, "precondition: the listing completed")
+            #expect(completed?.completionCounters == first, "the completion records the counters its listing started from")
+
+            let before = fetches()
+            await access(maxRequests: .max)
+            let after = fetches()
+            #expect(after > before, "the next access lists the folder again: its counters moved during the listing")
         }
     }
 
@@ -421,8 +601,17 @@ struct FollowedFolderIMAPTests {
             try await w.drain()
             await w.settle()
 
-            let landed = w.server.uids(in: Self.path, rfc822MessageId: "<\(Self.inboxMessage)@example.com>")
+            let rfc = "<\(Self.inboxMessage)@example.com>"
+            let landed = w.server.uids(in: Self.path, rfc822MessageId: rfc)
+            let leftInInbox = w.server.uids(in: "INBOX", rfc822MessageId: rfc)
             #expect(landed.count == 1, "setup: the move landed on the server: \(landed)")
+            #expect(leftInInbox.isEmpty, "setup: the move left nothing in the server's Inbox: \(leftInInbox)")
+            let inboxId = w.inboxId
+            let localInbox = try await w.pool.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader WHERE folderId = ? AND rfc822MessageId = ?",
+                                 arguments: [inboxId, rfc]) ?? 0
+            }
+            #expect(localInbox == 0, "the moved message has left the device's Inbox")
             try w.expectFollowed([w.folderId, w.inboxId], "move in")
             try w.expectReconciled("move in")
         }
@@ -435,10 +624,24 @@ struct FollowedFolderIMAPTests {
         try await Self.withWorld("message-open", server) { w in
             w.changeBelowTheNewest()
             // A search result opens the message by its header id, as any open does.
+            // Its body is not stored, so the open requests it; that request waits
+            // long enough for an access run started with the open to reach its
+            // first slice, and notes whether one did.
             let opened = try w.row(uid: 100, in: w.folderId)
-            let detail = MessageDetailViewModel(messageId: opened.id, dbPool: w.pool, fetchBodyOverride: { _ in })
+            let recorder = w.recorder
+            let bodyRequested = HeldWorkFlag()
+            let sliceBeforeBody = HeldWorkFlag()
+            let detail = MessageDetailViewModel(messageId: opened.id, dbPool: w.pool, fetchBodyOverride: { _ in
+                _ = bodyRequested.set()
+                for _ in 0..<Self.bodyRequestPolls where recorder.all.isEmpty {
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                if !recorder.all.isEmpty { _ = sliceBeforeBody.set() }
+            })
             await detail.loadBody()
             #expect(detail.message?.id == opened.id, "setup: the message opened")
+            #expect(bodyRequested.isSet, "setup: the open requested the message's body")
+            #expect(!sliceBeforeBody.isSet, "the folder's catch-up starts only after the message's body request")
 
             // The open starts the folder's access run on its own task.
             for _ in 0..<Self.openPolls {
@@ -448,6 +651,7 @@ struct FollowedFolderIMAPTests {
             }
             try w.expectFollowed([w.folderId], "message open")
             try w.expectReconciled("message open")
+            try w.expectScenarioReconciled("message open")
         }
     }
 }
@@ -471,13 +675,19 @@ struct FollowedFolderOutlookTests {
     /// listing has completed, or `passes` runs.
     static func catchUpUntilListed(_ w: R.World, _ engine: SyncEngine, _ path: String) async throws {
         for _ in 0..<passes {
-            let run = SyncEngine.CatchUpRun(
-                storageLimitInForce: false, deadline: nil, sliceSeconds: SyncConfig.catchUpSliceSeconds,
-                intervalSeconds: 0, clock: { Date() })
-            _ = await engine.runCatchUpRun(account: try w.account(), run: run)
+            try await catchUpOnce(w, engine)
             let state = ExchangeCatchUpState.decode(try w.folder(path).catchUpState)
             if state?.lastCompletedAt != nil, state?.listing == nil { return }
         }
+    }
+
+    /// One engine catch-up run, one slice, no pacing gap.
+    static func catchUpOnce(_ w: R.World, _ engine: SyncEngine) async throws {
+        let account = try w.account()
+        let run = SyncEngine.CatchUpRun(
+            storageLimitInForce: false, deadline: nil, sliceSeconds: SyncConfig.catchUpSliceSeconds,
+            intervalSeconds: 0, clock: { Date() })
+        _ = await engine.runCatchUpRun(account: account, run: run)
     }
 
     static func readUntilTracking(_ w: R.World, _ path: String) async throws {
@@ -510,7 +720,14 @@ struct FollowedFolderOutlookTests {
             #expect(try w.folder(Self.projects).catchUpState == nil, "precondition: no catch-up of it either")
             #expect(try w.rowIds(in: Self.projects) == ["p-keep", "p-gone", "p-read"])
 
-            try await w.pool.write { db in try SyncEngine.markFollowed(folderIds: [customId], db: db) }
+            let marked = try await w.pool.write { db in try SyncEngine.markFollowed(folderIds: [customId], db: db) }
+            #expect(marked == [customId], "setup: the folder is followed now")
+            // Followed, but the change read has not baselined it: the catch-up does not list it yet.
+            try await Self.catchUpOnce(w, engine)
+            let gated = ExchangeCatchUpState.decode(try w.folder(Self.projects).catchUpState)
+            #expect(gated?.listing == nil && gated?.lastCompletedAt == nil,
+                    "the catch-up does not list a followed folder before its baseline")
+            #expect(try w.rowIds(in: Self.projects) == ["p-keep", "p-gone", "p-read"], "nor remove anything from it")
             try await Self.readUntilTracking(w, Self.projects)
             #expect(try w.cursor(Self.projects)?.phase == .tracking, "the change read baselined the followed folder")
             #expect(try w.rowIds(in: Self.projects) == ["p-keep", "p-gone", "p-read"], "a baseline removes nothing")

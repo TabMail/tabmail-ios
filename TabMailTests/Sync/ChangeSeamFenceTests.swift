@@ -173,7 +173,8 @@ struct FolderChangeStateMigrationTests {
         #expect((column["notnull"] as Int) == 0)
         // The raw column, not a `Folder`: the record reads columns later
         // migrations add (`isFollowed`, v112), which this schema does not have yet.
-        let row = try #require(try db.read { try Row.fetchOne($0, sql: "SELECT changeState FROM folder") })
+        let stateRow = try db.read { try Row.fetchOne($0, sql: "SELECT changeState FROM folder") }
+        let row = try #require(stateRow)
         let changeState: String? = row["changeState"]
         #expect(changeState == nil)
         #expect(FolderChangeState(raw: changeState).tracking == false)
@@ -208,7 +209,8 @@ struct FolderChangeCursorMigrationTests {
         #expect((column["notnull"] as Int) == 0)
         // The raw column, not a `Folder`: the record reads columns later
         // migrations add (`isFollowed`, v112), which this schema does not have yet.
-        let row = try #require(try db.read { try Row.fetchOne($0, sql: "SELECT changeCursor FROM folder") })
+        let cursorRow = try db.read { try Row.fetchOne($0, sql: "SELECT changeCursor FROM folder") }
+        let row = try #require(cursorRow)
         let changeCursor: String? = row["changeCursor"]
         #expect(changeCursor == nil)
         #expect(OutlookFolderCursor(raw: changeCursor) == nil)

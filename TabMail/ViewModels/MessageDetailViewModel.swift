@@ -1486,11 +1486,16 @@ final class MessageDetailViewModel {
         // Opening a message is a user action in its folder, wherever it was
         // opened from (a folder, a search result, a chat or AI answer): the folder
         // is followed and its whole content reconciled (#1109,
-        // `SyncEngine.folderAccessed`). Off the open's path: nothing here waits.
+        // `SyncEngine.folderAccessed`). Started when this load ends, whichever way
+        // it ends, on its own task: the open never waits for it, and the folder's
+        // catch-up requests never queue ahead of this message's body request on a
+        // provider's shared request slots.
         let accessedAccountId = msg.accountId
         let accessedFolderId = msg.folderId
-        Task.detached(priority: .utility) { [manager] in
-            await manager.syncEngine.folderAccessed(accountId: accessedAccountId, folderIds: [accessedFolderId])
+        defer {
+            Task.detached(priority: .utility) { [manager] in
+                await manager.syncEngine.folderAccessed(accountId: accessedAccountId, folderIds: [accessedFolderId])
+            }
         }
 
         // Mark-as-read on open lives in `markReadOnOpenIfNeeded()` — called

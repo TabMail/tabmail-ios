@@ -226,7 +226,8 @@ struct FolderCodableTests {
         folder.isFollowed = false
         try db.write { try folder.update($0) }
         try db.write { try folder.save($0) }
-        let marked = try #require(try db.read { try Folder.fetchOne($0, key: folder.id) })
+        let markedRead = try db.read { try Folder.fetchOne($0, key: folder.id) }
+        let marked = try #require(markedRead)
         #expect(marked.isFollowed == true, "a whole-record write from a record read before the mark never clears it")
 
         // Every other column of the table is encoded: a new field cannot be

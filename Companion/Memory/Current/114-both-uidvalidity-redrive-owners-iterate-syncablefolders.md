@@ -73,8 +73,11 @@ mention that both share a filter).
 
 `SyncEngine.isSyncable(_:)` now also admits a FOLLOWED folder (`Folder.isFollowed`, v112): any folder a
 user action landed in (opened, a move, archive or delete with it as source or destination, or one of its
-messages opened). Both re-drive owners still share the one predicate, so a followed custom folder now
-has the re-drive, the change read and the catch-up; a custom folder nobody ever acted in still has none,
-and the gap above holds for it. The mark is never cleared, and it is NOT kept in `changeState`, which the
-epoch reaction itself clears: a mark there would drop the folder out of this very loop inside its own
-reaction. ADR-IOS-111, amendment 2026-11-22.
+messages opened). The re-drive owners no longer share one predicate: the full sync's per-folder loop
+still iterates the syncable set, but the change pass's `SyncEngine.redriveArmedTurnovers` re-drives every
+armed folder with a path, syncable or not, and the on-demand door above stays the third owner. So the gap
+above is closed for the re-drive whatever the mark; what the mark adds to a custom folder is the full
+sync's listing, the change read and the catch-up, which a custom folder nobody ever acted in still lacks.
+The mark is never cleared, and it is NOT kept in `changeState`, which the epoch reaction itself clears: a
+mark there would drop the folder out of the full sync's loop and out of its change read and catch-up
+inside its own reaction. ADR-IOS-111, amendment 2026-11-22.

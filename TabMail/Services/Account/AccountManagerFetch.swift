@@ -446,6 +446,13 @@ extension AccountManager {
                 guard connected != nil || account != nil else { continue }
                 let syncEngine = self.syncEngine
                 group.addTask {
+                    // The user opened or refreshed these folders: they are followed
+                    // from now on (#1109). Written first, before the connect and the
+                    // listings, so an open while offline, or a listing that fails,
+                    // still leaves them followed; and before the change read below,
+                    // which then reads (or first baselines) them.
+                    let accessed = accountFolders.filter { !$0.path.isEmpty }.map(\.id)
+                    await syncEngine.followFolders(accessed)
                     var provider = connected
                     if provider == nil, let account {
                         do {
@@ -458,12 +465,6 @@ extension AccountManager {
                     }
                     // Removed while connecting (or connected with no mail provider): nothing to sync.
                     guard let provider else { return }
-                    // The user opened or refreshed these folders: they are followed
-                    // from now on (#1109), written before the listings so a listing
-                    // that fails still leaves them followed, and before the change
-                    // read below, which then reads (or first baselines) them.
-                    let accessed = accountFolders.filter { !$0.path.isEmpty }.map(\.id)
-                    await syncEngine.followFolders(accessed)
                     // Pool creates connections on demand via checkout — no explicit connect needed.
                     for folder in accountFolders where !folder.path.isEmpty {
                         // Every listing goes through the one classifier (#755): an

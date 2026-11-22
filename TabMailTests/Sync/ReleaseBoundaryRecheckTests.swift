@@ -800,7 +800,8 @@ struct ReleaseBoundaryRecheckTests {
             let result = try await w.pool.write { db in
                 try SyncEngine.applyFolderChanges(FolderChanges(folderId: customId, status: .tracked, rereadLater: ids), db: db)
             }
-            #expect(try w.recheck(Self.customPath).count == SyncConfig.changeRecheckLimit, "the followed folder keeps its first ids")
+            let kept = try w.recheck(Self.customPath)
+            #expect(Set(kept) == Set(ids.prefix(SyncConfig.changeRecheckLimit)), "the followed folder keeps its first ids: \(kept.count)")
             #expect(result.armedCatchUp)
             #expect(try Self.lapseCount(w.pool, folderId: customId) == 1, "and its catch-up finds the rest")
         }
