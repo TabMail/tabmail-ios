@@ -34,8 +34,8 @@ struct FastSyncView: View {
     ///
     /// Each account's header walk done is read from the folders' `backfillComplete`
     /// (`SyncEngine.isFolderWalkComplete`), never from the progress entry, which is
-    /// not published until the launch's first folder list (#755). Missing = not
-    /// polled yet = not done (holds awake).
+    /// missing until the first update publishes it and can lag the folders.
+    /// Missing = not polled yet = not done (holds awake).
     @State private var keepAwakePoll = KeepAwakePoll()
 
     /// One poll of the keep-awake inputs. `downloadsHeld` is the download gate the

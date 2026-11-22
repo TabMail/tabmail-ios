@@ -1220,7 +1220,7 @@ heldRowsProof, arrivalRowsProof, fromServerInsertAllowed, ChangeInsertPremise, s
 
 **Context.** Item 9 of the #755 amendment published no backfill progress while `progressTotal` answered
 `.notKnownYet`. IMAP knows its total only after `fetchFolders` ran in this process, Outlook only after a full
-sync's `fetchFullSyncFolders`; the routine passes are change reads, which list no folders. So after a launch
+sync's `fetchFullSyncFolders`; the routine passes are change reads, which never adopt a folder-list total. So after a launch
 an IMAP (iCloud included) or Outlook account's Fast Sync card read "Waiting..." for a long time, also when its
 walk was complete. 1.11.4 always published progress from the database.
 
@@ -1237,7 +1237,9 @@ only a proven listing writes; an unproven count is never shown as a denominator.
 `pendingBodyCount` (PROJECT_MEMORY "Backfill / Fast Sync Completion").
 
 **Consequences.** Before a folder list the card's bar is "settled of stored", which can read near 100% while
-the walk still runs; it shows no check mark until the walk is done. No column, no migration.
+the walk still runs; it shows no check mark until the walk is done. For an account still crawling, the bar
+can drop once the provider's total arrives (IMAP switches to UIDs walked; Outlook's denominator becomes the
+folder-list sum). No column, no migration.
 
 Keywords: progressTotal, notKnownYet, updateBackfillProgressForAccount, Fast Sync Waiting, FastSyncAccountCard,
 BackfillProgress, #1273.
