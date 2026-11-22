@@ -310,9 +310,50 @@ struct ListingCountersTests {
             let folder = try Self.archive(w).folder
             _ = await w.engine.listFolder(folder, provider: w.provider, limit: 3)
             let after = try Self.archive(w)
-            #expect(after.uids.contains("7"), "a message above the listing's fetched window is not judged by it")
+            #expect(after.uids.contains("7"), "a message at or above the listing's own UIDNEXT (7) is not judged by it")
             #expect(!after.uids.contains("4"), "a message gone inside the window is removed")
             #expect(after.uids.isSuperset(of: ["1", "2", "3", "5", "6"]))
+        }
+    }
+
+    /// The window of a proven windowed listing runs from the lowest UID it
+    /// fetched to its own SELECT's UIDNEXT - 1, not to the highest UID it
+    /// fetched: the folder's newest message, deleted on the server after a
+    /// proven listing, sits above the next listing's highest fetched UID but
+    /// below its UIDNEXT (the server reports UIDNEXT as the highest UID ever
+    /// assigned + 1, RFC 3501), and must leave the device in that listing.
+    /// The device holds only the window (no lower rows), so the ADR-IOS-051
+    /// count walk never fires: only the sweep can remove it.
+    @Test("Invariant: after a proven windowed listing the device holds exactly the server's messages from the lowest fetched UID to that SELECT's UIDNEXT - 1: the folder's newest message, deleted on the server, is gone after one full sync")
+    func provenWindowHoldsExactlyTheServersMessagesUpToUidNext() async throws {
+        let limit = SyncConfig.syncMessageLimit
+        let newest = limit + 2
+        try await E.withWorld("lc-window-newest-deleted", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            // The server holds 1...newest, more than the window, so every
+            // listing is windowed; the device holds the newest `limit`
+            // (3...newest).
+            try Self.addArchive(w, serverUIDs: Array(1...newest), localUIDs: Array(3...newest))
+            let folder = try Self.archive(w).folder
+            let first = await w.engine.listFolder(folder, provider: w.provider, limit: limit)
+            if case .proven = first {} else { Issue.record("precondition: the first listing proves its window: \(first)") }
+            let listedUidNext = try Self.archive(w).folder.lastKnownUidNext
+            #expect(listedUidNext == newest + 1, "precondition: the listing stored its UIDNEXT")
+
+            // Deleted on another client: the folder's newest message.
+            w.server.setMessages(Array(1...(newest - 1)).map(IMAPChangeReaderTests.message), in: Self.archivePath)
+            let next = try await w.engine.fullSync(account: w.account, provider: w.provider)
+            #expect(next.listedFolderIds.contains(Self.archiveId(w)), "precondition: the changed count lists the folder")
+
+            let after = try Self.archive(w)
+            #expect(after.folder.lastKnownUidNext == newest + 1,
+                    "precondition: the listing's own UIDNEXT still lies above the deleted UID")
+            // The window is 2...(newest - 1) (the newest `limit` of what the
+            // server holds); UID 1 lies below it and was never held.
+            let expected = Set((2...(newest - 1)).map(String.init))
+            let extra = after.uids.subtracting(expected).sorted()
+            #expect(after.uids == expected,
+                    "exactly the server's messages from the lowest fetched UID to UIDNEXT - 1; extra rows: \(extra)")
+            #expect(!after.uids.contains(String(newest)), "the newest message deleted on the server is removed")
         }
     }
 

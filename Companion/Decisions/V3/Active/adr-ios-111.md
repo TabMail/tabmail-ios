@@ -985,6 +985,8 @@ its own SELECT.
    `ListingRouteFenceTests.sweepCoverageHasOneBuilder`. A
    message another listing stored after this listing's SELECT is never removed by it. Removals come only
    from this sweep and from the change reader's removal core; phase 2 removes only after its own walk.
+   *Amended 2026-11-22 (#1184): a windowed listing's ceiling is its UIDNEXT - 1 alone, not the highest
+   UID it fetched; see the amendment of that date below. The text above is kept as written.*
 7. **Observations are triggers only.** STATUS and the change read's observation decide whether a folder is
    listed. The full sync's MODSEQ skip (`shouldSkipFolderFetch`) needs MODSEQ, MESSAGES and UIDNEXT all equal
    to the stored listing counters and no due listing.
@@ -1021,6 +1023,36 @@ invalidateListingCounters, ListingOutcome, runListing, listingCounterColumns,
 inWindow, anyUID, unprovenListingAccounts, unprovenListingPasses, sweepCoverage, windowedSweepUIDBounds,
 windowRecordsAreConsistent, heldServerRowCount, adoptFullSyncFolderList, setReconnectsInsideCommands, ListingRouteFenceTests, syncFolderMessages, knownModSeq, NOMODSEQ, listingDueToken, oweDeepListing, answerEpoch, isCondStoreSelectRefusal, answeredInWindow, armListingDueIfHeldExceeds, folderWalkDone, listingDue, progressTotal, ProgressTotal, uidWalkProgress, folder counters one
 writer, #755, #985, #990, #997.
+
+### Amendment 2026-11-22 (#1184): the windowed sweep's ceiling is the listing's UIDNEXT - 1
+
+**Context.** The #755 amendment (item 6) bounded a windowed IMAP sweep above by the lower of the highest
+UID the listing fetched and its own UIDNEXT - 1. The highest fetched UID is below a message that was the
+folder's newest and was then deleted on the server, so that message was never judged: in an IMAP folder
+over `syncMessageLimit` (or the held-row cap) that is not tracked by QRESYNC, a message deleted on another
+client stayed on the device until newer mail arrived or the catch-up's daily check removed it.
+
+**Decision.** `SyncEngine.windowedSweepUIDBounds` judges from the lowest UID the listing fetched to the
+listing's own UIDNEXT - 1 when the listing reports a UIDNEXT, and to the highest UID it fetched only when it
+reports none; with no usable fetched UID it removes nothing, as before. The whole-folder branch already used UIDNEXT - 1 alone; both
+branches now bound by the listing's own SELECT the same way.
+
+**Why the #755 protection holds.** That bound protects a message another listing stored after this
+listing's SELECT. Every such message has a UID at or above this SELECT's UIDNEXT (RFC 3501 §2.3.1.1 and
+§6.3.1: UIDs are assigned in ascending order and UIDNEXT is the next one to be assigned), so UIDNEXT - 1
+alone keeps it out of the window. A UID between the highest fetched and UIDNEXT - 1 was assigned before the
+SELECT and is not in the listing's window, which reaches the folder's newest message; a proven listing
+returned every record that window holds, so such a UID is a message the server no longer holds. A record
+the client could not parse stays present (`unmaterialisedIds`).
+
+Tests: `ListingCountersTests.provenWindowHoldsExactlyTheServersMessagesUpToUidNext` (red with the old
+ceiling: the newest message, deleted after a proven listing, survived the next full sync);
+`StaleDetectionWindowTests.uidWindowStillDeletesGenuinelyStale` (the harness now carries the listing's
+UIDNEXT); `ListingCountersTests.overlappingWindowedListingKeepsAnArrivalAboveItsWindow` and
+`SyncEngineRunSyncTests.rowAboveOwnUidNextSurvivesBothSweepBranches` keep pinning the #755 protection.
+
+Keywords: windowedSweepUIDBounds, stale sweep ceiling, UIDNEXT - 1, highest fetched UID, deleted newest
+message, windowed listing, #1184, #755, #997.
 
 ### Amendment 2026-11-20 (#1062): the owed check is the catch-up's UID listing
 

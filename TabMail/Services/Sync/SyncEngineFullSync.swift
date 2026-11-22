@@ -1115,14 +1115,18 @@ extension SyncEngine {
     }
 
     /// The UID window a windowed IMAP sweep judges: from the lowest UID fetched
-    /// to the highest, and never at or above the listing's own UIDNEXT (a UID
-    /// allocated after its SELECT is never evidence for removal, #755). The one
-    /// source for both the candidate load and the removal decision. Nil when no
-    /// fetched record carried a usable UID: the sweep removes nothing.
+    /// to the listing's own UIDNEXT - 1. A UID at or above that UIDNEXT was
+    /// allocated after its SELECT and is never evidence for removal (#755); a UID
+    /// above the highest fetched but below UIDNEXT is a message the server no
+    /// longer holds (the window reaches the folder's newest message), so it is
+    /// judged: a deleted newest message leaves the device. The highest fetched
+    /// UID is the bound only when the listing carried no UIDNEXT. The one source
+    /// for both the candidate load and the removal decision. Nil when no fetched
+    /// record carried a usable UID: the sweep removes nothing.
     nonisolated static func windowedSweepUIDBounds(fetched: [MessageHeaderInfo], coverage: FetchCoverage) -> (floor: Int64, ceiling: Int64)? {
         let fetchedUIDs = fetched.compactMap { Int64($0.messageId) }
         guard let floorUID = fetchedUIDs.min(), let fetchedMax = fetchedUIDs.max() else { return nil }
-        let ceilingUID = coverage.counters?.uidNext.map { min(fetchedMax, Int64($0) - 1) } ?? fetchedMax
+        let ceilingUID = coverage.counters?.uidNext.map { Int64($0) - 1 } ?? fetchedMax
         guard ceilingUID >= floorUID else { return nil }
         return (floorUID, ceilingUID)
     }
@@ -1211,15 +1215,16 @@ extension SyncEngine {
             // fail-dangerous direction — while a higher floor merely defers a
             // deletion to a later pass. Fail closed.
             //
-            // The window is closed at BOTH ends: a message that arrived after the
-            // listing's FETCH (another listing may already have stored it) sits above
-            // the highest UID this listing returned, and this listing proves nothing
-            // about it. Only UIDs inside [lowest, highest] fetched are judged.
-            //
-            // And never above the listing's own SELECT: a UID at or above its
-            // UIDNEXT was allocated after that SELECT (its FETCH may still return
-            // it, e.g. flagged \Deleted, while another listing stores it live), so
-            // it is never evidence for removal (#755).
+            // The window is closed at BOTH ends: it runs from the lowest UID
+            // fetched to the listing's own UIDNEXT - 1. A UID at or above that
+            // UIDNEXT was allocated after the listing's SELECT (another listing
+            // may already have stored it; its FETCH may still return it, e.g.
+            // flagged \Deleted, while another listing stores it live), so it is
+            // never evidence for removal (#755). A UID between the highest
+            // fetched and UIDNEXT - 1 was assigned before the SELECT and the
+            // server no longer holds it (the window reaches the folder's newest
+            // message), so it is judged. The highest fetched UID is the
+            // bound only when the listing carried no UIDNEXT.
             guard let (floorUID, ceilingUID) = windowedSweepUIDBounds(fetched: fetched, coverage: coverage) else { return [] }
             return candidates.filter { row in
                 guard let uid = Int64(row.messageId) else { return false } // non-numeric id → never UID-stale
