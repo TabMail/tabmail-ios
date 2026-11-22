@@ -123,7 +123,9 @@ struct ChatRecentPeopleTests {
                 "nor the staging merge itself")
         #expect(reader.contains("return try SearchView.recentHeaders(db, folderIds: sentFolderIds, budget: scanCount)"),
                 "each Sent folder's newest on its own index, then the newest of those")
-        #expect(!reader.contains("write") && !reader.contains("UserDefaults") && !reader.contains("insert"), "nothing is stored")
+        // Database writes and saves by name: the word "insert" alone also matches the Set the reader dedupes with.
+        let stores = ["write", "UserDefaults", ".insert(db", ".save(db", ".update(db", ".upsert(db"].filter { reader.contains($0) }
+        #expect(stores.isEmpty, "nothing is stored: \(stores)")
     }
 
     private static func source(_ path: String) throws -> String {
@@ -325,7 +327,9 @@ struct ChatRecentPeopleHostedTests {
                 "Recent shows Sam and Jordan, not Maria, who is picked: \(recent)")
         #expect(recent.first?.contains("sam@example.com") == true, "a row shows the address under the name: \(recent)")
         #expect(ChatReplyToSheet.recentTitle == "Recent")
-        #expect(HostedAccessibility.labels(in: window).contains("Recent"), "the section is titled Recent")
+        // A grouped list may show a section heading upper-case, so the heading is matched ignoring case.
+        let titled = HostedAccessibility.labels(in: window).contains { $0.caseInsensitiveCompare("Recent") == .orderedSame }
+        #expect(titled, "the section is titled Recent")
 
         let samRecent = Self.elements(ChatReplyToSheet.recentId, in: window).first { ($0.accessibilityLabel ?? "").contains("Sam Patel") }
         let sam = try #require(samRecent)
@@ -415,9 +419,9 @@ struct ChatRecentPeopleHostedTests {
             try? await Task.sleep(for: .milliseconds(100))
             let addresses = recent.map(\.address)
             let recentRows = Self.elements(ChatReplyToSheet.recentId, in: window)
-            let labels = HostedAccessibility.labels(in: window)
+            let titled = HostedAccessibility.labels(in: window).contains { $0.caseInsensitiveCompare("Recent") == .orderedSame }
             #expect(recentRows.isEmpty, "\(addresses)")
-            #expect(!labels.contains("Recent"), "\(addresses)")
+            #expect(!titled, "\(addresses)")
         }
     }
 
