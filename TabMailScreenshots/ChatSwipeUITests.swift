@@ -620,6 +620,11 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertFalse(app.buttons["chatClose"].exists, "control: the panel is shut")
         textScroll(long, by: -Self.pastTheTextsEnd, in: app)
         XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag past the text's end opened the panel")
+        let opened = try XCTUnwrap(dragMarker(afterDrags: 1, in: app), "control: the field's pan saw the drag")
+        let watched = dragMarkerLabel(afterDrags: 1, in: app)
+        let downBuilds = try XCTUnwrap(opened.downBuilds, "control: the marker counted the field's builds while the finger was down (marker: \(watched))")
+        XCTAssertLessThanOrEqual(downBuilds, Self.dragStartBuildAllowance,
+                                 "the swell growing under the finger did not rebuild the field's editor: \(downBuilds) builds while it was down (marker: \(watched))")
         XCTAssertFalse(app.staticTexts[Self.signInBarText].exists, "control: signed in, the panel has its editor, not the sign-in bar")
         let panelTop = try XCTUnwrap(settledDragMarker(in: app)?.fieldTop, "control: the marker shows the open panel")
         let editor = typedField(containing: Self.overflowingLastLine, in: app)
@@ -682,9 +687,11 @@ final class ChatSwipeUITests: XCTestCase {
 
     /// The text's scroll room (three lines, about 60 points) plus well past the open distance.
     private static let pastTheTextsEnd: CGFloat = 220
-    /// The editor builds a drag may cause while its finger is down: one each as the drag starts and
-    /// as the field's freeze begins. A build per movement of the finger (the drag's state read in the
-    /// chat's body) gives one for each of the drag's many moves.
+    /// Slack for editor builds while a drag's finger is down that do not come from its movement:
+    /// the chat's body may run as the drag starts (its freeze and tip state), building the reply
+    /// field again. A build per movement (the drag's state read where the editor is built) gives one
+    /// for each of the drag's moves past the text's end, far more than this on the long drag that
+    /// opens the panel.
     private static let dragStartBuildAllowance = 2
     /// Past the open distance in all, yet past the nine-line draft's end (its scroll room, more
     /// than `withinTheScrollRoom`) by less than the open distance.

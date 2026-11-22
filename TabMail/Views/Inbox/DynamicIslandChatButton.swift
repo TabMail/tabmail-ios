@@ -886,7 +886,8 @@ struct DynamicIslandChat: View {
             .lineLimit(1...6)
             .focused($isTextFieldFocused)
             .modifier(ReplyFieldFocusMarker(focused: isTextFieldFocused))
-            // Debug UI tests only: counts this field being built after a drag's let-go.
+            // Debug UI tests only: counts this field being built while a drag's finger is down
+            // and after its let-go.
             .modifier(ChatFieldDragMarker.InputFieldBuilt())
             .frame(minHeight: dictation.isActive ? DictationConfig.meterMaxBarHeight : nil)
             .opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)

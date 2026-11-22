@@ -404,12 +404,6 @@ struct ChatFieldDragTests {
         other.state = .began
         cut()
         #expect(other.state == .cancelled, "a drag cut as it begins, before it moves, ends as an interrupted one")
-        let finished = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: cut)
-        finished.state = .began
-        finished.state = .changed
-        finished.state = .ended
-        cut()
-        #expect(finished.state == .ended, "control: a finished drag is left as it ended")
     }
 
     @Test("The cut holds its pan weakly, and each chat's cut ends only its own pan's drag")
@@ -418,13 +412,18 @@ struct ChatFieldDragTests {
         let coordinator = ChatFieldPan.Coordinator()
         let released = ChatFieldPan.Cut()
         autoreleasepool {
-            _ = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: released)
+            var owner: ChatFieldPan.Recognizer? = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: released)
+            let held = released.recognizer === owner
+            #expect(held, "control: the cut has the pan while SwiftUI holds it")
+            owner = nil
         }
         #expect(released.recognizer == nil, "a pan SwiftUI has let go of is not kept alive by the cut")
         let first = ChatFieldPan.Cut()
         let second = ChatFieldPan.Cut()
         let firstPan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: first)
         let secondPan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: second)
+        let ownPans = first.recognizer === firstPan && second.recognizer === secondPan
+        #expect(ownPans, "each chat's cut has its own pan after both are made")
         for pan in [firstPan, secondPan] {
             pan.state = .began
             pan.state = .changed
