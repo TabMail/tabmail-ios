@@ -839,6 +839,18 @@ struct ChatReplyFieldTests {
         request.composeView(account: accounts.first, onOutcome: { _ in })
     }
 
+    @Test("The one presenter opens the agent's new email from the account the host gives it, the bound From account")
+    func presenterOpensANewEmailFromTheAccountGiven() {
+        let second = Account(emailAddress: "second@example.com", displayName: "Second", provider: .gmail)
+        let request = AgentToolRouter.ComposeRequest(
+            mode: .compose, replyTo: nil, to: ["david@example.com"], cc: [], bcc: [], subject: "Friday",
+            body: "Friday works", origin: ComposeOrigin(sessionKey: "chat", screen: .chat, fromAccountId: second.id))
+        let bound = request.composeView(account: second, onOutcome: { _ in })
+        #expect(bound.account?.id == second.id, "the card sends from the account given, never the primary")
+        let control = request.composeView(account: Self.me, onOutcome: { _ in })
+        #expect(control.account?.id == Self.me.id && Self.me.id != second.id, "control: another account given, another From")
+    }
+
     /// Where the agent's reply was asked for: the open sheet, or the reply field with who was
     /// chosen in Reply to as it was sent (nil: nobody, Reply All).
     enum Origin {
@@ -1180,7 +1192,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("isReplyAll", in: chat) == 0,
                 "no card decides the kind or the Reply All recipients itself")
         // A card from a field request: the agent's closing words open nothing; a field send starts afresh.
-        #expect(Self.count("fieldComposeOpened = req.fieldReply != nil", in: chat) == 1)
+        #expect(Self.count("fieldComposeOpened = req.isFieldsOwnReply", in: chat) == 1,
+                "the chat reads the reply tool's one decision of the field's own reply (FieldReplyCardWordsTests)")
         #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false }, onAgentCompose: openAgentCompose, composeFromAccountId: viewModel.message?.accountId, composeHostCovered: isAnyPresentation)", in: chat) == 1,
                 "the chat's pill binds the email's account as a new message's From and takes nothing while the chat is covered")
         // A new message's card opens from the account bound when the turn started.
@@ -1188,7 +1201,7 @@ struct ChatReplyFieldTests {
         // The card and fieldComposeOpened are set only for a request this chat's own pill took
         // (ADR-IOS-053 Phase 2; ChatComposeRoutingTests runs it with the inbox and the email screen mounted).
         #expect(Self.count("private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {", in: chat) == 1)
-        #expect(Self.count("guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } fieldComposeOpened = req.fieldReply != nil agentCompose = req }", in: chat) == 1,
+        #expect(Self.count("guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } fieldComposeOpened = req.isFieldsOwnReply agentCompose = req }", in: chat) == 1,
                 "a new email's bound account is looked up as the card is taken, before anything is set")
         #expect(Self.count("private func agentAnswered() { guard !fieldComposeOpened else { return }", in: chat) == 1)
         #expect(Self.count("fieldComposeOpened = true", in: chat) == 0)
@@ -1245,10 +1258,11 @@ struct ChatReplyFieldTests {
         #expect(Self.count("guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } agentCompose = req", in: detailActions) == 1)
         #expect(Self.count("navigationStore.accounts.first { $0.id == req.fromAccountId }", in: detailActions) == 1)
         #expect(Self.count("pendingResume = .init( request: resumable.resumeRequest, fieldReply: resume.fieldReply, origin: resume.origin, fieldWordsKey: resume.fieldWordsKey)", in: island) == 1)
-        #expect(Self.count("lastFailedSend = .init(text: text, field: field)", in: island) == 1)
-        #expect(Self.count("sendAgentChat(failed.text, field: failed.field)", in: island) == 1)
-        // Re-send of the last turn sends it as it was sent: the bubble keeps the field's send and
-        // the menu passes it on (ChatComposeRoutingTests checks the bubble keeps it).
+        #expect(Self.count("lastFailedSend = .init(text: text, field: field, ownsFieldWords: fieldWordsKey != nil)", in: island) == 1)
+        #expect(Self.count("sendAgentChat(failed.text, field: failed.field, ownsFieldWords: failed.ownsFieldWords)", in: island) == 1)
+        // Re-send of the last turn sends it with its email and choice: the bubble keeps the field's
+        // send and the menu passes it on (ChatComposeRoutingTests checks the bubble keeps it); it owns
+        // none of the field's words (ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField).
         #expect(Self.count("chatMessages.append(ChatMessage(role: .user, content: text, timestamp: Date(), fieldSend: field))", in: island) == 1)
         #expect(Self.count("resendLastUserMessage(text: msg.content, field: msg.fieldSend, afterIndex: index)", in: island) == 1)
         // Rewind trims the later turns and sends the chosen turn again as a fresh turn, which names
@@ -1256,7 +1270,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("rewindToMessage(text: msg.content, atIndex: index)", in: island) >= 1, "the menu's Rewind reaches the rewind")
         #expect(Self.count("private func rewindToMessage(text: String, atIndex index: Int) { trimForRewind(atIndex: index) lastFailedSend = nil sendAgentChat(text) }", in: island) == 1,
                 "Rewind sends the turn again through the send that names the screen")
-        #expect(Self.count("trimForResendLast(atIndex: index) lastFailedSend = nil sendAgentChat(text, field: field)", in: island) == 1)
+        #expect(Self.count("trimForResendLast(atIndex: index) lastFailedSend = nil sendAgentChat(text, field: field, ownsFieldWords: false)", in: island) == 1)
         #expect(Self.count("replyField?.onlyTo", in: island) == 0 && Self.count("replyField?.isNoReply", in: island) == 0,
                 "no send reads the field's choice later")
     }

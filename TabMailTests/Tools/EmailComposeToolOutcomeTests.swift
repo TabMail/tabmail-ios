@@ -77,12 +77,18 @@ struct EmailComposeToolOutcomeTests {
                 "request": .string("ask Pat about Friday"),
             ], invocation: ComposeTestOrigin.invocation)
         }
-        let card = await waitForPendingCompose(on: router)
-        card?.onOutcome(.cancelled)
+        guard let opened = await waitForPendingCompose(on: router) else {
+            // A missed take ends the tool, so the test fails here instead of waiting for a card no
+            // host takes.
+            task.cancel()
+            _ = try? await task.value
+            Issue.record("the card opens")
+            return
+        }
+        opened.onOutcome(.cancelled)
         _ = try await task.value
 
         #expect(modes.withLock { $0 } == ["edit_new"], "the model is asked once, for a new email")
-        let opened = try #require(card, "the card opens")
         #expect(opened.mode == .compose && opened.to == ["pat@example.com"])
         if editSucceeds {
             #expect(opened.subject == "Friday" && opened.body == body, "the card holds the model's draft")

@@ -370,25 +370,32 @@ struct ChatReplyFieldRuntimeTests {
         return String(rest[..<(rest.range(of: "private func ")?.lowerBound ?? rest.endIndex)])
     }
 
-    @Test("The sheet's re-sends never send with what the field holds: Rewind sends with no field, Re-send with its own turn's field send")
+    @Test("The sheet's re-sends own none of the field's words: Rewind sends with no field, Re-send with its turn's field send and no words key")
     func sheetResendsSendWithNoField() throws {
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         let rewind = try Self.function("private func rewindToMessage(", in: island)
         #expect(rewind.contains("sendAgentChat(text)") && !rewind.contains("field:"), "Rewind sends with no field: \(rewind)")
-        // Re-send of the last turn sends it as it was sent, as Retry does: with the field send its
-        // bubble recorded (the menu passes `msg.fieldSend`), so only that send's words can complete,
-        // and only while they are still the unedited words of an open send (`ChatFieldFill.clears`).
+        // Re-send of the last turn carries the field send its bubble recorded (the menu passes
+        // `msg.fieldSend`): its email and who was chosen in Reply to. The turn was answered, so its
+        // own send is complete, and words open in the field by then belong to a newer send: the
+        // re-send owns none, so its answer, cards and sent compose leave them alone.
         let resend = try Self.function("private func resendLastUserMessage(", in: island)
-        #expect(resend.contains("sendAgentChat(text, field: field)") && !resend.contains("replyField"),
-                "Re-send sends with its turn's own field send: \(resend)")
-        // A send names the field's words only from the send's own field, never from what the field
-        // holds: the re-sends are reached only through a bubble's context menu, which takes no
-        // activation in a hosted test, so the one place a send's field key is decided is fenced.
+        #expect(resend.contains("sendAgentChat(text, field: field, ownsFieldWords: false)") && !resend.contains("replyField"),
+                "Re-send sends with its turn's own field send and owns no words: \(resend)")
+        // A send names the field's words only from the send's own field, and only when it owns them,
+        // never from what the field holds: the re-sends are reached only through a bubble's context
+        // menu, which takes no activation in a hosted test, so the one place a send's field key is
+        // decided is fenced.
         let send = try Self.function("func sendAgentChat(", in: island)
         #expect(send.components(separatedBy: "fieldWordsKey = ").count == 2
-                    && send.contains("let fieldWordsKey = field.map { ChatFieldWords.key(for: $0.message) }"),
-                "a send's field key comes from its field alone")
+                    && send.contains("let fieldWordsKey = ownsFieldWords ? field.map { ChatFieldWords.key(for: $0.message) } : nil"),
+                "a send's field key comes from its field alone, and only for the field's own send")
         #expect(!send.contains("holdsSentWords"), "what the field holds never names a send's field key")
+        // A failed re-send's Retry keeps the rule: the failure records whether the send owned words.
+        #expect(send.contains("lastFailedSend = .init(text: text, field: field, ownsFieldWords: fieldWordsKey != nil)"),
+                "a failed send records whether it owned the field's words")
+        #expect(island.contains("sendAgentChat(failed.text, field: failed.field, ownsFieldWords: failed.ownsFieldWords)"),
+                "Retry sends with the failed send's own ownership")
     }
 
     @Test("A sent compose card and an agent answer from the field complete on the request's own chat key, never the view's")

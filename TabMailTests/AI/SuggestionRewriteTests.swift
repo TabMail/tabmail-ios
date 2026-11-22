@@ -328,7 +328,26 @@ struct SuggestionRewriteRouteTests {
         #expect(card.body == Self.editedBody && card.subject == "Re: Offsite")
         #expect(try await row(fixture.db, fixture.header.id).suggestion == Self.shownReply)
         card.onOutcome(.cancelled)
-        #expect(try await task.value.contains("Opened the reply card"))
+        #expect(try await task.value.contains("goes to the reply card"))
+    }
+
+    /// The card's outcome is the agent's only word on it: a card refused before any screen showed
+    /// it (its account removed while it waited, `AgentToolRouter.endComposeRequestsOfRemovedAccounts`)
+    /// is reported as that refusal, never as a card that opened.
+    @Test("A reply card refused before it shows is reported as refused, never as opened")
+    func refusedCardIsNotReportedOpened() async throws {
+        let fixture = try await fixture()
+        let email = try await row(fixture.db, fixture.header.id)
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: email, accounts: [])
+        let refusal = ComposeOutcome.failed("the account was removed").describeForLLM
+        let output = await EmailReplyTool.finishSuggestionEdit(
+            Self.edit(subject: "Re: New plan"), shown: Self.shownReply, start: envelope, suggestionEnvelope: envelope,
+            email: email, rewritesInPlace: true, store: Self.store(fixture.db),
+            openCard: { @Sendable _, _ in refusal })
+        #expect(output.hasSuffix(refusal), "the card's own outcome is what the agent reads: \(output)")
+        #expect(!output.localizedCaseInsensitiveContains("opened"), "nothing claims the card opened: \(output)")
+        let stored = try await row(fixture.db, fixture.header.id).suggestion
+        #expect(stored == Self.shownReply, "control: the stored suggestion is unchanged")
     }
 
     /// What the card for one edit beyond the suggestion holds.
@@ -387,7 +406,7 @@ struct SuggestionRewriteRouteTests {
             keys.append(key)
             #expect(try await row(fixture.db, fixture.header.id).suggestion == Self.shownReply)
             card.onOutcome(.cancelled)
-            #expect(try await task.value.contains("Opened the reply card"), "the outcome says which path ran")
+            #expect(try await task.value.contains("goes to the reply card"), "the outcome says which path ran")
             // No compose view appears in this test, so the router is cleared for the next card.
             fixture.router.resetComposeQueueForTesting()
         }
@@ -1406,6 +1425,12 @@ struct FieldReplyCardWordsTests {
         let request = try #require(opened, "control: the reply card opened")
         let onOwnDraft = request.draftId != nil
         #expect(onOwnDraft == (card == .suggestionEdit), "control: only the suggestion edit's card opens on a draft of its own")
+        // One decision of the field's own reply, on the request: the chat that opens the card reads it
+        // too, so after the field's own card (any copy, any account) its closing answer opens nothing.
+        #expect(request.isFieldsOwnReply == card.isFieldsOwn, "the request carries whether it is the field's own reply")
+        if card == .otherAccountCopy {
+            #expect(request.fieldReply == nil, "control: the field's audience does not apply in another account")
+        }
         let composing = store.fill(for: key).composing
         #expect(composing == card.isFieldsOwn, "only the field's own reply card owns the send: \(store.fill(for: key))")
         request.onOutcome(.cancelled)

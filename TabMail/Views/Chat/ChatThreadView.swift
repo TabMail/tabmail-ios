@@ -939,14 +939,15 @@ struct ChatThreadView: View {
     }
 
     /// A compose card this chat's agent asked for, taken by this chat's pill (ADR-IOS-053 Phase 2),
-    /// never one another screen asked for. Asked for in the reply field: the agent's closing words
-    /// open nothing. Who the card goes to travels with the request (`fieldReply`); this chat's own
-    /// state decides nothing.
+    /// never one another screen asked for. The reply the reply field asked for
+    /// (`ComposeRequest.isFieldsOwnReply`, any copy of its email, in any account): the agent's
+    /// closing words open nothing. Who the card goes to travels with the request (`fieldReply`);
+    /// this chat's own state decides nothing.
     private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
         // A new email opens from the account bound when its turn started, looked up in the app's
         // accounts as the card is taken; when it is not there the request ends and nothing opens.
         guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return }
-        fieldComposeOpened = req.fieldReply != nil
+        fieldComposeOpened = req.isFieldsOwnReply
         agentCompose = req
     }
 

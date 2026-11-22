@@ -347,6 +347,11 @@ final class AgentToolRouter {
         /// user chose in Reply to when the request was sent (ADR-IOS-114 decision 11). Nil for
         /// every other request, whose compose keeps the recipients above.
         let fieldReply: ChatFieldReply?
+        /// The card is the reply the chat's reply field asked for (`ChatFieldReply.isOwnReply`): the
+        /// email the field showed, any copy, in any account, whoever it goes to. Decided once by the
+        /// reply tool; the field's words (`AgentToolRouter.enqueueComposeAndAwaitOutcome`) and the
+        /// chat that opens the card (its closing answer opens nothing) both read it.
+        let isFieldsOwnReply: Bool
         /// The draft the card saves to; nil, the reply's usual one. An edit of the AI Suggestion
         /// opens on the suggestion's own draft (`Draft.separateReplyKey`), as the ghost's card does.
         let draftId: String?
@@ -374,6 +379,7 @@ final class AgentToolRouter {
             suggestion: ReplyResult? = nil,
             isReplyAll: Bool = false,
             fieldReply: ChatFieldReply? = nil,
+            isFieldsOwnReply: Bool = false,
             draftId: String? = nil,
             onOutcome: @escaping @MainActor (ComposeOutcome) -> Void = { _ in },
             outcomeState: ComposeOutcomeState = ComposeOutcomeState()
@@ -389,6 +395,7 @@ final class AgentToolRouter {
             self.suggestion = suggestion
             self.isReplyAll = isReplyAll
             self.fieldReply = fieldReply
+            self.isFieldsOwnReply = isFieldsOwnReply
             self.draftId = draftId
             self.onOutcome = onOutcome
             self.outcomeState = outcomeState
@@ -697,18 +704,16 @@ extension AgentToolRouter {
     /// recipients and body in memory until some later take.
     ///
     /// `fieldWordsKey`: the request was sent from the chat's reply field under this chat key
-    /// (`ToolInvocation.fieldWordsKey`). The field's own reply card (`isFieldsOwnReply`,
+    /// (`ToolInvocation.fieldWordsKey`). The field's own reply card (`ComposeRequest.isFieldsOwnReply`,
     /// `ChatFieldReply.isOwnReply`, decided apart from who it goes to) marks the field composing
     /// there, and a sent card completes the field's send there, in `ChatFieldWords`, whether or not
     /// a chat view still shows it (ADR-IOS-117).
     func enqueueComposeAndAwaitOutcome(
         fieldWordsKey: String? = nil,
-        isFieldsOwnReply: Bool = false,
         make: (@escaping @MainActor (ComposeOutcome) -> Void, ComposeOutcomeState) -> ComposeRequest
     ) async -> ComposeOutcome {
         let state = ComposeOutcomeState()
-        let outcome = await awaitComposeOutcome(
-            state: state, fieldWordsKey: fieldWordsKey, isFieldsOwnReply: isFieldsOwnReply, make: make)
+        let outcome = await awaitComposeOutcome(state: state, fieldWordsKey: fieldWordsKey, make: make)
         composeQueue.removeAll { $0.outcomeState === state }
         return outcome
     }
@@ -716,7 +721,6 @@ extension AgentToolRouter {
     private func awaitComposeOutcome(
         state: ComposeOutcomeState,
         fieldWordsKey: String?,
-        isFieldsOwnReply: Bool,
         make: (@escaping @MainActor (ComposeOutcome) -> Void, ComposeOutcomeState) -> ComposeRequest
     ) async -> ComposeOutcome {
         let guard_ = ComposeContinuationGuard()
@@ -749,7 +753,7 @@ extension AgentToolRouter {
                     }
                     guard_.resume(returning: outcome)
                 }, state)
-                if let fieldWordsKey, isFieldsOwnReply {
+                if let fieldWordsKey, request.isFieldsOwnReply {
                     ChatFieldWords.shared.apply(.composeOpened, to: fieldWordsKey)
                 }
                 enqueueCompose(request)

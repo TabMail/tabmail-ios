@@ -243,7 +243,8 @@ struct EmailForwardToolBodyReadTests {
                                arguments: [Date(), folderId])
             }
         }
-        let header = try #require(try await db.read { try MessageHeader.fetchOne($0, key: id) })
+        let fetched = try await db.read { try MessageHeader.fetchOne($0, key: id) }
+        let header = try #require(fetched)
         let translator = MockChatIdTranslator()
         await translator.seed(header.id, as: 1)
         let router = AgentToolRouter()
@@ -271,6 +272,14 @@ struct EmailForwardToolBodyReadTests {
             if card == nil { try await Task.sleep(for: .milliseconds(10)) }
         }
         card?.onOutcome(.cancelled)
+        if card == nil, !resetPending {
+            // The control's card was not taken: end the tool, so the test fails here instead of
+            // waiting for a card no host takes. The reset case is refused before any card.
+            task.cancel()
+            _ = try? await task.value
+            Issue.record("control: the forward card opens")
+            return
+        }
         let output = try await task.value
 
         if resetPending {

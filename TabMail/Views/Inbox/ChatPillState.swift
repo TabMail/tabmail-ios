@@ -115,6 +115,9 @@ final class ChatPillState {
         struct FailedSend {
             let text: String
             let field: ChatFieldSend?
+            /// The failed send owned the field's words (`sendAgentChat`'s `ownsFieldWords`), so its
+            /// Retry does; a sheet Re-send's never did.
+            var ownsFieldWords = true
         }
 
         /// The cut-off turn's request and, when the reply field sent it, the field's request as it

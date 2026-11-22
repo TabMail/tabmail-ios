@@ -1024,7 +1024,7 @@ struct DynamicIslandChat: View {
                 } else if let failed = session.takeFailedSendForRetry() {
                     // The failed send leaves the chat, then is sent again (matches TB retry),
                     // as it was sent: from the field with its email and choice, or from the panel.
-                    sendAgentChat(failed.text, field: failed.field)
+                    sendAgentChat(failed.text, field: failed.field, ownsFieldWords: failed.ownsFieldWords)
                 }
             } label: {
                 Image(systemName: "arrow.clockwise.circle.fill")
@@ -2437,7 +2437,13 @@ struct DynamicIslandChat: View {
     /// `script`: a guided-tutorial prompt, answered by `TutorialChatScript`
     /// on the device instead of the AI.
     /// `field`: the reply field's send as it started; nil for a send from the panel.
-    func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil, field: ChatFieldSend? = nil) {
+    /// `ownsFieldWords`: the send is the field's open send, so its card, answer and sent compose
+    /// complete the field's words (`fieldWordsKey`). A sheet Re-send of an answered turn carries the
+    /// turn's `field` (its email and Reply to choice) but owns no words: its own send completed when
+    /// it was answered, and words open by then belong to a newer send.
+    func sendAgentChat(
+        _ text: String, script: TutorialCoordinator.ChatPrompt? = nil, field: ChatFieldSend? = nil, ownsFieldWords: Bool = true
+    ) {
         // If on the "new session" page in multi-session mode, start a fresh session
         if hasSessionHistory, activeSessionIndex < loadedSessions.count,
            loadedSessions[activeSessionIndex].id == "__new__" {
@@ -2549,7 +2555,7 @@ struct DynamicIslandChat: View {
         // chat key its words were sent under, where its card, answer and sent compose land
         // (ADR-IOS-117), whichever chat this pill shows by then, and whether or not it still exists.
         let fieldReply = field?.fieldReply
-        let fieldWordsKey = field.map { ChatFieldWords.key(for: $0.message) }
+        let fieldWordsKey = ownsFieldWords ? field.map { ChatFieldWords.key(for: $0.message) } : nil
         // The screen whose chat asked, where a compose card the turn asks for opens.
         let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)
 
@@ -2766,7 +2772,7 @@ struct DynamicIslandChat: View {
                 } else {
                     // Connection/server error — enable retry
                     BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: text)
-                    lastFailedSend = .init(text: text, field: field)
+                    lastFailedSend = .init(text: text, field: field, ownsFieldWords: fieldWordsKey != nil)
                     chatMessages.append(ChatMessage(
                         role: .agent,
                         content: "Couldn't connect. (\(error.localizedDescription))",
@@ -2968,12 +2974,13 @@ struct DynamicIslandChat: View {
     }
 
     /// Re-send the last user message (same session). Removes the agent response/error below it.
-    /// Sent from the reply field, it is sent again as it was sent (`field`, read from its bubble
-    /// before the trim), with its email and who the user chose in Reply to, as Retry does.
+    /// Sent from the reply field, it is sent again with its email and who the user chose in Reply
+    /// to (`field`, read from its bubble before the trim), as Retry does, but it owns none of the
+    /// field's words (`ownsFieldWords`): the turn was answered, so its send is complete.
     private func resendLastUserMessage(text: String, field: ChatFieldSend?, afterIndex index: Int) {
         trimForResendLast(atIndex: index)
         lastFailedSend = nil
-        sendAgentChat(text, field: field)
+        sendAgentChat(text, field: field, ownsFieldWords: false)
     }
 
     /// Rewind chat to an earlier user message (message-detail context).

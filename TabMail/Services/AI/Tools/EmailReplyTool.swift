@@ -265,7 +265,8 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// the task. `fieldReply` is the field's request as it applies to this reply (its audience
     /// only in the same account); whether the card is the field's own reply is read from the
     /// whole request (`invocation`), any copy of the email in any account
-    /// (`ChatFieldReply.isOwnReply`). `origin`: the chat that asked, where the card opens.
+    /// (`ChatFieldReply.isOwnReply`), once, onto the request (`ComposeRequest.isFieldsOwnReply`).
+    /// `origin`: the chat that asked, where the card opens.
     private func openReplyCard(
         header: MessageHeader, envelope: ChatReplyCompose, body: String?, suggestion: ReplyResult? = nil,
         fieldReply: ChatFieldReply?, draftId: String?, origin: ComposeOrigin, invocation: ToolInvocation
@@ -290,9 +291,7 @@ struct EmailReplyTool: AgentTool, Sendable {
         // the MainActor-isolated ComposeView callback resumes this tool's
         // continuation.
         let isFieldsOwnReply = invocation.fieldReply?.isOwnReply(to: header) == true
-        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome(
-            fieldWordsKey: invocation.fieldWordsKey, isFieldsOwnReply: isFieldsOwnReply
-        ) { onOutcome, state in
+        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome(fieldWordsKey: invocation.fieldWordsKey) { onOutcome, state in
             AgentToolRouter.ComposeRequest(
                 mode: .reply,
                 replyTo: header,
@@ -307,6 +306,7 @@ struct EmailReplyTool: AgentTool, Sendable {
                 // records reply-all on the original (#915).
                 isReplyAll: envelope.isReplyAll,
                 fieldReply: fieldReply,
+                isFieldsOwnReply: isFieldsOwnReply,
                 draftId: draftId,
                 onOutcome: onOutcome,
                 outcomeState: state
@@ -349,7 +349,8 @@ struct EmailReplyTool: AgentTool, Sendable {
             let why = staysTheSuggestion ? ""
                 : "the edited email has another subject or other recipients, which the AI Suggestion cannot hold; "
             let outcome = await openCard(suggestionEnvelope.with(recipients: recipients, subject: subject), body)
-            return "Opened the reply card with the edited email (\(why)the AI Suggestion is unchanged). Outcome: \(outcome)"
+            return "The edited email goes to the reply card, not the AI Suggestion (\(why)the AI Suggestion is unchanged). "
+                + "The reply card's outcome: \(outcome)"
         }
         let edit = ReplyResult(body: body, textMessage: textMessage, changeCommand: result.changeCommand)
         guard await store(edit, shown, email) == .written else {

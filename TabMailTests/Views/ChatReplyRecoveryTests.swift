@@ -959,8 +959,10 @@ struct ChatReplyRecoveryTests {
         }
     }
 
-    /// The sheet's "Re-send message" and "Rewind and re-send" send with no field and leave the
-    /// field's sent words in place; when that request is cut off, its recovery carries no field key
+    /// The sheet's "Re-send message" and "Rewind and re-send" own none of the field's words (Rewind
+    /// sends with no field; Re-send carries its turn's email and Reply to choice but no words key,
+    /// `ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField`), so they leave the field's sent words
+    /// in place; when that request is cut off, its recovery carries no field key
     /// (`cutOffRecoveryNamesTheFieldOnlyForItsOwnRequest`). The re-sends are reached only through a
     /// bubble's long-press menu, so this test gives the field each recovery and checks its rule.
     @Test("The field's unchanged sent words offer Send, not Retry, when the cut-off request is not the field's own",
@@ -985,7 +987,8 @@ struct ChatReplyRecoveryTests {
                 session.lastFailedSend = nil
                 if session.pendingResume == nil {
                     session.pendingResume = .init(
-                        request: CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil), fieldReply: nil)
+                        request: CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil), fieldReply: nil,
+                        origin: nil)
                 }
                 session.pendingResume?.fieldWordsKey = nil
                 try await Self.waitUntil {
