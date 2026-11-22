@@ -1608,10 +1608,15 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        a request while a compose or a draft is up anywhere (ADR-IOS-030's presentation count, which
        every `ComposeView` and `DraftComposePresenter` keeps, read as `AgentToolRouter.isComposeUp`)
        or while a preview is up (`PreviewFreezeGate`); one check, `ChatNewEmailCover.composeOrPreviewIsUp`,
-       in all three screens (review ruling 2026-11-22). Popovers and sheets a screen's own parts show
-       are not counted (the AI summaries notice and its report sheet, menus, alerts): a request from
-       outside the app while one is up is taken by the screen under it, and UIKit may refuse its
-       cover; that screen then takes no other request until it is left (ios#1259, P4).
+       in all three screens (review ruling 2026-11-22). A preview counts from the moment its
+       attachment starts downloading, so a request that comes during a slow download is not taken
+       either. Popovers and sheets a screen's own parts show are not counted (the AI summaries
+       notice and its report sheet, menus, alerts, a chat's email card, the attached-email sheet):
+       a request from outside the app while one is up is taken by the screen under it, and UIKit
+       may refuse its cover; that screen then takes no other request until it is left. The same
+       holds for an email an email pill pushes beneath a chat's email card, whose screen and the
+       chat may then both take one (ios#1259, P4). An agent's compose released as a cover closes
+       goes to whichever screen observes it first (ADR-IOS-030's one global slot, ios#1172).
      - *The agent's compose waits for it.* The new email's chat cover keeps ADR-IOS-030's
        presentation count while it is up, as `DraftComposePresenter` does for a draft's chat, so an
        agent's compose finished meanwhile is queued and comes up once the cover closes, instead of
@@ -1647,8 +1652,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    row and the opens from Drafts, and since 2026-11-22 a link's chat saving on background only once
    changed), `ChatNewEmailRequestTests` (every new email: the route, what a link brings and its
    draft, the primary account, the source wiring) and `ChatNewEmailRequestHostedTests` (each screen
-   hosted taking a contact pill's or a link's request, or not, and the agent's compose waiting for
-   the cover), `ComposeDraftSaveTests` (the shared writer
+   hosted taking a contact pill's or a link's request, or not, compose filled through the email
+   screen when the request goes to compose, and the agent's compose waiting for the cover),
+   `ComposeDraftSaveTests` (the shared writer
    against a real database), `DraftAttachmentImportTests`.
 
 ## The longer index line (routed 2026-11-09)

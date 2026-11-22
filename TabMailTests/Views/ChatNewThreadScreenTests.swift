@@ -190,24 +190,24 @@ struct ChatNewThreadScreenTests {
         let recorder = QueueRecorder()
         let link = MailtoRequest(
             to: ["Maria Lee <maria@example.com>"], cc: ["Sam Park <sam@example.com>"], bcc: ["alex@example.com"],
-            subject: "Lunch on Friday", body: "Are you free at noon?")
+            subject: "Lunch on Friday", body: "Are you free at noon?\nOr later this week?")
         let model = ChatNewThreadModel(account: fixture.account, request: link, queueDraftSave: { recorder.queue($0, $1) })
         let draftId = model.draftId
         try await withScreen(model) { screen in
-            #expect(Self.fieldText(in: screen.view) == "Are you free at noon?", "control: the field starts with the link's body")
+            #expect(Self.fieldText(in: screen.view) == "Are you free at noon?\nOr later this week?", "the field starts with the link's whole body")
             screen.stage.phase = .background
             try await Self.settle()
             let untouched = try await rowCount(fixture)
             #expect(untouched == 0, "unchanged since the link, the background saves nothing")
             #expect(recorder.calls.isEmpty, "and queues nothing")
             screen.stage.phase = .active
-            #expect(ThreadChatTests.type("Are you free at one?", in: screen.view), "control: the field takes words")
-            try await Self.waitUntil { model.words == "Are you free at one?" }
+            #expect(ThreadChatTests.type("Are you free at one?\nOr later this week?", in: screen.view), "control: the field takes words")
+            try await Self.waitUntil { model.words == "Are you free at one?\nOr later this week?" }
             screen.stage.phase = .background
             try await Self.waitUntil { recorder.calls.count == 1 }
             let savedRow = try await row(fixture, draftId)
             let saved = try #require(savedRow, "the background saved the change")
-            #expect(saved.body == "Are you free at one?")
+            #expect(saved.body == "Are you free at one?\nOr later this week?", "the whole body")
             #expect(saved.toArray.count == 1 && saved.toArray.first?.contains("maria@example.com") == true, "To is the link's person: \(saved.toArray)")
             #expect(saved.ccArray == [RecipientEntry.text(name: "Sam Park", address: "sam@example.com")])
             #expect(saved.bccArray == ["alex@example.com"], "Bcc stays Bcc")

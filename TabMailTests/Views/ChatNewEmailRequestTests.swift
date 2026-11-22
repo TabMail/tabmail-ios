@@ -351,8 +351,14 @@ struct ChatNewEmailRequestTests {
         #expect(Self.count(cover, in: detail) == 1)
         #expect(Self.count("ComposeView()", in: detail) == 0, "its compose button goes through the route")
         // Search and the screens opened in it are in the list column: given the detail column's
-        // state there, an email opened in Search would take nothing while Search is up.
+        // state there, an email opened in Search would take nothing while Search is up. So the
+        // state is given out only by the navigation, in the three places above, anywhere in the app.
         #expect(Self.count("listPresentationBesideDetail", in: inbox) == 0, "the list column never reads the detail column's state")
+        for path in try Self.swiftFiles(under: "TabMail") where path != "TabMail/Views/MailNavigationView.swift" {
+            let text = try Self.source(path)
+            #expect(Self.count(".environment(\\.listPresentationBesideDetail", in: text) == 0, "\(path) gives out no detail-column state")
+            #expect(Self.count(".environment(\\.listPresentationWriter", in: text) == 0, "\(path) gives out no list state")
+        }
         // A request is logged without its recipients: the debug log is kept on the device.
         for (path, text) in [(inboxPath, inbox), (chatPath, chat), (detailPath, detail)] {
             #expect(Self.count("request.to", in: text) == 0, "\(path) logs no recipient")
@@ -716,6 +722,39 @@ struct ChatNewEmailRequestHostedTests {
             #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: empty), "Back takes a tap")
             try await ThreadChatTests.wait { screen.topPresented() == nil }
             #expect(screen.topPresented() == nil, "Back closes it")
+        }
+    }
+
+    // MARK: - Compose through the email screen
+
+    @Test("Signed out with the chat view on, or with the chat view off, a link on the email screen opens compose filled with its To, Cc, Bcc, subject and body", arguments: [(true, false), (false, true)])
+    func fallbackThroughTheEmailScreen(chatView: Bool, signedIn: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await fallbackThroughTheEmailScreenBody(chatView: chatView, signedIn: signedIn) }
+    }
+
+    private func fallbackThroughTheEmailScreenBody(chatView: Bool, signedIn: Bool) async throws {
+        try await withScreen(chatView: chatView, signedIn: signedIn) { seed in
+            NavigationStack { MessageDetailView(messageId: seed.email.id) }
+        } body: { screen in
+            try await ThreadChatTests.wait { Self.composeButton(in: screen.view) != nil }
+            try await ThreadChatTests.settle()
+            #expect(screen.topPresented() == nil, "control: nothing is presented over the email")
+            NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
+            var fields: [String: String] = [:]
+            try await ThreadChatTests.wait {
+                fields = screen.topPresented().map { Self.composeRecipients($0.view) } ?? [:]
+                return fields["to"]?.isEmpty == false
+            }
+            let presented = try #require(screen.topPresented(), "compose came up: \(fields)")
+            #expect(Self.addresses(fields["to"]) == ["john@example.com"], "compose, filled: \(fields)")
+            #expect(Self.addresses(fields["cc"]) == ["sam@example.com"])
+            #expect(Self.addresses(fields["bcc"]) == ["alex@example.com"], "Bcc stays Bcc")
+            let texts = Self.fieldTexts(in: presented.view)
+            let hasBody = texts.contains { $0.contains("Are you free at noon?") }
+            #expect(texts.contains("Lunch on Friday"), "the subject: \(texts)")
+            #expect(hasBody, "the body: \(texts)")
+            #expect(!HostedAccessibility.identifiers(in: presented.view).contains(ChatNewThreadView.backId), "not the chat")
         }
     }
 
