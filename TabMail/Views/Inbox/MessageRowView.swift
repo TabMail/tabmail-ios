@@ -18,7 +18,7 @@ struct MessageRowView: View {
     /// adds no information.
     var showsRecipientInsteadOfSender: Bool = false
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
-    /// The AI choice, observed with the opt-out for the chat view's switch (`AIService.isAIOff`).
+    /// The AI choice, observed with the opt-out for the row's own chat-style decision (`chatViewActive`, as `AIService.isAIOff` reads them).
     @AppStorage(AIService.aiChoiceMadeKey, store: AIService.optOutStore) private var aiChoiceMade = false
     @AppStorage(ChatViewConfig.enabledKey) private var chatViewEnabled = true
     @State private var tagTapTick = 0
