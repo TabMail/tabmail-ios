@@ -61,7 +61,7 @@ struct ComposeRecipientsTests {
         #expect(filled[role].rejected == ["leftover"])
         #expect(filled[role].input.isEmpty)
 
-        let delta = RecipientEntryTests.delta(add: "new@example.com", remove: "*")
+        let delta = RecipientEntryTests.delta(add: ["new@example.com"], remove: ["*"])
         let edited: ComposeDraftGuards.Recipients
         switch role {
         case .to: edited = Self.start.applying(to: delta, cc: nil, bcc: nil)
@@ -87,7 +87,7 @@ struct ComposeRecipientsTests {
         #expect(typed[role].rejected == ["bob"])
         #expect(stored(typed) == Self.start[role].tokens + ["bob"])
 
-        let delta = RecipientEntryTests.delta(add: "Jane")
+        let delta = RecipientDelta(adds: RecipientEntry("Jane"), removes: [])
         #expect(!delta.isEmpty)
         let edited: ComposeDraftGuards.Recipients
         switch role {

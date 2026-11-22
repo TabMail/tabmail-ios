@@ -305,7 +305,7 @@ extension NSEAICacheUpdatedAtEncodingTests {
             try MessageAICache.writeThrough(
                 accountId: Self.accountId, folderPath: "INBOX", rfc822MessageId: Self.rfc822,
                 summaryBlurb: "Prior complete summary", summaryTodos: "prior todo",
-                actionTag: .archive, cachedReply: "preserved peer reply", db: db)
+                actionTag: .archive, reply: ReplyResult(body: "preserved peer reply", textMessage: nil), db: db)
         }
         let failure = FailFirstHeaderCommit()
         if headerPhaseFails {

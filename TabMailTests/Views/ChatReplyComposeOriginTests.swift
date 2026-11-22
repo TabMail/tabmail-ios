@@ -222,7 +222,7 @@ struct ChatReplyComposeOriginTests {
 
     /// The request as the reply field sends it about `email`: who was chosen in Reply to when sent.
     private static func field(_ email: MessageHeader, onlyTo: [String]?) -> ToolInvocation {
-        ToolInvocation(fieldReply: ChatFieldReply(emailKey: ChatThread.copyKey(email), onlyTo: onlyTo))
+        ToolInvocation(fieldReply: ChatFieldReply(email: email, onlyTo: onlyTo))
     }
 
     // MARK: - A request from elsewhere keeps its recipients

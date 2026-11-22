@@ -199,7 +199,7 @@ extension ChatThreadViewLifecycleTests {
         let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
         for job in await queue.takePendingIntoFlightForTesting() {
             await queue.executeWholeJobForTesting(job, aiService: service)
-            await queue.finishInFlightForTesting(job)
+            await queue.finishInFlightWithNotificationsOffForTesting(job)
         }
         try await Self.waitUntil { labels().contains { $0.hasSuffix("said: \(Self.landedText)") } }
         #expect(labels().contains { $0.hasSuffix("said: \(Self.landedText)") },

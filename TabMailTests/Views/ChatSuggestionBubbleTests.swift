@@ -172,8 +172,10 @@ struct ChatSuggestionBubbleTests {
             try await Self.openCard(chat)
             let queued = try await chat.pool.read { try OutboxMessage.fetchCount($0) }
             #expect(queued == 0, "nothing was sent")
+            #expect(Self.ghost(in: chat.view) == nil, "the ghost leaves while its own card is open")
             chat.controller.dismiss(animated: false)
             try await Self.waitUntil { chat.controller.presentedViewController == nil }
+            try await Self.waitUntil { Self.ghost(in: chat.view) != nil }
             #expect(Self.ghost(in: chat.view) != nil, "Close goes back with the ghost still there")
         }
     }
@@ -211,14 +213,26 @@ struct ChatSuggestionBubbleTests {
         }
     }
 
-    @Test("An edit of the suggestion stored from compose takes the ghost away: its text no longer matches")
-    func composeEditRetiresTheGhost() async throws {
+    @Test("An edit of the suggestion stored from compose shows its text version in the ghost")
+    func composeEditUpdatesTheGhost() async throws {
         try await withChat { chat in
             #expect(Self.ghost(in: chat.view) != nil, "control: the ghost shows")
             // Compose's own writer, as when the user edits the suggestion in the card.
-            await ComposeView.writeCachedReplyToDB("Hello Sam,\n\nMaybe Wednesday?", replyTo: chat.email, db: chat.pool)
+            await ComposeView.writeOverCurrent(ReplyResult(body: "Hello Sam,\n\nMaybe Wednesday?", textMessage: "Maybe Wednesday?", changeCommand: nil), replyTo: chat.email, db: chat.pool)
+            try await Self.waitUntil { Self.ghost(in: chat.view)?.accessibilityLabel == "AI Suggestion: Maybe Wednesday?" }
+            #expect(Self.ghost(in: chat.view)?.accessibilityLabel == "AI Suggestion: Maybe Wednesday?",
+                    "the edit's text version replaces the ghost without leaving the chat")
+            #expect(!HostedAccessibility.labels(in: chat.view).contains { $0.contains(Self.ready) }, "the old text is gone")
+        }
+    }
+
+    @Test("An edit stored without a text version takes the ghost away: no text describes its body")
+    func composeEditWithoutTextRetiresTheGhost() async throws {
+        try await withChat { chat in
+            #expect(Self.ghost(in: chat.view) != nil, "control: the ghost shows")
+            await ComposeView.writeOverCurrent(ReplyResult(body: "Hello Sam,\n\nMaybe Wednesday?", textMessage: nil, changeCommand: nil), replyTo: chat.email, db: chat.pool)
             try await Self.waitUntil { Self.ghost(in: chat.view) == nil }
-            #expect(Self.ghost(in: chat.view) == nil, "the stale suggestion is gone without leaving the chat")
+            #expect(Self.ghost(in: chat.view) == nil)
             let stored = try await chat.pool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
             #expect(stored?.cachedReply == "Hello Sam,\n\nMaybe Wednesday?", "control: the edit was stored")
         }

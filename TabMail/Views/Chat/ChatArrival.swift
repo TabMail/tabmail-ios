@@ -4,7 +4,7 @@
 
 import SwiftUI
 
-/// A new email arriving in the open chat (ADR-IOS-114 decision 21): it rises from behind the
+/// A new email arriving in the open chat (ADR-IOS-114 decision 23): it rises from behind the
 /// reply field like a new message, and the chat moves up with it, in one animation. Under Reduce
 /// Motion the space opens at once (the chat jumps up) and the bubble fades in. The open's own
 /// landing is not an arrival: nothing animates until the chat has landed. Nor is the user's own

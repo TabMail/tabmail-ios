@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// Blocking-contract tests for `EmailComposeTool` — mirrors the coverage that
@@ -48,6 +49,46 @@ struct EmailComposeToolOutcomeTests {
             await Task.yield()
         }
         return router.pendingCompose
+    }
+
+    /// THE SYSTEM PROPERTY: an agent's new email with a compose request is written by the model as a
+    /// new email (`edit_new`), and its card opens with exactly the model's subject and body; a failed
+    /// or malformed edit opens the card with the agent's own words, never part of an edit.
+    /// Through the request path, the model answered by the compose edit the tool is given.
+    @Test("A new email's compose request opens its card with the model's draft; a failed edit keeps the agent's words",
+          arguments: [true, false])
+    func composeRequestOpensTheModelsDraft(editSucceeds: Bool) async throws {
+        let (_, db, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        let ctx = ToolContext(db: db, translator: MockChatIdTranslator(), router: router)
+        let modes = Mutex<[String]>([])
+        let body = "Hi Pat,\n\nAre you free on Friday?\n\nAlex"
+        let tool = EmailComposeTool(context: ctx, composeEdit: { context, _, _, _ in
+            modes.withLock { $0.append(context.mode) }
+            guard editSucceeds else { throw InlineEditFailure(message: "The edit could not be read. Please try again.") }
+            return try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+                response: "Done.", subject: "Friday", body: body, textMessage: "Free on Friday?", changeCommand: "")))
+        })
+        let task = Task { @MainActor in
+            try await tool.execute(arguments: [
+                "to": .array([.string("pat@example.com")]),
+                "subject": .string("Agent subject"),
+                "body": .string("Agent body"),
+                "request": .string("ask Pat about Friday"),
+            ])
+        }
+        let card = await waitForPendingCompose(on: router)
+        card?.onOutcome(.cancelled)
+        _ = try await task.value
+
+        #expect(modes.withLock { $0 } == ["edit_new"], "the model is asked once, for a new email")
+        let opened = try #require(card, "the card opens")
+        #expect(opened.mode == .compose && opened.to == ["pat@example.com"])
+        if editSucceeds {
+            #expect(opened.subject == "Friday" && opened.body == body, "the card holds the model's draft")
+        } else {
+            #expect(opened.subject == "Agent subject" && opened.body == "Agent body", "the agent's own words, unchanged")
+        }
     }
 
     @Test("Tool name is email_compose")

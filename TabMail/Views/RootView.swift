@@ -595,7 +595,7 @@ struct RootView: View {
                         var score = 0
                         if h.summaryBlurb != nil { score += 1 }
                         if h.actionTag != nil { score += 1 }
-                        if h.cachedReply != nil { score += 1 }
+                        if h.suggestion != nil { score += 1 }
                         if score > bestScore {
                             bestScore = score
                             bestHeader = h
@@ -605,7 +605,7 @@ struct RootView: View {
                     if let header = bestHeader, bestScore > 0 {
                         let hasSummary = wantSummary && header.summaryBlurb != nil
                         let hasAction = wantAction && header.actionTag != nil
-                        let hasReply = wantReply && header.cachedReply != nil
+                        let hasReply = wantReply && header.suggestion != nil
                         BackgroundSyncLogger.logDebug("[AIProbe] Found \(headers.count) match(es) for key \"\(key)\" — best: summary=\(hasSummary ? "present" : "nil"), action=\(header.actionTag?.rawValue ?? "nil"), reply=\(hasReply ? "present" : "nil")")
 
                         var result = AICacheResult()
@@ -620,7 +620,7 @@ struct RootView: View {
                         if hasAction, let action = header.actionTag {
                             result.action = action.rawValue
                         }
-                        if hasReply, let reply = header.cachedReply, !reply.isEmpty {
+                        if hasReply, let reply = header.suggestion?.body, !reply.isEmpty {
                             result.reply = reply
                         }
                         if result.summary != nil || result.action != nil || result.reply != nil {
@@ -652,7 +652,7 @@ struct RootView: View {
                             if wantAction, let action = cached.actionTag {
                                 result.action = action.rawValue
                             }
-                            if wantReply, let reply = cached.cachedReply, !reply.isEmpty {
+                            if wantReply, let reply = cached.suggestion?.body, !reply.isEmpty {
                                 result.reply = reply
                             }
                             if result.summary != nil || result.action != nil || result.reply != nil {

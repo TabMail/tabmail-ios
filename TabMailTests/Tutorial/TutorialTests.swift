@@ -776,9 +776,9 @@ struct TutorialLifecycleTests {
         // The draft chat holds the edit; Use Suggestion waits for it.
         #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt)
         #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
-        var edited: String?
+        var edited: ReplyResult?
         await coordinator.runPracticeReplyEdit { edited = $0 }
-        #expect(edited == TutorialChatScript.declinedReply, "the draft receives the declined reply")
+        #expect(edited?.body == TutorialChatScript.declinedReply, "the draft receives the declined reply")
         #expect(coordinator.replyEdited)
         #expect(coordinator.composeEditPrompt == nil, "the edit is not offered again")
         #expect(coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
@@ -913,7 +913,7 @@ struct TutorialLifecycleTests {
 
         try await startRun(.reuseReply)
         try #require(coordinator.step == .replyToPriya)
-        var edited: String?
+        var edited: ReplyResult?
         let edit = Task { await coordinator.runPracticeReplyEdit { edited = $0 } }
         await Task.yield()
         // Skip, then part 2 again, while the edit waits.

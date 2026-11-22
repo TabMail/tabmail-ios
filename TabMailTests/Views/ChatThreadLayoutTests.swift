@@ -193,7 +193,7 @@ struct ChatThreadLayoutTests {
                 let mic = try #require(HostedAccessibility.elements(under: controller.view)
                     .first { $0.accessibilityLabel == "Dictate" }?.accessibilityFrame,
                     "labels: \(HostedAccessibility.labels(in: controller.view).prefix(30))")
-                // One body line at this text size, scaled as the text is (ADR-IOS-114 decision 17).
+                // One body line at this text size, scaled as the text is (ADR-IOS-114 decision 19).
                 let largest = UITraitCollection(preferredContentSizeCategory: .accessibilityExtraExtraExtraLarge)
                 let line = UIFontMetrics(forTextStyle: .body).scaledValue(
                     for: ChatViewLayout.fieldLineHeight, compatibleWith: largest)
@@ -332,7 +332,7 @@ struct ChatThreadLayoutTests {
 
     /// The short chat above has nothing to scroll, so it cannot tell how the chat moves. In a chat
     /// longer than the screen, held at its bottom by the landing, the chat moves up with the rise
-    /// (decision 21: "the rows above move up with it"): its scroll position as drawn passes through
+    /// (decision 23: "the rows above move up with it"): its scroll position as drawn passes through
     /// places between where it was and where it ends, rather than jumping there in one frame, and
     /// the new email ends at the bar, on screen, where the newest email ended before it. This
     /// measures how the chat moves, not the new row's own transition.
