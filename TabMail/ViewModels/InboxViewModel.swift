@@ -2151,7 +2151,7 @@ final class InboxViewModel {
                     messages: [move.message]))
             }
         }
-        manager.enqueueWriteFromSynchronousContext { [manager] in
+        manager.enqueueWriteFromSynchronousContext { [manager, groups] in
             for group in groups {
                 // Read intent BEFORE the move — see `archive(_:)`. Only the
                 // members that are actually unread at execution time get it.

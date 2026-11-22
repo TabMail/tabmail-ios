@@ -4,6 +4,8 @@
 
 import Foundation
 import GRDB
+import Observation
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -45,6 +47,30 @@ struct InboxThreadAcrossAccountsTests {
         case whileUndoIsQueued
         var testDescription: String { rawValue }
     }
+
+    enum RefusedPart: String, CaseIterable, CustomTestStringConvertible {
+        /// The entry's first part (Gmail) is refused; the second comes back.
+        case first
+        /// The first part comes back; the second (Outlook) is refused.
+        case second
+        case both
+        var testDescription: String { rawValue }
+    }
+
+    enum ImapMove: String, CaseIterable, CustomTestStringConvertible {
+        /// The IMAP move is still queued and was never attempted.
+        case queued
+        /// The executor has sent it; the server has not answered yet.
+        case onTheWire
+        var testDescription: String { rawValue }
+    }
+
+    /// The IMAP account's folder epochs and the member's UID before and after
+    /// its move. Test data, named once.
+    private static let imapInboxEpoch = 41
+    private static let imapArchiveEpoch = 52
+    private static let imapUid = "101"
+    private static let imapUidInArchive = "901"
 
     private struct Fixture {
         let pool: DatabasePool
@@ -188,6 +214,43 @@ struct InboxThreadAcrossAccountsTests {
         }
     }
 
+    /// Every acted-on member's on-screen state and its hold are gone once the
+    /// writes that took them have run: the list shows the database again.
+    private func expectOverlayReleased(
+        _ ids: [String], after phase: String,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) {
+        let overlay = AccountManager.shared.snapshotOverlay()
+        let retains = AccountManager.shared.overlayOpRefCountForTesting()
+        for id in ids {
+            #expect(overlay[id] == nil, "\(id) still shows what \(phase) gave it", sourceLocation: sourceLocation)
+            #expect(retains[id] == nil, "\(id) is still held after \(phase)", sourceLocation: sourceLocation)
+        }
+    }
+
+    private func folder(
+        _ name: String, path: String, role: FolderRole, account: String, epoch: Int
+    ) -> Folder {
+        var folder = Folder(name: name, path: path, role: role, accountId: account)
+        folder.lastKnownUidValidity = epoch
+        return folder
+    }
+
+    /// A third account, on IMAP: its addresses carry a folder epoch, which
+    /// its queued moves name and its Undo must give back.
+    private func addImapAccount(to fixture: Fixture) async throws -> (inbox: Folder, archive: Folder) {
+        let inbox = folder("INBOX", path: "INBOX", role: .inbox, account: "imap1", epoch: Self.imapInboxEpoch)
+        let archive = folder("Archive", path: "Archive", role: .archive, account: "imap1", epoch: Self.imapArchiveEpoch)
+        try await fixture.pool.writeWithoutTransaction { db in
+            var account = Account(emailAddress: "third@example.com", displayName: "Third", provider: .imap)
+            account.id = "imap1"
+            try account.insert(db)
+            try inbox.insert(db)
+            try archive.insert(db)
+        }
+        return (inbox, archive)
+    }
+
     // MARK: - Archive and delete
 
     @Test("archiving or deleting a thread whose members are on two accounts shows and sends each member to its own account's folder, and one Undo cancels exactly those moves and brings each member back", arguments: RoleAction.allCases)
@@ -242,6 +305,7 @@ struct InboxThreadAcrossAccountsTests {
         ], "each account's operation names that account's own folder and only its own member")
         #expect(forwards.count == 2 && forwardsWaitUnattempted,
                 "setup: offline, so both forward moves are still queued and never attempted")
+        expectOverlayReleased([onGmail.id, onOutlook.id], after: "the forward moves")
 
         #expect(UndoService.shared.undoStack.count == 1, "the whole thread is one undo entry")
         await UndoService.shared.undo()
@@ -251,6 +315,7 @@ struct InboxThreadAcrossAccountsTests {
         #expect(try await folderId(of: onOutlook.id, in: fixture.pool) == fixture.outlookInbox.id)
         #expect(try await operations(in: fixture.pool).map(\.id) == [unrelated.id],
                 "Undo cancels exactly the thread's own queued moves and queues no reverse move")
+        expectOverlayReleased([onGmail.id, onOutlook.id], after: "Undo")
     }
 
     @Test("archiving or deleting a thread across two accounts records each account's read before that account's move, for the acted-on unread members only", arguments: RoleAction.allCases)
@@ -273,8 +338,8 @@ struct InboxThreadAcrossAccountsTests {
         #expect(skipped == [settled.id])
         await AccountManager.shared.awaitWriteQueueDrain()
 
-        let operations = try await operations(in: fixture.pool)
-        let reads = operations.filter { $0.type == .markRead }
+        let queued = try await operations(in: fixture.pool)
+        let reads = queued.filter { $0.type == .markRead }
         let readPayloads = Set(reads.map { [$0.accountId, $0.folderPath] + $0.messageIds.sorted() })
         #expect(readPayloads == [
             ["gmail1", fixture.gmailInbox.path, onGmail.messageId],
@@ -282,7 +347,7 @@ struct InboxThreadAcrossAccountsTests {
         ], "one read per account, in its SOURCE folder, naming only its acted-on member")
         for account in ["gmail1", "outlook1"] {
             let read = reads.first { $0.accountId == account }
-            let move = operations.first { $0.type == .move && $0.accountId == account }
+            let move = queued.first { $0.type == .move && $0.accountId == account }
             #expect(read != nil && move != nil, "\(account) has a read and a move")
             if let read, let move {
                 #expect(read.queuePosition < move.queuePosition,
@@ -293,6 +358,45 @@ struct InboxThreadAcrossAccountsTests {
         #expect(try await header(onOutlook.id, in: fixture.pool)?.isRead == true)
         #expect(try await header(settled.id, in: fixture.pool)?.isRead == false,
                 "a member the action left out is not marked read")
+    }
+
+    @Test("archiving or deleting a thread across two accounts when one account's read write is refused keeps the other account's read, which still comes before its move", arguments: RoleAction.allCases)
+    func refusedReadOnOneAccountLeavesTheOthersRead(action: RoleAction) async throws {
+        let fixture = try makeFixture()
+        defer { finish(fixture) }
+        clearSharedState()
+        UserDefaults.standard.set(true, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        let onGmail = makeHeader(folder: fixture.gmailInbox, messageId: "gmail-member", isRead: false)
+        let onOutlook = makeHeader(folder: fixture.outlookInbox, messageId: "outlook-member", isRead: false)
+        try await insert([onGmail, onOutlook], into: fixture.pool)
+        // Only Gmail's read insert fails, so only a transaction holding it rolls back.
+        try await fixture.pool.writeWithoutTransaction { db in
+            try db.execute(sql: """
+                CREATE TEMP TRIGGER failGmailReadInsert BEFORE INSERT ON \(PendingOperation.databaseTableName)
+                WHEN NEW.type = '\(OperationType.markRead.rawValue)' AND NEW.accountId = 'gmail1'
+                BEGIN SELECT RAISE(ABORT, 'test: Gmail read insert fails'); END
+                """)
+        }
+
+        let vm = InboxViewModel(folders: [fixture.gmailInbox, fixture.outlookInbox])
+        let skipped = await act(action, on: [onGmail.id, onOutlook.id], with: vm)
+        #expect(skipped.isEmpty)
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        let queued = try await operations(in: fixture.pool)
+        let reads = queued.filter { $0.type == .markRead }
+        let readPayloads = reads.map { [$0.accountId, $0.folderPath] + $0.messageIds.sorted() }
+        #expect(readPayloads == [["outlook1", fixture.outlookInbox.path, onOutlook.messageId]],
+                "Gmail's refused read must not take the Outlook read with it")
+        #expect(try await header(onOutlook.id, in: fixture.pool)?.isRead == true,
+                "the Outlook member is read in the database")
+        let outlookMove = queued.first { $0.type == .move && $0.accountId == "outlook1" }
+        #expect(reads.count == 1 && outlookMove != nil, "Outlook has its read and its move")
+        if let read = reads.first, let outlookMove {
+            #expect(read.queuePosition < outlookMove.queuePosition,
+                    "Outlook's read is claimed before its move")
+        }
     }
 
     @Test("a thread member whose account has no folder for the action is reported skipped, while the member on the other account still goes to its own folder, whichever account misses it", arguments: RoleAction.allCases, ["gmail1", "outlook1"])
@@ -322,6 +426,45 @@ struct InboxThreadAcrossAccountsTests {
         #expect(try await queuedMoves(in: fixture.pool) == [
             [present.accountId, fixture.inbox(present.accountId).path, presentDestination.path, present.messageId],
         ])
+    }
+
+    @Test("a thread member already in another folder of the action's kind (a second archive or trash folder of its account) is reported skipped like one in the main folder, while the member in the inbox still goes, and Undo brings it back", arguments: RoleAction.allCases)
+    func memberInAnotherFolderOfTheKindIsSkipped(action: RoleAction) async throws {
+        let fixture = try makeFixture()
+        defer { finish(fixture) }
+        clearSharedState()
+        let usual = fixture.destination(action, account: "outlook1")
+        let other = Folder(
+            name: "Old \(usual.name)", path: "\(usual.path)-old",
+            role: action == .archive ? .archive : .trash, accountId: "outlook1")
+        try await fixture.pool.writeWithoutTransaction { db in try other.insert(db) }
+
+        let inInbox = makeHeader(folder: fixture.outlookInbox, messageId: "outlook-inbox-member")
+        let inUsual = makeHeader(folder: usual, messageId: "outlook-usual-member")
+        let inOther = makeHeader(folder: other, messageId: "outlook-other-member")
+        try await insert([inInbox, inUsual, inOther], into: fixture.pool)
+
+        let vm = InboxViewModel(folders: [fixture.outlookInbox])
+        let skipped = await act(action, on: [inInbox.id, inUsual.id, inOther.id], with: vm)
+        #expect(skipped == [inUsual.id, inOther.id],
+                "a member already in a folder of that kind stays, whichever of the two it is")
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        // The account has two folders of the kind; the inbox member goes to
+        // the one its account's lookup names, whichever that is.
+        let landed = try await header(inInbox.id, in: fixture.pool)?.folderPath
+        #expect(landed == usual.path || landed == other.path, "the inbox member went: \(landed ?? "nowhere")")
+        #expect(try await queuedMoves(in: fixture.pool) == [
+            ["outlook1", fixture.outlookInbox.path, landed ?? "<none>", inInbox.messageId],
+        ], "only the inbox member is moved")
+        #expect(try await folderId(of: inUsual.id, in: fixture.pool) == usual.id)
+        #expect(try await folderId(of: inOther.id, in: fixture.pool) == other.id)
+
+        await UndoService.shared.undo()
+        await AccountManager.shared.awaitWriteQueueDrain()
+        #expect(UndoService.shared.undoFailureMessage == nil, "Undo must not be refused")
+        #expect(try await folderId(of: inInbox.id, in: fixture.pool) == fixture.outlookInbox.id)
+        #expect(try await queuedMoves(in: fixture.pool).isEmpty)
     }
 
     @Test("when both accounts name the folder alike, a move write refused for one account leaves the other account's move in place and reports only the refused member, and Undo brings back the moved one")
@@ -362,12 +505,14 @@ struct InboxThreadAcrossAccountsTests {
         #expect(try await queuedMoves(in: fixture.pool) == [
             ["outlook1", fixture.outlookInbox.path, outlookArchive.path, onOutlook.messageId],
         ])
+        expectOverlayReleased([onGmail.id, onOutlook.id], after: "the forward moves")
 
         await UndoService.shared.undo()
         await AccountManager.shared.awaitWriteQueueDrain()
         #expect(try await folderId(of: onOutlook.id, in: fixture.pool) == fixture.outlookInbox.id)
         #expect(try await folderId(of: onGmail.id, in: fixture.pool) == fixture.gmailInbox.id)
         #expect(try await queuedMoves(in: fixture.pool).isEmpty)
+        expectOverlayReleased([onGmail.id, onOutlook.id], after: "Undo")
     }
 
     @Test("Undo of a thread archived from two folders of one account returns each member to the folder it came from")
@@ -397,8 +542,8 @@ struct InboxThreadAcrossAccountsTests {
 
     // MARK: - Undo notice
 
-    @Test("an Undo that brings back one account's member and is refused for the other's says some messages were not moved back; refused for both, it says nothing was", arguments: [false, true])
-    func undoNoticeSaysWhatCameBack(bothRefused: Bool) async throws {
+    @Test("an Undo refused for some parts of a thread entry says so once, after its last part ran: some messages were not moved back when another part came back, in either order, and nothing was moved back when none did", arguments: RefusedPart.allCases)
+    func undoNoticeSaysWhatCameBack(refused: RefusedPart) async throws {
         let fixture = try makeFixture()
         defer { finish(fixture) }
         clearSharedState()
@@ -409,23 +554,46 @@ struct InboxThreadAcrossAccountsTests {
         let vm = InboxViewModel(folders: [fixture.gmailInbox, fixture.outlookInbox])
         #expect(vm.archiveThread([onGmail.id, onOutlook.id]).isEmpty)
         await AccountManager.shared.awaitWriteQueueDrain()
+        #expect(UndoService.shared.currentAction?.commands.map(\.accountId) == ["gmail1", "outlook1"],
+                "setup: Gmail's part runs first, Outlook's last")
 
-        // Sync removed the archived Gmail row (and, in the second case, the
-        // Outlook one) before the user asked for Undo.
-        let gone = bothRefused ? [onGmail.id, onOutlook.id] : [onGmail.id]
+        // Sync removed the archived rows of the refused parts before the user
+        // asked for Undo.
+        let gone: [String] = switch refused {
+        case .first: [onGmail.id]
+        case .second: [onOutlook.id]
+        case .both: [onGmail.id, onOutlook.id]
+        }
         try await fixture.pool.writeWithoutTransaction { db in
             for id in gone { _ = try MessageHeader.deleteOne(db, key: id) }
         }
 
+        let pool = fixture.pool
+        let outlookId = onOutlook.id
+        let outlookInboxId = fixture.outlookInbox.id
+        let probe = UndoNoticeProbe(lastPartIds: [outlookId]) {
+            (try? pool.read { db in try MessageHeader.fetchOne(db, key: outlookId)?.folderId }) == outlookInboxId
+        }
+        defer { probe.stop() }
         await UndoService.shared.undo()
         await AccountManager.shared.awaitWriteQueueDrain()
-        if bothRefused {
-            #expect(UndoService.shared.undoFailureMessage == UndoService.moveUndoRefusedMessage)
-        } else {
+
+        let lastPartHadRun = probe.lastPartHadRunAtFirstNotice
+        #expect(lastPartHadRun == true,
+                "the notice is decided once, after the entry's last part ran, never after an earlier part")
+        switch refused {
+        case .first:
             #expect(try await folderId(of: onOutlook.id, in: fixture.pool) == fixture.outlookInbox.id,
                     "setup: the Outlook member is moved back")
-            #expect(UndoService.shared.undoFailureMessage == UndoService.moveUndoPartlyRefusedMessage,
+            #expect(UndoService.shared.undoFailureMessage == "Some messages were not moved back.",
                     "a partial Undo must not say that nothing was moved back")
+        case .second:
+            #expect(try await folderId(of: onGmail.id, in: fixture.pool) == fixture.gmailInbox.id,
+                    "setup: the Gmail member is moved back")
+            #expect(UndoService.shared.undoFailureMessage == "Some messages were not moved back.",
+                    "a part that came back before the refused one still counts")
+        case .both:
+            #expect(UndoService.shared.undoFailureMessage == "Nothing was moved back.")
         }
     }
 
@@ -473,8 +641,13 @@ struct InboxThreadAcrossAccountsTests {
         case .whileUndoIsQueued:
             let gate = await gateWriteQueue()
             await UndoService.shared.undo()
-            try await finishOutlookMove()
+            // Release and drain the shared queue on every exit: a throw here
+            // must not leave it held when the fixture is taken down.
+            var finishError: (any Error)?
+            do { try await finishOutlookMove() } catch { finishError = error }
             gate.finish()
+            await AccountManager.shared.awaitWriteQueueDrain()
+            if let finishError { throw finishError }
         }
         await AccountManager.shared.awaitWriteQueueDrain()
 
@@ -517,41 +690,145 @@ struct InboxThreadAcrossAccountsTests {
                 "the dropped member stays where its move put it")
     }
 
+    @Test("Undo of a thread whose second part is an IMAP member cancels that member's queued move and gives back its folder epoch, or, when its move is already on the wire, queues one reverse move naming the address the server gave it; the Gmail part is cancelled either way", arguments: ImapMove.allCases)
+    func undoBringsBackAnImapMemberOfALaterPart(imapMove: ImapMove) async throws {
+        let fixture = try makeFixture()
+        defer { finish(fixture) }
+        defer { MessageHeaderRekey.clearAddressHandoffsForTesting() }
+        clearSharedState()
+        MessageHeaderRekey.clearAddressHandoffsForTesting()
+        await AccountManager.shared.clearDeferredMoveSuccessorsForTesting()
+        let imap = try await addImapAccount(to: fixture)
+
+        let onGmail = makeHeader(folder: fixture.gmailInbox, messageId: "gmail-member")
+        var onImap = makeHeader(folder: imap.inbox, messageId: Self.imapUid)
+        onImap.observedUidValidity = Self.imapInboxEpoch
+        onImap.rfc822MessageId = "imap-member@example.com"
+        try await insert([onGmail, onImap], into: fixture.pool)
+
+        let vm = InboxViewModel(folders: [fixture.gmailInbox, imap.inbox])
+        #expect(vm.archiveThread([onGmail.id, onImap.id]).isEmpty)
+        await AccountManager.shared.awaitWriteQueueDrain()
+        #expect(UndoService.shared.currentAction?.commands.map(\.accountId) == ["gmail1", "imap1"],
+                "setup: the IMAP member is in the entry's second part")
+        let imapMoves = try await operations(in: fixture.pool).filter { $0.type == .move && $0.accountId == "imap1" }
+        #expect(imapMoves.map(\.observedUidValidity) == [Self.imapInboxEpoch],
+                "setup: the IMAP move names the epoch of its source folder")
+        guard imapMoves.count == 1 else { return }
+
+        let imapForward: PendingOperation
+        switch imapMove {
+        case .queued:
+            imapForward = imapMoves[0]
+        case .onTheWire:
+            let forwardId = imapMoves[0].id
+            let claimed = try await fixture.pool.write { db -> PendingOperation? in
+                _ = try PendingOperation.filter(Column("id") == forwardId).updateAll(
+                    db,
+                    Column("status").set(to: PendingStatus.inFlight.rawValue),
+                    Column("everAttempted").set(to: true))
+                return try PendingOperation.fetchOne(db, key: forwardId)
+            }
+            imapForward = try #require(claimed)
+        }
+
+        await UndoService.shared.undo()
+        await AccountManager.shared.awaitWriteQueueDrain()
+        #expect(UndoService.shared.undoFailureMessage == nil, "Undo must not be refused")
+        #expect(try await folderId(of: onGmail.id, in: fixture.pool) == fixture.gmailInbox.id)
+
+        switch imapMove {
+        case .queued:
+            let row = try await header(onImap.id, in: fixture.pool)
+            #expect(row?.folderId == imap.inbox.id)
+            #expect(row?.observedUidValidity == Self.imapInboxEpoch,
+                    "the cancelled move gives back the epoch the member's address was proven under")
+            #expect(try await operations(in: fixture.pool).isEmpty, "both queued moves are cancelled")
+        case .onTheWire:
+            #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1,
+                    "setup: the IMAP part waits for the address its move is given")
+            // The server finished the move and named the message's new UID.
+            let finished = try await fixture.pool.write { db in
+                let result = try MessageHeaderRekey.finishMove(
+                    imapForward,
+                    destinations: [ProvenDestinationAddress(
+                        sourceProviderId: Self.imapUid,
+                        destinationProviderId: Self.imapUidInArchive,
+                        destinationUidValidity: UInt32(Self.imapArchiveEpoch))],
+                    addressChangesOnMove: true,
+                    accountScopedIds: false,
+                    db: db)
+                _ = try PendingOperation.deleteOne(db, key: imapForward.id)
+                MessageHeaderRekey.publishAddressHandoffsAfterCommit(result.applied, in: db)
+                return result
+            }
+            await AccountManager.shared.materializeDeferredMoveSuccessors(after: imapForward, result: finished)
+            await AccountManager.shared.awaitWriteQueueDrain()
+
+            let newHeaderId = MessageIdentity.headerId(
+                accountId: "imap1", folderPath: imap.archive.path, messageId: Self.imapUidInArchive)
+            #expect(try await header(newHeaderId, in: fixture.pool)?.folderPath == imap.inbox.path,
+                    "the IMAP member shows back in its inbox under its new address")
+            let remaining = try await operations(in: fixture.pool)
+            let remainingPayloads = remaining.map {
+                [$0.accountId, $0.folderPath, $0.destinationPath ?? "<nil>"] + $0.messageIds
+            }
+            #expect(remainingPayloads == [
+                ["imap1", imap.archive.path, imap.inbox.path, Self.imapUidInArchive],
+            ], "one reverse move naming the UID the server gave; the queued Gmail move is cancelled")
+            #expect(remaining.map(\.observedUidValidity) == [Self.imapArchiveEpoch])
+            #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 0)
+        }
+        expectOverlayReleased([onGmail.id, onImap.id], after: "Undo")
+    }
+
     // MARK: - Move
 
-    @Test("moving a thread whose members are on two accounts moves only the members of the account whose folder was picked; the other member is reported skipped and left where it is, and Undo returns the moved one")
+    @Test("moving a thread whose members are on two accounts moves only the members of the account whose folder was picked, from each folder they are in, even when the other account has a folder of the same name; the other member is reported skipped and left where it is, and one Undo returns each moved member to its own folder")
     func moveActsOnlyOnThePickedAccount() async throws {
         let fixture = try makeFixture()
         defer { finish(fixture) }
         clearSharedState()
+        // The other account has a folder of the same name: a message still
+        // cannot move between accounts.
+        let gmailProjects = Folder(
+            name: "Projects", path: fixture.outlookProjects.path, role: .custom, accountId: "gmail1")
+        try await fixture.pool.writeWithoutTransaction { db in try gmailProjects.insert(db) }
 
         let onGmail = makeHeader(folder: fixture.gmailInbox, messageId: "gmail-member")
-        let onOutlook = makeHeader(folder: fixture.outlookInbox, messageId: "outlook-member")
-        try await insert([onGmail, onOutlook], into: fixture.pool)
+        let inInbox = makeHeader(folder: fixture.outlookInbox, messageId: "outlook-inbox-member")
+        let inArchive = makeHeader(folder: fixture.outlookArchive, messageId: "outlook-archive-member")
+        try await insert([onGmail, inInbox, inArchive], into: fixture.pool)
 
         let vm = InboxViewModel(folders: [fixture.gmailInbox, fixture.outlookInbox])
         let gate = await gateWriteQueue()
         let skipped = vm.moveThread(
-            [onGmail.id, onOutlook.id], toFolderPath: fixture.outlookProjects.path,
+            [onGmail.id, inInbox.id, inArchive.id], toFolderPath: fixture.outlookProjects.path,
             accountId: fixture.outlookProjects.accountId)
         #expect(skipped == [onGmail.id], "a message cannot move to another account's folder")
         let overlay = AccountManager.shared.snapshotOverlay()
         #expect(overlay[onGmail.id] == nil)
-        #expect(overlay[onOutlook.id]?.folderId == fixture.outlookProjects.id)
+        #expect(overlay[inInbox.id]?.folderId == fixture.outlookProjects.id)
+        #expect(overlay[inArchive.id]?.folderId == fixture.outlookProjects.id)
         gate.finish()
 
         await AccountManager.shared.awaitWriteQueueDrain()
         #expect(try await folderId(of: onGmail.id, in: fixture.pool) == fixture.gmailInbox.id)
-        #expect(try await folderId(of: onOutlook.id, in: fixture.pool) == fixture.outlookProjects.id)
+        #expect(try await folderId(of: inInbox.id, in: fixture.pool) == fixture.outlookProjects.id)
+        #expect(try await folderId(of: inArchive.id, in: fixture.pool) == fixture.outlookProjects.id)
         #expect(try await queuedMoves(in: fixture.pool) == [
-            ["outlook1", fixture.outlookInbox.path, fixture.outlookProjects.path, onOutlook.messageId],
-        ])
+            ["outlook1", fixture.outlookArchive.path, fixture.outlookProjects.path, inArchive.messageId],
+            ["outlook1", fixture.outlookInbox.path, fixture.outlookProjects.path, inInbox.messageId],
+        ], "one move per source folder, each naming the picked account's folder, none for the Gmail member")
+        expectOverlayReleased([inInbox.id, inArchive.id], after: "the forward moves")
 
         #expect(UndoService.shared.undoStack.count == 1)
         await UndoService.shared.undo()
         await AccountManager.shared.awaitWriteQueueDrain()
         #expect(UndoService.shared.undoFailureMessage == nil, "Undo must not be refused")
-        #expect(try await folderId(of: onOutlook.id, in: fixture.pool) == fixture.outlookInbox.id)
+        #expect(try await folderId(of: inInbox.id, in: fixture.pool) == fixture.outlookInbox.id)
+        #expect(try await folderId(of: inArchive.id, in: fixture.pool) == fixture.outlookArchive.id)
+        #expect(try await folderId(of: onGmail.id, in: fixture.pool) == fixture.gmailInbox.id)
         #expect(try await queuedMoves(in: fixture.pool).isEmpty)
     }
 
@@ -582,5 +859,46 @@ struct InboxThreadAcrossAccountsTests {
         #expect(try await folderId(of: inProjects.id, in: fixture.pool) == fixture.outlookProjects.id)
         #expect(try await queuedMoves(in: fixture.pool).isEmpty,
                 "Undo cancels the queued move and queues no move for the member that never moved")
+    }
+}
+
+/// Watches one Undo of an entry with several parts and records, at the moment
+/// the Undo notice is FIRST about to change, whether the entry's last part had
+/// already run. A refused part posts `.inboxDataDidChange` naming its members
+/// before it is counted; a part that came back shows in the database
+/// (`lastPartIsBack`). Observation calls `onChange` synchronously, before the
+/// new value is set, on the actor that sets it.
+private final class UndoNoticeProbe: @unchecked Sendable {
+    private let lastPartRefused = Mutex(false)
+    private let firstNotice = Mutex<Bool?>(nil)
+    private let lastPartIsBack: @Sendable () -> Bool
+    private var observer: NSObjectProtocol?
+
+    @MainActor
+    init(lastPartIds: [String], lastPartIsBack: @escaping @Sendable () -> Bool) {
+        self.lastPartIsBack = lastPartIsBack
+        observer = NotificationCenter.default.addObserver(
+            forName: .inboxDataDidChange, object: nil, queue: nil
+        ) { [self] notification in
+            guard notification.object as? [String] == lastPartIds else { return }
+            lastPartRefused.withLock { $0 = true }
+        }
+        withObservationTracking {
+            _ = UndoService.shared.undoFailureMessage
+        } onChange: { [self] in
+            let lastPartRan = lastPartRefused.withLock { $0 } || self.lastPartIsBack()
+            firstNotice.withLock { recorded in
+                if recorded == nil { recorded = lastPartRan }
+            }
+        }
+    }
+
+    /// Whether the entry's last part had run when the notice first changed;
+    /// `nil` when the notice never changed.
+    var lastPartHadRunAtFirstNotice: Bool? { firstNotice.withLock { $0 } }
+
+    func stop() {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
     }
 }
