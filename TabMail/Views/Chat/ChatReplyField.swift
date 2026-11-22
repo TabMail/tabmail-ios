@@ -125,6 +125,11 @@ struct ChatFieldFill: Equatable {
     /// any edit of the words. Ownership follows edits, not content: words cleared and retyped to the
     /// same text after Send are newly written, so they are kept and no completion empties them.
     private(set) var holdsSentWords = false
+    /// A confirmation card took the field's sent words off the input (the request shows in the
+    /// sheet), unedited since: true from that card until any edit of the words or the send's end.
+    /// They are still the send's words, so if the field's own compose card then closes unsent, the
+    /// answer hands them back (`answered`) as it does when they stayed on the input.
+    private(set) var sentWordsTaken = false
     /// How many changes the words have had: the change counter a live transcript compares.
     private(set) var changes = 0
     /// A compose card opened for the field's send: the reply is the point, so the agent's closing
@@ -178,6 +183,7 @@ struct ChatFieldFill: Equatable {
         case let .said(text):
             words = DictationController.appending(text, to: words)
             holdsSentWords = false
+            sentWordsTaken = false
         case .startHearing:
             hearing = Hearing(base: words, at: changes)
             return
@@ -185,6 +191,7 @@ struct ChatFieldFill: Equatable {
             guard let hearing, hearing.at == changes else { self.hearing = nil; return }
             words = DictationController.appending(transcript, to: hearing.base)
             holdsSentWords = false
+            sentWordsTaken = false
             changes += 1
             self.hearing = Hearing(base: hearing.base, at: changes)
             return
@@ -194,33 +201,49 @@ struct ChatFieldFill: Equatable {
             guard text != words else { return }
             words = text
             holdsSentWords = false
+            sentWordsTaken = false
         case .sentFromSheet:
             atSend = ""
             words = ""
             holdsSentWords = false
+            sentWordsTaken = false
         case .sentFromField:
             atSend = words
             holdsSentWords = true
+            sentWordsTaken = false
             composing = false
         case .completed:
             if clears { words = "" }
             atSend = nil
             holdsSentWords = false
+            sentWordsTaken = false
             composing = false
         case .answered:
             // A compose card that opened for the send owns its completion. The answer comes once
             // the card is done; if it is still composing, the card closed unsent: the answer
-            // empties nothing and hands the words back to the user, so they are kept.
-            if !composing, clears { words = "" }
+            // empties nothing and hands the words back to the user, so they are kept. Words a
+            // confirmation card took off the input before the card opened come back too.
+            if composing {
+                if sentWordsTaken, let atSend { words = atSend }
+            } else if clears {
+                words = ""
+            }
             atSend = nil
             holdsSentWords = false
+            sentWordsTaken = false
             composing = false
         case .composeOpened:
             composing = true
         case .confirmationCard:
             // Same ownership as `answered`: once a compose card opened for the send, the card owns
             // its completion, and a confirmation for another step of the request empties nothing.
-            if !composing, clears { words = ""; holdsSentWords = false }
+            // Before that, it takes the sent words off the input, still the send's words (a
+            // second card finds them taken already).
+            if !composing, clears {
+                if holdsSentWords { sentWordsTaken = true }
+                words = ""
+                holdsSentWords = false
+            }
         }
         if words != before { changes += 1 }
     }

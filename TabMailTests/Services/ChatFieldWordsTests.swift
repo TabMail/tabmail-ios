@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import SQLite3
 import Synchronization
 import Testing
 @testable import TabMail
@@ -885,27 +886,39 @@ struct ChatFieldWordsTests {
         }
     }
 
-    @Test("Every resync (Delete All Email Index Data, Reset Message Data, a UIDVALIDITY change) keeps a thread's old unsent words for the full grace from the reset, whether or not a maintenance pass saw the thread lately; an orphan already past the grace goes; after the resync the words show again",
+    @Test("Every resync (Delete All Email Index Data, Reset Message Data, a UIDVALIDITY change) keeps a thread's old unsent words for the full grace from the reset, whether a maintenance pass last saw the thread partway through the grace or none ran since the words aged past it; once the full grace from the reset passes with the thread still gone its words go; an orphan already past the grace goes; after the resync the words show again",
           arguments: Resync.allCases, [true, false])
     func resyncKeepsTheWordsForTheFullGrace(_ resync: Resync, passSawTheThread: Bool) async throws {
         try await Self.withStore { pool, storage, store in
             try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
             let tag = "\(resync.rawValue)-\(passSawTheThread)"
             let email = Self.header("w-1-\(tag)", thread: "wiped-\(tag)")
-            try await pool.write { try email.insert($0) }
+            // A thread whose email the resync never brings back (deleted on the server meanwhile).
+            let lost = Self.header("w-3-\(tag)", thread: "lost-\(tag)")
+            try await pool.write { db in
+                try email.insert(db)
+                try lost.insert(db)
+            }
             let key = ChatFieldWords.key(for: email)
+            let lostKey = ChatFieldWords.key(for: lost)
             // A thread with no email on the device.
             let orphan = ChatFieldWords.key(for: Self.header("w-2-\(tag)", thread: "gone-\(tag)"))
             let words = "Typed long before the reset"
             store.apply(.put(words), to: key)
+            store.apply(.put("Words of a thread the resync loses"), to: lostKey)
             store.apply(.put("Words of a thread long gone"), to: orphan)
             await store.written()
-            try Self.age(key, pool: pool)
+            for live in [key, lostKey] { try Self.age(live, pool: pool) }
             let database = PrioritizedDatabase(pool: pool)
-            // With `passSawTheThread` false, no maintenance pass ran since the words aged past the
-            // grace (the app was not polled): only the reset itself can mark the thread as seen.
+            // With `passSawTheThread`, the last maintenance pass saw the threads half the grace
+            // before the reset: their words are inside the grace, which ends well before the
+            // reset's. Without it, no pass ran since the words aged past the grace (the app was not
+            // polled): only the reset itself can mark the threads as seen.
             if passSawTheThread {
-                SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: Date())
+                let lastPass = try Self.hours(-SyncConfig.aiCacheOrphanGraceDays * 12, after: Date())
+                SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: lastPass)
+                #expect(try Self.rows(pool).map(\.sessionId).sorted() == [key, lostKey, orphan].sorted(),
+                        "control: the last pass kept every row")
             }
             // The orphan is past the grace when the reset runs.
             try Self.age(orphan, pool: pool)
@@ -913,17 +926,49 @@ struct ChatFieldWordsTests {
             let reset = Date()
             try await resync.run(pool, account: Self.account)
             let left = try await pool.read { try MessageHeader.fetchCount($0) }
-            #expect(left == 0, "control: the reset deleted the thread's email")
-            // The first poll after the reset runs maintenance before the thread is back, an hour
+            #expect(left == 0, "control: the reset deleted the threads' emails")
+            let deadline = try Self.later(SyncConfig.aiCacheOrphanGraceDays, from: reset)
+            // The first poll after the reset runs maintenance before the threads are back, an hour
             // inside the full grace counted from the reset.
-            let inside = try Self.hours(-1, after: try Self.later(SyncConfig.aiCacheOrphanGraceDays, from: reset))
-            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: inside)
-            #expect(try Self.rows(pool).map(\.sessionId) == [key],
-                    "the live thread's words wait out the full grace from the reset; the orphan past the grace went")
+            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: try Self.hours(-1, after: deadline))
+            #expect(try Self.rows(pool).map(\.sessionId).sorted() == [key, lostKey].sorted(),
+                    "the live threads' words wait out the full grace from the reset; the orphan past the grace went")
 
-            // The resync restores the thread.
+            // The resync restores one thread; the other never comes back. An hour past the full
+            // grace from the reset, the lost thread's words go and the restored thread's stay.
             try await pool.write { try email.insert($0) }
-            #expect(await Self.nextRun(storage, key) == words, "the thread's unsent words show again")
+            SyncEngine.runPurgeOrphanedChatFieldWords(dbPool: database, now: try Self.hours(1, after: deadline))
+            #expect(try Self.rows(pool).map(\.sessionId) == [key],
+                    "no email of the lost thread for the full grace from the reset: its words went")
+            #expect(await Self.nextRun(storage, key) == words, "the restored thread's unsent words show again")
+        }
+    }
+
+    @Test("The re-stamp binds one key per statement: more live chats than SQLite's bound-variable limit are all re-stamped, and the transaction it runs in commits")
+    func restampHasNoBoundVariableLimit() async throws {
+        try await Self.withStore { pool, _, store in
+            try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
+            // The writer's limit for this test: twice as many live chats as bound variables.
+            let limit: Int32 = 8
+            let emails = (0..<Int(limit) * 2).map { Self.header("v-\($0)", thread: "bound-\($0)") }
+            try await pool.write { db in
+                for email in emails { try email.insert(db) }
+            }
+            let keys = emails.map { ChatFieldWords.key(for: $0) }
+            for key in keys { store.apply(.put("Words of \(key)"), to: key) }
+            await store.written()
+            for key in keys { try Self.age(key, pool: pool) }
+            let now = Date()
+            let live = try await pool.write { db -> Set<String>? in
+                guard let connection = db.sqliteConnection else { return nil }
+                let previous = sqlite3_limit(connection, SQLITE_LIMIT_VARIABLE_NUMBER, limit)
+                defer { sqlite3_limit(connection, SQLITE_LIMIT_VARIABLE_NUMBER, previous) }
+                return try ChatFieldWords.restampLive(db: db, now: now)
+            }
+            #expect(live == Set(keys), "every live chat's key")
+            let stamps = try Self.rows(pool).map(\.updatedAt)
+            let restamped = stamps.count == keys.count && stamps.allSatisfy { abs($0.timeIntervalSince(now)) < 1 }
+            #expect(restamped, "every row re-stamped: \(stamps)")
         }
     }
 

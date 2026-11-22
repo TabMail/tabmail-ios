@@ -312,8 +312,10 @@ final class ChatFieldWords {
         return purged
     }
 
-    /// Re-stamp to `now`, in one UPDATE, every row whose thread still has an email on the device
-    /// (`ChatThreadKey.memberSQL`), and return their keys. The orphan pass runs it first; every
+    /// Re-stamp to `now` every row whose thread still has an email on the device
+    /// (`ChatThreadKey.memberSQL`), and return their keys. One row at a time, as the AI cache
+    /// re-stamps its kept entries: no statement binds more than one key, so no number of rows meets
+    /// SQLite's bound-variable limit and fails the transaction it runs in. The orphan pass runs it first; every
     /// transaction that deletes emails for a resync runs it before the headers go (Delete All Email
     /// Index Data, `SettingsView.localIndexWipeTxn`; an account's Reset Message Data,
     /// `AccountDetailView.resetMessageDataTxn`; a folder's UIDVALIDITY change,
@@ -322,21 +324,18 @@ final class ChatFieldWords {
     @discardableResult
     nonisolated static func restampLive(db: Database, now: Date) throws -> Set<String> {
         let keys = try String.fetchAll(db, sql: "SELECT sessionId FROM \(ChatFieldWordsRecord.databaseTableName)")
-        var live: [String] = []
+        var live: Set<String> = []
         for key in keys {
             if let (accountId, threadId) = ChatThreadKey.parse(key),
                try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM messageHeader WHERE \(ChatThreadKey.memberSQL))",
                                  arguments: [accountId, threadId, threadId]) == true {
-                live.append(key)
+                try db.execute(
+                    sql: "UPDATE \(ChatFieldWordsRecord.databaseTableName) SET updatedAt = ? WHERE sessionId = ?",
+                    arguments: [now, key])
+                live.insert(key)
             }
         }
-        if !live.isEmpty {
-            let marks = Array(repeating: "?", count: live.count).joined(separator: ",")
-            try db.execute(
-                sql: "UPDATE \(ChatFieldWordsRecord.databaseTableName) SET updatedAt = ? WHERE sessionId IN (\(marks))",
-                arguments: StatementArguments([now]) + StatementArguments(live))
-        }
-        return Set(live)
+        return live
     }
 
     /// Delete every row of the account `accountId`, real and demo: part of the account's

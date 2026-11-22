@@ -994,17 +994,32 @@ struct ChatFieldWordsRuntimeTests {
         }
     }
 
-    @Test("A field request's own reply card closed unsent, then a confirmation card of the same request, then its answer: the sent words are the user's again, in the field, on the device and after a relaunch")
-    func closedOwnCardThenConfirmationKeepsTheSend() async throws {
+    /// What else a field request does around its own reply card that closes unsent.
+    enum AroundClosedOwnCard: String, CaseIterable, CustomTestStringConvertible {
+        /// A confirmation card (an archive) after the card closed: it empties nothing.
+        case confirmationAfter
+        /// A confirmation card before the card opened: it takes the sent words off the field, and
+        /// the card closing unsent hands them back.
+        case confirmationBefore
+        /// A forward card sent after the card closed: part of the request went out, so its Send
+        /// completes the field's send and the words go.
+        case forwardSentAfter
+        var testDescription: String { rawValue }
+        var keepsTheWords: Bool { self != .forwardSentAfter }
+    }
+
+    @Test("A field request's own reply card closed unsent, with a confirmation card of the same request before or after it, then its answer: the sent words are the user's again, in the field, on the device and after a relaunch; a forward card of the request sent after it completes the send and the words go",
+          arguments: AroundClosedOwnCard.allCases)
+    func closedOwnCardThenConfirmationKeepsTheSend(_ around: AroundClosedOwnCard) async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can drive the hosted field")
         try await HostedAccessibility.withAutomation {
             try await Self.withDatabase { pool in
                 try FolderEpochTestFixture.insertFolder(accountId: "words", path: "INBOX", role: .inbox, pool: pool)
-                let email = Self.header("closed-confirm", thread: "closed-confirm-thread")
+                let email = Self.header("closed-\(around.rawValue)", thread: "closed-thread-\(around.rawValue)")
                 try await pool.write { try email.insert($0) }
                 let key = ChatFieldWords.key(for: email)
-                let sent = "Reply that Friday works and archive the rest"
-                // One invocation for the whole request: its card and its confirmation carry the same field key.
+                let sent = "Reply that Friday works, archive the rest and forward it to the team"
+                // One invocation for the whole request: its cards and its confirmation carry the same field key.
                 let invocation = Self.invocation(.fieldUnchanged, email: email)
                 let backend = ThreadChatTests.Backend(holdAnswers: true)
                 try await ThreadChatTests.withBackend(backend, chatView: true) {
@@ -1014,6 +1029,18 @@ struct ChatFieldWordsRuntimeTests {
                     try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
                     let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
                     #expect(asked, "control: the request reached the backend")
+                    let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: email))
+                    let sink = SessionUISink(session: session, fieldWordsKey: invocation.fieldWordsKey)
+                    let card = AgentToolRouter.ActionConfirmation(
+                        action: .archive, emails: [], contacts: [], calendarEvents: [], templates: [], onRespond: { _ in })
+
+                    if around == .confirmationBefore {
+                        // The request raises a confirmation card (an archive) before its reply card.
+                        sink.deliverConfirmation(card)
+                        try await Self.settle()
+                        let afterCard = ChatFieldWords.shared.fill(for: key)
+                        #expect(afterCard.words == "" && afterCard.atSend == sent, "the card took the sent words off the field: \(afterCard)")
+                    }
 
                     // The field's own reply card opens and closes unsent.
                     let result = try await Self.sendCompose(.reply, invocation, email: email, pool: pool, outcome: .cancelled)
@@ -1021,31 +1048,45 @@ struct ChatFieldWordsRuntimeTests {
                     let composing = ChatFieldWords.shared.fill(for: key).composing
                     #expect(composing, "control: the field's own card owns the send")
 
-                    // The same request then raises a confirmation card (an archive).
-                    let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: email))
-                    let card = AgentToolRouter.ActionConfirmation(
-                        action: .archive, emails: [], contacts: [], calendarEvents: [], templates: [], onRespond: { _ in })
-                    SessionUISink(session: session, fieldWordsKey: invocation.fieldWordsKey).deliverConfirmation(card)
-                    try await Self.settle()
-                    let afterCard = ChatFieldWords.shared.fill(for: key)
-                    #expect(afterCard.words == sent, "the confirmation empties nothing: \(afterCard)")
+                    switch around {
+                    case .confirmationAfter:
+                        // The same request then raises a confirmation card (an archive).
+                        sink.deliverConfirmation(card)
+                        try await Self.settle()
+                        let afterCard = ChatFieldWords.shared.fill(for: key)
+                        #expect(afterCard.words == sent, "the confirmation empties nothing: \(afterCard)")
+                    case .confirmationBefore:
+                        break
+                    case .forwardSentAfter:
+                        // The same request then forwards the email, and the user sends the forward.
+                        let forward = try await Self.sendCompose(.forward, invocation, email: email, pool: pool)
+                        #expect(forward.contains("sent successfully"), "control: the forward went out: \(forward)")
+                        let afterSend = ChatFieldWords.shared.fill(for: key)
+                        #expect(afterSend.words == "" && afterSend.atSend == nil, "the forward's Send completed the send: \(afterSend)")
+                    }
 
                     // The request's answer.
                     backend.proceed.signal()
                     try await ThreadChatTests.wait { !ActiveAgentTracker.shared.anyWorking }
                     try await Self.settle()
                     let fill = ChatFieldWords.shared.fill(for: key)
-                    #expect(fill.words == sent && fill.unsent == sent && fill.atSend == nil && !fill.composing,
-                            "the words are the user's again: \(fill)")
                     let texts = Self.fieldTexts(pill.view)
-                    #expect(texts.contains(sent), "the words stay in the field: \(texts)")
+                    #expect(fill.atSend == nil && !fill.composing, "the answer ended the send: \(fill)")
+                    if around.keepsTheWords {
+                        #expect(fill.words == sent && fill.unsent == sent, "the words are the user's again: \(fill)")
+                        #expect(texts.contains(sent), "the words are in the field: \(texts)")
+                    } else {
+                        #expect(fill.words == "" && fill.unsent == "", "the words stay gone: \(fill)")
+                        #expect(!texts.contains(sent), "the field is empty: \(texts)")
+                    }
                 }
+                let expected = around.keepsTheWords ? sent : ""
                 await ChatFieldWords.shared.written()
-                #expect(try Self.stored(pool) == [key: sent], "kept on the device")
+                #expect(try Self.stored(pool) == (expected.isEmpty ? [:] : [key: expected]), "kept on the device only when handed back")
                 // A relaunch: a fresh store on the same database.
                 await Self.newRun { PrioritizedDatabase(pool: pool) }
                 await ChatFieldWords.shared.load(key)
-                #expect(ChatFieldWords.shared.fill(for: key).words == sent,
+                #expect(ChatFieldWords.shared.fill(for: key).words == expected,
                         "after a relaunch: \(ChatFieldWords.shared.fill(for: key).words)")
             }
         }

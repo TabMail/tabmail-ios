@@ -544,6 +544,30 @@ struct ChatReplyFieldTests {
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer"), .confirmationCard).words == "Newer")
     }
 
+    @Test("Sent words a confirmation card took off the field come back when the field's own card then closes unsent; an edit since, or a completion, keeps them gone")
+    func confirmationBeforeTheOwnCardHandsTheWordsBack() {
+        // A confirmation card first (an archive), then the field's own reply card, closed unsent:
+        // the answer hands the words back as it does when they stayed in the field.
+        let taken = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard)
+        #expect(taken.words == "" && taken.unsent == "" && taken.sentWordsTaken, "the card took them: \(taken)")
+        let handedBack = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .answered)
+        #expect(handedBack.words == "Ask" && handedBack.unsent == "Ask" && handedBack.atSend == nil
+                    && !handedBack.composing && !handedBack.sentWordsTaken, "\(handedBack)")
+        // A second confirmation before the card finds them taken already.
+        let twice = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .confirmationCard, .composeOpened, .answered)
+        #expect(twice.words == "Ask", "\(twice)")
+        // The user's edit after the card took them is the user's: nothing comes back over it.
+        let edited = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, Self.typed("x"), Self.typed(""), .composeOpened, .answered)
+        #expect(edited.words == "", "\(edited)")
+        let newer = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, Self.typed("Newer"), .composeOpened, .answered)
+        #expect(newer.words == "Newer", "\(newer)")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .said("more"), .composeOpened, .answered).words
+                    == DictationController.appending("more", to: ""))
+        // With no card of the field's own the answer completes the send; a card's Send completes it.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .answered).words == "")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .completed, .answered).words == "")
+    }
+
     @Test("Words cleared and retyped to the sent text after Send are newly written: kept, never emptied by the send")
     func retypedSentTextIsNewWords() {
         // Unchanged sent words: not kept, and the send's answer empties them.

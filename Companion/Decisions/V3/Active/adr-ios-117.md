@@ -43,7 +43,10 @@ chat's field, also after the app is closed.
    Once shown, the words are the field's words like typed ones: a request the user starts reads them as
    it reads typed words, their Send, and a dictation into the field, whose cleanup context is the
    field's text (`DynamicIslandChat.dictationContext`) (2026-11-22: the user's own words on screen, in a
-   request the user starts; not a store leak). The table is part of the app's database, which the
+   request the user starts; not a store leak). A dictation that starts by itself (Auto-Enable
+   Dictation, which the user turned on, as a pill opens or after an answer) is the user's dictation
+   into the field too and reads the field's text the same way, restored words included (2026-11-22,
+   later: no request reads the stored words apart from what the field shows). The table is part of the app's database, which the
    device's own backup carries like the rest of it (the chat history, the Outbox, drafts): "on this
    iPhone only" means the app never syncs or sends the words, not that they are kept out of the
    user's own device backup (2026-11-22, later).
@@ -52,8 +55,9 @@ chat's field, also after the app is closed.
 5. **Lifetime: the thread's AI data rule.** A thread's words stay while any email of that thread (its
    account, its thread id: `ChatThreadKey.memberSQL`) is on the device. A row whose thread no
    maintenance pass has seen with an email for `SyncConfig.aiCacheOrphanGraceDays` is deleted; every pass
-   first re-stamps the rows whose thread still has an email (`ChatFieldWords.restampLive`, one UPDATE, as
-   the AI cache re-stamps its kept entries), so emails briefly gone (a UIDVALIDITY resync re-walking, a
+   first re-stamps the rows whose thread still has an email (`ChatFieldWords.restampLive`, one row at a
+   time as the AI cache re-stamps its kept entries, so no statement binds more than one key and no
+   number of rows meets SQLite's bound-variable limit; 2026-11-22, later), so emails briefly gone (a UIDVALIDITY resync re-walking, a
    move between folders) never cost the words. Every transaction that deletes emails for a resync
    runs the same re-stamp before the headers go: Delete All Email Index Data
    (`SettingsView.localIndexWipeTxn`, 2026-11-22), an account's Reset Message Data
@@ -109,7 +113,11 @@ chat history the same key already keeps, and goes with that thread's AI data and
   its answer empties the sent words. A confirmation card the same request raises once the field's own
   card opened empties nothing either (`apply(.confirmationCard)` checks `composing` as the answer does,
   2026-11-22): the card owns the completion, so the words a closed card hands back are never lost to a
-  confirmation for another step of the request.
+  confirmation for another step of the request. A confirmation card that comes BEFORE the field's own
+  card opened takes the sent words off the field (the request shows in the sheet) but they stay the
+  send's (`ChatFieldFill.sentWordsTaken`, until any edit of the words or the send's end): if the own card
+  then closes unsent, the answer hands them back as it does when they stayed on the field (2026-11-22,
+  later). An edit since then is the user's, and nothing comes back over it.
 - A request that opens several cards (a reply and a forward, say): any card's Send completes the
   field's send (`enqueueComposeAndAwaitOutcome` applies `.completed` for every sent card carrying the
   field key), also after the field's own reply card closed unsent. Part of what the words asked for
@@ -134,15 +142,16 @@ chat history the same key already keeps, and goes with that thread's AI data and
 **Tests:** `ChatFieldWordsRuntimeTests` (Back and reopen, the newer email of the thread, another thread
 and another account never show them, a new store after a restart, two pills on one chat, a failed or left
 read, an emptying before the read lands, a pill moving between chats while reads are held, the email
-screen's pill and the inbox control, a demo's words through `DemoModeService.exit`, a chat opened from the Search sheet over the sheet's dismissal, an earlier request's card and answer after the pill moved to another chat, an answer after the chat was torn down, newer words typed while the agent works, a closed card then the answer with and without an AI Suggestion shown at Send, the field's own card closed unsent then a confirmation of the same request then the answer), `ChatReplyRecoveryTests` (`fieldEditCardClosedUnsentKeepsTheWords`: a field edit of the AI Suggestion whose card the agent's real `email_reply` opens, closed unsent, hands the words back, kept and shown again after a relaunch; `resumedFieldRequestCompletesTheFieldWords`: the field's Retry on the unchanged sent words resumes with one stored user turn; `editedFieldWordsSendAnew`: an edit, even to the same text, turns Retry into Send and sends a new request; `newerSendEndsTheRecovery`: Retry on the unchanged words only for a cut-off, Send after a plain failure; `inboxPillWordsAfterCutOffOfferSend`: the inbox pill's own words after a cut-off offer Send; `cutOffRecoveryNamesTheFieldOnlyForItsOwnRequest`: a sheet send's recovery names no field words), `SearchChatWordsUITests` (the real Search route: type, Back, Done, reopen), `ChatFieldWordsTests`
+screen's pill and the inbox control, a demo's words through `DemoModeService.exit`, a chat opened from the Search sheet over the sheet's dismissal, an earlier request's card and answer after the pill moved to another chat, an answer after the chat was torn down, newer words typed while the agent works, a closed card then the answer with and without an AI Suggestion shown at Send, the field's own card closed unsent with a confirmation of the same request after it or before it, then the answer; the own card closed unsent then a forward of the same request sent, which completes the send), `ChatReplyRecoveryTests` (`fieldEditCardClosedUnsentKeepsTheWords`: a field edit of the AI Suggestion whose card the agent's real `email_reply` opens, closed unsent, hands the words back, kept and shown again after a relaunch; `resumedFieldRequestCompletesTheFieldWords`: the field's Retry on the unchanged sent words resumes with one stored user turn; `editedFieldWordsSendAnew`: an edit, even to the same text, turns Retry into Send and sends a new request; `newerSendEndsTheRecovery`: Retry on the unchanged words only for a cut-off, Send after a plain failure; `inboxPillWordsAfterCutOffOfferSend`: the inbox pill's own words after a cut-off offer Send; `cutOffRecoveryNamesTheFieldOnlyForItsOwnRequest`: a sheet send's recovery names no field words), `SearchChatWordsUITests` (the real Search route: type, Back, Done, reopen), `ChatFieldWordsTests`
 (store restart, keying, clearing on send and on an emptied field, every newer intention against a held
 read, a late read, a failed read, a failed read after an edit, reads landing only on their own chat, writes during a write and a failed
 write, a removed account's or ended demo's words never handed to a write again, no words in failure logs, purge with the thread's AI data per account and for a threadless email,
-a re-stamp inside the grace, every resync (index wipe, Reset Message Data, UIDVALIDITY purge) with or
-without a recent pass keeping live words for the full grace from the reset while an orphan past the
-grace goes, account removal, demo wipe), `SyncMaintenanceTests.maintenanceRunsThePurge` (the real
+a re-stamp inside the grace, every resync (index wipe, Reset Message Data, UIDVALIDITY purge) with a
+last pass partway through the grace or none since the words aged keeping live words for the full grace
+from the reset and no longer, while an orphan past the grace goes, a re-stamp of more live chats than
+the connection's bound-variable limit, account removal, demo wipe), `SyncMaintenanceTests.maintenanceRunsThePurge` (the real
 maintenance pass purges an orphan's words and keeps a live thread's),
 `FieldReplyCardWordsTests` (the field's own card: the suggestion edit, a copy in another account or
 folder; not its own: another email, an older email of the same thread chat), `ChatReplyFieldTests` (a confirmation
-card after the field's own card opened), `ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField` (the
+card after the field's own card opened; one before it, handing the words back unless edited since), `ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField` (the
 sheet's re-sends send with no field, and a send's field key comes from its field alone).

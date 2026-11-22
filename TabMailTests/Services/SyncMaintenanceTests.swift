@@ -686,7 +686,7 @@ struct AICachePurgeTests {
         let liveWords = ChatThreadKey.key(accountId: "acc1", threadId: MessageIdentity.headerId(accountId: "acc1", folderPath: "Archive", messageId: "3"))
         let goneWords = ChatThreadKey.key(accountId: "acc1", threadId: "gone-thread")
         let aged = try #require(Calendar.current.date(byAdding: .day, value: -pastGrace, to: Date()))
-        try f.pool.write { db in
+        try await f.pool.write { db in
             for key in [liveWords, goneWords] {
                 try ChatFieldWordsRecord(sessionId: key, words: "Unsent words", updatedAt: aged).insert(db)
             }
@@ -696,7 +696,7 @@ struct AICachePurgeTests {
 
         #expect(try cache(f, "acc1:INBOX:gone@example.com") == nil)
         #expect(try cache(f, "acc1:Archive:live@example.com") != nil)
-        let words = try f.pool.read { try String.fetchAll($0, sql: "SELECT sessionId FROM chatFieldWords") }
+        let words = try await f.pool.read { try String.fetchAll($0, sql: "SELECT sessionId FROM chatFieldWords") }
         #expect(words == [liveWords], "the live email's chat keeps its words; the gone thread's go")
     }
 
