@@ -959,16 +959,19 @@ struct ChatReplyFieldTests {
     @Test("""
     A reply the agent writes to mixed-case named mailboxes is Reply All exactly when it holds the \
     whole audience, a Reply-To entry with no address included and someone moved to Bcc alone; \
-    the card keeps each field's mailboxes in their case and the entry as written
+    the card keeps each field's mailboxes with their names and case, and the entry as written
     """)
     func agentReplyAudienceIsComparedAsComposeReadsIt() {
+        // The Reply-To writes the entry with no address in another case than the agent does, so
+        // both sides of the comparison must fold the case.
+        let startEntry = "Undisclosed-Recipients:;"
         var email = Self.header("n1")
-        email.replyTo = "Alex Doe <alex@example.com>, undisclosed-recipients:;"
+        email.replyTo = "Alex Doe <alex@example.com>, \(startEntry)"
         email.to = "me@example.com, David Roe <David@Example.com>"
         email.cc = "Sam Poe <sam@example.com>"
         let audience = buildReplyAllRecipients(for: email, allAccounts: [Self.me])
-        #expect(audience.to == ["alex@example.com", "undisclosed-recipients:;", "david@example.com"] && audience.cc == ["sam@example.com"],
-                "control: the audience is Alex, the entry with no address, David and Sam")
+        #expect(audience.to == ["alex@example.com", startEntry, "david@example.com"] && audience.cc == ["sam@example.com"],
+                "control: the audience is Alex, the entry with no address as written, David and Sam")
 
         let alex = "\"Alex Doe\" <Alex@Example.com>"
         let noAddress = "undisclosed-recipients:;"
@@ -990,6 +993,8 @@ struct ChatReplyFieldTests {
             ("everyone, David moved to Bcc alone", [alex, noAddress], [sam], [davidBcc], true),
         ]
         let envelope = ChatReplyCompose.suggestionEnvelope(for: email, accounts: [Self.me])
+        #expect(envelope.to == ["alex@example.com", startEntry, "david@example.com"] && envelope.cc == ["sam@example.com"],
+                "control: the AI Suggestion's envelope keeps the entry as the Reply-To wrote it, not as the agent does")
         for item in cases {
             // As the AI reply tool builds it: the AI Suggestion's envelope, as the agent edited it.
             let edited = envelope.with(
@@ -1007,8 +1012,8 @@ struct ChatReplyFieldTests {
             for field in fields {
                 let card = RecipientEntry(field.card ?? [])
                 let agent = RecipientEntry(field.agent)
-                #expect(card.addresses == agent.addresses && card.leftovers == agent.leftovers,
-                        "\(item.name): the card's \(field.name) keeps the agent's mailboxes in their case and the entry as written")
+                #expect(card.recipients == agent.recipients && card.leftovers == agent.leftovers,
+                        "\(item.name): the card's \(field.name) keeps the agent's mailboxes, their names and their case, and the entry as written")
             }
         }
     }
