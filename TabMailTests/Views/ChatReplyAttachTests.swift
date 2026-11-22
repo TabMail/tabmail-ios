@@ -10,6 +10,12 @@ import UIKit
 import UniformTypeIdentifiers
 @testable import TabMail
 
+/// The two orders a Files picker can report a pick and close in (`hostedFilesPicker`). At file
+/// scope: a test's arguments cannot name a member of its own suite.
+enum PaperclipFilesOrder: CaseIterable, Sendable {
+    case reportsThenCloses, closesThenReports
+}
+
 /// ADR-IOS-114 decision 10: the paperclip in every chat's reply field.
 ///
 /// THE SYSTEM PROPERTY pinned here: something picked with the paperclip opens the reply's compose
@@ -179,7 +185,7 @@ struct ChatReplyAttachTests {
         // The paperclip shows only once the chat can tell the user's own addresses from the others.
         #expect(Self.count("suggestion: shown, attach: knowsAudience ? attachFromField : nil),", in: chat) == 1, "the field shows the paperclip")
         #expect(Self.count("let knowsAudience = viewModel.hasLoadedThread && context.isLoaded && context.accounts.contains(where: { $0.id == newest.accountId })", in: chat) == 1)
-        #expect(Self.count("private func attachFromField(_ source: ChatNewEmailField.AttachSource) { guard TutorialCoordinator.shared.admits(.other) else { return } switch source { case .photos: showsPhotoPicker = true case .camera: showsCamera = true case .files: showsFilePicker = true } }", in: chat) == 1,
+        #expect(Self.count("private func attachFromField(_ source: ChatNewEmailField.AttachSource) { guard TutorialCoordinator.shared.admits(.other) else { return } paperclipPickerOpen = true switch source { case .photos: showsPhotoPicker = true case .camera: showsCamera = true case .files: showsFilePicker = true } }", in: chat) == 1,
                 "each choice opens its own picker; the tutorial's mail actions are off")
         // Each picker hands its pick over, and the card opens from the picker's onDismiss.
         #expect(Self.count(".sheet(isPresented: $showsPhotoPicker, onDismiss: openPendingAttachCard) { PhotoLibraryPickerView { providers in attachPicked(.photos(providers)) } }", in: chat) == 1)
@@ -193,7 +199,12 @@ struct ChatReplyAttachTests {
         #expect(Self.count("private func attachPicked(_ pick: ComposeAttachmentPick) { guard let newest = thread.newest else { return }", in: chat) == 1,
                 "the newest email, not the opened one")
         #expect(Self.count("pendingAttachCard = ChatReadyReply( attaching: pick, to: newest, onlyTo: replyTarget.only, shown: shownSuggestion(on: newest, thread: thread), accounts: context.accounts)", in: chat) == 1)
-        #expect(Self.count("private func openPendingAttachCard() { guard let card = pendingAttachCard else { return } pendingAttachCard = nil readyReply = card }", in: chat) == 1)
+        #expect(Self.count("private func openPendingAttachCard() { paperclipPickerOpen = false guard let card = pendingAttachCard else { return } pendingAttachCard = nil readyReply = card }", in: chat) == 1)
+        // A pick a picker reports after its onDismiss (the Files picker can close itself first)
+        // opens at once; one reported while the picker is open waits for the onDismiss.
+        #expect(Self.count("accounts: context.accounts) if !paperclipPickerOpen { openPendingAttachCard() } }", in: chat) == 1)
+        #expect(Self.count("paperclipPickerOpen = true", in: chat) == 1, "set only by the menu's choice")
+        #expect(Self.count("paperclipPickerOpen = false", in: chat) == 2, "its start, and the picker's onDismiss")
         #expect(Self.count("readyReply = ", in: chat) == 2, "the ghost's tap and the paperclip's pick, through the one presenter")
         // The pickers, and a pick waiting for its picker to close, count as presentations over the chat.
         #expect(Self.count("|| forwardMessage != nil || showsReplyTo || showsMove || showsPhotoPicker || showsFilePicker || showsCamera || pendingAttachCard != nil", in: chat) == 1)
@@ -322,8 +333,18 @@ struct ChatReplyAttachTests {
         NotificationCenter.default.post(name: .chatPaperclipOpenForTesting, object: source)
     }
 
-    @Test("In the chat, a file picked in the paperclip's Files picker opens the Reply All card once the picker has closed")
-    func hostedFilesPicker() async throws {
+    /// The picked file in the card: its chip, or compose's report that it could not be added (a
+    /// test's file is not one the Files picker grants access to). Either shows the card took the
+    /// file; a card that dropped it shows neither.
+    private static func fileShown(_ name: String, card: UIView, in chat: ChatReplyRecoveryTests.Chat) -> Bool {
+        if cardLabels(card).contains(where: { $0.contains(name) }) { return true }
+        guard let alert = presented(UIAlertController.self, over: chat) else { return false }
+        return alert.title == "Attachments Not Added" || (alert.message ?? "").contains(name)
+    }
+
+    @Test("In the chat, a file picked in the paperclip's Files picker opens the Reply All card with it, whether the picker reports before or after it closes",
+          arguments: PaperclipFilesOrder.allCases)
+    func hostedFilesPicker(order: PaperclipFilesOrder) async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
         let backend = ChatReplyRecoveryTests.Backend(failure: .serverError, asksForReply: false)
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -339,8 +360,19 @@ struct ChatReplyAttachTests {
                 let delegate = try #require(picker.delegate, "the Files picker reports its pick to the chat")
                 #expect(ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view).isEmpty,
                         "control: no card is open while the picker is")
-                // The pick, as the picker reports it; the picker then closes, and only then the card opens.
-                delegate.documentPicker?(picker, didPickDocumentsAt: [file])
+                switch order {
+                case .reportsThenCloses:
+                    // The pick while the picker is open; the picker then closes, and only then the card opens.
+                    delegate.documentPicker?(picker, didPickDocumentsAt: [file])
+                case .closesThenReports:
+                    // The Files picker can close itself before it reports, as UIKit's own picker does.
+                    picker.dismiss(animated: true)
+                    try await ChatReplyRecoveryTests.waitUntil { chat.controller.presentedViewController == nil }
+                    #expect(chat.controller.presentedViewController == nil, "control: the picker closed itself")
+                    try await Task.sleep(for: Self.cardWouldHaveOpened)
+                    #expect(chat.controller.presentedViewController == nil, "control: nothing opened before the pick")
+                    delegate.documentPicker?(picker, didPickDocumentsAt: [file])
+                }
                 try await ChatReplyRecoveryTests.waitUntil {
                     ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view)["to"]?.isEmpty == false
                 }
@@ -350,6 +382,9 @@ struct ChatReplyAttachTests {
                 #expect(ChatReplyRecoveryTests.addresses(recipients["to"]).union(ChatReplyRecoveryTests.addresses(recipients["cc"]))
                             == ["alex@example.com", "david@example.com", "sam@example.com"],
                         "the card goes to everyone on the email: \(recipients)")
+                try await ChatReplyRecoveryTests.waitUntil { Self.fileShown("notes.txt", card: card, in: chat) }
+                #expect(Self.fileShown("notes.txt", card: card, in: chat),
+                        "the card took the file (its chip, or its report that it could not be added): \(Self.cardLabels(card).prefix(30))")
             }
         }
     }

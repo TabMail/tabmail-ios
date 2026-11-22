@@ -129,6 +129,10 @@ struct ChatThreadView: View {
     @State private var showsFilePicker = false
     @State private var showsCamera = false
     @State private var pendingAttachCard: ChatReadyReply?
+    /// A paperclip picker is open: from the menu's choice until its `onDismiss`. A pick that lands
+    /// while it is waits for that `onDismiss`; one a picker reports after it (the Files picker can
+    /// close itself first) opens at once, since nothing is closing any more.
+    @State private var paperclipPickerOpen = false
     @Environment(\.dismiss) private var dismiss
     /// The app's accounts: a new email's card opens from its bound account, looked up here.
     @Environment(NavigationStore.self) private var navigationStore
@@ -1208,6 +1212,7 @@ struct ChatThreadView: View {
     /// tutorial's mail actions are off.
     private func attachFromField(_ source: ChatNewEmailField.AttachSource) {
         guard TutorialCoordinator.shared.admits(.other) else { return }
+        paperclipPickerOpen = true
         switch source {
         case .photos: showsPhotoPicker = true
         case .camera: showsCamera = true
@@ -1218,7 +1223,7 @@ struct ChatThreadView: View {
     /// Something picked with the paperclip: the reply's compose card with it, read as the pick
     /// lands, as a send from the field is: on the newest email, to whom the field's reply goes, with
     /// the suggestion the chat shows (`ChatReadyReply(attaching:)`). It opens once the picker has
-    /// closed (`openPendingAttachCard`).
+    /// closed (`openPendingAttachCard`), at once if it already has.
     private func attachPicked(_ pick: ComposeAttachmentPick) {
         guard let newest = thread.newest else { return }
         if DebugModeManager.isLoggingEnabled() {
@@ -1227,10 +1232,12 @@ struct ChatThreadView: View {
         pendingAttachCard = ChatReadyReply(
             attaching: pick, to: newest, onlyTo: replyTarget.only,
             shown: shownSuggestion(on: newest, thread: thread), accounts: context.accounts)
+        if !paperclipPickerOpen { openPendingAttachCard() }
     }
 
     /// The paperclip's picker has closed: the card its pick made, if any, opens now.
     private func openPendingAttachCard() {
+        paperclipPickerOpen = false
         guard let card = pendingAttachCard else { return }
         pendingAttachCard = nil
         readyReply = card

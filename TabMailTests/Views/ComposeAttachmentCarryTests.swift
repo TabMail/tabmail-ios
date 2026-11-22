@@ -305,6 +305,11 @@ struct ComposeAttachmentCarryTests {
         #expect(complete.lowerBound < publish.lowerBound, "failures are published once the item settles")
         let done = try #require(body.range(of: "done()"))
         #expect(publish.lowerBound < done.lowerBound, "what runs afterward (the selection clearing) runs after every item settled")
+        // Inside the same task, after the loader returns: outside it, the selection would clear
+        // while the items still load.
+        let bodyFlat = body.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        #expect(bodyFlat.contains("publishAttachmentPreparationFailuresIfSettled() }) done() } }"),
+                "done() runs in the loading task, once the loader has returned: \(bodyFlat.suffix(160))")
         #expect(body.contains("load: load,"), "each item loads with its picker's own loader")
         #expect(body.contains("recordAttachmentPreparationFailure"), "a failed item is surfaced as compose's preparation failure")
         // What the loader gives compose lands in compose's own list, named by what is there.
