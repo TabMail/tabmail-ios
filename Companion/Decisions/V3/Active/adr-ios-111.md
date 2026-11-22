@@ -1011,6 +1011,8 @@ its own SELECT.
    list (`SyncEngine.uidWalkProgress`). Before the first folder list nothing is published. The wake lock
    reads the folders' walk state and fails closed: an account not polled, or with no folder rows, is not
    done.
+   *Superseded (2026-11-22, #1273):* "Before the first folder list nothing is published." See the amendment
+   of that date below: until the provider's total is known, progress is the database's own.
 
 **Consequences.** A folder whose listing proves nothing keeps its earlier counters and rows and is listed
 again next pass. The engine stays provider-blind. No column, no migration (`listingDue` lives in
@@ -1213,3 +1215,29 @@ before); a progress-only bookmark write fails a concurrent crawl range or load-o
 Keywords: IMAPChangeMode, CHANGEDSINCE, flagsChangedSince, messageCount, provenFrom, pendingCheck,
 IMAPRemovalCheckProgress, imapChangeRemovalCheckWindow, numericIdsBelow, IMAPChangeCountMismatch, mustList,
 heldRowsProof, arrivalRowsProof, fromServerInsertAllowed, ChangeInsertPremise, stagedRowProvenGone, heldSyncTurn, #755.
+
+### Amendment 2026-11-22 (#1273): backfill progress before the provider's total is known
+
+**Context.** Item 9 of the #755 amendment published no backfill progress while `progressTotal` answered
+`.notKnownYet`. IMAP knows its total only after `fetchFolders` ran in this process, Outlook only after a full
+sync's `fetchFullSyncFolders`; the routine passes are change reads, which list no folders. So after a launch
+an IMAP (iCloud included) or Outlook account's Fast Sync card read "Waiting..." for a long time, also when its
+walk was complete. 1.11.4 always published progress from the database.
+
+**Decision.** `SyncEngine.updateBackfillProgressForAccount` publishes while the total is not known yet. A
+`.notKnownYet` answer adds no UID scope (`uidTotal` 0) and no server total, so the published progress is the
+database's own: messages stored (`totalEmails`), settled (`ftsIndexed`), still owed a body
+(`pendingBodyCount`) and the walk's state (`headersDone`), hence the completed state ("N messages indexed")
+once every folder's walk is done and no body is owed. Once the provider's total is known it sharpens the
+denominator exactly as before (IMAP's UID scope from the folder list, Outlook's folder-list sum while
+crawling). A provider not registered yet still publishes nothing.
+
+**What stays.** Progress never reads the stored folder counters (`totalCount`, `lastKnownUidNext`), which
+only a proven listing writes; an unproven count is never shown as a denominator. Completion still gates on
+`pendingBodyCount` (PROJECT_MEMORY "Backfill / Fast Sync Completion").
+
+**Consequences.** Before a folder list the card's bar is "settled of stored", which can read near 100% while
+the walk still runs; it shows no check mark until the walk is done. No column, no migration.
+
+Keywords: progressTotal, notKnownYet, updateBackfillProgressForAccount, Fast Sync Waiting, FastSyncAccountCard,
+BackfillProgress, #1273.

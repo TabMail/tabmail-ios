@@ -220,16 +220,21 @@ struct ExchangeFolderTreeTests {
         #expect(requests.withLock { $0 } == sent, "asking for the total sends no request")
     }
 
-    @Test("Backfill progress on a new Exchange account: nothing is published before the folder list (never 0, never the row count); after it the denominator is the provider total, folders never listed in the database included")
-    func progressWaitsForTheFolderListThenUsesTheProviderTotal() async throws {
+    @Test("Backfill progress on an Exchange account before its first full sync is the database's own (stored and settled messages, never the stored folder count); after it the denominator is the provider total, folders never listed in the database included")
+    func progressBeforeTheFolderListIsTheDatabasesThenUsesTheProviderTotal() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: "/v1.0/me/mailFolders", handler: Self.serve)
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let account = try FolderEpochTestFixture.makeAccount(id: "exch-progress", provider: .outlook, pool: pool)
-        // One stored folder, still crawling; every other folder is not in the database.
-        try FolderEpochTestFixture.insertFolder(accountId: account.id, path: "f-inbox", role: .inbox, pool: pool)
+        // One stored folder, still crawling, with a stored count far from its rows;
+        // every other folder is not in the database.
+        try FolderEpochTestFixture.insertFolder(accountId: account.id, path: "f-inbox", role: .inbox, pool: pool, totalCount: 500)
+        try FolderEpochTestFixture.insertHeaders(accountId: account.id, path: "f-inbox", uids: [1, 2, 3], pool: pool)
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE accountId = ? AND messageId = '1'", arguments: [account.id])
+        }
         let provider = ExchangeProvider(
             userEmail: "folder-tree@example.com", accessToken: { _ in "fake-graph-token" }, session: http.session)
         let engine = SyncEngine()
@@ -237,8 +242,16 @@ struct ExchangeFolderTreeTests {
                               workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
         await AccountManager.shared.clearBackfillProgress(accountId: account.id)
 
+        let source = await provider.progressTotal(crawling: true)
+        #expect(source == .notKnownYet, "precondition: no full sync has run in this process")
         await engine.updateBackfillProgressForAccount(account)
-        #expect(await AccountManager.shared._backfillBacking[account.id] == nil, "nothing is published before the folder list")
+        let before = try #require(await AccountManager.shared._backfillBacking[account.id],
+                                  "progress is published before the folder list")
+        #expect(before.totalEmails == 3, "the messages stored, never the stored folder count")
+        #expect(before.ftsIndexed == 1)
+        #expect(before.pendingBodyCount == 2)
+        #expect(before.uidTotal == 0)
+        #expect(!before.headersDone && !before.isFullyComplete)
 
         // The scheduled full sync on a cold provider (no folder list since
         // launch) lists the folders even when the change read says it applied
