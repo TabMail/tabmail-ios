@@ -56,12 +56,15 @@ final class SearchChatWordsUITests: XCTestCase {
         result.tap()
     }
 
+    /// The chat's reply field: by its placeholder while it is empty, by the test's words once it
+    /// holds them (a multi-line field reports no placeholder while it has text). Every access
+    /// queries again, so the one query has to match the field both ways.
     private func replyField(in app: XCUIApplication) -> XCUIElement {
         let field = app.descendants(matching: .any).matching(NSPredicate(
-            format: "(elementType == %d OR elementType == %d) AND placeholderValue == %@",
+            format: "(elementType == %d OR elementType == %d) AND (placeholderValue == %@ OR value == %@)",
             XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue,
-            Self.replyPlaceholder)).firstMatch
-        XCTAssertTrue(field.waitForExistence(timeout: 15), "control: the chat's reply field, found by its placeholder")
+            Self.replyPlaceholder, Self.words)).firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 15), "control: the chat's reply field, found by its placeholder or the words")
         return field
     }
 
