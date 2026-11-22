@@ -393,15 +393,20 @@ struct ChatFieldDragTests {
         let cut = ChatFieldPan.Cut()
         let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: cut)
         #expect(cut.recognizer === pan, "the chat's cut holds this pan")
+        // The pan's own delegate would refuse a start with no travel; the cut does not involve it.
+        pan.delegate = nil
         cut()
         #expect(pan.state == .possible, "no drag held: nothing to cut")
         pan.state = .began
         pan.state = .changed
+        #expect(pan.state == .changed, "control: the drag is held")
         cut()
         #expect(pan.state == .cancelled, "a held drag ends as an interrupted one")
         let other = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: cut)
         #expect(cut.recognizer === other, "a rebuilt pan takes the cut over")
+        other.delegate = nil
         other.state = .began
+        #expect(other.state == .began, "control: the drag has begun")
         cut()
         #expect(other.state == .cancelled, "a drag cut as it begins, before it moves, ends as an interrupted one")
     }
@@ -425,9 +430,12 @@ struct ChatFieldDragTests {
         let ownPans = first.recognizer === firstPan && second.recognizer === secondPan
         #expect(ownPans, "each chat's cut has its own pan after both are made")
         for pan in [firstPan, secondPan] {
+            pan.delegate = nil
             pan.state = .began
             pan.state = .changed
         }
+        let bothHeld = firstPan.state == .changed && secondPan.state == .changed
+        #expect(bothHeld, "control: both drags are held")
         first()
         #expect(firstPan.state == .cancelled, "the first chat's held drag is cut")
         #expect(secondPan.state == .changed, "the other chat's held drag is not")

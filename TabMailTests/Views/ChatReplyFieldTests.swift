@@ -1216,9 +1216,9 @@ struct ChatReplyFieldTests {
         #expect(Self.count("withAnimation(Self.pillSpring) { fieldDrag.progress = ChatFieldDrag.Progress() if opens { chatExpanded = true } }", in: ended) == 1)
         // The freeze, under its own id, from the gesture state, so a cancelled drag releases.
         #expect(Self.count(".modifier(ChatFieldDrag.Watch(model: fieldDrag) { fieldDragChanged($0) })", in: chat) == 1)
-        let bar = try Self.source("TabMail/Views/Chat/ChatFieldBarRow.swift")
-        #expect(Self.count("content.onChange(of: model.progress.isDragging) { _, dragging in changed(dragging) }", in: bar) == 1)
-        #expect(Self.count("content.padding(.top, sign * (model?.progress.swell ?? 0))", in: bar) == 1)
+        let dragModifiers = try Self.source("TabMail/Views/Chat/ChatFieldBarRow.swift")
+        #expect(Self.count("content.onChange(of: model.progress.isDragging) { _, dragging in changed(dragging) }", in: dragModifiers) == 1)
+        #expect(Self.count("content.padding(.top, sign * (model?.progress.swell ?? 0))", in: dragModifiers) == 1)
         let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
         #expect(Self.count("ChatSwipeHold.shared.begin(Self.fieldDragHoldId)", in: changed) == 1)
         // Every let-go holds through the settle and the freeze rule's cooldown, on the swipes' own

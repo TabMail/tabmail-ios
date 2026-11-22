@@ -408,12 +408,16 @@ final class ChatSwipeUITests: XCTestCase {
             add(found)
         }
         // VoiceOver can still reach the waiting card's words (tabmail-ios#1255, a VoiceOver-only
-        // issue fixed later): expected to fail until then, so the upright half below still runs.
+        // issue fixed later): expected to fail until then. The launch helper stops at the first
+        // failure and an expected one counts, so it is let through here and the upright half below
+        // still runs.
         let voiceOverIssue = XCTExpectedFailure.Options()
         voiceOverIssue.isStrict = false
+        continueAfterFailure = true
         XCTExpectFailure("tabmail-ios#1255: a tip card waiting for room stays in the accessibility tree", options: voiceOverIssue) {
             XCTAssertFalse(words.exists, "and none of its words")
         }
+        continueAfterFailure = false
         app.terminate()
 
         XCUIDevice.shared.orientation = .portrait
@@ -605,6 +609,10 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the drag scrolled the overflowing text; the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "and the field kept its focus")
         let watched = dragMarkerLabel(afterDrags: 1, in: app)
+        // Where the drag left it: the caret is at the draft's end, so a scroll to the caret after the
+        // let-go would still leave a line other than Line 1 at the top.
+        XCTAssertEqual(dragMarker(afterDrags: 1, in: app)?.textMove, "none",
+                       "after the let-go the text stayed where the drag left it (marker: \(watched))")
         let after = topLine(of: long, in: app)
         XCTAssertNotNil(after, "control: a line is at the text's top")
         XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag (marker: \(watched))")
@@ -655,6 +663,7 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
         let watched = dragMarkerLabel(afterDrags: 1, in: app)
+        XCTAssertEqual(marker.textMove, "none", "after the let-go the text stayed where the drag left it (marker: \(watched))")
         let after = topLine(of: long, in: app)
         XCTAssertNotNil(after, "control: a line is at the text's top")
         XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag (marker: \(watched))")
@@ -1646,6 +1655,9 @@ final class ChatSwipeUITests: XCTestCase {
         /// How often the reply field's editor was built while the last drag's finger was down; nil
         /// while that drag has not let go or when the marker does not say.
         let downBuilds: Int?
+        /// The text under the last drag's first move of a point or more after its let-go, while the
+        /// marker watched (`none`: it stayed where the drag left it); nil when the marker does not say.
+        let textMove: String?
     }
 
     /// `<top>:<bottom>`, or nil for "none".
@@ -1675,7 +1687,8 @@ final class ChatSwipeUITests: XCTestCase {
                           events: fields["events"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) },
                           tipWaiting: fields["wait"].map { $0 == "1" },
                           pan: fields["pan"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) },
-                          downBuilds: fields["builds"]?.split(separator: ":").first.flatMap { Int($0) })
+                          downBuilds: fields["builds"]?.split(separator: ":").first.flatMap { Int($0) },
+                          textMove: fields["textMove"])
     }
 
     /// The marker once it has seen `drags` drags and stopped watching the last one.
