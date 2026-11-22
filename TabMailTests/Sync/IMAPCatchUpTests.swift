@@ -613,6 +613,33 @@ struct IMAPCatchUpTests {
         }
     }
 
+    /// A listing in progress already knows the folder's top, so its call reads
+    /// no UIDNEXT first: the range's own listing FETCH is the first request to
+    /// see the new numbering, and its epoch check alone keeps that numbering's
+    /// flags off the old rows.
+    @Test("A turnover first seen by a resumed listing's range FETCH applies no flags")
+    func turnoverSeenByAResumedListingAppliesNoFlags() async throws {
+        let raised = Mutex<[UInt32]>([])
+        AccountManager.shared.setUidValidityChangeHandlerForTesting { _, _, _, observed in
+            raised.withLock { $0.append(observed) }
+        }
+        defer { AccountManager.shared.resetUidValidityChangeHandlerForTesting() }
+        let uids = [1, 2, 3]
+        try await Self.withWorld("cu-turnover-resumed", serverUIDs: uids, localUIDs: uids) { world async throws in
+            var listing = IMAPCatchUpState.Listing(firstStamp: nil, nextUid: 1)
+            listing.top = uids.last
+            let resumed = IMAPCatchUpState(epoch: Self.epoch, completionStamp: nil, lastCompletedAt: nil, listing: listing)
+            try Self.setState(resumed, world)
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 1)
+            world.server.setUidValidity(Int(Self.epoch + 1), for: Self.path)
+            await Self.pass(world)
+
+            #expect(try Self.rows(world)["1"]?.isRead == false, "a flag from another numbering is another message's (C3)")
+            #expect(try Self.state(world) == resumed, "the listing in progress is left as it was")
+            #expect(raised.withLock { $0 } == [Self.epoch + 1], "the turnover reaction is raised")
+        }
+    }
+
     @Test("A turnover between a range's listing and its removal proof removes nothing")
     func turnoverBeforeTheRemovalProofRemovesNothing() async throws {
         let raised = Mutex<[UInt32]>([])

@@ -578,6 +578,54 @@ extension IMAPMissingByUIDTests {
         }
     }
 
+    // MARK: - a turnover after the listing's last range answers
+
+    /// The listing is in progress on its last range, so no later range's
+    /// listing SELECT follows in the call: only the checks between this range's
+    /// listing and the insert (its membership proof, the header FETCH's SELECT
+    /// and the epoch that FETCH observed) keep a load across the turnover out.
+    @Test("An epoch turnover right after the listing's last range answers: the missing message the call would load is not inserted, no row lands under the new epoch, and the turnover is reported")
+    @MainActor
+    func turnoverAfterTheLastRangeInsertsNothing() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        let lost = 1010
+        let raised = Mutex<[UInt32]>([])
+        AccountManager.shared.setUidValidityChangeHandlerForTesting { _, _, _, observed in
+            raised.withLock { $0.append(observed) }
+        }
+        defer { AccountManager.shared.resetUidValidityChangeHandlerForTesting() }
+        try await Self.withWorld("turnover-last-range", server: server, local: server) { w in
+            let folderId = w.folderId
+            // The first UID past the first range (`rangeMessages` 1: every range
+            // has the minimum width).
+            let firstPastTheFirstRange = server.first(where: { $0 > SyncConfig.catchUpListingMinRangeSpan })
+            let lastRangeStart = try #require(firstPastTheFirstRange)
+            try await w.markOwed()
+            try await Self.setListing(w, nextUid: lastRangeStart, rangeWidth: nil, top: server.last)
+            try await w.dropLocal([lost])
+            let afterLoss = Set(try w.held())
+            // The mailbox is renumbered right after the range's listing FETCH
+            // answers, keeping the same UIDs, so a load under the new numbering
+            // would find the message.
+            let fresh = Self.epoch + 1
+            w.server.resetMailboxAfterNextSuccessfulResponse(
+                containing: "UID FETCH", mailbox: Self.path, uidValidity: fresh, messages: server.map(Self.message))
+            let start = w.server.recordedCommands().count
+            await w.slice(clock: CatchUpTestClock())
+            let asked = Self.listingRanges(Array(w.server.recordedCommands().dropFirst(start)))
+            #expect(asked.first?.lowerBound == lastRangeStart, "setup: the call listed the last range: \(asked)")
+            let afterSlice = Set(try w.held())
+            #expect(afterSlice.isSubset(of: afterLoss), "#1062: nothing read across the turnover is inserted: \(afterSlice.subtracting(afterLoss).sorted())")
+            let stray = try await w.pool.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader WHERE folderId = ? AND observedUidValidity IS NOT NULL AND observedUidValidity != ?",
+                                 arguments: [folderId, Self.epoch]) ?? 0
+            }
+            #expect(stray == 0, "#1062: no row under the new epoch")
+            let reported = raised.withLock { $0 }
+            #expect(reported.contains(UInt32(fresh)), "#1062: the turnover is reported: \(reported)")
+        }
+    }
+
     // MARK: - I7: seeded schedules through the real catch-up
 
     @Test("Seeded schedules of lost rows, budget cuts, partial header replies, short FETCH replies, user moves (also completing mid-slice), \\Deleted messages and epoch resets (also between the listing and the header FETCH) converge: every message held once, where the server holds it, under its UID and epoch",

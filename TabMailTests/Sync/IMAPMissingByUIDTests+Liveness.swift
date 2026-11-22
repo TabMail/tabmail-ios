@@ -137,6 +137,10 @@ extension IMAPMissingByUIDTests {
             #expect((try w.changeState()).selfHealDue, "#1062: a listing whose loads were skipped does not settle the mark")
             let state = try #require(try w.catchUpState(), "#1062: the stored catch-up state still decodes")
             #expect(state.listing == nil && state.completionStamp != nil, "#1062: the completion is kept, not replaced")
+            // The completion already made this listing unclean: no record of
+            // the skipped loads is left for the next listing, which would then
+            // complete unclean too and never settle the mark.
+            #expect(state.skippedLoads == nil, "#1062: a completed listing leaves no skipped-loads record for the next listing")
             let clock = CatchUpTestClock()
             clock.advance(by: Self.pastTheHold)
             let start = w.server.recordedCommands().count
@@ -191,6 +195,44 @@ extension IMAPMissingByUIDTests {
                 result, windowMode: .uid, readStartedAt: readStartedAt, selfHealOwedAtRead: read.owedAtRead)
             #expect(!(try w.held()).contains(12), "#1062: the latch set in the insert chunk drops the load")
             #expect((try w.changeState()).selfHealDue, "#1062: the dropped load makes the listing unclean")
+        }
+    }
+
+    @Test("The over-age latch never flips back: a wall clock that is past the retention at the insert and then in time again (set back) still withholds the transaction's flag update")
+    @MainActor
+    func overAgeLatchNeverFlipsBack() async throws {
+        let server = Array(1...20) + Array(1001...1060)
+        try await Self.withWorld("owed-latch-back", server: server, local: server) { w in
+            w.server.setFlags(["\\Seen"], in: Self.path, uid: 3)
+            try await w.dropLocal([12])
+            try await w.markOwed()
+            let read = try await w.read(CatchUpContext(deadline: .distantFuture, clock: { Date() }, listingRangeMessages: w.rangeMessages))
+            let result = try #require(read.results.first)
+            let loadsTwelve = result.loaded.contains { $0.id == "12" }
+            let updatesThree = result.flagUpdates.contains { $0.messageId == "3" }
+            #expect(loadsTwelve && updatesThree, "setup: a completion with a load and a flag update")
+            // Checks: before the insert (in time), the one insert chunk (past the
+            // retention), then the transaction and every later one (in time
+            // again, as after the device clock is set back).
+            let readStartedAt = Date()
+            let checks = OSAllocatedUnfairLock(initialState: 0)
+            CatchUpWallClock.nowForTesting.withLock { $0 = {
+                let n = checks.withLock { $0 += 1; return $0 }
+                return n == 2 ? readStartedAt.addingTimeInterval(SyncConfig.catchUpCompletionLogRetentionSeconds + 60)
+                    : readStartedAt.addingTimeInterval(10)
+            } }
+            defer { CatchUpWallClock.nowForTesting.withLock { $0 = nil } }
+            _ = await w.engine.applyCatchUpResult(
+                result, windowMode: .uid, readStartedAt: readStartedAt, selfHealOwedAtRead: read.owedAtRead)
+            let folderId = w.folderId
+            let isRead = try await w.pool.read { db in
+                try Bool.fetchOne(db, sql: "SELECT isRead FROM messageHeader WHERE folderId = ? AND messageId = '3'", arguments: [folderId])
+            }
+            let held = try w.held()
+            let owed = try w.changeState().selfHealDue
+            #expect(!held.contains(12), "#1062: the insert chunk past the retention drops the load")
+            #expect(isRead == false, "#1062: once past the retention the read stays past it: the transaction withholds the flag update")
+            #expect(owed, "#1062: the dropped load keeps the listing unclean")
         }
     }
 

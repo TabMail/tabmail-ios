@@ -299,9 +299,14 @@ extension IMAPMissingByUIDTests {
             w.server.setMessages(expected.map(Self.message), in: Self.path)
             // One request: the load batch, which does not answer the expunged UID.
             await w.slice(maxRequests: 1, clock: clock)
-            let carried = try w.catchUpState()?.listing?.carried
+            let afterStop = try w.catchUpState()?.listing
+            let carried = afterStop?.carried
             #expect(carried?.unanswered == [UInt32(expunged)] && carried?.missing.isEmpty == true,
                     "#1062: the SEARCH the budget left is carried: \(String(describing: carried))")
+            // A budget stop is not a failed request: it starts no hold, so the
+            // carried SEARCH is never passed over however long the next slice waits.
+            #expect(afterStop?.loadHeldSince == nil && afterStop?.passedOver != true,
+                    "#1062: the budget stop holds nothing: \(String(describing: afterStop))")
             let slices = try await Self.slicesUntilRepaired(w, expected: expected, maxRequests: 1, clock: clock,
                                                             bound: 2 * (Self.carryRequestsNeeded + 1))
             #expect(slices <= Self.carryRequestsNeeded + 1, "#1062: converges within the bound: \(slices)")
@@ -363,6 +368,36 @@ extension IMAPMissingByUIDTests {
             let asked = Self.listingRanges(Array(w.server.recordedCommands().dropFirst(start)))
             let above = asked.filter { $0.upperBound > top }
             #expect(above.isEmpty, "#1062: no listing range asks above the server's top \(top): \(above)")
+        }
+    }
+
+    @Test("An owed folder whose top falls inside a listing range, one request per call: the last range is cut at the server's top and no range asks above it")
+    @MainActor
+    func topInsideARangeCutsTheLastRange() async throws {
+        // A top half a range past a range boundary, so a range of the full width
+        // would end above it.
+        let span = SyncConfig.catchUpListingMinRangeSpan
+        let server = Array(1...(2 * span + span / 2))
+        let top = try #require(server.last)
+        let missing = [5, top - 5]
+        try await Self.withWorld("carry-top-inside-a-range", server: server, local: server,
+                                 rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
+            try await w.dropLocal(missing)
+            try await w.markOwed()
+            let clock = CatchUpTestClock()
+            let start = w.server.recordedCommands().count
+            // Per range its listing FETCH, its membership SEARCH and one header
+            // batch; the listing's UIDNEXT read; one call that finds it complete.
+            let ranges = (server.count + span - 1) / span
+            let bound = 3 * ranges + 2
+            let slices = try await Self.slicesUntilRepaired(w, expected: server, maxRequests: 1, clock: clock, bound: 2 * bound)
+            #expect(slices <= bound, "#1062: one request per call converges within \(bound) calls: \(slices)")
+            try w.expectHeldExactly(server, "#1062 top inside a range")
+            let asked = Self.listingRanges(Array(w.server.recordedCommands().dropFirst(start)))
+            let above = asked.filter { $0.upperBound > top }
+            let lastUpper = asked.last?.upperBound
+            #expect(above.isEmpty, "#1062: no listing range asks above the server's top \(top): \(above)")
+            #expect(lastUpper == top, "#1062: the last range ends at the server's top \(top): \(asked)")
         }
     }
 
@@ -501,6 +536,29 @@ extension IMAPMissingByUIDTests {
             let asked = Self.listingRanges(Array(w.server.recordedCommands().dropFirst(start)))
             #expect(asked.isEmpty, "#1062: no range is listed with no local rows and an unknown top: \(asked)")
             #expect(try w.catchUpState()?.listing == nil, "#1062: the listing completed in one call")
+            #expect((try w.changeState()).selfHealDue, "#1062: the folder stays owed")
+        }
+    }
+
+    @Test("A server whose SELECT omits UIDNEXT: a listing that read it, then lost every local row before its next call, completes in that call, sends no range and leaves the folder owed")
+    @MainActor
+    func unknownTopListingWhoseLocalRowsGoCompletesAtOnce() async throws {
+        let server = Array(1...40)
+        try await Self.withWorld("no-uidnext-rows-go", server: server, local: server) { w in
+            try await w.markOwed()
+            w.server.suppressSelectUidNext(for: Self.path)
+            defer { w.server.restoreSelectUidNext(for: Self.path) }
+            let clock = CatchUpTestClock()
+            // The first call reads UIDNEXT and has no budget left for a range.
+            await w.slice(maxRequests: Self.newListingStartRequests, clock: clock)
+            let started = try w.catchUpState()?.listing
+            #expect(started?.topUnknown == true, "setup: the listing goes on with an unknown top: \(String(describing: started))")
+            try await w.dropLocal(server)
+            let start = w.server.recordedCommands().count
+            await w.slice(clock: clock)
+            let asked = Self.listingRanges(Array(w.server.recordedCommands().dropFirst(start)))
+            #expect(asked.isEmpty, "#1062: with an unknown top and no local row left, no range is listed: \(asked)")
+            #expect(try w.catchUpState()?.listing == nil, "#1062: the listing completed in that call")
             #expect((try w.changeState()).selfHealDue, "#1062: the folder stays owed")
         }
     }

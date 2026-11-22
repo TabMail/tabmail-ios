@@ -903,6 +903,7 @@ extension IMAPMissingByUIDTests {
             let listing = try #require(IMAPCatchUpState.decode(result.newState)?.listing, "#1062: the listing stays in progress")
             #expect(listing.nextUid == 7, "#1062: the listing never moves past a range that did not answer")
             #expect(listing.rangeWidth == 1, "#1062: a one-UID range that fails keeps the width 1")
+            #expect(listing.widthCap == 1, "#1062: a one-UID range that fails caps the next range at that one UID: \(String(describing: listing.widthCap))")
             #expect(!result.madeProgress, "#1062: a repeat failure at width 1 is no progress, so the run stops")
         }
     }
