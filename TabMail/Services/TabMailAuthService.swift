@@ -314,7 +314,7 @@ final class TabMailAuthService: NSObject {
         }
 
         let authURL = components.url!
-        BackgroundSyncLogger.logDebug("[TabMailAuth] Opening \(provider.rawValue) OAuth: \(authURL)")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] Opening \(provider.rawValue) OAuth: \(LoggableURL.address(authURL))")
 
         return try await performWebAuth(url: authURL)
     }

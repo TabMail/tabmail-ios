@@ -130,7 +130,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // The query filter is applied client-side (Graph calendarView doesn't support $search),
         // to each page as it is read, so `maxResults` counts matching events, never the rows
         // a page happened to hold. Reading stops once `maxResults` events are listed.
-        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listEvents endpoint: \(endpoint)")
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listEvents endpoint: \(LoggableURL.address(endpoint))")
         let lower = query.flatMap { $0.isEmpty ? nil : $0.lowercased() }
         var events: [GCalEvent] = []
         try await readPages(path: endpoint, logLabel: "listEvents response") { (page: [MSEvent]) in

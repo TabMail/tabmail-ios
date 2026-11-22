@@ -127,7 +127,7 @@ final class OAuthService: NSObject {
         components.queryItems = queryItems
 
         let authURL = components.url!
-        BackgroundSyncLogger.logDebug("[OAuth] authURL: \(authURL)")
+        BackgroundSyncLogger.logDebug("[OAuth] authURL: \(LoggableURL.address(authURL))")
 
         let callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
             let session = ASWebAuthenticationSession(url: authURL, callback: .customScheme(redirectScheme)) { url, error in

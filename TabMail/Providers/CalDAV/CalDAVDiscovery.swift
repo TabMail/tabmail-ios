@@ -36,7 +36,7 @@ enum CalDAVDiscovery {
         // Step 2: Get calendar-home-set from principal
         let calendarHomeURL = try await discoverCalendarHome(principalURL: principalURL, client: client)
 
-        BackgroundSyncLogger.logDebug("[CalDAVDiscovery] principal=\(principalURL), home=\(calendarHomeURL)")
+        BackgroundSyncLogger.logDebug("[CalDAVDiscovery] principal=\(LoggableURL.address(principalURL)), home=\(LoggableURL.address(calendarHomeURL))")
         return DiscoveryResult(principalURL: principalURL, calendarHomeURL: calendarHomeURL)
     }
 

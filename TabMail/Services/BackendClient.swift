@@ -1277,7 +1277,7 @@ extension BackendClient {
 
                 let toolName = toolCall.function.name
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Executing client-side tool: \(toolName) (call_id=\(toolCall.id.prefix(8)))")
-                BackgroundSyncLogger.logDebug("[AIChatDebug]   args: \(toolCall.function.arguments.prefix(200))")
+                BackgroundSyncLogger.logDebug("[AIChatDebug]   args: \(toolCall.function.arguments.utf8.count) bytes")
 
                 // Fire tool-started event for client-side tools (matching server-side SSE events)
                 onSSEEvent?(.toolStarted(ToolStatusEvent(

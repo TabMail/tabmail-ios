@@ -61,11 +61,11 @@ extension OAuthService {
         components.queryItems = queryItems
 
         let authURL = components.url!
-        BackgroundSyncLogger.logDebug("[OAuth] Microsoft authURL: \(authURL)")
+        BackgroundSyncLogger.logDebug("[OAuth] Microsoft authURL: \(LoggableURL.address(authURL))")
 
         let callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
             let session = ASWebAuthenticationSession(url: authURL, callback: .customScheme(redirectScheme)) { url, error in
-                BackgroundSyncLogger.logDebug("[OAuth] Microsoft callback — url: \(String(describing: url)), error: \(String(describing: error))")
+                BackgroundSyncLogger.logDebug("[OAuth] Microsoft callback — url: \(LoggableURL.address(url)), error: \(String(describing: error))")
                 if let error { continuation.resume(throwing: error) }
                 else if let url { continuation.resume(returning: url) }
                 else { continuation.resume(throwing: OAuthError.cancelled) }
