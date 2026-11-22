@@ -592,11 +592,13 @@ extension AgentToolRouter {
     ///   - `ComposeOutcomeState.tryResolve` — atomic first-wins flag
     ///   - `ComposeContinuationGuard.resume` — NSLock-serialized resume
     /// `fieldWordsKey`: the request was sent from the chat's reply field under this chat key
-    /// (`ToolInvocation.fieldWordsKey`). A card asked for in the field (`fieldReply`) marks the
-    /// field composing there, and a sent card completes the field's send there, in `ChatFieldWords`,
-    /// whether or not a chat view still shows it (ADR-IOS-117).
+    /// (`ToolInvocation.fieldWordsKey`). The field's own reply card (`isFieldsOwnReply`,
+    /// `ChatFieldReply.isOwnReply`, decided apart from who it goes to) marks the field composing
+    /// there, and a sent card completes the field's send there, in `ChatFieldWords`, whether or not
+    /// a chat view still shows it (ADR-IOS-117).
     func enqueueComposeAndAwaitOutcome(
         fieldWordsKey: String? = nil,
+        isFieldsOwnReply: Bool = false,
         make: (@escaping @MainActor (ComposeOutcome) -> Void, ComposeOutcomeState) -> ComposeRequest
     ) async -> ComposeOutcome {
         let state = ComposeOutcomeState()
@@ -630,7 +632,7 @@ extension AgentToolRouter {
                     }
                     guard_.resume(returning: outcome)
                 }, state)
-                if let fieldWordsKey, request.fieldReply != nil {
+                if let fieldWordsKey, isFieldsOwnReply {
                     ChatFieldWords.shared.apply(.composeOpened, to: fieldWordsKey)
                 }
                 enqueueCompose(request)

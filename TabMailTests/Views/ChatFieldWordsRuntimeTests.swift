@@ -927,8 +927,9 @@ struct ChatFieldWordsRuntimeTests {
         case none, reply, compose, forward
         var testDescription: String { rawValue }
         var producer: ComposeProducer? { ComposeProducer(rawValue: rawValue) }
-        /// Only the reply tool's card is the field's own (`request.fieldReply`): it owns the
-        /// completion, so its answer hands the words back. Every other answer empties them.
+        /// Only the reply tool's card for the email the field showed is the field's own
+        /// (`ChatFieldReply.isOwnReply`): it owns the completion, so its answer hands the words
+        /// back. Every other answer empties them.
         var keepsTheWords: Bool { self == .reply }
     }
 

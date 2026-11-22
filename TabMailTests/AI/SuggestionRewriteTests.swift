@@ -1290,3 +1290,103 @@ struct SuggestionSinglePathFenceTests {
         #expect(try Self.lines(matching: #"composeViewForAgentRequest"#, in: files).isEmpty)
     }
 }
+
+/// A field request's reply card owns the field's sent words (ADR-IOS-117).
+///
+/// THE SYSTEM PROPERTY pinned here, through `EmailReplyTool` and the field-words store: a reply
+/// card the field's request opens for the email the field showed, any copy of it in any account,
+/// the card of an edit of its AI Suggestion included, owns the send's completion. Closed unsent,
+/// the request's answer hands the sent words back to the user, kept for the next app run. A reply
+/// card for another email does not own it: the answer empties them.
+@Suite("A field request's reply card owns the field's sent words", .serialized, .processGlobalState)
+@MainActor
+struct FieldReplyCardWordsTests {
+
+    /// Which reply card the field's request opens.
+    enum Card: String, CaseIterable, CustomTestStringConvertible {
+        /// The edit of the AI Suggestion shown, beyond its envelope (a new subject): the edit's own card.
+        case suggestionEdit
+        /// A reply to another account's copy of the email shown, where the field's audience does not apply.
+        case otherAccountCopy
+        /// Control: a reply to another email in the same account.
+        case otherEmail
+        var testDescription: String { rawValue }
+        var isFieldsOwn: Bool { self != .otherEmail }
+    }
+
+    /// Field words kept in memory as the database keeps them: a new store on the same rows is the
+    /// next app run.
+    static func storage(_ rows: OSAllocatedUnfairLock<[String: String]>) -> ChatFieldWords.Storage {
+        ChatFieldWords.Storage(
+            read: { key in rows.withLock { $0[key] } },
+            write: { batch in
+                rows.withLock { stored in
+                    for (key, write) in batch { stored[key] = write.words.isEmpty ? nil : write.words }
+                }
+            })
+    }
+
+    @Test("A reply card the field asked for, closed unsent, then the answer: the sent words are the user's again, kept for the next run; a card for another email: the answer empties them",
+          arguments: Card.allCases)
+    func closedUnsentCardThenAnswer(_ card: Card) async throws {
+        let routes = SuggestionRewriteRouteTests()
+        let fixture = try await routes.fixture()
+        let number: Int
+        switch card {
+        case .suggestionEdit:
+            number = 1
+        case .otherAccountCopy:
+            try TestDatabase.insertAccount(fixture.db, id: "acc2", email: "second@example.com")
+            try TestDatabase.insertFolder(fixture.db, accountId: "acc2")
+            let copy = try TestDatabase.insertMessageHeader(
+                fixture.db, messageId: "s3", subject: "Offsite", folderId: "acc2:INBOX", accountId: "acc2",
+                rfc822MessageId: "<offsite@example.com>")
+            await fixture.translator.seed(copy.id, as: 2)
+            number = 2
+        case .otherEmail:
+            let other = try TestDatabase.insertMessageHeader(
+                fixture.db, messageId: "s4", subject: "Lunch", rfc822MessageId: "<lunch@example.com>")
+            await fixture.translator.seed(other.id, as: 3)
+            number = 3
+        }
+        let rows = OSAllocatedUnfairLock<[String: String]>(initialState: [:])
+        let store = ChatFieldWords(storage: Self.storage(rows))
+        let previous = ChatFieldWords.shared
+        ChatFieldWords.shared = store
+        defer { ChatFieldWords.shared = previous }
+
+        // The field sends the user's words about the email it shows, its AI Suggestion showing.
+        let key = ChatFieldWords.key(for: fixture.header)
+        let sent = "Make it more formal"
+        store.apply(.put(sent), to: key)
+        store.apply(.sentFromField, to: key)
+        let invocation = ToolInvocation(
+            fieldReply: ChatFieldReply(email: fixture.header, onlyTo: nil, suggestion: SuggestionRewriteRouteTests.shownReply),
+            fieldWordsKey: key)
+        let tool = routes.tool(fixture, calls: SuggestionRewriteRouteTests.Calls(),
+                               answer: SuggestionRewriteRouteTests.edit(subject: "Re: New plan"))
+        let arguments: [String: JSONValue] = ["unique_id": .int(number), "request": .string(sent)]
+        let task = Task { @MainActor in try await tool.run(arguments: arguments, invocation: invocation, rewritesInPlace: true) }
+        let opened = await routes.waitForCard(fixture.router)
+        let request = try #require(opened, "control: the reply card opened")
+        let onOwnDraft = request.draftId != nil
+        #expect(onOwnDraft == (card == .suggestionEdit), "control: only the suggestion edit's card opens on a draft of its own")
+        let composing = store.fill(for: key).composing
+        #expect(composing == card.isFieldsOwn, "only the field's own reply card owns the send: \(store.fill(for: key))")
+        request.onOutcome(.cancelled)
+        _ = try await task.value
+        let shown = try await routes.row(fixture.db, fixture.header.id).suggestion
+        #expect(shown == SuggestionRewriteRouteTests.shownReply, "control: the stored suggestion is unchanged")
+
+        // The request's answer comes once the card is done.
+        store.apply(.answered, to: key)
+        let expected = card.isFieldsOwn ? sent : ""
+        let fill = store.fill(for: key)
+        #expect(fill.words == expected && fill.unsent == expected, "after the answer: \(fill)")
+        await store.written()
+        let next = ChatFieldWords(storage: Self.storage(rows))
+        await next.load(key)
+        let nextWords = next.fill(for: key).words
+        #expect(nextWords == expected, "the next app run: \(nextWords)")
+    }
+}

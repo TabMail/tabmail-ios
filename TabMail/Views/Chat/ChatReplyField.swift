@@ -271,6 +271,14 @@ struct ChatFieldReply: Sendable, Equatable {
     func audienceApplies(to header: MessageHeader) -> Bool {
         header.accountId == email.accountId && ChatThread.copyKey(header) == ChatThread.copyKey(email)
     }
+
+    /// Whether a reply to `header` is the field's own reply, the card its send asked for: `header`
+    /// is the email the field showed, any copy of it, in any account (`ChatThread.copyKey`). Unlike
+    /// the audience, it holds across accounts: the user asked for this reply in the field, so its
+    /// card owns the send's completion (`ChatFieldFill.Change.composeOpened`).
+    func isOwnReply(to header: MessageHeader) -> Bool {
+        ChatThread.copyKey(header) == ChatThread.copyKey(email)
+    }
 }
 
 /// A send from the chat's reply field, read once as it starts: the email it is about, who the user

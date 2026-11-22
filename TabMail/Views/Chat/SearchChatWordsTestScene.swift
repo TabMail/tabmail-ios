@@ -44,8 +44,11 @@ struct SearchChatWordsTestScene: View {
     private func seed() async {
         do {
             UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
-            // An open goes to the chat only for a subscriber (`MessageOpenView`).
+            // An open goes to the chat only for a subscriber with the AI choice made, AI on
+            // (`MessageOpenView`); the gate and the choice persist across launches, so every run
+            // sets both. Nothing is queued for AI (`resume`).
             AISubscriptionGate.shared.openGate()
+            AIService.recordAIChoice(aiEnabled: true, resume: {})
             let accountID = Self.accountID
             let folder = Self.folder
             try await AppDatabase.dbPool.write { db in

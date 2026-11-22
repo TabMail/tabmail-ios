@@ -386,6 +386,70 @@ struct ChatReplyRecoveryTests {
         }
     }
 
+    /// The draft bodies the field request's compose edits were given.
+    final class EditedBodies: Sendable {
+        let all = Mutex<[String]>([])
+    }
+
+    @Test("A field edit request sent while Reply to hides the AI Suggestion carries none: recovered, it writes a fresh reply only to David, never the hidden Reply All")
+    func hiddenSuggestionFieldRequestKeepsItsChoice() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
+        let backend = Backend(failure: .serverError, editRequest: "make it formal")
+        let edited = EditedBodies()
+        let composeEdit: EmailReplyTool.ComposeEdit = { _, _, body, _ in
+            edited.all.withLock { $0.append(body) }
+            return try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+                response: "Done.", subject: "Re: Plans", body: "Hi David,\n\nFriday works.\n\nThanks",
+                textMessage: "Friday works", changeCommand: "")))
+        }
+        try await HostedAccessibility.withAutomation {
+            try await withChat(backend, tag: "hidden-ghost", suggestion: Self.shownSuggestion, composeEdit: composeEdit) { chat in
+                let router = AgentToolRouter.shared
+                try await Self.waitUntil { Self.ghosts(in: chat.view).contains { $0.text == Self.shownSuggestion.textMessage } }
+                #expect(Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage],
+                        "control: the chat shows the AI Suggestion: \(Self.ghosts(in: chat.view).map(\.text))")
+                // Reply only to David: the Reply All suggestion steps aside.
+                try await Self.toggle(["alex@example.com", "sam@example.com"], in: chat)
+                #expect(Self.replyingOnlyTo(in: chat.view) != nil, "control: the chat replies only to David")
+                try await Self.waitUntil { Self.ghosts(in: chat.view).isEmpty }
+                #expect(Self.ghosts(in: chat.view).isEmpty,
+                        "control: the suggestion is hidden: \(Self.ghosts(in: chat.view).map(\.text))")
+
+                // The field asks for an edit; the first request fails, and Retry recovers it.
+                try await Self.waitUntil { Self.type("Make it formal", in: chat.view) }
+                #expect(Self.type("Make it formal", in: chat.view), "control: the field takes words")
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
+                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.count == 1, "control: the request went out once and failed")
+                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
+                router.composePresentationDidBegin()
+                #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
+                        "control: the field offers Retry: \(HostedAccessibility.identifiers(in: chat.view))")
+                try await Self.waitUntil { router.composeQueueDepth == 1 }
+                #expect(router.composeQueueDepth == 1, "control: the recovered turn opened a reply card")
+
+                let request = try #require(router.firstQueuedRequestForTesting)
+                #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == ["david@example.com"],
+                        "the request keeps the email shown and the choice made: \(String(describing: request.fieldReply))")
+                #expect(request.fieldReply?.suggestion == nil, "the hidden suggestion was not the field's")
+                let editedBodies = edited.all.withLock { $0 }
+                #expect(editedBodies == [""], "a fresh reply was written, not an edit of the hidden suggestion: \(editedBodies)")
+                let reply = (isReplyAll: request.isReplyAll, to: request.to, cc: request.cc, bcc: request.bcc)
+                #expect(!reply.isReplyAll && reply.to == ["david@example.com"] && reply.cc.isEmpty && reply.bcc.isEmpty,
+                        "a plain reply to only David: \(reply)")
+                let emailId = chat.email.id
+                let stored = try await chat.pool.read { try MessageHeader.fetchOne($0, key: emailId) }
+                #expect(stored?.suggestion == Self.shownSuggestion, "the stored suggestion is unchanged")
+
+                // The card the chat opens is left open; closing the chat ends its turn.
+                router.composePresentationDidEnd()
+                try await Self.waitUntil { chat.controller.presentedViewController != nil }
+            }
+        }
+    }
+
     @Test("A field request with nobody chosen, recovered after a failure, replies to everyone whatever Reply to shows when recovered",
           arguments: Failure.allCases)
     func recoveredFieldRequestKeepsReplyAll(failure: Failure) async throws {
