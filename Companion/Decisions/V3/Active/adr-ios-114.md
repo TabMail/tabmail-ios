@@ -1229,11 +1229,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    ends at the bar, on screen, as far above the field as the newest email was before it; it
    measures the chat's motion, not the row's own transition).
 
-22. **A new email starts as an empty chat (amendment 2026-11-21).** With the chat view on, the inbox
-   compose button pushes an empty chat (`ChatNewThreadView`, `ChatNewThreadModel`) instead of
+22. **A new email starts as an empty chat (amendment 2026-11-21).** With the chat view on, the mailbox
+   list's compose button pushes an empty chat (`ChatNewThreadView`, `ChatNewThreadModel`) instead of
    presenting compose; off, compose opens as before (`ChatNewThreadRoute.composeButton`, the setting
-   read once at the tap). This amendment covers the inbox compose button only; other ways of
-   starting an email (a contact, the email screen, links, the iPad split view) still open compose.
+   read once at the tap). The mailbox list (`InboxView`) is the list of every folder, so this is the
+   compose button of the Inbox, Sent, Drafts and every other folder alike. Other ways of starting an
+   email (a contact, the email screen, links, the iPad split view) still open compose.
    - *The chat.* The header sits where every chat's header is, with one empty avatar and "Add
      recipient" until people are picked (`ChatHeaderView(people:emptyTitle:hint:)`); the line under
      it reads "New email"; the chat area says "New email. Type what you want to say, or ask TabMail
@@ -1247,12 +1248,15 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    - *Add recipient.* The header's tap opens the "Reply to" sheet titled "Add recipient"
      (`ChatReplyToSheet(title:)`), starting from the people already picked (none at first) with its
      contact search and typed address; Done needs someone ticked (`ChatReplyToChoice.canFinish`), and
-     its result replaces the picked people (`ChatNewDraft.people(after:current:)`). No "Recent"
+     its result replaces the picked people (`ChatNewDraft.people(after:current:)`). The user's own
+     addresses (every account's address, read as the chat opens) are never added
+     (`ChatReplyToChoice.add(_:name:ownAddresses:)`), as in the "Reply to" sheet. No "Recent"
      section: a recent-people source is separate work.
    - *Attachments.* Picked photos and videos, a camera photo and files wait above the field
      (`ChatAttachmentTray`: photos as thumbnails, files as chips, each with an x). They are named and
      typed by the rules compose uses (`DraftAttachmentImport`, moved out of `ComposeView` with tests
-     pinning its behaviour first); a save waits for photos still loading
+     pinning its behaviour first), and picked photos load through the loader compose uses
+     (`DraftAttachmentImport.loadPicked`); a save waits for photos still loading
      (`ComposeAttachmentCarryGate`); items that do not load are listed in "Couldn't add".
    - *Send.* With nobody picked, Send asks "Who is this to?" ("Add at least one recipient to send
      this email.", Add recipient / Cancel) and the words and attachments stay
@@ -1269,10 +1273,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      something to keep (`ChatNewDraft.needsSave`): a chat with no saved draft saves only words or
      attachments (people alone are not kept, and an empty chat leaves nothing in Drafts); a saved
      draft is saved whenever what the chat holds changed, emptied included. Nothing here deletes a
-     draft: an emptied draft is removed only by compose's Discard. The save is compose's
-     (`ChatNewDraftSave.run`: a fail-closed read, the attachments staged, the row saved through the
-     chat's generation (`ComposeGenerationCursor`), staged or superseded files removed only after the
-     commit, then `queueDraftSave`); a subject, Cc or Bcc the row already holds is kept. Back leaves
+     draft: an emptied draft is removed only by compose's Discard. The save is compose's own writer,
+     which compose's Save also uses (`ComposeDraftSave.run`: a fail-closed read, the attachments
+     staged, the row saved through the chat's generation (`ComposeGenerationCursor`), staged or
+     superseded files removed only after the commit), then `queueDraftSave` (`ChatNewDraftSave.run`);
+     a subject, Cc or Bcc the row already holds is kept. Back leaves
      only once the save is durable; a refused save keeps the chat open and offers "Leave without
      saving" or "Stay". Back replaces the system Back, so the edge swipe back is off in this chat.
      While the chat is open its draft is exempt from eviction (`DraftSessionRegistry`).
@@ -1287,9 +1292,19 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      saved-draft path of decision 9's 2026-11-15 amendment is unchanged for every other draft.
    - *Later, with the compose card.* The compose card stays today's compose; the chat's draft is
      deleted only once the card's Send has a durable outbox row (never-drop). The card's delivery and
-     the Sending bubble, found by the email's own Message-ID, come with that work.
+     the Sending bubble come with that work, decided now so it is built on them:
+     - The card reaches this chat through `ComposeOrigin`, the way every agent compose card reaches
+       the screen that asked for it; the new chat counts as a chat origin and has no origin concept
+       of its own.
+     - The Sending bubble finds the email's outbox row by the email's own Message-ID (a new email
+       has no In-Reply-To for `ChatUnsentReply` to find it by).
+     - When that email's Sent copy lands, the new chat becomes the ordinary chat of its thread
+       (`ChatThreadView`), as a reply's bubble hands over to its Sent copy (decision 10).
+     - The undo toast follows the chat's rule for every send: it is hidden only for a send that has
+       a Sending bubble, so a new email sent from this chat shows its bubble, not the toast.
    Tests: `ChatNewThreadTests` (routing, the pure decisions, the saves against a real database, the
-   reopen route, the source wiring), `DraftAttachmentImportTests`.
+   reopen route, the source wiring), `ComposeDraftSaveTests` (the shared writer against a real
+   database), `DraftAttachmentImportTests`.
 
 ## The longer index line (routed 2026-11-09)
 
