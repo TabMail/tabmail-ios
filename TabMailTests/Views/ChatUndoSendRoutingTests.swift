@@ -485,8 +485,10 @@ struct ChatUndoSendRoutingTests {
                 try await chat.expectUndosOnItsOwnHold(row, Undos(bubble: 0, toast: 1), "sent: the toast's Undo")
                 try await Self.holdOpen(row, fixture)
                 try await chat.expectUndos(Undos(bubble: 0, toast: 1), "sent: only the toast's Undo")
-                // The toast's close, as its presenter runs it.
-                PendingSendService.shared.dismiss()
+                // The user taps the toast's close (×) on screen, through RootView's presenter.
+                #expect(HostedAccessibility.activate(PendingSendToast.closeId, in: chat.controller.view),
+                        "the user closes the toast")
+                #expect(PendingSendService.shared.undoOwner(for: row.id) == .bubble, "the close handed its Undo to the bubble")
                 try await chat.expectUndos(Undos(bubble: 1, toast: 0), "the toast closed: only the bubble's Undo")
             }
         }

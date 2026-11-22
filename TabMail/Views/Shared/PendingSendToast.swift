@@ -28,6 +28,9 @@ struct PendingSendToast: View {
     let onUndo: () -> Void
     let onDismiss: () -> Void
 
+    /// The close (×) button's accessibility identifier.
+    static let closeId = "pendingSendToastClose"
+
     var body: some View {
         TimelineView(.animation) { context in
             switch PendingSendToastPhase.resolve(
@@ -67,6 +70,7 @@ struct PendingSendToast: View {
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.6))
                 }
+                .accessibilityIdentifier(Self.closeId)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)

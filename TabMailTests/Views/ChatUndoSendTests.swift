@@ -939,13 +939,18 @@ struct ChatUndoSendTests {
         try await Self.setHold(pool, row.id, Date().addingTimeInterval(3600))
         // The summary made at Send, which the bubble shows (`ChatUnsentReply.summary`): the real Send
         // writes it to the AI cache under the row's Sent folder and Message-ID; the queue write alone
-        // does not.
+        // does not. The cache keeps a summary's text only with its blurb, as `SentEmailSummary` writes both.
         let sentMessageId = EmailFilter.normalizeMessageId(try #require(row.sentMessageId, "control: the queued row has its Message-ID"))
         try await pool.write { db in
             try MessageAICache.writeThrough(
                 accountId: Self.account, folderPath: "Sent", rfc822MessageId: sentMessageId,
-                summaryTextMessage: "I said Tuesday works.", db: db)
+                summaryBlurb: "Tuesday works.", summaryTextMessage: "I said Tuesday works.", db: db)
         }
+        let key = try #require(
+            MessageAICache.cacheKey(accountId: Self.account, folderPath: "Sent", rfc822MessageId: sentMessageId),
+            "control: the summary's cache key")
+        let cached = try await pool.read { db in try MessageAICache.fetchOne(db, key: key)?.summaryTextMessage }
+        #expect(cached == "I said Tuesday works.", "control: the summary the bubble shows is cached before the chat mounts")
         let chat = try Self.host(fixture)
         defer { chat.close() }
         func drawn() throws -> String? {
