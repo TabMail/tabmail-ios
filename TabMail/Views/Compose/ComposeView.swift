@@ -2058,21 +2058,10 @@ struct ComposeView: View {
     }
 
     private func handlePhotoPickerItemsChange(_ items: [PhotosPickerItem]) {
-        guard !items.isEmpty else { return }
-        attachmentCarryGate.begin(items.count)
-        Task { @MainActor in
-            await DraftAttachmentImport.loadPicked(
-                items,
-                load: { item in (try await item.loadTransferable(type: Data.self), item.supportedContentTypes.first) },
-                existingCount: { attachments.count },
-                add: { attachments.append($0) },
-                fail: { recordAttachmentPreparationFailure($0) },
-                settled: { succeeded in
-                    attachmentCarryGate.completeOne(succeeded: succeeded)
-                    publishAttachmentPreparationFailuresIfSettled()
-                })
-            photoPickerItems = []
-        }
+        addPickedPhotos(
+            items,
+            load: { item in (try await item.loadTransferable(type: Data.self), item.supportedContentTypes.first) },
+            then: { photoPickerItems = [] })
     }
 
     /// ADR-IOS-030: Track ComposeView lifecycle so AgentToolRouter's FIFO queue
@@ -3572,9 +3561,35 @@ struct ComposeView: View {
             BackgroundSyncLogger.logDebug("[ComposeView] adding the pick made before opening instance=\(instanceToken) draftId=\(draftId)")
         }
         switch attachmentPick {
-        case .photos(let items): handlePhotoPickerItemsChange(items)
+        case .photos(let providers): addPickedPhotos(providers, load: { try await DraftAttachmentImport.providedItem($0) })
         case .camera(let image): addCameraPhoto(image)
         case .files(let urls): handleFileImport(.success(urls))
+        }
+    }
+
+    /// Photos and videos picked, with the card's own Photos button or with the chat's paperclip
+    /// before it opened: all counted into the carry gate at once, so Send waits for them, then
+    /// loaded one after another through the shared loader; each one settles the gate whether it
+    /// loaded or not, and one that did not is reported. `then` runs once every item has settled.
+    private func addPickedPhotos<Item>(
+        _ items: [Item],
+        load: @escaping @MainActor (Item) async throws -> (data: Data?, type: UTType?),
+        then done: @escaping @MainActor () -> Void = {}
+    ) {
+        guard !items.isEmpty else { return }
+        attachmentCarryGate.begin(items.count)
+        Task { @MainActor in
+            await DraftAttachmentImport.loadPicked(
+                items,
+                load: load,
+                existingCount: { attachments.count },
+                add: { attachments.append($0) },
+                fail: { recordAttachmentPreparationFailure($0) },
+                settled: { succeeded in
+                    attachmentCarryGate.completeOne(succeeded: succeeded)
+                    publishAttachmentPreparationFailuresIfSettled()
+                })
+            done()
         }
     }
 

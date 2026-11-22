@@ -277,24 +277,36 @@ struct ComposeAttachmentCarryTests {
 
     @Test("Photos-picker work joins the same attachment completion boundary")
     func photoPickerPreparationCannotBeSnapshottedMidImport() throws {
-        let body = try functionBody(
+        let source = try composeSource()
+        // The card's Photos button: its picker's items, loaded and typed by their first content
+        // type, through the one step that adds picked photos; the selection clears afterward.
+        let picker = try functionBody(
             "private func handlePhotoPickerItemsChange(_ items: [PhotosPickerItem]) {",
             before: "private func performLifecycleAppear()",
-            in: composeSource())
-        let begin = try #require(body.range(of: "attachmentCarryGate.begin"))
-        let load = try #require(body.range(of: "await item.loadTransferable"))
+            in: source)
+        let pickerFlat = picker.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        #expect(pickerFlat.contains("addPickedPhotos( items, load: { item in (try await item.loadTransferable(type: Data.self), item.supportedContentTypes.first) }, then: { photoPickerItems = [] })"),
+                "the picker's items load whole, typed by their first content type, and the selection clears once they settled: \(pickerFlat)")
+        #expect(!picker.contains("try? await item.loadTransferable"),
+                "a selected attachment that fails to load must be surfaced, not silently omitted")
+
+        let body = try functionBody(
+            "private func addPickedPhotos<Item>(",
+            before: "// MARK: - File Import",
+            in: source)
+        #expect(body.contains("guard !items.isEmpty else { return }"),
+                "clearing the selection (no items) counts nothing into the gate")
+        let begin = try #require(body.range(of: "attachmentCarryGate.begin(items.count)"))
+        let load = try #require(body.range(of: "await DraftAttachmentImport.loadPicked("))
         let complete = try #require(body.range(of: "attachmentCarryGate.completeOne"))
         #expect(begin.lowerBound < load.lowerBound && load.lowerBound < complete.lowerBound,
                 "every selected item must be counted before its async load and settled afterward")
-        #expect(!body.contains("try? await item.loadTransferable"),
-                "a selected attachment that fails to load must be surfaced, not silently omitted")
         let publish = try #require(body.range(of: "publishAttachmentPreparationFailuresIfSettled()"))
         #expect(complete.lowerBound < publish.lowerBound, "failures are published once the item settles")
-        let cleared = try #require(body.range(of: "photoPickerItems = []"))
-        #expect(publish.lowerBound < cleared.lowerBound, "the picker's selection clears after every item settled")
+        let done = try #require(body.range(of: "done()"))
+        #expect(publish.lowerBound < done.lowerBound, "what runs afterward (the selection clearing) runs after every item settled")
+        #expect(body.contains("load: load,"), "each item loads with its picker's own loader")
         #expect(body.contains("recordAttachmentPreparationFailure"), "a failed item is surfaced as compose's preparation failure")
-        #expect(body.contains("item.supportedContentTypes.first"), "a picked item is typed by its first content type")
-        #expect(body.contains("await DraftAttachmentImport.loadPicked("), "compose loads picked items through the loader the chat shares")
         // What the loader gives compose lands in compose's own list, named by what is there.
         #expect(body.contains("existingCount: { attachments.count },"), "a picked item is named by the attachments already there")
         #expect(body.contains("add: { attachments.append($0) },"), "every item that loads is added to the compose")

@@ -575,10 +575,13 @@ same AI result, kept as long as the email itself is shown.
    **The paperclip in every chat's reply field (amendment 2026-11-22).** Every chat's reply field,
    not only a new email's (decision 24), shows the paperclip at the end of its text, inside the
    field, so the row's mic, text and Send keep their places (`ChatReplyField.paperclip`,
-   `ChatPaperclipButton`): Photos, Camera or Files. A pick opens the reply's compose card with it
-   attached, through the presenter the ghost's tap uses (`ChatThreadView.openAttachCard`,
-   `ChatReadyReply(attaching:to:onlyTo:shown:accounts:)`), read as the pick lands, as a send from the
-   field is: on the newest email, to whom the field's reply goes (Reply All with the suggestion's
+   `ChatPaperclipButton`): Photos, Camera or Files. It shows once the chat knows to whom the reply
+   goes: the thread has loaded, and the newest email's account is among the accounts loaded, so a
+   pick never opens a card for the wrong people. A pick opens the reply's compose card with it
+   attached, through the presenter the ghost's tap uses
+   (`ChatReadyReply(attaching:to:onlyTo:shown:accounts:)`), read as the pick lands
+   (`ChatThreadView.attachPicked`), as a send from the field is: on the newest email, to whom the
+   field's reply goes (Reply All with the suggestion's
    envelope, `ChatReplyCompose.suggestionEnvelope`, or a plain reply to only the people chosen in
    Reply to, `ChatReplyCompose.onlyTo`), with the AI Suggestion the chat shows in its box and no
    other. So the box is empty while the reply goes only to some of the people (the suggestion was
@@ -588,12 +591,18 @@ same AI result, kept as long as the email itself is shown.
    overwrites no other reply draft. The card adds the pick once its draft has loaded, after the
    fields' starting state is recorded (`ComposeView.attachmentPick`, `addAttachmentPick`), through its
    own Photos, Camera and Files steps: a photo still loading holds Send (ADR-IOS-074), a photo or
-   file that cannot be read is reported, and Close asks before losing the pick. The camera's photo
-   opens the card once the camera's cover has closed, so the card's cover never opens over a closing
-   one; a Files picker that fails shows "Couldn't add". The field's words stay as they are; a sent
-   card clears "Replying only to" (decision 11). The tutorial's mail actions
-   keep the paperclip off. Tests: `ChatReplyAttachTests` (the card's value, its wiring, and a photo
-   through the hosted chat for Reply All and for a reply to only some of the people).
+   file that cannot be read is reported, and Close asks before losing the pick. The library's
+   photos load through the step the card's own Photos button uses (`ComposeView.addPickedPhotos`,
+   item by item with `DraftAttachmentImport.providedItem`). The card opens only once the picker has
+   closed (`ChatThreadView.openPendingAttachCard`, from each picker's `onDismiss`): UIKit refuses a
+   presentation while the chat is still closing the picker. So Photos and Files are UIKit pickers a
+   sheet presents (`PhotoLibraryPickerView`, `FilePickerView`), as the camera's is
+   (`CameraPickerView`); the SwiftUI `photosPicker` and `fileImporter` tell only that a pick landed,
+   not when their picker has gone. The field's words stay as they are; a sent card clears "Replying
+   only to" (decision 11). The tutorial's mail actions keep the paperclip off. Tests:
+   `ChatReplyAttachTests` (the card's value, its wiring, the pickers, and a camera photo and a
+   library photo through the hosted chat for Reply All and for a reply to only some of the people),
+   `DraftAttachmentImportTests` (the library item's loading).
 
 11. **Who gets the reply, and Forward (amendment 2026-11-05).** The
    reply is a Reply All to the newest email's people by default (`ChatReplyTarget.replyAll`).

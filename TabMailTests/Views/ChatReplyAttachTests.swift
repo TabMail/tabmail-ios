@@ -3,10 +3,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
-import PhotosUI
 import SwiftUI
 import Testing
 import UIKit
+import UniformTypeIdentifiers
 @testable import TabMail
 
 /// ADR-IOS-114 decision 10: the paperclip in every chat's reply field.
@@ -42,6 +42,12 @@ struct ChatReplyAttachTests {
             UIColor.red.setFill()
             context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
         }
+    }
+
+    /// A JPEG photo as the photo library picker hands it over: an item provider holding its bytes.
+    private static func libraryPhoto() -> NSItemProvider {
+        let bytes = photo().jpegData(compressionQuality: DraftAttachmentImport.cameraJPEGQuality) ?? Data()
+        return NSItemProvider(item: bytes as NSData, typeIdentifier: UTType.jpeg.identifier)
     }
 
     // MARK: - The card's value
@@ -90,11 +96,11 @@ struct ChatReplyAttachTests {
         let email = Self.groupEmail()
         let image = Self.photo()
         let url = URL(fileURLWithPath: "/tmp/attach/plan.pdf")
-        let item = PhotosPickerItem(itemIdentifier: "attach-photo")
+        let provider = Self.libraryPhoto()
         let pick: ComposeAttachmentPick = switch kind {
         case "camera": .camera(image)
         case "files": .files([url])
-        default: .photos([item])
+        default: .photos([provider])
         }
         let card = ChatReadyReply(attaching: pick, to: email, onlyTo: nil, shown: Self.suggestion, accounts: [Self.me])
         let compose = card.composeView(openedOn: .chat, onOutcome: { _ in })
@@ -107,7 +113,7 @@ struct ChatReplyAttachTests {
         switch (kind, compose.attachmentPick) {
         case ("camera", .camera(let given)?): #expect(given === image)
         case ("files", .files(let given)?): #expect(given == [url])
-        case ("photos", .photos(let given)?): #expect(given == [item])
+        case ("photos", .photos(let given)?): #expect(given.count == 1 && given.first === provider)
         default: Issue.record("the card carries the pick as picked: \(kind), \(String(describing: compose.attachmentPick))")
         }
 
@@ -159,44 +165,66 @@ struct ChatReplyAttachTests {
         #expect(Self.count("snapshotInitialState() } /// Download and re-attach", in: compose) == 1,
                 "control: prepopulate ends by recording the starting state")
         #expect(Self.count("guard let attachmentPick else { return }", in: compose) == 1)
-        #expect(Self.count("switch attachmentPick { case .photos(let items): handlePhotoPickerItemsChange(items) case .camera(let image): addCameraPhoto(image) case .files(let urls): handleFileImport(.success(urls)) }", in: compose) == 1,
+        #expect(Self.count("switch attachmentPick { case .photos(let providers): addPickedPhotos(providers, load: { try await DraftAttachmentImport.providedItem($0) }) case .camera(let image): addCameraPhoto(image) case .files(let urls): handleFileImport(.success(urls)) }", in: compose) == 1,
                 "each pick goes through the card's own Photos, Camera and Files steps")
+        // The card's own Photos button and the paperclip's photos share the one step.
+        #expect(Self.count("private func handlePhotoPickerItemsChange(_ items: [PhotosPickerItem]) { addPickedPhotos( items, load: { item in (try await item.loadTransferable(type: Data.self), item.supportedContentTypes.first) }, then: { photoPickerItems = [] }) }", in: compose) == 1)
+        #expect(Self.count("addPickedPhotos(", in: compose) == 2, "used by the card's Photos button and the pick (declared as `addPickedPhotos<Item>(`)")
     }
 
-    @Test("The chat's paperclip opens its pickers, and a pick opens the reply's card with it")
+    @Test("The chat's paperclip opens its pickers, and a pick opens the reply's card with it once its picker has closed")
     func chatWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(Self.count("suggestion: shown, attach: attachFromField),", in: chat) == 1, "the field shows the paperclip")
+        // The paperclip shows only once the chat can tell the user's own addresses from the others.
+        #expect(Self.count("suggestion: shown, attach: knowsAudience ? attachFromField : nil),", in: chat) == 1, "the field shows the paperclip")
+        #expect(Self.count("let knowsAudience = viewModel.hasLoadedThread && context.isLoaded && context.accounts.contains(where: { $0.id == newest.accountId })", in: chat) == 1)
         #expect(Self.count("private func attachFromField(_ source: ChatNewEmailField.AttachSource) { guard TutorialCoordinator.shared.admits(.other) else { return } switch source { case .photos: showsPhotoPicker = true case .camera: showsCamera = true case .files: showsFilePicker = true } }", in: chat) == 1,
                 "each choice opens its own picker; the tutorial's mail actions are off")
-        #expect(Self.count(".photosPicker(isPresented: $showsPhotoPicker, selection: $photoPickerItems, matching: .any(of: [.images, .videos]))", in: chat) == 1)
-        #expect(Self.count(".onChange(of: photoPickerItems) { _, items in attachPicked(items) }", in: chat) == 1)
-        #expect(Self.count("guard !items.isEmpty else { return } photoPickerItems = [] openAttachCard(.photos(items))", in: chat) == 1)
-        #expect(Self.count(".fileImporter(isPresented: $showsFilePicker, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in attachFiles(result) }", in: chat) == 1)
-        #expect(Self.count("case .success(let urls): guard !urls.isEmpty else { return } openAttachCard(.files(urls)) case .failure(let error): attachFailure = error.localizedDescription", in: chat) == 1,
-                "a Files picker that failed says so")
-        // The camera's photo waits for its cover to close, so the card's cover never opens over it.
-        #expect(Self.count(".fullScreenCover(isPresented: $showsCamera, onDismiss: attachCameraPhoto) { CameraPickerView { image in cameraPhoto = image } }", in: chat) == 1)
-        #expect(Self.count("guard let image = cameraPhoto else { return } cameraPhoto = nil openAttachCard(.camera(image))", in: chat) == 1)
-        // The card: the one presenter, on the newest email, to whom the field's reply goes, with the
-        // suggestion the chat shows.
-        #expect(Self.count("readyReply = ChatReadyReply( attaching: pick, to: newest, onlyTo: replyTarget.only, shown: shownSuggestion(on: newest, thread: thread), accounts: context.accounts)", in: chat) == 1)
-        #expect(Self.count("readyReply = ", in: chat) == 2, "the ghost's tap and the paperclip's pick")
-        // The pickers count as presentations over the chat.
-        #expect(Self.count("|| forwardMessage != nil || showsReplyTo || showsMove || showsPhotoPicker || showsFilePicker || showsCamera", in: chat) == 1)
-        // The test seam exists only in debug builds.
-        let seam = try #require(chat.range(of: ".onReceive(NotificationCenter.default.publisher(for: .chatPaperclipPhotoForTesting))"))
+        // Each picker hands its pick over, and the card opens from the picker's onDismiss.
+        #expect(Self.count(".sheet(isPresented: $showsPhotoPicker, onDismiss: openPendingAttachCard) { PhotoLibraryPickerView { providers in attachPicked(.photos(providers)) } }", in: chat) == 1)
+        #expect(Self.count(".sheet(isPresented: $showsFilePicker, onDismiss: openPendingAttachCard) { FilePickerView { urls in attachPicked(.files(urls)) } }", in: chat) == 1)
+        #expect(Self.count(".fullScreenCover(isPresented: $showsCamera, onDismiss: openPendingAttachCard) { CameraPickerView { image in attachPicked(.camera(image)) } }", in: chat) == 1)
+        #expect(Self.count("onDismiss: openPendingAttachCard", in: chat) == 3, "only the paperclip's pickers open the card")
+        #expect(Self.count(".photosPicker(", in: chat) == 0 && Self.count(".fileImporter(", in: chat) == 0,
+                "no picker that says nothing of its closing")
+        // The card, read as the pick lands: on the newest email, to whom the field's reply goes,
+        // with the suggestion the chat shows.
+        #expect(Self.count("private func attachPicked(_ pick: ComposeAttachmentPick) { guard let newest = thread.newest else { return }", in: chat) == 1,
+                "the newest email, not the opened one")
+        #expect(Self.count("pendingAttachCard = ChatReadyReply( attaching: pick, to: newest, onlyTo: replyTarget.only, shown: shownSuggestion(on: newest, thread: thread), accounts: context.accounts)", in: chat) == 1)
+        #expect(Self.count("private func openPendingAttachCard() { guard let card = pendingAttachCard else { return } pendingAttachCard = nil readyReply = card }", in: chat) == 1)
+        #expect(Self.count("readyReply = ", in: chat) == 2, "the ghost's tap and the paperclip's pick, through the one presenter")
+        // The pickers, and a pick waiting for its picker to close, count as presentations over the chat.
+        #expect(Self.count("|| forwardMessage != nil || showsReplyTo || showsMove || showsPhotoPicker || showsFilePicker || showsCamera || pendingAttachCard != nil", in: chat) == 1)
+        // The test seam takes the same two steps as a picker, and exists only in debug builds.
+        let seamText = ".onReceive(NotificationCenter.default.publisher(for: .chatPaperclipPickForTesting)) { note in guard let pick = note.object as? ComposeAttachmentPick else { return } attachPicked(pick) openPendingAttachCard() }"
+        #expect(Self.count(seamText, in: chat) == 1)
+        let seam = try #require(chat.range(of: seamText))
         let opened = try #require(chat.range(of: "#if DEBUG", options: .backwards, range: chat.startIndex..<seam.lowerBound))
         let closed = chat.range(of: "#endif", options: .backwards, range: chat.startIndex..<seam.lowerBound)
         #expect(closed.map { $0.lowerBound < opened.lowerBound } ?? true, "the seam sits inside #if DEBUG")
     }
 
+    @Test("The photo library and Files pickers hand over what was picked, nothing on Cancel, then close")
+    func pickerViews() throws {
+        let pickers = try Self.source("TabMail/Views/Compose/AttachmentPickerViews.swift")
+        #expect(Self.count("configuration.filter = .any(of: [.images, .videos])", in: pickers) == 1, "photos and videos, as compose's own Photos button")
+        #expect(Self.count("configuration.selectionLimit = 0", in: pickers) == 1, "any number")
+        #expect(Self.count("if !results.isEmpty { parent.onPick(results.map(\\.itemProvider)) } parent.dismiss()", in: pickers) == 1)
+        #expect(Self.count("UIDocumentPickerViewController(forOpeningContentTypes: [.item])", in: pickers) == 1, "any file, opened in place")
+        #expect(Self.count("picker.allowsMultipleSelection = true", in: pickers) == 1)
+        #expect(Self.count("if !urls.isEmpty { parent.onPick(urls) } parent.dismiss()", in: pickers) == 1)
+        #expect(Self.count("func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { parent.dismiss() }", in: pickers) == 1)
+        #expect(Self.count("context.coordinator.parent = self", in: pickers) == 2, "a picker reports to the view as it is now")
+    }
+
     // MARK: - In the chat
 
-    /// The paperclip's card, opened through the chat's own presenter (`ChatThreadView.openAttachCard`)
-    /// with a camera photo (the system pickers cannot be driven from a hosted test).
-    private static func attachPhoto(in chat: ChatReplyRecoveryTests.Chat) async throws -> UIView {
-        NotificationCenter.default.post(name: .chatPaperclipPhotoForTesting, object: photo())
+    /// The paperclip's card, opened through the chat's own steps (`ChatThreadView.attachPicked`,
+    /// then `openPendingAttachCard`, as a picker's pick and its `onDismiss` take them) and its one
+    /// presenter. The system pickers themselves cannot be driven from a hosted test.
+    private static func attach(_ pick: ComposeAttachmentPick, in chat: ChatReplyRecoveryTests.Chat) async throws -> UIView {
+        NotificationCenter.default.post(name: .chatPaperclipPickForTesting, object: pick)
         try await ChatReplyRecoveryTests.waitUntil {
             ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view)["to"]?.isEmpty == false
         }
@@ -207,7 +235,7 @@ struct ChatReplyAttachTests {
         HostedAccessibility.labels(in: card)
     }
 
-    @Test("In the chat, a photo from the paperclip opens the Reply All card with it and the AI Suggestion shown")
+    @Test("In the chat, a camera photo from the paperclip opens the Reply All card with it and the AI Suggestion shown")
     func hostedReplyAll() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
         let backend = ChatReplyRecoveryTests.Backend(failure: .serverError, asksForReply: false)
@@ -215,36 +243,45 @@ struct ChatReplyAttachTests {
             try await ChatReplyRecoveryTests().withChat(backend, tag: "attach-all", suggestion: ChatReplyRecoveryTests.shownSuggestion) { chat in
                 let shown = ChatReplyRecoveryTests.shownSuggestion
                 try await ChatReplyRecoveryTests.waitUntil { ChatReplyRecoveryTests.ghosts(in: chat.view).contains { $0.text == shown.textMessage } }
+                #expect(ChatReplyRecoveryTests.ghosts(in: chat.view).map(\.text) == [shown.textMessage],
+                        "control: the chat shows the AI Suggestion: \(ChatReplyRecoveryTests.ghosts(in: chat.view).map(\.text))")
                 #expect(HostedAccessibility.identifiers(in: chat.view).contains(ChatPaperclipButton.id),
                         "the reply field shows the paperclip: \(HostedAccessibility.identifiers(in: chat.view))")
-                let card = try await Self.attachPhoto(in: chat)
+                let card = try await Self.attach(.camera(Self.photo()), in: chat)
                 let recipients = ChatReplyRecoveryTests.composeRecipients(card)
                 #expect(ChatReplyRecoveryTests.addresses(recipients["to"]).union(ChatReplyRecoveryTests.addresses(recipients["cc"]))
                             == ["alex@example.com", "david@example.com", "sam@example.com"],
                         "the card goes to everyone on the email: \(recipients)")
                 try await ChatReplyRecoveryTests.waitUntil { Self.cardLabels(card).contains { $0.contains("photo_1.jpg") } }
                 #expect(Self.cardLabels(card).contains { $0.contains("photo_1.jpg") }, "the photo is attached: \(Self.cardLabels(card).prefix(30))")
+                // Also the control for the case below: the card's suggestion box is readable here.
                 #expect(Self.cardLabels(card).contains("Use Suggestion"), "the suggestion the chat showed is in its box: \(Self.cardLabels(card).prefix(30))")
             }
         }
     }
 
-    @Test("In the chat, replying only to David, a photo from the paperclip opens a plain reply to David with it and no suggestion")
+    @Test("In the chat, replying only to David, a library photo from the paperclip opens a plain reply to David with it and no suggestion")
     func hostedOnlyTo() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
         let backend = ChatReplyRecoveryTests.Backend(failure: .serverError, asksForReply: false)
         try await HostedAccessibility.withAutomation {
             // The email stores an AI Suggestion, so a card that read it would show it.
             try await ChatReplyRecoveryTests().withChat(backend, tag: "attach-only", suggestion: ChatReplyRecoveryTests.shownSuggestion) { chat in
+                let shown = ChatReplyRecoveryTests.shownSuggestion
+                try await ChatReplyRecoveryTests.waitUntil { ChatReplyRecoveryTests.ghosts(in: chat.view).contains { $0.text == shown.textMessage } }
+                #expect(ChatReplyRecoveryTests.ghosts(in: chat.view).map(\.text) == [shown.textMessage],
+                        "control: the email's AI Suggestion is stored and shown before Reply to narrows the reply")
                 try await ChatReplyRecoveryTests.toggle(["alex@example.com", "sam@example.com"], in: chat)
                 #expect(ChatReplyRecoveryTests.replyingOnlyTo(in: chat.view) != nil, "control: the chat replies only to David")
-                let card = try await Self.attachPhoto(in: chat)
+                let card = try await Self.attach(.photos([Self.libraryPhoto()]), in: chat)
                 let recipients = ChatReplyRecoveryTests.composeRecipients(card)
                 #expect(ChatReplyRecoveryTests.addresses(recipients["to"]) == ["david@example.com"], "only David: \(recipients)")
                 #expect(ChatReplyRecoveryTests.addresses(recipients["cc"]).isEmpty && ChatReplyRecoveryTests.addresses(recipients["bcc"]).isEmpty,
                         "nobody else: \(recipients)")
-                try await ChatReplyRecoveryTests.waitUntil { Self.cardLabels(card).contains { $0.contains("photo_1.jpg") } }
-                #expect(Self.cardLabels(card).contains { $0.contains("photo_1.jpg") }, "the photo is attached: \(Self.cardLabels(card).prefix(30))")
+                // The photo loads through the card's carry gate after the card has prepopulated, so
+                // once it shows, a suggestion the card was given or read would show too.
+                try await ChatReplyRecoveryTests.waitUntil { Self.cardLabels(card).contains { $0.contains("photo_1.jpeg") } }
+                #expect(Self.cardLabels(card).contains { $0.contains("photo_1.jpeg") }, "the photo is attached: \(Self.cardLabels(card).prefix(30))")
                 #expect(!Self.cardLabels(card).contains("Use Suggestion"),
                         "the suggestion written for everyone stays out of the card: \(Self.cardLabels(card).prefix(30))")
             }
