@@ -786,9 +786,10 @@ struct InboxView: View {
         .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
             // One screen takes each request, the one on top: an email opened over the list, by a
             // row (`selectedMessageId`) or an email pill (`pushedMessageId`), takes it itself, its
-            // chat or its email screen, and so does an email opened in Search. With a sheet or cover
-            // of its own up, the list takes none (`isAnyListPresentation`).
-            guard selectedMessageId == nil, pushedMessageId == nil, !isAnyListPresentation else { return }
+            // chat or its email screen, and so does an email opened in Search. While the new email its
+            // compose button pushed is open (`newEmail`), or with a sheet or cover of its own up
+            // (`isAnyListPresentation`), the list takes none: a new email being written is not covered.
+            guard selectedMessageId == nil, pushedMessageId == nil, newEmail == nil, !isAnyListPresentation else { return }
             guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                 chatExpanded = false

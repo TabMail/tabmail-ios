@@ -1589,12 +1589,15 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        (review ruling 2026-11-22): a second request never replaces a new email being written, and
        nothing is queued for later. The list counts every sheet and cover it presents
        (`InboxView.isAnyListPresentation`), the email screen its own (`isAnyCoverPresented`), a chat
-       its own (`isAnyPresentation`). On iPad the screen in the detail column stays on screen behind
+       its own (`isAnyPresentation`). The list also takes none while the new email its compose
+       button pushed is open (`newEmail`): that screen takes no request, so none is taken until it
+       closes. On iPad the screen in the detail column stays on screen behind
        the list's Search or any other sheet or cover the list has up, so the list reports what it
        has up (`ListPresentationState`, written through `listPresentationWriter` on the list column)
-       and the detail column's chat and email screen take nothing while it is up; only the detail
-       column reads it (`listPresentationBesideDetail`), so an email opened inside Search, which
-       carries the list's environment, still takes the request.
+       and the detail column's chat and email screen take nothing while it is up. Only the screens
+       that open in the detail column read it (`listPresentationBesideDetail`: the selected email,
+       `MessageDetailContainer`, and an email pill's email, `PushedMessageDestination`), so an email
+       opened inside Search, which carries the list's environment, still takes the request.
      - *A save whose push was refused (review ruling 2026-11-22).* A save writes the row on the
        device first and then queues its push to the server's Drafts; when only the queue refuses,
        the row still holds that version. From then on the row is what later saves compare with, not

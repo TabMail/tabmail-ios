@@ -588,7 +588,9 @@ struct MailNavigationView: View {
             MailContentColumn(selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId)
                 .environment(\.listPresentationWriter, listPresentation)
                 .navigationDestination(item: $pushedMessageId) { id in
+                    // On iPad an email pill's email opens in the detail column, beside the list.
                     PushedMessageDestination(messageId: id)
+                        .environment(\.listPresentationBesideDetail, listPresentation)
                 }
                 .navigationDestination(isPresented: $pushedShowsAccount) {
                     // Mirrors SettingsContentColumn's `.account` case.

@@ -304,8 +304,8 @@ struct ChatNewEmailRequestTests {
         let detailPath = "TabMail/Views/Message/MessageDetailView.swift"
         let cover = ".fullScreenCover(item: $newEmailCover) { ChatNewEmailCoverView(cover: $0) }"
         let inbox = try Self.source(inboxPath)
-        #expect(Self.count("guard selectedMessageId == nil, pushedMessageId == nil, !isAnyListPresentation else { return }", in: inbox) == 1,
-                "an email opened over the list, by a row, a pill or in Search, takes it itself")
+        #expect(Self.count("guard selectedMessageId == nil, pushedMessageId == nil, newEmail == nil, !isAnyListPresentation else { return }", in: inbox) == 1,
+                "an email opened over the list, by a row, a pill or in Search, takes it itself; the list's own new email takes none")
         #expect(Self.count("newEmailCover != nil || showSearch || viewModel.showCompose || replyMessage != nil || draftOpen != nil || agentCompose != nil || moveMessageId != nil || moveThreadGroup != nil || labelMenuMessage != nil || showLabelFilterPicker", in: inbox) == 1,
                 "every sheet and cover the list presents counts, its own new email's included")
         #expect(Self.count(".onChange(of: isAnyListPresentation, initial: true) { _, up in listPresentationWriter?.isUp = up } .onDisappear { listPresentationWriter?.isUp = false }", in: inbox) == 1,
@@ -313,9 +313,13 @@ struct ChatNewEmailRequestTests {
         let navigation = try Self.source("TabMail/Views/MailNavigationView.swift")
         #expect(Self.count("pushedMessageId: $pushedMessageId) .environment(\\.listPresentationWriter, listPresentation)", in: navigation) == 1,
                 "the list column writes the state")
+        // Every screen that opens in the detail column reads it: the selected email and an email
+        // pill's email. Nothing in the list column does, so an email opened in Search still takes one.
         #expect(Self.count("MessageDetailContainer(selectedMessageId: selectedMessageId, notificationOpenedId: notificationOpenedId) .environment(\\.listPresentationBesideDetail, listPresentation)", in: navigation) == 1,
-                "only the detail column reads it, so an email opened in Search still takes a request")
-        #expect(Self.count("\\.listPresentationBesideDetail", in: navigation) == 1)
+                "the selected email in the detail column reads it")
+        #expect(Self.count("PushedMessageDestination(messageId: id) .environment(\\.listPresentationBesideDetail, listPresentation)", in: navigation) == 1,
+                "an email pill's email, which opens in the detail column on iPad, reads it")
+        #expect(Self.count("\\.listPresentationBesideDetail", in: navigation) == 2, "and nothing else in the navigation")
         #expect(Self.count("\\.listPresentationWriter", in: navigation) == 1)
         #expect(Self.count("newEmailCover = .make( request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession, chatAccount: viewModel.primaryAccount, composeAccount: viewModel.primaryAccount)", in: inbox) == 1)
         #expect(Self.count(cover, in: inbox) == 1)
@@ -338,8 +342,8 @@ struct ChatNewEmailRequestTests {
         #expect(Self.count("ComposeView()", in: detail) == 0, "its compose button goes through the route")
         let view = try Self.source("TabMail/Views/Chat/ChatNewThreadView.swift")
         #expect(Self.count(".safeAreaBar(edge: .top, spacing: 0) { ChatNewEmailSubjectLine(subject: model.carried.shownSubject) }", in: view) == 1)
-        // Exactly these three screens take a request: a structural check only; which instance
-        // takes it is shown by the hosted tests below.
+        // Exactly these three screens take a request: a structural check only. The hosted tests
+        // below show each one taking it, or not, as mounted.
         let takers = try Self.swiftFiles(under: "TabMail").filter {
             try Self.source($0).contains("publisher(for: .contactPillComposeTapped)")
         }
@@ -394,7 +398,7 @@ struct ChatNewEmailRequestHostedTests {
 
     // MARK: - An open chat
 
-    @Test("A link posted while a chat is open brings the new email's chat up over it with the person, the words, the subject, Cc and Bcc; a second link leaves it up; Back with nothing changed closes it and saves nothing; in the detail column, none while the list beside it has something up")
+    @Test("A link posted while a chat is open brings the new email's chat up over it with the person, the words, the subject, Cc and Bcc; a second link leaves it up; Back with nothing changed closes it and saves nothing; in the detail column, none while the list beside it has something up; with its email card up, the card's email screen takes it")
     func linkOverAnOpenChat() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await linkOverAnOpenChatBody() }
@@ -425,12 +429,49 @@ struct ChatNewEmailRequestHostedTests {
             try await Self.secondLeavesItUp(screen)
             try await Self.backClosesAndSavesNothing(screen)
             #expect(ThreadChatTests.shows("Ann Example", in: screen.view), "the chat is still there")
+
+            // The email card: its email screen, on top, takes the request, over the card.
+            let bubble = try #require(Self.bubble(in: screen.view), "control: the email's bubble: \(ThreadChatTests.labels(screen.view).prefix(12))")
+            #expect(bubble.accessibilityActivate(), "control: the bubble opens the email card")
+            try await ThreadChatTests.wait { screen.topPresented() != nil }
+            let card = screen.topPresented()
+            #expect(card != nil, "control: the email card is up")
+            try await ThreadChatTests.settle()
+            try await ThreadChatTests.settle()
+            NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
+            try await ThreadChatTests.wait { Self.newEmailView(screen) != nil }
+            let overCardLabels = screen.topPresented().map { Array(HostedAccessibility.labels(in: $0.view).prefix(16)) } ?? []
+            let overCard = try #require(Self.newEmailView(screen), "the card's email screen takes it: \(overCardLabels)")
+            #expect(card?.presentedViewController != nil, "the new email comes up over the card")
+            #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: overCard), "Back takes a tap")
+            try await ThreadChatTests.wait { screen.topPresented() === card }
+            #expect(screen.topPresented() === card, "Back returns to the card")
+        }
+    }
+
+    @Test("An email opened inside the list's Search, which carries the list's surroundings with Search up, takes a link")
+    func linkOverAnEmailInSearch() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await linkOverAnEmailInSearchBody() }
+    }
+
+    private func linkOverAnEmailInSearchBody() async throws {
+        try await withScreen { seed in
+            NavigationStack { ChatThreadView(messageId: seed.email.id) }
+                .environment(\.listPresentationWriter, seed.state)
+        } body: { screen in
+            screen.state.isUp = true
+            try await ThreadChatTests.wait { ThreadChatTests.shows("Ann Example", in: screen.view) }
+            #expect(ThreadChatTests.shows("Ann Example", in: screen.view), "control: the chat is open: \(ThreadChatTests.labels(screen.view).prefix(12))")
+            try await ThreadChatTests.settle()
+            _ = try await Self.postedLinkShowsNewEmail(screen)
+            try await Self.backClosesAndSavesNothing(screen)
         }
     }
 
     // MARK: - The list
 
-    @Test("The list with nothing over it takes a link and reports its new email up; a second link leaves it up; with Search up the list takes none and reports Search up")
+    @Test("The list with nothing over it takes a link and reports its new email up; a second link leaves it up; while the new email its compose button pushed is open it takes none; with Search up it takes none and reports Search up")
     func linkOverTheList() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await linkOverTheListBody() }
@@ -454,6 +495,19 @@ struct ChatNewEmailRequestHostedTests {
             try await Self.backClosesAndSavesNothing(screen)
             try await ThreadChatTests.wait { !screen.state.isUp }
             #expect(!screen.state.isUp, "closed: the list reports nothing up")
+
+            // The new email the list's compose button pushes: while it is open, the list takes none.
+            let compose = try #require(Self.composeButton(in: screen.view), "control: the list's compose button: \(ThreadChatTests.labels(screen.view).prefix(20))")
+            #expect(compose.accessibilityActivate(), "control: the compose button takes a tap")
+            try await ThreadChatTests.wait { HostedAccessibility.identifiers(in: screen.view).contains(ChatNewThreadView.backId) }
+            #expect(HostedAccessibility.identifiers(in: screen.view).contains(ChatNewThreadView.backId), "control: the button pushed the new email's chat")
+            #expect(screen.topPresented() == nil, "control: pushed, not presented")
+            NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
+            let notCovered = try await Self.keeps { screen.topPresented() == nil }
+            #expect(notCovered, "a new email being written is not covered by another")
+            #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: screen.view), "Back takes a tap")
+            try await ThreadChatTests.wait { Self.searchButton(in: screen.view) != nil }
+            #expect(Self.searchButton(in: screen.view) != nil, "control: back on the list")
 
             let search = try #require(Self.searchButton(in: screen.view))
             #expect(search.accessibilityActivate(), "control: Search takes a tap")
@@ -539,6 +593,29 @@ struct ChatNewEmailRequestHostedTests {
         #expect(router.composePresentationCount == 0, "control: compose reported itself gone")
     }
 
+    @Test("A cover decided for the chat shows the chat with what the link brought, also when the chat view was turned off or the user signed out before it shows", arguments: [(false, true), (true, false)])
+    func capturedChatCover(chatView: Bool, signedIn: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await capturedChatCoverBody(chatView: chatView, signedIn: signedIn) }
+    }
+
+    private func capturedChatCoverBody(chatView: Bool, signedIn: Bool) async throws {
+        // Decided for the chat (on and signed in when the request came); shown after the change.
+        try await withScreen(chatView: chatView, signedIn: signedIn) { seed in
+            ChatNewEmailCoverView(cover: .make(
+                request: Self.link, opensInChat: true, signedIn: true, chatAccount: seed.account, composeAccount: nil))
+        } body: { screen in
+            #expect(ChatViewConfig.opensInChat == chatView, "control: the chat view is \(chatView ? "on" : "off") as it shows")
+            try await ThreadChatTests.wait { Self.labels(of: ChatNewThreadView.hintId, in: screen.view) == Self.johnHint }
+            let hint = Self.labels(of: ChatNewThreadView.hintId, in: screen.view)
+            #expect(hint == Self.johnHint, "the chat, to the link's person: \(ThreadChatTests.labels(screen.view).prefix(16))")
+            #expect(Self.fieldText(in: screen.view) == "Are you free at noon?", "with the link's words")
+            #expect(Self.labels(of: ChatNewThreadView.ccLineId, in: screen.view) == ["Cc: Sam Park."])
+            let fields = Self.composeRecipients(screen.view)
+            #expect(fields.isEmpty, "not compose: \(fields)")
+        }
+    }
+
     // MARK: - Steps
 
     /// In the detail column with the list beside it showing a sheet or cover, a request is not
@@ -609,8 +686,11 @@ struct ChatNewEmailRequestHostedTests {
     }
 
     /// Mounts `root` on an installed app database holding one email, with the chat view on and
-    /// signed in and the AI queue held, runs `body`, then takes it all down, also when it throws.
+    /// signed in unless told otherwise and the AI queue held, runs `body`, then takes it all down,
+    /// also when it throws.
     private func withScreen<Root: View>(
+        chatView: Bool = true,
+        signedIn: Bool = true,
         @ViewBuilder _ root: (Seed) -> Root,
         body: (Screen) async throws -> Void
     ) async throws {
@@ -619,7 +699,7 @@ struct ChatNewEmailRequestHostedTests {
         let queue = ActiveAIQueue.shared
         await queue.setDispatchSuppressedForTesting(true)
         await queue.clearForTesting()
-        saved.setChatView(on: true)
+        saved.setChatView(on: chatView)
         defer {
             ChatPillState.shared.removeAllSessions()
             saved.restore()
@@ -642,7 +722,7 @@ struct ChatNewEmailRequestHostedTests {
         let controller = UIHostingController(rootView: AnyView(
             root(seed)
                 .environment(navigationStore)
-                .environment(\.hasTabMailSession, true)))
+                .environment(\.hasTabMailSession, signedIn)))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         func cleanUp() async {
@@ -684,6 +764,14 @@ struct ChatNewEmailRequestHostedTests {
             try await Task.sleep(for: .milliseconds(100))
         }
         return condition()
+    }
+
+    /// The email's bubble in the chat: its label names the sender and the subject (no summary yet).
+    private static func bubble(in view: UIView) -> NSObject? {
+        HostedAccessibility.elements(under: view).first {
+            let label = $0.accessibilityLabel ?? ""
+            return label.hasPrefix("Ann Example") && label.contains(" said: Lunch plans")
+        }
     }
 
     private static func searchButton(in view: UIView) -> NSObject? {
