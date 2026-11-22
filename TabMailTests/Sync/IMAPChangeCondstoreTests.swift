@@ -271,6 +271,11 @@ struct IMAPChangeCondstoreTests {
                 ])
         }
         await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        // The merge shields what it staged from every removal for
+        // `SyncConfig.pushMergeStaleProtectionTTLSeconds` (StaleProtectionTests;
+        // a removal the change apply declines goes on the folder's re-read
+        // list). These tests judge what the passes do once that shield is over.
+        await AccountManager.shared.clearRecentlyCompletedForTesting()
         return try await staging.read { db in
             try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM nse_processed_message WHERE id = ?)", arguments: [id]) ?? false
         }

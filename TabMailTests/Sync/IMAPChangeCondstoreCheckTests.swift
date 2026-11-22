@@ -439,8 +439,13 @@ struct IMAPChangeCondstoreCheckTests {
         ) { w in
             try await Self.trackedThreeWithASpentUID(w)
             let before = try Self.cursor(w.folder().changeCursor)
-            w.server.setSelectExists(0, forNext: 1, of: path)
+            // The change connection still has the inbox selected from the last
+            // pass, so the reader observes it with a SELECT (RFC 3501 §6.3.10: no
+            // STATUS for the selected mailbox) before the SELECT it reads on, and
+            // both say EXISTS 0. What this pass did not take is cleared after it.
+            w.server.setSelectExists(0, forNext: 2, of: path)
             try await C.foregroundPass(w)
+            w.server.setSelectExists(nil, for: path)
             let contradicted = try w.folder()
             #expect(!FolderChangeState(raw: contradicted.changeState).tracking, "the contradictory read clears the folder's coverage")
             let kept = try Self.cursor(contradicted.changeCursor)
