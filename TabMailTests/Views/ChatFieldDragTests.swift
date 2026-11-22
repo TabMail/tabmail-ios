@@ -183,6 +183,35 @@ struct ChatFieldDragTests {
         #expect(pan.restedBeforeLift == 0, "a lift with no move read is no rest")
     }
 
+    /// A touch at a set time, as UIKit hands each new finger to the pan's delegate.
+    private final class TimedTouch: UITouch {
+        var time: TimeInterval = 0
+        override var timestamp: TimeInterval { time }
+    }
+
+    @Test("A second finger landing during a hold leaves it a hold: the held let-go still settles back")
+    @MainActor
+    func secondFingerKeepsTheRest() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true)
+        // 25 up at 250 pt/s predicts 87.5: a flick that opens when lifted with its move.
+        let flick = ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: -25), velocity: CGSize(width: 0, height: -250))
+        pan.moved(at: 10)
+        let second = TimedTouch()
+        second.time = 10.2
+        #expect(coordinator.gestureRecognizer(pan, shouldReceive: second), "control: the pan takes the second finger")
+        pan.lifted(at: 10.25)
+        let rested = pan.restedBeforeLift
+        let held = ChatFieldDrag.letGo(flick, rested: rested)
+        #expect(rested == 0.25, "the rest counts from the last move, not from the second finger")
+        #expect(!ChatFieldDrag.opens(letGo: held), "held, it settles back")
+        pan.reset()
+        pan.moved(at: 20)
+        pan.lifted(at: 20)
+        let lifted = ChatFieldDrag.letGo(flick, rested: pan.restedBeforeLift)
+        #expect(ChatFieldDrag.opens(letGo: lifted), "control: the same drag lifted with its move opens")
+    }
+
     /// A drag that started in the focused field's text, and the field's share of it, worked out by
     /// hand: the text keeps the drag until its end, the rest of the same drag is the field's, both
     /// axes counted from the hand-off (`handOff`, the drag's travel where the text reached its end;
