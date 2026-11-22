@@ -742,10 +742,13 @@ struct ChatThreadViewLifecycleTests {
         var landed: Bool { top(of: ChatThreadViewLifecycleTests.length - 1) != nil && (scroll?.contentSize.height ?? 0) > (scroll?.bounds.height ?? .infinity) }
         /// The screen top of email `index`'s bubble.
         func top(of index: Int) -> CGFloat? { ChatThreadViewLifecycleTests.bubbleFrame(index, in: controller.view)?.minY }
-        /// How far the newest email's bubble ends above the field's top (negative if under it).
+        /// How far the newest email's bubble ends above the reply pill's top, the whole field bar
+        /// rather than its text (negative if under it).
         var newestAboveField: CGFloat? {
-            guard let fieldTop, let newest = ChatThreadViewLifecycleTests.bubbleFrame(ChatThreadViewLifecycleTests.length - 1, in: controller.view) else { return nil }
-            return fieldTop - newest.maxY
+            guard let pill = HostedAccessibility.elements(under: controller.view)
+                    .first(where: { HostedAccessibility.identifier(of: $0) == ChatThreadView.replyPillId })?.accessibilityFrame,
+                  let newest = ChatThreadViewLifecycleTests.bubbleFrame(ChatThreadViewLifecycleTests.length - 1, in: controller.view) else { return nil }
+            return pill.minY - newest.maxY
         }
         /// Whether any part of email `index`'s bubble is in the scroll view's visible area.
         func shows(_ index: Int) -> Bool {
@@ -894,10 +897,11 @@ struct ChatThreadViewLifecycleTests {
     }
 
     // A change of the bottom inset alone (the keyboard's arrival) changes neither the scroll view's
-    // size nor its content's, so only the landing's re-issue on the bottom inset answers it. The
-    // platform either keeps the scroll offset (the newest bubble would end under the risen field)
-    // or keeps the bottom (the Unread line would move up with it); one of the two tests below sees
-    // each.
+    // size nor its content's. The landing re-issues on the bottom inset, though the platform may
+    // also hold the landing by itself, so these tests pin the outcome, not which of the two did it.
+    // A wrong outcome is either the scroll offset kept (the newest bubble would end under the risen
+    // field) or the bottom kept (the Unread line would move up with it); one of the two tests below
+    // sees each.
 
     @Test("Opened at the bottom, the chat ends at the bottom when only the bottom inset grows, as the keyboard's does")
     func bottomLandingFollowsABottomInset() async throws {

@@ -226,10 +226,20 @@ struct TabMailApp: App {
             #else
             let tipStore = Tips.ConfigurationOption.DatastoreLocation.applicationDefault
             #endif
-            try? Tips.configure([
-                .displayFrequency(.daily),
-                .datastoreLocation(tipStore)
-            ])
+            do {
+                try Tips.configure([
+                    .displayFrequency(.daily),
+                    .datastoreLocation(tipStore)
+                ])
+            } catch {
+                #if DEBUG
+                // The drag tip's lifecycle UI test depends on this store; a launch without it would
+                // pass or fail for the wrong reason.
+                if usesFieldDragTipStore {
+                    preconditionFailure("The drag tip test's datastore could not be opened: \(error)")
+                }
+                #endif
+            }
             #if DEBUG
             // The swipe fixture has no RootView to open the onboarding gate: opened here, as for a
             // user past onboarding.
