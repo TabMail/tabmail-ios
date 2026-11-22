@@ -1366,7 +1366,7 @@ struct IMAPMoveWireContractTests {
 
     // MARK: - T3.12 — a cancelled task never completes a second mutation
 
-    @Test("A move cancelled while its UID COPY is on the wire stops at a step boundary and never soft-deletes the source")
+    @Test("A move cancelled while its UID COPY is on the wire fails with CancellationError and never soft-deletes the source")
     func cancelledMoveNeverCompletesTheSecondMutation() async throws {
         let target = "cancel-target@example.com"
         let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
