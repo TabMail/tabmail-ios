@@ -61,6 +61,7 @@ struct FixedDateFormatFenceTests {
         "TabMail/Views/RootView.swift": 1,                         // account deletion date
         "TabMail/Views/Settings/AccountDeletionView.swift": 1,     // account deletion date
         "TabMail/Views/Settings/AccountDetailView.swift": 1,       // oldest synced month
+        "TabMail/Views/Chat/ChatNewThread.swift": 1,               // a saved new email's time
     ]
 
     /// The stored reminder due-date (`yyyy-MM-dd`) read paths → the number of

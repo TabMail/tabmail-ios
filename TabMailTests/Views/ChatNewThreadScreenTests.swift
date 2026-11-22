@@ -11,8 +11,8 @@ import UIKit
 
 /// A new email's chat on screen, signed in, pushed in a navigation as the mailbox list pushes it,
 /// against a real database: what the field shows of a reopened draft and of an empty one (focus,
-/// mic, paperclip, the "e.g." line, the row's order and places), the typed words kept when a cover
-/// hides the chat and it shows again, the attachments waiting above it and the files that could
+/// mic, paperclip, the "e.g." line, the row's order and places), the typed words kept when another
+/// screen hides the chat and it shows again, the attachments waiting above it and the files that could
 /// not be added, Send's ask, its Cancel and
 /// the way from it to "Add recipient", Send with someone picked, the header's sheet, the alert a
 /// reopened draft with unreadable attachments shows, and what the app going to the background,
@@ -52,7 +52,7 @@ struct ChatNewThreadScreenTests {
         var phase: ScenePhase = .active
         var pushed: ChatNewThreadModel?
         var shown = true
-        /// A full-screen cover over the navigation, as the camera's hides the chat.
+        /// Another screen pushed over the chat, which hides it until it is popped.
         var covered = false
         /// Pushed once: the root appearing again after Back does not push the chat again.
         var didPush = false
@@ -68,14 +68,16 @@ struct ChatNewThreadScreenTests {
             if stage.shown {
                 NavigationStack {
                     Color.clear
-                        .navigationDestination(item: $stage.pushed) { ChatNewThreadView(model: $0) }
+                        .navigationDestination(item: $stage.pushed) {
+                            ChatNewThreadView(model: $0)
+                                .navigationDestination(isPresented: $stage.covered) { Color.black }
+                        }
                         .onAppear {
                             guard !stage.didPush else { return }
                             stage.didPush = true
                             stage.pushed = model
                         }
                 }
-                .fullScreenCover(isPresented: $stage.covered) { Color.black }
                 .environment(\.scenePhase, stage.phase)
                 .environment(\.hasTabMailSession, true)
             } else {
@@ -255,13 +257,14 @@ struct ChatNewThreadScreenTests {
         }
     }
 
-    @Test("A reopened draft's chat hidden by a full-screen cover and shown again keeps the words typed since it opened, and Back saves them")
+    @Test("A reopened draft's chat hidden by another screen and shown again keeps the words typed since it opened, and Back saves them")
     func hiddenAndShownKeepsTyping() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await hiddenAndShownKeepsTypingBody() }
     }
 
-    /// The camera's cover hides the chat the same way (the simulator has no camera): the field
+    /// A screen pushed over the chat hides it and shows it again (the simulator has no camera, and
+    /// a full-screen cover over this test's navigation does not make the chat go away): the field
     /// puts the draft's saved words in once, as the chat first opens, never again as it shows.
     private func hiddenAndShownKeepsTypingBody() async throws {
         let fixture = try fixture()
@@ -277,7 +280,7 @@ struct ChatNewThreadScreenTests {
             screen.stage.covered = true
             try await Self.waitUntil { !DraftSessionRegistry.shared.isActive(model.draftId) }
             let hidden = !DraftSessionRegistry.shared.isActive(model.draftId)
-            #expect(hidden, "control: the cover hid the chat (it went away and gave its draft back)")
+            #expect(hidden, "control: the screen pushed over it hid the chat (it went away and gave its draft back)")
             screen.stage.covered = false
             try await Self.waitUntil { DraftSessionRegistry.shared.isActive(model.draftId) && Self.fieldText(in: screen.view) != nil }
             let shown = DraftSessionRegistry.shared.isActive(model.draftId)
@@ -374,9 +377,18 @@ struct ChatNewThreadScreenTests {
             #expect(names.accessibilityActivate())
             try await Self.waitUntil { Self.sheetIsUp(screen) }
             let listed = Self.presentedLabels(screen)
-            #expect(listed.contains("Maria") && listed.contains("maria@example.com"), "the sheet lists who is picked: \(listed.prefix(20))")
+            // A person's row reads as one element: the name, then the address.
+            let listsMaria = listed.contains { $0.contains("Maria") && $0.contains("maria@example.com") }
+            #expect(listsMaria, "the sheet lists who is picked: \(listed.prefix(20))")
             let sheet = try #require(Self.topPresented(screen)?.view)
             let own = fixture.account.emailAddress
+            // The screen reads the user's addresses as it opens (`loadOwnAddresses`), through the
+            // app's read path, which can be slow on a loaded test host; wait until that path
+            // reads the account. The window before that read ends is tabmail-ios#1236.
+            try await Self.waitUntil { try await Self.accountAddresses().contains(own) }
+            let known = try await Self.accountAddresses()
+            #expect(known.contains(own), "control: the app's read path has the user's address: \(known)")
+            try await Self.settle()
             #expect(ThreadChatTests.type(own, in: sheet), "the sheet takes an address")
             try await Self.settle()
             let doneButton = HostedAccessibility.elements(under: sheet).first { $0.accessibilityLabel == "Done" }
@@ -828,6 +840,11 @@ struct ChatNewThreadScreenTests {
         for dir in dirs { DraftAttachmentStorage.deleteAttachments(dirName: dir) }
         AppDatabase.shared.withLock { $0 = fixture.previous }
         TestDatabaseTeardown.retire(pool: fixture.pool, directory: fixture.directory)
+    }
+
+    /// The accounts' addresses, read the way the screen reads them.
+    private static func accountAddresses() async throws -> [String] {
+        try await AppDatabase.dbPool.read { db in try Account.fetchAll(db) }.map(\.emailAddress)
     }
 
     private func row(_ fixture: Fixture, _ id: String) async throws -> Draft? {

@@ -528,12 +528,12 @@ struct ChatReplyFieldTests {
         // The "e.g." line's change goes in as words and is never sent from here.
         #expect(Self.count("func putExample(_ example: String) { fieldFill.apply(.put(example)) inputSelection = .init(insertionPoint: inputText.endIndex) }", in: text) == 1)
         // A new email's saved words go in once, as its chat first opens; the screen hidden and
-        // shown again (the camera's cover) keeps what was typed since.
+        // shown again keeps what was typed since (ChatNewThreadScreenTests.hiddenAndShownKeepsTyping).
         #expect(Self.count("guard let newEmail = replyField?.newEmail, !newEmailStarted else { return } newEmailStarted = true if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) }", in: text) == 1)
         #expect(Self.count("fieldFill.apply(", in: text) == 11)
     }
 
-    @Test("The field's Send sends the words to the agent; nothing in the field opens compose")
+    @Test("The field's Send sends the words to the agent, except in a new email's chat, which takes its own Send; nothing in the field opens compose")
     func fieldSendWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         // Collapsed, the reply field's Send takes the field's route; the open sheet keeps the chat's.
@@ -541,7 +541,11 @@ struct ChatReplyFieldTests {
         // Send refuses only an empty input, and the collapsed field then takes its own route.
         #expect(message.hasPrefix(" let text = inputText.trimmingCharacters(in: .whitespaces) guard !text.isEmpty else { return } if let replyField, !isExpanded { sendFromReplyField(text, replyField) return }"))
         let send = try Self.body(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {", in: text)
-        #expect(Self.count("return", in: send) == 0, "every send from the field goes to the agent")
+        // A new email's chat takes the words first and only (what its Send does is driven in
+        // ChatNewThreadScreenTests); every other send from the field goes to the agent.
+        #expect(send.hasPrefix(" // A new email's chat decides what its Send does; the words stay until it acts on them. if let newEmail = field.newEmail { newEmail.send(text) return } isTextFieldFocused = false"),
+                "a new email's chat takes its own Send, first")
+        #expect(Self.count("return", in: send) == 1, "every other send from the field goes to the agent")
         #expect(Self.count("onSendReadyReply", in: text) == 0 && Self.count("ChatReplyField.route", in: text) == 0)
         #expect(Self.count("onFieldSend?(text)", in: send) == 1)
         #expect(Self.count("sendAgentChat(text, field: send)", in: send) == 1)
