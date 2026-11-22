@@ -209,9 +209,9 @@ final class ChatSwipeUITests: XCTestCase {
     /// A drag held past the open distance when the panel opens under it, as an agent's answer opens
     /// it: opening turns the field's pan off, which cuts the drag off while the finger is still
     /// down. The fixture opens the panel the moment the app sees the held drag swollen past the open
-    /// distance, and the app records what happened to the drag in order: the opening, then the cut
-    /// (a drag that ran on to the let-go would record `end` instead, and the swell would hold until
-    /// the finger lifts). The freeze the drag held is released, and once the panel closes the field
+    /// distance, and the app records what happened to the drag in order: the opening's request, then
+    /// the cut (a drag that ran on to the let-go would record `end` instead, and the swell would hold
+    /// until the finger lifts). The panel's actual opening is read from its Close button. The freeze the drag held is released, and once the panel closes the field
     /// is back at rest, no swell left, and the next drag opens the panel. (A cut-off drag cannot
     /// itself open the panel, as `fieldDragWiring` pins by reading; here the panel is open either
     /// way.)
@@ -227,7 +227,7 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "control: the panel opened under the held drag")
         let marker = try XCTUnwrap(dragMarker(afterDrags: 1, in: app), "control: the marker recorded the one drag")
         XCTAssertEqual(marker.events, ["open", "cut"],
-                       "the panel opened under the held drag, then cut the drag off before the finger lifted")
+                       "the opening was requested under the held drag, and the drag was then cut off before the finger lifted")
         XCTAssertFalse(marker.frozen, "the cut-off drag released the freeze")
         app.buttons["chatClose"].tap()
         XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "control: Close closed the panel")
@@ -623,7 +623,8 @@ final class ChatSwipeUITests: XCTestCase {
         let marker = try XCTUnwrap(dragMarker(afterDrags: 1, in: app), "control: the field's pan saw the drag")
         XCTAssertGreaterThan(marker.rise, 1, "past the text's end the rest of the drag swelled the field: \(marker.rise)")
         XCTAssertLessThan(marker.rise, Self.openDistance, "only the rest past the text's end: \(marker.rise)")
-        let pastEnd = try XCTUnwrap(marker.textPastEnd, "control: the marker reports the text's place")
+        let pastEnd = try XCTUnwrap(marker.textPastEnd, "control: the field's pan read the text's place while the drag moved")
+        XCTAssertGreaterThan(pastEnd, -1, "control: the text reached its end under the drag: \(pastEnd)")
         XCTAssertLessThan(pastEnd, 1, "the text stopped at its end and did not bounce past it while the field swelled: \(pastEnd)")
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")

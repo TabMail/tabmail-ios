@@ -1119,7 +1119,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    sixteen-line draft: a drag past the open distance inside the text's room leaves the field's
    glass still and the panel shut), `testDragUpPastTheTextsEndByLessThanTheOpenDistanceSettlesBack`
    (past the open distance in all but past the end by less: the glass rises only by the rest, the
-   panel stays shut, and the debug marker's `over` shows the text never went past its end),
+   panel stays shut, and the debug marker's `over`, which the field's pan must have read, shows the
+   text reached its end and never went past it),
    `testDoubleTapInOverflowingTextSelectsAWordToReplace` (the text view's own selection in an
    overflowing draft: the typed word replaces the double-tapped one),
    `ChatFieldDragTests.fieldShareOfATextDrag` and `panSharesWithTheTextUnderTheTouch` (the field's
@@ -1138,8 +1139,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (signed in through the fixture's `--chat-swipe-signed-in`: the panel's editor holds the draft),
    `testDragCutOffByThePanelOpeningSettlesAndTheNextDragWorks` (the fixture's
    `--chat-swipe-open-panel-under-drag` opens the panel the moment the debug marker sees the held
-   drag swollen past the open distance, which turns the pan off: the marker records the opening and
-   then the cut, in that order, so the drag ended with the finger still down; the freeze is
+   drag swollen past the open distance, which turns the pan off: the marker records the opening's
+   request and then the cut, in that order, so the drag ended with the finger still down (the
+   panel's own opening is read from its Close button); the freeze is
    released, the field is back at rest, the next drag opens),
    `testOpenActionsDragUpOnTheReplyFieldOnlyCloses` and the back swipes that start at the field
    (`testNothingOpenRightDragOnTheReplyFieldGoesBack`, `testNothingOpenEdgeDragOnTheReplyFieldGoesBack`

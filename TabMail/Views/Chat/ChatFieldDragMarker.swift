@@ -23,8 +23,9 @@ import SwiftUI
 /// included (the open panel's top while it is open), `rise` how far that top rose above where it
 /// was at the last drag's start while the finger moved (the swell XCUITest cannot see), `dims`
 /// how many taps the open panel's dim has taken, `over` how far the text under the last drag went
-/// past its end while the drag moved (its scroll position as the field's pan read it; 0 if it never
-/// did), `events` what happened to the last drag, in order (`Probe.events`), and `wait` whether the
+/// past its end while the drag moved (the most the field's pan read, negative if the text stayed
+/// short of its end; `none` until the pan has read it), `events` what happened to the last drag, in
+/// order (`Probe.events`), and `wait` whether the
 /// drag tip is waiting for room (`TipWait`).
 enum ChatFieldDragMarker {
     static let identifier = "chatFieldDragMarker"
@@ -196,14 +197,16 @@ enum ChatFieldDragMarker {
         private(set) var rise: CGFloat = 0
         private var dragging = false
         var dims = 0
-        /// How far the text under the last drag went past its end while it moved.
-        private(set) var pastEnd: CGFloat = 0
+        /// How far the text under the last drag went past its end while it moved (negative if it
+        /// stayed short of it); nil until the field's pan has read the text's place.
+        private(set) var pastEnd: CGFloat?
 
         func textPastEnd(_ points: CGFloat) {
-            pastEnd = max(pastEnd, points)
+            pastEnd = max(pastEnd ?? points, points)
         }
 
-        /// What happened to the last drag, in order: `open` when the armed opening ran under it,
+        /// What happened to the last drag, in order: `open` when the armed opening was requested
+        /// under it (queued for the main actor; the panel's own opening is observed separately),
         /// then `end` when it was let go or `cut` when it was cut off with the finger still down.
         private(set) var events: [String] = []
         /// Armed by the swipe fixture (`openUnderTheNextDrag`): opens the panel the moment a drag
@@ -249,7 +252,7 @@ enum ChatFieldDragMarker {
                 heldAtSettle = false
                 glassRest = glassTop
                 rise = 0
-                pastEnd = 0
+                pastEnd = nil
                 events = []
                 return
             }
@@ -270,7 +273,7 @@ enum ChatFieldDragMarker {
             let at = String(format: "%.1f", newestMinY ?? -1)
             let tip = tipFrame.map { String(format: "%.1f:%.1f", $0.minY, $0.maxY) } ?? "none"
             let room = tipRoom.map { String(format: "%.1f", $0) }.joined(separator: ":")
-            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(String(format: "%.1f", pastEnd)) events=\(events.isEmpty ? "none" : events.joined(separator: ",")) wait=\(tipWaiting ? 1 : 0)"
+            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(pastEnd.map { String(format: "%.1f", $0) } ?? "none") events=\(events.isEmpty ? "none" : events.joined(separator: ",")) wait=\(tipWaiting ? 1 : 0)"
         }
     }
 
