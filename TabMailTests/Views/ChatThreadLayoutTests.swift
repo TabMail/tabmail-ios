@@ -308,8 +308,9 @@ struct ChatThreadLayoutTests {
     /// longer than the screen, held at its bottom by the landing, the chat moves up with the rise
     /// (decision 21: "the rows above move up with it"): its scroll position as drawn passes through
     /// places between where it was and where it ends, rather than jumping there in one frame, and
-    /// the new email ends fully above the field.
-    @Test("In a chat longer than the screen, an arrival moves the chat up through the rise, not in one jump, and ends fully above the field")
+    /// the new email ends at the bar, on screen, where the newest email ended before it. This
+    /// measures how the chat moves, not the new row's own transition.
+    @Test("In a chat longer than the screen, an arrival moves the chat up through the rise, not in one jump, and ends at the bar")
     func arrivalInALongChatMovesItUpWithTheRise() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
         try await HostedAccessibility.withAutomation {
@@ -321,6 +322,12 @@ struct ChatThreadLayoutTests {
                 let contentHeight = scroll.contentSize.height
                 try #require(contentHeight > window.bounds.height, "control: the chat is longer than the screen, \(contentHeight)")
                 let start = Self.shownOffset(of: scroll)
+                // Where the newest email ends above the field before the arrival: the place at the
+                // bar the arrival takes over.
+                let lastBefore = try #require(Self.bubbleFrame(saying: "Lunch?", in: controller.view), "control: the newest before the arrival")
+                let fieldBefore = try #require(Self.frame(of: id, in: controller.view))
+                let gap = fieldBefore.minY - lastBefore.maxY
+                #expect(gap >= 0, "control: held at its bottom, the newest email ends above the field: \(gap)")
                 try await Self.arrive(after: parent)
                 var shown: [CGFloat] = []
                 for _ in 0..<Self.arrivalSamples {
@@ -334,6 +341,11 @@ struct ChatThreadLayoutTests {
                 let new = try #require(Self.bubbleFrame(saying: "Noon works", in: controller.view), "the arrival shows")
                 let field = try #require(Self.frame(of: id, in: controller.view))
                 #expect(new.maxY <= field.minY + 0.5, "the arrival \(new) is fully above the field \(field)")
+                // And at the bar, on screen: it ends where the newest email ended before it, not
+                // anywhere above.
+                let newGap = field.minY - new.maxY
+                #expect(abs(newGap - gap) <= Self.arrivalAtTheBar, "the arrival ends at the bar, \(newGap) above the field, as the newest did at \(gap)")
+                #expect(new.minY >= window.bounds.minY, "the arrival \(new) is on screen")
             }
         }
     }
@@ -345,6 +357,8 @@ struct ChatThreadLayoutTests {
     private static let arrivalSamples = 250
     private static let arrivalSampleInterval: Duration = .milliseconds(8)
     private static let arrivalLeastRise: CGFloat = 20
+    /// How closely the arrival must end where the newest email ended above the field.
+    private static let arrivalAtTheBar: CGFloat = 1
 
     /// The chat's scroll position as drawn: an animated scroll's in-between position, read from the
     /// presentation layer, or the position itself when nothing animates.

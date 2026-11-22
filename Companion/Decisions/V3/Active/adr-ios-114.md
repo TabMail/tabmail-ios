@@ -353,10 +353,14 @@ same AI result, kept as long as the email itself is shown.
      `bottomLandingFollowsABottomInset` and `unreadLandingKeepsItsAnchorThroughABottomInset` grow
      only the bottom safe area (the hosting controller's additional safe-area inset, about a
      keyboard's height), check that the field rose and the scroll view kept its size, and require
-     the landing to hold: the chat at its bottom, the Unread line where it landed, both for half a
-     second of frames after. The platform either keeps the scroll offset (the newest bubble would
-     end under the risen field) or keeps the bottom (the Unread line would move up with it), so
-     between them the two tests see the bottom-inset term.
+     the landing to hold: the chat at its bottom, neither short of it nor pulled past it, with the
+     newest bubble as far above the risen field as it was above the field at the landing; the
+     Unread line where it landed; both for half a second of frames after. Where the platform keeps
+     the scroll offset the newest bubble would end under the risen field, and where it keeps the
+     bottom the Unread line would move up with it, so the two tests see the bottom-inset term
+     wherever the platform does not hold the landing by itself (amended 2026-11-22: they do not
+     prove that it never does; if both hold without the term, its removal is invisible on that
+     input).
 
    **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
    In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible
@@ -1114,8 +1118,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    top, a drag up within its scroll room moves another line to the top, read by tapping the
    top-left corner and typing a mark, and the panel stays shut),
    `testDragUpInOverflowingTextPastItsEndOpensThePanel` (signed in, the same drag carried past the
-   end opens the panel, whose editor holds the whole draft, inside the panel and above the
-   keyboard when one shows), `testDragUpPastTheOpenDistanceInsideTheTextsRoomIsAllTheTexts` (a
+   end opens the panel, whose editor holds the whole draft and keeps its focus, inside the panel
+   and above the keyboard when one shows), `testDragUpPastTheOpenDistanceInsideTheTextsRoomIsAllTheTexts` (a
    sixteen-line draft: a drag past the open distance inside the text's room leaves the field's
    glass still and the panel shut), `testDragUpPastTheTextsEndByLessThanTheOpenDistanceSettlesBack`
    (past the open distance in all but past the end by less: the glass rises only by the rest, the
@@ -1214,7 +1218,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (2026-11-21: the first chat is shorter than the screen and has nothing to scroll; in a chat
    longer than the screen, held at its bottom, the scroll position as drawn passes through places
    between where it was and where it ends, rather than jumping in one frame, and the new email
-   ends fully above the field).
+   ends at the bar, on screen, as far above the field as the newest email was before it; it
+   measures the chat's motion, not the row's own transition).
 
 ## The longer index line (routed 2026-11-09)
 

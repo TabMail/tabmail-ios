@@ -586,6 +586,10 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(editor.waitForExistence(timeout: 3), "the panel's editor holds the draft")
         XCTAssertEqual(editor.value as? String, Self.overflowingText, "the whole draft, unchanged")
         XCTAssertGreaterThanOrEqual(editor.frame.minY, panelTop - 1, "inside the open panel")
+        // The draft keeps the keyboard's focus in the panel's editor (read from the element, so it
+        // holds whether or not the simulator shows its software keyboard), and where a software
+        // keyboard shows, the editor sits above it.
+        XCTAssertTrue(waitForFocus(editor, true, timeout: 3), "the panel's editor keeps the draft's focus")
         let keyboard = app.keyboards.firstMatch
         if keyboard.exists {
             XCTAssertLessThanOrEqual(editor.frame.maxY, keyboard.frame.minY + 1, "above the keyboard")
