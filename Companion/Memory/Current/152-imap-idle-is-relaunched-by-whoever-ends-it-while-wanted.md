@@ -1,0 +1,13 @@
+
+### IMAP IDLE is relaunched by whoever ends it while it is wanted (#1288)
+
+- `IMAPProvider.idleEnabled` is the wish for IDLE: `startIdle()` sets it, `stopIdle()` (and `disconnect()` through it) clears it. `idleServer` is the slot, planted only by `claimIdleServerSlot`, which refuses a cancelled launch, a launch after `stopIdle()`, and a launch when the slot is already taken.
+- A cancelled listener returns without relaunching and without logging out, and a refused launch only logs out its own connection (#953, DONE before LOGOUT). So the code that cancels a listener or a launch while the wish stands must start or schedule the successor itself:
+  - `markDirty()`: at once, in the same actor turn, inside `tearDownIdleConnection` (`if idleEnabled { launchIdleConnection() }`);
+  - `onIdleStreamEnded`: after 5 s, or 10 s on an error;
+  - `retryLaunchIdleConnection`: after 10 s;
+  - `evictIdleConnection`: after 30 s.
+- What went wrong in 1.11.5: on most returns to the app the resume calls `markAllProvidersDirty()` while `startIdle()`'s launch is still connecting. `markDirty()` cancelled the launch, the claim refused it, and nothing started IDLE again until the next return to the app. In 1.11.4 the cancelled listener's stream end happened to relaunch after 5 s; #953 removed that path on purpose (it raced a LOGOUT ahead of the DONE), which exposed the missing relaunch.
+- Accepted cost: when `markDirty()` lands while a launch is connecting, that launch's connection is surplus (one extra login), refused at its claim and logged out.
+- Still open (#1295, P4): the UIDVALIDITY reaction calls `provider.disconnect()`, which clears the wish, so IDLE stays off until the next return to the app (`AccountManagerUidValidityReset.swift`).
+- Test: `IMAPProviderPoolInvariantTests.markDirtyKeepsWantedIdleMonitoringLive` (live session, launch still connecting, stopped).
