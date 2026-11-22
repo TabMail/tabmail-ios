@@ -266,9 +266,10 @@ struct ComposeToolGenerationBoundaryTests {
         case forward
     }
 
-    /// The fake backend: answers every model call "Done" and records its body. For the compose
-    /// editor's case, its first request (the editor's own instruction) is answered with a call to
-    /// `email_compose` asking for words.
+    /// The fake backend: answers every model call with a compose edit the inline-edit parser reads
+    /// (`ComposeEditJSON`, the 2.0.0 edit JSON) and records its body. For the compose editor's case,
+    /// its first request (the editor's own instruction) is answered with a call to `email_compose`
+    /// asking for words.
     final class Backend: @unchecked Sendable {
         /// What a tool asks the model to write.
         static let writeRequest = "Say that Friday works for everyone"
@@ -298,7 +299,7 @@ struct ComposeToolGenerationBoundaryTests {
                         "conversation_state": ["harmony_messages": [], "current_round": 1],
                     ]
                 } else {
-                    final = ["assistant": "Done"]
+                    final = ["assistant": ComposeEditJSON.make(response: "Done.")]
                 }
                 let text = String(decoding: try! JSONSerialization.data(withJSONObject: final), as: UTF8.self)
                 return .bytes(Data("event: final\ndata: \(text)\n\n".utf8), contentType: "text/event-stream")

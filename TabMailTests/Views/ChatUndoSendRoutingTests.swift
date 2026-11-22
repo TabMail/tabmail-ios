@@ -378,10 +378,24 @@ struct ChatUndoSendRoutingTests {
         func expectUndosOnItsOwnHold(_ row: OutboxMessage, _ expected: Undos, _ note: String) async throws {
             try ChatUndoSendRoutingTests.expectQueuedHold(row, note)
             let deadline = OutboxCancellationPolicy.undoDeadline(for: row.holdUntil)
+            let firstLook = state(of: row, deadline: deadline)
             while Date() < deadline, undos() != expected { try await Task.sleep(for: .milliseconds(50)) }
             let seen = undos()
             let inTime = Date() < deadline
-            #expect(seen == expected && inTime, "\(note), on the send's own hold: \(seen)")
+            #expect(seen == expected && inTime,
+                    "\(note), on the send's own hold: \(seen); at the first look \(firstLook); now \(state(of: row, deadline: deadline))")
+        }
+
+        /// What decides and draws `row`'s Undo, for a failure message: its owner, the chat view and
+        /// the plan as Send reads them, whether its toast is the one RootView shows, whether a compose
+        /// still covers the screen, and the time left to its Undo deadline.
+        func state(of row: OutboxMessage, deadline: Date) -> String {
+            let owner = PendingSendService.shared.undoOwner(for: row.id).map { "\($0)" } ?? "none"
+            let toastIsItsOwn = PendingSendService.shared.visibleToast?.id == row.id
+            let covered = controller.presentedViewController != nil
+            let left = deadline.timeIntervalSinceNow
+            return "owner \(owner), chat view \(ChatViewConfig.isActive), plan \(AISubscriptionGate.shared.isActive), "
+                + "its toast shown \(toastIsItsOwn), covered \(covered), \(String(format: "%.1f", left)) s left"
         }
     }
 
