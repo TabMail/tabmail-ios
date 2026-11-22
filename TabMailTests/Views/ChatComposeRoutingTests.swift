@@ -304,8 +304,9 @@ struct ChatComposeRoutingTests {
             if let earlierEmail { try earlierEmail.insert(db) }
             try email.insert(db)
         }
+        let accountId = Self.account
         let storedFolder = try await pool.read { db in
-            try Folder.filter(Column("accountId") == Self.account && Column("role") == FolderRole.inbox.rawValue).fetchOne(db)
+            try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.inbox.rawValue).fetchOne(db)
         }
         let folder = try #require(storedFolder, "control: the inbox folder is stored")
         let storedEmail = try await pool.read { db in try MessageHeader.fetchOne(db, key: email.id) }
