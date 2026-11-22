@@ -162,6 +162,13 @@ struct ChatReplyFieldTests {
         var filtered = Self.header("r4", reply: "")
         filtered.actionTag = ActionTag.none
         #expect(Self.phase(filtered) == nil, "filtered: no reply will come, no Writing")
+        // A reply stored with no text version shows no ghost, so an untagged Inbox email with
+        // one is still case 2: Writing.
+        let bodyOnly = Self.header("r5", reply: "Hi Alex,\n\nTuesday works.")
+        #expect(bodyOnly.actionTag == nil && bodyOnly.isInInbox)
+        let bodyOnlyShown = ChatReplyField.shown(newest: bodyOnly, usersTurn: false, onlyTo: nil)
+        #expect(bodyOnlyShown == nil, "control: no text version, no ghost")
+        #expect(Self.phase(bodyOnly) == .writing, "untagged in the Inbox with a reply but no ghost: Writing")
         // The same predicate the inbox row reads.
         #expect(AIWorkingRule.isWorking(tagged: true, replyProcessed: false, inInbox: false, aiSourceEnabled: false, subscribed: true))
         #expect(AIWorkingRule.isWorking(tagged: false, replyProcessed: false, inInbox: true, aiSourceEnabled: true, subscribed: false))

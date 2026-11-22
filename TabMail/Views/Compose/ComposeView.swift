@@ -1166,7 +1166,8 @@ struct ComposeView: View {
     @State private var shownSuggestion: ReplyResult?
     private var currentSuggestion: String? { shownSuggestion?.body }
     @State private var isRecomputing = false
-    /// The card's running recompute: a new one or the card closing cancels it.
+    /// The card's running recompute: only the card closing cancels it (`cardClosed`); the compose
+    /// agent fence admits one Recompute or edit at a time.
     @State private var recomputeTask: Task<Void, Never>?
     @State private var isApplyingEdit = false
     @State private var aiWorking = false
