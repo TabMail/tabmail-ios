@@ -1472,11 +1472,31 @@ final class ChatSwipeUITests: XCTestCase {
     }
 
     /// Whether `element` has (or has lost) the keyboard's focus within `timeout`, read from the
-    /// element, so it holds whether the simulator shows its software keyboard or not.
+    /// element, so it holds whether the simulator shows its software keyboard or not. Focus gained,
+    /// it notes whether a software keyboard came up for it (`noteTheKeyboard`) before the caller
+    /// types the first key.
     private func waitForFocus(_ element: XCUIElement, _ focused: Bool, timeout: TimeInterval) -> Bool {
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "hasKeyboardFocus == %@", NSNumber(value: focused)), object: element)
-        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+        let reached = XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+        if focused, reached { noteTheKeyboard(in: XCUIApplication()) }
+        return reached
+    }
+
+    /// Notes whether a keyboard of a software keyboard's size comes up for the field just focused,
+    /// waiting up to `keyboardAppearLimit`. Typing drops a software keyboard at the first key, so
+    /// only a keyboard seen here, before any key, or by `waitForTheKeyboardBack` keeps a field that
+    /// holds still with the keyboard away from counting as a run with no software keyboard.
+    private func noteTheKeyboard(in app: XCUIApplication) {
+        let keyboard = app.keyboards.firstMatch
+        let deadline = Date().addingTimeInterval(Self.keyboardAppearLimit)
+        repeat {
+            if keyboard.exists, keyboard.frame.height > app.frame.height * Self.keyboardMinShare {
+                sawSoftwareKeyboard = true
+                return
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.keyboardBackPollStep))
+        } while Date() < deadline
     }
 
     /// XCUITest types like a hardware keyboard: a simulator that shows its software keyboard drops
@@ -1516,16 +1536,19 @@ final class ChatSwipeUITests: XCTestCase {
                 + "keyboard \(String(describing: keys)), software keyboard seen \(sawSoftwareKeyboard))")
     }
 
-    /// Whether a keyboard of a software keyboard's size was seen in this test (`waitForTheKeyboardBack`).
+    /// Whether a keyboard of a software keyboard's size was seen in this test, once a field took
+    /// focus (`noteTheKeyboard`) or after typing (`waitForTheKeyboardBack`).
     private var sawSoftwareKeyboard = false
 
-    /// How long the field may keep moving after typing; how often it is read; the least share of the
-    /// screen's height a software keyboard covers (the hardware keyboard's small bar covers less);
-    /// how long a field with no software keyboard must hold still, past the keyboard's return.
+    /// How long the field may keep moving after typing; how often it and the keyboard are read; the
+    /// least share of the screen's height a software keyboard covers (the hardware keyboard's small
+    /// bar covers less); how long a field with no software keyboard must hold still, past the
+    /// keyboard's return; how long a software keyboard may take to come up once a field has focus.
     private static let keyboardBackLimit: TimeInterval = 8
     private static let keyboardBackPollStep: TimeInterval = 0.25
     private static let keyboardMinShare: CGFloat = 0.25
     private static let keyboardReturnWindow: TimeInterval = 2.5
+    private static let keyboardAppearLimit: TimeInterval = 2
 
     /// How long a focus read through the app's marker may take to settle.
     private static let focusMarkerPollLimit: TimeInterval = 3

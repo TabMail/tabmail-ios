@@ -208,12 +208,16 @@ enum ChatFieldDragMarker {
     /// The drag on the field let go or was cut off with `text` under it (the focused field's
     /// scrolling text, if any), the text last read at `lastMoved` while the drag moved: records
     /// where the text is now and, for `Probe.watchAfterLetGo`, its first move after that with the
-    /// call stack that made it, to find what moves a text the drag left scrolled (debug builds
+    /// call stack that made it, to find what moves a text the drag left scrolled. Only here, in a
+    /// launch the swipe UI tests made and with a text under the drag, are UIKit's text calls
+    /// wrapped (`TextCalls`), so no other process has its UIKit methods changed (debug builds
     /// only; nothing in release).
     @MainActor
     static func textLetGo(_ text: UIScrollView?, lastMoved: CGFloat) {
         #if DEBUG
-        if Probe.isActive { Probe.shared.watchText(text, lastMoved: lastMoved) }
+        guard Probe.isActive else { return }
+        if text != nil { TextCalls.install() }
+        Probe.shared.watchText(text, lastMoved: lastMoved)
         #endif
     }
 
@@ -485,7 +489,6 @@ enum ChatFieldDragMarker {
                 textAtLetGo = "none"
                 return
             }
-            TextCalls.install()
             let from = text.contentOffset.y
             textAtLetGo = String(format: "%.1f:%.1f", lastMoved, from)
             textWatch = text.observe(\.contentOffset, options: [.new]) { [weak self] _, change in
@@ -620,12 +623,15 @@ enum ChatFieldDragMarker {
             String(format: "%.0fms", (CACurrentMediaTime() - began) * Self.millisecondsPerSecond)
         }
 
+        /// A new owner or swipe starts a new record, its times counted from the binding until the
+        /// swipe first begins.
         func watch(_ pop: UIGestureRecognizer, for owner: ObjectIdentifier) {
             guard owner != self.owner || pop !== self.pop else { return }
             end()
             self.owner = owner
             self.pop = pop
             lastState = pop.state
+            began = CACurrentMediaTime()
             pop.addTarget(self, action: #selector(changed(_:)))
             enabledWatch = pop.observe(\.isEnabled, options: [.old, .new]) { [weak self] _, change in
                 // A recognizer is turned on or off on the main thread.
