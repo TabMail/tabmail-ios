@@ -284,7 +284,11 @@ struct IMAPChangeCondstoreTests {
     /// One real foreground pass (`SyncEngine.sync`): the change read, the
     /// listings it needs, and the baseline commit that alone turns tracking on
     /// (`commitChangeBaseline`). The recent-sync throttle is cleared so the pass
-    /// runs; `listing` also makes the scheduled full sync due.
+    /// runs; `listing` also makes the scheduled full sync due. The pass starts
+    /// the account's background backfill (`SyncEngine.startBackfill`), whose walk
+    /// and catch-up would reach the same server at a moment the test does not
+    /// choose; the pass stops it before it starts, and a test that needs the
+    /// catch-up runs it itself (`catchUp`).
     static func foregroundPass(_ w: E.World, listing: Bool = false) async throws {
         let id = w.account.id
         try await w.pool.write { db in
@@ -295,6 +299,15 @@ struct IMAPChangeCondstoreTests {
         }
         let account = try #require(try await w.pool.read { db in try Account.fetchOne(db, key: id) })
         _ = try await w.engine.sync(account: account)
+        await w.engine.resetBackfill(accountId: id)
+    }
+
+    /// One catch-up run (`SyncEngine.runCatchUpRun`), as the background
+    /// backfill's cycle runs it after a pass.
+    static func catchUp(_ w: E.World) async throws {
+        let id = w.account.id
+        let account = try #require(try await w.pool.read { db in try Account.fetchOne(db, key: id) })
+        _ = await w.engine.runCatchUpRun(account: account, run: .snapshot(deadline: Date().addingTimeInterval(30)))
     }
 
     static func bookmarkDropped(_ w: E.World) throws -> Bool {
@@ -353,6 +366,7 @@ struct IMAPChangeCondstoreTests {
         try await E.withWorld(name, capabilities: Self.condstore, serverUIDs: [1], localUIDs: [1]) { w in
             w.server.setExpungeKeepsHighestModSeq(true, for: E.path)
             try await Self.foregroundPass(w)
+            try await Self.catchUp(w)
             try #require(try Self.tracked(w), "setup: the baseline pass's listing and commit track the folder")
             try #require(IMAPChangeCursor.decode(try w.folder().changeCursor)?.uidNext == 2, "setup: the bookmark's UIDNEXT is 2")
             try #require(IMAPCatchUpState.decode(try w.folder().catchUpState)?.lastCompletedAt != nil,
