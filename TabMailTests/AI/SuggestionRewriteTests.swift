@@ -1087,6 +1087,32 @@ struct SuggestionRewriteRouteTests {
                 showingSuggestion: true, isForward: false, replyTo: email,
                 recipients: otherCase, subject: envelope.subject, accountId: nil, accounts: [])
             #expect(otherCaseTarget?.id == email.id, "the entry kept in another case: still the suggestion's envelope")
+            // Another entry in its place: not the suggestion's envelope.
+            let otherEntry = envelope.recipients.filling(
+                to: RecipientEntry(["sender@example.com", "Private-List:;", "recipient@example.com"]))
+            let otherEntryTarget = ComposeView.suggestionEditTarget(
+                showingSuggestion: true, isForward: false, replyTo: email,
+                recipients: otherEntry, subject: envelope.subject, accountId: nil, accounts: [])
+            #expect(otherEntryTarget == nil, "another entry in its place: the edit stays in the card")
+            // The entry moved to Cc, every address in its role: not the suggestion's envelope.
+            let movedToCc = envelope.recipients.filling(
+                to: RecipientEntry(["sender@example.com", "recipient@example.com"]), cc: RecipientEntry(["Undisclosed-Recipients:;"]))
+            #expect(movedToCc.cc.rejected == ["Undisclosed-Recipients:;"], "control: the entry moved to Cc")
+            let movedTarget = ComposeView.suggestionEditTarget(
+                showingSuggestion: true, isForward: false, replyTo: email,
+                recipients: movedToCc, subject: envelope.subject, accountId: nil, accounts: [])
+            #expect(movedTarget == nil, "the entry in another field: the edit stays in the card")
+            // Two entries, in another order: still the suggestion's envelope.
+            var twoEntries = email
+            twoEntries.replyTo = "sender@example.com, Undisclosed-Recipients:;, Private-List:;"
+            let twoEnvelope = ChatReplyCompose.suggestionEnvelope(for: twoEntries, accounts: [])
+            let reordered = twoEnvelope.recipients.filling(
+                to: RecipientEntry(["sender@example.com", "Private-List:;", "Undisclosed-Recipients:;", "recipient@example.com"]))
+            #expect(reordered.to.rejected == ["Private-List:;", "Undisclosed-Recipients:;"], "control: both entries, reordered")
+            let reorderedTarget = ComposeView.suggestionEditTarget(
+                showingSuggestion: true, isForward: false, replyTo: twoEntries,
+                recipients: reordered, subject: twoEnvelope.subject, accountId: nil, accounts: [])
+            #expect(reorderedTarget?.id == email.id, "the same entries in another order: still the suggestion's envelope")
         } else {
             let cardTo = RecipientEntry(opened?.to ?? [])
             #expect(cardTo.addresses == ["sender@example.com", "recipient@example.com"] && cardTo.leftovers.isEmpty,
