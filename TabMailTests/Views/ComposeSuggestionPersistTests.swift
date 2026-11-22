@@ -792,6 +792,14 @@ struct ComposeSuggestionPersistTests {
         let save = try #require(edit.range(of: "await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: dbPool)"))
         let fade = try #require(edit.range(of: "withAnimation(.easeOut(duration: 0.4)) {"))
         #expect(gate.lowerBound < save.lowerBound && save.lowerBound < fade.lowerBound)
+        // The one write runs only for the email the decision named, never the card's own email
+        // in its place: an edit the decision keeps in the card is never stored.
+        let target = try #require(edit.range(of: "if let value = edit.edited, let reply = edit.target {"))
+        let between = String(edit[target.upperBound..<save.lowerBound])
+        #expect(gate.lowerBound < target.lowerBound && between.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the write sits directly inside the decision's target: \(between)")
+        #expect(edit.components(separatedBy: "writeCachedReplyToDB").count - 1 == 1, "one write, the gated one")
+        #expect(!edit.contains("edit.target ??"), "no other email stands in for the decision's target")
         #expect(!edit.contains("Task {"), "the save is awaited by the edit, never detached")
         // The card shows the stored whole value, so a second edit starts from (and replaces) this one.
         let shown = try #require(edit.range(of: "if showingSuggestion {"))

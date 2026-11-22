@@ -89,12 +89,15 @@ struct EmailReplyWordsTests {
                        ctx: ToolContext(db: db, translator: translator, router: router))
     }
 
-    /// A second email in `accountId`, numbered 2, holding its own stored suggestion: another email
-    /// (its own Message-ID), or the fixture email's copy in another account (the same one).
-    func insertOther(_ fixture: Fixture, accountId: String, own: String, subject: String, rfc822: String) async throws -> MessageHeader {
+    /// A second email in `accountId`'s `folder`, numbered 2, holding its own stored suggestion:
+    /// another email (its own Message-ID), or a copy of the fixture email (the same one) in another
+    /// account or another folder.
+    func insertOther(
+        _ fixture: Fixture, accountId: String, own: String, subject: String, rfc822: String, folder: String = "INBOX"
+    ) async throws -> MessageHeader {
         let inserted = try TestDatabase.insertMessageHeader(
             fixture.db, messageId: "w2", subject: subject, to: "\(own), alex@example.com",
-            folderId: "\(accountId):INBOX", accountId: accountId, rfc822MessageId: rfc822)
+            folderId: "\(accountId):\(folder)", accountId: accountId, folderPath: folder, rfc822MessageId: rfc822)
         let other = Self.otherStored
         try await fixture.db.write { db in
             try db.execute(
@@ -195,7 +198,7 @@ struct EmailReplyWordsTests {
         #expect(Set(call.context.toRecipients + call.context.ccRecipients + call.context.bccRecipients) == Set(chosen),
                 "the model writes for the people chosen alone: \(call.context.toRecipients) cc \(call.context.ccRecipients)")
         #expect(call.context.senderEmail == "test@example.com", "written as the account the reply is sent from")
-        let bodyText = call.context.bodyText ?? ""
+        let bodyText = call.context.bodyText
         #expect(bodyText.contains(Self.emailText) && !bodyText.contains(fixture.header.snippet),
                 "the model reads the email's own text, not its snippet: \(bodyText)")
 
@@ -274,6 +277,33 @@ struct EmailReplyWordsTests {
         #expect(Set(card.to + card.cc) == Self.everyone && card.isReplyAll, "a Reply All to the target's people")
         #expect(!card.composeView(account: nil, onOutcome: { _ in }).onlyToChosen, "an ordinary card")
         let after = try await row(fixture.db, target.id).suggestion
+        #expect(after == Self.otherStored, "nothing is stored")
+    }
+
+    /// The choice applies to any copy of the email in the same account: a reply to another
+    /// folder's copy (another row) with no request is written for the people chosen too, never
+    /// with that copy's own stored suggestion.
+    @Test("A reply narrowed in the field to another folder's copy of the email, with no request, is written for the people chosen")
+    func narrowedReplyToAnotherFoldersCopyIsWrittenForThePeopleChosen() async throws {
+        let fixture = try await fixture()
+        try TestDatabase.insertFolder(fixture.db, name: "Archive", path: "Archive", role: .archive)
+        let copy = try await insertOther(fixture, accountId: "acc1", own: "test@example.com", subject: "Offsite",
+                                         rfc822: "<offsite@example.com>", folder: "Archive")
+        let applies = ChatFieldReply(email: fixture.header, onlyTo: ["sender@example.com"]).audienceApplies(to: copy)
+        #expect(copy.id != fixture.header.id && applies, "control: another row, the same email in the same account")
+
+        let calls = Calls()
+        let card = try await card(fixture, calls: calls, answer: .writes, arguments: ["unique_id": .int(2)],
+                                  onlyTo: ["sender@example.com"], fieldEmail: fixture.header)
+        #expect(calls.all.count == 1, "the reply is written once")
+        guard calls.all.count == 1 else { return }
+        let call = calls.all[0]
+        #expect(call.request == "" && call.subject == "" && call.body == "", "a reply asked for with no request")
+        #expect(call.context.toRecipients == ["sender@example.com"] && call.context.ccRecipients.isEmpty
+                    && call.context.bccRecipients.isEmpty, "written for the people chosen")
+        #expect(card.body == Self.written && card.suggestion == nil, "the words written for them, not the copy's stored suggestion")
+        #expect(card.composeView(account: nil, onOutcome: { _ in }).onlyToChosen)
+        let after = try await row(fixture.db, copy.id).suggestion
         #expect(after == Self.otherStored, "nothing is stored")
     }
 
