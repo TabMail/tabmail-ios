@@ -70,6 +70,36 @@ enum ChatFieldDrag {
         var swell: CGFloat = 0
     }
 
+    /// The drag's progress as the chat holds it. Read only inside `Swell`, `Watch` and the debug
+    /// marker, so a moving finger redraws those modifiers alone and never rebuilds the chat's body
+    /// or the reply field under the drag (UI run 2026-11-22: after the let-go the field's text
+    /// scrolled to its caret, on the first layout after builds made while the finger moved).
+    @MainActor @Observable
+    final class Model {
+        var progress = Progress()
+    }
+
+    /// The swell: on the field's glass (`sign` 1), and taken back out of the layout around it
+    /// (`sign` -1), so the field's measured height never moves under a drag.
+    struct Swell: ViewModifier {
+        let model: Model?
+        let sign: CGFloat
+
+        func body(content: Content) -> some View {
+            content.padding(.top, sign * (model?.progress.swell ?? 0))
+        }
+    }
+
+    /// Tells `changed` when a drag begins and when it ends, finished or cancelled.
+    struct Watch: ViewModifier {
+        let model: Model
+        let changed: (Bool) -> Void
+
+        func body(content: Content) -> some View {
+            content.onChange(of: model.progress.isDragging) { _, dragging in changed(dragging) }
+        }
+    }
+
     /// The drag's progress for a drag of `translation`.
     static func progress(translation: CGSize) -> Progress {
         Progress(isDragging: true, swell: swell(translation: translation))

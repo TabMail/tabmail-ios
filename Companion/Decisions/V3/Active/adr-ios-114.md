@@ -1258,15 +1258,21 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
 21. **Drag the field up to open the TabMail chat (amendment 2026-11-20).** Until now the panel
    opened only on an agent answer, a confirmation card or `.openMessageWithChat`. A drag up on the
    collapsed reply field now opens it too, and the field itself swells into the panel: while the
-   finger moves, the field's top follows it (`ChatReplyField.swell`, `ChatFieldDrag.swell`, at most
+   finger moves, the field's top follows it (`ChatReplyField.drag`, `ChatFieldDrag.swell`, at most
    `ChatViewLayout.fieldDragMaxSwell`); on let-go the panel opens with the pill's spring once the
    swell, or a flick's predicted swell, reaches `fieldDragOpenDistance`, and otherwise the field
    settles back. Only a drag more up than sideways counts, so the chat's sideways swipes are
    unchanged. The swell is not the field's room: `pill(on:)` takes it back out of the layout right
-   after the field (`.padding(.top, -fieldDragProgress.swell)`), so the field's glass grows upward
-   while its measured height, the bar, its inset and the chat stay put; the two paddings read the
-   same gesture state and spring back in the same reset transaction, so they cancel through the
-   settle too. While the field is dragged up, its swollen glass grows over the "Replying only to" line or
+   after the field (`ChatFieldDrag.Swell(model: fieldDrag, sign: -1)`; formerly
+   `.padding(.top, -fieldDragProgress.swell)`), so the field's glass grows upward while its
+   measured height, the bar, its inset and the chat stay put; the two paddings read the same drag
+   state and spring back in the same reset transaction, so they cancel through the settle too.
+   **The drag state is read only in modifiers (amended 2026-11-22):** it lives in an observable
+   model (`ChatFieldDrag.Model`, held by `ChatThreadView.fieldDrag`) that only the two `Swell`
+   paddings, the drag's start and end watch (`ChatFieldDrag.Watch`) and the debug marker read, so a
+   moving finger redraws those modifiers and never rebuilds the chat's body or the reply field
+   (a UI run showed the field's text scrolling to its caret after the let-go, on the first layout
+   after builds made while the finger moved). While the field is dragged up, its swollen glass grows over the "Replying only to" line or
    the no-reply notice above it, and the bar, the chat and its inset stay still, as designed. *Superseded 2026-11-21 (the compensation below needed three fixes and was deleted
    for the padding above):* "from the drag's start until its swell has settled
    (`ChatThreadView.fieldDragSettle`, the pill spring's own `settlingDuration`, so the two cannot
@@ -1315,8 +1321,14 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    waits for its scroll (text overflowing the six lines) and its long presses (caret, loupe,
    selection), and its taps wait for the pan." Its state (`ChatFieldDrag.Progress`) is
    reset with the pill's spring however the drag ends (`fieldDragEnded`), so a cancelled drag (the
-   panel opening on an agent answer mid-drag, which turns the pan off, or a system interruption)
-   springs back too. **The release policy** (`ChatFieldDrag.opens(letGo:)`, amended 2026-11-21):
+   panel opening on an agent answer mid-drag, or a system interruption) springs back too. **The
+   panel opening cuts a held drag off itself (amended 2026-11-22):** turning the pan off
+   (`isEnabled`) did not end a drag already held (a UI run showed it running on to its let-go with
+   the swell held), so the chat's `onChange(of: chatExpanded)` calls `ChatFieldPan.Cut`, which sets
+   the held pan to cancelled (`Recognizer.cut`; a pan with no drag held is left as it is). The text
+   counts as at its end within `ChatViewLayout.fieldTextEndTolerance` (0.1 pt) of the end its sizes
+   give (`ChatFieldPan.Coordinator.isAtEnd`, amended 2026-11-22): UIKit holds the text on its own
+   value, which read a hair short of it, and the field then never got its share. **The release policy** (`ChatFieldDrag.opens(letGo:)`, amended 2026-11-21):
    only a finished drag can open the panel. It opens when its swell (its upward travel, counted
    only while it goes more up than sideways) reaches `fieldDragOpenDistance` (60 pt), or when its
    predicted end does: the travel plus `ChatViewLayout.fieldFlickCarry` (0.25 s) of travel at the
@@ -1419,7 +1431,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (`ChatThreadView.tipRoom`, amended 2026-11-21): at a large text size, in landscape (supported on
    iPhone) or above a tall draft the card could run off the top of the screen, so it waits for room
    instead, not shown and still eligible for its one showing. `ViewThatFits` measures the card
-   without showing it. Tests:
+   without showing it. VoiceOver can still reach the card while it waits (tabmail-ios#1255, a
+   VoiceOver-only issue for later; hiding the choice while the stand-in shows did not take and was
+   removed 2026-11-22). Tests:
    `ChatReplyFieldTests.fieldDragTip`, `ChatFieldDragTests.firstDragWithTheTipOpens`,
    `ChatSwipeUITests.testFieldDragTipShowsAndLeavesTheFieldItsTouches` (launched with
    `--chat-field-drag-tip`, which resets the TipKit datastore and forces the tip on),

@@ -84,8 +84,11 @@ struct ChatThreadView: View {
     @State private var chatAreaHeight: CGFloat = 0
     /// A drag up on the collapsed field (`ChatFieldDrag`, `ChatFieldPan`): reset however the drag
     /// ends, a cancelled one included, with the pill's spring, so the swell always springs back
-    /// (`fieldDragEnded`).
-    @State private var fieldDragProgress = ChatFieldDrag.Progress()
+    /// (`fieldDragEnded`). Its progress is read only in modifiers (`ChatFieldDrag.Model`), never
+    /// in this body.
+    @State private var fieldDrag = ChatFieldDrag.Model()
+    /// Cuts off a drag on the field the panel opened under (`ChatFieldPan.Cut`).
+    @State private var fieldPanCut = ChatFieldPan.Cut()
     @State private var chatInputFocused = false
     @State private var chatWorking = false
     /// The ready AI Suggestion's compose card: the email it answers, and how it opens.
@@ -111,8 +114,6 @@ struct ChatThreadView: View {
     @State private var headerBottom = -CGFloat.infinity
     @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
-    /// Whether the field's drag tip waits for room: `ViewThatFits` picked its empty stand-in.
-    @State private var tipWaitsForRoom = false
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Held only while a grow is pending: set when the AI Suggestion's row becomes Writing, cleared
@@ -964,7 +965,7 @@ struct ChatThreadView: View {
                     clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
                     tutorialMove: tutorialMove(thread),
-                    swell: fieldDragProgress.swell,
+                    drag: fieldDrag,
                     // The drag's VoiceOver equivalent (decision 12: every chat swipe has a named
                     // action), on the text field VoiceOver focuses; not over the panel or the tutorial.
                     showChat: chatExpanded || TutorialCoordinator.shared.isRunning
@@ -976,19 +977,20 @@ struct ChatThreadView: View {
             // The swell is not the field's room: its glass grows upward, and the same swell is taken
             // back out of the layout here, springing back in the same transaction, so the field's
             // measured height, the bar, its inset and the chat never move under a drag.
-            .padding(.top, -fieldDragProgress.swell)
+            .modifier(ChatFieldDrag.Swell(model: fieldDrag, sign: -1))
             // Drag the field up: it swells under the finger and opens the TabMail chat panel. A
             // UIKit pan, so once it starts the field's text view loses the touch and a drag never
             // focuses the field (`ChatFieldPan`). Not in the tutorial, whose steps open the chat
             // themselves.
             .gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning,
-                                  moved: fieldDragMoved, ended: fieldDragEnded))
-            .onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }
+                                  cut: fieldPanCut, moved: fieldDragMoved, ended: fieldDragEnded))
+            .modifier(ChatFieldDrag.Watch(model: fieldDrag) { fieldDragChanged($0) })
             // Debug UI tests only: what the drag did to the chat (`ChatFieldDragMarker`).
-            .modifier(ChatFieldDragMarker.Field(dragging: fieldDragProgress.isDragging))
-            // A tap on the field (it takes focus) or the panel opening ends the tip.
+            .modifier(ChatFieldDragMarker.Field(model: fieldDrag))
+            // A tap on the field (it takes focus) or the panel opening ends the tip. The panel
+            // opening under a held drag (an agent answer, a notification) also cuts that drag off.
             .onChange(of: chatInputFocused) { _, focused in if focused { ChatFieldDragTip.close() } }
-            .onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close() } }
+            .onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close(); fieldPanCut() } }
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.replyPillId)
@@ -1016,16 +1018,10 @@ struct ChatThreadView: View {
                                 // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop))
                             Color.clear.frame(height: 0)
-                                .onAppear { tipWaitsForRoom = true }
-                                .onDisappear { tipWaitsForRoom = false }
                                 // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipWait())
                         }
-                        // `ViewThatFits` keeps the candidate it did not pick in the accessibility
-                        // tree, and does not apply a later change to that candidate's own modifiers:
-                        // VoiceOver must not read a card that is not on screen while the stand-in
-                        // shows. The stand-in has nothing to read, so the whole choice is hidden.
-                        .accessibilityHidden(tipWaitsForRoom)
+                        // VoiceOver can still reach a card waiting for room (tabmail-ios#1255).
                         .frame(height: tipRoom, alignment: .bottom)
                     }
             }
@@ -1044,7 +1040,7 @@ struct ChatThreadView: View {
 
     /// The drag up on the collapsed field moved (`ChatFieldPan`): the field swells under the finger.
     private func fieldDragMoved(_ drag: ChatHorizontalPan.Sample) {
-        fieldDragProgress = ChatFieldDrag.progress(translation: drag.travel)
+        fieldDrag.progress = ChatFieldDrag.progress(translation: drag.travel)
     }
 
     /// The drag up on the collapsed field let go, or was cancelled (`ChatFieldPan`): the swell
@@ -1055,7 +1051,7 @@ struct ChatThreadView: View {
         ChatFieldDragMarker.dragEnded(finished: finished)
         let opens = finished && ChatFieldDrag.opens(letGo: drag)
         withAnimation(Self.pillSpring) {
-            fieldDragProgress = ChatFieldDrag.Progress()
+            fieldDrag.progress = ChatFieldDrag.Progress()
             if opens { chatExpanded = true }
         }
     }

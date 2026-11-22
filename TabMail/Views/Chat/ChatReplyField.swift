@@ -23,8 +23,9 @@ struct ChatReplyField {
     var onlyTo: [ChatThread.Person]? = nil
     /// In the tutorial, what the read-only field holds and sends (part 2); nil holds nothing.
     var tutorialMove: TutorialCoordinator.FieldMove? = nil
-    /// How far a drag up has swelled the field toward the panel (`ChatFieldDrag`); 0 at rest.
-    var swell: CGFloat = 0
+    /// A drag up in flight, whose swell grows the field toward the panel (`ChatFieldDrag.Swell`);
+    /// nil swells nothing.
+    var drag: ChatFieldDrag.Model? = nil
     /// VoiceOver's "Show TabMail chat" (`ChatViewConfig.showChatActionName`), the drag up's
     /// equivalent, offered on the element VoiceOver focuses (`showChatAction`); nil offers nothing
     /// (the panel open, the tutorial).

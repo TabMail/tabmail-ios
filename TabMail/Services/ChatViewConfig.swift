@@ -160,6 +160,12 @@ enum ChatViewLayout {
     /// held still this long lets go at rest. Six frames at 60 Hz; a flick lifts within a frame or
     /// two of its last move.
     static let fieldFlickRest: TimeInterval = 0.1
+    /// How close to its end the focused field's overflowing text counts as at its end, where the
+    /// rest of a drag becomes the field's (`ChatFieldPan.Coordinator.isAtEnd`), in points: the
+    /// end is computed from the text's sizes while UIKit stops its scroll on its own value, so a
+    /// text held at its end read a hair short of it (UI run 2026-11-22: `over=-0.0`, under 0.05)
+    /// and the field never got its share. Well under a pixel at any scale.
+    static let fieldTextEndTolerance: CGFloat = 0.1
     /// The pill's spring (the panel opening and closing, the field's swell springing back): its
     /// response in seconds and its damping ratio. A drag's settle lasts this spring's own settling
     /// duration (`ChatThreadView.fieldDragSettle`).

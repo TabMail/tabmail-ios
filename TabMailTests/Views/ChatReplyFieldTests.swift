@@ -1125,17 +1125,16 @@ struct ChatReplyFieldTests {
         // the no-reply notice rather than over them: hung by its bottom from the stack's top edge.
         // Only while the whole card fits between the header and the stack: otherwise nothing, so
         // the tip waits for room and keeps its one showing.
-        // While it waits, the whole `ViewThatFits` is hidden from VoiceOver: it keeps the card it did
-        // not pick in the accessibility tree, and a later change to that card's own modifiers does
-        // not take, so VoiceOver would otherwise read a card that is not on screen.
-        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop)) Color.clear.frame(height: 0) .onAppear { tipWaitsForRoom = true } .onDisappear { tipWaitsForRoom = false } // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipWait()) } // `ViewThatFits` keeps the candidate it did not pick in the accessibility // tree, and does not apply a later change to that candidate's own modifiers: // VoiceOver must not read a card that is not on screen while the stand-in // shows. The stand-in has nothing to read, so the whole choice is hidden. .accessibilityHidden(tipWaitsForRoom) .frame(height: tipRoom, alignment: .bottom) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
-        #expect(Self.count(".accessibilityHidden(tipWaitsForRoom)", in: chat) == 1, "on the whole choice only")
+        // VoiceOver can still reach a waiting card (tabmail-ios#1255): hiding the choice while the
+        // stand-in shows did not take.
+        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop)) Color.clear.frame(height: 0) // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipWait()) } // VoiceOver can still reach a card waiting for room (tabmail-ios#1255). .frame(height: tipRoom, alignment: .bottom) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
         let room = try Self.body(of: "private var tipRoom: CGFloat {", in: chat)
         #expect(Self.count("let room = pillTop - headerBottom return room.isFinite ? max(0, room) : 0", in: room) == 1,
                 "the measured space between the header's bottom and the stack's top; none until measured")
         // A tap on the field focuses it, a drag starts, or the panel opens: each ends the tip for good.
+        // The panel opening also cuts off a drag held on the field.
         #expect(Self.count(".onChange(of: chatInputFocused) { _, focused in if focused { ChatFieldDragTip.close() } }", in: chat) == 1)
-        #expect(Self.count(".onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close() } }", in: chat) == 1)
+        #expect(Self.count(".onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close(); fieldPanCut() } }", in: chat) == 1)
         let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
         let dragStart = try #require(changed.range(of: "if dragging {"))
         let dragEnd = try #require(changed[dragStart.upperBound...].range(of: "return }"))
@@ -1191,17 +1190,29 @@ struct ChatReplyFieldTests {
         #expect(Self.count("DragGesture", in: chat) == 0)
         #expect(Self.count("@GestureState", in: chat) == 0)
         #expect(Self.count("fieldDragGesture", in: chat) == 0)
-        #expect(Self.count("@State private var fieldDragProgress = ChatFieldDrag.Progress()", in: chat) == 1)
+        #expect(Self.count("@State private var fieldDrag = ChatFieldDrag.Model()", in: chat) == 1)
         #expect(Self.count("@State private var fieldSwell", in: chat) == 0)
+        // The drag's progress is written by the pan's two calls and read only inside modifiers, so a
+        // moving finger never rebuilds the chat's body or the reply field.
+        #expect(Self.count("fieldDrag.progress", in: chat) == 2, "only the two writes below")
+        #expect(Self.count("drag: fieldDrag,", in: chat) == 1, "the field gets the model, not a swell")
+        #expect(Self.count(".modifier(ChatFieldDrag.Swell(model: fieldDrag, sign: -1))", in: chat) == 1,
+                "the swell taken back out of the layout")
+        let fieldBar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
+        #expect(Self.count(".modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))", in: fieldBar) == 1, "the swell on the glass")
+        #expect(Self.count(".modifier(ChatFieldDragMarker.Field(model: fieldDrag))", in: chat) == 1)
         let moved = try Self.body(of: "private func fieldDragMoved(_ drag: ChatHorizontalPan.Sample) {", in: chat)
-        #expect(Self.count("fieldDragProgress = ChatFieldDrag.progress(translation: drag.travel) }", in: moved) == 1)
+        #expect(Self.count("fieldDrag.progress = ChatFieldDrag.progress(translation: drag.travel) }", in: moved) == 1)
         #expect(Self.count("chatExpanded", in: moved) == 0, "a move only swells the field")
         // A cancelled drag resets too, so the field never stays swollen; only a finished drag opens.
         let ended = try Self.body(of: "private func fieldDragEnded(_ drag: ChatHorizontalPan.Sample, finished: Bool) {", in: chat)
         #expect(Self.count("let opens = finished && ChatFieldDrag.opens(letGo: drag)", in: ended) == 1)
-        #expect(Self.count("withAnimation(Self.pillSpring) { fieldDragProgress = ChatFieldDrag.Progress() if opens { chatExpanded = true } }", in: ended) == 1)
+        #expect(Self.count("withAnimation(Self.pillSpring) { fieldDrag.progress = ChatFieldDrag.Progress() if opens { chatExpanded = true } }", in: ended) == 1)
         // The freeze, under its own id, from the gesture state, so a cancelled drag releases.
-        #expect(Self.count(".onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }", in: chat) == 1)
+        #expect(Self.count(".modifier(ChatFieldDrag.Watch(model: fieldDrag) { fieldDragChanged($0) })", in: chat) == 1)
+        let bar = try Self.source("TabMail/Views/Chat/ChatFieldBarRow.swift")
+        #expect(Self.count("content.onChange(of: model.progress.isDragging) { _, dragging in changed(dragging) }", in: bar) == 1)
+        #expect(Self.count("content.padding(.top, sign * (model?.progress.swell ?? 0))", in: bar) == 1)
         let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: chat)
         #expect(Self.count("ChatSwipeHold.shared.begin(Self.fieldDragHoldId)", in: changed) == 1)
         // Every let-go holds through the settle and the freeze rule's cooldown, on the swipes' own
@@ -1209,7 +1220,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: Self.fieldDragSettle + ChatViewLayout.freezeCooldown)", in: changed) == 1)
         #expect(Self.count("ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)", in: chat) == 1, "and if the chat goes away")
         // Never in the tutorial, whose steps open the chat themselves, nor over the open panel.
-        #expect(Self.count(".gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning, moved: fieldDragMoved, ended: fieldDragEnded))", in: chat) == 1)
+        #expect(Self.count(".gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning, cut: fieldPanCut, moved: fieldDragMoved, ended: fieldDragEnded))", in: chat) == 1)
         #expect(Self.count("simultaneousGesture", in: chat) == 0)
         // One bridge for every chat pan: the field's drag reads the swipes' sample and outcome, with
         // no delivery of its own.

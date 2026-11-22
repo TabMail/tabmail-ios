@@ -6,6 +6,7 @@ import CoreGraphics
 import Foundation
 import Testing
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 @testable import TabMail
 
 /// Dragging the reply field up (`ChatFieldDrag`): the field swells under the finger, only for a drag
@@ -193,7 +194,7 @@ struct ChatFieldDragTests {
     @MainActor
     func secondFingerKeepsTheRest() {
         let coordinator = ChatFieldPan.Coordinator()
-        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true)
+        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: ChatFieldPan.Cut())
         // 25 up at 250 pt/s predicts 87.5: a flick that opens when lifted with its move.
         let flick = ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: -25), velocity: CGSize(width: 0, height: -250))
         pan.moved(at: 10)
@@ -345,6 +346,56 @@ struct ChatFieldDragTests {
         #expect(up == Self.sample(0, -65), "the sideways travel made in the text is not the field's")
         let opens = ChatFieldDrag.opens(letGo: up)
         #expect(opens, "65 straight up past the end opens the panel")
+    }
+
+    // UIKit holds a text at its end on its own value, which can read a hair under the end its sizes
+    // give (UI run 2026-11-22: 0.0 shown, under 0.05 short): that text is at its end.
+    @Test("A text a hair short of its computed end is at its end, at the touch and while the drag moves; a point short is not")
+    @MainActor
+    func textEndTolerance() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        let hair = ChatViewLayout.fieldTextEndTolerance / 2
+        let nearEnd = ChatFieldPan.Coordinator.isAtEnd(end - hair, end: end)
+        let pointShortEnd = ChatFieldPan.Coordinator.isAtEnd(end - 1, end: end)
+        #expect(nearEnd)
+        #expect(!pointShortEnd)
+
+        text.contentOffset = CGPoint(x: 0, y: end - hair)
+        coordinator.touchDown(on: inner)
+        let fromTheEnd = coordinator.share(Self.sample(0, -70, speed: -300))
+        #expect(fromTheEnd == Self.sample(0, -70, speed: -300), "a hair short at the touch: the drag is the field's from its start")
+
+        text.contentOffset = CGPoint(x: 0, y: end / 2)
+        coordinator.touchDown(on: inner)
+        text.contentOffset = CGPoint(x: 0, y: end - hair)
+        let crossed = coordinator.share(Self.sample(0, -130))
+        #expect(crossed == Self.sample(0, -30), "held a hair short of its end, the rest of the drag is the field's")
+
+        text.contentOffset = CGPoint(x: 0, y: end - 1)
+        coordinator.touchDown(on: inner)
+        let pointShort = coordinator.share(Self.sample(0, -70, speed: -300))
+        #expect(pointShort == Self.sample(0, 0), "a point short, the text still has room: none of it is the field's")
+    }
+
+    // The panel opening under a held drag turned the pan off, yet the drag ran on to its let-go
+    // (UI run 2026-11-22), so the chat cuts it off itself.
+    @Test("The chat's cut ends a held drag as cancelled, and leaves a pan with no drag held as it is")
+    @MainActor
+    func cutEndsAHeldDrag() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let cut = ChatFieldPan.Cut()
+        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: cut)
+        #expect(cut.recognizer === pan, "the chat's cut holds this pan")
+        cut()
+        #expect(pan.state == .possible, "no drag held: nothing to cut")
+        pan.state = .began
+        pan.state = .changed
+        cut()
+        #expect(pan.state == .cancelled, "a held drag ends as an interrupted one")
+        let other = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: cut)
+        #expect(cut.recognizer === other, "a rebuilt pan takes the cut over")
     }
 
     @Test("Sideways travel made while the text scrolled does not turn the field's straight pull sideways")
@@ -600,11 +651,11 @@ struct ChatFieldDragTests {
     @MainActor
     func panCancelsTheFieldsTouch() {
         let coordinator = ChatFieldPan.Coordinator()
-        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true)
+        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: ChatFieldPan.Cut())
         #expect(pan.delegate === coordinator)
         #expect(pan.cancelsTouchesInView, "a started drag takes the touch from the text view, so it never focuses it")
         #expect(pan.isEnabled)
-        #expect(!ChatFieldPan.makePan(delegate: coordinator, isEnabled: false).isEnabled, "off over the panel and in the tutorial")
+        #expect(!ChatFieldPan.makePan(delegate: coordinator, isEnabled: false, cut: ChatFieldPan.Cut()).isEnabled, "off over the panel and in the tutorial")
     }
 
     @Test("The field's pan starts only on a first movement more up than sideways")
@@ -627,7 +678,7 @@ struct ChatFieldDragTests {
     @MainActor
     func textViewOrdering() {
         let coordinator = ChatFieldPan.Coordinator()
-        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true)
+        let pan = ChatFieldPan.makePan(delegate: coordinator, isEnabled: true, cut: ChatFieldPan.Cut())
         let text = UITextView()
         let press = UILongPressGestureRecognizer()
         let tap = UITapGestureRecognizer()

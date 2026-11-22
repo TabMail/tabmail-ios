@@ -516,13 +516,15 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
 /// v15 H2). That text never bounces vertically (`Coordinator.touchDown`), so past its end it stays
 /// at its end while the field swells.
 struct ChatFieldPan: UIGestureRecognizerRepresentable {
-    /// Off over the open panel and in the tutorial. Turning it off mid-drag cancels the drag, which
-    /// ends as an interrupted one.
+    /// Off over the open panel and in the tutorial, so no new drag starts there. A drag already
+    /// held when it turns off is cut by `cut`, not by this.
     let isEnabled: Bool
+    /// Cuts the drag held on the field off (`Cut`): the chat calls it when the panel opens.
+    let cut: Cut
     /// The drag's travel since it began (`ChatHorizontalPan.Sample`).
     let moved: (ChatHorizontalPan.Sample) -> Void
     /// The drag's travel and its velocity at the let-go, and whether the user finished it (false
-    /// when the system cancelled or failed it).
+    /// when the system cancelled or failed it, or the chat cut it off).
     let ended: (ChatHorizontalPan.Sample, Bool) -> Void
 
     func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
@@ -530,18 +532,34 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
     }
 
     func makeUIGestureRecognizer(context: Context) -> Recognizer {
-        Self.makePan(delegate: context.coordinator, isEnabled: isEnabled)
+        Self.makePan(delegate: context.coordinator, isEnabled: isEnabled, cut: cut)
     }
 
     /// The field's pan (`Recognizer`) asking `delegate`, as the swipes' pan does
     /// (`ChatHorizontalPan.makePan`), cancelling the touch for the views under it once it starts
-    /// (UIKit's default, stated because the field's focus depends on it).
-    static func makePan(delegate: Coordinator, isEnabled: Bool) -> Recognizer {
+    /// (UIKit's default, stated because the field's focus depends on it). `cut` cuts its drags off.
+    static func makePan(delegate: Coordinator, isEnabled: Bool, cut: Cut) -> Recognizer {
         let pan = Recognizer()
         pan.delegate = delegate
         pan.cancelsTouchesInView = true
         pan.isEnabled = isEnabled
+        cut.recognizer = pan
         return pan
+    }
+
+    /// Cuts the drag held on the field off, as the system cancelling it (`Recognizer.cut`): it
+    /// ends as an interrupted drag, springs back and opens nothing. The panel opening under a held
+    /// drag (an agent's answer, the inbox's agent toast) turns the pan off, yet the drag ran on to
+    /// its let-go with the swell held (UI run 2026-11-22: the opening was requested, then the drag
+    /// ended, never cut), so the chat cuts it itself when the panel opens. One per chat; it holds the
+    /// pan weakly.
+    @MainActor
+    final class Cut {
+        fileprivate(set) weak var recognizer: Recognizer?
+
+        func callAsFunction() {
+            recognizer?.cut()
+        }
     }
 
     func updateUIGestureRecognizer(_ recognizer: Recognizer, context: Context) {
@@ -603,6 +621,13 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             lift = nil
         }
 
+        /// Cuts the drag in progress off while the finger is still down, as the system cancelling
+        /// it; a pan with no drag in progress is left as it is.
+        func cut() {
+            guard state == .began || state == .changed else { return }
+            state = .cancelled
+        }
+
         #if DEBUG
         // Debug UI tests only: the pan was cancelled (`ChatFieldDragMarker`; reads the new state
         // only in a debug build the swipe UI tests launch).
@@ -662,7 +687,7 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             lastOffset = text?.contentOffset.y ?? 0
             // A drag that starts with the text at its end is the field's from its start.
             let end = text.map { Self.end(of: $0) }
-            if let text, let end, text.contentOffset.y >= end {
+            if let text, let end, Self.isAtEnd(text.contentOffset.y, end: end) {
                 handOff = .zero
             } else {
                 handOff = nil
@@ -682,7 +707,7 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             let end = Self.end(of: text)
             let offset = text.contentOffset.y
             let wasHandedOff = handOff != nil
-            if offset < end {
+            if !Self.isAtEnd(offset, end: end) {
                 handOff = nil
             } else if handOff == nil {
                 handOff = Self.crossing(from: lastTravel, textAt: lastOffset, to: drag.travel, end: end)
@@ -717,6 +742,13 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             let room = min(up, max(0, end - textAt))
             return CGSize(width: last.width + (travel.width - last.width) * (room / up),
                           height: last.height - room)
+        }
+
+        /// Whether the text at scroll position `offset` is at its `end`: within
+        /// `ChatViewLayout.fieldTextEndTolerance` of it, since a text UIKit holds at its end can
+        /// read a hair short of the end its sizes give.
+        static func isAtEnd(_ offset: CGFloat, end: CGFloat) -> Bool {
+            offset >= end - ChatViewLayout.fieldTextEndTolerance
         }
 
         /// The scroll position at which `text` shows its end (its top when it does not scroll).
