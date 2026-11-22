@@ -82,6 +82,8 @@ struct InlineEditResultTests {
             toDelta: nil,
             ccDelta: nil,
             bccDelta: nil,
+            textMessage: "New body",
+            changeCommand: "ask for a later date",
             raw: "Response: Updated\nSubject: New Subject\nBody: New body"
         )
         #expect(result.response == "Updated your draft")
@@ -99,6 +101,8 @@ struct InlineEditResultTests {
             toDelta: nil,
             ccDelta: nil,
             bccDelta: nil,
+            textMessage: nil,
+            changeCommand: nil,
             raw: "raw text"
         )
         #expect(result.response == nil)
@@ -108,271 +112,139 @@ struct InlineEditResultTests {
     }
 }
 
-@Suite("AIService.parseInlineEditResponse")
+/// The compose edit as the backend sends it to a client at the JSON protocol (2.0.0): every field,
+/// in the shape the backend validates (`readStructuredComposeEdit`).
+enum ComposeEditJSON {
+    static func make(
+        response: Any = "Made it shorter.",
+        addTo: Any = [[String: Any]](), removeTo: Any = [String](),
+        addCc: Any = [[String: Any]](), removeCc: Any = [String](),
+        addBcc: Any = [[String: Any]](), removeBcc: Any = [String](),
+        subject: Any = "Re: Offsite",
+        body: Any = "Hi Sam,\n\nCount me in.\n\nBest,\nAlex",
+        textMessage: Any = "Count me in.",
+        changeCommand: Any = "decline instead",
+        drop: String? = nil, extra: [String: Any] = [:]
+    ) -> String {
+        var object: [String: Any] = [
+            "response": response, "add_to": addTo, "remove_to": removeTo, "add_cc": addCc,
+            "remove_cc": removeCc, "add_bcc": addBcc, "remove_bcc": removeBcc, "subject": subject,
+            "body": body, "text_message": textMessage, "change_command": changeCommand,
+        ]
+        if let drop { object[drop] = nil }
+        object.merge(extra) { $1 }
+        let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+@Suite("AIService.parseInlineEditResponse — the 2.0.0 compose edit JSON")
 struct ParseInlineEditResponseTests {
 
-    // MARK: - Full Format (Response + Subject + Body)
-
-    @Test("Parses all three fields")
-    func parsesAllFields() {
-        let input = """
-        Response: I updated your email.
-        Subject: New Meeting Time
-        Body: Hi team,
-
-        The meeting has been moved to 3pm.
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.response == "I updated your email.")
-        #expect(result.subject == "New Meeting Time")
-        #expect(result.body != nil)
-        #expect(result.body!.contains("meeting has been moved"))
-    }
-
-    @Test("Stores raw text unchanged")
-    func storesRawText() {
-        let input = "Response: Done.\nSubject: Test\nBody: Content"
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.raw == input)
-    }
-
-    // MARK: - Partial Fields
-
-    @Test("Parses with only Body field")
-    func bodyOnly() {
-        let input = "Body: Just the body content here."
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.response == nil)
-        #expect(result.subject == nil)
-        #expect(result.body == "Just the body content here.")
-    }
-
-    @Test("Parses Response and Body without Subject")
-    func responseAndBody() {
-        let input = "Response: Made it shorter.\nBody: Short content."
-        let result = AIService.parseInlineEditResponse(input)
+    @Test("Reads every field of the compose edit")
+    func readsEveryField() throws {
+        let result = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make()))
         #expect(result.response == "Made it shorter.")
-        #expect(result.subject == nil)
-        #expect(result.body == "Short content.")
+        #expect(result.subject == "Re: Offsite")
+        #expect(result.body == "Hi Sam,\n\nCount me in.\n\nBest,\nAlex")
+        #expect(result.textMessage == "Count me in.")
+        #expect(result.changeCommand == "decline instead")
+        #expect(result.toDelta == nil && result.ccDelta == nil && result.bccDelta == nil, "[] and [] leave a field unchanged")
     }
 
-    @Test("Parses Subject and Body without Response")
-    func subjectAndBody() {
-        let input = "Subject: Updated\nBody: New body text."
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.response == nil)
-        #expect(result.subject == "Updated")
-        #expect(result.body == "New body text.")
+    @Test("The body is kept as the backend wrote it")
+    func bodyVerbatim() throws {
+        let body = "  Hi,\n\n  indented line\n"
+        let result = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(body: body)))
+        #expect(result.body == body)
     }
 
-    // MARK: - Fallback Behavior
-
-    @Test("No markers treats entire text as body")
-    func noMarkersFallback() {
-        let input = "This is just plain text with no markers at all."
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.response == nil)
-        #expect(result.subject == nil)
-        #expect(result.body == input)
+    @Test("An add item is one recipient with its name; an empty name shows the email")
+    func addItems() throws {
+        let result = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            addTo: [["name": "Doe, Ann \"A\"", "email": "ann@example.com"], ["name": "", "email": "bob@example.com"]])))
+        let to = try #require(result.toDelta)
+        #expect(to.adds.recipients == [
+            RecipientEntry.Recipient(address: "ann@example.com", name: "Doe, Ann \"A\""),
+            RecipientEntry.Recipient(address: "bob@example.com", name: nil),
+        ])
+        #expect(to.adds.leftovers.isEmpty)
+        #expect(to.removes.isEmpty)
     }
 
-    @Test("Only Response marker — rest becomes body via fallback")
-    func onlyResponseMarker() {
-        // Response: is found but no Body: and no Subject:
-        // → body == nil AND subject == nil → fallback: body = full text
-        let input = "Response: I made changes."
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.response == "I made changes.")
-        // No Subject or Body markers → fallback sets body to entire text
-        // But wait — body == nil AND subject == nil → fallback triggers
-        #expect(result.body == input)
-    }
-
-    // MARK: - Multiline Body
-
-    @Test("Body captures multiline content")
-    func multilineBody() {
-        let input = """
-        Response: Updated draft.
-        Subject: Q1 Report
-        Body: Dear Team,
-
-        Please find attached the Q1 report.
-
-        Key findings:
-        - Revenue up 15%
-        - Costs down 3%
-
-        Best regards
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.body != nil)
-        #expect(result.body!.contains("Revenue up 15%"))
-        #expect(result.body!.contains("Best regards"))
-    }
-
-    // MARK: - Case Insensitivity
-
-    @Test("Field labels are case-insensitive")
-    func caseInsensitive() {
-        let input = "response: Did it.\nsubject: Lower Case\nbody: lowercase body"
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.response == "Did it.")
-        #expect(result.subject == "Lower Case")
-        #expect(result.body == "lowercase body")
-    }
-
-    // MARK: - Edge Cases
-
-    @Test("Empty input")
-    func emptyInput() {
-        let result = AIService.parseInlineEditResponse("")
-        #expect(result.body == "")
-        #expect(result.raw == "")
-    }
-
-    @Test("Whitespace-only input")
-    func whitespaceOnly() {
-        let result = AIService.parseInlineEditResponse("   \n  \n  ")
-        #expect(result.body == "")
-    }
-
-    @Test("Empty Subject field with space before Body")
-    func emptySubject() {
-        // When Subject: has no value, \s* in regex eats the newline,
-        // so "Body: Some content" becomes the subject match.
-        // The parser requires explicit subject text after "Subject:".
-        let input = "Subject: \n\nBody: Some content"
-        let result = AIService.parseInlineEditResponse(input)
-        // Subject regex .*$ stops at newline, so empty subject → nil
-        // Body regex matches the "Body:" line
-        #expect(result.body == "Some content")
-    }
-
-    @Test("Empty Body field triggers no body, falls to checking subject")
-    func emptyBody() {
-        let input = "Subject: Has Subject\nBody:"
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.subject == "Has Subject")
-        // Body: with nothing after → empty → nil
-        // But subject is non-nil, so fallback doesn't trigger
-        #expect(result.body == nil)
-    }
-
-    // MARK: - v1.5.16: +/- recipient deltas
-
-    @Test("Parses +/- delta lines into toDelta/ccDelta/bccDelta")
-    func parsesDeltaLines() {
-        let input = """
-        Response: Swapped Bob for Alice and added Carol to cc.
-        +To: Alice Anderson <alice@example.com>
-        -To: bob@example.com
-        +Cc: Carol <carol@example.com>
-        Subject: Re: Budget
-        Body: Hi all
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.toDelta?.adds.recipients.count == 1)
-        #expect(result.toDelta?.adds.recipients.first?.name == "Alice Anderson")
-        #expect(result.toDelta?.adds.recipients.first?.address == "alice@example.com")
-        #expect(result.toDelta?.removes == ["bob@example.com"])
-        #expect(result.ccDelta?.adds.recipients.count == 1)
-        #expect(result.ccDelta?.adds.recipients.first?.address == "carol@example.com")
-        #expect(result.ccDelta?.removes.isEmpty == true)
-        // Bcc had no +/- line at all → no change signal.
-        #expect(result.bccDelta == nil)
-    }
-
-    @Test("Absent delta lines leave the field untouched (nil)")
-    func absentDeltaLinesReturnNil() {
-        let input = """
-        Response: Minor wording change.
-        Subject: Re: Budget
-        Body: Hi team
-        """
-        let result = AIService.parseInlineEditResponse(input)
+    @Test("Removals are emails, matched in lower case; [\"*\"] clears the field")
+    func removals() throws {
+        let result = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            removeCc: ["Carol@Example.com"], removeBcc: ["*"])))
+        #expect(result.ccDelta?.removes == ["carol@example.com"])
+        #expect(result.bccDelta?.clearsField == true)
         #expect(result.toDelta == nil)
-        #expect(result.ccDelta == nil)
-        #expect(result.bccDelta == nil)
     }
 
-    @Test("-Cc: * is recognised as clear-all sentinel")
-    func clearAllSentinel() {
-        let input = """
-        Response: Dropped everyone from cc.
-        -Cc: *
-        Subject: Re: Budget
-        Body: Hi team
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.ccDelta != nil)
-        #expect(result.ccDelta?.clearsField == true)
-        #expect(result.ccDelta?.removes.contains("*") == true)
-        #expect(result.ccDelta?.adds.recipients.isEmpty == true)
+    @Test("A blank subject is no subject from the model (the draft keeps its own); a written one is kept as written",
+          arguments: ["", "   "])
+    func blankSubjectIsNoSubject(_ blank: String) throws {
+        let result = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(subject: blank)))
+        #expect(result.subject == nil)
+        // Control: a subject is kept as written.
+        #expect(AIService.parseInlineEditResponse(ComposeEditJSON.make(subject: " Re: Offsite"))?.subject == " Re: Offsite")
     }
 
-    @Test("Multiple emails on a -To: line populate removes correctly")
-    func multipleRemoves() {
-        let input = """
-        -To: bob@example.com, dave@example.com
-        Subject: x
-        Body: y
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.toDelta?.removes == ["bob@example.com", "dave@example.com"])
-        #expect(result.toDelta?.adds.recipients.isEmpty == true)
+    @Test("One mailbox per item, a display name included, is read")
+    func oneMailboxWithItsName() throws {
+        let result = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
+            addTo: [["name": "", "email": "Ann <ann@example.com>"]], removeCc: ["\"Doe, Bob\" <Bob@example.com>"])))
+        #expect(result.toDelta?.adds.recipients.map(\.address) == ["ann@example.com"])
+        #expect(result.ccDelta?.removes == ["bob@example.com"])
     }
 
-    @Test("Quoted display names with commas on +To: are not split")
-    func quotedDisplayNamesInAdds() {
-        let input = """
-        +To: "Doe, John" <john@example.com>, "Smith, Jane" <jane@example.com>
-        Subject: Test
-        Body: body
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.toDelta?.adds.recipients.count == 2)
-        #expect(result.toDelta?.adds.recipients[0].name == "Doe, John")
-        #expect(result.toDelta?.adds.recipients[0].address == "john@example.com")
-        #expect(result.toDelta?.adds.recipients[1].name == "Smith, Jane")
+    @Test("Keys it does not know are ignored")
+    func unknownKeysIgnored() throws {
+        let result = try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(extra: ["tone": "warm", "v": 3])))
+        #expect(result.textMessage == "Count me in.")
     }
 
-    @Test("Bare emails in +To: are accepted with empty name")
-    func bareEmailsInAdds() {
-        let input = """
-        +To: alice@example.com, bob@example.com
-        Subject: Test
-        Body: body
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.toDelta?.adds.recipients.count == 2)
-        #expect(result.toDelta?.adds.recipients[0].address == "alice@example.com")
-        #expect(result.toDelta?.adds.recipients[0].name == nil)
-        #expect(result.toDelta?.adds.recipients[1].address == "bob@example.com")
+    @Test("A missing or malformed known field is an error, never a body", arguments: [
+        ComposeEditJSON.make(drop: "body"),
+        ComposeEditJSON.make(body: "  \n"),
+        ComposeEditJSON.make(drop: "text_message"),
+        ComposeEditJSON.make(textMessage: " "),
+        ComposeEditJSON.make(drop: "change_command"),
+        ComposeEditJSON.make(drop: "response"),
+        ComposeEditJSON.make(drop: "subject"),
+        ComposeEditJSON.make(drop: "add_cc"),
+        ComposeEditJSON.make(drop: "remove_bcc"),
+        ComposeEditJSON.make(subject: 3),
+        ComposeEditJSON.make(addTo: ["ann@example.com"]),
+        ComposeEditJSON.make(addTo: [["name": "Ann"]]),
+        ComposeEditJSON.make(addTo: [["name": "Ann", "email": " "]]),
+        ComposeEditJSON.make(removeTo: [""]),
+        ComposeEditJSON.make(removeTo: ["*", "bob@example.com"]),
+        ComposeEditJSON.make(removeTo: "bob@example.com"),
+        // One mailbox per item: an item naming several, or text with no address, is malformed.
+        ComposeEditJSON.make(addTo: [["name": "", "email": "ann@example.com, bob@example.com"]]),
+        ComposeEditJSON.make(addTo: [["name": "", "email": "Ann"]]),
+        ComposeEditJSON.make(removeCc: ["ann@example.com; bob@example.com"]),
+        ComposeEditJSON.make(removeCc: ["Ann"]),
+        // The same mailbox twice is still two elements, and a group is not one mailbox.
+        ComposeEditJSON.make(addTo: [["name": "", "email": "ann@example.com, ann@example.com"]]),
+        ComposeEditJSON.make(removeTo: ["ann@example.com, ANN@example.com"]),
+        ComposeEditJSON.make(addCc: [["name": "", "email": "Team: ann@example.com;"]]),
+        ComposeEditJSON.make(removeBcc: ["Team: ann@example.com;"]),
+    ])
+    func malformedIsAnError(json: String) {
+        #expect(AIService.parseInlineEditResponse(json) == nil)
     }
 
-    @Test("Both +Cc: and -Cc: in the same response produce one delta with both sides")
-    func addAndRemoveSameField() {
-        let input = """
-        +Cc: new@example.com
-        -Cc: old@example.com
-        Subject: x
-        Body: y
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.ccDelta?.adds.recipients.count == 1)
-        #expect(result.ccDelta?.adds.recipients.first?.address == "new@example.com")
-        #expect(result.ccDelta?.removes == ["old@example.com"])
-    }
-
-    @Test("-To: lowercases emails for case-insensitive matching")
-    func removalsLowercased() {
-        let input = """
-        -To: Bob@Example.COM
-        Subject: x
-        Body: y
-        """
-        let result = AIService.parseInlineEditResponse(input)
-        #expect(result.toDelta?.removes == ["bob@example.com"])
+    @Test("Labelled text, empty text and prose are not a compose edit", arguments: [
+        "Response: Updated.\nSubject: Re: Offsite\nBody: Hi Sam,\n\nCount me in.",
+        "Hi Sam,\n\nCount me in.",
+        "",
+        "   \n ",
+        "[]",
+        "```json\n{}\n```",
+    ])
+    func notTheJSONIsAnError(text: String) {
+        #expect(AIService.parseInlineEditResponse(text) == nil)
     }
 }

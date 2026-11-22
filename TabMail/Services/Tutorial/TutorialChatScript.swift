@@ -30,9 +30,16 @@ enum TutorialChatScript {
     /// The chat view's practice reply after its edit ("Make it shorter"): still a yes, as its
     /// Sent bubble says.
     static let shorterReply = "Thanks, Priya. I’m in, and happy to say a few words on day one."
+    /// The edited replies' text versions. Every compose edit returns its email with its text
+    /// version, and the scripted edit stands in for one: the chat's AI Suggestion shows this
+    /// text, so the edited reply stays tappable in the chat after the card closes.
+    static let declinedTextMessage = "Can’t make the offsite this time, could you share the agenda notes after?"
+    static let shorterTextMessage = "I’m in, happy to say a few words on day one."
 
-    static func editedReply(teachesChat: Bool) -> String {
-        teachesChat ? shorterReply : declinedReply
+    static func editedReply(teachesChat: Bool) -> ReplyResult {
+        teachesChat
+            ? ReplyResult(body: shorterReply, textMessage: shorterTextMessage)
+            : ReplyResult(body: declinedReply, textMessage: declinedTextMessage)
     }
     /// How long the draft pulses before the edit lands: long enough to see
     /// that something is happening, short enough not to feel slow.

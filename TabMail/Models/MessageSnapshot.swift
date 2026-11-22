@@ -47,7 +47,7 @@ struct MessageSnapshot: Identifiable, Hashable, Sendable {
     var summaryTextMessage: String?
     var isInInbox: Bool
     var hasReplyReady: Bool
-    var isReplyProcessed: Bool // cachedReply != nil (includes empty sentinel for filtered messages)
+    var isReplyProcessed: Bool // suggestion != nil (includes the empty sentinel for filtered messages)
     var userLabels: [UserLabel]
 
     init(from header: MessageHeader, userLabels: [UserLabel] = []) {
@@ -76,8 +76,8 @@ struct MessageSnapshot: Identifiable, Hashable, Sendable {
         self.summaryBlurb = header.summaryBlurb
         self.summaryTextMessage = header.summaryTextMessage
         self.isInInbox = header.isInInbox
-        self.hasReplyReady = header.cachedReply != nil && !header.cachedReply!.isEmpty
-        self.isReplyProcessed = header.cachedReply != nil
+        self.hasReplyReady = header.suggestion.map { !$0.body.isEmpty } ?? false
+        self.isReplyProcessed = header.suggestion != nil
         self.userLabels = userLabels
     }
 

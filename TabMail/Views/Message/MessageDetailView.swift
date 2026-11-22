@@ -323,7 +323,7 @@ struct MessageDetailView: View {
             ComposeView(replyTo: msg, isForward: true)
         }
         .fullScreenCover(item: $agentCompose) { req in
-            composeViewForAgentRequest(req)
+            req.composeView(account: currentAccount, onOutcome: req.onOutcome)
         }
         .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
             if newId != nil {

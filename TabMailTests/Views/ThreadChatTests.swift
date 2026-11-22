@@ -522,7 +522,7 @@ struct ThreadChatTests {
             try account.insert(db)
             try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: Self.accountA).insert(db)
             try Folder(name: "Archive", path: "Archive", role: .archive, accountId: Self.accountA).insert(db)
-            for header in [first, second, apiEmail, other] { try header.insert(db) }
+            for header in [first, second, apiEmail, other] { try TestDatabase.insertAtOldSchema(header, db) }
             let a = Self.accountA
             let turns = [
                 Self.turn("t1", session: "msg:\(a):up-1@example.com", minutesAgo: 50, words: "first email"),

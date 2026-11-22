@@ -555,7 +555,8 @@ same AI result, kept as long as the email itself is shown.
    Outlook's own apps record; the kind drives the Outlook last-verb marker on the original. A reply
    that drops anyone in the audience stays a plain reply; from the open sheet the agent must also have
    opened it as a Reply All, as before. Before this, a reply the agent widened was a plain reply.
-   `ChatReplyCompose.make` checks containment once for every agent reply. Tests:
+   `ChatReplyCompose.make` checks containment once for every agent reply (since decision 18,
+   `ChatReplyCompose.with`; `make` is gone). Tests:
    `ChatReplyFieldTests.agentReplyThatAddsPeopleIsStillReplyAll`,
    `agentReplyFromTheFieldFollowsTheTarget`, `agentReplyFromTheSheetKeepsItsRecipients`.
    *Amended 2026-11-22:* containment is judged by mailbox address, read as compose reads its
@@ -569,7 +570,9 @@ same AI result, kept as long as the email itself is shown.
    asked for in the field, and who was chosen in Reply to, are read once, as the field's send
    starts, and travel with the request (`ChatFieldReply`: `ToolInvocation.fieldReply`, stamped on
    the `ComposeRequest` by the reply tool only for a reply to the email the field replies to). The
-   agent's compose card is read from its request alone (`ChatReplyCompose.make(agent:)`): with
+   agent's compose card is read from its request alone (`ChatReplyCompose.make(agent:)`; since
+   decision 18, the reply tool's start envelope, `ChatReplyCompose.suggestionEnvelope` or
+   `onlyTo`, through `ChatReplyCompose.with`, and one presenter): with
    people chosen when it was sent, a plain reply to only them; otherwise the agent's recipients,
    under the containment rule above. The chat that shows the card decides nothing from its own state
    at that moment. Before this, the chat replaced any agent reply's recipients with its current
@@ -974,16 +977,19 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    `chatSuggestionText`; `ChatViewLayout.suggestionStrokeWidth`, `suggestionDash`), with "AI
    Suggestion · Tap to use" under it. The name is "AI Suggestion", the one compose's suggestion box
    uses (`ChatSuggestionConfig.label`); "AI Reply" is gone from the chat view's strings. Its text is
-   the reply's text message, read from the email's row (`ChatReplyField.suggestionText`), so a new
+   the reply's text message, read from the email's row (`ChatReplyField.suggestionText`; since
+   decision 18, the one shown value `ChatReplyField.shown`), so a new
    text message there rewrites the ghost in place, with no second copy. None shows on the user's
    turn, for a no-reply sender, or while the reply goes only to people chosen in Reply to (the
    suggestion was written for everyone; the field has the agent write one for them).
    - **Tap** (the bubble or its caption, one button): opens today's Reply All compose card with the
      full reply in its suggestion box, as Send did (`ChatThreadView.openSuggestion`,
-     `ChatReplyCompose.make(replyAllTo:)`); Send there sends and the Sent bubble replaces the ghost,
+     `ChatReplyCompose.make(replyAllTo:)`; since decision 18, `ChatReadyReply` with
+     `ChatReplyCompose.suggestionEnvelope`); Send there sends and the Sent bubble replaces the ghost,
      and the field's words stay (the card is not a send from the field); Close goes back with the
      ghost still there. An edit or a Recompute in the card that is stored on the row posts
-     `.messageDataDidChange`, so the ghost under the card follows it. How a thread reload
+     `.messageDataDidChange`, so the ghost shows the stored change once the card closes (the
+     ghost leaves while its own card is open). How a thread reload
      is ordered against such a refresh (a reload that read its rows before the change and finishes
      after it puts the older row back, #992) is not decided here: it is superseded by "one display
      read at a time", fixed on its own (ADR-IOS-049's #992 amendment, `MessageDetailViewModel.inDisplayTurn`). The card saves to a draft of its own
@@ -991,7 +997,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      drafts, so a reply draft already saved for the email stays as it is in Drafts, never opened,
      saved over or deleted by the card; each card has its own key, so two cards' drafts never
      overwrite each other. The ghost shows only once the thread and the email's own account have
-     loaded, and not while the agent works on a request from the field. In the tutorial only the step that asks for it
+     loaded, and not while the agent works on a request from the field.
+     A late suggestion stays hidden while "Writing your email" runs or a compose card is open, shows when the card closes without sending, and waits as the ghost while the field has words (`ChatReplyField.shown(writing:cardOpen:)`).
+     In the tutorial only the step that asks for it
      (`FieldMove.tapSuggestion`, ringed by `TutorialPulseRing`) opens the card; elsewhere the
      locked notice shows.
    - **The field** holds only the user's words (`ChatFieldFill`: `shown`, `emptiedOn` and
@@ -1050,6 +1058,161 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    Tests: `ChatReplyFieldTests.suggestionPhaseWritingThenReady`, `suggestionPhaseNewEmailResetsToWriting`,
    `workingDots`, `suggestionPhaseWritingRule`, `suggestionFillWiring`;
    `ChatSwipeUITests.testWorkingBubbleBecomesTheGhostAboveTheField`.
+
+   **With the late-suggestion rule (2026-11-21):** the row's ghost is the suggestion the chat shows
+   (`ChatThreadView.shownSuggestion`, `ChatReplyField.shown(writing:cardOpen:)`), and only the working
+   bubble comes from `suggestionPhase`. So a suggestion stored while a compose card is open shows no row
+   until the card closes, then the ghost at once; while "Writing your email" runs neither shows.
+   *Amended 2026-11-22:* `ChatReplyField.suggestionPhase` itself returns only `.writing` or nothing,
+   never `.ready`; a stored suggestion that `shown` would show without its gates gives no working
+   bubble. Tests: `ChatReplyFieldTests.suggestionPhaseWritingNeverReady` (renamed from
+   `suggestionPhaseWritingThenReady`) and `suggestionPhaseNewEmailResetsToWriting`.
+
+17. **A change asked in the field is a compose edit of the AI Suggestion (amendment 2026-11-18).**
+   Every compose returns its email with its text version (the backend's compose prompt, not a
+   summary), so the ghost always shows the text of the email it stands for.
+   - **The compose edit is JSON at 2.0.0.** The backend answers a 2.0.0 client's compose edit
+     (`edit_reply`, `edit_forward`, `edit_new`) with one JSON object: `response`, `add_to`/`add_cc`/
+     `add_bcc` as `[{name, email}]` (both strings, the email non-blank, the name may be ""),
+     `remove_to`/`remove_cc`/`remove_bcc` as email strings (`["*"]` alone clears; `[]` in both lists
+     leaves a field unchanged), `subject`, `body`, `text_message`, `change_command`. The one reader is
+     `AIService.parseInlineEditResponse`: keys it does not know are ignored; a missing or malformed
+     known field (blank body or text message, a wrong type, an add item or removal that names no
+     mailbox or several, `"*"` beside others) is an error, and the draft stays as it was. The labelled
+     `Response:`/`+To:`/`Body:` reader and its "whole text is the body" fallback are deleted. This
+     build sends the 2.0.0 marker, so it must never ship without this reader: a build with the marker
+     and the labelled reader puts the raw JSON into the draft
+     (`ComposeEditMarkerTests.markerAndReader`, fed the backend producer's own example). Each item
+     is exactly one mailbox, read by SwiftMail's one-element parser (`AddressListEntry`: the same
+     mailbox twice, or a group, is malformed, never deduplicated into one) and written with its
+     name by `RecipientEntry.text`; nothing joins or splits two items. A written `subject`
+     replaces the draft's; a blank one is no subject from the model (the backend sends `''` for
+     one, and refuses a non-string), so the draft keeps the subject the edit started from: "Re: X"
+     stays "Re: X", and a subject the user cleared stays empty.
+   - **The field's request edits the suggestion showing.** The field's send snapshots the AI
+     Suggestion's full email as it shows then (`ChatReplyField.suggestion`, `ChatFieldSend`,
+     `ChatFieldReply.suggestion`: its body, text version and change command as one value, so the
+     edit never looks them up again). Only a reply to the exact row the field shows
+     (`ChatFieldReply.email`, the row and its identity) takes the field's suggestion; its audience
+     applies to the same account's copies of that email, never another account's (decision 18). When the agent answers a reply request on that email with
+     `email_reply` and a `request`, `EmailReplyTool` runs the compose edit with that email as the
+     draft and the user's words as the request, Thunderbird's inline-editor call
+     (`compose/modules/inlineEditor.js` -> `runComposeEdit({body, request})`). Questions still go to
+     the agent as before; with no suggestion showing, a request writes a fresh reply on the card as
+     before. `EmailReplyTool.finishSuggestionEdit` ends it, the one choice point
+     (`ChatSuggestionConfig.fieldEditRewritesInPlace`, tested both ways): in place (the default),
+     an edit that touches only body, text version and change command replaces the suggestion in one
+     guarded write (`ComposeView.writeCachedReplyToDB(replacing:)`, stored only while the row still
+     holds the whole suggestion edited, body, text and command: a newer one stored meanwhile wins),
+     written through to the on-device AI cache in the same transaction; the ghost shows it, and no
+     card opens; a tap on the ghost opens it (decision 16). An edit that changes the subject or
+     recipients, which the suggestion cannot hold, or not in place, opens the card with the edited
+     email, subject and recipients, and the suggestion is unchanged. The tool's answer says which
+     path ran. The protocol witness `execute(arguments:invocation:)` reads the choice and calls
+     `run(arguments:invocation:rewritesInPlace:)`, so registry dispatch takes the same route.
+     A failed edit leaves the suggestion as it was and the agent says so; no fallback.
+     TB-parity exception: TB has no ghost, so TB's chat request always opens compose.
+   - **A card edit keeps the ghost.** `ComposeView.writeCachedReplyToDB` stores the edit's text
+     version with its body (it cleared `replyTextMessage`); an edit with no text version still clears
+     it, so a text never describes another body. Each edit turn records the text version stored with
+     the body it was asked on (`InlineEditTurn.textMessageAtRequest`, from the suggestion value the
+     card carries, `ComposeView.currentSuggestionTexts`), and a resend or rewind that puts that body
+     back stores it again, so the ghost stays (it vanished before). The resent request edits the
+     restored turn's body and subject (`sendComposeEdit(from:)`), not the card's draft from before
+     the restore reached it. The restore and the edit's result are applied, and stored, awaited
+     inside the request's compose fence admission (`applyInlineEdit` is async); the text's fade is
+     presentation only. Edit history saved by older builds decodes it as nil and clears it as before.
+   - **A superseded recompute never lands over a newer suggestion.** A card's Recompute reads the
+     suggestion it replaces as it starts and stores its reply only over that one
+     (`ComposeView.recomputedReply` -> `writeCachedReplyToDB(replacing:)`, `cachedReply IS ?` in the
+     same guarded write). The card owns its recompute (`recomputeTask`): a new Recompute, an edit of the
+     suggestion landing, or the card closing cancels it, and a cancelled one stores nothing and leaves the card alone. So Recompute,
+     Discard while it waits, reopen, Recompute again finishing first: the ghost shows the second
+     (`AITextMessageCallerTests.supersededRecomputeLosesToTheNewer`).
+     *Amended 2026-11-22:* only the card closing cancels `recomputeTask` (`ComposeView.cardClosed`). A
+     new Recompute or an edit of the suggestion does not cancel it: the compose agent fence
+     (`agentSendFence`) admits Recompute and edits one at a time.
+   - **The field's example follows the suggestion (v108).** A reply result and each compose edit
+     carry `change_command`, a short command that would change the reply. It is stored with the
+     reply as on-device AI cache, the same class as `replyTextMessage` (`v108_addReplyChangeCommand`
+     adds `replyChangeCommand` to `messageHeader` and `messageAICache`, nullable, no backfill), so
+     ADR-004 is not touched. Every writer that sets `replyTextMessage` sets it the same way (the
+     reply jobs, peer replies clear it, the sync carries, the cache write-through and restore, the
+     edit and recompute writes, the resend and rewind restores via `changeCommandAtRequest`).
+     While the AI Suggestion shows, the field's "e.g." line offers it
+     (`ChatReplyField.example`); otherwise, or when the reply has none, a configured example
+     (`ChatSuggestionConfig.randomExample`). Tests: `AIReplyParseTests.changeCommand`,
+     `AITextMessageStorageTests.migrationAddsChangeCommand`, `changeCommandFollowsReply`,
+     `ChatReplyFieldTests.exampleLine`, and the change-command checks in
+     `AITextMessageCallerTests`, `SuggestionRewriteRouteTests.rewritesInPlace` and
+     `ComposeSuggestionPersistTests`.
+   - **The tutorial's practice edit is a whole compose result.** `TutorialChatScript.editedReply`
+     returns the edited reply with its text version (`ReplyResult`), passed through the card's edit
+     path like a real edit's. Before, "Make it shorter" then Discard left Priya's chat without an AI
+     Suggestion while its card still said "Tap the AI Suggestion", and the run waited forever.
+   Tests: `ComposeEditMarkerTests`, `ParseInlineEditResponseTests`, `SuggestionRewriteRouteTests`,
+   `TutorialChatViewRunTests.editThenDiscardLeavesTheSuggestionToTap`,
+   `TutorialChatViewContentTests.practiceChatCardsHaveTheirMove`,
+   `ChatSuggestionBubbleTests.composeEditUpdatesTheGhost`, `ComposeSuggestionPersistTests.storesTheEditsTextVersion`,
+   `AITextMessageCallerTests.supersededRecomputeLosesToTheNewer`,
+   `ComposeSuggestionPersistTests.restoreKeepsTheTextVersion` (resend and rewind),
+   `ComposeSuggestionPersistTests.olderHistoryDecodesNil`.
+
+18. **Amendment: one suggestion value with one guarded writer; one reply envelope for card and field.**
+    
+    - **One value.** The AI Suggestion is one value, `ReplyResult` (body, text version, change command).
+      Every reader takes it from one accessor on the header and the on-device AI cache.
+    - **One writer.** Every writer goes through one function that states the value it expects to replace
+      and writes only if the row still holds exactly that value. The write runs inside the identity-guarded
+      header write, updates the on-device AI cache in the same transaction, and goes through the app's
+      prioritized writer.
+    - **What the writer prevents.** Automatic producers expect the value they read (empty, or the filtered
+      sentinel), so a late automatic reply never replaces an accepted edit or a newer value. A user edit or
+      recompute expects the suggestion it was shown.
+    - **One envelope.** The suggestion slot holds only the Reply All draft. The reply envelope (subject,
+      sender, To, Cc and Bcc by role) is built once, by the same builder for the ghost tap and the chat
+      field's edit.
+    - **Publish or card.** An edit is published to the suggestion only when its envelope equals the
+      starting one (`ChatReplyCompose.holds`: per role the same addresses, and the same entries that
+      name no sendable address, each as its text in any case). Anything else opens the compose card
+      with exactly the edited envelope, under a separate reply-draft key, or stays in the card. A narrowed audience therefore never becomes the shared
+      suggestion.
+    - **Identity.** The field's edit is bound to the displayed row and its identity, re-checked before the
+      body is read. The field's audience applies to copies with the same account and Message-ID.
+    - **One presenter.** The reply tool builds the agent's reply card once, into its request
+      (recipients by role, exactly, an empty field included; the subject; the suggestion's own
+      draft key for an edit of the AI Suggestion). The chat, the inbox and the email's screen open
+      it through one presenter, so leaving the chat while an edit runs opens the same card. Every
+      reply card takes its fields exactly: an empty To is never refilled from the reply's Reply-To.
+    - **Value boundaries.** The ghost, the "e.g." line and the field's edit read one shown value
+      (`ChatReplyField.shown`); the on-device AI cache reads and writes the value whole; the demo
+      and preview seeds go through the same value API (the screenshot seed too). A source fence
+      (`SuggestionSinglePathFenceTests`) keeps any read or write of a column outside the value's
+      accessors, any SQL that names a column other than to schedule (`IS [NOT] NULL`), and a second
+      envelope builder out.
+    - **The kind follows the final audience.** A reply card is Reply All only while its To, Cc and Bcc
+      still hold the whole Reply All audience (people added included); narrowed, even to one person,
+      it is a plain reply, so the send records a reply on the original (`ChatReplyCompose.with`).
+      Both sides are read as compose reads its fields: each mailbox as its address, and an entry that
+      names no sendable address (a Reply-To's `undisclosed-recipients:;`) as the text written, in any
+      case, so leaving that entry out narrows the audience too.
+      The reply tool derives one start envelope (`ChatReplyCompose.suggestionEnvelope` with the call's
+      recipient changes, or `onlyTo` for people chosen in the field) and uses it for both the model's
+      context and the card; the subject is the edit's when it writes one, else the start's.
+    - **Ordering and identity in the card.** Recompute and an inline edit are admitted through the
+      compose agent fence, one at a time, and an edit stores over the suggestion it started from.
+      The edit is applied and stored awaited under that admission. Every compose edit's body is read
+      by one identity-checked read (`ComposeEditContext.relatedBodyText`, the card's included, read
+      when the edit is sent); another email seated at the address refuses the edit. The card's edits
+      and Recompute ask the chat's one AI service (`ChatPillState.shared.aiService`).
+      A Recompute from another sender than the email's own account stays in its card. A Recompute,
+      and a field request about the row the field showed, check that row's identity before any
+      read or AI call; another email seated at the address refuses the request.
+    - **Trade-off.** There is one more indirection at every suggestion write, and envelope comparison
+      instead of a cheaper delta check. In exchange, ordering and audience are properties of one writer and
+      one builder, rather than of each caller. The rejected alternative was patching each caller with its
+      own guard: review found a new missed caller in each round.
+    Decided 2026-11-18.
 
 ## The longer index line (routed 2026-11-09)
 

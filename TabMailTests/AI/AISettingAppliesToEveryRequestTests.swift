@@ -310,12 +310,23 @@ struct AISettingAppliesToEveryRequestTests {
         }
     }
 
+    /// The compose edit as the backend answers this build (the 2.0.0 JSON), as the `assistant`
+    /// text of the stream's `final` event.
+    private static let editAnswer = String(decoding: try! JSONSerialization.data(withJSONObject: [
+        "assistant": ComposeEditJSON.make(
+            response: "Shortened.", subject: "Planning", body: "Thursday?", textMessage: "Thursday?", changeCommand: ""),
+    ]), as: UTF8.self)
+
+    /// One answer for a chat turn and a compose edit alike: the chat reads any `assistant` text,
+    /// and the edit reads the compose edit JSON this build asks for.
+    private static let chatOrEditAnswer = stream(editAnswer)
+
     @Test("an inline edit refused after its check returns the AI-off result and leaves the draft as it was")
     func aRefusedInlineEditLeavesTheDraft() async throws {
         #expect(await MainActor.run { !DemoModeStore.shared.isActive })
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        http.register(path: "/completions/chat", method: "POST", response: Self.stream(#"{"assistant":"Response: Shortened.\nSubject: Planning\nBody: Thursday?"}"#))
+        http.register(path: "/completions/chat", method: "POST", response: Self.stream(Self.editAnswer))
         let setting = AISettingSwitch()
         let service = makeService(http, setting)
 
@@ -386,7 +397,7 @@ struct AISettingAppliesToEveryRequestTests {
     func theDemoReadsTheDeviceSetting(aiOff: Bool) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        http.register(path: "/completions/chat", method: "POST", response: Self.answer)
+        http.register(path: "/completions/chat", method: "POST", response: Self.chatOrEditAnswer)
         http.register(path: DictationConfig.warmUpPath, response: .status(200))
         // The default reading of the setting: no injected switch.
         let client = BackendClient(llmSession: http.session)
@@ -408,7 +419,7 @@ struct AISettingAppliesToEveryRequestTests {
     func aRefusedDemoCallUsesNoBudget(call: DemoCall) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        http.register(path: "/completions/chat", method: "POST", response: Self.answer)
+        http.register(path: "/completions/chat", method: "POST", response: Self.chatOrEditAnswer)
         let setting = AISettingSwitch()
         let service = makeService(http, setting)
 

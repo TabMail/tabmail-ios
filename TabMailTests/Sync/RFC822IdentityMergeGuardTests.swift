@@ -711,7 +711,7 @@ struct RFC822IdentityMergeGuardTests {
         try pool.writeWithoutTransaction { db in
             try db.execute(sql: """
                 UPDATE messageHeader SET summaryBlurb = 'Budget review.', summaryTextMessage = 'Can you review the budget?',
-                    cachedReply = 'Sure, I will.', replyTextMessage = 'Will do' WHERE id = ?
+                    cachedReply = 'Sure, I will.', replyTextMessage = 'Will do', replyChangeCommand = 'Say no' WHERE id = ?
                 """, arguments: [id])
         }
     }
@@ -737,5 +737,6 @@ struct RFC822IdentityMergeGuardTests {
         #expect(synced.summaryTextMessage == "Can you review the budget?")
         #expect(synced.cachedReply == "Sure, I will.")
         #expect(synced.replyTextMessage == "Will do")
+        #expect(synced.replyChangeCommand == "Say no", "the change command travels with its reply")
     }
 }
