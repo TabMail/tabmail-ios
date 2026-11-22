@@ -252,9 +252,11 @@ struct ComposeSuggestionPersistTests {
             message: email, suggestion: ReplyResult(body: Self.cardSuggestion, textMessage: nil), accounts: [account])
         let accepted = ComposeDraftGuards.acceptingVisibleSuggestion(.init(
             messageBody: "", showingSuggestion: true, currentSuggestion: Self.cardSuggestion))
-        let existing = try await db.read { try Draft.fetchOne($0, key: card.draftId) }
+        // The card holds a pick (not Sendable), so the database read gets only its draft's key.
+        let draftId = card.draftId
+        let existing = try await db.read { try Draft.fetchOne($0, key: draftId) }
         let row = ComposeDraftGuards.draftToSave(
-            existing: existing, id: card.draftId, accountId: account.id,
+            existing: existing, id: draftId, accountId: account.id,
             recipients: (card.compose.to, card.compose.cc, card.compose.bcc), subject: "Re: Test Subject",
             body: accepted.messageBody, replyTo: email, isForward: false, isReplyAll: false,
             attachmentsDirName: nil, now: Date().timeIntervalSince1970)
