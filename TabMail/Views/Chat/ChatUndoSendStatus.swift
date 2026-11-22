@@ -88,33 +88,70 @@ enum ChatUndoSendLook: Equatable {
 }
 
 enum ChatUndoSendConfig {
-    /// How often the rising fill redraws while it moves.
-    static let fillFrameInterval: TimeInterval = 1.0 / 30
+    /// How often a second the rising fill redraws while it moves.
+    static let fillFramesPerSecond = 30
 }
 
-/// When the bubble redraws: while the fill rises, every `fillFrameInterval`; otherwise (Reduce
-/// Motion, or no fill) only when the seconds change: `start`, each whole second before the deadline,
-/// then the deadline itself. Nothing is scheduled after the deadline.
+/// When the bubble redraws: `start`; each whole second before the deadline, counted back from it
+/// (all the countdown needs); while the fill rises (no Reduce Motion), every frame
+/// (`ChatUndoSendConfig.fillFramesPerSecond`) inside the fill's window, the last
+/// `SyncConfig.outboxUndoHoldSeconds` before the deadline (before it the fill is empty and does
+/// not move); then the deadline itself. Nothing is scheduled after the deadline.
+///
+/// The instants are made one at a time, as the timeline asks for them, never laid out in memory:
+/// a queued row's durable hold can lie far ahead of the clock (a reply queued while the device's
+/// date ran ahead, the date set right before it went out).
 struct ChatUndoSendSchedule: TimelineSchedule {
     let deadline: Date
     let animatesFill: Bool
 
-    func entries(from start: Date, mode: TimelineScheduleMode) -> [Date] {
-        animatesFill ? Self.frames(from: start, deadline: deadline) : Self.ticks(from: start, deadline: deadline)
+    func entries(from start: Date, mode: TimelineScheduleMode) -> Entries {
+        Entries(start: start, deadline: deadline, animatesFill: animatesFill)
     }
 
-    static func ticks(from start: Date, deadline: Date) -> [Date] {
-        let left = deadline.timeIntervalSince(start)
-        guard left > 0 else { return [start] }
-        let whole = Int(left.rounded(.up))
-        return [start] + (0..<whole).reversed()
-            .map { deadline.addingTimeInterval(-TimeInterval($0)) }
-            .filter { $0 > start }
-    }
+    struct Entries: Sequence, IteratorProtocol {
+        private let start: Date
+        private let deadline: Date
+        /// Units a second: frames while the fill rises, else whole seconds.
+        private let perSecond: Int
+        /// The fill's window in units: every unit inside it is a redraw; above it only whole seconds.
+        private let window: Int
+        /// The time left before the deadline at the next redraw, in units (0: the deadline itself);
+        /// nil once the deadline was given, or when `start` is not before it.
+        private var left: Int?
+        private var startGiven = false
 
-    static func frames(from start: Date, deadline: Date) -> [Date] {
-        guard deadline > start else { return [start] }
-        return Array(stride(from: start, to: deadline, by: ChatUndoSendConfig.fillFrameInterval)) + [deadline]
+        init(start: Date, deadline: Date, animatesFill: Bool) {
+            self.start = start
+            self.deadline = deadline
+            perSecond = animatesFill ? ChatUndoSendConfig.fillFramesPerSecond : 1
+            window = animatesFill ? Int((SyncConfig.outboxUndoHoldSeconds * Double(perSecond)).rounded(.down)) : 0
+            let total = deadline.timeIntervalSince(start)
+            // The last unit before `total`, then the redraw at or under it.
+            left = total > 0 ? Self.redraw(atOrUnder: Int((total * Double(perSecond)).rounded(.up)) - 1, window: window, perSecond: perSecond) : nil
+        }
+
+        /// The redraw at or under `units` left: every unit inside the window, else the whole second
+        /// at or under it, but never under the window's first unit.
+        private static func redraw(atOrUnder units: Int, window: Int, perSecond: Int) -> Int {
+            // `Swift.max`: inside a sequence, a bare `max` names the sequence's own `max()`.
+            guard units > window else { return Swift.max(0, units) }
+            return Swift.max(units / perSecond * perSecond, window)
+        }
+
+        mutating func next() -> Date? {
+            if !startGiven {
+                startGiven = true
+                return start
+            }
+            while let units = left {
+                left = units == 0 ? nil : Self.redraw(atOrUnder: units - 1, window: window, perSecond: perSecond)
+                let instant = deadline.addingTimeInterval(-Double(units) / Double(perSecond))
+                // Rounding can put the first unit at `start`, which was already given.
+                if instant > start { return instant }
+            }
+            return nil
+        }
     }
 }
 

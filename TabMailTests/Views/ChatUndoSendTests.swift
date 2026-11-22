@@ -76,14 +76,45 @@ struct ChatUndoSendTests {
         #expect(Self.reply(holdUntil: hold, draftId: nil).undoSecondsLeft(at: now) == nil)
     }
 
+    /// The bubble's redraw instants from `start`, as its timeline asks for them.
+    private static func redraws(from start: Date, deadline: Date, animatesFill: Bool) -> [Date] {
+        Array(ChatUndoSendSchedule(deadline: deadline, animatesFill: animatesFill).entries(from: start, mode: .normal))
+    }
+
     @Test("The countdown's ticks fall on each whole second before the deadline and end at it")
     func ticksEndAtTheDeadline() {
         let start = Date()
         let deadline = start.addingTimeInterval(2.5)
-        let ticks = ChatUndoSendSchedule.ticks(from: start, deadline: deadline)
+        let ticks = Self.redraws(from: start, deadline: deadline, animatesFill: false)
         #expect(ticks == [start, deadline.addingTimeInterval(-2), deadline.addingTimeInterval(-1), deadline])
-        #expect(ChatUndoSendSchedule.ticks(from: deadline.addingTimeInterval(1), deadline: deadline).count == 1,
+        #expect(Self.redraws(from: deadline.addingTimeInterval(1), deadline: deadline, animatesFill: false).count == 1,
                 "nothing scheduled after the deadline")
+        #expect(Self.redraws(from: deadline.addingTimeInterval(1), deadline: deadline, animatesFill: true).count == 1,
+                "nor with the fill")
+    }
+
+    @Test("A hold far ahead of the clock redraws once a second until the fill's window, then frame by frame to the deadline")
+    func farHoldRedrawsBySecondsUntilTheFill() {
+        // A reply queued while the device's date ran a day ahead, its chat opened after the date was set right.
+        let start = Date()
+        let deadline = start.addingTimeInterval(86_400.5)
+        let window = SyncConfig.outboxUndoHoldSeconds
+        let frame = 1 / Double(ChatUndoSendConfig.fillFramesPerSecond)
+        let redraws = Self.redraws(from: start, deadline: deadline, animatesFill: true)
+        #expect(redraws.first == start && redraws.last == deadline, "from the start to the deadline")
+        let gaps = zip(redraws, redraws.dropFirst()).map { (at: $0, gap: $1.timeIntervalSince($0)) }
+        #expect(gaps.allSatisfy { $0.gap > 0 }, "in order, each instant once")
+        let fillStarts = deadline.addingTimeInterval(-window)
+        let beforeFill = gaps.filter { $0.at < fillStarts.addingTimeInterval(-1) }
+        #expect(!beforeFill.isEmpty && beforeFill.allSatisfy { abs($0.gap - 1) < 0.001 || $0.at == start },
+                "before the fill moves, one redraw a second: the countdown's")
+        let inFill = gaps.filter { $0.at >= fillStarts }
+        #expect(inFill.count == Int((window / frame).rounded()) && inFill.allSatisfy { abs($0.gap - frame) < 0.001 },
+                "inside the fill's window, every frame")
+        #expect(redraws.count < 86_400 + 2 * Int((window / frame).rounded()),
+                "control: about one redraw a second, not a frame's worth: \(redraws.count)")
+        let still = Self.redraws(from: start, deadline: deadline, animatesFill: false)
+        #expect(still.count == 86_402 && still.last == deadline, "Reduce Motion: the whole seconds alone, then the deadline")
     }
 
     // MARK: - 1b. The fill-up look follows the deadline
@@ -139,12 +170,11 @@ struct ChatUndoSendTests {
                 "a failed send has its own Not sent look on the ordinary bubble")
         #expect(row.undoSecondsLeft(at: deadline) == nil, "control: Undo itself still ends at the deadline")
         let start = deadline.addingTimeInterval(-4)
-        let still = ChatUndoSendSchedule(deadline: deadline, animatesFill: false)
-        #expect(still.entries(from: start, mode: .normal) == ChatUndoSendSchedule.ticks(from: start, deadline: deadline),
-                "no frame-by-frame redraw: only the whole seconds")
-        let moving = ChatUndoSendSchedule(deadline: deadline, animatesFill: true)
-        let frames = moving.entries(from: start, mode: .normal)
-        #expect(frames.count > still.entries(from: start, mode: .normal).count && frames.last == deadline
+        let still = Self.redraws(from: start, deadline: deadline, animatesFill: false)
+        let wholeSeconds = [start] + [3.0, 2.0, 1.0].map { deadline.addingTimeInterval(-$0) } + [deadline]
+        #expect(still == wholeSeconds, "no frame-by-frame redraw: only the whole seconds")
+        let frames = Self.redraws(from: start, deadline: deadline, animatesFill: true)
+        #expect(frames.count > still.count && frames.last == deadline
                 && frames.allSatisfy { $0 <= deadline }, "control: the moving fill redraws often and stops at the deadline")
     }
 
@@ -907,6 +937,15 @@ struct ChatUndoSendTests {
         let fixture = try await Self.makeFixture(pool)
         let row = try await Self.queueReply(fixture, draftId: "draft-db-sent")
         try await Self.setHold(pool, row.id, Date().addingTimeInterval(3600))
+        // The summary made at Send, which the bubble shows (`ChatUnsentReply.summary`): the real Send
+        // writes it to the AI cache under the row's Sent folder and Message-ID; the queue write alone
+        // does not.
+        let sentMessageId = EmailFilter.normalizeMessageId(try #require(row.sentMessageId, "control: the queued row has its Message-ID"))
+        try await pool.write { db in
+            try MessageAICache.writeThrough(
+                accountId: Self.account, folderPath: "Sent", rfc822MessageId: sentMessageId,
+                summaryTextMessage: "I said Tuesday works.", db: db)
+        }
         let chat = try Self.host(fixture)
         defer { chat.close() }
         func drawn() throws -> String? {
@@ -921,13 +960,15 @@ struct ChatUndoSendTests {
             return "other"
         }
         try await Self.waitFor { (try? drawn()) == "pending" }
+        let bubble = Self.bubbleFrame(in: chat.controller.view)
+        #expect(bubble != nil, "control: the chat shows the reply's bubble with its summary")
         #expect(try drawn() == "pending", "control: queued, the bubble is pending")
 
-        // The provider took the email: the outbox row records it and stays (its Sent copy is not
-        // in the chat yet).
+        // The provider took the email: the outbox row records it under the Message-ID it was queued
+        // with, and stays (its Sent copy is not in the chat yet).
+        let id = row.id
         try await pool.write { db in
-            try db.execute(sql: "UPDATE outboxMessage SET sentAt = ?, sentMessageId = ? WHERE id = ?",
-                           arguments: [Date(), "sent-copy@example.com", row.id])
+            try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?", arguments: [Date(), id])
         }
         #expect(try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) } != nil, "control: the row stays")
         try await Self.waitFor { (try? drawn()) == "solid" }

@@ -490,10 +490,19 @@ same AI result, kept as long as the email itself is shown.
    chat looks for after Send, which lost the Undo. Every way of sending (Send, Send with the shown
    suggestion, the Empty Body alert's Send Anyway) reads the setting in one place
    (`ComposeView.startSend`). RootView's toast is its own presenter (`PendingSendToastPresenter`),
-   so a test draws it over the real chat and counts the Undos on screen. Tests:
+   so a test draws it over the real chat and counts the Undos on screen.
+   *Amended 2026-11-22 (later):* the origin is the compose's state, set once as it opens
+   (`ComposeView.openedOn`): a chat builds its cover's compose again whenever it redraws, and with
+   a plain input a merge of threads while the compose was open could change the origin it had
+   opened with. The bubble's redraw schedule (`ChatUndoSendSchedule`) makes its instants one at a
+   time, once a second until the fill's window and every frame inside it: a queued row's hold can lie
+   far ahead of a clock set back, and a schedule laid out in memory at 30 frames a second up to it
+   could exhaust the app's memory. Tests:
    `ChatUndoSendTests`, `ChatUndoSendRoutingTests` (the real Send of each kind of compose; the
-   agent's cards from the mounted chat with the toast over it, one Undo on screen),
-   `UndoSendReturnsToDraftsTests` (the return to Drafts from the toast and from the bubble).
+   agent's cards, the AI Suggestion and the toolbar Forward from the mounted chat with the toast
+   over it, one Undo on screen, checked on the hold Send gave the email; a compose built again with
+   another origin), `UndoSendReturnsToDraftsTests` (the return to Drafts from the toast and from
+   the bubble).
    **Superseded by the rebuild (2026-11-09), kept for history:**
    **The Sending bubble follows its queued email (decided 2026-11-07):** a reply sent from
    the chat (the ready AI Reply, or an agent compose) reports its queued email's outbox row

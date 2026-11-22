@@ -1277,10 +1277,12 @@ struct ComposeView: View {
     /// PORT — process-local Undo reopens only the retained exact Draft
     /// owner/generation reconstructed before confirmed Outbox cancellation.
     var retainedDraftAuthority: PendingSendService.RetainedDraftAuthority?
-    /// The screen this compose was opened on, given as it opens and never changed (nil: a screen
-    /// that names none, or a chat that does not show this compose's send). Read at Send to decide who
-    /// offers the send's Undo (`PendingSendService.sendHasBubbleUndo`).
-    var openedOn: ComposeScreen?
+    /// The screen this compose was opened on, given as it opens and kept for its whole presentation
+    /// (nil: a screen that names none, or a chat that does not show this compose's send). State, so
+    /// a screen that builds the compose again while it is open (a chat whose emails changed, a merge
+    /// bringing in or taking out the email it answers) never changes it: the first value stays. Read
+    /// at Send to decide who offers the send's Undo (`PendingSendService.sendHasBubbleUndo`).
+    @State private var openedOn: ComposeScreen?
     /// Fires when the user either sends, fails to persist, or dismisses —
     /// exactly once per compose session, via `ComposeOutcomeState.tryResolve`
     /// upstream. Non-agent compose entry points leave this `nil` and the
@@ -1329,7 +1331,7 @@ struct ComposeView: View {
         self.openAuthority = openAuthority
         self.preparedDraft = preparedDraft
         self.retainedDraftAuthority = retainedDraftAuthority
-        self.openedOn = openedOn
+        _openedOn = State(initialValue: openedOn)
         self.onAgentOutcome = onAgentOutcome
         if let preparedDraft {
             var recipients = ComposeDraftGuards.Recipients()

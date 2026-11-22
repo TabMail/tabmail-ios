@@ -126,7 +126,9 @@ enum PendingSendToastPhase: Equatable, Sendable {
 /// Design:
 /// - Only one pending toast at a time (the most recent send). A second
 ///   `present()` replaces `current`; the previous message's OutboxMessage row
-///   continues through its own hold → drain → send flow (its Undo is forfeited).
+///   continues through its own hold → drain → send flow. Its Undo passes to its
+///   chat bubble while its window lasts (`releaseToast`); a send with no bubble
+///   (a new email) has no Undo left.
 /// - Toast phase rendering lives in PendingSendToast (TimelineView, wall-clock).
 ///   This service only stores `current` and an auto-dismiss Task.
 /// - `undoAndReopen()` attempts a confirmed cancellation regardless of whether compose

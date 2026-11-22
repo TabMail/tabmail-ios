@@ -251,6 +251,7 @@ struct ChatThreadView: View {
                 }
                 .disabled(thread.newest == nil)
                 .accessibilityLabel("Forward")
+                .accessibilityIdentifier(Self.forwardId)
             }
         }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
@@ -780,6 +781,9 @@ struct ChatThreadView: View {
 
     /// The reply field's container, as tests find it.
     static let replyPillId = "chatReplyPill"
+
+    /// The toolbar's Forward, as tests find it.
+    static let forwardId = "chatForward"
 
     /// The AI Suggestion's row, from `suggestionPhase`. The working bubble filling in grows the row
     /// into the ghost over `ChatSuggestionConfig.fillDuration`, and while the landing holds its
