@@ -377,6 +377,10 @@ struct ChatComposeRoutingTests {
             // The root screen shows first, with its pill, then the chat is pushed over it.
             if waiting == nil {
                 try await Self.waitUntil { HostedAccessibility.identifiers(in: screens.view).contains("chatPill") }
+                // The pill's take as it first appears can run after the pill is in the accessibility
+                // tree, with the root as it first showed. Settled here, so a case's first change and
+                // request come after it, as a request over the network does.
+                try await Task.sleep(for: .milliseconds(300))
             }
             if chat {
                 route.chatShown = true
@@ -1096,6 +1100,7 @@ struct ChatComposeRoutingTests {
                 let depth = router.composeQueueDepth
                 let holding = router.composeAwaitingAppear
                 let underTheEmail = Self.card(in: screens)
+                #expect(screens.route.inboxSaysPushed, "control: the inbox's navigation still says an email is pushed")
                 #expect(depth == 1, "the inbox under a pushed email takes nothing")
                 #expect(!holding, "and holds no take for a card that cannot show")
                 #expect(underTheEmail.isEmpty, "nothing opens: \(underTheEmail)")
@@ -1127,6 +1132,8 @@ struct ChatComposeRoutingTests {
                 let depth = router.composeQueueDepth
                 let holding = router.composeAwaitingAppear
                 let underTheEmail = Self.card(in: screens)
+                let selectedNow = screens.route.inboxSelected
+                #expect(selectedNow == screens.email.id, "control: the email is still selected, not cleared by the list")
                 #expect(depth == 1, "the inbox under a selected email takes nothing")
                 #expect(!holding, "and holds no take for a card that cannot show")
                 #expect(underTheEmail.isEmpty, "nothing opens: \(underTheEmail)")
