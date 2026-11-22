@@ -87,6 +87,7 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @MainActor
     private struct Screen {
         let controller: UIHostingController<AnyView>
         let stage: Stage
