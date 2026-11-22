@@ -10,6 +10,10 @@ designing anything that compares, stores or searches by an IMAP mod-sequence.
   (`IMAPServer+Mailbox`, `IMAPNamedConnection+Mailbox`). `IMAPProvider.fetchFolders` copies it to
   `FolderInfo.highestModSeq`. The full sync's folder upsert and delta sync write it to
   `Folder.lastKnownHighestModSeq`.
+  *Correction (2026-11-22, tabmail-ios #755):* the last sentence is superseded and kept. Since
+  ADR-IOS-111's amendment 2026-11-18 (#755), item 1, only `SyncEngine.writeListingCounters` (the window
+  listing, from its own SELECT) writes `Folder.lastKnownHighestModSeq`; resets clear it through
+  `SyncEngine.invalidateListingCounters`. STATUS is a trigger and writes no counter.
 - **The SELECT modseq is a NIOIMAPCore type.** `Mailbox.Selection.highestModSequence` is
   `ModificationSequenceValue?` from NIOIMAPCore. The app imports only `SwiftMail`, which does not
   re-export NIOIMAPCore (no `@_exported`), and `project.yml` links only the SwiftMail product.
@@ -26,6 +30,12 @@ designing anything that compares, stores or searches by an IMAP mod-sequence.
 
 The catch-up's stamps are STATUS values taken earlier in the same pass. The per-range SELECT
 supplies only the epoch (UIDVALIDITY).
+
+Correction (2026-11-22, tabmail-ios #755): the first sentence above is superseded and kept. A listing's
+first stamp is not a STATUS value. A tracked folder (a change bookmark of the folder's epoch, on a folder
+not owed a check) stamps the bookmark's MODSEQ; every other folder stamps its stored HIGHESTMODSEQ
+(`Folder.lastKnownHighestModSeq`, written only by the window listing, `SyncEngine.writeListingCounters`).
+See ADR-IOS-111, amendment 2026-11-19 (#755) "CONDSTORE without QRESYNC", item 8.
 
 ## Test harness
 

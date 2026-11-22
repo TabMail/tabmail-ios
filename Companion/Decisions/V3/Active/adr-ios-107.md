@@ -411,6 +411,14 @@ The owner's rulings of 2026-11-09:
        `Mailbox.Selection.highestModSequence` is NIOIMAPCore's type, which the app does not import, and
        STATUS of the same pass is already a stamp taken before every range. The per-range SELECT
        supplies the per-range EPOCH, which is what removal safety needs.
+     - *Amended 2026-11-22 (#755): where the first stamp comes from.* It is not a STATUS value. A
+       tracked folder (a change bookmark of the folder's epoch, on a folder not owed a check) stamps the
+       bookmark's MODSEQ. Every other folder (no bookmark, a bookmark of another epoch, or owed a check)
+       stamps its stored HIGHESTMODSEQ (`Folder.lastKnownHighestModSeq`, written only by the window
+       listing, `SyncEngine.writeListingCounters`). The stamp is still taken when the listing starts and
+       carried unchanged in `listing.firstStamp`. See ADR-IOS-111, amendment 2026-11-19 (#755) "CONDSTORE
+       without QRESYNC", item 8. The STATUS wording above, in this bullet and its deviation note, is
+       superseded and kept.
    - **The request stays inside the local range.** *Superseded 2026-11-20 (#1062): the upper bound is
      the larger of the last local UID and the bookmark's (else the listing's own) UIDNEXT - 1; see the
      amendment of that date.* Each FETCH runs from the range's first local UID
@@ -419,6 +427,9 @@ The owner's rulings of 2026-11-09:
    - **The first stamp of a new folder.** The full sync's folder insert writes STATUS HIGHESTMODSEQ
      to the new row, as its update arm always did. Without it a new folder's first listing completed
      with no stamp, and the cheap check stayed off until the next full check.
+     - *Amended 2026-11-22 (#755):* the STATUS write above is superseded and kept. The folder insert
+       and update write no counter (ADR-IOS-111, amendment 2026-11-18 (#755), item 1); a new folder's
+       stored HIGHESTMODSEQ is written by its window listing.
 7. **One removal path, two triggers.** There is one deletion core (`deleteConfirmedGhostHeaders`)
    and one absence proof (`UID SEARCH UID <set>` under the stored verified epoch). They are reached by:
    - IDLE VANISHED (unchanged);

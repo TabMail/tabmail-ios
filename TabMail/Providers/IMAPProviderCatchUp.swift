@@ -166,10 +166,13 @@ extension IMAPProvider {
     }
 
     /// The per-folder decision.
-    /// - `freshModSeq` is the HIGHESTMODSEQ the folder's last proven listing
-    ///   stored (`Folder.lastKnownHighestModSeq`, written only by
-    ///   `SyncEngine.writeListingCounters`; STATUS is a trigger and never writes
-    ///   it), nil on a server or session without CONDSTORE.
+    /// - `freshModSeq` is the folder's MODSEQ freshness: the MODSEQ check's input
+    ///   (untracked folders only) and a new listing's first stamp. For a tracked
+    ///   folder (bookmark held, not owed a check) whose bookmark has this epoch
+    ///   it is the bookmark's MODSEQ; otherwise it is the HIGHESTMODSEQ the
+    ///   folder's last proven listing stored (`Folder.lastKnownHighestModSeq`,
+    ///   written only by `SyncEngine.writeListingCounters`; STATUS is a trigger
+    ///   and never writes it), nil on a server or session without CONDSTORE.
     /// - The decision is the same on every network, battery level and power mode:
     ///   a scan is cheap and always runs; only downloads wait (#1063).
     /// - `isTracked`: the folder's change bookmark covers it (ADR-IOS-111). Its
@@ -202,8 +205,9 @@ extension IMAPProvider {
     }
 
     /// `EmailProvider.catchUp` for IMAP (ADR-IOS-107). For each folder whose epoch is
-    /// known: the cheap check (the latest STATUS HIGHESTMODSEQ against the stored
-    /// completion stamp, no request), and when that or the full-check interval
+    /// known: the cheap check (an untracked folder's stored HIGHESTMODSEQ,
+    /// `Folder.lastKnownHighestModSeq`, against the stored completion stamp, no
+    /// request; see `catchUpPlan`), and when that or the full-check interval
     /// calls for it, a flags-only listing by UID ranges that resumes across passes.
     /// Least recently attempted folder first. Every request is preceded by a budget check
     /// and bounded by `SyncConfig.catchUpRequestTimeoutSeconds`; a timeout or any
