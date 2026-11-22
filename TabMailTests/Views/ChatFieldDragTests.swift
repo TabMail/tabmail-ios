@@ -138,13 +138,12 @@ struct ChatFieldDragTests {
 
     /// A drag that started in the focused field's text, and the field's share of it, worked out by
     /// hand: the text keeps the drag until its end, the rest of the same drag is the field's, both
-    /// axes counted from the hand-off (`handOff`, the sideways travel when the text reached its
-    /// end; nil while the text can still scroll). Velocities are upward only.
+    /// axes counted from the hand-off (`handOff`, the drag's travel where the text reached its end;
+    /// nil while the text can still scroll). Velocities are upward only.
     private struct Shared {
         let travel: CGSize
         let velocity: CGFloat
-        let textScrolled: CGFloat
-        let handOff: CGFloat?
+        let handOff: CGSize?
         let share: CGSize
         let shareVelocity: CGFloat
         let opens: Bool
@@ -152,40 +151,43 @@ struct ChatFieldDragTests {
     }
 
     private static let shared: [Shared] = [
-        Shared(travel: CGSize(width: 0, height: -30), velocity: -90, textScrolled: 30, handOff: nil,
+        Shared(travel: CGSize(width: 0, height: -30), velocity: -90, handOff: nil,
                share: .zero, shareVelocity: 0, opens: false,
                why: "the text still had room: it took the whole drag"),
-        Shared(travel: CGSize(width: 0, height: -32), velocity: -2000, textScrolled: 30, handOff: nil,
+        Shared(travel: CGSize(width: 0, height: -32), velocity: -2000, handOff: nil,
                share: .zero, shareVelocity: 0, opens: false,
                why: "a fast flick inside the text, the text a sample behind the finger: still the text's"),
-        Shared(travel: CGSize(width: 40, height: -30), velocity: -90, textScrolled: 30, handOff: nil,
+        Shared(travel: CGSize(width: 40, height: -30), velocity: -90, handOff: nil,
                share: .zero, shareVelocity: 0, opens: false,
                why: "sideways travel while the text scrolls is not the field's either"),
-        Shared(travel: CGSize(width: 0, height: -100), velocity: 0, textScrolled: 40, handOff: 0,
+        Shared(travel: CGSize(width: 0, height: -100), velocity: 0, handOff: CGSize(width: 0, height: -40),
                share: CGSize(width: 0, height: -60), shareVelocity: 0, opens: true,
                why: "the text reached its end 40 in; the rest of the same drag, 60, opens the panel"),
-        Shared(travel: CGSize(width: 0, height: -90), velocity: 0, textScrolled: 40, handOff: 0,
+        Shared(travel: CGSize(width: 0, height: -90), velocity: 0, handOff: CGSize(width: 0, height: -40),
                share: CGSize(width: 0, height: -50), shareVelocity: 0, opens: false,
                why: "50 past the end is short of the open distance"),
-        Shared(travel: CGSize(width: 0, height: -60), velocity: -120, textScrolled: 40, handOff: 0,
+        Shared(travel: CGSize(width: 0, height: -60), velocity: -120, handOff: CGSize(width: 0, height: -40),
                share: CGSize(width: 0, height: -20), shareVelocity: -120, opens: false,
                why: "past the end, the flick counts: 20 + 30 = 50 predicted, short"),
-        Shared(travel: CGSize(width: 0, height: -60), velocity: -400, textScrolled: 40, handOff: 0,
+        Shared(travel: CGSize(width: 0, height: -60), velocity: -400, handOff: CGSize(width: 0, height: -40),
                share: CGSize(width: 0, height: -20), shareVelocity: -400, opens: true,
                why: "past the end, a quick flick predicts 120 and opens"),
-        Shared(travel: CGSize(width: 0, height: -70), velocity: -300, textScrolled: 0, handOff: 0,
+        Shared(travel: CGSize(width: 0, height: -70), velocity: -300, handOff: CGSize(width: 0, height: 0),
                share: CGSize(width: 0, height: -70), shareVelocity: -300, opens: true,
                why: "text that does not scroll (a short draft) leaves the field the whole drag"),
-        Shared(travel: CGSize(width: 0, height: 20), velocity: 0, textScrolled: -20, handOff: nil,
+        Shared(travel: CGSize(width: 0, height: 20), velocity: 0, handOff: nil,
                share: .zero, shareVelocity: 0, opens: false,
                why: "a drag down scrolls the text back; nothing is the field's"),
-        Shared(travel: CGSize(width: 75, height: -165), velocity: 0, textScrolled: 100, handOff: 75,
+        Shared(travel: CGSize(width: 10, height: 40), velocity: 600, handOff: nil,
+               share: .zero, shareVelocity: 0, opens: false,
+               why: "a fast drag down in the text: neither its travel nor its speed is the field's"),
+        Shared(travel: CGSize(width: 75, height: -165), velocity: 0, handOff: CGSize(width: 75, height: -100),
                share: CGSize(width: 0, height: -65), shareVelocity: 0, opens: true,
                why: "75 sideways and 100 up reached the end; 65 straight up after it is the field's and opens"),
-        Shared(travel: CGSize(width: 75, height: -155), velocity: 0, textScrolled: 100, handOff: 75,
+        Shared(travel: CGSize(width: 75, height: -155), velocity: 0, handOff: CGSize(width: 75, height: -100),
                share: CGSize(width: 0, height: -55), shareVelocity: 0, opens: false,
                why: "the same drag 55 past the end: short of the open distance"),
-        Shared(travel: CGSize(width: 155, height: -140), velocity: 0, textScrolled: 100, handOff: 75,
+        Shared(travel: CGSize(width: 155, height: -140), velocity: 0, handOff: CGSize(width: 75, height: -100),
                share: CGSize(width: 80, height: -40), shareVelocity: 0, opens: false,
                why: "past the end the field's own segment, 80 sideways and 40 up, is more sideways than up"),
     ]
@@ -194,7 +196,7 @@ struct ChatFieldDragTests {
     func fieldShareOfATextDrag() {
         for one in Self.shared {
             let drag = ChatHorizontalPan.Sample(travel: one.travel, velocity: CGSize(width: 0, height: one.velocity))
-            let share = ChatFieldDrag.fieldShare(of: drag, textScrolled: one.textScrolled, handOff: one.handOff)
+            let share = ChatFieldDrag.fieldShare(of: drag, handOff: one.handOff)
             let expected = ChatHorizontalPan.Sample(travel: one.share, velocity: CGSize(width: 0, height: one.shareVelocity))
             let opens = ChatFieldDrag.opens(letGo: share)
             #expect(share == expected, "\(one.why)")
@@ -223,7 +225,7 @@ struct ChatFieldDragTests {
         text.contentOffset = CGPoint(x: 0, y: end)
         let past = coordinator.share(Self.sample(0, -room - 70, speed: -300))
         #expect(past == Self.sample(0, -70, speed: -300),
-                "70 past the end is the field's, counted from where the touch found the text, not from its top")
+                "70 past the end is the field's, counted from where the text reached its end")
         let opens = ChatFieldDrag.opens(letGo: past)
         #expect(opens, "and it opens the panel")
         // The overshot offset a bounce would leave is still only the text's end.
@@ -346,6 +348,84 @@ struct ChatFieldDragTests {
             #expect(letGo == Self.sample(x - 46, -62), "counted from (46, -100), the second hand-off")
             let opened = ChatFieldDrag.opens(letGo: letGo)
             #expect(opened == opens, "\(x - 46) sideways and 62 up past the end")
+        }
+    }
+
+    // Up past the end, back into the text, then up across the end again: both axes of the field's
+    // share count from the second crossing, never from where the touch found the text.
+    @Test("After a reversal, the field's upward share counts from where the text reached its end again, not from the touch")
+    @MainActor
+    func upwardShareCountsFromTheSecondHandOff() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        // (release height, opens): 20 up past the second hand-off stays shut; 65 up opens.
+        for (y, opens) in [(CGFloat(-165), false), (CGFloat(-210), true)] {
+            text.contentOffset = CGPoint(x: 0, y: end / 2)
+            coordinator.touchDown(on: inner)
+            text.contentOffset = CGPoint(x: 0, y: end)
+            let crossed = coordinator.share(Self.sample(0, -150))
+            #expect(crossed == Self.sample(0, -50), "control: past the end the field has the rest")
+            // Back down into the text, 40 sideways on the way: the text scrolls back 20.
+            text.contentOffset = CGPoint(x: 0, y: end - 20)
+            let back = coordinator.share(Self.sample(40, -125))
+            #expect(back == Self.sample(0, 0), "control: back in the text, nothing is the field's")
+            // The finger's 40 up took the text's last 20 first: the text reached its end at (46, -145).
+            text.contentOffset = CGPoint(x: 0, y: end)
+            let again = coordinator.share(Self.sample(52, -165))
+            #expect(again == Self.sample(6, -20), "the second crossing's part past the end: 6 sideways, 20 up")
+            let letGo = coordinator.share(Self.sample(52, y))
+            #expect(letGo == Self.sample(6, y + 145), "counted from (46, -145), the second hand-off")
+            let opened = ChatFieldDrag.opens(letGo: letGo)
+            #expect(opened == opens, "\(-(y + 145)) up past the second hand-off")
+        }
+    }
+
+    // The text can reach its end in a sample where the finger did not move up (its own scroll still
+    // carrying it): the hand-off is that sample's end, both axes.
+    @Test("A sample that reaches the text's end with no upward move hands off at its end")
+    @MainActor
+    func handOffWithNoUpwardMove() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        // (release x, opens): 62 sideways and 65 up past the hand-off opens; 70 sideways stays shut.
+        for (x, opens) in [(CGFloat(72), true), (CGFloat(80), false)] {
+            text.contentOffset = CGPoint(x: 0, y: end / 2)
+            coordinator.touchDown(on: inner)
+            text.contentOffset = CGPoint(x: 0, y: end - 5)
+            let before = coordinator.share(Self.sample(0, -95))
+            #expect(before == Self.sample(0, 0), "control: 5 short of the end the text has the drag")
+            text.contentOffset = CGPoint(x: 0, y: end)
+            let reached = coordinator.share(Self.sample(10, -95))
+            #expect(reached == Self.sample(0, 0), "reached with a sideways move only: the field's share starts at (10, -95)")
+            let letGo = coordinator.share(Self.sample(x, -160))
+            #expect(letGo == Self.sample(x - 10, -65), "counted from (10, -95)")
+            let opened = ChatFieldDrag.opens(letGo: letGo)
+            #expect(opened == opens, "\(x - 10) sideways and 65 up past the hand-off")
+        }
+    }
+
+    @Test("While the text has the drag, up or down, the field gets no travel and no speed")
+    @MainActor
+    func noShareWhileTheTextHasTheDrag() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        let start = end / 2
+        text.contentOffset = CGPoint(x: 0, y: start)
+        coordinator.touchDown(on: inner)
+        // (finger travel, speed, where the text's scroll left it)
+        let drags: [(CGSize, CGFloat, CGFloat)] = [
+            (CGSize(width: 0, height: -40), -2000, start + 40),
+            (CGSize(width: -30, height: -20), -300, start + 20),
+            (CGSize(width: 5, height: 30), 800, start - 30),
+            (CGSize(width: 0, height: 60), 1500, start - 60),
+        ]
+        for (travel, speed, offset) in drags {
+            text.contentOffset = CGPoint(x: 0, y: offset)
+            let share = coordinator.share(Self.sample(travel.width, travel.height, speed: speed))
+            #expect(share == Self.sample(0, 0), "\(travel) at \(speed): the text has the drag")
         }
     }
 

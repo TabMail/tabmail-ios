@@ -1055,12 +1055,17 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    text (over its six lines) can still scroll, the text keeps the drag; once it reaches its end,
    the rest of the SAME drag is the field's: its swell, its open distance and its flick, as for a
    short draft. The pan runs beside the text's own scroll (`shouldRecognizeSimultaneouslyWith`),
-   notes the text under the drag's first touch and its scroll offset then, and hands on only the
-   field's share of each sample (`ChatFieldPan.Coordinator.share`, `ChatFieldDrag.fieldShare`):
-   the finger's travel less what the text scrolled, counted up to its end; short of the end, no
-   upward travel and no velocity, so a flick inside the text never opens the panel. Both axes of
+   notes the text under the drag's first touch, and hands on only the field's share of each sample
+   (`ChatFieldPan.Coordinator.share`, `ChatFieldDrag.fieldShare`): the finger's travel past the
+   point where the text reached its end; short of the end, no travel and no velocity, either way,
+   so a flick inside the text never opens the panel. Both axes of
    the share count from the hand-off, where the text reached its end, found within the sample that
-   crosses it from the finger's travel (amended 2026-11-21, and 2026-11-22 for the crossing sample): sideways
+   crosses it from the finger's travel (amended 2026-11-21, and 2026-11-22 for the crossing sample).
+   The hand-off is ONE point of the finger's travel, both axes (amended 2026-11-22): sideways taken
+   at the same point of the crossing sample, upward the previous sample's travel less the text's
+   remaining room, and a sample that reaches the end with no upward move hands off at its end; no
+   second origin (where the touch found the text) remains, so an axis cannot keep counting from an
+   earlier crossing after a reversal. Sideways
    travel made while the text had the drag is not the field's, and a drag that reverses until the
    text scrolls again drops the hand-off and takes a new one when the text is back at its end; the
    field's segment keeps the more-up-than-sideways rule, and whether the pan begins at all is
@@ -1131,7 +1136,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    share, from a touch-down offset that is not zero; `handOffClearsOnAReversal` and
    `diagonalThenStraightUp` the hand-off's state, both axes; `handOffInsideACrossingSample` and
    `handOffInsideACrossingSampleAfterAReversal` the hand-off inside a sample that crosses the end, where
-   the text reached it; `textUnderTheTouchDoesNotBounce` the
+   the text reached it; `upwardShareCountsFromTheSecondHandOff` the upward share after a reversal,
+   `handOffWithNoUpwardMove` a crossing with no upward move, `noShareWhileTheTextHasTheDrag` no
+   travel and no speed in the text, up or down; `textUnderTheTouchDoesNotBounce` the
    no-bounce rule; `textViewOrdering` pins the pan beside the text's scroll and not beside any other
    pan in or on the text view, a selection handle's among them; the first was
    `testDragUpInOverflowingTextScrollsItAndShortTextOpens`, whose short half ran signed out, where

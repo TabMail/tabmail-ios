@@ -577,13 +577,12 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             Self.isTextViews(other) && other is UILongPressGestureRecognizer
         }
 
-        /// The text the drag's first touch landed in, where it was scrolled then, and the drag's
-        /// sideways travel when the text last reached its end (nil while it can still scroll). The
-        /// previous sample's travel and the text's place then, to find where in the next sample
-        /// the text reached its end.
+        /// The text the drag's first touch landed in, and the drag's travel, both axes, where the
+        /// text last reached its end (nil while it can still scroll): the field's share counts from
+        /// that one point. The previous sample's travel and the text's place then, to find where in
+        /// the next sample the text reached its end.
         private weak var text: UIScrollView?
-        private var textStart: CGFloat = 0
-        private var handOff: CGFloat?
+        private var handOff: CGSize?
         private var lastTravel = CGSize.zero
         private var lastOffset: CGFloat = 0
 
@@ -601,23 +600,22 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         func touchDown(on view: UIView?) {
             text = Self.scrollingText(around: view)
             text?.bouncesVertically = false
-            textStart = text?.contentOffset.y ?? 0
             lastTravel = .zero
-            lastOffset = textStart
+            lastOffset = text?.contentOffset.y ?? 0
             // A drag that starts with the text at its end is the field's from its start.
             if let text, text.contentOffset.y >= Self.end(of: text) {
-                handOff = 0
+                handOff = .zero
             } else {
                 handOff = nil
             }
         }
 
-        /// The field's share of `drag` (`ChatFieldDrag.fieldShare`): how far the text under it has
-        /// scrolled since the touch, up to its end, is the text's, and so is the sideways travel
-        /// until the text reached its end. The hand-off is found in the first sample with the text
-        /// at its end, at the point of that sample where the text reached it (`crossing`), and
-        /// dropped when the text scrolls back from it, so a drag that reverses into the text and
-        /// reaches the end again hands off afresh. Off the text, all of it.
+        /// The field's share of `drag` (`ChatFieldDrag.fieldShare`): the drag's travel, both axes,
+        /// from the point where the text under it reached its end; none while the text can still
+        /// scroll. The hand-off is found in the first sample with the text at its end, at the point
+        /// of that sample where the text reached it (`crossing`), and dropped when the text scrolls
+        /// back from it, so a drag that reverses into the text and reaches the end again hands off
+        /// afresh. Off the text, all of it.
         func share(_ drag: ChatHorizontalPan.Sample) -> ChatHorizontalPan.Sample {
             guard let text else { return drag }
             let end = Self.end(of: text)
@@ -631,22 +629,22 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             lastOffset = min(offset, end)
             // Debug UI tests only: how far the text went past its end (`ChatFieldDragMarker`).
             ChatFieldDragMarker.textPastEnd(offset - end)
-            return ChatFieldDrag.fieldShare(of: drag, textScrolled: min(offset, end) - textStart,
-                                            handOff: handOff)
+            return ChatFieldDrag.fieldShare(of: drag, handOff: handOff)
         }
 
-        /// The drag's sideways travel where the text reached its end, within the sample that went
+        /// The drag's travel, both axes, where the text reached its end, within the sample that went
         /// from `last` (the text then at `textAt`) to `travel`: the finger's upward move in that
-        /// sample took the text's remaining room first, and the sideways travel is taken at the
-        /// same point of the move, so neither axis of the field's share counts travel the text had.
-        /// The text's place cannot tell where in the sample the finger was, since the text holds
-        /// still at its end; the finger's travel can. A sample with no upward move hands off at its
-        /// end.
-        static func crossing(from last: CGSize, textAt: CGFloat, to travel: CGSize, end: CGFloat) -> CGFloat {
+        /// sample took the text's remaining room first, so the hand-off is that room further up
+        /// than `last`, and the sideways travel is taken at the same point of the move. Neither
+        /// axis of the field's share then counts travel the text had. The text's place cannot tell
+        /// where in the sample the finger was, since the text holds still at its end; the finger's
+        /// travel can. A sample with no upward move hands off at its end.
+        static func crossing(from last: CGSize, textAt: CGFloat, to travel: CGSize, end: CGFloat) -> CGSize {
             let up = last.height - travel.height
-            guard up > 0 else { return travel.width }
-            let part = min(1, max(0, (end - textAt) / up))
-            return last.width + (travel.width - last.width) * part
+            guard up > 0 else { return travel }
+            let room = min(up, max(0, end - textAt))
+            return CGSize(width: last.width + (travel.width - last.width) * (room / up),
+                          height: last.height - room)
         }
 
         /// The scroll position at which `text` shows its end (its top when it does not scroll).
