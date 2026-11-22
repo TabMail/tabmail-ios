@@ -365,10 +365,13 @@ struct ChatReplyAttachTests {
                     // The pick while the picker is open; the picker then closes, and only then the card opens.
                     delegate.documentPicker?(picker, didPickDocumentsAt: [file])
                 case .closesThenReports:
-                    // The Files picker can close itself before it reports, as UIKit's own picker does.
-                    picker.dismiss(animated: true)
+                    // The Files picker can close before it reports. A hosted test cannot make UIKit's
+                    // picker close itself (`dismiss(animated:)` on it leaves the sheet up), so the
+                    // sheet closes through its own close, Cancel's: its onDismiss runs, then the pick
+                    // is reported.
+                    delegate.documentPickerWasCancelled?(picker)
                     try await ChatReplyRecoveryTests.waitUntil { chat.controller.presentedViewController == nil }
-                    #expect(chat.controller.presentedViewController == nil, "control: the picker closed itself")
+                    #expect(chat.controller.presentedViewController == nil, "control: the picker closed")
                     try await Task.sleep(for: Self.cardWouldHaveOpened)
                     #expect(chat.controller.presentedViewController == nil, "control: nothing opened before the pick")
                     delegate.documentPicker?(picker, didPickDocumentsAt: [file])
