@@ -711,7 +711,9 @@ struct DynamicIslandChat: View {
         // The compose cards this screen's chat asked for (ADR-IOS-053 Phase 2), taken while the
         // pill is on screen, whenever one may have become takeable or the chat's keys change.
         // Another screen's request is never taken here, whichever screens are mounted.
-        .onChange(of: composeTakeWatch) { _, watch in takeAgentCompose(for: watch.host) }
+        // `initial`: a screen mounted with a request already waiting (the inbox entered again
+        // from the sidebar, whose on-screen value starts true) takes it without a later change.
+        .onChange(of: composeTakeWatch, initial: true) { _, watch in takeAgentCompose(for: watch.host) }
         .onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
             fieldFill.apply(.confirmationCard)

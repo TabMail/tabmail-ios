@@ -680,10 +680,23 @@ extension AgentToolRouter {
     /// Exactly-once resume is guaranteed by:
     ///   - `ComposeOutcomeState.tryResolve` — atomic first-wins flag
     ///   - `ComposeContinuationGuard.resume` — NSLock-serialized resume
+    ///
+    /// When the wait ends the request leaves the queue if it is still there: a request
+    /// stopped while it waits for a screen that does not come back would otherwise keep its
+    /// recipients and body in memory until some later take.
     func enqueueComposeAndAwaitOutcome(
         make: (@escaping @MainActor (ComposeOutcome) -> Void, ComposeOutcomeState) -> ComposeRequest
     ) async -> ComposeOutcome {
         let state = ComposeOutcomeState()
+        let outcome = await awaitComposeOutcome(state: state, make: make)
+        composeQueue.removeAll { $0.outcomeState === state }
+        return outcome
+    }
+
+    private func awaitComposeOutcome(
+        state: ComposeOutcomeState,
+        make: (@escaping @MainActor (ComposeOutcome) -> Void, ComposeOutcomeState) -> ComposeRequest
+    ) async -> ComposeOutcome {
         let guard_ = ComposeContinuationGuard()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<ComposeOutcome, Never>) in
