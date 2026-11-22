@@ -43,14 +43,20 @@ struct IMAPChangeCondstoreCheckTests {
 
     @Test("T5: a failed or unlisted chunk SEARCH keeps every row and the bookmark, with the failure time set")
     func failedChunkSearchKeepsEverything() async throws {
-        for fault in ["refused", "unlisted"] {
+        // "unlisted" reports matches and lists none, which the IMAP library refuses itself.
+        // "contradicted" lists fewer UIDs than its own COUNT, and "outside" lists a UID the
+        // chunk did not ask about: the library passes both, and the reader refuses them
+        // (`listed(within:)`), never reading them as a list of the present messages.
+        let answers = ["unlisted": "COUNT 3", "contradicted": "COUNT 3 ALL 1,3", "outside": "ALL 1:9"]
+        for fault in ["refused", "unlisted", "contradicted", "outside"] {
             try await C.withWorld(inbox: [1, 2, 3]) { w in
                 let base = try await R.baseline(w)
                 C.remove([2], from: w.server)
                 if fault == "refused" {
                     w.server.failNextCommand(containing: "UID SEARCH")
                 } else {
-                    w.server.answerNextUIDSearch(in: R.inboxPath, esearchData: "COUNT 3")
+                    let answer = try #require(answers[fault])
+                    w.server.answerNextUIDSearch(in: R.inboxPath, esearchData: answer)
                 }
                 let changes = try await R.inbox(w, R.read(w, cursors: [w.inboxId: base]))
                 guard case .failed = changes.status else { Issue.record("\(fault): expected failed, got \(changes.status)"); return }
@@ -94,6 +100,50 @@ struct IMAPChangeCondstoreCheckTests {
             #expect(changes.armCatchUpWithBookmark, "the older rows get the catch-up's check")
             let next = try Self.cursor(changes.cursor)
             #expect(next.messageCount == 9 && next.pendingCheck == nil)
+        }
+    }
+
+    /// New mail a server rule moves out at once leaves its UID spent: UIDNEXT
+    /// moves past a message the folder never shows. Removals are owed by count
+    /// (old count, plus the arrivals read, minus the new count), so a spent UID
+    /// owes none, and the older mail is not searched again.
+    @Test("T7 control: an arrival expunged before the read (a spent UID) owes no removal: no check runs and the catch-up is not armed")
+    func spentUIDOwesNoRemoval() async throws {
+        try await C.withWorld(inbox: Array(1...10)) { w in
+            await w.provider.setRemovalCheckWindowForTesting(3)
+            let base = try await R.baseline(w)
+            C.add([11, 12], to: w.server)
+            // The server assigns UID 12 (it observes its mailbox) before 12 leaves.
+            _ = w.server.qresyncHighestModSeq(for: R.inboxPath)
+            C.remove([12], from: w.server)
+            let start = w.server.recordedCommands().count
+            let changes = try await R.inbox(w, R.read(w, cursors: [w.inboxId: base]))
+            #expect(R.isTracked(changes.status), "got \(changes.status)")
+            #expect(changes.removals.isEmpty)
+            #expect(changes.records.contains { $0.messageId == "11" }, "the arrival is read")
+            #expect(!changes.armCatchUpWithBookmark, "nothing was deleted: the older rows need no catch-up")
+            let searches = w.server.recordedCommands().dropFirst(start).filter { $0.uppercased().contains("UID SEARCH") }
+            #expect(searches.count == 1, "only the arrivals' SEARCH, no removal check: \(Array(searches))")
+            let next = try Self.cursor(changes.cursor)
+            #expect(next.messageCount == 11 && next.uidNext == 13 && next.pendingCheck == nil)
+        }
+    }
+
+    /// RFC 7162 has the CHANGEDSINCE read report a new message, and a SEARCH that
+    /// leaves it out does not make it absent: it still counts as an arrival, so
+    /// the count owes no removal for it.
+    @Test("An arrival the changed-flags read reports but the arrivals SEARCH leaves out counts as an arrival, never as a removal")
+    func arrivalTheSearchLeavesOutIsStillAnArrival() async throws {
+        try await C.withWorld(inbox: [1, 2, 3]) { w in
+            let base = try await R.baseline(w)
+            C.add([4], to: w.server)
+            w.server.setSearchOmits([4], in: R.inboxPath)
+            let changes = try await R.inbox(w, R.read(w, cursors: [w.inboxId: base]))
+            #expect(R.isTracked(changes.status), "got \(changes.status)")
+            #expect(changes.removals.isEmpty)
+            #expect(changes.records.contains { $0.messageId == "4" }, "the arrival is read in full")
+            let next = try Self.cursor(changes.cursor)
+            #expect(next.messageCount == 4 && next.uidNext == 5 && next.pendingCheck == nil)
         }
     }
 
