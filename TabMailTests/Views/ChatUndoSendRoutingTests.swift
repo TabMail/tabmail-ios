@@ -789,30 +789,4 @@ struct ChatUndoSendRoutingTests {
         #expect(try drawn(reduceMotion: true).shows(Palette.chatUndoSendPendingTint, at: Self.backgroundColumn, middle, dark: false),
                 "Reduce Motion: still the pending tint")
     }
-
-    @Test("A mounted bubble offers Undo until its deadline passes, then shows Sending with no Undo")
-    func mountedBubbleCrossesItsDeadline() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted bubble")
-        try await HostedAccessibility.withAutomation { @MainActor in
-            let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + 1.5)
-            let reply = ChatUnsentReply(outboxId: "o-mounted", status: .queued, sentAt: nil, holdUntil: hold,
-                                        draftId: "d", instanceEpoch: "E1", filed: false, textMessage: "I said Tuesday works.")
-            let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-            let window = UIWindow(windowScene: scene)
-            window.frame = CGRect(x: 0, y: 0, width: 393, height: 300)
-            let controller = UIHostingController(rootView: ChatUnsentReplyBubble(reply: reply, retry: {}, delete: {}, undo: {}))
-            window.rootViewController = controller
-            window.makeKeyAndVisible()
-            defer {
-                window.isHidden = true
-                window.rootViewController = nil
-            }
-            let hasUndo: @MainActor () -> Bool = { HostedAccessibility.identifiers(in: controller.view).contains(ChatUndoSendStatus.undoId) }
-            for _ in 0..<20 where !hasUndo() { try await Task.sleep(for: .milliseconds(50)) }
-            #expect(hasUndo(), "Undo while the window lasts")
-            for _ in 0..<60 where hasUndo() { try await Task.sleep(for: .milliseconds(100)) }
-            #expect(!hasUndo(), "no Undo once the deadline passed")
-            #expect(HostedAccessibility.labels(in: controller.view).contains { $0.contains("Sending") }, "the bubble still reads Sending")
-        }
-    }
 }

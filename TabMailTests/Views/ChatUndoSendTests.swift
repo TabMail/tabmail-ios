@@ -76,18 +76,37 @@ struct ChatUndoSendTests {
         #expect(Self.reply(holdUntil: hold, draftId: nil).undoSecondsLeft(at: now) == nil)
     }
 
+    /// More entries than any schedule in these tests has (the far hold's is about 86,550): reading
+    /// stops there, so a sequence that never ends fails instead of hanging.
+    nonisolated private static let entryBound = 200_000
+    /// A century: a date this far past every redraw the bubble needs is one no mounted bubble waits for.
+    nonisolated private static let unreachableWait: TimeInterval = 100 * 365 * 86_400
+
     /// The bubble's redraw instants from `start`, as its timeline asks for them: the whole sequence,
-    /// its closing `Date.distantFuture` included.
+    /// its closing entry included, read up to `entryBound`.
     private static func schedule(from start: Date, deadline: Date, animatesFill: Bool) -> [Date] {
-        Array(ChatUndoSendSchedule(deadline: deadline, animatesFill: animatesFill).entries(from: start, mode: .normal))
+        var entries = ChatUndoSendSchedule(deadline: deadline, animatesFill: animatesFill)
+            .entries(from: start, mode: .normal).makeIterator()
+        var all: [Date] = []
+        while all.count <= Self.entryBound, let next = entries.next() { all.append(next) }
+        let ended = all.count <= Self.entryBound
+        #expect(ended, "the sequence ends")
+        return all
     }
 
     /// The instants the timeline actually redraws at: the sequence less its closing entry. A
     /// TimelineView does not redraw at its schedule's last date, so the sequence must not end on one
-    /// it needs.
+    /// it needs: after the last date it needs (the deadline, or `start` when that is not before it)
+    /// it gives exactly one more, beyond any wait, and then ends.
     private static func redraws(from start: Date, deadline: Date, animatesFill: Bool) -> [Date] {
         let all = schedule(from: start, deadline: deadline, animatesFill: animatesFill)
-        #expect(all.last == .distantFuture, "the sequence closes with an instant the timeline never reaches")
+        let inOrder = zip(all, all.dropFirst()).allSatisfy { $0 < $1 }
+        #expect(inOrder, "in order, each instant once")
+        let lastNeeded = max(start, deadline)
+        let closing = all.filter { $0 > lastNeeded }
+        #expect(closing.count == 1 && closing.first == all.last, "one entry after the last needed date, and it ends the sequence")
+        let beyondAnyWait = closing.first.map { $0.timeIntervalSince(lastNeeded) > Self.unreachableWait } ?? false
+        #expect(beyondAnyWait, "the closing entry is one no mounted bubble reaches: \(String(describing: closing.first))")
         return Array(all.dropLast())
     }
 
@@ -97,11 +116,12 @@ struct ChatUndoSendTests {
         let deadline = start.addingTimeInterval(2.5)
         let ticks = Self.redraws(from: start, deadline: deadline, animatesFill: false)
         #expect(ticks == [start, deadline.addingTimeInterval(-2), deadline.addingTimeInterval(-1), deadline])
-        #expect(Self.redraws(from: deadline.addingTimeInterval(1), deadline: deadline, animatesFill: false).count == 1,
-                "nothing scheduled after the deadline")
-        #expect(Self.redraws(from: deadline.addingTimeInterval(1), deadline: deadline, animatesFill: true).count == 1,
-                "nor with the fill")
         for animatesFill in [false, true] {
+            // Opened at the deadline, or after it: the start alone, nothing more to redraw.
+            for late in [deadline, deadline.addingTimeInterval(1)] {
+                let lateRedraws = Self.redraws(from: late, deadline: deadline, animatesFill: animatesFill)
+                #expect(lateRedraws == [late], "a start at or after the deadline redraws once: fill \(animatesFill)")
+            }
             let all = Self.schedule(from: start, deadline: deadline, animatesFill: animatesFill)
             #expect(all.dropLast().last == deadline,
                     "the deadline is not the schedule's last date, so the timeline redraws at it: \(animatesFill)")
@@ -929,6 +949,96 @@ struct ChatUndoSendTests {
         #expect(try drawn() == "pending", "retried, queued again: pending")
         try await show(reply("o-retry", .queued, sentAt: Date()))
         #expect(try drawn() == "solid", "and solid once sent")
+    }
+
+    /// How long after the deadline a mounted bubble may still show its Undo: the display's own
+    /// scheduling, well under half a second.
+    nonisolated private static let displayAllowance: TimeInterval = 0.25
+    /// How long the mounted bubble is read after its deadline.
+    nonisolated private static let watchPastDeadline: TimeInterval = 1
+    /// How often the mounted bubble is read.
+    nonisolated private static let readInterval: Duration = .milliseconds(50)
+
+    @Test("A mounted bubble offers Undo until its deadline and not after it, with motion and under Reduce Motion; past the deadline a queued reply is solid to the top with motion and still pending under Reduce Motion",
+          arguments: [false, true])
+    func mountedBubbleCrossesItsDeadline(reduceMotion: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable && HostedAccessibility.canSetReduceMotion,
+                "control: the test can read the bubble and set Reduce Motion")
+        try await HostedAccessibility.withAutomation { @MainActor in
+            try await HostedAccessibility.withReduceMotion(reduceMotion) { @MainActor in
+                try await mountedDeadlineBody(reduceMotion: reduceMotion)
+            }
+        }
+    }
+
+    private func mountedDeadlineBody(reduceMotion: Bool) async throws {
+        let setting = UIAccessibility.isReduceMotionEnabled
+        #expect(setting == reduceMotion, "control: Reduce Motion is set as the case asks")
+        // Undo ends 2.5 s from now; the reply stays queued past it (a claim buffer, or offline).
+        let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + 2.5)
+        let reply = ChatUnsentReply(outboxId: "o-mounted", status: .queued, sentAt: nil, holdUntil: hold,
+                                    draftId: "d", instanceEpoch: "E1", filed: false, textMessage: "ok, Tuesday works.")
+        let deadline = reply.undoDeadline
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 300)
+        let controller = UIHostingController(rootView: ChatUnsentReplyBubble(reply: reply, retry: {}, delete: {}, undo: {}))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func hasUndo() -> Bool {
+            HostedAccessibility.identifiers(in: controller.view).contains(ChatUndoSendStatus.undoId)
+        }
+        // The bubble's colour low in it (the text's bottom-left corner, beside the round "o") and
+        // at its top (inside the top padding, above the text): where a rising fill arrives first
+        // and where it arrives last.
+        func drawn() throws -> (low: String, top: String) {
+            let image = UIGraphicsImageRenderer(bounds: controller.view.bounds).image { _ in
+                controller.view.drawHierarchy(in: controller.view.bounds, afterScreenUpdates: true)
+            }
+            let frame = try #require(Self.bubbleFrame(in: controller.view), "the bubble's text is on screen")
+            func name(at point: CGPoint) -> String {
+                let pixel = Self.color(of: image, at: point)
+                if pixel.isClose(to: Palette.chatUndoSendPendingTint, in: controller.traitCollection) { return "pending" }
+                if pixel.isClose(to: Theme.accent, in: controller.traitCollection) { return "solid" }
+                return "other"
+            }
+            return (name(at: CGPoint(x: frame.minX + 1, y: frame.maxY - 1)), name(at: CGPoint(x: frame.midX, y: frame.minY - 5)))
+        }
+
+        // Read the bubble over the whole window and a second past its deadline, each reading
+        // stamped before it is taken.
+        var readings: [(at: Date, undo: Bool)] = []
+        var lookWithUndo: (low: String, top: String)?
+        while Date() < deadline.addingTimeInterval(Self.watchPastDeadline) {
+            let at = Date()
+            let undo = hasUndo()
+            readings.append((at: at, undo: undo))
+            // Drawn once while at least a second of Undo is left: the fill is under 80% up.
+            if undo, lookWithUndo == nil, at < deadline.addingTimeInterval(-1) { lookWithUndo = try drawn() }
+            try await Task.sleep(for: Self.readInterval)
+        }
+
+        let undoBefore = readings.contains { $0.undo && $0.at < deadline }
+        #expect(undoBefore, "control: Undo while the window lasts")
+        let pastAllowance = readings.filter { $0.at >= deadline.addingTimeInterval(Self.displayAllowance) }
+        #expect(!pastAllowance.isEmpty, "control: the bubble was read after the deadline")
+        let lateUndo = pastAllowance.filter { $0.undo }.map { $0.at.timeIntervalSince(deadline) }
+        #expect(lateUndo.isEmpty, "no Undo once the deadline has passed; seen this many seconds after it: \(lateUndo)")
+        let sending = HostedAccessibility.labels(in: controller.view).contains { $0.contains("Sending") }
+        #expect(sending, "the bubble still reads Sending")
+
+        let before = try #require(lookWithUndo, "control: the bubble was drawn while Undo was offered")
+        let lowBefore = reduceMotion ? "pending" : "solid"
+        #expect(before.low == lowBefore, "control: with motion the fill has risen past the bottom; under Reduce Motion there is none")
+        #expect(before.top == "pending", "control: the fill has not reached the top yet, so the top probe sees a partial fill")
+        let after = try drawn()
+        let expected = reduceMotion ? "pending" : "solid"
+        #expect(after.low == expected && after.top == expected,
+                "past the deadline, still queued: solid to the top with motion, pending under Reduce Motion")
     }
 
     @Test("In a mounted chat under Reduce Motion, the bubble turns solid when the outbox row records the send (observed from the database)")
