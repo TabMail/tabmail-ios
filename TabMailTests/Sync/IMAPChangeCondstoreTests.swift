@@ -288,17 +288,16 @@ struct IMAPChangeCondstoreTests {
 
     /// One real foreground pass (`SyncEngine.sync`): the change read, the
     /// listings it needs, and the baseline commit that alone turns tracking on
-    /// (`commitChangeBaseline`). The recent-sync throttle is cleared so the pass
-    /// runs; `listing` also makes the scheduled full sync due. The pass starts
+    /// (`commitChangeBaseline`). `listing` makes the scheduled full sync due.
+    /// The pass starts
     /// the account's background backfill (`SyncEngine.startBackfill`), whose walk
     /// and catch-up would reach the same server at a moment the test does not
     /// choose; the pass stops it before it starts, and a test that needs the
     /// catch-up runs it itself (`catchUp`).
     static func foregroundPass(_ w: E.World, listing: Bool = false) async throws {
         let id = w.account.id
-        try await w.pool.write { db in
-            try db.execute(sql: "UPDATE account SET lastSyncedAt = NULL WHERE id = ?", arguments: [id])
-            if listing {
+        if listing {
+            try await w.pool.write { db in
                 try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [id])
             }
         }

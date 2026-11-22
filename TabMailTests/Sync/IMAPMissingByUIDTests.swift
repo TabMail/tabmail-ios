@@ -170,9 +170,6 @@ struct IMAPMissingByUIDTests {
         func foregroundSync() async throws {
             await AccountManager.shared.clearRecentlyCompletedForTesting()
             let accountId = accountId
-            try await pool.write { db in
-                try db.execute(sql: "UPDATE account SET lastSyncedAt = NULL WHERE id = ?", arguments: [accountId])
-            }
             _ = try? await engine.sync(account: try account())
             // `SyncEngine.sync` ends by starting the account's backfill worker
             // (`startBackfill`), whose walk and catch-up would run beside the

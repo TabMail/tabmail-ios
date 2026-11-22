@@ -121,3 +121,35 @@ Tests: `SyncTurnsForResetTests` (sorted order: a reset queued on the lower id ho
 higher; every turn released on a throw), `IMAPMissingByUIDTests.resetDuringASliceIsNeverUndone` (both
 entry points: a reset issued while a slice is in flight leaves no pre-reset pick inserted and no
 pre-reset progress kept). Cancelling the running pass is not done (tabmail-ios#1118).
+
+**Amended 2026-11-22 (tabmail-ios #1275): no recent-sync skip; the two clocks gate the pass.** A
+foreground pass is gated by the account's two persisted clocks and nothing else. It always reads changes
+(the change read stamps `lastSyncedAt`), then runs the full sync when `lastFullSyncAt` on the turn-start
+row is `fullSyncInterval` old or more, or NULL, or when the change read needs a listing; the order inside
+the pass (change read, then full sync) is unchanged. The 15-second recent-sync check on `lastSyncedAt` is
+deleted. Why: item 2 moved that check onto the fresh row, which also carries the stamp of a change read
+that has just run. Every foreground return runs a background delta (`SyncScheduler.syncStartup`, then
+`backgroundPoll`) before its poll's foreground pass, and pull to refresh runs one too
+(`AccountManager.syncFolders`), so the poll's pass found the account synced moments ago and returned
+before the full-sync-due decision. A due full sync then ran only when the app stayed open for a whole poll
+interval (`SyncConfig.foregroundPollIntervalSeconds`); on the caller's copy (before item 2) the stamp
+predated the change read and it ran. The check is not needed: passes of an account take turns (item 1),
+so a pass that follows another repeats only a change read that finds nothing, and never a full sync the
+other recorded (it reads `lastFullSyncAt` at its turn's start, item 2). Cost accepted: a foreground
+return now runs the change read twice per account (the background delta, then the poll's pass), as it
+did before item 1 when the two ran at the same time; the fix for that cost is the trigger shape (one gated
+pass per account per trigger), never a time skip. A pass behind one whose full sync was not recorded (a
+dropped folder or an unproven listing, #755) runs the full sync again, as every waiting pass did on the
+caller's copy. The epoch rebuild's and Settings' resyncs, which clear `lastFullSyncAt`, always run their
+full sync. `lastSyncedAt` is still written by every change read and full sync, and is shown in the
+account's Settings. Superseded wording, kept: in item 2, "and the 15-second recent-sync check
+(`lastSyncedAt`)"; in item 3, "the 15-second recent-sync check (now on the fresh row, item 2)"; in the
+Consequence, "A foreground pass that waited behind one that has just synced skips (the 15-second check)",
+"unless its turn starts within 15 seconds of another pass's sync (the recent-sync check), in which case the
+full sync stays due and the next foreground pass runs it", and in its test list "and a waiting foreground
+pass then skips rather than sync again" (it now runs its change read and no second full sync). Tests:
+`OneSyncAtATimeTests.passRightAfterAChangeRead` (right after a background delta stamped the account, the
+foreground pass reads changes, and runs the full sync when it was never run or ran an hour ago, and not
+when it ran a minute ago), `secondPassWaitsForTheFirst` (either second pass runs its change read after the
+first pass's full sync, and no second full sync). The test helpers that cleared `lastSyncedAt` to get past
+the check no longer do.

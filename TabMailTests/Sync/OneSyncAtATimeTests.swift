@@ -15,7 +15,9 @@ import Testing
 /// at a time, in arrival order, and the turn is per account. A pass never acts on
 /// account sync state its caller read before its turn: a pass that waited never
 /// clears or overwrites a cursor a pass ahead of it wrote, and never runs a full
-/// sync that pass already ran.
+/// sync that pass already ran. A foreground pass is gated by the account's two
+/// clocks alone: it reads changes, and runs the full sync whenever it is due, even
+/// right after a change read.
 ///
 /// The first two drive production `SyncEngine.sync(account:)` and
 /// `SyncEngine.backgroundDeltaSync(account:)` end to end on `FakeHTTP` with a
@@ -160,10 +162,10 @@ struct OneSyncAtATimeTests {
     }
 
     /// RED on main: the work queue let the first pass's full sync run while the
-    /// second pass's delta was in flight. A background delta then runs its delta;
-    /// a foreground pass finds, on the row as it is when its turn starts, that the
-    /// first pass synced moments ago, and runs neither a delta nor a second full
-    /// sync (RED while it decided on its caller's copy).
+    /// second pass's delta was in flight. Either second pass then runs its delta,
+    /// after the first pass's full sync; a foreground pass finds, on the row as it
+    /// is when its turn starts, that the first pass recorded its full sync, and
+    /// runs no second one (RED while it decided on its caller's copy).
     @Test("A second pass waits until the first pass's full sync is done", arguments: SecondPass.allCases)
     func secondPassWaitsForTheFirst(second: SecondPass) async throws {
         try await Self.withAppDB { pool in
@@ -202,13 +204,8 @@ struct OneSyncAtATimeTests {
             let seen = wire.snapshot
             #expect(!seen.overlapped, "a delta and a full sync of one account were in flight together")
             #expect(seen.listingRequests == 1, "the first pass ran the full sync, and only it")
-            switch second {
-            case .backgroundDelta:
-                #expect(seen.historyRequests == 2, "both passes must run their delta (none is skipped or joined)")
-                #expect(seen.historyAfterFirstListing, "the second pass's delta must start after the first pass's full sync")
-            case .foreground:
-                #expect(seen.historyRequests == 1, "a pass that waited behind a pass that has just synced syncs again")
-            }
+            #expect(seen.historyRequests == 2, "both passes must run their delta (none is skipped or joined)")
+            #expect(seen.historyAfterFirstListing, "the second pass's delta must start after the first pass's full sync")
             await engine.remove(accountId: Self.accountId)
         }
     }
@@ -353,6 +350,74 @@ struct OneSyncAtATimeTests {
 
             #expect(wire.snapshot.historyStarts == ["1500"], "the delta must run from the stored cursor")
             #expect(wire.snapshot.listingRequests == 1, "the full sync the row says is due did not run")
+            await engine.remove(accountId: Self.accountId)
+        }
+    }
+
+    /// When the account's last full sync ran, as the foreground pass finds it.
+    enum LastFullSync: String, CaseIterable, Sendable {
+        /// Cleared: a release boundary, the epoch rebuild or Settings' resync.
+        case never
+        /// Longer ago than the full-sync interval.
+        case anHourAgo
+        /// Within the interval: no full sync is due.
+        case aMinuteAgo
+
+        var date: Date? {
+            switch self {
+            case .never: nil
+            case .anHourAgo: Date().addingTimeInterval(-3600)
+            case .aMinuteAgo: Date().addingTimeInterval(-60)
+            }
+        }
+    }
+
+    /// RED on main: every foreground return runs a change read (the background
+    /// delta) before its poll, and that read stamps `lastSyncedAt`, so the poll's
+    /// foreground pass found the account synced moments ago and returned before
+    /// the full sync that was due. The pass is gated by the two clocks alone: it
+    /// reads changes, and runs the full sync when `lastFullSyncAt` says it is due.
+    @Test("A pass right after a change read reads changes and runs the full sync when due",
+          arguments: LastFullSync.allCases)
+    func passRightAfterAChangeRead(lastFullSync: LastFullSync) async throws {
+        try await Self.withAppDB { pool in
+            let anHourAgo = Date().addingTimeInterval(-3600)
+            let account = try Self.makeAccount(pool: pool, lastFullSyncAt: lastFullSync.date, lastSyncedAt: anHourAgo)
+            try await pool.write { db in
+                _ = try Account.filter(Column("id") == Self.accountId)
+                    .updateAll(db, Column("lastHistoryId").set(to: "1500"))
+            }
+            let wire = CursorWire()
+            let scenario = Self.cursorScenario(wire: wire, parkFirstListing: false)
+            defer { scenario.close() }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+            let engine = await Self.engine(provider: provider)
+
+            // The change read a foreground return runs before its poll.
+            _ = try await engine.backgroundDeltaSync(account: account)
+            let afterRead = try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) }
+            let stampedJustNow = afterRead?.lastSyncedAt.map { Date().timeIntervalSince($0) < 15 } == true
+            #expect(stampedJustNow, "precondition: the change read stamped the account just now")
+            #expect(wire.snapshot.historyStarts == ["1500"], "precondition: the change read ran from the stored cursor")
+            #expect(wire.snapshot.listingRequests == 0, "precondition: the change read runs no full sync")
+
+            // The poll's foreground pass.
+            _ = try await engine.sync(account: account)
+
+            let afterPass = try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) }
+            #expect(wire.snapshot.historyStarts == ["1500", "2001"],
+                    "the pass must read changes from the cursor the change read left")
+            switch lastFullSync {
+            case .never, .anHourAgo:
+                let recorded = afterPass?.lastFullSyncAt.map { Date().timeIntervalSince($0) < 15 } == true
+                #expect(wire.snapshot.listingRequests == 1, "the due full sync did not run after the change read")
+                #expect(recorded, "the due full sync was not recorded as run")
+            case .aMinuteAgo:
+                let unmoved = afterPass?.lastFullSyncAt == afterRead?.lastFullSyncAt
+                #expect(wire.snapshot.listingRequests == 0, "a full sync ran that was not due")
+                #expect(unmoved, "the last full sync time moved")
+            }
             await engine.remove(accountId: Self.accountId)
         }
     }

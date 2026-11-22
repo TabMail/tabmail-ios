@@ -732,12 +732,6 @@ struct ListingCountersTests {
             let first = try Self.fullSyncStamp(w)
             #expect(first != nil, "the first pass's full sync is stamped")
             for pass in 2...3 {
-                // Each pass really runs: no early return through the short
-                // repeat-sync guard on `lastSyncedAt`.
-                let id = w.account.id
-                try await w.pool.write { db in
-                    try db.execute(sql: "UPDATE account SET lastSyncedAt = NULL WHERE id = ?", arguments: [id])
-                }
                 let before = w.server.recordedCommands().count
                 _ = try await w.engine.sync(account: try Self.account(w))
                 #expect(w.server.recordedCommands().count > before, "pass \(pass) reached the server")
@@ -777,10 +771,6 @@ struct ListingCountersTests {
             #expect(held.uids == ["1", "2"], "nothing listed, nothing removed")
             #expect(held.folder.totalCount == 2 && held.folder.lastKnownUidNext == 3, "its counters stay unwritten")
             for pass in 2...3 {
-                let id = w.account.id
-                try await w.pool.write { db in
-                    try db.execute(sql: "UPDATE account SET lastSyncedAt = NULL WHERE id = ?", arguments: [id])
-                }
                 let before = w.server.recordedCommands().count
                 _ = try await w.engine.sync(account: try Self.account(w))
                 #expect(w.server.recordedCommands().count > before, "pass \(pass) reached the server")
@@ -1079,10 +1069,6 @@ struct ListingCountersTests {
             #expect(try w.uids() == ["1", "2"], "precondition: the Inbox listing proved its window")
             #expect(try Self.fullSyncStamp(w) == nil, "the pass's unproven refresh withholds its stamp although the full sync's listings proved")
 
-            let id = w.account.id
-            try await w.pool.write { db in
-                try db.execute(sql: "UPDATE account SET lastSyncedAt = NULL WHERE id = ?", arguments: [id])
-            }
             _ = try await w.engine.sync(account: try Self.account(w))
             #expect(try Self.fullSyncStamp(w) != nil, "a later pass with every listing proven stamps")
         }

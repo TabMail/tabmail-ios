@@ -723,14 +723,13 @@ actor SyncEngine {
             return false
         }
 
-        // Skip if this account was synced very recently — prevents redundant syncs
-        // from overlapping callers (RootView.task, SyncScheduler, InboxViewModel).
-        // Read from the row as it is now, so a pass that waited behind one that
-        // has just synced skips too.
-        if let lastSync = account.lastSyncedAt, Date().timeIntervalSince(lastSync) < 15 {
-            BackgroundSyncLogger.logDebug("[Sync] Skipping \(account.emailAddress) — synced \(Int(Date().timeIntervalSince(lastSync)))s ago")
-            return false
-        }
+        // No recent-sync skip: the two persisted clocks gate the pass. It always
+        // reads changes, and runs the full sync when `lastFullSyncAt` says it is
+        // due or the read needs a listing (step 2). Passes of an account take
+        // turns (`oneSyncAtATime`), so one that follows another only repeats a
+        // change read that finds nothing, and never a full sync the other
+        // recorded. A skip on `lastSyncedAt`, which every change read stamps,
+        // swallowed due full syncs (#1275).
 
         defer {
             Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
