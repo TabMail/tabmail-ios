@@ -1260,7 +1260,8 @@ on the re-drive.
      asks, because the access writes through the shared engine and database, not a test's own pool.
    The trigger is not `syncFolderMessages`, the place the issue first proposed: that route also serves
    the post-send Sent listing and step 6 of the epoch rebuild, which are not user actions in the folder.
-3. **The access catch-up run** (`SyncEngine.startAccessCatchUp`): one per account, detached; folders that
+3. **The access catch-up run** (`SyncEngine.startAccessCatchUp`): one per account, on its own task (an
+   unstructured task, as the older-mail worker's), never awaited by the caller; folders that
    arrive while it runs are taken by its next run. Each run is `runCatchUpRun` with
    `CatchUpRun.accessedFolderIds`: it asks only those folders (the syncable ones among them, so a folder
    whose mark did not land is not asked), under the account's turn and slice pacing like every slice,
@@ -1313,12 +1314,15 @@ read and catch-up from then on. The set only grows; a folder the user stops usin
 Limits (each recovers through the ordinary schedule, because the folder is followed from then on):
 - An access that comes inside an open slice window waits for it (at most `catchUpSliceIntervalSeconds`).
 - A visit shorter than the folder view's start delay before its sync is not an access: no sync starts,
-  so the folder is not marked.
+  so the folder is not marked. This is on purpose: the mark is never cleared, so a folder tapped by
+  mistake and left at once is not followed for good.
 - An access with no change evidence waits for the ordinary schedule: on Outlook a first access by a
   drained action or a message open waits until the change read baselines the folder (decision 5); on IMAP
   with no mod-sequences, a flag change made elsewhere below the newest listing within an hour of the last
-  completed listing waits for the next access after that hour, or the daily check, and so does a message
-  open or a move's source whose counters did not move; a tracked folder's changes wait for its next change
+  completed listing waits for the next access after that hour, or the daily check; a message open, and
+  the source of a drained move, archive or delete (which the drain does not list), compare the counters
+  the folder's last listing stored, so a change made elsewhere since then waits for the folder's next
+  open (whose listing refreshes them), the next access after the hour, or the daily check; a tracked folder's changes wait for its next change
   read; a listing that throws ends that run.
 - A message whose body is still queued (the poll path: a background body queue, cancelled reads, an
   address the provider is blocking) starts its access when the load hands over to the poll, so the poll's
@@ -1327,7 +1331,10 @@ Limits (each recovers through the ordinary schedule, because the folder is follo
 - Rare timing windows where one action's mark is missed (an app kill between a drained action's commit
   and its mark, which also spans the post-drain listings; a retirement replay committed while offline,
   whose drain stops at the connectivity check before the mark; a message load cancelled during its first
-  read): the next action in the folder marks it (#1263).
+  read): the next action in the folder marks it (#1263). The same issue holds a window where an
+  account is removed and registered again under the same id while its old engine state is torn down:
+  the teardown can cancel the new registration's access run; the marks stay, and the ordinary catch-up
+  reconciles the folders.
 - Following widens two existing limits to followed folders: a Gmail label's re-read overflow cut in a
   syncable label drops the retry for a label set the catch-up never replaces (#1268); Outlook reads
   tracking folders before baselines every pass, so with many synced folders a new followed folder can
@@ -1338,14 +1345,16 @@ Limits (each recovers through the ordinary schedule, because the folder is follo
 
 Tests: `FollowedFolderTests` (`FollowedFolderMarkTests`: the mark, the order, the access plan: moved
 counters list with or without a MODSEQ pair, the age rule only without one, including a missing fresh
-MODSEQ; `FollowedFolderIMAPTests`: the wire oracle for opening the folder, a move into it and a move out
-of it (a folder already followed and checked), and opening one of its messages, on a server with no
-mod-sequences and on a QRESYNC server, each against the scenario's expected server and device state with
-no mutating command in the followed folder but the action's own, each run asking only the accessed
+MODSEQ; a state stored before the counters existed decodes with none and its next access lists the
+folder; `FollowedFolderIMAPTests`: the wire oracle for opening the folder, a move into it, taking a
+message out of it by a move, an archive or a delete (each following the folder and the destination, the
+message held once in the destination on both sides), and opening one of its messages, on a server with
+no mod-sequences and on a QRESYNC server, each against the scenario's expected server and device state,
+the action's own `UID MOVE` the only change sent to the server, each run asking only the accessed
 folders and a quiet re-open listing nothing, the message's body requested before any catch-up slice, a
-second access during a run taken by the next run (and never asked alone), an open while offline that
-still follows the folder, and a completion that keeps the counters its listing started from across
-slices; `FollowedFolderOutlookTests`: through the production change read, the gated access sends no
+second access during a run taken by the next run (and never asked alone, with a pause between the
+handovers), an open while offline that still follows the folder, and a completion that keeps the
+counters its listing started from across slices; `FollowedFolderOutlookTests`: through the production change read, the gated access sends no
 request for the folder and writes no listing, then the baseline, then the listing),
 `ReleaseBoundaryRecheckTests.applyOverflowInAFollowedFolderArmsTheCatchUp` (the first ids are kept),
 `FolderIsFollowedMigrationTests`, `ListingRouteFenceTests.followMarkHasOneWriter` (every production

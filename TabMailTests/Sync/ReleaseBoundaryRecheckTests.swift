@@ -795,7 +795,9 @@ struct ReleaseBoundaryRecheckTests {
             let stored = try await w.pool.read { db in try Folder.fetchOne(db, key: customId) }
             let followed = try #require(stored, "precondition: the folder is stored")
             #expect(SyncEngine.isSyncable(followed), "precondition: the catch-up checks a followed folder")
-            let ids = (0...SyncConfig.changeRecheckLimit).map { "fo-\($0)" }
+            // Fixed width: the cut keeps a pass's new ids in their sorted order,
+            // so the first ids by number are the first by sort.
+            let ids = (0...SyncConfig.changeRecheckLimit).map { String(format: "fo-%04d", $0) }
 
             let result = try await w.pool.write { db in
                 try SyncEngine.applyFolderChanges(FolderChanges(folderId: customId, status: .tracked, rereadLater: ids), db: db)

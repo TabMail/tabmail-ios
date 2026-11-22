@@ -122,6 +122,37 @@ struct FollowedFolderMarkTests {
         // A first listing records the counters it starts from.
         #expect(P.catchUpPlan(state: nil, freshModSeq: nil, now: now, counters: counters) == list(counters))
     }
+
+    @Test("A catch-up state stored before the counters were recorded decodes with none; its listing resumes, and once one completes with none the next access lists the folder")
+    func stateStoredWithoutCountersDecodes() throws {
+        typealias Counters = IMAPCatchUpState.Counters
+        let counters = Counters(exists: 118, uidNext: 121)
+        let now = Date()
+        var written = IMAPCatchUpState(epoch: 1, completionStamp: 9, lastCompletedAt: now, completionCounters: counters)
+        written.listing = .init(firstStamp: 9, firstCounters: counters, nextUid: 5)
+        // The same state as an older build stored it: no counters, in the state or its listing.
+        let raw = try #require(written.encoded())
+        let parsed = try JSONSerialization.jsonObject(with: Data(raw.utf8))
+        var object = try #require(parsed as? [String: Any])
+        var listingObject = try #require(object["listing"] as? [String: Any])
+        object.removeValue(forKey: "completionCounters")
+        listingObject.removeValue(forKey: "firstCounters")
+        object["listing"] = listingObject
+        let olderData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = IMAPCatchUpState.decode(String(decoding: olderData, as: UTF8.self))
+        let older = try #require(decoded, "a state stored before the counters decodes")
+        let inProgress = try #require(older.listing, "with its listing in progress")
+        #expect(older.completionCounters == nil && inProgress.firstCounters == nil)
+        #expect(older.completionStamp == 9 && inProgress.firstStamp == 9 && inProgress.nextUid == 5, "the rest is kept")
+
+        let resumed = IMAPProvider.catchUpPlan(state: older, freshModSeq: 9, now: now, counters: counters, accessed: true)
+        #expect(resumed == .list(inProgress), "the listing in progress resumes where it was")
+        var completed = older
+        completed.listing = nil
+        let next = IMAPProvider.catchUpPlan(state: completed, freshModSeq: 9, now: now, counters: counters, accessed: true)
+        #expect(next == .list(.init(firstStamp: 9, firstCounters: counters, nextUid: 1)),
+                "a completion with no counters recorded: the next access lists the folder, recording them")
+    }
 }
 
 // MARK: - IMAP, end to end
@@ -162,6 +193,34 @@ struct FollowedFolderIMAPTests {
     /// How long (in 50 ms polls) a message's body request waits for an access
     /// run that may have started with the open: 2 s.
     static let bodyRequestPolls = 40
+    /// The pause between two accesses handed over during a run.
+    static let handoverGap = Duration.milliseconds(200)
+    /// The role folders an archive and a delete move a message to.
+    static let archivePath = "Archive"
+    static let trashPath = "Trash"
+
+    /// A user action that takes a message out of the folder.
+    enum Action: String, CaseIterable, Sendable {
+        case move, archive, delete
+
+        /// Where the message lands.
+        var destination: String {
+            switch self {
+            case .move: "INBOX"
+            case .archive: FollowedFolderIMAPTests.archivePath
+            case .delete: FollowedFolderIMAPTests.trashPath
+            }
+        }
+
+        @MainActor
+        func perform(_ message: MessageHeader) async {
+            switch self {
+            case .move: await AccountManager.shared.move([message], to: destination)
+            case .archive: _ = await AccountManager.shared.archive([message])
+            case .delete: await AccountManager.shared.delete([message])
+            }
+        }
+    }
 
     enum Server: String, CaseIterable, Sendable {
         /// No CONDSTORE: no change read; the access check compares counters.
@@ -215,6 +274,8 @@ struct FollowedFolderIMAPTests {
         let recorder = SliceRecorder()
         var folderId: String { "\(accountId):\(FollowedFolderIMAPTests.path)" }
         var inboxId: String { "\(accountId):INBOX" }
+        /// The id of the account's folder at `path`.
+        func idOfFolder(_ path: String) -> String { "\(accountId):\(path)" }
 
         /// Installs the account engine's slice hook: each slice is recorded,
         /// then `action` runs, and the slice waits for it.
@@ -318,11 +379,18 @@ struct FollowedFolderIMAPTests {
 
         /// The same property against the scenario itself (`changeBelowTheNewest`),
         /// not the server's current state: exactly the messages the other client
-        /// left, one row each, with the read and flag state it set, on the device
-        /// and still on the server; and the open sent the server no change.
-        func expectScenarioReconciled(_ label: String, sourceLocation: SourceLocation = #_sourceLocation) throws {
+        /// left (plus the UIDs `plus` that an action moved in, less the UIDs
+        /// `minus` it moved out), one row each, with the read and flag state the
+        /// other client set, on the device and still on the server; and the only
+        /// change sent to the server is the action's own `UID MOVE` (`move`: the
+        /// UID it moved, from the mailbox it was in), or none for an open.
+        func expectScenarioReconciled(
+            _ label: String, plus: [Int] = [], minus: [Int] = [], move: (uid: Int, from: String)? = nil,
+            sourceLocation: SourceLocation = #_sourceLocation
+        ) throws {
             let t = FollowedFolderIMAPTests.self
-            let expected = Set(t.serverUIDs).subtracting(t.deleted).subtracting(t.movedAway).sorted()
+            let expected = Set(t.serverUIDs).subtracting(t.deleted).subtracting(t.movedAway)
+                .subtracting(minus).union(plus).sorted()
             let held = try local()
             let heldUIDs = held.keys.sorted()
             let folderId = folderId
@@ -342,8 +410,24 @@ struct FollowedFolderIMAPTests {
                 let flagged = server.flags(in: t.path, uid: uid).contains("\\Flagged")
                 #expect(isFlagged == true && flagged, "\(label): \(uid), flagged elsewhere, is flagged here and there", sourceLocation: sourceLocation)
             }
-            let mutating = mutatingCommands()
-            #expect(mutating.isEmpty, "\(label): an open changes nothing on the server: \(mutating)", sourceLocation: sourceLocation)
+            let changes = server.recordedCommandsWithMailbox().filter { Self.isMutating($0.command) }
+            let sent = changes.map(\.command)
+            if let move {
+                let prefix = "UID MOVE \(move.uid) "
+                let onlyTheMove = changes.count == 1
+                    && changes.allSatisfy { $0.mailbox == move.from && $0.command.uppercased().hasPrefix(prefix) }
+                #expect(onlyTheMove, "\(label): the action's move is the only change sent to the server: \(sent)", sourceLocation: sourceLocation)
+            } else {
+                #expect(sent.isEmpty, "\(label): an open changes nothing on the server: \(sent)", sourceLocation: sourceLocation)
+            }
+        }
+
+        /// The device's rows for the message `rfc` in the folder `folderId`.
+        func rows(rfc822MessageId rfc: String, in folderId: String) throws -> Int {
+            try pool.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader WHERE folderId = ? AND rfc822MessageId = ?",
+                                 arguments: [folderId, rfc]) ?? 0
+            }
         }
 
         func expectFollowed(_ folderIds: [String], _ label: String, sourceLocation: SourceLocation = #_sourceLocation) throws {
@@ -422,6 +506,8 @@ struct FollowedFolderIMAPTests {
         let mailboxes: [String: [FakeIMAPServer.Message]] = [
             "INBOX": [message(inboxUID, id: inboxMessage)],
             path: serverUIDs.map { message($0) },
+            archivePath: [],
+            trashPath: [],
         ]
         let server = FakeIMAPServer(capabilities: kind.capabilities, mailboxes: mailboxes)
         for mailbox in mailboxes.keys { server.setUidValidity(epoch, for: mailbox) }
@@ -438,6 +524,10 @@ struct FollowedFolderIMAPTests {
         try FolderEpochTestFixture.insertFolder(accountId: accountId, path: path, role: .custom, pool: pool,
                                                 totalCount: serverUIDs.count, lastKnownUidNext: serverUIDs.count + 1,
                                                 lastKnownUidValidity: epoch)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: archivePath, role: .archive, pool: pool,
+                                                lastKnownUidNext: 1, lastKnownUidValidity: epoch)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: trashPath, role: .trash, pool: pool,
+                                                lastKnownUidNext: 1, lastKnownUidValidity: epoch)
         try FolderEpochTestFixture.insertHeaders(accountId: accountId, path: "INBOX", uids: [inboxUID], pool: pool)
         try FolderEpochTestFixture.insertHeaders(accountId: accountId, path: path, uids: serverUIDs.filter { $0 != neverLoaded }, pool: pool)
         try await pool.write { db in
@@ -535,6 +625,9 @@ struct FollowedFolderIMAPTests {
                 // opened again.
                 guard folderIds == [folderId], !handedOver.set() else { return }
                 await engine.startAccessCatchUp(accountId: accountId, folderIds: [inboxId])
+                // A pause between the two: a second run started beside the one
+                // going would take the Inbox alone meanwhile.
+                try? await Task.sleep(for: Self.handoverGap)
                 await engine.startAccessCatchUp(accountId: accountId, folderIds: [folderId])
             }
             try await w.open()
@@ -640,49 +733,47 @@ struct FollowedFolderIMAPTests {
 
             // Against the scenario itself, not the server's current state: the
             // folder holds what the other client left plus the moved message,
-            // which kept its state (unread, not flagged), and the move sent
-            // nothing while the folder was selected.
-            let t = Self.self
-            let scenario = Set(t.serverUIDs).subtracting(t.deleted).subtracting(t.movedAway)
-            let expected = scenario.union(landed).sorted()
-            let heldUIDs = try w.local().keys.sorted()
-            #expect(w.serverHeld() == expected, "move in: the server holds what the other client left and the moved message")
-            #expect(heldUIDs == expected, "move in: so does the device")
+            // which kept its state (unread, not flagged) on both sides, and the
+            // move, sent from the Inbox, is the only change sent to the server.
+            try w.expectScenarioReconciled("move in", plus: landed, move: (uid: Self.inboxUID, from: "INBOX"))
             if let landedUID = landed.first {
                 let landedFlags = w.server.flags(in: Self.path, uid: landedUID)
+                let landedRow = try w.local()[landedUID]
                 #expect(!landedFlags.contains("\\Seen") && !landedFlags.contains("\\Flagged"),
-                        "move in: the moved message kept its state: \(landedFlags)")
+                        "move in: the moved message kept its state on the server: \(landedFlags)")
+                #expect(landedRow?.isRead == false && landedRow?.isFlagged == false,
+                        "move in: and on the device")
             }
-            let changedInFolder = w.mutatingCommands(in: Self.path)
-            #expect(changedInFolder.isEmpty, "move in: nothing was changed in the folder itself: \(changedInFolder)")
         }
     }
 
-    @Test("A move out of a folder that is not followed reconciles the rest of it, and follows it",
-          arguments: Server.allCases)
+    @Test("A move, archive or delete out of a folder that is not followed reconciles the rest of it, and follows it and the destination",
+          arguments: Server.allCases, Action.allCases)
     @MainActor
-    func movingOutOfTheFolderReconcilesIt(server: Server) async throws {
-        try await Self.withWorld("move-out", server) { w in
+    func takingAMessageOutReconcilesTheFolder(server: Server, action: Action) async throws {
+        try await Self.withWorld("out-\(action.rawValue)", server) { w in
             w.changeBelowTheNewest()
             // One of the folder's newest messages, which its own listing covers.
             let movedUID = 100
             let moving = try w.row(uid: movedUID, in: w.folderId)
             let rfc = "<followed-\(movedUID)@example.com>"
+            let label = "\(action.rawValue) out"
             w.server.expectMutation(rfc822MessageId: rfc)
 
-            await AccountManager.shared.move([moving], to: "INBOX")
+            await action.perform(moving)
             try await w.drain()
             await w.settle()
 
-            let landed = w.server.uids(in: "INBOX", rfc822MessageId: rfc)
-            #expect(landed.count == 1, "setup: the move landed in the server's Inbox: \(landed)")
-            try w.expectFollowed([w.folderId], "move out")
-            try w.expectReconciled("move out")
-            let t = Self.self
-            let expected = Set(t.serverUIDs).subtracting(t.deleted).subtracting(t.movedAway).subtracting([movedUID]).sorted()
-            let heldUIDs = try w.local().keys.sorted()
-            #expect(w.serverHeld() == expected, "move out: the server holds what the other client left, less the moved message")
-            #expect(heldUIDs == expected, "move out: so does the device")
+            let destinationId = w.idOfFolder(action.destination)
+            let landed = w.server.uids(in: action.destination, rfc822MessageId: rfc)
+            #expect(landed.count == 1, "\(label): setup: the message landed on the server: \(landed)")
+            let inDestination = try w.rows(rfc822MessageId: rfc, in: destinationId)
+            let inFolder = try w.rows(rfc822MessageId: rfc, in: w.folderId)
+            #expect(inDestination == 1, "\(label): the device holds it in the destination, once: \(inDestination)")
+            #expect(inFolder == 0, "\(label): and no longer in the folder: \(inFolder)")
+            try w.expectFollowed([w.folderId, destinationId], label)
+            try w.expectReconciled(label)
+            try w.expectScenarioReconciled(label, minus: [movedUID], move: (uid: movedUID, from: Self.path))
         }
     }
 
