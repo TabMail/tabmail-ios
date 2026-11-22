@@ -488,6 +488,13 @@ struct FolderResetGenerationTests {
             #expect(firstRead == onAtStart, "the archived email's read flag follows the value the action read as it started")
         }
 
+        // The first archive's completion protects UID 101 and its Message-ID for 30 s, and the
+        // process-global scope clears that record only when a test starts. The second environment
+        // reuses both, so its resync would skip the replacement; clear the record and the
+        // completion log here, as a new test starts with them.
+        await AccountManager.shared.clearRecentlyCompletedForTesting()
+        AccountManager.shared.clearActionCompletionsForTesting()
+
         // The next confirmation starts with the flipped value.
         try await withEnv(accountId: "frg-sweep-next-\(onAtStart)", shownHasRfc: false, trash: [Self.trashedServerCopy]) { next in
             UserDefaults.standard.set(!onAtStart, forKey: key)
