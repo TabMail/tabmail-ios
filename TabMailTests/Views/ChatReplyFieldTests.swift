@@ -211,14 +211,24 @@ struct ChatReplyFieldTests {
         #expect(Self.count("AIWorkingRule.", in: text) == 4, "no inline copy of the rule")
     }
 
-    @Test("The AI Suggestion's row is the working bubble while the reply is written, then the ghost")
-    func suggestionPhaseWritingThenReady() {
+    @Test("The row's rule is the working bubble while the reply is written, never the ghost")
+    func suggestionPhaseWritingNeverReady() {
         var email = Self.header("w1")
         email.actionTag = .reply
         #expect(Self.phase(email) == .writing, "tagged with no reply yet: Writing")
         email.cachedReply = "Hi Alex,\n\nTuesday works."
         email.replyTextMessage = "Tuesday works"
-        #expect(Self.phase(email) == .ready("Tuesday works"), "the stored reply fills it in")
+        let stored = ChatReplyField.shown(newest: email, usersTurn: false, onlyTo: nil)?.textMessage
+        #expect(stored == "Tuesday works", "control: the stored reply is the ghost the chat shows")
+        #expect(Self.phase(email) == nil, "the stored reply ends Writing; the ghost is the chat's own")
+        // Untagged in the Inbox with an AI source on stays the inbox row's case 2 with its reply
+        // stored; the chat's row still gives no working bubble for it, card open or not.
+        let untagged = Self.header("w2", reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
+        #expect(untagged.actionTag == nil && untagged.isInInbox)
+        let untaggedWorking = AIWorkingRule.isWorking(
+            tagged: false, replyProcessed: true, inInbox: untagged.isInInbox, aiSourceEnabled: true, subscribed: true)
+        #expect(untaggedWorking, "control: the inbox row's rule still counts it as working")
+        #expect(Self.phase(untagged) == nil, "an untagged email with its reply stored: no Writing")
 
         // Nothing where the user cannot use a suggestion.
         var writing = Self.header("w4")
@@ -235,8 +245,10 @@ struct ChatReplyFieldTests {
     func suggestionPhaseNewEmailResetsToWriting() {
         var first = Self.header("n1", minutesAgo: 5, reply: "Hi Alex,\n\nTuesday works.", replyText: "Tuesday works")
         first.actionTag = .reply
-        let shown = Self.phase(first)
-        #expect(shown == .ready("Tuesday works"))
+        #expect(Self.phase(first) == nil, "the row's rule adds no Writing under the ghost")
+        let firstText = ChatReplyField.shown(newest: first, usersTurn: false, onlyTo: nil)?.textMessage
+        #expect(firstText == "Tuesday works", "control: the first email's ghost shows")
+        let shown = ChatSuggestionPhase.ready("Tuesday works")
 
         // The usual arrival: staged before it is tagged.
         var second = Self.header("n2", inReplyTo: first.rfc822MessageId)
@@ -251,8 +263,10 @@ struct ChatReplyFieldTests {
 
         second.cachedReply = "Hi Alex,\n\nSee you then."
         second.replyTextMessage = "See you then"
-        let ready = Self.phase(second)
-        #expect(ready == .ready("See you then"))
+        #expect(Self.phase(second) == nil, "its stored reply ends Writing")
+        let secondText = ChatReplyField.shown(newest: second, usersTurn: false, onlyTo: nil)?.textMessage
+        #expect(secondText == "See you then", "control: its ghost shows")
+        let ready = ChatSuggestionPhase.ready("See you then")
         #expect(ChatSuggestionPhase.fills(from: afterArrival, to: ready), "the working bubble grows into the ghost")
 
         #expect(!ChatSuggestionPhase.fills(from: nil, to: ready), "a ghost with no working bubble before it shows at once")

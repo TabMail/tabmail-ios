@@ -57,18 +57,20 @@ struct ChatReplyField: Equatable {
         return configured
     }
 
-    /// The AI Suggestion's row under the newest email: `.ready` with the ghost's text once the
-    /// reply is stored (`shown`), `.writing` while the AI still works on the email (the
-    /// inbox row's rule, `AIWorkingRule`: tagged with no reply processed, or untagged in the Inbox
-    /// with an AI source on), else nothing. A filtered email's empty-reply sentinel counts as
+    /// The working bubble under the newest email: `.writing` while the AI still works on the email
+    /// (the inbox row's rule, `AIWorkingRule`: tagged with no reply processed, or untagged in the
+    /// Inbox with an AI source on), else nothing. Never `.ready`: the ghost is only the suggestion
+    /// the chat shows (`shown`, gated by "Writing your email" and an open compose card). A stored
+    /// suggestion that `shown` would show without those gates gives no working bubble either, so
+    /// an open card hides the row until it closes. A filtered email's empty-reply sentinel counts as
     /// processed, so it never writes. Keyed by the newest email alone, so a new email that arrives
     /// above a ready ghost, tagged or not yet, puts the row back to `.writing` until its own
     /// suggestion is stored.
     static func suggestionPhase(
         newest: MessageHeader, usersTurn: Bool, onlyTo: [ChatThread.Person]?, aiSourceEnabled: Bool, subscribed: Bool
     ) -> ChatSuggestionPhase? {
-        if let text = shown(newest: newest, usersTurn: usersTurn, onlyTo: onlyTo)?.textMessage { return .ready(text) }
-        guard !usersTurn, onlyTo == nil, !EmailFilter.isNoReply(newest.fromAddress),
+        guard shown(newest: newest, usersTurn: usersTurn, onlyTo: onlyTo) == nil,
+              !usersTurn, onlyTo == nil, !EmailFilter.isNoReply(newest.fromAddress),
               AIWorkingRule.isWorking(tagged: newest.actionTag != nil, replyProcessed: newest.suggestion != nil,
                                       inInbox: newest.isInInbox, aiSourceEnabled: aiSourceEnabled,
                                       subscribed: subscribed) else { return nil }
@@ -470,8 +472,8 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
     }
 }
 
-/// The AI Suggestion's row in the chat (`ChatReplyField.suggestionPhase`): the working bubble while
-/// the AI writes it, then the ghost with its text.
+/// The AI Suggestion's row in the chat: the working bubble while the AI writes it
+/// (`ChatReplyField.suggestionPhase`), then the ghost with its text (`ChatReplyField.shown`).
 enum ChatSuggestionPhase: Equatable {
     case writing
     case ready(String)

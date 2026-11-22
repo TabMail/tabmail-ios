@@ -11,8 +11,8 @@ import GRDB
 /// body, the edit request keeps every recipient's role. A Cc recipient arrives as Cc, never
 /// as To, so the AI does not write the body as if the copied person were a primary addressee.
 ///
-/// The backend call is replaced per task through `EmailComposeTool.inlineEditOverride`, which
-/// receives the exact `ComposeEditContext` the tool built for `performInlineEdit`.
+/// Each tool gets the backend call through its init's `composeEdit:` seam, which receives the
+/// exact `ComposeEditContext` the tool built for `performInlineEdit`.
 @Suite("Compose edit keeps recipient roles")
 @MainActor
 struct ComposeEditRecipientRolesTests {
@@ -43,39 +43,36 @@ struct ComposeEditRecipientRolesTests {
         return router.pendingCompose
     }
 
-    /// Runs `tool` with the backend edit call captured, closes the compose card it opens, and
-    /// returns every edit context the tool built.
+    /// Runs the tool `run` builds with the capturing edit call, closes the compose card it opens,
+    /// and returns every edit context the tool built.
     private func captureEditContexts(
         router: AgentToolRouter,
-        run: @escaping @MainActor () async throws -> String
+        run: @escaping @MainActor (_ composeEdit: @escaping EmailReplyTool.ComposeEdit) async throws -> String
     ) async throws -> [ComposeEditContext] {
         try await captureEditAndRequest(router: router, run: run).contexts
     }
 
     /// The edit contexts the tool built and the To/Cc/Bcc of the compose request it enqueued.
+    /// `run` passes `composeEdit` to the tool's init, the tool's one edit call.
     private func captureEditAndRequest(
         router: AgentToolRouter,
-        run: @escaping @MainActor () async throws -> String
+        run: @escaping @MainActor (_ composeEdit: @escaping EmailReplyTool.ComposeEdit) async throws -> String
     ) async throws -> (contexts: [ComposeEditContext], to: [String], cc: [String], bcc: [String]) {
-        var enqueued: (to: [String], cc: [String], bcc: [String]) = ([], [], [])
         let box = ContextBox()
-        let override: @Sendable (ComposeEditContext, String) async throws -> InlineEditResult = { ctx, _ in
+        let composeEdit: EmailReplyTool.ComposeEdit = { ctx, _, _, _ in
             await box.append(ctx)
             return InlineEditResult(response: nil, subject: "Subject", body: "Body", toDelta: nil, ccDelta: nil, bccDelta: nil, textMessage: nil, changeCommand: nil, raw: "")
         }
-        try await EmailComposeTool.$inlineEditOverride.withValue(override) {
-            let task = Task { @MainActor () -> String in try await run() }
-            guard let req = await waitForPendingCompose(on: router) else {
-                Issue.record("Tool did not open a compose card")
-                task.cancel()
-                _ = try? await task.value
-                return
-            }
-            enqueued = (req.to, req.cc, req.bcc)
-            req.onOutcome(.cancelled)
-            _ = try await task.value
+        let task = Task { @MainActor () -> String in try await run(composeEdit) }
+        guard let req = await waitForPendingCompose(on: router) else {
+            Issue.record("Tool did not open a compose card")
+            task.cancel()
+            _ = try? await task.value
+            return (await box.contexts, [], [], [])
         }
-        return (await box.contexts, enqueued.to, enqueued.cc, enqueued.bcc)
+        req.onOutcome(.cancelled)
+        _ = try await task.value
+        return (await box.contexts, req.to, req.cc, req.bcc)
     }
 
     private static let named: [String: String] = [
@@ -115,9 +112,8 @@ struct ComposeEditRecipientRolesTests {
     @Test("email_compose: To Sam, Cc Pat, Bcc Lee reaches the edit request as To Sam, Cc Pat")
     func composeKeepsCcAsCc() async throws {
         let (ctx, _, _, router) = try makeContext()
-        let tool = EmailComposeTool(context: ctx)
-        let contexts = try await captureEditContexts(router: router) {
-            try await tool.execute(arguments: [
+        let contexts = try await captureEditContexts(router: router) { composeEdit in
+            try await EmailComposeTool(context: ctx, composeEdit: composeEdit).execute(arguments: [
                 "to": .array([.string(Self.primary)]),
                 "cc": .array([.string(Self.copied)]),
                 "bcc": .array([.string(Self.blind)]),
@@ -134,9 +130,8 @@ struct ComposeEditRecipientRolesTests {
     @Test("email_compose: recipient display names reach the edit request with bare addresses")
     func composeKeepsDisplayNames() async throws {
         let (ctx, _, _, router) = try makeContext()
-        let tool = EmailComposeTool(context: ctx)
-        let contexts = try await captureEditContexts(router: router) {
-            try await tool.execute(arguments: [
+        let contexts = try await captureEditContexts(router: router) { composeEdit in
+            try await EmailComposeTool(context: ctx, composeEdit: composeEdit).execute(arguments: [
                 "recipients": .array([.dictionary(["name": .string("Sam Lee"), "email": .string(Self.primary)])]),
                 "cc": .array([.dictionary(["name": .string("Pat Kim"), "email": .string(Self.copied)])]),
                 "request": .string("Ask about moving the offsite to Friday"),
@@ -159,9 +154,8 @@ struct ComposeEditRecipientRolesTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "fwd1", subject: "Offsite")
         await translator.seed(header.id, as: 11)
 
-        let tool = EmailForwardTool(context: ctx)
-        let contexts = try await captureEditContexts(router: router) {
-            try await tool.execute(arguments: [
+        let contexts = try await captureEditContexts(router: router) { composeEdit in
+            try await EmailForwardTool(context: ctx, composeEdit: composeEdit).execute(arguments: [
                 "unique_id": .int(11),
                 "to": .array([.string(Self.primary)]),
                 "cc": .array([.string(Self.copied)]),
@@ -195,15 +189,14 @@ struct ComposeEditRecipientRolesTests {
         try await db.write { db in try updated.update(db) }
         await translator.seed(header.id, as: 12)
 
-        let tool = EmailReplyTool(context: ctx)
         var arguments: [String: JSONValue] = [
             "unique_id": .int(12),
             "request": .string("Say Friday works"),
         ]
         arguments.merge(extraArguments) { _, new in new }
         let finalArguments = arguments
-        return try await captureEditContexts(router: router) {
-            try await tool.execute(arguments: finalArguments)
+        return try await captureEditContexts(router: router) { composeEdit in
+            try await EmailReplyTool(context: ctx, composeEdit: composeEdit).execute(arguments: finalArguments)
         }
     }
 
@@ -258,9 +251,8 @@ struct ComposeEditRecipientRolesTests {
     @Test("email_compose: named To, Cc and Bcc reach the compose card with their names")
     func composeRequestKeepsNames() async throws {
         let (ctx, _, _, router) = try makeContext()
-        let tool = EmailComposeTool(context: ctx)
-        let captured = try await captureEditAndRequest(router: router) {
-            try await tool.execute(arguments: [
+        let captured = try await captureEditAndRequest(router: router) { composeEdit in
+            try await EmailComposeTool(context: ctx, composeEdit: composeEdit).execute(arguments: [
                 "recipients": .array([Self.namedObject(Self.primary)]),
                 "cc": .array([Self.namedObject(Self.copied)]),
                 "bcc": .array([Self.namedObject(Self.blind)]),
@@ -280,9 +272,8 @@ struct ComposeEditRecipientRolesTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "fwd2", subject: "Offsite")
         await translator.seed(header.id, as: 13)
 
-        let tool = EmailForwardTool(context: ctx)
-        let captured = try await captureEditAndRequest(router: router) {
-            try await tool.execute(arguments: [
+        let captured = try await captureEditAndRequest(router: router) { composeEdit in
+            try await EmailForwardTool(context: ctx, composeEdit: composeEdit).execute(arguments: [
                 "unique_id": .int(13),
                 "to": .array([Self.namedObject(Self.primary)]),
                 "cc": .array([Self.namedObject(Self.copied)]),
@@ -315,9 +306,8 @@ struct ComposeEditRecipientRolesTests {
         )
         await translator.seed(header.id, as: 14)
 
-        let tool = EmailReplyTool(context: ctx)
-        let captured = try await captureEditAndRequest(router: router) {
-            try await tool.execute(arguments: [
+        let captured = try await captureEditAndRequest(router: router) { composeEdit in
+            try await EmailReplyTool(context: ctx, composeEdit: composeEdit).execute(arguments: [
                 "unique_id": .int(14),
                 "add_recipients": .array([Self.namedObject(Self.newlyCopied)]),
                 "add_cc": .array([Self.namedObject(Self.copied)]),
@@ -353,9 +343,8 @@ struct ComposeEditRecipientRolesTests {
         await translator.seed(header.id, as: 16)
 
         let mixedCase = "Kim@example.com"
-        let tool = EmailReplyTool(context: ctx)
-        let captured = try await captureEditAndRequest(router: router) {
-            try await tool.execute(arguments: [
+        let captured = try await captureEditAndRequest(router: router) { composeEdit in
+            try await EmailReplyTool(context: ctx, composeEdit: composeEdit).execute(arguments: [
                 "unique_id": .int(16),
                 "add_cc": .array([.dictionary(["name": .string("Kim Cho"), "email": .string(mixedCase)])]),
                 "request": .string("Say Friday works"),
@@ -382,9 +371,8 @@ struct ComposeEditRecipientRolesTests {
         )
         await translator.seed(header.id, as: 15)
 
-        let tool = EmailReplyTool(context: ctx)
-        let captured = try await captureEditAndRequest(router: router) {
-            try await tool.execute(arguments: [
+        let captured = try await captureEditAndRequest(router: router) { composeEdit in
+            try await EmailReplyTool(context: ctx, composeEdit: composeEdit).execute(arguments: [
                 "unique_id": .int(15),
                 "add_recipients": .array([Self.namedObject(Self.primary)]),
                 "request": .string("Say Friday works"),

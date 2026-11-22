@@ -273,7 +273,7 @@ struct MessageRowView: View {
 
 /// "AI is working" on an email (or a thread, through its aggregates), the inbox row's rule. The
 /// inbox row draws case 1 as the tag chip's shimmer and case 2 as its spinner; the chat's AI
-/// Suggestion row shows "Writing" when the newest email meets either (`ChatReplyField.suggestionPhase`).
+/// Suggestion row shows "Writing" when the newest email meets either (`AIWorkingRule`'s `isWorking`).
 /// One rule, so the two never disagree on whether the AI still works on an email.
 enum AIWorkingRule {
     /// Any AI source on: AI not hidden by demo, AI not opted out (or Device Sync adopts the

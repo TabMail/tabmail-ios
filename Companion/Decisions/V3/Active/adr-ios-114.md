@@ -1037,6 +1037,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (`ChatThreadView.shownSuggestion`, `ChatReplyField.shown(writing:cardOpen:)`), and only the working
    bubble comes from `suggestionPhase`. So a suggestion stored while a compose card is open shows no row
    until the card closes, then the ghost at once; while "Writing your email" runs neither shows.
+   *Amended 2026-11-22:* `ChatReplyField.suggestionPhase` itself returns only `.writing` or nothing,
+   never `.ready`; a stored suggestion that `shown` would show without its gates gives no working
+   bubble. Tests: `ChatReplyFieldTests.suggestionPhaseWritingNeverReady` (renamed from
+   `suggestionPhaseWritingThenReady`) and `suggestionPhaseNewEmailResetsToWriting`.
 
 17. **A change asked in the field is a compose edit of the AI Suggestion (amendment 2026-11-18).**
    Every compose returns its email with its text version (the backend's compose prompt, not a
@@ -1099,6 +1103,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      suggestion landing, or the card closing cancels it, and a cancelled one stores nothing and leaves the card alone. So Recompute,
      Discard while it waits, reopen, Recompute again finishing first: the ghost shows the second
      (`AITextMessageCallerTests.supersededRecomputeLosesToTheNewer`).
+     *Amended 2026-11-22:* only the card closing cancels `recomputeTask` (`ComposeView.cardClosed`). A
+     new Recompute or an edit of the suggestion does not cancel it: the compose agent fence
+     (`agentSendFence`) admits Recompute and edits one at a time.
    - **The field's example follows the suggestion (v108).** A reply result and each compose edit
      carry `change_command`, a short command that would change the reply. It is stored with the
      reply as on-device AI cache, the same class as `replyTextMessage` (`v108_addReplyChangeCommand`

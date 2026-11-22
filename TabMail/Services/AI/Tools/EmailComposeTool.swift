@@ -101,13 +101,6 @@ struct EmailComposeTool: AgentTool, Sendable {
 
     // MARK: - Compose Edit (TB Parity)
 
-    /// Per-task replacement for the backend edit call: receives the edit context and
-    /// instruction the tool built (`runComposeEdit`, or the reply tool's own context). Read by
-    /// the agent compose tools' one production edit, `EmailReplyTool.chatComposeEdit`, so it
-    /// reaches the compose, forward and reply tools alike. `@TaskLocal`, so a test's override
-    /// reaches only the tool calls made inside its own `withValue` scope.
-    @TaskLocal static var inlineEditOverride: (@Sendable (ComposeEditContext, String) async throws -> InlineEditResult)?
-
     /// Shared compose edit flow matching TB's `runComposeEdit()`.
     /// Resolves account/prompts, builds `ComposeEditContext`, and calls `performInlineEdit()`.
     /// Used by email_compose (mode "edit_new"), email_reply (mode "edit_reply"),
