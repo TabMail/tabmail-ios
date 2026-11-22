@@ -750,11 +750,8 @@ struct SettingsView: View {
 
     private func archiveOldMessages() async {
         let archiveCutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.archiveAgeDays, to: Date()) ?? Date()
-        let inboxFolderIds = Set(navigationStore.folders.filter { $0.role == .inbox }.map(\.id))
-        guard !inboxFolderIds.isEmpty else { return }
-
-        guard let totalArchived = await Self.archiveOldMessages(
-            inboxFolderIds: inboxFolderIds, archiveCutoff: archiveCutoff) else { return }
+        guard let totalArchived = await Self.archiveOldMessagesAction(
+            folders: navigationStore.folders, archiveCutoff: archiveCutoff) else { return }
 
         BackgroundSyncLogger.logDebug("[ArchiveOld] Archived \(totalArchived) messages older than \(SyncConfig.archiveAgeDays) days")
 
@@ -762,6 +759,25 @@ struct SettingsView: View {
         isLargeInbox = false
         UserDefaults.standard.set(false, forKey: "isLargeInbox")
         oldMessageCount = 0
+    }
+
+    /// What the Archive confirmation runs, from the folders the sidebar lists: it reads the
+    /// mark-as-read setting as it starts and hands that value to the sweep with the inbox
+    /// folders. Returns the sweep's count, or nil when there is no inbox or the sweep attempted
+    /// nothing. `afterRead` is the sweep's test seam; production passes nothing.
+    @MainActor
+    @discardableResult
+    static func archiveOldMessagesAction(
+        folders: [Folder],
+        archiveCutoff: Date,
+        afterRead: () async -> Void = {}
+    ) async -> Int? {
+        // The mark-as-read setting as it stands when the action starts.
+        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
+        let inboxFolderIds = Set(folders.filter { $0.role == .inbox }.map(\.id))
+        guard !inboxFolderIds.isEmpty else { return nil }
+        return await archiveOldMessages(
+            inboxFolderIds: inboxFolderIds, archiveCutoff: archiveCutoff, marksRead: marksRead, afterRead: afterRead)
     }
 
     /// The "Archive old messages" sweep. Returns how many rows it asked to move,
@@ -773,18 +789,17 @@ struct SettingsView: View {
     /// move refuses them instead of acting on the replacement email re-seated
     /// at a row's id. `beforeRead` runs after the stamp and before the read,
     /// `afterRead` once the rows are read; both are test seams for those windows
-    /// and production passes nothing. The mark-as-read setting is read once, as
-    /// the sweep starts, and that value applies to every row it archives.
+    /// and production passes nothing. `marksRead` is the mark-as-read setting the
+    /// caller read when the action started.
     @MainActor
     @discardableResult
     static func archiveOldMessages(
         inboxFolderIds: Set<String>,
         archiveCutoff: Date,
+        marksRead: Bool,
         beforeRead: () async -> Void = {},
         afterRead: () async -> Void = {}
     ) async -> Int? {
-        // The mark-as-read setting as it stands when the action starts.
-        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
         let stamp = FolderResetGeneration.current()
         await beforeRead()
         guard let oldMessages = try? await AppDatabase.dbPool.read({ db in

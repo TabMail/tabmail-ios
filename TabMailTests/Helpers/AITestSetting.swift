@@ -40,3 +40,29 @@ enum AITestSetting {
         return try await body()
     }
 }
+
+/// The subscription gate as a test found it: `AISubscriptionGate.shared`'s open state and checked
+/// bit, and both values it stores. Create it before the test touches the gate and call `restore()`
+/// in a `defer`, so every way out puts all four back (a value that was absent is removed again).
+/// `openGate`/`closeGate` alone cannot do this: both set the checked bit and store it.
+@MainActor
+struct AIGateTestState {
+    private static let keys = ["ai_subscription_last_known_active", "ai_subscription_has_checked_once"]
+
+    private let isActive = AISubscriptionGate.shared.isActive
+    private let hasCheckedOnce = AISubscriptionGate.shared.hasCheckedOnce
+    private let stored: [(key: String, value: Any?)] = AIGateTestState.keys.map {
+        (key: $0, value: UserDefaults.standard.object(forKey: $0))
+    }
+
+    func restore() {
+        AISubscriptionGate.shared.restoreForTesting(isActive: isActive, hasCheckedOnce: hasCheckedOnce)
+        for entry in stored {
+            if let value = entry.value {
+                UserDefaults.standard.set(value, forKey: entry.key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: entry.key)
+            }
+        }
+    }
+}

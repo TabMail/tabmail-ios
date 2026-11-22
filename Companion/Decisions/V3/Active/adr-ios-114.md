@@ -201,6 +201,15 @@ same AI result, kept as long as the email itself is shown.
    deleted. A search result whose header no longer carries the Message-ID it found goes to the chat
    or the detail, which refuse a replaced message. The chat screen and the Reply to sheet dismiss
    the keyboard on a tap outside it (`dismissKeyboardOnTap`, the keyboard dismiss rule).
+   *Amended 2026-11-22:* "AI on" also needs the AI choice. The chat view is on only after the AI
+   choice is made with AI on: `ChatViewConfig.isAIOn` reads `AIService.isAIOff`, the one device AI
+   setting (ADR-IOS-038, amendment 2026-11-19), through `AIConsentPolicy.isDisabled(choiceMade:optedOut:)`,
+   and the views that observe the setting (`MessageRowView`, `ChatViewToggleRow`) pass their observed
+   values to the same rule. With no choice yet the app shows today's email view, as for an
+   opted-out user, and sends no AI request. During a tutorial run, which view opens follows the run
+   (`ChatViewConfig.followingTutorial`, decision 13); the first sentence's "and during the tutorial"
+   no longer holds. Tests: `ChatSummaryQueueTests.chatViewWaitsForTheAIChoice`, `ChatViewToggleRowTests`
+   (`switchFollowsAI`, its `noChoice` case; `rowFollowsTheOptOut`).
    `ChatThreadView` reuses `MessageDetailViewModel` (body, thread load, mark-read; at first also
    archive, delete and move from today's pill menus, which the reply field drops, decision 10); `ChatThread` is the pure model: drafts left out, one copy per `stableId` (the opened copy,
    else one with a text message), oldest first by (date, id), own = from one of the account addresses
@@ -550,6 +559,13 @@ same AI result, kept as long as the email itself is shown.
    `ChatReplyCompose.with`; `make` is gone). Tests:
    `ChatReplyFieldTests.agentReplyThatAddsPeopleIsStillReplyAll`,
    `agentReplyFromTheFieldFollowsTheTarget`, `agentReplyFromTheSheetKeepsItsRecipients`.
+   *Amended 2026-11-22:* containment is judged by mailbox address, read as compose reads its
+   fields (`RecipientEntry`). A `"Name" <address>` recipient counts as its address, compared
+   case-insensitively, wherever it appears (To, Cc, Bcc or several of them). An audience entry with
+   no sendable address counts as its text. Before this, whole strings were compared, so a recipient
+   kept with its name (#1039) did not match the same bare address. Tests:
+   `ChatReplyFieldTests.agentReplyThatMovesSomeoneToCcByNameIsStillReplyAll`,
+   `agentReplyAudienceIsComparedAsComposeReadsIt`.
    **Who a field reply is for travels with its request (2026-11-16, current):** whether a reply was
    asked for in the field, and who was chosen in Reply to, are read once, as the field's send
    starts, and travel with the request (`ChatFieldReply`: `ToolInvocation.fieldReply`, stamped on
@@ -785,6 +801,16 @@ same AI result, kept as long as the email itself is shown.
    switch; the edit is "Make it shorter"; the template is "Event RSVP: yes"; compose keeps its Use
    Suggestion step; no attachment chip is seeded for the agenda; the Reply tag opens the chat in
    general, not only in the tutorial.
+   *Amended 2026-11-22:* the tour reads only the opt-out (`TutorialCoordinator.chatViewOnForTutorial`,
+   with Chat View on), not the AI choice, so a tour started before the AI choice teaches the chat
+   view. It is a scripted demo that sends no AI request and touches no mail of the user's. While a
+   run is active, four things follow the run's `teachesChat` through one gate,
+   `ChatViewConfig.followingTutorial`: which view opens (`opensInChat`), the summary at Send
+   (`SentEmailSummary.mayRun`, through `opensInChat`), the inbox rows
+   (`MessageRowView.chatViewActive`) and the Enable Chat View switch (`ChatViewToggleRow`). Outside
+   a run they follow the live setting. The tour never records an AI choice. Tests:
+   `TutorialChatViewRunTests` (`runBeforeTheAIChoice`, `openBeforeTheAIChoice`,
+   `classicRunStaysClassic`, `summaryAtSendFollowsTheRun`).
 
 14. **One TabMail chat per thread (amendment 2026-11-16).** An email's TabMail chat belongs to its
    thread, with the chat view on or off. Decided 2026-11-16: "per-mail chat sessions now should be

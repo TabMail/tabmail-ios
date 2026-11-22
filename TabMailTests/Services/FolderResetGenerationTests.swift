@@ -83,12 +83,12 @@ struct FolderResetGenerationTests {
 
     private func makeEnv(
         accountId: String, shownHasRfc: Bool = true, writeFailure: OneShotWriteFailure? = nil,
-        archive: [FakeIMAPServer.Message] = []
+        archive: [FakeIMAPServer.Message] = [], trash: [FakeIMAPServer.Message] = []
     ) throws -> Env {
         let server = FakeIMAPServer(mailboxes: [
             "INBOX": [FakeIMAPServer.makeMessage(uid: Self.uid, rfc822Text: Self.rfc822(messageId: Self.replacementRfc))],
             "Archive": archive,
-            "Trash": [],
+            "Trash": trash,
         ])
         for path in ["INBOX", "Archive", "Trash"] { server.setUidValidity(Self.newEpoch, for: path) }
         try server.start()
@@ -142,12 +142,13 @@ struct FolderResetGenerationTests {
     }
 
     /// Runs `body` in a new environment and awaits `finish` on every way out, a throw included,
-    /// so a failed reset or wire check never leaves the installed database, the fake server or
-    /// the setting behind for the next test.
+    /// so a failed reset or wire check never leaves the installed database or the fake server
+    /// behind for the next test.
     private func withEnv(
-        accountId: String, shownHasRfc: Bool = true, _ body: (Env) async throws -> Void
+        accountId: String, shownHasRfc: Bool = true, trash: [FakeIMAPServer.Message] = [],
+        _ body: (Env) async throws -> Void
     ) async throws {
-        let env = try makeEnv(accountId: accountId, shownHasRfc: shownHasRfc)
+        let env = try makeEnv(accountId: accountId, shownHasRfc: shownHasRfc, trash: trash)
         do {
             try await body(env)
         } catch {
@@ -363,7 +364,6 @@ struct FolderResetGenerationTests {
     func archiveOldSweepAcrossAResetNeverMutatesTheReplacement(reset: SweepReset, markReadOnArchive: Bool) async throws {
         // No Message-ID on the swept row: only the reset itself tells the rows apart.
         let env = try makeEnv(accountId: "frg-sweep-\(reset)-\(markReadOnArchive)", shownHasRfc: false)
-        UserDefaults.standard.set(markReadOnArchive, forKey: AccountManager.markReadOnArchiveDeleteKey)
         clearOverlay()
         if reset == .beforeSweep {
             try await runReset(env)
@@ -373,7 +373,7 @@ struct FolderResetGenerationTests {
         env.server.expectMutation(rfc822MessageId: refused ? Self.shownRfc : Self.replacementRfc)
         let cutoff = Date().addingTimeInterval(3600)
         let swept = await SettingsView.archiveOldMessages(
-            inboxFolderIds: [env.inboxFolderId], archiveCutoff: cutoff,
+            inboxFolderIds: [env.inboxFolderId], archiveCutoff: cutoff, marksRead: markReadOnArchive,
             beforeRead: { if reset == .beforeRead { try? await self.runReset(env) } },
             afterRead: { if reset == .afterRead { try? await self.runReset(env) } })
         #expect(swept == 1, "fixture: the sweep did not read the old row")
@@ -401,50 +401,106 @@ struct FolderResetGenerationTests {
         await finish(env)
     }
 
-    /// One sweep on a stable folder (its reset ran before the sweep, so nothing refuses the move),
-    /// archived to the fake server; returns whether the archived copy is read (`\Seen`) there. The
-    /// sweep is the Settings action's own entry, which reads Mark as Read on Archive once, as it
-    /// starts; `afterRead` runs between its read and its mark-read and move.
-    private func sweepStableFolder(_ env: Env, afterRead: () async -> Void = {}) async throws -> Bool {
+    /// An old unread email in Trash, on the device and on the server (`trashedServerCopy`, for
+    /// `withEnv`'s `trash`): "Archive old messages" archives the inbox's old mail only, so this one
+    /// stays in Trash, unread.
+    private static let trashedUid = 55
+    private static let trashedRfc = "trashed-55@example.com"
+    private static var trashedServerCopy: FakeIMAPServer.Message {
+        FakeIMAPServer.makeMessage(uid: trashedUid, rfc822Text: rfc822(messageId: trashedRfc))
+    }
+
+    /// One Archive confirmation on a stable folder (its reset ran before, so nothing refuses the
+    /// move), run as the Archive button runs it (`SettingsView.archiveOldMessagesAction`) on the
+    /// account's folders as the sidebar lists them: an inbox holding the old row, Archive, and
+    /// Trash holding an old unread email (the environment's server Trash must hold
+    /// `trashedServerCopy`). The inbox's email is archived to the fake server and the Trash one is
+    /// left as it was; returns whether the archived copy is read (`\Seen`) there. The action reads
+    /// Mark as Read on Archive as it starts; `afterRead` runs between the sweep's read and its
+    /// mark-read and move.
+    private func confirmArchiveOnStableFolder(_ env: Env, afterRead: () async -> Void = {}) async throws -> Bool {
         try await runReset(env)
         try await expectReseated(env)
         env.server.expectMutation(rfc822MessageId: Self.replacementRfc)
-        let swept = await SettingsView.archiveOldMessages(
-            inboxFolderIds: [env.inboxFolderId], archiveCutoff: Date().addingTimeInterval(3600),
-            afterRead: afterRead)
-        #expect(swept == 1, "fixture: the sweep did not read the old row")
+        var trashed = MessageHeader(
+            messageId: String(Self.trashedUid), subject: "trashed", from: "Sender",
+            fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "trashed",
+            folderId: MessageIdentity.folderId(accountId: env.accountId, folderPath: "Trash"),
+            accountId: env.accountId, folderPath: "Trash", isInInbox: false)
+        trashed.rfc822MessageId = "<\(Self.trashedRfc)>"
+        trashed.headerComplete = true
+        trashed.observedUidValidity = Self.newEpoch
+        let trashedRow = trashed
+        try await env.pool.write { db in try trashedRow.insert(db) }
+        let trashedOnServer = env.server.snapshotMessagesWithFlags(in: "Trash").map(\.message.uid)
+        #expect(trashedOnServer == [Self.trashedUid], "control: the server's Trash holds the old email")
+        let folders = try await env.pool.read { db in
+            try Folder.filter(Column("accountId") == env.accountId).fetchAll(db)
+        }
+        let inboxes = folders.filter { $0.role == .inbox }.map(\.id)
+        #expect(inboxes == [env.inboxFolderId], "control: the sidebar's folders hold the account's inbox")
+        let swept = await SettingsView.archiveOldMessagesAction(
+            folders: folders, archiveCutoff: Date().addingTimeInterval(3600), afterRead: afterRead)
+        #expect(swept == 1, "the confirmation swept the inbox's old row and nothing outside the inbox")
         try await drainToWire(env)
         #expect(env.server.wrongMessageViolations().isEmpty)
+        let trashedAfter = try await env.pool.read { db in try MessageHeader.fetchOne(db, key: trashedRow.id) }
+        let trashedPath = trashedAfter?.folderPath
+        let trashedRead = trashedAfter?.isRead
+        #expect(trashedPath == "Trash", "the old email outside the inbox stays in Trash")
+        #expect(trashedRead == false, "the old email outside the inbox stays unread")
+        let trashedSeen = env.server.snapshotMessagesWithFlags(in: "Trash").map { $0.flags.contains("\\Seen") }
+        #expect(trashedSeen == [false], "the server's Trash still holds the old email, unread")
         let archived = env.server.snapshotMessagesWithFlags(in: "Archive")
-        #expect(archived.count == 1, "control: the swept email is not in Archive on the server")
+        #expect(archived.count == 1, "the swept email is in Archive on the server")
         let seen = archived.map { $0.flags.contains("\\Seen") }
         return seen == [true]
     }
 
     @Test("""
-    "Archive old messages" marks read as Mark as Read on Archive stood when the sweep started: \
-    flipping it once the sweep has read its rows leaves the archived email's read flag on the \
-    wire as captured, and the next sweep uses the new value
+    "Archive old messages" marks read as Mark as Read on Archive stood when the confirmation \
+    started: flipping it once the sweep has read its rows leaves the archived email's read flag \
+    on the wire as captured, and the next confirmation uses the new value
     """, arguments: [true, false])
     func archiveOldSweepUsesTheSettingCapturedAtItsStart(onAtStart: Bool) async throws {
-        try await withEnv(accountId: "frg-sweep-flip-\(onAtStart)", shownHasRfc: false) { first in
-            UserDefaults.standard.set(onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        // The preference as the test found it, put back on every way out (absent included);
+        // `finish` removes it after each environment.
+        let key = AccountManager.markReadOnArchiveDeleteKey
+        let savedPreference = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let savedPreference {
+                UserDefaults.standard.set(savedPreference, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+
+        try await withEnv(accountId: "frg-sweep-flip-\(onAtStart)", shownHasRfc: false, trash: [Self.trashedServerCopy]) { first in
+            UserDefaults.standard.set(onAtStart, forKey: key)
             clearOverlay()
-            // The sweep reads the setting itself; the test only flips it once the rows are read.
-            let firstRead = try await sweepStableFolder(first, afterRead: {
-                UserDefaults.standard.set(!onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
+            // The action reads the setting itself; the test only flips it once the rows are read.
+            let firstRead = try await confirmArchiveOnStableFolder(first, afterRead: {
+                UserDefaults.standard.set(!onAtStart, forKey: key)
             })
             let flipped = AccountManager.markReadOnArchiveDeleteEnabled
             #expect(flipped == !onAtStart, "control: the setting flipped during the sweep")
-            #expect(firstRead == onAtStart, "the archived email's read flag follows the value the sweep read as it started")
+            #expect(firstRead == onAtStart, "the archived email's read flag follows the value the action read as it started")
         }
 
-        // `finish` removed the setting; the next sweep starts with the flipped value.
-        try await withEnv(accountId: "frg-sweep-next-\(onAtStart)", shownHasRfc: false) { next in
-            UserDefaults.standard.set(!onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        // The first archive's completion protects UID 101 and its Message-ID for 30 s, and the
+        // process-global scope clears that record only when a test starts. The second environment
+        // reuses both, so its resync would skip the replacement; clear the record and the
+        // completion log here, as a new test starts with them.
+        await AccountManager.shared.clearRecentlyCompletedForTesting()
+        AccountManager.shared.clearActionCompletionsForTesting()
+
+        // The next confirmation starts with the flipped value.
+        try await withEnv(accountId: "frg-sweep-next-\(onAtStart)", shownHasRfc: false, trash: [Self.trashedServerCopy]) { next in
+            UserDefaults.standard.set(!onAtStart, forKey: key)
             clearOverlay()
-            let nextRead = try await sweepStableFolder(next)
-            #expect(nextRead == !onAtStart, "the next sweep uses the new value")
+            let nextRead = try await confirmArchiveOnStableFolder(next)
+            #expect(nextRead == !onAtStart, "the next confirmation uses the new value")
         }
     }
 
@@ -452,7 +508,7 @@ struct FolderResetGenerationTests {
     func archiveOldSweepWithNothingToArchiveReportsNil() async throws {
         let env = try makeEnv(accountId: "frg-sweep-none")
         let swept = await SettingsView.archiveOldMessages(
-            inboxFolderIds: [env.inboxFolderId], archiveCutoff: Date().addingTimeInterval(-3600))
+            inboxFolderIds: [env.inboxFolderId], archiveCutoff: Date().addingTimeInterval(-3600), marksRead: false)
         #expect(swept == nil)
         #expect(try await ops(env).isEmpty)
         await finish(env)

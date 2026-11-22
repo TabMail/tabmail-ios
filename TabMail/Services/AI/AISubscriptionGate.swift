@@ -273,4 +273,15 @@ final class AISubscriptionGate: @unchecked Sendable {
         hasCheckedOnce = true
         UserDefaults.standard.set(true, forKey: Self.hasCheckedOnceKey)
     }
+
+    #if DEBUG
+    /// Test fixtures only: puts back the open state and the checked bit a test found, which
+    /// `openGate`/`closeGate` cannot (both stamp the checked bit). Writes no stored value; the
+    /// fixture puts those back itself.
+    @MainActor
+    func restoreForTesting(isActive: Bool, hasCheckedOnce: Bool) {
+        self.isActive = isActive
+        self.hasCheckedOnce = hasCheckedOnce
+    }
+    #endif
 }

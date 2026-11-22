@@ -194,10 +194,13 @@ struct OneAISettingForTheDeviceTests {
     @Test("each sign-in clears before it writes the session, and nothing else clears")
     func everySessionWriteClearsFirst() throws {
         let root = DiagnosticPrintGateTests.repositoryRoot()
-        let auth = try String(contentsOf: root.appendingPathComponent("TabMail/Services/TabMailAuthService.swift"), encoding: .utf8)
-            .components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("//") }
+        func code(_ path: String) throws -> [String] {
+            try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+                .components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && !$0.hasPrefix("//") }
+        }
+        let auth = try code("TabMail/Services/TabMailAuthService.swift")
         let writes = auth.indices.filter { auth[$0].contains("installNewSession(") }
         #expect(writes.count == 3, "session writes: \(writes.map { auth[$0] })")
         for index in writes {
@@ -218,7 +221,8 @@ struct OneAISettingForTheDeviceTests {
         }
         #expect(callers == Array(repeating: "TabMailAuthService.swift", count: 3), "\(callers)")
 
-        // Only the sign-in step clears the device's AI answer.
+        // Only the sign-in step clears the device's AI answer. The one other clear is in
+        // ChatSwipeTestScene.swift, a DEBUG-only UI-test scene that seeds the tutorial before the AI choice.
         let clearers = try ["TabMail", "TabMailNotificationService", "Shared"].flatMap { dir -> [String] in
             let base = root.appendingPathComponent(dir)
             let files = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil)?
@@ -229,7 +233,36 @@ struct OneAISettingForTheDeviceTests {
                     .map { _ in file.lastPathComponent }
             }
         }
-        #expect(clearers == ["TabMailAuthService+AIChoice.swift"], "\(clearers)")
+        let sortedClearers = clearers.sorted()
+        #expect(sortedClearers == ["ChatSwipeTestScene.swift", "TabMailAuthService+AIChoice.swift"], "\(clearers)")
+
+        // That allowance never reaches Release code: the whole scene file sits inside one
+        // `#if DEBUG`. Its first code line after the license header is `#if DEBUG`, its last is
+        // `#endif`, and no top-level `#else`, `#elseif` or `#endif` closes it before then.
+        let scene = try code("TabMail/Views/Chat/ChatSwipeTestScene.swift")
+        let opensWithHeader = scene.first?.hasPrefix("/*") == true
+        let headerClose = scene.firstIndex { $0.hasSuffix("*/") }
+        let codeStart = opensWithHeader ? min((headerClose ?? scene.count) + 1, scene.count) : 0
+        let sceneCode = Array(scene[codeStart...])
+        let firstLine = sceneCode.first
+        let lastLine = sceneCode.last
+        #expect(firstLine == "#if DEBUG", "first code line: \(firstLine ?? "none")")
+        #expect(lastLine == "#endif", "last code line: \(lastLine ?? "none")")
+        var depth = 0
+        var closedEarly: [String] = []
+        for (index, line) in sceneCode.enumerated() {
+            if line.hasPrefix("#if") {
+                depth += 1
+            } else if line.hasPrefix("#else") {
+                // `#else` and `#elseif`: at the top level they end the DEBUG-only part.
+                if depth <= 1 { closedEarly.append("\(index): \(line)") }
+            } else if line.hasPrefix("#endif") {
+                depth -= 1
+                if depth <= 0 && index != sceneCode.count - 1 { closedEarly.append("\(index): \(line)") }
+            }
+        }
+        #expect(closedEarly.isEmpty, "the outer #if DEBUG is closed early: \(closedEarly)")
+        #expect(depth == 0, "unbalanced #if/#endif: depth \(depth)")
     }
 
     // MARK: - An answer from an earlier version
