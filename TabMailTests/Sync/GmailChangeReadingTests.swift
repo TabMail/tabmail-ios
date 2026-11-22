@@ -667,10 +667,11 @@ struct GmailChangeReadingTests {
     }
 
     /// The folder list is applied by `applyFolderList`, shared by the change
-    /// read and the full sync. A foreground pass with the full sync due applies
-    /// it once: the read's list, which the full sync takes instead of asking again.
-    @Test("a foreground pass with the full sync due applies the folder list from one label request")
-    func foregroundPassAppliesFolderListOnce() async throws {
+    /// read and the full sync. A foreground pass with the full sync due asks for
+    /// the label list exactly twice: once in the change read, once in the full
+    /// sync's own discovery (`fetchFullSyncFolders`, #755). A third is red.
+    @Test("a foreground pass with the full sync due asks for the label list exactly twice: the change read's and the full sync discovery's")
+    func foregroundPassAsksForTheLabelListTwice() async throws {
         try await Pins.withWorld(seeds: []) { w in
             w.server.setUserLabel(id: "Label_3", name: "Travel")
             w.server.removeUserLabel(id: Pins.userLabelId)
@@ -681,7 +682,7 @@ struct GmailChangeReadingTests {
             }
             #expect(paths.contains("Label_3"), "a label created on the server is a folder after the pass")
             #expect(!paths.contains(Pins.userLabelId), "a label deleted on the server is gone after the pass")
-            #expect(Self.labelRequests(w) - before == 1, "the pass asked for the label list \(Self.labelRequests(w) - before) times")
+            #expect(Self.labelRequests(w) - before == 2, "the pass asked for the label list \(Self.labelRequests(w) - before) times")
         }
     }
 

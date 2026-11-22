@@ -195,9 +195,9 @@ struct MockProviderEpochSeamTests {
         #expect(mock.lastObservedUidValidity(folderPath: "Archive") == nil,
                 "a folder the test never configured must still answer honestly unknown")
 
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
 
         // Bound to a local first: Swift Testing does not expand a `try`
         // expression, so asserting on the call directly would print the
@@ -249,9 +249,9 @@ struct MockProviderEpochSeamTests {
         await mock.setMockedUidValidity(staticEpoch, folderPath: "INBOX")
         await mock.setFetchMessagesResult([])
 
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
         let afterFirst = try storedEpoch(accountId: accountId, path: "INBOX", pool: pool)
         #expect(afterFirst == Int(firstEpoch),
                 """
@@ -261,9 +261,9 @@ struct MockProviderEpochSeamTests {
                 """)
 
         try clearStoredEpoch(folderId: folderId, pool: pool)
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
         let afterSecond = try storedEpoch(accountId: accountId, path: "INBOX", pool: pool)
         #expect(afterSecond == Int(secondEpoch),
                 """
@@ -273,9 +273,9 @@ struct MockProviderEpochSeamTests {
                 """)
 
         try clearStoredEpoch(folderId: folderId, pool: pool)
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
         let afterThird = try storedEpoch(accountId: accountId, path: "INBOX", pool: pool)
         #expect(afterThird == Int(staticEpoch),
                 "once the sequence is exhausted the static value must answer, not nil")

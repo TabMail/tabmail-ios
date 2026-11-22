@@ -267,6 +267,37 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// folder's baseline.
     var changeCursor: String?
 
+    /// The listing counters are not part of the record's persistence: a whole
+    /// record insert, update or save never writes them. Their one writer is the
+    /// column-scoped `SyncEngine.writeListingCounters` (and
+    /// `SyncEngine.invalidateListingCounters` for resets), ADR-IOS-111. The
+    /// exclusion lives in the database record encoding only; `Codable` stays
+    /// whole (a JSON round trip keeps every field). A fence test checks that
+    /// every other column is encoded, so a new field cannot be dropped from
+    /// here unnoticed.
+    static let listingCounterColumns: Set<String> = ["totalCount", "lastKnownUidNext", "lastKnownHighestModSeq"]
+
+    func encode(to container: inout PersistenceContainer) throws {
+        container["id"] = id
+        container["accountId"] = accountId
+        container["name"] = name
+        container["path"] = path
+        container["role"] = role.rawValue
+        container["unreadCount"] = unreadCount
+        container["isFavorite"] = isFavorite
+        container["backfillComplete"] = backfillComplete
+        container["oldestSyncedDate"] = oldestSyncedDate
+        container["backfillUidCursor"] = backfillUidCursor
+        container["backfillPageToken"] = backfillPageToken
+        container["backfillPageHeldSince"] = backfillPageHeldSince
+        container["backfillVersion"] = backfillVersion
+        container["lastKnownUidValidity"] = lastKnownUidValidity
+        container["uidValidityResetPendingAt"] = uidValidityResetPendingAt
+        container["catchUpState"] = catchUpState
+        container["changeState"] = changeState
+        container["changeCursor"] = changeCursor
+    }
+
     init(name: String, path: String, role: FolderRole, accountId: String) {
         self.id = "\(accountId):\(path)"
         self.accountId = accountId

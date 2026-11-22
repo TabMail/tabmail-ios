@@ -109,6 +109,15 @@ extension AIService {
                 onSSEEvent: onSSEEvent,
                 invocation: invocation
             )
+        } catch is AIOffError {
+            // AI was turned off during the turn: end as the check above does, with no
+            // answer and no Demo Mode call used. The user's message stays as the caller saved it.
+            if inDemo {
+                await MainActor.run { DemoModeStore.shared.refundCall() }
+                didRefund = true
+            }
+            BackgroundSyncLogger.logDebug("[AIService] sendChatMessage: stopped — AI turned off")
+            return nil
         } catch {
             // Demo refund on transient errors.
             if inDemo, DemoModeStore.shouldRefund(for: error) {
@@ -200,6 +209,13 @@ extension AIService {
         let response: CompletionsResponse
         do {
             response = try await sendWithToolsDirect(request: refreshed, onSSEEvent: onSSEEvent, invocation: invocation)
+        } catch is AIOffError {
+            // AI was turned off during the resumed turn: end as the check above does.
+            if inDemo {
+                await MainActor.run { DemoModeStore.shared.refundCall() }
+            }
+            BackgroundSyncLogger.logDebug("[AIService] resumeChatMessage: stopped — AI turned off")
+            return nil
         } catch {
             if inDemo, DemoModeStore.shouldRefund(for: error) {
                 await MainActor.run { DemoModeStore.shared.refundCall() }

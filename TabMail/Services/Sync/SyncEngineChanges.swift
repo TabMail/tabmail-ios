@@ -52,10 +52,62 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// pass and in turn, until the change applies. `SyncConfig.changeRecheckLimit`
     /// bounds only a pass's own additions; an id already stored is never cut (#903).
     var recheck: [String] = []
+    /// How many moves retired without proof have left this folder possibly
+    /// wrong since its last complete self-heal pass (`MessageHeaderRekey.finishMove`,
+    /// ADR-IOS-111 exit rule), whether or not it held a bookmark then. While it is
+    /// above zero the folder gets ONE self-heal pass at each full sync
+    /// (`healFoldersAfterAnUnprovenMove`) and is not tracked. The window listing
+    /// reaches only the newest messages, so one the move left in the folder below
+    /// it would otherwise stay missing. A count, not a flag: a pass clears it only
+    /// when no retirement was added while the pass ran.
+    var selfHealOwed: Int = 0
+
+    /// The full sync's listing is due for this folder whatever its counters say:
+    /// a count check (phase 2) that did not finish (a failed SEARCH, or a ghost
+    /// a shield protects) set it; a phase 2 that finishes clears it (#755).
+    var listingDue: Bool = false
+
+    /// Who set `listingDue` last: a fresh token on every mark. A count check
+    /// clears the bit only while the token is still the one its own mark wrote,
+    /// so an older check landing after a newer listing marked the folder never
+    /// clears the newer mark (#755). Nil when not due.
+    var listingDueToken: String?
+
+    /// Mark the listing due under a fresh token, returned for the clear.
+    @discardableResult
+    mutating func markListingDue() -> String {
+        let token = UUID().uuidString
+        listingDue = true
+        listingDueToken = token
+        return token
+    }
+
+    /// Clear the listing-due bit only when `token` is still the last mark's.
+    mutating func clearListingDue(ifMarkedBy token: String) {
+        guard listingDueToken == token else { return }
+        listingDue = false
+        listingDueToken = nil
+    }
+
+    /// The folder is owed a self-heal pass before it is tracked again.
+    var selfHealDue: Bool { selfHealOwed > 0 }
 
     init(tracking: Bool = false, recheck: [String] = []) {
         self.tracking = tracking
         self.recheck = recheck
+    }
+
+    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed, listingDue, listingDueToken }
+
+    /// `selfHealOwed` is absent from a state stored before it existed.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        v = try container.decode(Int.self, forKey: .v)
+        tracking = try container.decode(Bool.self, forKey: .tracking)
+        recheck = try container.decode([String].self, forKey: .recheck)
+        selfHealOwed = try container.decodeIfPresent(Int.self, forKey: .selfHealOwed) ?? 0
+        listingDue = try container.decodeIfPresent(Bool.self, forKey: .listingDue) ?? false
+        listingDueToken = try container.decodeIfPresent(String.self, forKey: .listingDueToken)
     }
 
     /// The stored JSON; unreadable or absent = the untracked default.
@@ -68,9 +120,10 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         self = decoded
     }
 
-    /// The JSON to store; nil for the default (untracked, nothing to re-read).
+    /// The JSON to store; nil for the default (untracked, nothing to re-read,
+    /// no self-heal due).
     var encoded: String? {
-        guard tracking || !recheck.isEmpty,
+        guard tracking || !recheck.isEmpty || selfHealDue || listingDue,
               let data = try? JSONEncoder().encode(self) else { return nil }
         return String(data: data, encoding: .utf8)
     }
@@ -87,9 +140,6 @@ struct ChangePassOutcome: Sendable {
     var outOfTime = false
     /// Rows were written.
     var hadChanges = false
-    /// The read carried the folder list and it was applied (the MODSEQ-skippable
-    /// paths), so the full sync skips its own discovery.
-    var appliedFolderList: Set<String>?
     /// A candidate bookmark, stored after the foreground pass's listings.
     var candidate: String?
     /// Folders the read covered (`.tracked` or `.baselineReady`).
@@ -97,6 +147,14 @@ struct ChangePassOutcome: Sendable {
     /// The folders need a listing in this pass (a refusal, a candidate or a
     /// completed baseline).
     var needsListing = false
+    /// The folder bookmark this pass left each folder with: the one its apply
+    /// wrote or kept, or the one its read was issued with when nothing was
+    /// applied. Present only for a folder that had one on either side (a folder
+    /// of an account-wide reader never does); nil = this pass left it none.
+    /// `commitChangeBaseline` tracks such a folder only while it still stores
+    /// exactly this bookmark: one dropped since (an unproven move, ADR-IOS-111
+    /// item 11) or never written is not tracked on the strength of this pass.
+    var folderBookmarkLeft: [String: String?] = [:]
 }
 
 extension SyncEngine {
@@ -106,7 +164,7 @@ extension SyncEngine {
     /// - Parameter deadline: the caller's own deadline for the whole pass (its
     ///   timeout), or nil when the caller sets none. It is not account sync state.
     func readAndApplyChanges(
-        account: Account, provider: any EmailProvider, scope: ChangeScope, deadline: Date? = nil
+        account: Account, provider: any EmailProvider, scope: ChangeScope, deadline: Date? = nil, pass: UUID? = nil
     ) async throws -> ChangePassOutcome? {
         let accountId = account.id
         let request = try await makeChangeRequest(accountId: accountId, scope: scope, deadline: deadline)
@@ -135,6 +193,19 @@ extension SyncEngine {
         }
         var outcome = try await applyChangeSet(changeSet, account: account, request: request)
         outcome.needsListing = outcome.needsListing || refused
+        // Folders no bookmark can cover: listed here when they changed.
+        for changes in changeSet.folders {
+            guard case .untracked(let observation) = changes.status else { continue }
+            switch try await refreshUntrackedFolder(
+                folderId: changes.folderId, observation: observation, account: account, provider: provider,
+                deadline: deadline, pass: pass) {
+            case .listed: outcome.hadChanges = true
+            // Recorded for this pass by `listFolder` (`unprovenListingPasses`),
+            // so an error in a later folder cannot lose it.
+            case .unproven: break
+            case .notListed: break
+            }
+        }
         outcome.outOfTime = outOfTime
         if outOfTime {
             BackgroundSyncLogger.logDebug("[Sync] Change read for \(account.emailAddress): no read budget left when the turn started — read nothing")
@@ -177,7 +248,7 @@ extension SyncEngine {
             if !asked.isEmpty { recheck[folder.id] = asked }
         }
         let context = ChangeContext(
-            deadline: readEnd, clock: clock, isExpensiveNetwork: NetworkMonitor.checkExpensive(),
+            deadline: readEnd, clock: clock,
             onProgress: { count in
                 guard count > 0 else { return }
                 Task { @MainActor in
@@ -188,7 +259,9 @@ extension SyncEngine {
             folders: folders.map {
                 ChangeFolder(
                     id: $0.id, path: $0.path, role: $0.role, cursor: $0.changeCursor,
-                    isSynced: synced.contains($0.id), heldSince: $0.oldestSyncedDate)
+                    isSynced: synced.contains($0.id), heldSince: $0.oldestSyncedDate,
+                    addressEpoch: Self.knownUidValidity($0.lastKnownUidValidity),
+                    olderMailComplete: $0.backfillComplete, olderMailCursor: $0.backfillUidCursor)
             },
             scope: scope, recheck: recheck, context: context,
             localRows: SyncEngineCatchUpRowReader(pool: dbPool))
@@ -235,14 +308,12 @@ extension SyncEngine {
 
         switch changeSet.folderList {
         case .complete(let folderList):
-            outcome.appliedFolderList = try await dbPool.write { db in
+            _ = try await dbPool.write { db in
                 try Self.applyFolderList(folderList, account: account, db: db)
             }
         case .updated(let updates):
-            // Folders already stored, matched by path: nothing to add or remove,
-            // so the full sync's own discovery is not needed either.
+            // Folders already stored, matched by path: nothing to add or remove.
             try await dbPool.write { db in try Self.applyFolderUpdates(updates, accountId: accountId, db: db) }
-            outcome.appliedFolderList = []
         case nil:
             break
         }
@@ -253,12 +324,16 @@ extension SyncEngine {
         var failures: [any Error] = []
         var readFolders = 0
         var wroteRows = false
-        for changes in changeSet.folders {
+        var armedTurnovers: [String] = []
+        let issuedWith = Dictionary(request.folders.map { ($0.id, $0.cursor) }, uniquingKeysWith: { first, _ in first })
+        for var changes in changeSet.folders {
+            if let cursor = issuedWith[changes.folderId] { changes.readFrom = FolderChanges.ReadFrom(cursor: cursor) }
+            if let issued = issuedWith[changes.folderId], let cursor = issued { outcome.folderBookmarkLeft[changes.folderId] = cursor }
             if changes.status.isTrackable { outcome.trackableFolderIds.insert(changes.folderId) }
             switch changes.status {
             case .failed(let error): failures.append(error)
             case .refused, .baselineReady: outcome.needsListing = true
-            case .tracked, .baselining, .notRun: break
+            case .tracked, .baselining, .notRun, .untracked: break
             }
             if case .notRun = changes.status {} else { readFolders += 1 }
             // A folder with only a message to read later still writes: its re-read
@@ -266,7 +341,16 @@ extension SyncEngine {
             // move. So does a folder whose own bookmark or coverage changed.
             guard !changes.records.isEmpty || !changes.removals.isEmpty || !changes.rereadLater.isEmpty
                 || changes.cursor != nil || changes.status.changesFolderCoverage else { continue }
-            let applied = try await dbPool.write { db in try Self.applyFolderChanges(changes, db: db) }
+            let applying = changes
+            let applied = try await dbPool.write { db in try Self.applyFolderChanges(applying, db: db) }
+            if applied.storedCursor != nil || outcome.folderBookmarkLeft[changes.folderId] != nil {
+                outcome.folderBookmarkLeft[changes.folderId] = applied.storedCursor
+            }
+            if applied.rejected {
+                // Nothing written, not even the bookmark: the folder is not
+                // tracked on the strength of this read, and arms nothing.
+                outcome.trackableFolderIds.remove(changes.folderId)
+            }
             newHeaders += applied.newHeaders
             removedIds += applied.removedIds
             discoveredParents += applied.discoveredParents
@@ -274,6 +358,15 @@ extension SyncEngine {
             if applied.armedCatchUp {
                 BackgroundSyncLogger.logDebug("[Sync] Change apply: re-read list full for folder \(changes.folderId.suffix(12)) — catch-up armed")
             }
+            if let path = applied.armedTurnoverPath { armedTurnovers.append(path) }
+        }
+
+        // A renumbered folder's turnover reaction, armed durably in its folder
+        // transaction above, runs now (single-flight; a crash re-drives it from
+        // the armed flag at the next pass start).
+        for path in armedTurnovers {
+            BackgroundSyncLogger.logDebug("[Sync] Change apply: folder \(path) renumbered — turnover reaction")
+            await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: path)
         }
 
         ReplyParentResolver.postParentNotifications(discoveredParents)
@@ -322,10 +415,11 @@ extension SyncEngine {
         return outcome
     }
 
-    /// Names and counts of folders already stored, matched by path, column by
-    /// column (`updateChanges`, which bumps no backfill version; ADR-IOS-107). A
-    /// path not stored is ignored: adding and removing folders is the complete
-    /// list's job.
+    /// Names of folders already stored, matched by path, column by column
+    /// (`updateChanges`, which bumps no backfill version; ADR-IOS-107). A path
+    /// not stored is ignored: adding and removing folders is the complete list's
+    /// job. Counts are not written: a folder's counters have one writer, its
+    /// listing.
     nonisolated static func applyFolderUpdates(_ updates: [FolderInfo], accountId: String, db: Database) throws {
         for info in updates {
             guard var folder = try Folder
@@ -333,7 +427,6 @@ extension SyncEngine {
                 .fetchOne(db) else { continue }
             let original = folder
             folder.name = info.name
-            folder.totalCount = info.totalCount
             _ = try folder.updateChanges(db, from: original)
         }
     }
@@ -346,8 +439,11 @@ extension SyncEngine {
     ///   asked to list again (#783). It is stored also when the full sync
     ///   dropped a folder (`FullSyncListing.droppedFolder`: a lost connection
     ///   stops the listing there, so that folder and every later one; a failed
-    ///   retry or SELECT, that folder). Those folders stay untracked and the
-    ///   caller keeps the full sync due, so the next foreground pass lists them;
+    ///   retry, a short FETCH, or an empty count the server did not confirm
+    ///   (`ProviderListingUnconfirmed`), that folder) or found one not listable
+    ///   (`notListableFolderIds`: SELECT refused or no usable EXISTS). Those
+    ///   folders stay untracked; for a dropped one the caller keeps the full
+    ///   sync due, so the next foreground pass lists them;
     ///   their changes after the candidate arrive by the reads from the bookmark
     ///   (an account-wide reader names every folder, and a full record inserts a
     ///   message the folder does not hold yet). A listing that fails any other
@@ -363,10 +459,25 @@ extension SyncEngine {
             }
             for folderId in nowTracked {
                 guard let folder = try Folder.fetchOne(db, key: folderId) else { continue }
+                // A folder with a bookmark of its own is tracked only while it
+                // stores the one this pass left it: a bookmark dropped since (an
+                // unproven move, ADR-IOS-111 item 11), or none at all, leaves it
+                // untracked until a new baseline. The compare is in the UPDATE.
+                let left = outcome.folderBookmarkLeft[folderId]
+                if let left, left == nil || folder.changeCursor != left { continue }
                 var state = FolderChangeState(raw: folder.changeState)
-                guard !state.tracking else { continue }
+                // A folder still owed its self-heal pass after an unproven move
+                // stays untracked: the next full sync lists it and heals it again.
+                // So does one whose count check is still owed (`listingDue`): a
+                // tracked folder gets no listing, so the check could never finish.
+                guard !state.tracking, !state.selfHealDue, !state.listingDue else { continue }
                 state.tracking = true
-                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
+                if let left, let bookmark = left {
+                    try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ? AND changeCursor = ?", arguments: [state.encoded, folderId, bookmark])
+                    guard db.changesCount > 0 else { continue }
+                } else {
+                    try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
+                }
             }
         }
         if outcome.candidate != nil {
@@ -388,7 +499,7 @@ extension FolderChangeStatus {
     /// flag left on by a reset that raced a pass is cleared here).
     var changesFolderCoverage: Bool {
         switch self {
-        case .refused, .baselining, .baselineReady: return true
+        case .refused, .baselining, .baselineReady, .untracked: return true
         case .tracked, .failed, .notRun: return false
         }
     }

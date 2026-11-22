@@ -44,13 +44,44 @@ actor BackendClient {
     /// The injected session also serves the maintenance-class calls, so a manual compaction is testable.
     private let longOpSessionOverride: URLSession?
 
-    init(llmSession: URLSession? = nil) {
+    /// Whether AI is turned off (Settings → Opt Out of AI), read right before each AI
+    /// request is sent (`refuseIfAIOff`). Test seam: production reads the setting itself.
+    private let isAIOff: @Sendable () -> Bool
+
+    init(llmSession: URLSession? = nil, isAIOff: @escaping @Sendable () -> Bool = { AIService.isAIOff }) {
         self.llmSession = llmSession ?? {
             let config = URLSessionConfiguration.ephemeral
             config.timeoutIntervalForResource = SyncConfig.llmResourceTimeoutSeconds
             return URLSession(configuration: config)
         }()
         longOpSessionOverride = llmSession
+        self.isAIOff = isAIOff
+    }
+
+    // MARK: - AI request dispatch
+
+    /// Every AI request leaves through `aiBytes` or `aiData`, the only users of the LLM
+    /// sessions. Each checks the AI setting right before the send, after every wait the
+    /// request had (a free slot, the auth token, a rate-limit back-off, the client tools of
+    /// the round before), so turning AI off stops an operation at its next request: a
+    /// retry, a tool round, a queued job, a dictation chunk. A request already sent is not
+    /// recalled, and its answer is used.
+    private func refuseIfAIOff() throws {
+        guard isAIOff() else { return }
+        BackgroundSyncLogger.logAIProcessing("[HTTP] request not sent: AI is turned off")
+        throw AIOffError()
+    }
+
+    /// A streamed AI request (completions). `session` nil is the default LLM session.
+    private func aiBytes(for request: URLRequest, session: URLSession? = nil) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        try refuseIfAIOff()
+        return try await (session ?? llmSession).bytes(for: request)
+    }
+
+    /// A plain AI request (dictation transcription and its warm-up).
+    private func aiData(for request: URLRequest) async throws -> (Data, URLResponse) {
+        try refuseIfAIOff()
+        return try await llmSession.data(for: request)
     }
 
     // 403 exponential backoff state — shared across all completions requests.
@@ -199,7 +230,7 @@ extension BackendClient {
             cleanup: cleanup
         ))
 
-        let (data, response) = try await llmSession.data(for: request)
+        let (data, response) = try await aiData(for: request)
         guard let http = response as? HTTPURLResponse else { throw DictationError.invalidResponse }
         guard http.statusCode == 200 else {
             throw DictationError(status: http.statusCode, code: (try? JSONDecoder().decode(TranscriptionErrorBody.self, from: data))?.error)
@@ -224,7 +255,7 @@ extension BackendClient {
         request.setValue("ios", forHTTPHeaderField: "X-Client-Type")
         request.setValue(Self.clientVersion, forHTTPHeaderField: "X-Client-Version")
         do {
-            let (_, response) = try await llmSession.data(for: request)
+            let (_, response) = try await aiData(for: request)
             BackgroundSyncLogger.logDebug("[Dictation] warm-up answered \((response as? HTTPURLResponse)?.statusCode ?? 0)")
         } catch {
             BackgroundSyncLogger.logDebug("[Dictation] warm-up failed: \(type(of: error))")
@@ -911,7 +942,7 @@ extension BackendClient {
     ) async throws -> Data {
         let httpT0 = CFAbsoluteTimeGetCurrent()
 
-        let (bytes, response) = try await (session ?? llmSession).bytes(for: urlRequest)
+        let (bytes, response) = try await aiBytes(for: urlRequest, session: session)
         guard let httpResponse = response as? HTTPURLResponse else {
             BackgroundSyncLogger.logAIProcessing("[HTTP] SSE response — not HTTPURLResponse")
             throw BackendError.requestFailed(statusCode: 0)
@@ -1067,67 +1098,6 @@ extension BackendClient {
 
         log("[HTTP] SSE complete (events=\(eventCount), heartbeats=\(heartbeatCount), bytes=\(result.count), elapsed=\(elapsed)ms)")
         return result
-    }
-
-    /// Retry wrapper matching TB's `retryWithBackoff()` + 429 throttle loop pattern.
-    ///
-    /// - General errors (network, 5xx, 408): retry up to `maxRetries` times with exponential backoff.
-    ///   On exhaustion, throw — the message stays as `summaryBlurb == nil` and will be retried
-    ///   on the next sync cycle (system-level "never quit").
-    /// - 429 rate limit: retry indefinitely with gentle backoff capped at 5s (matches TB's throttle loop).
-    /// - Non-retriable (401, 4xx, decode): throw immediately.
-    func sendCompletionsWithRetry(_ request: CompletionsRequest, maxRetries: Int = 5) async throws -> CompletionsResponse {
-        await llmSemaphore.acquire()
-        defer { llmSemaphore.release() }
-
-        var attempt = 0
-        let maxDelay: Double = 10
-
-        while true {
-            try Task.checkCancellation()
-            do {
-                let response = try await sendCompletionsInternal(request)
-                if attempt > 0 {
-                    BackgroundSyncLogger.logDebug("[BackendClient] Succeeded after \(attempt) retries")
-                }
-                return response
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch let error as BackendError {
-                if case .requestFailed(statusCode: 429) = error {
-                    // 429 rate limit: retry indefinitely with gentle backoff (matches TB's throttle loop)
-                    attempt += 1
-                    let delay = min(1.5 * pow(1.5, Double(attempt - 1)) + Double.random(in: 0...0.5), 5.0)
-                    BackgroundSyncLogger.logDebug("[BackendClient] Rate limited, retry #\(attempt) after \(String(format: "%.1f", delay))s")
-                    try await Task.sleep(for: .seconds(delay))
-                } else if error.isRetriable {
-                    // Other retriable errors (5xx, 408, 0): retry up to maxRetries
-                    attempt += 1
-                    guard attempt <= maxRetries else {
-                        BackgroundSyncLogger.logDebug("[BackendClient] Exhausted \(maxRetries) retries: \(error)")
-                        throw error
-                    }
-                    let delay = min(pow(2.0, Double(attempt - 1)) + Double.random(in: 0...1), maxDelay)
-                    BackgroundSyncLogger.logDebug("[BackendClient] Retry #\(attempt)/\(maxRetries) after \(String(format: "%.1f", delay))s: \(error)")
-                    try await Task.sleep(for: .seconds(delay))
-                } else {
-                    throw error
-                }
-            } catch let error as URLError {
-                // Network errors: retry up to maxRetries
-                BackgroundSyncLogger.logAIProcessing("[HTTP] URLError code=\(error.code.rawValue) (\(error.localizedDescription))")
-                attempt += 1
-                guard attempt <= maxRetries else {
-                    BackgroundSyncLogger.logDebug("[BackendClient] Exhausted \(maxRetries) retries: \(error.localizedDescription)")
-                    throw error
-                }
-                let delay = min(pow(2.0, Double(attempt - 1)) + Double.random(in: 0...1), maxDelay)
-                BackgroundSyncLogger.logDebug("[BackendClient] Retry #\(attempt)/\(maxRetries) after \(String(format: "%.1f", delay))s: \(error.localizedDescription)")
-                try await Task.sleep(for: .seconds(delay))
-            } catch {
-                throw error
-            }
-        }
     }
 
     /// Parse SSE text and extract the JSON data from the "event: final" event.
@@ -2033,4 +2003,13 @@ struct ChatConnectionLostError: Error, LocalizedError {
     /// LocalizedError so those show a clean message, not the Swift default
     /// "The operation couldn't be completed. (… error 1.)".
     var errorDescription: String? { "Connection lost. Please try again." }
+}
+
+/// An AI request the client did not send because AI is turned off (Settings → Opt Out of
+/// AI), checked right before each request goes out (`BackendClient.refuseIfAIOff`). It is
+/// not a network or server failure, so no retry, resume or refund rule matches it: the
+/// operation ends at once, and each AI entry point ends the way it does when AI is
+/// already off at its start.
+struct AIOffError: Error, LocalizedError {
+    var errorDescription: String? { "AI is turned off in Settings." }
 }

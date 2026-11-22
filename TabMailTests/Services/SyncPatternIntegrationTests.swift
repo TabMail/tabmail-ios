@@ -28,7 +28,7 @@ struct FolderInfoToFolderInsertTests {
                 var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: "acc1")
                 folder.totalCount = info.totalCount
                 folder.lastKnownUidNext = info.uidNext
-                try folder.insert(dbConn)
+                try folder.insertWithListingCounters(dbConn)
             }
         }
 
@@ -277,7 +277,7 @@ struct FolderSyncUpdateTests {
                     existing.name = info.name
                     existing.totalCount = info.totalCount
                     if let uidNext = info.uidNext { existing.lastKnownUidNext = uidNext }
-                    try existing.update(dbConn)
+                    try existing.updateWithListingCounters(dbConn)
                 }
             }
         }
@@ -303,11 +303,11 @@ struct FolderSyncUpdateTests {
             for info in remoteFolders {
                 if var existing = localFolders.first(where: { $0.path == info.path }) {
                     existing.totalCount = info.totalCount
-                    try existing.update(dbConn)
+                    try existing.updateWithListingCounters(dbConn)
                 } else {
                     var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: "acc1")
                     folder.totalCount = info.totalCount
-                    try folder.insert(dbConn)
+                    try folder.insertWithListingCounters(dbConn)
                 }
             }
         }

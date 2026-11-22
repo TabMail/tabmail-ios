@@ -90,6 +90,24 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Folders
 
+    /// The sum of `totalItemCount` over the last complete folder list the full
+    /// sync listed (`fetchFullSyncFolders`), held in memory only (no
+    /// request of its own): the backfill progress denominator
+    /// (`progressTotal`). Nil until a full sync adopted one.
+    var lastFolderListMessageTotal: Int?
+
+    func progressTotal(crawling: Bool) async -> ProgressTotal {
+        lastFolderListMessageTotal.map(ProgressTotal.messages) ?? .notKnownYet
+    }
+
+    /// The complete tree, with its total stored before it is returned. The
+    /// change read lists the tree through `fetchFolders`, which stores nothing.
+    func fetchFullSyncFolders() async throws -> [FolderInfo] {
+        let folders = try await fetchFolders()
+        lastFolderListMessageTotal = folders.reduce(0) { $0 + $1.totalCount }
+        return folders
+    }
+
     func fetchFolders() async throws -> [FolderInfo] {
         // v1.0 mailFolder resource does NOT include wellKnownName property.
         // Resolve well-known folder IDs by addressing them by name (e.g., GET /mailFolders/inbox).

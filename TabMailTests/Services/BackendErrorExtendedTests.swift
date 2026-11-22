@@ -69,8 +69,8 @@ struct BackendErrorExtendedTests {
 
     @Test("streamTruncated is NOT auto-retriable (manual tap-to-retry only)")
     func streamTruncatedNotRetriable() {
-        // If this flips to true, the background path (sendCompletionsWithRetry)
-        // would silently auto-retry truncations, and the agent-chat tool loop's
+        // If this flips to true, a retry path keyed on isRetriable would
+        // silently auto-retry truncations, and the agent-chat tool loop's
         // conversion to a resumable ChatConnectionLostError could be bypassed.
         #expect(BackendError.streamTruncated.isRetriable == false)
     }

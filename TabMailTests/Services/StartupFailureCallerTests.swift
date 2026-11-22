@@ -5,6 +5,7 @@
 import Foundation
 import Synchronization
 import Testing
+import UserNotifications
 import UIKit
 @testable import TabMail
 
@@ -50,7 +51,7 @@ struct StartupFailureCallerTests {
             let calls = Mutex<[String]>([])
             let delegate = NotificationDelegate(
                 readiness: { await startup.awaitLaunchReady(background: true) },
-                action: { _, _, _ in Issue.record("Unexpected notification action") },
+                action: { _, _, _, _ in Issue.record("Unexpected notification action") },
                 foregroundMerge: { calls.withLock { $0.append("merge") } },
                 foregroundSync: { calls.withLock { $0.append("sync") } }
             )
@@ -132,7 +133,7 @@ struct StartupFailureCallerTests {
                         calls.withLock { $0.append("readiness") }
                         return await startup.awaitLaunchReady(background: true)
                     },
-                    action: { _, _, _ in calls.withLock { $0.append("action") } }
+                    action: { _, _, _, _ in calls.withLock { $0.append("action") } }
                 )
                 delegate.handleNotificationResponse(
                     actionId: action,
@@ -160,14 +161,21 @@ struct StartupFailureCallerTests {
             let initialWorkCount = DatabaseSuspension.shared.backgroundWorkCountForTesting
             let delegate = NotificationDelegate(
                 readiness: { await startup.awaitLaunchReady(background: true) },
-                action: { receivedAction, message, account in
+                action: { receivedAction, message, account, notifiedEpoch in
                     #expect(receivedAction == action && message == "test-message" && account == "test-account")
+                    // The epoch the producer recorded reaches the router (#538).
+                    #expect(notifiedEpoch == 41)
                     calls.withLock { $0.append("action") }
                 }
             )
+            // The payload exactly as the real notification producer writes it.
+            let content = UNMutableNotificationContent()
+            EmailNotificationBuilder.fill(
+                content, signal: EmailNotificationBuilder.Signal(senderName: "S", subject: "T"),
+                accountId: "test-account", messageId: "test-message", observedUidValidity: 41)
             delegate.handleNotificationResponse(
                 actionId: action,
-                userInfo: ["messageId": "test-message", "accountId": "test-account"]
+                userInfo: content.userInfo
             ) { calls.withLock { $0.append("finish") }; finished.open() }
             try await withTimeout(seconds: 3) { await finished.wait() }
             #expect(calls.withLock { $0 } == ["action", "finish"])
@@ -181,7 +189,7 @@ struct StartupFailureCallerTests {
             let calls = Mutex<[String]>([])
             let delegate = NotificationDelegate(
                 readiness: { calls.withLock { $0.append("readiness") }; return false },
-                action: { _, _, _ in calls.withLock { $0.append("action") } }
+                action: { _, _, _, _ in calls.withLock { $0.append("action") } }
             )
             delegate.handleNotificationResponse(actionId: action, userInfo: [:]) {
                 calls.withLock { $0.append("finish") }
@@ -271,6 +279,10 @@ private final class BackgroundReadinessFixture {
                 }
             }
         )
+        // The processing job measures Wi-Fi concurrently with its work (the work
+        // never waits for it); a fixed answer keeps a live NWPathMonitor out of
+        // these lifetime tests.
+        SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = true }
         scheduler = SyncScheduler(
             backgroundReadiness: { await startup.awaitLaunchReady(background: true) },
             backgroundWork: { inboxOnly in
@@ -283,6 +295,10 @@ private final class BackgroundReadinessFixture {
             refreshNetworkAvailable: connected,
             pollActive: pollActive
         )
+    }
+
+    deinit {
+        SyncScheduler.jobOnWiFiMeasurementForTesting.withLock { $0 = nil }
     }
 
     func start(processing: Bool, expireBeforeRegistration: Bool = false) {

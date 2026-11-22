@@ -374,6 +374,8 @@ struct NSESummaryTextMessageCarryTests {
         defaults.set("{\"user@example.com\":\"\(accountId)\",\"other@example.com\":\"other-account\"}",
                      forKey: SharedNSEData.accountMapKey)
         defaults.set(false, forKey: SharedNSEData.deviceSyncEnabledKey)
+        // The AI choice made, AI on: the extension sends only then (`NSEState.isAIDisabled`).
+        AIConsentPolicy.recordChoice(aiEnabled: true, in: defaults)
 
         let body = Data("Lunch on Friday?".utf8).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")

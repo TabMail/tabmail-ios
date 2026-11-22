@@ -228,9 +228,6 @@ struct BackfillPageWalkHoldBoundTests {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         defer { Self.setHoldClock(nil) }
-        let ccBccKey = "ccBccBackfillDone"
-        let savedCcBcc = UserDefaults.standard.object(forKey: ccBccKey)
-        defer { UserDefaults.standard.set(savedCcBcc, forKey: ccBccKey) }
         let accountId = "gm-fresh-after-reset"
         let (server, account) = try Self.gmailInbox(accountId, pool: pool)
         defer { server.close() }

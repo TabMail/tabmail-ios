@@ -1113,10 +1113,11 @@ nothing is ever decided about a UID whose numbering is unproven (ADR-IOS-107). C
   starts after the budget is spent, the removal proof included.
 - **Not the backfill.** With a partial backfill, no command names a UID below the lowest local UID or
   above the highest, and no row is inserted.
-- **Always-expensive network.** After `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` without a
-  completed listing, a folder lists on an expensive network: one never listed, one on a server
-  without CONDSTORE, and one whose listing was parked. The first sight of a folder on an expensive
-  network writes when the wait began and makes no request.
+- **Scans under every download gate (#1063).** A due scan runs on an expensive network, below 20%
+  battery and in Low Power Mode, in the worker and in the background job, and the walk stays held
+  (`scanRunsUnderEveryDownloadGate` per provider); a folder never listed lists at once on an
+  expensive network. *Superseded:* "Always-expensive network. After the expensive-network wait bound
+  without a completed listing, a folder lists on an expensive network [...]".
 - **A new folder.** A folder the full sync itself created follows an older-mail change on the next
   pass.
 - **A just-completed user action** wins over a stale listing, per message.
@@ -1445,3 +1446,22 @@ happens to the view that asked for it, and a report it did not take says nothing
     with its sheet up, before or after Report, and the notice is reopened. SwiftUI then presents
     the old sheet again from the closed popover, which UIKit refuses; the reopened notice stays
     open with nothing on it (and after an old refusal), and its own report's Cancel closes it.
+
+## A stale move never redirects a deferred Undo after a folder reset
+
+`FolderResetGenerationTests.staleMoveNeverRedirectsADeferredUndoOfTheReplacement` runs the real
+UIDVALIDITY reset reaction against `FakeIMAPServer`, so a different email (the replacement) is
+re-seated at the shown id. The user archives the replacement and presses Undo while the archive is in
+flight, so the Undo waits as a deferred successor. A move of the same id stamped before the reset then
+arrives by one of five routes: a direct move that would retarget the Undo, a direct move back to
+Archive that would cancel it, an AI delete card of an RFC-less shown row (whose execution-time
+re-resolve hands `move` the optimistically archived row, still keyed by its INBOX id), a batch with a
+member already at the destination, and a batch with an unaffected member that moves for real. The
+stale arm expects the replacement back in INBOX under a new UID on the server (the archive and Undo
+really ran), the stale member terminal and reported through `.messageMovesRefused`, and other members
+acting; a post-reset stamp cancels or redirects the Undo as before. Final placement on the server is
+the oracle here; the wrong-message oracle cannot be armed on the shown email because the user's own
+archive and Undo of the replacement are legitimate. `replyDraftShapedIdIsJudgedByItsOwnFolder` and
+`generationScopeAndReDrive` pin `FolderResetGeneration.refuses(headerId:accountId:)`: an id is judged
+by the folder it names through `MessageIdentity.headerIdBelongsToFolder`, never a hand split, so a
+reply-draft id with extra colons is refused only when its own folder was reset.

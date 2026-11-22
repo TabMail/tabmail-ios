@@ -22,7 +22,7 @@ import Testing
 /// on a message the phone holds and when that read completes, and chaos for the
 /// read itself: page and batch latency, failed pages (a server error, a
 /// throttle, a dropped connection), failed batches, one message whose header
-/// fetch answers an error, a read budget cut anywhere, and an expensive network.
+/// fetch answers an error, and a read budget cut anywhere.
 ///
 /// Invariants checked after every read, never expected values for a schedule:
 /// 1. **Intention ledger**: every queued read the schedule did not complete is
@@ -36,7 +36,12 @@ import Testing
 ///    server's flags. A foreground pass lists the newest messages of a folder
 ///    it does not track whatever their age, so a row below the held range is
 ///    allowed when it is still in the folder and was there when a foreground
-///    pass ran.
+///    pass ran. A row below the held range is also allowed when another
+///    client marked it read or unread in that folder after the baseline and the
+///    server still holds it there: the change can put the message on the
+///    folder's re-read list, and an explicit re-read answer is inserted
+///    whatever the window (ADR-IOS-111, amendment 2026-11-14, rule 2). Such a
+///    row is allowed, never required.
 ///
 /// Knobs (`TEST_RUNNER_` prefix on the CLI): `OUTLOOK_CHANGE_FUZZ_ITERATIONS`
 /// (default `FuzzConfig.defaultIterations`) and `OUTLOOK_CHANGE_FUZZ_SEED`
@@ -124,6 +129,9 @@ struct OutlookChangeFuzzTests {
             var everIn: [String: Set<String>] = [:]
             for folder in Self.folders { everIn[folder] = w.server.messageIds(inFolder: folder) }
             var arrivedAfterBaseline: [String: Set<String>] = [:]
+            // Messages another client marked read or unread after the baseline,
+            // by the folder they were in: allowed below the held range, not required.
+            var readAfterBaseline: [String: Set<String>] = [:]
             // Messages in each folder when a foreground pass ran.
             var listable: [String: Set<String>] = [:]
             var openReads: [String: (opId: String, folder: String)] = [:]
@@ -153,6 +161,7 @@ struct OutlookChangeFuzzTests {
                             let read = w.server.snapshot(providerMessageId: id)?.isRead ?? false
                             w.server.setReadFromOtherClient(providerMessageId: id, isRead: !read)
                             did.append("read \(id)=\(!read)")
+                            readAfterBaseline[folder, default: []].insert(id)
                         }
                     case 2:
                         if let id = Self.pick(ids, &localRng) {
@@ -161,7 +170,8 @@ struct OutlookChangeFuzzTests {
                             did.append("flag \(id)=\(!flagged)")
                             // A flag record carries the message's date, so a message the
                             // phone does not hold gets its headers and appears, whatever
-                            // its age (a read-only record carries no date and inserts nothing).
+                            // its age (a read-only record carries no date and inserts nothing
+                            // itself, but its message may be re-read by id and inserted).
                             arrivedAfterBaseline[folder, default: []].insert(id)
                         }
                     case 3:
@@ -225,7 +235,8 @@ struct OutlookChangeFuzzTests {
                 }
                 let requests: Int? = Int(localRng.next() % 100) < FuzzConfig.budgetCutPercent
                     ? 1 + Int(localRng.next() % UInt64(FuzzConfig.budgetCutMaxRequests)) : nil
-                let expensive = localRng.next() % 5 == 0
+                // The retired network draw, kept so every seed replays the same schedule.
+                _ = localRng.next()
 
                 let driver = Int(localRng.next() % 100)
                 if driver < FuzzConfig.foregroundPassPercent {
@@ -236,8 +247,8 @@ struct OutlookChangeFuzzTests {
                 } else if driver < FuzzConfig.foregroundPassPercent + FuzzConfig.enginePassPercent {
                     do { try await w.delta(); did.append("change pass") } catch { did.append("change pass failed: \(error)") }
                 } else {
-                    try await w.read(now: now, requests: requests, expensive: expensive)
-                    did.append("read requests=\(requests.map(String.init) ?? "all") expensive=\(expensive)")
+                    try await w.read(now: now, requests: requests)
+                    did.append("read requests=\(requests.map(String.init) ?? "all")")
                 }
                 let differs = try Self.differences(w).joined(separator: ", ")
                 trace.append("round \(round): \(did.joined(separator: "; ")); differs: \(differs)")
@@ -269,7 +280,8 @@ struct OutlookChangeFuzzTests {
                 if settled { break }
             }
             if try !Self.checkConvergence(
-                w, arrivedAfterBaseline: arrivedAfterBaseline, listable: listable, where: "\(label) quiescence") {
+                w, arrivedAfterBaseline: arrivedAfterBaseline, readAfterBaseline: readAfterBaseline,
+                listable: listable, where: "\(label) quiescence") {
                 Issue.record("[\(label)] schedule:\n\(trace.joined(separator: "\n"))")
                 failed = true
             }
@@ -307,7 +319,8 @@ struct OutlookChangeFuzzTests {
 
     /// 3. Each folder's rows and flags equal what the server holds and the phone keeps.
     private static func checkConvergence(
-        _ w: Reader.World, arrivedAfterBaseline: [String: Set<String>], listable: [String: Set<String>], where: String
+        _ w: Reader.World, arrivedAfterBaseline: [String: Set<String>], readAfterBaseline: [String: Set<String>],
+        listable: [String: Set<String>], where: String
     ) throws -> Bool {
         var ok = true
         let server = w.server.state.value.withLock { Array($0.messagesByProviderId.values) }
@@ -322,8 +335,10 @@ struct OutlookChangeFuzzTests {
             }.map(\.providerMessageId))
             let local = try w.rowIds(in: folder)
             let listed = (listable[folder] ?? []).intersection(inFolder.map(\.providerMessageId))
+            // A read change can re-read a message by id, inserted whatever its age.
+            let readHere = (readAfterBaseline[folder] ?? []).intersection(inFolder.map(\.providerMessageId))
             let missing = expected.subtracting(local)
-            let extra = local.subtracting(expected).subtracting(listed)
+            let extra = local.subtracting(expected).subtracting(listed).subtracting(readHere)
             if !missing.isEmpty || !extra.isEmpty {
                 Issue.record("[\(`where`)] \(folder) rows: missing \(missing.sorted()), extra \(extra.sorted())")
                 ok = false

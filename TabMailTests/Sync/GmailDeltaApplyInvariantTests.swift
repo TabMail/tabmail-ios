@@ -586,6 +586,39 @@ struct GmailDeltaApplyInvariantTests {
         }
     }
 
+    @Test("P11b: a new message whose reply is already stored in Sent is marked replied, its Reply tag cleared, and says so")
+    func insertedParentOfStoredReplyMarkedReplied() async throws {
+        try await Self.withWorld(seeds: []) { w in
+            let reply = try w.insertRow("p11b-reply", in: w.sent)
+            let parentRfc = Self.normalized("p11b-parent")
+            let key = try #require(MessageAICache.cacheKey(accountId: w.accountId, folderPath: w.inbox.path, rfc822MessageId: parentRfc))
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET inReplyTo = ? WHERE id = ?", arguments: [parentRfc, reply.id])
+                var cache = MessageAICache(key: key, rfc822MessageId: parentRfc)
+                cache.actionTag = .reply
+                try cache.insert(db)
+            }
+            let posted = Mutex<Set<String>>([])
+            let token = NotificationCenter.default.addObserver(forName: .messageDataDidChange, object: nil, queue: nil) { note in
+                if let id = note.object as? String { _ = posted.withLock { $0.insert(id) } }
+            }
+            defer { NotificationCenter.default.removeObserver(token) }
+
+            w.server.addMessage(Self.seed("p11b-parent", labels: ["INBOX"]))
+            try await w.completedDelta()
+
+            let parent = try #require(try w.row("p11b-parent", in: w.inbox), "precondition: the parent was inserted")
+            #expect(parent.isReplied)
+            #expect(parent.actionTag == ActionTag.none)
+            let ops = try await w.pool.read { db in
+                try PendingOperation.filter(Column("type") == OperationType.setTag.rawValue).fetchAll(db)
+            }
+            #expect(ops.contains { $0.messageIds == [parent.stableId] && $0.folderPath == w.inbox.path
+                                   && $0.tagValue == ActionTag.none.rawValue })
+            #expect(posted.withLock { $0.contains(parent.id) }, "the parent's change is announced")
+        }
+    }
+
     // MARK: - P12: existing rows
 
     @Test("P12: an existing row takes the server's flags and thread headers, but keeps local flags under a pending flag op")

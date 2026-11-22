@@ -110,7 +110,15 @@ extension AIService {
         BackgroundSyncLogger.logDebug("[AIService] generateReply: sending to backend (disable_tools=false, timezone=\(TimeZone.current.identifier))")
         let llmT0 = CFAbsoluteTimeGetCurrent()
         BackgroundSyncLogger.logAIProcessing("Reply LLM START (body.len=\(bodyText.count))")
-        let response = try await backend.sendCompletionsWithTools(request)
+        let response: CompletionsResponse
+        do {
+            response = try await backend.sendCompletionsWithTools(request)
+        } catch is AIOffError {
+            // AI was turned off before a request of this reply (its first, a retry or a
+            // tool round) was sent: end as the check above does.
+            BackgroundSyncLogger.logAIProcessing("Reply stopped: AI turned off")
+            return nil
+        }
         let llmElapsed = Int((CFAbsoluteTimeGetCurrent() - llmT0) * 1000)
         BackgroundSyncLogger.logAIProcessing("Reply LLM END in \(llmElapsed)ms")
 

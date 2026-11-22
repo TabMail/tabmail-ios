@@ -7,8 +7,9 @@ import Foundation
 /// Whether the chat view, and the AI work only it needs, is on.
 ///
 /// The user switches it in TabMail Settings ("Enable Chat View", on by default). It needs AI:
-/// while AI is off (opted out, or no plan) it is off everywhere, nothing requests summaries for
-/// whole threads, and the user's choice is kept for when AI comes back.
+/// while AI is off (the AI choice not made yet, opted out, or no plan) it is off everywhere,
+/// nothing requests summaries for whole threads, and the user's choice is kept for when AI comes
+/// back.
 ///
 /// Read `isActive` ONCE at the start of an operation and pass the value along; never re-read it
 /// mid-operation.
@@ -21,14 +22,14 @@ enum ChatViewConfig {
         UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
     }
 
-    /// AI is on: not opted out, and a plan (or trial) is active.
+    /// AI is on: the device's AI setting is on (`AIService.isAIOff`: the AI choice made, not opted
+    /// out), and a plan (or trial) is active.
     static var isAIOn: Bool {
-        isAIOn(optedOut: AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey),
-               subscribed: AISubscriptionGate.shared.isActive)
+        isAIOn(aiOff: AIService.isAIOff, subscribed: AISubscriptionGate.shared.isActive)
     }
 
-    static func isAIOn(optedOut: Bool, subscribed: Bool) -> Bool {
-        !optedOut && subscribed
+    static func isAIOn(aiOff: Bool, subscribed: Bool) -> Bool {
+        !aiOff && subscribed
     }
 
     static var isActive: Bool {

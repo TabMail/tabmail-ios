@@ -34,7 +34,7 @@ struct PromptWriterInterruptionTests {
     private func quiet() {
         UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
         DeviceSyncService.shared.disconnect()
-        AIService.writeOptOutFlag(false)
+        AITestSetting.set(aiOff: false)
     }
 
     private func backend(_ payload: [String: Any], gate: ResponseGate) throws -> (BackendClient, FakeHTTP.Scenario) {
@@ -142,7 +142,7 @@ struct QueuedActionRefineTests {
     func dispatchPersistsOrDrops() async throws {
         UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
         DeviceSyncService.shared.disconnect()
-        AIService.writeOptOutFlag(false)
+        AITestSetting.set(aiOff: false)
         for interrupt in [false, true] {
             let tag = PromptStoreTestCleanup.tag()
             let gate = ResponseGate()
@@ -317,7 +317,7 @@ struct ActionRuleExactByteTests {
     private func quiet() {
         UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
         DeviceSyncService.shared.disconnect()
-        AIService.writeOptOutFlag(false)
+        AITestSetting.set(aiOff: false)
     }
 
     private func persisted() -> String {

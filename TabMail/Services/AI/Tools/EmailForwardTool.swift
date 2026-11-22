@@ -99,13 +99,15 @@ struct EmailForwardTool: AgentTool, Sendable {
                     return EmailFilter.htmlToPlainText(html)
                 }
                 let result = try await EmailComposeTool.runComposeEdit(
-                    recipients: to + cc,
+                    to: to,
+                    cc: cc,
                     subject: nil,
                     body: nil,
                     request: wrappedRequest,
                     mode: "edit_forward",
                     relatedHeader: header,
                     relatedBodyText: relatedBodyText,
+                    db: ctx.db,
                     ai: ctx.aiService
                 )
                 generatedSubject = result.subject

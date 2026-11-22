@@ -92,4 +92,48 @@ struct FolderSyncGoneStatusTests {
 
         #expect(surfaced != nil, "only 404 and 410 are skipped; any other status is the caller's to classify")
     }
+
+    @Test("An IMAP listing whose EXISTS 0 its SEARCH did not confirm (contradicted or refused) is skipped and the folders after it still sync",
+          arguments: [nil, "Injected refusal"] as [String?])
+    func anUnconfirmedListingCountIsSkippedAndTheFoldersAfterItStillSync(refusal: String?) async throws {
+        let f = try await Self.makeFixture(
+            accountId: "unconfirmed-\(refusal == nil ? "contradicted" : "refused")",
+            error: ProviderListingUnconfirmed(folder: "INBOX", refusal: refusal))
+
+        var surfaced: Error?
+        do {
+            try await AccountManager.shared.syncFolders(f.folders, connecting: [])
+        } catch {
+            surfaced = error
+        }
+        let fetched = await Self.fetchedFolders(f.provider)
+        await Self.tearDown(f)
+
+        #expect(surfaced == nil, "one folder's unconfirmed listing must not fail the sync, got \(String(describing: surfaced))")
+        #expect(fetched.contains("INBOX"), "the folder was attempted, got \(fetched)")
+        #expect(fetched.contains("Archive"), "one folder's unconfirmed listing must not abandon the folders after it, got \(fetched)")
+    }
+
+    @Test("A lost connection during a pull-to-refresh ends it with that error and publishes nothing")
+    func aLostConnectionEndsTheRefreshWithItsErrorAndPublishesNothing() async throws {
+        let lost = URLError(.networkConnectionLost)
+        let f = try await Self.makeFixture(accountId: "lost-connection", error: lost)
+        let before = try f.folders.map { try #require(try FolderEpochTestFixture.readFolder(accountId: f.accountId, path: $0.path, pool: f.pool)) }
+        let headersBefore = try await f.pool.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM messageHeader") ?? 0 }
+
+        var surfaced: Error?
+        do {
+            try await AccountManager.shared.syncFolders(f.folders, connecting: [])
+        } catch {
+            surfaced = error
+        }
+        let after = try f.folders.map { try #require(try FolderEpochTestFixture.readFolder(accountId: f.accountId, path: $0.path, pool: f.pool)) }
+        let headersAfter = try await f.pool.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM messageHeader") ?? 0 }
+        await Self.tearDown(f)
+
+        #expect((surfaced as? URLError)?.code == .networkConnectionLost,
+                "a lost connection must reach the user as the same error it did before, got \(String(describing: surfaced))")
+        #expect(after == before, "an unproven listing must publish no folder state")
+        #expect(headersAfter == headersBefore, "an unproven listing must publish no rows")
+    }
 }

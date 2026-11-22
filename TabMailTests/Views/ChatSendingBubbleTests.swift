@@ -136,6 +136,9 @@ struct ChatSendingBubbleTests {
     func summaryAtSendIsTheEmailsOwn() async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let restoreAISetting = AITestSetting.save()
+        AITestSetting.set(aiOff: false)
+        defer { restoreAISetting() }
         let fixture = try await Self.makeFixture(pool)
         let row = try await Self.queueReply(fixture, draftId: "draft-own", holdsForUndo: false)
         let messageId = try #require(row.sentMessageId, "the queued email has its Message-ID from the queue write")
@@ -169,6 +172,9 @@ struct ChatSendingBubbleTests {
     func lateSummaryReachesTheSentCopy() async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let restoreAISetting = AITestSetting.save()
+        AITestSetting.set(aiOff: false)
+        defer { restoreAISetting() }
         let fixture = try await Self.makeFixture(pool)
         let row = try await Self.queueReply(fixture, draftId: "draft-late", holdsForUndo: false)
 

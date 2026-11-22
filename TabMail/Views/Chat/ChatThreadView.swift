@@ -16,7 +16,7 @@ extension Notification.Name {
 
 extension ChatViewConfig {
     /// Whether an open goes to the chat now. Demo mode with AI declined counts as AI off. A
-    /// tutorial run follows what it teaches, decided when it started (`teachesChat`).
+    /// tutorial run follows what it teaches (`followingTutorial`).
     @MainActor static var opensInChat: Bool {
         let tutorial = TutorialCoordinator.shared
         return opensInChat(active: isActive,
@@ -26,7 +26,24 @@ extension ChatViewConfig {
     }
 
     static func opensInChat(active: Bool, demoHidesAI: Bool, tutorialRunning: Bool, tutorialTeachesChat: Bool) -> Bool {
-        tutorialRunning ? tutorialTeachesChat : active && !demoHidesAI
+        followingTutorial(active && !demoHidesAI, tutorialRunning: tutorialRunning, tutorialTeachesChat: tutorialTeachesChat)
+    }
+
+    /// The chat view's one tutorial-aware gate: while a tutorial runs, what the run teaches
+    /// (`TutorialCoordinator.teachesChat`, decided when it started); otherwise `live`, the app's own
+    /// value. Opens (`opensInChat`, and `SentEmailSummary.mayRun` through it), the inbox rows' chat
+    /// preview and the Enable Chat View switch all go through it, so a run shows one view
+    /// everywhere, before the AI choice too.
+    ///
+    /// Read in a view's body, it observes the run (`TutorialCoordinator` is `@Observable`; both
+    /// `isRunning` and `teachesChat` are read), so the view repaints when a run starts or ends.
+    @MainActor static func followingTutorial(_ live: Bool) -> Bool {
+        let tutorial = TutorialCoordinator.shared
+        return followingTutorial(live, tutorialRunning: tutorial.isRunning, tutorialTeachesChat: tutorial.teachesChat)
+    }
+
+    static func followingTutorial(_ live: Bool, tutorialRunning: Bool, tutorialTeachesChat: Bool) -> Bool {
+        tutorialRunning ? tutorialTeachesChat : live
     }
 }
 
@@ -104,9 +121,13 @@ struct ChatThreadView: View {
     private static let chatSwipeId = "chat-swipe"
     private static let pillSpring = Animation.spring(response: 0.45, dampingFraction: 0.82)
 
-    init(messageId: String, expectedRfc822MessageId: String? = nil, highlightsOpenedMessage: Bool = false) {
+    init(
+        messageId: String, expectedRfc822MessageId: String? = nil, expectedObservedUidValidity: Int? = nil,
+        highlightsOpenedMessage: Bool = false
+    ) {
         self._viewModel = State(initialValue: MessageDetailViewModel(
-            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId))
+            messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
+            expectedObservedUidValidity: expectedObservedUidValidity))
         self.highlightsOpenedMessage = highlightsOpenedMessage
     }
 

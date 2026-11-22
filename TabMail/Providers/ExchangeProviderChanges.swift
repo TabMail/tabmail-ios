@@ -43,10 +43,9 @@ import Foundation
 /// or coverage change (`.notRun`). Each listed message is read by id and
 /// answered for that folder by its `parentFolderId`.
 ///
-/// **Network.** A state baseline on an expensive network (cellular, a hotspot)
-/// waits, at most `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` counted from
-/// when the folder first needed it, then runs on any network, as the catch-up
-/// does. The Inbox baseline runs on any network.
+/// **Network.** Every baseline, the Inbox's and a state baseline, runs on any
+/// network, battery level and power mode, as the catch-up does: a scan always
+/// runs; only downloads wait (#1063).
 ///
 /// **Budget.** No request starts after `ChangeContext.deadline`, every request is
 /// given up after `SyncConfig.changeReadRequestTimeoutSeconds`, and one read
@@ -172,19 +171,10 @@ extension ExchangeProvider {
     ) async throws -> (changes: FolderChanges, verbIds: [String]) {
         let context = request.context
         let stored = OutlookFolderCursor(raw: folder.cursor)
-        var state = stored ?? OutlookFolderCursor.fresh(role: folder.role, now: context.clock())
+        var state = stored ?? OutlookFolderCursor.fresh(role: folder.role)
         var changes = FolderChanges(folderId: folder.id, status: .notRun)
         var collected = CollectedChanges()
         var verbOrder: [String] = []
-
-        // A state baseline on an expensive network waits, within its bound.
-        if state.phase == .baseline, state.select == .state, context.isExpensiveNetwork,
-           context.clock().timeIntervalSince(state.baselineSince) < SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds {
-            BackgroundSyncLogger.logDebug("[Exchange] change read: folder \(folder.id.suffix(12)) baseline waits for a non-expensive network")
-            changes.status = .baselining
-            changes.cursor = state != stored ? state.encoded : nil
-            return (changes, [])
-        }
 
         var ending = FolderReadEnding.cut
         var restartedBaseline = false
@@ -736,22 +726,16 @@ struct OutlookFolderCursor: Codable, Equatable, Sendable {
     var next: String?
     /// The first counted failure since the folder's last good page.
     var failingSince: Date?
-    /// When the folder first needed this baseline; an expensive network holds a
-    /// state baseline back for at most `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds`
-    /// from here.
-    var baselineSince: Date
 
-    static func fresh(role: FolderRole, now: Date) -> OutlookFolderCursor {
-        OutlookFolderCursor(phase: .baseline, select: role == .inbox ? .header : .state, baselineSince: now)
+    static func fresh(role: FolderRole) -> OutlookFolderCursor {
+        OutlookFolderCursor(phase: .baseline, select: role == .inbox ? .header : .state)
     }
 
-    init(phase: Phase, select: Selection, next: String? = nil,
-         failingSince: Date? = nil, baselineSince: Date) {
+    init(phase: Phase, select: Selection, next: String? = nil, failingSince: Date? = nil) {
         self.phase = phase
         self.select = select
         self.next = next
         self.failingSince = failingSince
-        self.baselineSince = baselineSince
     }
 
     /// Nil when absent, unreadable or of another version: the folder starts a
@@ -770,7 +754,7 @@ struct OutlookFolderCursor: Codable, Equatable, Sendable {
         return text
     }
 
-    /// Page 1 of the same baseline, keeping when it was first needed.
+    /// Page 1 of the same baseline.
     mutating func restartBaseline() {
         next = nil
     }
