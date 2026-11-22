@@ -15,6 +15,9 @@ extension Notification.Name {
     /// Test seam only: a pick for the reply field's paperclip (a `ComposeAttachmentPick`), as if a
     /// picker gave it and closed.
     static let chatPaperclipPickForTesting = Notification.Name("chatPaperclipPickForTesting")
+    /// Test seam only: a choice in the reply field's paperclip menu (a
+    /// `ChatNewEmailField.AttachSource`), which opens its picker as the menu does.
+    static let chatPaperclipOpenForTesting = Notification.Name("chatPaperclipOpenForTesting")
 }
 #endif
 
@@ -387,6 +390,12 @@ struct ChatThreadView: View {
             guard let pick = note.object as? ComposeAttachmentPick else { return }
             attachPicked(pick)
             openPendingAttachCard()
+        }
+        // Test seam: the paperclip's menu is a system menu a hosted test cannot open, so the test
+        // makes the menu's choice here and then drives the real picker. Production never posts it.
+        .onReceive(NotificationCenter.default.publisher(for: .chatPaperclipOpenForTesting)) { note in
+            guard let source = note.object as? ChatNewEmailField.AttachSource else { return }
+            attachFromField(source)
         }
         #endif
         .sheet(isPresented: $showsMove) {

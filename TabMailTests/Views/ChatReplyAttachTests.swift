@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import PhotosUI
 import SwiftUI
 import Testing
 import UIKit
@@ -199,10 +200,15 @@ struct ChatReplyAttachTests {
         // The test seam takes the same two steps as a picker, and exists only in debug builds.
         let seamText = ".onReceive(NotificationCenter.default.publisher(for: .chatPaperclipPickForTesting)) { note in guard let pick = note.object as? ComposeAttachmentPick else { return } attachPicked(pick) openPendingAttachCard() }"
         #expect(Self.count(seamText, in: chat) == 1)
-        let seam = try #require(chat.range(of: seamText))
-        let opened = try #require(chat.range(of: "#if DEBUG", options: .backwards, range: chat.startIndex..<seam.lowerBound))
-        let closed = chat.range(of: "#endif", options: .backwards, range: chat.startIndex..<seam.lowerBound)
-        #expect(closed.map { $0.lowerBound < opened.lowerBound } ?? true, "the seam sits inside #if DEBUG")
+        // The seam that opens a picker makes the menu's choice through the menu's own step.
+        let openText = ".onReceive(NotificationCenter.default.publisher(for: .chatPaperclipOpenForTesting)) { note in guard let source = note.object as? ChatNewEmailField.AttachSource else { return } attachFromField(source) }"
+        #expect(Self.count(openText, in: chat) == 1)
+        for text in [seamText, openText] {
+            let seam = try #require(chat.range(of: text))
+            let opened = try #require(chat.range(of: "#if DEBUG", options: .backwards, range: chat.startIndex..<seam.lowerBound))
+            let closed = chat.range(of: "#endif", options: .backwards, range: chat.startIndex..<seam.lowerBound)
+            #expect(closed.map { $0.lowerBound < opened.lowerBound } ?? true, "the seam sits inside #if DEBUG: \(text.prefix(80))")
+        }
     }
 
     @Test("The photo library and Files pickers hand over what was picked, nothing on Cancel, then close")
@@ -216,13 +222,16 @@ struct ChatReplyAttachTests {
         #expect(Self.count("if !urls.isEmpty { parent.onPick(urls) } parent.dismiss()", in: pickers) == 1)
         #expect(Self.count("func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { parent.dismiss() }", in: pickers) == 1)
         #expect(Self.count("context.coordinator.parent = self", in: pickers) == 2, "a picker reports to the view as it is now")
+        #expect(Self.count("picker.delegate = context.coordinator", in: pickers) == 2, "each picker reports to its coordinator")
     }
 
     // MARK: - In the chat
 
     /// The paperclip's card, opened through the chat's own steps (`ChatThreadView.attachPicked`,
     /// then `openPendingAttachCard`, as a picker's pick and its `onDismiss` take them) and its one
-    /// presenter. The system pickers themselves cannot be driven from a hosted test.
+    /// presenter, for picks a test cannot make in a real picker (a camera photo, a library photo).
+    /// The real pickers, their closing and the card after them: `hostedFilesPicker`,
+    /// `hostedPickerClosedWithoutPick`.
     private static func attach(_ pick: ComposeAttachmentPick, in chat: ChatReplyRecoveryTests.Chat) async throws -> UIView {
         NotificationCenter.default.post(name: .chatPaperclipPickForTesting, object: pick)
         try await ChatReplyRecoveryTests.waitUntil {
@@ -284,6 +293,94 @@ struct ChatReplyAttachTests {
                 #expect(Self.cardLabels(card).contains { $0.contains("photo_1.jpeg") }, "the photo is attached: \(Self.cardLabels(card).prefix(30))")
                 #expect(!Self.cardLabels(card).contains("Use Suggestion"),
                         "the suggestion written for everyone stays out of the card: \(Self.cardLabels(card).prefix(30))")
+            }
+        }
+    }
+
+    // MARK: - The real pickers
+
+    /// How long a card would take to start opening after its picker closed (`onDismiss`), before
+    /// a case says none did. The Files case shows one starting well within it.
+    private static let cardWouldHaveOpened: Duration = .milliseconds(800)
+
+    /// The first view controller of `type` presented over the chat (in a sheet's own hierarchy too).
+    private static func presented<T: UIViewController>(_ type: T.Type, over chat: ChatReplyRecoveryTests.Chat) -> T? {
+        var pending: [UIViewController] = chat.controller.presentedViewController.map { [$0] } ?? []
+        while let next = pending.popLast() {
+            if let match = next as? T { return match }
+            pending.append(contentsOf: next.children)
+            if let presented = next.presentedViewController { pending.append(presented) }
+        }
+        return nil
+    }
+
+    /// Waits for the chat's paperclip, then makes `source`'s choice in its menu.
+    private static func open(_ source: ChatNewEmailField.AttachSource, in chat: ChatReplyRecoveryTests.Chat) async throws {
+        try await ChatReplyRecoveryTests.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains(ChatPaperclipButton.id) }
+        #expect(HostedAccessibility.identifiers(in: chat.view).contains(ChatPaperclipButton.id),
+                "control: the reply field shows the paperclip: \(HostedAccessibility.identifiers(in: chat.view))")
+        NotificationCenter.default.post(name: .chatPaperclipOpenForTesting, object: source)
+    }
+
+    @Test("In the chat, a file picked in the paperclip's Files picker opens the Reply All card once the picker has closed")
+    func hostedFilesPicker() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let backend = ChatReplyRecoveryTests.Backend(failure: .serverError, asksForReply: false)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent("notes.txt")
+        try Data("Agenda".utf8).write(to: file)
+        try await HostedAccessibility.withAutomation {
+            try await ChatReplyRecoveryTests().withChat(backend, tag: "attach-files", suggestion: ChatReplyRecoveryTests.shownSuggestion) { chat in
+                try await Self.open(.files, in: chat)
+                try await ChatReplyRecoveryTests.waitUntil { Self.presented(UIDocumentPickerViewController.self, over: chat) != nil }
+                let picker = try #require(Self.presented(UIDocumentPickerViewController.self, over: chat), "control: the Files picker opened")
+                let delegate = try #require(picker.delegate, "the Files picker reports its pick to the chat")
+                #expect(ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view).isEmpty,
+                        "control: no card is open while the picker is")
+                // The pick, as the picker reports it; the picker then closes, and only then the card opens.
+                delegate.documentPicker?(picker, didPickDocumentsAt: [file])
+                try await ChatReplyRecoveryTests.waitUntil {
+                    ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view)["to"]?.isEmpty == false
+                }
+                let card = try #require(chat.controller.presentedViewController?.view, "the reply's card opened after the picker")
+                #expect(Self.presented(UIDocumentPickerViewController.self, over: chat) == nil, "the picker has closed")
+                let recipients = ChatReplyRecoveryTests.composeRecipients(card)
+                #expect(ChatReplyRecoveryTests.addresses(recipients["to"]).union(ChatReplyRecoveryTests.addresses(recipients["cc"]))
+                            == ["alex@example.com", "david@example.com", "sam@example.com"],
+                        "the card goes to everyone on the email: \(recipients)")
+            }
+        }
+    }
+
+    @Test("In the chat, a paperclip picker closed without a pick opens no card",
+          arguments: [ChatNewEmailField.AttachSource.photos, .files])
+    func hostedPickerClosedWithoutPick(source: ChatNewEmailField.AttachSource) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let backend = ChatReplyRecoveryTests.Backend(failure: .serverError, asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await ChatReplyRecoveryTests().withChat(backend, tag: "attach-none", suggestion: ChatReplyRecoveryTests.shownSuggestion) { chat in
+                try await Self.open(source, in: chat)
+                switch source {
+                case .photos:
+                    try await ChatReplyRecoveryTests.waitUntil { Self.presented(PHPickerViewController.self, over: chat) != nil }
+                    let picker = try #require(Self.presented(PHPickerViewController.self, over: chat), "control: the photo library picker opened")
+                    let delegate = try #require(picker.delegate, "the photo library picker reports to the chat")
+                    delegate.picker(picker, didFinishPicking: [])
+                case .files:
+                    try await ChatReplyRecoveryTests.waitUntil { Self.presented(UIDocumentPickerViewController.self, over: chat) != nil }
+                    let picker = try #require(Self.presented(UIDocumentPickerViewController.self, over: chat), "control: the Files picker opened")
+                    let delegate = try #require(picker.delegate, "the Files picker reports to the chat")
+                    delegate.documentPickerWasCancelled?(picker)
+                case .camera:
+                    Issue.record("the camera is not available to a hosted test")
+                    return
+                }
+                try await ChatReplyRecoveryTests.waitUntil { chat.controller.presentedViewController == nil }
+                #expect(chat.controller.presentedViewController == nil, "the picker closed itself")
+                try await Task.sleep(for: Self.cardWouldHaveOpened)
+                #expect(chat.controller.presentedViewController == nil, "and no card opened after it")
             }
         }
     }
