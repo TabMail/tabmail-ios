@@ -323,7 +323,15 @@ struct ComposeAttachmentCarryTests {
             ".fullScreenCover(isPresented: $showCamera)",
             before: ".dismissKeyboardOnTap()",
             in: source)
-        #expect(camera.contains("recordAttachmentPreparationFailure"),
+        #expect(camera.contains("CameraPickerView { image in addCameraPhoto(image) }"),
+                "the camera's photo is added by the one camera step")
+        let addCamera = try functionBody(
+            "private func addCameraPhoto(_ image: UIImage) {",
+            before: "private func addAttachmentPick() {",
+            in: source)
+        #expect(addCamera.contains("recordAttachmentPreparationFailure(DraftAttachmentImport.cameraFailureLabel)"),
                 "a failed camera-image conversion must be surfaced")
+        #expect(addCamera.contains("publishAttachmentPreparationFailuresIfSettled()"),
+                "and shown once nothing else is still being prepared")
     }
 }

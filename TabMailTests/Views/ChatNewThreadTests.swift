@@ -528,8 +528,9 @@ struct ChatNewThreadTests {
         #expect(Self.count(".task(id: replyField?.newEmail?.sessionKey) { startNewEmail() }", in: pill) == 1)
         #expect(Self.count(".onChange(of: inputText) { _, words in replyField?.newEmail?.wordsChanged(words) }", in: pill) == 1)
         let bar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
-        #expect(Self.count("if let newEmail = field.newEmail {", in: bar) == 1)
-        #expect(Self.count("ChatPaperclipButton(attach: newEmail.attach)", in: bar) == 1)
+        // The paperclip at the text's end: a new email's, or a thread's (`ChatReplyField.paperclip`).
+        #expect(Self.count("if let attach = field.paperclip {", in: bar) == 1)
+        #expect(Self.count("ChatPaperclipButton(attach: attach)", in: bar) == 1)
     }
 
     @Test("Back saves before it leaves, the background saves, and the open draft is kept from eviction")

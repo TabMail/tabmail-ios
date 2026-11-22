@@ -316,7 +316,8 @@ struct ChatNewEmailSubjectLine: View {
     }
 }
 
-/// A new email's paperclip, at the end of the field's text: Photos, Camera or Files.
+/// The field's paperclip, at the end of its text: Photos, Camera or Files. A new email's chat and
+/// every thread's chat show it (`ChatReplyField.paperclip`).
 struct ChatPaperclipButton: View {
     let attach: (ChatNewEmailField.AttachSource) -> Void
     @ScaledMetric(relativeTo: .body) private var lineHeight = ChatViewLayout.fieldLineHeight

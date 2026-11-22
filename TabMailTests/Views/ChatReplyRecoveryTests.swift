@@ -182,7 +182,7 @@ struct ChatReplyRecoveryTests {
     }
 
     /// Opens the chat on `groupEmail(tag)` in a window, its requests going to `backend`, and runs `body`.
-    private func withChat(_ backend: Backend, tag: String, suggestion: ReplyResult? = nil,
+    func withChat(_ backend: Backend, tag: String, suggestion: ReplyResult? = nil,
                           composeEdit: EmailReplyTool.ComposeEdit? = nil,
                           _ body: @MainActor (Chat) async throws -> Void) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -268,7 +268,7 @@ struct ChatReplyRecoveryTests {
     }
 
     /// Toggles `addresses` in the Reply to sheet, as the user does, then Done.
-    private static func toggle(_ addresses: [String], in chat: Chat) async throws {
+    static func toggle(_ addresses: [String], in chat: Chat) async throws {
         let names = try #require(namesButton(in: chat.view))
         #expect(names.accessibilityActivate(), "control: the header's names open Reply to")
         try await waitUntil { chat.controller.presentedViewController != nil }
@@ -291,7 +291,7 @@ struct ChatReplyRecoveryTests {
     }
 
     /// The "Replying only to" line above the field, if shown.
-    private static func replyingOnlyTo(in view: UIView) -> String? {
+    static func replyingOnlyTo(in view: UIView) -> String? {
         HostedAccessibility.labels(in: view).first { $0.hasPrefix("Replying only to") }
     }
 
@@ -301,7 +301,7 @@ struct ChatReplyRecoveryTests {
     }
 
     /// The compose's addresses by field ("to", "cc", "bcc"), as its recipient fields name them.
-    private static func composeRecipients(_ view: UIView?) -> [String: String] {
+    static func composeRecipients(_ view: UIView?) -> [String: String] {
         guard let view else { return [:] }
         var found: [String: String] = [:]
         for element in HostedAccessibility.elements(under: view) {
@@ -312,7 +312,7 @@ struct ChatReplyRecoveryTests {
         return found
     }
 
-    private static func addresses(_ field: String?) -> Set<String> {
+    static func addresses(_ field: String?) -> Set<String> {
         Set((field ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty })
     }
 
@@ -330,7 +330,7 @@ struct ChatReplyRecoveryTests {
     }
 
     /// Polls `condition` for up to ten seconds; the caller asserts on it afterwards.
-    private static func waitUntil(_ condition: @MainActor () async throws -> Bool) async throws {
+    static func waitUntil(_ condition: @MainActor () async throws -> Bool) async throws {
         for _ in 0..<100 {
             if try await condition() { return }
             try await Task.sleep(for: .milliseconds(100))
@@ -634,13 +634,13 @@ struct ChatReplyRecoveryTests {
         }
     }
 
-    private static let shownSuggestion = ReplyResult(
+    static let shownSuggestion = ReplyResult(
         body: "Hi Alex,\n\nTuesday works for me.\n\nThanks", textMessage: "Tuesday works for me")
     private static let editedSuggestion = ReplyResult(
         body: "Hi Alex,\n\nTuesday works.\n\nThanks", textMessage: "Tuesday works", changeCommand: "make it shorter")
 
     /// The AI Suggestions on screen, by the text they show.
-    private static func ghosts(in view: UIView) -> [(text: String, element: NSObject)] {
+    static func ghosts(in view: UIView) -> [(text: String, element: NSObject)] {
         HostedAccessibility.elements(under: view).compactMap { element in
             guard HostedAccessibility.identifier(of: element) == ChatSuggestionBubble.bubbleId,
                   let label = element.accessibilityLabel,
@@ -660,8 +660,7 @@ struct ChatReplyRecoveryTests {
         let store = NavigationStore()
         store.accounts = chat.accounts
         let card = UIHostingController(rootView: AnyView(
-            ready.compose.composeView(replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
-                                      openedOn: .chat, onAgentOutcome: { _ in })
+            ready.composeView(openedOn: .chat, onOutcome: { _ in })
                 .environment(store)
                 .environment(\.hasTabMailSession, true)))
         card.modalPresentationStyle = .fullScreen

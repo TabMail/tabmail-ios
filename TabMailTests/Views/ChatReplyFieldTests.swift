@@ -745,12 +745,16 @@ struct ChatReplyFieldTests {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(Self.count("readyReply = ChatReadyReply(message: newest, suggestion: shown, accounts: context.accounts)", in: text) == 1)
         #expect(Self.count("req.composeView(account:", in: text) == 1, "every agent compose opens through the one presenter")
-        #expect(Self.count("onAgentOutcome:", in: text) == 1, "only the AI Suggestion's card")
+        #expect(Self.count("onAgentOutcome:", in: text) == 0, "the ghost's and the paperclip's card open through their one builder")
         #expect(Self.count("composeEnded(.", in: text) == 0 && Self.count("{ _ in composeEnded", in: text) == 0)
-        // The AI Suggestion's card is not a send from the field: its outcome leaves the field's
-        // words alone (a completion with no field send would empty them).
-        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: composeScreen(answering: ready.message), onAgentOutcome: { _ in })", in: text) == 1,
-                "the card holds the suggestion the ghost showed, records the chat's screen and never completes the field")
+        // The ghost's and the paperclip's card are not a send from the field: their outcome leaves
+        // the field's words alone (a completion with no field send would empty them); a sent reply
+        // clears "Replying only to".
+        #expect(Self.count("ready.composeView(openedOn: composeScreen(answering: ready.message)) { outcome in readyCardEnded(outcome) }", in: text) == 1,
+                "the card is the value's own builder (its suggestion, draft and pick) and records the chat's screen")
+        let readyEnded = try Self.body(of: "private func readyCardEnded(_ outcome: ComposeOutcome) {", in: text)
+        #expect(readyEnded.hasPrefix(" guard case .sent = outcome else { return } replyTarget = .replyAll }"),
+                "only a sent reply resets who the next one goes to, and the field is never emptied: \(readyEnded)")
         #expect(Self.count("@State private var example = ChatSuggestionConfig.randomExample()", in: text) == 1,
                 "one example per chat open, kept across redraws")
         #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
@@ -870,8 +874,7 @@ struct ChatReplyFieldTests {
     /// The compose card the chat opens for the AI Suggestion, as the chat's cover builds it.
     private static func card(_ message: MessageHeader, accounts: [Account] = [me]) -> ComposeView {
         let ready = ChatReadyReply(message: message, suggestion: message.suggestion ?? .filtered, accounts: accounts)
-        return ready.compose.composeView(
-            replyTo: message, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: .chat, onAgentOutcome: { _ in })
+        return ready.composeView(openedOn: .chat, onOutcome: { _ in })
     }
 
     /// The compose card the chat opens for the agent's reply, as the chat's cover builds it.

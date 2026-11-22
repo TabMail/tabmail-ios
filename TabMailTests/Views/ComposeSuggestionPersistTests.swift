@@ -224,7 +224,8 @@ struct ComposeSuggestionPersistTests {
         let fresh = try #require(prepopulate.range(of: "freshSuggestion: {"))
         #expect(prepopulate[decision.upperBound..<fresh.lowerBound].contains("onlyToChosen: onlyToChosen,"),
                 "the card's own choice decides whether it may read the row's reply")
-        let closure = try #require(prepopulate.range(of: "guard let reply = replyTo else { return nil }"))
+        // A chat card reads no stored suggestion (`offersStoredSuggestion`): it shows the chat's or none.
+        let closure = try #require(prepopulate.range(of: "guard offersStoredSuggestion, let reply = replyTo else { return nil }"))
         let stored = try #require(prepopulate.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
         #expect(closure.lowerBound < stored.lowerBound,
                 "the closure reads the stored suggestion from the row at reply.id")

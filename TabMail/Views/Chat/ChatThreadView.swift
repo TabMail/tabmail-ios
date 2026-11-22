@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import GRDB
+import PhotosUI
 import SwiftUI
 import TipKit
 
@@ -12,6 +13,8 @@ extension Notification.Name {
     static let chatScrollPhaseForTesting = Notification.Name("chatScrollPhaseForTesting")
     /// Test fixture only: the jump button was tapped (its animated scroll starts now).
     static let chatJumpTappedForTesting = Notification.Name("chatJumpTappedForTesting")
+    /// Test seam only: a photo for the reply field's paperclip, as if the camera took it.
+    static let chatPaperclipPhotoForTesting = Notification.Name("chatPaperclipPhotoForTesting")
 }
 #endif
 
@@ -117,6 +120,15 @@ struct ChatThreadView: View {
     /// (`ChatNewEmailCover`).
     @State private var newEmailCover: ChatNewEmailCover?
     @Environment(\.hasTabMailSession) private var hasTabMailSession
+    /// The reply field's paperclip (ADR-IOS-114 decision 10): its pickers, and the camera's photo
+    /// until the camera's cover has closed.
+    @State private var showsPhotoPicker = false
+    @State private var photoPickerItems: [PhotosPickerItem] = []
+    @State private var showsFilePicker = false
+    @State private var showsCamera = false
+    @State private var cameraPhoto: UIImage?
+    /// The Files picker itself failed: said once.
+    @State private var attachFailure: String?
     @Environment(\.dismiss) private var dismiss
     /// The app's accounts: a new email's card opens from its bound account, looked up here.
     @Environment(NavigationStore.self) private var navigationStore
@@ -189,9 +201,14 @@ struct ChatThreadView: View {
         Set(members.compactMap { $0.rfc822MessageId.map(EmailFilter.normalizeMessageId) })
     }
 
+    private var attachFailureShown: Binding<Bool> {
+        Binding(get: { attachFailure != nil }, set: { if !$0 { attachFailure = nil } })
+    }
+
     private var isAnyPresentation: Bool {
         cardMessage != nil || readyReply != nil || agentCompose != nil
             || forwardMessage != nil || showsReplyTo || showsMove || newEmailCover != nil
+            || showsPhotoPicker || showsFilePicker || showsCamera
     }
 
     // MARK: - Body
@@ -342,13 +359,12 @@ struct ChatThreadView: View {
         }
         .fullScreenCover(item: $readyReply) { ready in
             let _ = ChatThreadView.logReadyCard(ready)
-            // Today's Reply All compose, with the AI Suggestion in its box: the full reply of the
-            // row the ghost showed, read with it, so the card holds the reply that was tapped. It
-            // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
+            // Today's reply compose: the ghost's, Reply All with the AI Suggestion in its box (the
+            // full reply of the row the ghost showed, read with it, so the card holds the reply
+            // that was tapped), or the paperclip's, with what was picked. It leaves the field
+            // alone: the field's words are not what it sends, and a sent reply retires the
             // suggestion through the outbox.
-            ready.compose.composeView(
-                replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
-                openedOn: composeScreen(answering: ready.message), onAgentOutcome: { _ in })
+            ready.composeView(openedOn: composeScreen(answering: ready.message)) { outcome in readyCardEnded(outcome) }
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
         .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }
@@ -358,6 +374,30 @@ struct ChatThreadView: View {
                 replyPeople: thread.replyPeople, target: replyTarget,
                 ownAddresses: context.ownAddresses) { replyTarget = $0 }
         }
+        // The reply field's paperclip: a pick opens the reply's card with it. The camera's photo
+        // waits until its cover has closed, so the card's cover never opens over a closing one.
+        .photosPicker(isPresented: $showsPhotoPicker, selection: $photoPickerItems, matching: .any(of: [.images, .videos]))
+        .onChange(of: photoPickerItems) { _, items in attachPicked(items) }
+        .fileImporter(isPresented: $showsFilePicker, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            attachFiles(result)
+        }
+        .fullScreenCover(isPresented: $showsCamera, onDismiss: attachCameraPhoto) {
+            CameraPickerView { image in cameraPhoto = image }
+        }
+        .alert("Couldn't add", isPresented: attachFailureShown) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(attachFailure ?? "")
+        }
+        #if DEBUG
+        // Test seam: a hosted test cannot drive the system pickers, so it hands over a camera photo
+        // here, as the camera's cover closing does. Production never posts it.
+        .onReceive(NotificationCenter.default.publisher(for: .chatPaperclipPhotoForTesting)) { note in
+            guard let image = note.object as? UIImage else { return }
+            cameraPhoto = image
+            attachCameraPhoto()
+        }
+        #endif
         .sheet(isPresented: $showsMove) {
             if let opened = viewModel.message {
                 MoveFolderPicker(accountId: opened.accountId, currentFolderPath: opened.folderPath) { path in
@@ -940,7 +980,7 @@ struct ChatThreadView: View {
     /// Debug-gated: each build of the ready card's content, with the draft it names.
     static func logReadyCard(_ ready: ChatReadyReply) {
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) suggestionLen=\(ready.suggestion.body.count)")
+            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) suggestionLen=\(ready.suggestion?.body.count ?? -1) picked=\(ready.pick != nil)")
         }
     }
 
@@ -989,7 +1029,8 @@ struct ChatThreadView: View {
                     // action), on the text field VoiceOver focuses; not over the panel or the tutorial.
                     showChat: chatExpanded || TutorialCoordinator.shared.isRunning
                         ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } },
-                    suggestion: shown),
+                    suggestion: shown,
+                    attach: attachFromField),
                 onFieldSend: { _ in fieldComposeOpened = false },
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: viewModel.message?.accountId,
@@ -1156,6 +1197,60 @@ struct ChatThreadView: View {
     private func agentAnswered() {
         guard !fieldComposeOpened else { return }
         withAnimation(Self.pillSpring) { chatExpanded = true }
+    }
+
+    /// A choice in the reply field's paperclip (ADR-IOS-114 decision 10): the picker it names. The
+    /// tutorial's mail actions are off.
+    private func attachFromField(_ source: ChatNewEmailField.AttachSource) {
+        guard TutorialCoordinator.shared.admits(.other) else { return }
+        switch source {
+        case .photos: showsPhotoPicker = true
+        case .camera: showsCamera = true
+        case .files: showsFilePicker = true
+        }
+    }
+
+    private func attachPicked(_ items: [PhotosPickerItem]) {
+        guard !items.isEmpty else { return }
+        photoPickerItems = []
+        openAttachCard(.photos(items))
+    }
+
+    private func attachFiles(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard !urls.isEmpty else { return }
+            openAttachCard(.files(urls))
+        case .failure(let error):
+            attachFailure = error.localizedDescription
+        }
+    }
+
+    /// The camera's cover closed: its photo, if one was taken, opens the card.
+    private func attachCameraPhoto() {
+        guard let image = cameraPhoto else { return }
+        cameraPhoto = nil
+        openAttachCard(.camera(image))
+    }
+
+    /// Something picked with the paperclip: the reply's compose card opens with it, read as the pick
+    /// lands, as a send from the field is: on the newest email, to whom the field's reply goes, with
+    /// the suggestion the chat shows (`ChatReadyReply(attaching:)`).
+    private func openAttachCard(_ pick: ComposeAttachmentPick) {
+        guard let newest = thread.newest else { return }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Chat] paperclip card message=\(newest.id) onlyTo=\(replyTarget.only?.count ?? -1)")
+        }
+        readyReply = ChatReadyReply(
+            attaching: pick, to: newest, onlyTo: replyTarget.only,
+            shown: shownSuggestion(on: newest, thread: thread), accounts: context.accounts)
+    }
+
+    /// The ghost's or the paperclip's card closed. Its words were never the field's, so the field
+    /// stays as it is; a reply sent clears "Replying only to", so the next one is a Reply All again.
+    private func readyCardEnded(_ outcome: ComposeOutcome) {
+        guard case .sent = outcome else { return }
+        replyTarget = .replyAll
     }
 
     /// A compose card from the chat closed. Sent: a reply shows as its queued email's bubble, read

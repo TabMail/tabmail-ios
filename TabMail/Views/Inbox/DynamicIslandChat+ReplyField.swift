@@ -70,12 +70,12 @@ extension DynamicIslandChat {
                             // The drag stays on while the agent works: so does its VoiceOver action.
                             .showChatAction(field.showChat, isExpanded: isExpanded)
                     } else {
-                        if let newEmail = field.newEmail {
-                            // A new email's paperclip sits at the text's end, inside the field: the
-                            // row's mic, text and Send keep their places.
+                        if let attach = field.paperclip {
+                            // The paperclip sits at the text's end, inside the field: the row's
+                            // mic, text and Send keep their places.
                             HStack(alignment: .bottom, spacing: ChatViewLayout.fieldTextGap) {
                                 replyInput(field)
-                                ChatPaperclipButton(attach: newEmail.attach)
+                                ChatPaperclipButton(attach: attach)
                             }
                         } else {
                             replyInput(field)
