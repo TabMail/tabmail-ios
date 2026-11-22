@@ -906,7 +906,8 @@ struct ChatThreadViewLifecycleTests {
     @Test("Opened at the bottom, the chat ends at the bottom when only the bottom inset grows, as the keyboard's does")
     func bottomLandingFollowsABottomInset() async throws {
         try await withPinned(unreadFrom: nil) { chat in
-            #expect(try await Self.until { chat.field != nil && chat.landed && abs(chat.belowScreen) < 2 }, "control: the open lands at the bottom")
+            let opened = try await Self.until { chat.field != nil && chat.landed && abs(chat.belowScreen) < 2 }
+            #expect(opened, "control: the open lands at the bottom")
             chat.phases(.animating, .decelerating, .idle)
             let height = try #require(chat.scroll?.bounds.height)
             let fieldTop = try #require(chat.fieldTop)
@@ -932,8 +933,8 @@ struct ChatThreadViewLifecycleTests {
     func unreadLandingKeepsItsAnchorThroughABottomInset() async throws {
         let firstUnread = 20
         try await withPinned(unreadFrom: firstUnread) { chat in
-            #expect(try await Self.until { chat.field != nil && chat.shows(firstUnread) && !chat.shows(firstUnread - 1) && chat.belowScreen > 2 },
-                    "control: the open lands at the Unread line")
+            let opened = try await Self.until { chat.field != nil && chat.shows(firstUnread) && !chat.shows(firstUnread - 1) && chat.belowScreen > 2 }
+            #expect(opened, "control: the open lands at the Unread line")
             let landed = try #require(chat.top(of: firstUnread))
             chat.phases(.animating, .decelerating, .idle)
             let height = try #require(chat.scroll?.bounds.height)
