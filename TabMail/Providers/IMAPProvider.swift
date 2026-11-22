@@ -796,6 +796,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// connections.
     var generation: Int = 0
 
+    /// Set once, by `disconnectForAccountRemoval()`, and never cleared: the
+    /// account is gone, so no later caller may open a server session with its
+    /// credentials. Read by `openingTornDown`, the one opening check.
+    private var retiredForAccountRemoval = false
+
     // MARK: - Action Connection
     // Dedicated connection for user-initiated actions (move, flag, mark read, draft, etc.).
     // SELECTs the needed folder per-operation (~150ms, fine for low-volume user actions).
@@ -858,8 +863,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `dropChangeServer`, `evictChangeConnectionIfIdle`, `disconnect()` and
     /// `markDirty()`.
     var changeServer: IMAPServer?
-    /// `ENABLE QRESYNC` was acknowledged on `changeServer`'s session.
-    var changeServerQResync = false
+    /// How `changeServer`'s session reads changes, decided once when it opened
+    /// (`IMAPChangeMode.decide`); nil = it cannot, every folder is untracked.
+    var changeMode: IMAPChangeMode?
+    #if DEBUG
+    /// Test seam: `SyncConfig.imapChangeRemovalCheckWindow` for this provider.
+    var removalCheckWindowForTesting: Int?
+    #endif
     var changeServerLastUsed: Date?
     /// The LOGOUT of the change session dropped last (`dropChangeServer`): true
     /// once the session has ended. A pass opens a new session after a dropped one
@@ -970,6 +980,25 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     private nonisolated let serverCreatedTestHook =
         Mutex<(@Sendable (IMAPServer, String) -> Void)?>(nil)
 
+    #if DEBUG
+    /// Test seam: when set, `send(draft:)` uses the returned SMTP session
+    /// instead of a SwiftMail `SMTPServer` (`IMAPProviderSMTPSession.swift`).
+    private nonisolated let smtpSessionTestFactory =
+        Mutex<(@Sendable () -> any SMTPSubmissionSession)?>(nil)
+
+    nonisolated func setSMTPSessionFactoryForTesting(_ factory: (@Sendable () -> any SMTPSubmissionSession)?) {
+        smtpSessionTestFactory.withLock { $0 = factory }
+    }
+    #endif
+
+    /// The SMTP session one send uses.
+    private nonisolated func makeSMTPSession() -> any SMTPSubmissionSession {
+        #if DEBUG
+        if let factory = smtpSessionTestFactory.withLock({ $0 }) { return factory() }
+        #endif
+        return SMTPServer(host: smtpHost, port: smtpPort)
+    }
+
     /// Test seam: install `serverCreatedTestHook`.
     nonisolated func setServerCreatedTestHookForTesting(_ hook: (@Sendable (IMAPServer, String) -> Void)?) {
         serverCreatedTestHook.withLock { $0 = hook }
@@ -1040,6 +1069,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `passGeneration`: the generation of the change pass the session is opened
     /// for; the LOGIN is sent only while it holds.
     private func createServer(diagSite: String, passGeneration: Int? = nil) async throws -> IMAPServer {
+        // A provider retired by account removal opens nothing, for any caller.
+        if openingTornDown(passGeneration) { throw ProviderError.notConnected }
         let server = IMAPServer(
             host: host,
             port: port,
@@ -2686,6 +2717,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         startKeepAlive()
     }
 
+    /// Account removal: retire the provider in this actor turn, before any
+    /// suspension, then tear down as `disconnect()` does. A caller still
+    /// holding this provider (a listing that waited for the sync turn, a send)
+    /// gets `ProviderError.notConnected` from every later opening.
+    func disconnectForAccountRemoval() async {
+        retiredForAccountRemoval = true
+        try? await disconnect()
+    }
+
     func disconnect() async throws {
         stopKeepAlive()
         stopIdle()
@@ -2744,7 +2784,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let capturedActionServer = actionServer
         let capturedChangeServer = changeServer
         changeServer = nil
-        changeServerQResync = false
+        changeMode = nil
         changeSelectedPath = nil
         let capturedFolderWaiters = folderWaiters
         let capturedFolderCapacityWaiters = folderCapacityWaiters
@@ -2911,7 +2951,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if let server = changeServer {
             detachedTeardownLogout(server)
             changeServer = nil
-            changeServerQResync = false
+            changeMode = nil
             changeSelectedPath = nil
         }
 
@@ -3711,15 +3751,18 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         guard let server = changeServer, !changeLaneBusy else { return false }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAPChanges] Evicting the idle change connection to free a server slot") }
         changeServer = nil
-        changeServerQResync = false
+        changeMode = nil
         changeSelectedPath = nil
         logouts.append(detachedTeardownLogout(server))
         return true
     }
 
-    /// Whether the change pass of `passGeneration` has been torn down since.
+    /// Whether an opening must stop: the provider was retired by account
+    /// removal (terminal, every caller), or the change pass of
+    /// `passGeneration` has been torn down since.
     private func openingTornDown(_ passGeneration: Int?) -> Bool {
-        passGeneration.map { $0 != generation } ?? false
+        if retiredForAccountRemoval { return true }
+        return passGeneration.map { $0 != generation } ?? false
     }
 
     /// Teardown: close at once, without a LOGOUT, the change session being
@@ -6292,14 +6335,20 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     func send(draft: DraftMessage) async throws {
+        // The SMTP session logs in with the same credentials: a retired
+        // provider sends nothing.
+        if openingTornDown(nil) { throw ProviderError.notConnected }
         try await withTimeout(seconds: SyncConfig.smtpSendTimeoutSeconds) {
+            // The timeout runs this in an unstructured task: removal can land
+            // between the entry check and its start, so no connection opens then.
+            if await self.openingTornDown(nil) { throw ProviderError.notConnected }
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Sending via \(self.smtpHost):\(self.smtpPort) from=\(self.senderEmail) to=\(draft.to) attachments=\(draft.attachments.count)") }
             // Built before connecting: a recipient SwiftMail cannot read fails the
             // send without opening a connection.
             let email = try Self.buildEmail(from: draft, senderEmail: self.senderEmail)
-            let smtpServer = SMTPServer(host: self.smtpHost, port: self.smtpPort)
+            let smtpServer = self.makeSMTPSession()
             do {
-                try await smtpServer.connect()
+                try await smtpServer.openConnection()
             } catch {
                 // IOS-TLS-002, send path. Without this the row stays `.queued`
                 // FOREVER: `isTransientSendError` reads `.tlsFailed`/connection
@@ -6308,20 +6357,30 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // given the Retry/Discard agency Outbox Rules 7/9 promise.
                 throw Self.mapTransportSecurityFailure(error, host: self.smtpHost)
             }
-            try await smtpServer.login(username: self.username, password: self.password)
+            // Connect, greeting and TLS were awaited: an account removed
+            // meanwhile neither authenticates nor submits.
+            if await self.openingTornDown(nil) {
+                try? await smtpServer.close()
+                throw ProviderError.notConnected
+            }
+            try await smtpServer.authenticate(username: self.username, password: self.password)
+            if await self.openingTornDown(nil) {
+                try? await smtpServer.close()
+                throw ProviderError.notConnected
+            }
 
             do {
-                try await smtpServer.sendEmail(email)
+                try await smtpServer.submit(email)
             } catch {
                 if !(error is CancellationError) && !SyncEngine.isConnectionError(error) {
                     BackgroundSyncLogger.logError("SMTP send failed: \(error)", source: "outbox:\(self.senderEmail)")
                 }
                 // Best-effort disconnect before rethrowing
-                try? await smtpServer.disconnect()
+                try? await smtpServer.close()
                 throw error
             }
             // Email is sent — disconnect is cleanup, must not throw
-            try? await smtpServer.disconnect()
+            try? await smtpServer.close()
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Send complete") }
         }
     }

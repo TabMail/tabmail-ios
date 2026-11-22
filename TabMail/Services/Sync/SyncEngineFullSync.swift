@@ -422,20 +422,14 @@ extension SyncEngine {
             for folder in syncableFolders where !folder.path.isEmpty && !skippablePaths.contains(folder.path)
                 && !trackedFolderIds.contains(folder.id) {
                 // T4.S6 re-drive. A folder left quarantined by an interrupted
-                // reaction (crash, transient step failure) BRANCHES INTO the
-                // reaction instead of a normal sync — never a plain skip. The flag
-                // means "re-drive me", and only incidentally "skip normal sync
-                // until then": an ordinary pass here would insert NEW-epoch headers
-                // under the OLD stamp, which is precisely the state a bare-UID
-                // durable op mutates the wrong message from. Launch/foreground full
-                // sync is therefore the re-drive OWNER; `runUidValidityResetReaction`
-                // re-enters at the barrier (idempotent) when the flag is already set.
-                if folder.uidValidityResetPendingAt != nil {
-                    await AccountManager.shared.runUidValidityResetReaction(
-                        accountId: account.id, folderPath: folder.path
-                    )
-                    continue
-                }
+                // reaction (crash, transient step failure) is never listed here:
+                // an ordinary pass would insert NEW-epoch headers under the OLD
+                // stamp, which is precisely the state a bare-UID durable op
+                // mutates the wrong message from. It BRANCHES INTO the reaction
+                // after this block, in the pass's own task (`quarantinedFolders`
+                // below): the reaction's resync lists inside the account's sync
+                // turn, which this detached task does not hold (#755).
+                if folder.uidValidityResetPendingAt != nil { continue }
                 // The `recentlyCompleted` protection set is NOT read here. It is
                 // read INSIDE `runSyncMessages`'s write transaction — see the note
                 // there and on `AccountManager.liveRecentlyCompleted`.
@@ -494,6 +488,21 @@ extension SyncEngine {
             return (allMigratedIds, listing)
         }.value
 
+        // T4.S6 re-drive, in the pass's own task (the turn's holder), after the
+        // listing so no reaction delays it. The flag means "re-drive me", and
+        // only incidentally "skip normal sync until then". Launch/foreground full
+        // sync is therefore the re-drive OWNER; `runUidValidityResetReaction`
+        // re-enters at the barrier (idempotent) when the flag is already set.
+        // The same folders the listing loop skipped for it.
+        let quarantinedFolders = syncableFolders.filter {
+            !$0.path.isEmpty && !skippablePaths.contains($0.path) && !trackedFolderIds.contains($0.id)
+                && $0.uidValidityResetPendingAt != nil
+        }
+        for folder in quarantinedFolders {
+            try Task.checkCancellation()
+            await AccountManager.shared.runUidValidityResetReaction(accountId: account.id, folderPath: folder.path)
+        }
+
         // Clear undo protection for migrated UIDs
         // UID migration tracking — logged for diagnostics but no longer clears undoProtectedIds
         // (pending-op check in sync transaction handles undo protection now)
@@ -533,7 +542,8 @@ extension SyncEngine {
                     folderId: folder.id, folderPath: folder.path, accountId: account.id,
                     provider: provider, dbPool: pool)
                 // A tracked folder's removals arrive exactly through the change
-                // read (QRESYNC VANISHED against held rows): no count walk for
+                // read (QRESYNC VANISHED, or the CONDSTORE removal check, against
+                // held rows): no count walk for
                 // it (ADR-IOS-111). An untracked folder's removals come from its
                 // listing's own sweep and from the walk below.
                 if trackedFolderIds.contains(folder.id) { continue }
@@ -587,13 +597,23 @@ extension SyncEngine {
     /// move, step 6 of an epoch rebuild. Publishes `.checking` for the account.
     /// Lists through the one classifier (`listFolder`): the outcome says what
     /// the server proved, and no listing error escapes it (#755). Returns nil
-    /// when the folder's armed turnover reaction ran instead. Throws only
+    /// when the folder's armed turnover reaction ran instead, or when the
+    /// account was removed or the folder deleted before the sync turn was
+    /// acquired (nothing is listed). Throws only
     /// `CancellationError`.
+    #if DEBUG
+    /// Test harness only: awaited by a standalone listing after its turn-holder
+    /// checks and current-folder lookup, before it reads anything else. Nil in
+    /// every run but the test that sets it.
+    static let standaloneListingAfterLookupTestHook = Mutex<(@Sendable (_ accountId: String) async -> Void)?>(nil)
+    #endif
+
     @discardableResult
     func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws -> ListingOutcome? {
         // T4.S6 re-drive — the THIRD owner, and the ONLY one that reaches a custom
-        // non-favourite folder. `fullSync`'s per-folder loop and `imapDeltaSync`
-        // both branch into the reaction for a quarantined folder, but both iterate
+        // non-favourite folder. `fullSync` (after its listing, in the pass's own
+        // task) and `imapDeltaSync` both branch into the reaction for a quarantined
+        // folder, but both iterate
         // `syncableFolders` (primary ∪ secondary ∪ favourite), so a quarantined
         // custom folder previously had NO re-drive at all: `runSyncMessages`'s
         // in-transaction quarantine term correctly SKIPS the merge pass and
@@ -620,7 +640,34 @@ extension SyncEngine {
             return nil
         }
         Task { @MainActor in AccountManagerState.shared.setSyncPhase(.checking, forAccount: folder.accountId) }
-        let outcome = await listFolder(folder, provider: provider, limit: SyncConfig.syncMessageLimit)
+        // Inside the account's sync turn: no listing commits between a change
+        // read and its apply (#755).
+        //
+        // The post-send and post-drain listings wait for this turn without a
+        // work-queue slot, holding a captured provider and folder. An account
+        // removed or a folder deleted while they wait must not be listed: the
+        // captured IMAP provider would log in again with its retained password.
+        // So the turn's holder re-checks the terminal removal fence and the
+        // folder's current row, and lists nothing when either is gone.
+        let outcome: ListingOutcome? = await oneSyncAtATime(accountId: folder.accountId) {
+            guard !AccountManager.shared.isRuntimeRemoved(folder.accountId) else {
+                BackgroundSyncLogger.logDebug("[Sync] \(folder.name): account removed while waiting for the sync turn; listing skipped")
+                return nil
+            }
+            guard let current = try? await dbPool.read({ [folderId = folder.id] db in
+                try Folder.fetchOne(db, key: folderId)
+            }) else {
+                BackgroundSyncLogger.logDebug("[Sync] \(folder.name): folder gone while waiting for the sync turn; listing skipped")
+                return nil
+            }
+            // The checks above cover only up to here: removal or deletion during
+            // the awaits that follow is refused by the provider's retirement
+            // (no session opens) and by the listing's own folder-row read.
+            #if DEBUG
+            if let hook = Self.standaloneListingAfterLookupTestHook.withLock({ $0 }) { await hook(folder.accountId) }
+            #endif
+            return await listFolder(current, provider: provider, limit: SyncConfig.syncMessageLimit)
+        }
         try Task.checkCancellation()
         // Unread recount is handled when the listing's result is published.
 
@@ -1325,9 +1372,13 @@ extension SyncEngine {
         // (guard (a) skips this pass and the reaction owns it). It is a no-op — one
         // small read, no network — for every folder that already has an epoch, holds
         // no rows, or is already quarantined, which is the steady state.
-        await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
+        //
+        // A folder whose row is gone by now (deleted, or its account removed while
+        // this listing waited) is not read from the server at all.
+        let verification = await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
             folderId: folder.id, folderPath: folder.path, accountId: folder.accountId,
             provider: provider, dbPool: dbPool)
+        if verification == .folderGone { throw FolderGoneBeforeListing() }
         let fetched = try await provider.fetchMessagesWithObservedEpoch(
             folder: folder.path, limit: limit, offset: 0)
         let messages = fetched.messages
@@ -2614,8 +2665,14 @@ extension SyncEngine {
     ///   contradicted EXISTS 0, any error after SELECT. Nothing written; the
     ///   stamp is withheld. `connectionLost` lets the caller retry once.
     /// No error escapes the classifier, so no caller can rethrow past it.
+    /// `runSyncMessages` found the folder's row gone before reading the server.
+    struct FolderGoneBeforeListing: Error {}
+
     enum ListingOutcome: Sendable {
         case proven(SyncMessagesResult)
+        /// The folder's row was gone before the listing read the server: nothing
+        /// was read or written, and the folder owes nothing.
+        case folderGone
         case notListable(SyncMessagesResult?)
         /// `error` is the listing's own error, when it ended with one, so a
         /// caller that shows errors (pull-to-refresh) can show the same one.
@@ -2628,6 +2685,7 @@ extension SyncEngine {
             case .proven(let r): r
             case .notListable(let r): r
             case .unproven(let r, _, _): r
+            case .folderGone: nil
             }
         }
     }
@@ -2641,6 +2699,8 @@ extension SyncEngine {
             let result = try await runSyncMessages(for: folder, provider: provider, limit: limit, dbPool: dbPool)
             if result.proven { return .proven(result) }
             return result.notListable ? .notListable(result) : .unproven(result, connectionLost: false, error: nil)
+        } catch is FolderGoneBeforeListing {
+            return .folderGone
         } catch is ProviderFolderNotListable {
             return .notListable(nil)
         } catch {
@@ -2662,6 +2722,8 @@ extension SyncEngine {
         case .unproven:
             listing.droppedFolder = true
             oweDeepListing(folderId: folderId)
+        case .folderGone:
+            break
         }
     }
 

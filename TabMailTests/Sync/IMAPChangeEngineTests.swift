@@ -20,7 +20,9 @@ struct IMAPChangeEngineTests {
     static let epoch = 61_200
     static let path = "INBOX"
     static let qresync = FakeIMAPServer.defaultCapabilities + ["ENABLE", "CONDSTORE", "QRESYNC"]
-    static let condstoreOnly = FakeIMAPServer.defaultCapabilities + ["CONDSTORE"]
+    /// CONDSTORE without QRESYNC or UIDPLUS: no change reader, so every folder
+    /// is untracked (with UIDPLUS a CONDSTORE server is read, #755).
+    static let condstoreOnly = FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" } + ["CONDSTORE"]
 
     struct World {
         let server: FakeIMAPServer

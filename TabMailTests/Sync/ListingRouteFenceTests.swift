@@ -96,7 +96,7 @@ struct ListingRouteFenceTests {
         ], "a new caller is reviewed against the one classifier: \(callers.sorted())")
         let engine = try #require(sources.first { $0.path == Self.engineFile }?.text)
         let body = try #require(engine.range(of: "func syncFolderMessages(").map { String(engine[$0.lowerBound...].prefix(4000)) })
-        #expect(body.contains("await listFolder(folder, provider: provider"), "syncFolderMessages lists through listFolder")
+        #expect(body.contains("listFolder(current, provider: provider"), "syncFolderMessages lists the re-read folder row through listFolder")
     }
 
     /// Both stale-sweep branches build the coverage they judge with through the

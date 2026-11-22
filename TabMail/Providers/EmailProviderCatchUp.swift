@@ -36,6 +36,10 @@ protocol CatchUpLocalRowReader: Sendable {
     /// Rows whose id, read as an integer, lies in `lower...upper`, ascending by
     /// that integer (IMAP: a UID range).
     func rows(folderId: String, numericIdsFrom lower: Int, through upper: Int) async throws -> [CatchUpLocalRow]
+    /// Up to `limit` rows whose id, read as an integer, is below `upper`,
+    /// descending by that integer (IMAP: the newest UIDs below a bound; never
+    /// by date).
+    func rows(folderId: String, numericIdsBelow upper: Int, limit: Int) async throws -> [CatchUpLocalRow]
     /// The smallest id, read as an integer, that is `>= lower`, or nil when none is.
     func firstNumericId(folderId: String, atLeast lower: Int) async throws -> Int?
     /// The largest id, read as an integer, or nil when the folder holds none.

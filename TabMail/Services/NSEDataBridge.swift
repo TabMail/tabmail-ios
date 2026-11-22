@@ -3769,6 +3769,11 @@ enum NSEDataBridge {
             arguments: [header.id]
         ) ?? 0
         let didInsert = rowsAfter > rowsBefore
+        // A staged row the folder's change bookmark claims it already held may be
+        // a message a read proved gone: the folder is listed again (#755).
+        if didInsert {
+            try SyncEngine.endTrackingIfBookmarkClaimsHeld(folderId: folderId, messageId: msg.messageId, db: db)
+        }
 
         if DebugModeManager.isLoggingEnabled() {
             print("[NSEDataBridge] Created header for \(msg.messageId) from NSE staging (pre-sync), inserted=\(didInsert)")

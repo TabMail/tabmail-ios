@@ -81,6 +81,24 @@ struct ChangeSeamFenceTests {
         }
     }
 
+    @Test("only the IMAP provider, its fork adapter and the notification merge read the IMAP bookmark; the from-server insert guard is provider-blind (#755)")
+    func imapBookmarkStaysBelowTheBoundary() throws {
+        let files = try Self.sources()
+        let allowed = ["TabMail/Providers/IMAPProvider", "TabMail/Providers/IMAPChangeCommands.swift", "TabMail/Services/NSEDataBridge.swift"]
+        let readers = files.filter { file in
+            file.source.contains("IMAPChangeCursor") && !allowed.contains { file.relativePath.hasPrefix($0) }
+        }
+        #expect(readers.isEmpty, "IMAPChangeCursor named above the boundary: \(readers.map(\.relativePath))")
+        let guardFile = try Self.file(files, "TabMail/Services/Sync/SyncEngineFromServerInsertGuard.swift")
+        for term in ["GmailProvider", "ExchangeProvider", "IMAPProvider", "IMAPChange", "provider as?", "case .imap"] {
+            #expect(!guardFile.contains(term), "the insert guard names \(term)")
+        }
+        // The only provider-neutral result fields the CONDSTORE reader added.
+        let seam = try Self.file(files, "TabMail/Providers/EmailProviderChanges.swift")
+        #expect(seam.contains("var mustList = false"))
+        #expect(seam.contains("var heldRowsProof: HeldRowsProof?"))
+    }
+
     @Test("the release boundary's re-read of retired actions names no concrete provider and tests no account provider (#876)")
     func retiredActionRecheckIsProviderBlind() throws {
         let source = try Self.file(try Self.sources(), "TabMail/Services/Sync/SyncEngineRetiredActionRecheck.swift")
@@ -95,7 +113,9 @@ struct ChangeSeamFenceTests {
 
     @Test("the change readers only read: no database in a reader file")
     func readersOnlyRead() throws {
-        let files = try Self.sources().filter { $0.relativePath.hasSuffix("ProviderChanges.swift") }
+        let files = try Self.sources().filter {
+            $0.relativePath.hasSuffix("ProviderChanges.swift") || $0.relativePath.hasSuffix("ProviderChangesCondstore.swift")
+        }
         #expect(files.count >= 3, "precondition: the seam and the Gmail and Outlook readers were read")
         for file in files {
             for term in ["dbPool", "Database", "import GRDB", ".write {", ".read {"] {

@@ -436,7 +436,18 @@ extension SyncEngine {
     /// exactly that folder.
     struct CrawlEpochPremise: Sendable, Equatable {
         let epoch: UInt32?
-        init(_ epoch: UInt32?) { self.epoch = epoch }
+        /// The crawl's change premise (#755), read before the range's server
+        /// read: the insert lands only while the folder's change bookmark and
+        /// state are unchanged (`fromServerInsertAllowed`). A serial caller
+        /// (inside the sync turn) holds none.
+        let guardsChange: Bool
+        let change: SyncEngine.ChangeInsertPremise?
+        init(_ epoch: UInt32?) { self.init(epoch, guardsChange: false, change: nil) }
+        init(_ epoch: UInt32?, guardsChange: Bool, change: SyncEngine.ChangeInsertPremise?) {
+            self.epoch = epoch
+            self.guardsChange = guardsChange
+            self.change = change
+        }
     }
 
     /// May a bookkeeping write from this pass land on this folder, judged against
@@ -1809,6 +1820,20 @@ extension SyncEngine {
                                         break
                                     }
 
+                                    // The change premise, before this range's server read:
+                                    // a change read that proves one of its UIDs gone
+                                    // meanwhile refuses its insert (#755).
+                                    let changePremise: SyncEngine.ChangeInsertPremise?
+                                    do {
+                                        changePremise = try await AppDatabase.backgroundPool.read { db in
+                                            try SyncEngine.changeInsertPremise(db, folderId: folderCaptured.id)
+                                        }
+                                    } catch {
+                                        await cursor.failRange(from: range.from, to: range.to)
+                                        outcome.stoppedOnFailure = true
+                                        break
+                                    }
+
                                     // SEARCH first: discover which UIDs exist in this range
                                     let existingUIDs: [UInt32]
                                     do {
@@ -1971,14 +1996,14 @@ extension SyncEngine {
                                             await self.insertBackfillBatch(
                                                 fetchedHeaders, folderId: folderCaptured.id, accountId: folderCaptured.accountId,
                                                 folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox,
-                                                epochPremise: .init(walkWritePremise),
+                                                epochPremise: .init(walkWritePremise, guardsChange: true, change: changePremise),
                                                 observedEpoch: fetched.observedEpoch
                                             )
                                         else {
                                             await cursor.failRange(from: range.from, to: range.to)
                                             outcome.epochDisagreed = true
                                             if DebugModeManager.isLoggingEnabled() {
-                                                BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused at INSERT — the folder no longer holds the UIDVALIDITY this pass premised, \(fetchedHeaders.count) headers discarded")
+                                                BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused at INSERT — the folder no longer holds the UIDVALIDITY or change bookmark this pass premised, \(fetchedHeaders.count) headers discarded")
                                             }
                                             break
                                         }

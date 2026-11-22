@@ -61,6 +61,8 @@ enum ProcessGlobalTestState {
         // No system permission alert in the test host: its inactive scene
         // stops SwiftUI tasks a later test waits on. See the type.
         TestPermissionPrompts.installIfNeeded()
+        // A stuck sync-turn wait fails the test instead of hanging the run.
+        TestSyncTurnWaitWatch.installIfNeeded()
         try await lock.withLock(
             ownerToken: ownerToken,
             queuedObserver: queuedObserver

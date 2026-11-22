@@ -511,4 +511,42 @@ struct OneSyncAtATimeTests {
         #expect(await engine.syncPassRunning.isEmpty)
         #expect(await engine.syncPassWaiters.isEmpty)
     }
+
+    /// THE CLASS, not one site: a turn holder that awaits a task which takes the
+    /// same account's turn never finishes. The test harness reports such a wait
+    /// once it overruns `SyncConfig.syncTurnWaitTestBoundSeconds`, naming the
+    /// account and the waiting caller, and releases it so the run goes on.
+    /// Without the watch this test records a deadlock at its own deadline.
+    @Test("A turn holder awaiting a detached task that takes the same turn is reported as a stuck wait, not a hung suite")
+    func awaitedChildTakingTheTurnIsReported() async throws {
+        TestSyncTurnWaitWatch.installIfNeeded()
+        let engine = SyncEngine()
+        let reports = Mutex<[String]>([])
+        let installed = SyncEngine.syncTurnWaitWatch.withLock { $0 }
+        SyncEngine.syncTurnWaitWatch.withLock { watch in
+            if installed != nil { watch = { accountId, caller in reports.withLock { $0.append("\(accountId) \(caller)") } } }
+        }
+        defer { SyncEngine.syncTurnWaitWatch.withLock { $0 = installed } }
+
+        let finished = Mutex(false)
+        let holder = Task {
+            await engine.oneSyncAtATime(accountId: Self.accountId) {
+                await Task.detached { await engine.oneSyncAtATime(accountId: Self.accountId) {} }.value
+            }
+            finished.withLock { $0 = true }
+        }
+        let deadline = Date().addingTimeInterval(SyncConfig.syncTurnWaitTestBoundSeconds * 2)
+        while !finished.withLock({ $0 }), Date() < deadline {
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        #expect(finished.withLock { $0 }, "the holder deadlocked: no stuck-wait report released it")
+        guard finished.withLock({ $0 }) else { return }
+        await holder.value
+        let seen = reports.withLock { $0 }
+        #expect(seen.count == 1, "one stuck wait: \(seen)")
+        #expect(seen.first?.hasPrefix(Self.accountId) == true)
+        #expect(seen.first?.contains("OneSyncAtATimeTests.swift") == true, "the report names the waiting caller: \(seen)")
+        #expect(await engine.syncPassRunning.isEmpty)
+        #expect(await engine.syncPassWaiters.isEmpty)
+    }
 }

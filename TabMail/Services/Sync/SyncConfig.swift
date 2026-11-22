@@ -1019,6 +1019,11 @@ enum SyncConfig {
     /// listing plus one catch-up check is the cheaper path. Same order of work as
     /// Gmail's `GmailAPI.historyMaxChanges`.
     static let imapChangeArrivalsLimit = 100
+    /// IMAP change reader on a CONDSTORE server without QRESYNC (#755): how many
+    /// of a folder's newest held UIDs below the bookmark's UIDNEXT one removal
+    /// check searches when the count says a message went. Older removals are the
+    /// catch-up's (armed with the check).
+    static let imapChangeRemovalCheckWindow = 2_000
     /// IMAP change reader: passes in a row whose inbox read timed out before the
     /// next pass reads the other folders first and the inbox last. One timeout
     /// keeps the inbox first, so a passing blip never delays new mail; a
@@ -1031,4 +1036,9 @@ enum SyncConfig {
     /// caller's deadline. A folder whose SELECT keeps timing out is started again
     /// after `changeReadFailureLapseSeconds`.
     static let imapChangeSelectTimeoutSeconds: TimeInterval = 15
+    /// Test harness only (#755): a sync-turn wait longer than this is reported
+    /// to `SyncEngine.syncTurnWaitWatch` as a stuck wait (a turn holder awaiting
+    /// a task that needs the same turn). Far above any wait on the fake servers,
+    /// where a pass holds the turn for well under a second. Unused in production.
+    static let syncTurnWaitTestBoundSeconds: TimeInterval = 60
 }

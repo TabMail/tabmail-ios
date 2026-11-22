@@ -77,6 +77,9 @@ and that capture was a lapse, so a new account listed every folder twice for the
    runs it after the pass, in slices. The pass lists and then stores the candidate; the catch-up's listing
    comes later. The candidate was still read before every listing, so a change made during the catch-up's
    listing is in the history the next read takes. "runs the catch-up" above is superseded.
+   **Superseded in part 2026-11-19 (#1060; see the #755 amendment item 3):** an unproven listing no longer fails
+   the pass. It withholds the full-sync stamp and the folder is listed again on the next pass; the text above is
+   kept as written.
 6. **Refusal.** One transaction clears the bookmark, untracks every folder, marks one lapse for each
    folder's catch-up and makes the full sync due (`applyChangeRefusal`); the same pass then reads again with
    no bookmark, so the re-list and the new candidate happen in that pass and exactly one catch-up check runs.
@@ -1038,3 +1041,102 @@ unclean listing still records. A clean completion that started before the mark r
 bound) or one that started before the mark re-marks the catch-up lapse, so a folder holding a new
 bookmark is still listed again until the mark settles." (selfHealDue, owed check, unproven move,
 catch-up, re-arm, #1062)
+
+### Amendment 2026-11-19 (#755): CONDSTORE without QRESYNC
+
+**Context.** A server with CONDSTORE and UIDPLUS but no QRESYNC was read as untracked: its folders were listed
+from STATUS, so a flag change below the listing window and an expunge of an older message stayed unseen
+until the catch-up or a count walk. Without QRESYNC an expunge is not reported and may leave HIGHESTMODSEQ
+unchanged (RFC 7162).
+
+**Decision.**
+1. **Mode, once per change session** (`IMAPChangeMode.plan`): QRESYNC + ENABLE + UIDPLUS asks `ENABLE QRESYNC`
+   (`.qresync` only when acknowledged); else CONDSTORE + UIDPLUS asks `ENABLE CONDSTORE` (only an acknowledged
+   one gives `.condstore(selectParameter: false)`), or, without ENABLE, `.condstore(selectParameter: true)` and
+   every SELECT on the change session carries `(CONDSTORE)`; else untracked. ENABLE only after the pass's
+   generation check. No retry across modes. The engine never sees the mode.
+2. **The bookmark carries MESSAGES** (`IMAPChangeCursor.messageCount`, the SELECT's EXISTS, both modes; a count
+   outside 0...UInt32.max does not decode). A CONDSTORE read of a bookmark without it starts a baseline. A
+   tracked read also wrote `provenFrom` (removed 2026-11-19, see clause 6). A bookmark stores EXISTS 0 only after
+   `UID SEARCH ALL` on the same selection reads empty (`searchReadsEmpty`, `listed(within:)`): on a first
+   baseline, and (amended 2026-11-19, review) on a tracked CONDSTORE read too, where a SELECT saying EXISTS 0
+   while SEARCH still finds UIDs leaves the folder untracked that pass with its prior bookmark kept. Committing
+   that count would make every later read's owed count negative and fail until the failure lapse.
+3. **The read** (`IMAPProviderChangesCondstore.swift`): STATUS fast path only when MESSAGES, UIDNEXT, HIGHESTMODSEQ
+   and UIDVALIDITY all equal the bookmark's, no re-read list and no pending check. Otherwise SELECT (epoch
+   refusal; NOMODSEQ or no EXISTS untracked; no UIDVALIDITY/UIDNEXT fails), `UID FETCH lo:N1-1 (UID FLAGS)
+   (CHANGEDSINCE m)` through `IMAPChangeCommands.flagsChangedSince`, then the shared classifier and arrivals
+   SEARCH (`readChangedAndArrivals`; a CHANGEDSINCE UID in [N0, N1) is an arrival). owed = M0 + |A| - M1; below
+   0 fails the folder (`IMAPChangeCountMismatch`).
+4. **The removal check.** With owed > 0 (or a held moved-in row in [N0, N1) missing from A) the newest held UIDs
+   below N0, up to `SyncConfig.imapChangeRemovalCheckWindow`, are searched by chunk from
+   `CatchUpLocalRowReader.rows(folderId:numericIdsBelow:limit:)` (UID order, never date). A candidate is removed
+   only when the FETCH and a confirming SEARCH both leave it out (`rereadIds`). Held rows left below the window
+   arm the catch-up with the new bookmark (`armCatchUpWithBookmark`). The read reports
+   `FolderChanges.heldRowsProof {lowerId, upperId, checkedIds}`; before any removal the apply re-reads the rows it
+   holds in that range and, when one is not among `checkedIds`, keeps the stored bookmark.
+5. **The cut.** The check is priced from its exact request count before the arrivals' FETCH. When it does not
+   fit (or the budget runs out mid-check) the folder is reported `.untracked` with
+   `UntrackedObservation.mustList` (listed the same pass), the bookmark keeps its reading position and carries
+   the check's progress (`pendingCheck {pending, nextBelow, remaining, unproven}`). The pass that creates the
+   check arms the catch-up (its bytes change, so the arm lands); later passes write progress only and never
+   arm again: one lapse per check. A finished check commits the pending bookmark of the pass that started it.
+   *Amended 2026-11-19 (review):* the up-front price is removed. It counted the ORIGINAL owed removals on
+   every pass, so after a bulk expunge (owed above about 1000) a check that had finished never "fit" the
+   20 s budget and was cut on every pass, dropping the folder's flag changes for good. The check is
+   budgeted step by step (`runRemovalCheck` stops before a step the budget cannot pay), so only an
+   unfinished check cuts; the arrivals' FETCH keeps its own budget gate.
+6. **The from-server insert guard** (`SyncEngine.fromServerInsertAllowed`): the crawl (per range) and load older
+   (per folder) snapshot the folder's `changeCursor` and `changeState` before their server read and insert
+   only while both are byte-equal in their write transaction; a refused crawl range fails (nothing advances),
+   a refused load-older page reports more to load. The notification merge refuses a staged UID the folder does
+   not hold below the UIDNEXT of a `provenFrom` bookmark (`NSEDataBridge.stagedRowProvenGone`, skip-and-delete).
+   **Amended 2026-11-19 (review): that merge refusal is removed, with `provenFrom` and
+   `IMAPChangeCursor.provesGone`.** UIDNEXT is not per-UID evidence: a live older UID the window never loaded,
+   or a header the prune removed, also sits below it unheld, and its staged notification payload was deleted.
+   Unproven staging stays for merge or retry; a staged copy of a message a read proved gone can therefore be
+   merged back as a header, which a later listing or removal check removes again. It also kept an IMAP
+   bookmark reading out of the notification merge, above the provider boundary. Any replacement needs
+   positive per-UID evidence.
+   **Amended again 2026-11-19 (review): the merge-back is settled by ending tracking.** A tracked folder is
+   never listed, healed or count-checked, so the merged-back header above could stay for good. Now, when the
+   notification merge inserts a header under an id the folder's change bookmark claims it already held
+   (`EmailProvider.changeBookmark(_:claimsHeld:)`, read by account type beside the protocol; IMAP: a UID below
+   the bookmark's UIDNEXT, either mode), the same transaction drops the bookmark as a refused read does
+   (`SyncEngine.endTrackingIfBookmarkClaimsHeld` -> `dropChangeBookmark`). The staged row is kept. The next full
+   sync lists the folder and removes a gone message; a live one stays and the folder is tracked again after
+   its next baseline. The cost is one listing per such merge; tabmail-ios#1089 (P4) tracks the per-UID
+   record of proven removals that would avoid it. No new persisted state.
+   **Amended 2026-11-20 (review): the newly covered arrival range is proven too.** A staged UID equal to the
+   stored UIDNEXT is not claimed by the stored bookmark, so a merge between the read's lookup and its apply
+   kept tracking, and the new bookmark then covered a row nothing checked (a permanent ghost when the server
+   had expunged it). The CONDSTORE read now also reports `FolderChanges.arrivalRowsProof` for [N0, N1 of the
+   bookmark it writes): the arrivals the server listed plus the moved-in rows its own lookup found. The apply
+   checks it as it checks `heldRowsProof`; any other held row there keeps the stored bookmark, so the next
+   read finds the row moved-in and checks it. The staged row is kept; no new persisted state.
+   A UID admitted to that proof must have an applicable result. A listed arrival the read sees flagged
+   `\Deleted` (not expunged) is therefore emitted as a removal whether or not the folder held it at the
+   lookup (IOS-IMAP-001 D3: a `\Deleted` message is not present for display); the shared changed-flags
+   classifier (`readChangedAndArrivals`) no longer restricts that removal to held rows, for QRESYNC too, and
+   the apply's shields (pending operations, recent/outbox protections) decide as for every removal. A row
+   the merge inserts before the apply is removed by it; one it inserts after the apply contradicts the new
+   bookmark and ends tracking (`endTrackingIfBookmarkClaimsHeld`), so the next listing settles it. The
+   proof was not narrowed to omit such UIDs: one rule, no second path.
+7. **The turn.** A standalone `syncFolderMessages` lists inside `oneSyncAtATime`, which is re-entrant for the
+   task holding it (`@TaskLocal heldSyncTurn`).
+8. The catch-up's MODSEQ freshness for a TRACKED folder with a same-epoch bookmark (one not owed a check) is
+   the bookmark's MODSEQ alone: its plan compares nothing (a tracked folder gets no MODSEQ check), and a new
+   listing stamps that MODSEQ. A folder owed a check is untracked in the plan even with a bookmark (amendment
+   2026-11-20 (#1062) above): its freshness stays its stored HIGHESTMODSEQ (`lastKnownHighestModSeq`), so a
+   moved listing counter relists it whatever its bookmark says. A bookmark of another epoch never supplies it.
+   *Superseded in place (2026-11-21):* "for a folder with a same-epoch bookmark", which also took the
+   bookmark's MODSEQ for an owed folder, so its relisting waited for a change read to move the bookmark.
+   This amendment changes nothing about network conditions for scans (handled separately).
+
+**Consequences.** CONDSTORE servers get the change reader; the only new provider-neutral seam fields are
+`mustList` and `heldRowsProof`. No column, no migration. Limits: a cut pass lists the folder (no later than
+before); a progress-only bookmark write fails a concurrent crawl range or load-older page once (retried).
+
+Keywords: IMAPChangeMode, CHANGEDSINCE, flagsChangedSince, messageCount, provenFrom, pendingCheck,
+IMAPRemovalCheckProgress, imapChangeRemovalCheckWindow, numericIdsBelow, IMAPChangeCountMismatch, mustList,
+heldRowsProof, arrivalRowsProof, fromServerInsertAllowed, ChangeInsertPremise, stagedRowProvenGone, heldSyncTurn, #755.

@@ -56,7 +56,10 @@ extension IMAPMissingByUIDTests {
     @MainActor
     func condstoreRepeatListingStaysCheap() async throws {
         let server = Self.sparseServer
-        let condstore = FakeIMAPServer.defaultCapabilities + ["ENABLE", "CONDSTORE"]
+        // No UIDPLUS: the CONDSTORE change reader needs it (`IMAPChangeMode.plan`),
+        // so no change bookmark is ever written and the folder stays untracked,
+        // the case this test measures.
+        let condstore = FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" } + ["ENABLE", "CONDSTORE"]
         try await Self.withWorld("a1-condstore", capabilities: condstore, server: server, local: server,
                                  rangeMessages: SyncConfig.catchUpListingRangeMessages) { w in
             let ranges = (server.count + SyncConfig.catchUpListingRangeMessages - 1) / SyncConfig.catchUpListingRangeMessages
@@ -65,6 +68,7 @@ extension IMAPMissingByUIDTests {
             // compare. The foreground sync stores the server's HIGHESTMODSEQ;
             // the owed listing that follows records it as its stamp.
             try await w.foregroundSync()
+            #expect(try w.folder().changeCursor == nil, "setup: no change reader on this server, so no bookmark")
             try await w.markOwed()
             try await w.workerRun()
             let warmServerModSeq = w.server.qresyncHighestModSeq(for: Self.path)
@@ -80,6 +84,8 @@ extension IMAPMissingByUIDTests {
                 let storedBefore = try w.folder().lastKnownHighestModSeq
                 let serverModSeq = w.server.qresyncHighestModSeq(for: Self.path)
                 try await w.foregroundSync()
+                #expect(try w.folder().changeCursor == nil,
+                        "repeat \(repeatIndex): setup: the foreground sync wrote no bookmark; the folder stays untracked")
                 let storedAfter = try w.folder().lastKnownHighestModSeq
                 let stamp = try IMAPCatchUpState.decode(w.folder().catchUpState)?.completionStamp
                 #expect(storedAfter == serverModSeq,

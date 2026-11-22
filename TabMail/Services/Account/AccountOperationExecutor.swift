@@ -125,6 +125,14 @@ final class AccountOperationExecutor {
     func beginDrain(using manager: isolated AccountManager) { drainContext = DrainContext() }
     func prepareDrain(using manager: isolated AccountManager) { manager.pruneRecentlyCompleted() }
 
+    #if DEBUG
+    /// Test seam: record folders to sync in the current drain, as a retired
+    /// operation does (`AccountManager.finishDrainForTesting`).
+    func recordFoldersToSyncForTesting(_ folderKeys: [String], using manager: isolated AccountManager) {
+        drainContext.foldersToSync.formUnion(folderKeys)
+    }
+    #endif
+
     /// A provider outcome whose LOCAL write could not commit. Full/partial
     /// cases retain settlement proof; providerFailure retains one eligible failure
     /// event, whose accounting is evaluated against the live row on replay.
@@ -292,9 +300,9 @@ final class AccountOperationExecutor {
                     continue
                 }
                 do {
-                    _ = try await queue.execute(priority: .userAction) {
-                        try await manager.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
-                    }
+                    // No work-queue slot around it: the listing takes the
+                    // account's sync turn (see the post-send Sent sync).
+                    _ = try await manager.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
                     queueLog("[MoveTrace] post-drain sync — completed for \(folder.name)")
                 } catch {
                     queueLog("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")

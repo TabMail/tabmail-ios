@@ -402,6 +402,41 @@ actor AccountManager {
         workQueues.removeValue(forKey: accountId)
     }
 
+    #if DEBUG
+    /// Test seam: register `provider` for `account` exactly as `connectAccount`
+    /// does: one `ProviderWorkQueue`, sized by provider, shared by the outbox and
+    /// action drains (`workQueues`) and the sync engine. Without the network
+    /// connect or the initial sync. Undo with `disconnectProviderForTesting`.
+    func connectProviderForTesting(account: Account, provider: any EmailProvider) async {
+        providers[account.id] = provider
+        let concurrency: Int
+        switch account.provider {
+        case .gmail: concurrency = SyncConfig.gmailWorkQueueConcurrency
+        case .outlook: concurrency = SyncConfig.exchangeWorkQueueConcurrency
+        default: concurrency = SyncConfig.imapMaxConnectionCeiling
+        }
+        let queue = ProviderWorkQueue(provider: provider, maxConcurrency: concurrency)
+        workQueues[account.id] = queue
+        await syncEngine.register(accountId: account.id, provider: provider, workQueue: queue)
+    }
+
+    /// Test seam: the post-drain phase (`AccountOperationExecutor.finishDrain`)
+    /// of a drain that recorded `folderKeys` (`"accountId|path"`) as folders to
+    /// sync, without executing any operation.
+    func finishDrainForTesting(foldersToSync folderKeys: [String]) async {
+        operationExecutor.beginDrain(using: self)
+        operationExecutor.recordFoldersToSyncForTesting(folderKeys, using: self)
+        await operationExecutor.finishDrain(using: self)
+    }
+
+    /// Test seam: undo `connectProviderForTesting`.
+    func disconnectProviderForTesting(accountId: String) async {
+        providers.removeValue(forKey: accountId)
+        workQueues.removeValue(forKey: accountId)
+        await syncEngine.remove(accountId: accountId)
+    }
+    #endif
+
     /// Test seam: the calendar sibling of `registerProviderForTesting`, so the
     /// calendar tools and `drainCalendarQueue` can be exercised against a
     /// `MockCalendarProvider` without a network account. Same replace-on-call
@@ -1751,8 +1786,14 @@ actor AccountManager {
         // Tear down the provider socket before waiting for sync tasks. Their
         // cancellation is cooperative, so a read parked in SwiftMail may not
         // return until disconnect closes the underlying connection.
+        // Removal retires the provider: a caller still holding it (a listing
+        // waiting for the sync turn) opens no new session with its credentials.
         if let provider {
-            try? await provider.disconnect()
+            if caldavConfigIds != nil {
+                await provider.disconnectForAccountRemoval()
+            } else {
+                try? await provider.disconnect()
+            }
         }
         await syncEngine.remove(accountId: account.id)
         // AI processing is now handled by ActiveBodyQueue + ActiveAIQueue actors

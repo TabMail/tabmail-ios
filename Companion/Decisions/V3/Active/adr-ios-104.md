@@ -57,6 +57,13 @@ pass's full sync while another pass's delta was in flight, and both write the ac
    indexing and the AI queues. None of them runs a delta or a full sync, or writes the account's delta
    cursor (`Account.lastHistoryId`).
 
+   **Amended 2026-11-22 (tabmail-ios #755): `syncFolderMessages` takes the turn.** A single-folder
+   listing now runs inside `oneSyncAtATime` of its account (ADR-IOS-111, amendment 2026-11-19 (#755)
+   "CONDSTORE without QRESYNC", item 7), so no listing commits between a change read and its apply. It
+   still runs no delta or full sync and writes no delta cursor. Its quarantined-folder branch still
+   starts the UIDVALIDITY reaction before taking the turn. Superseded wording, kept: "single-folder
+   syncs (`SyncEngine.syncFolderMessages`: ...)" in the list of what is "Not inside it" above.
+
 **Rejected:** joining a running pass or coalescing waiters into one trailing pass (the owner asked for a
 plain semaphore, and both change what a caller's pass does); a wait cap that drops the waiter (a
 skipped pass); relying on the work queue (it has several slots by design, for throughput).
@@ -77,6 +84,20 @@ sync made due after the caller read the account still runs; a pass that throws h
 waiting their turn run one at a time in arrival order, and one arriving during a handed-over turn waits
 too; passes whose account was removed while they waited do nothing and hand the turn on; another
 account's pass does not wait).
+
+**Amended 2026-11-22 (tabmail-ios #755): the semaphore is re-entrant for the task holding the turn.**
+`oneSyncAtATime` records the task holding each account's turn in a task-local (`@TaskLocal heldSyncTurn`,
+`SyncEngineOneSyncAtATime.swift`). A call from that same task, such as a listing reached inside a pass
+(a quarantined folder's turnover resync during the full sync), runs in the pass's turn instead of waiting
+for it. A task spawned inside the turn is a different task and waits like any other caller, so a turn
+holder must never await such a task: it would never finish. The test harness reports such a wait once it
+overruns `SyncConfig.syncTurnWaitTestBoundSeconds`. See ADR-IOS-111, amendment 2026-11-19 (#755)
+"CONDSTORE without QRESYNC", item 7. Superseded wording, kept: "so the non-reentrant semaphore cannot
+deadlock; a new caller from inside a pass would" (a caller in the holding task now runs in the turn; one
+in another task that the holder awaits still would). Tests: `IMAPChangeTurnAndGuardTests`
+(`nestedListingInsideTheTurnCompletes`, `spawnedTaskWaitsForTheTurn`,
+`fullSyncReDrivesAQuarantinedFolderWithoutDeadlock`, `turnFuzzNeverDeadlocksAndConverges`),
+`OneSyncAtATimeTests.awaitedChildTakingTheTurnIsReported`.
 
 **Amended 2026-11-20 (tabmail-ios #1062): the Settings resets are turn-takers.** "Reset message data" (one
 account) and "Delete All Email Index Data" (every account) run their authoritative write transaction
