@@ -309,8 +309,10 @@ struct ChatNewEmailRequestTests {
                 "an email opened over the list, by a row, a pill or in Search, takes it itself; the list's own new email takes none")
         #expect(Self.count("newEmailCover != nil || showSearch || viewModel.showCompose || replyMessage != nil || draftOpen != nil || agentCompose != nil || moveMessageId != nil || moveThreadGroup != nil || labelMenuMessage != nil || showLabelFilterPicker", in: inbox) == 1,
                 "every sheet and cover the list presents counts, its own new email's included")
-        #expect(Self.count(".onChange(of: isAnyListPresentation, initial: true) { _, up in listPresentationWriter?.isUp = up } .onDisappear { listPresentationWriter?.isUp = false }", in: inbox) == 1,
+        #expect(Self.count(".onChange(of: isAnyListPresentation, initial: true) { _, up in listPresentationWriter?.isUp = up }", in: inbox) == 1,
                 "the list reports what it has up for the detail column")
+        #expect(Self.count("listPresentationWriter?.isUp =", in: inbox) == 1,
+                "and only as that changes: a screen pushed over the list hides the list, not its Search")
         let navigation = try Self.source("TabMail/Views/MailNavigationView.swift")
         #expect(Self.count("pushedMessageId: $pushedMessageId) .environment(\\.listPresentationWriter, listPresentation)", in: navigation) == 1,
                 "the list column writes the state")
@@ -341,8 +343,8 @@ struct ChatNewEmailRequestTests {
         let detail = try Self.source(detailPath)
         #expect(Self.count("newEmailCover = .make( request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession, chatAccount: Account.primary(), composeAccount: nil)", in: detail) == 1)
         #expect(Self.count("askForNewEmail(request)", in: detail) == 1, "a contact pill or a link")
-        #expect(Self.count("guard !isAnyCoverPresented, listPresentationBesideDetail?.isUp != true else { return }", in: detail) == 1,
-                "none while something is up over it or the list beside it has something up")
+        #expect(Self.count("guard viewModel.isViewVisible, !isAnyCoverPresented, listPresentationBesideDetail?.isUp != true else { return }", in: detail) == 1,
+                "none under a screen pushed over it, while something is up over it, or while the list beside it has something up")
         #expect(Self.count("askForNewEmail(nil)", in: detail) == 1, "its compose button")
         #expect(Self.count("newEmailCover != nil || replyMessage != nil", in: detail) == 1, "counted among its presentations")
         #expect(Self.count(cover, in: detail) == 1)
@@ -453,6 +455,64 @@ struct ChatNewEmailRequestHostedTests {
             #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: overCard), "Back takes a tap")
             try await ThreadChatTests.wait { screen.topPresented() === card }
             #expect(screen.topPresented() === card, "Back returns to the card")
+
+            // The chat under the card took none: once the card is closed nothing else comes up,
+            // and the chat takes the next.
+            let closedCard = try #require(card)
+            await Self.swipeDown(closedCard)
+            try await ThreadChatTests.wait { screen.topPresented() == nil }
+            #expect(screen.topPresented() == nil, "control: the card is closed")
+            let nothing = try await Self.keeps { screen.topPresented() == nil }
+            #expect(nothing, "nothing comes up once the card is closed")
+            _ = try await Self.postedLinkShowsNewEmail(screen)
+            try await Self.backClosesAndSavesNothing(screen)
+        }
+    }
+
+    // MARK: - A screen pushed over another
+
+    @Test("With a screen pushed over another of its kind, only the one on top takes a link; once its new email is closed and it is popped, nothing else comes up and the one below takes the next", arguments: [false, true])
+    func linkOverAPushedScreen(chat: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await linkOverAPushedScreenBody(chat: chat) }
+    }
+
+    /// An email screen with an email pill's email screen pushed over it, or a chat with another
+    /// chat pushed over it.
+    private func linkOverAPushedScreenBody(chat: Bool) async throws {
+        let push = Push()
+        try await withScreen { seed in
+            Stacked(push: push) {
+                if chat { ChatThreadView(messageId: seed.email.id) } else { MessageDetailView(messageId: seed.email.id) }
+            } top: { id in
+                if chat { ChatThreadView(messageId: id) } else { MessageDetailView(messageId: id) }
+            }
+        } body: { screen in
+            // The chat shows its person; the email screen its compose button.
+            let shows: (UIView) -> Bool = chat
+                ? { ThreadChatTests.shows("Ann Example", in: $0) }
+                : { Self.composeButton(in: $0) != nil }
+            try await ThreadChatTests.wait { Self.depth(screen) == 1 && shows(screen.view) }
+            let shown = shows(screen.view)
+            #expect(shown, "control: the screen is up: \(ThreadChatTests.labels(screen.view).prefix(12))")
+            try await ThreadChatTests.settle()
+            push.id = screen.email.id
+            try await ThreadChatTests.wait { Self.depth(screen) == 2 }
+            #expect(Self.depth(screen) == 2, "control: a second screen is pushed over the first")
+            try await ThreadChatTests.settle()
+
+            _ = try await Self.postedLinkShowsNewEmail(screen)
+            try await Self.backClosesAndSavesNothing(screen)
+            let nothingOnTop = try await Self.keeps { screen.topPresented() == nil }
+            #expect(nothingOnTop, "the screen below took none: nothing comes up once the new email is closed")
+
+            push.id = nil
+            try await ThreadChatTests.wait { Self.depth(screen) == 1 }
+            #expect(Self.depth(screen) == 1, "control: popped back to the first screen")
+            let nothingBelow = try await Self.keeps { screen.topPresented() == nil }
+            #expect(nothingBelow, "nothing comes up once the screen below shows again")
+            _ = try await Self.postedLinkShowsNewEmail(screen)
+            try await Self.backClosesAndSavesNothing(screen)
         }
     }
 
@@ -525,6 +585,86 @@ struct ChatNewEmailRequestHostedTests {
             NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
             let stayed = try await Self.keeps { screen.topPresented() === searchSheet && Self.newEmailView(screen) == nil }
             #expect(stayed, "with Search up, the list takes none")
+        }
+    }
+
+    @Test("With Search up over the list and an email pill's email pushed over the list beneath it, the list still reports Search up and the pushed email takes no link; once Search is closed nothing comes up and the pushed email takes the next; back on the list, nothing comes up")
+    func linkWithAnEmailPushedBeneathSearch() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await linkWithAnEmailPushedBeneathSearchBody() }
+    }
+
+    /// The list column as the navigation mounts it on iPhone: the list writes its state, and an
+    /// email pill's email is pushed over it through `pushedMessageId` and reads the state.
+    private func linkWithAnEmailPushedBeneathSearchBody() async throws {
+        let push = Push()
+        try await withScreen { seed in
+            Stacked(push: push) {
+                InboxView(title: "Inbox", folders: seed.inbox, selection: .unified(.inbox),
+                          selectedMessageId: .constant(nil), pushedMessageId: Bindable(push).id)
+                    .environment(\.listPresentationWriter, seed.state)
+            } top: { id in
+                PushedMessageDestination(messageId: id)
+                    .environment(\.listPresentationBesideDetail, seed.state)
+            }
+        } body: { screen in
+            try await ThreadChatTests.wait { Self.searchButton(in: screen.view) != nil }
+            let search = try #require(Self.searchButton(in: screen.view), "control: the list is up: \(ThreadChatTests.labels(screen.view).prefix(20))")
+            #expect(search.accessibilityActivate(), "control: Search takes a tap")
+            try await ThreadChatTests.wait { screen.topPresented() != nil }
+            let searchSheet = try #require(screen.topPresented(), "control: Search is up")
+            #expect(screen.state.isUp, "control: the list reports Search up")
+
+            push.id = screen.email.id
+            try await ThreadChatTests.wait { Self.depth(screen) == 2 }
+            #expect(Self.depth(screen) == 2, "control: the email is pushed over the list, beneath Search")
+            try await ThreadChatTests.settle()
+            #expect(screen.topPresented() === searchSheet, "control: Search is still up")
+            #expect(screen.state.isUp, "the list, hidden by the push, still has Search up and still reports it")
+            NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
+            let stayed = try await Self.keeps { screen.topPresented() === searchSheet && Self.newEmailView(screen) == nil }
+            #expect(stayed, "beneath Search, the pushed email takes none")
+
+            let done = try #require(Self.button("Done", in: searchSheet.view), "control: Search's Done: \(ThreadChatTests.labels(searchSheet.view).prefix(16))")
+            #expect(done.accessibilityActivate(), "control: Done takes a tap")
+            try await ThreadChatTests.wait { screen.topPresented() == nil }
+            #expect(screen.topPresented() == nil, "control: Search is closed")
+            let nothing = try await Self.keeps { screen.topPresented() == nil }
+            #expect(nothing, "nothing comes up once Search is closed")
+            try await ThreadChatTests.wait { !screen.state.isUp }
+            #expect(!screen.state.isUp, "the list under the pushed email reports Search closed")
+            _ = try await Self.postedLinkShowsNewEmail(screen)
+            try await Self.backClosesAndSavesNothing(screen)
+
+            push.id = nil
+            try await ThreadChatTests.wait { Self.depth(screen) == 1 }
+            #expect(Self.depth(screen) == 1, "control: back on the list")
+            let nothingOnTheList = try await Self.keeps { screen.topPresented() == nil }
+            #expect(nothingOnTheList, "the list under the pushed email took none: nothing comes up back on it")
+        }
+    }
+
+    @Test("The list with an email open over it, selected or pushed from an email pill, takes no link", arguments: [true, false])
+    func listWithAnEmailOpenTakesNone(selected: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await listWithAnEmailOpenTakesNoneBody(selected: selected) }
+    }
+
+    private func listWithAnEmailOpenTakesNoneBody(selected: Bool) async throws {
+        try await withScreen { seed in
+            NavigationStack {
+                InboxView(title: "Inbox", folders: seed.inbox, selection: .unified(.inbox),
+                          selectedMessageId: .constant(selected ? seed.email.id : nil),
+                          pushedMessageId: .constant(selected ? nil : seed.email.id))
+            }
+            .environment(\.listPresentationWriter, seed.state)
+        } body: { screen in
+            try await ThreadChatTests.wait { Self.searchButton(in: screen.view) != nil }
+            #expect(Self.searchButton(in: screen.view) != nil, "control: the list is up: \(ThreadChatTests.labels(screen.view).prefix(20))")
+            #expect(screen.topPresented() == nil, "control: nothing is presented over the list")
+            NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
+            let nothing = try await Self.keeps { screen.topPresented() == nil }
+            #expect(nothing, "the email open over the list takes it, not the list")
         }
     }
 
@@ -741,12 +881,13 @@ struct ChatNewEmailRequestHostedTests {
         let state: ListPresentationState
     }
 
-    /// A mounted screen: its controller, the app database, and the list's presentation state.
+    /// A mounted screen: its controller, the app database, the list's presentation state, and the email.
     @MainActor
     struct Screen {
         let controller: UIViewController
         let pool: DatabasePool
         let state: ListPresentationState
+        let email: MessageHeader
         var view: UIView { controller.view }
 
         /// What is presented over the screen, topmost; nil for nothing.
@@ -754,6 +895,26 @@ struct ChatNewEmailRequestHostedTests {
             var top = controller.presentedViewController
             while let next = top?.presentedViewController { top = next }
             return top
+        }
+    }
+
+    /// The email pushed over a stack's first screen; nil for none.
+    @MainActor @Observable
+    final class Push {
+        var id: String?
+    }
+
+    /// One navigation stack: `bottom`, and `top` for the email `push` names pushed over it, as
+    /// `MailNavigationView` pushes an email pill's email.
+    struct Stacked<Bottom: View, Top: View>: View {
+        @Bindable var push: Push
+        @ViewBuilder let bottom: () -> Bottom
+        @ViewBuilder let top: (String) -> Top
+
+        var body: some View {
+            NavigationStack {
+                bottom().navigationDestination(item: $push.id) { top($0) }
+            }
         }
     }
 
@@ -805,7 +966,7 @@ struct ChatNewEmailRequestHostedTests {
             await queue.setDispatchSuppressedForTesting(false)
         }
         do {
-            try await body(Screen(controller: controller, pool: pool, state: state))
+            try await body(Screen(controller: controller, pool: pool, state: state, email: email))
         } catch {
             await cleanUp()
             throw error
@@ -851,7 +1012,33 @@ struct ChatNewEmailRequestHostedTests {
     }
 
     private static func composeButton(in view: UIView) -> NSObject? {
-        HostedAccessibility.elements(under: view).first { $0.accessibilityLabel == "Compose" }
+        button("Compose", in: view)
+    }
+
+    private static func button(_ label: String, in view: UIView) -> NSObject? {
+        HostedAccessibility.elements(under: view).first { $0.accessibilityLabel == label }
+    }
+
+    /// How many screens the navigation stack under the mounted screen holds; 0 for no stack.
+    private static func depth(_ screen: Screen) -> Int {
+        var pending: [UIViewController] = [screen.controller]
+        while !pending.isEmpty {
+            let controller = pending.removeFirst()
+            if let navigation = controller as? UINavigationController { return navigation.viewControllers.count }
+            pending += controller.children
+        }
+        return 0
+    }
+
+    /// Closes a sheet as a swipe down does: UIKit takes it down and tells the sheet's delegate,
+    /// which is how SwiftUI learns that it is gone.
+    private static func swipeDown(_ sheet: UIViewController) async {
+        guard let presentation = sheet.presentationController else { return }
+        presentation.delegate?.presentationControllerWillDismiss?(presentation)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            sheet.dismiss(animated: false) { done.resume() }
+        }
+        presentation.delegate?.presentationControllerDidDismiss?(presentation)
     }
 
     private static func labels(of id: String, in view: UIView) -> [String] {

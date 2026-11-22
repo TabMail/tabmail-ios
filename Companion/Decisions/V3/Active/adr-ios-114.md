@@ -1580,8 +1580,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        function both use. Compose keeps its own default where it was given none.
      - *One screen takes each request, the one on top.* The list takes it only while no email is
        open over it (by a row, an email pill, or in Search); an open chat (`ChatThreadView`) while it
-       is on screen with nothing presented over it; the email screen while it shows, including the
-       one in a chat's email card. Before this an open chat took no request, so a contact pill or a
+       is on screen with none of its own sheets or covers up; the email screen while it shows
+       (`MessageDetailViewModel.isViewVisible`, so not while another screen is pushed over it),
+       including the one in a chat's email card. Before this an open chat took no request, so a contact pill or a
        link did nothing while a chat was open. A request that arrives while another screen is
        presented over the chat, or while Search is open with no email opened in it, is not taken
        (as before for Search): the user taps again once it closes.
@@ -1594,7 +1595,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        closes. On iPad the screen in the detail column stays on screen behind
        the list's Search or any other sheet or cover the list has up, so the list reports what it
        has up (`ListPresentationState`, written through `listPresentationWriter` on the list column)
-       and the detail column's chat and email screen take nothing while it is up. Only the screens
+       and the detail column's chat and email screen take nothing while it is up. The list writes it
+       only as what it has up changes, never on disappearing: on iPhone a screen pushed over the
+       list while Search is up (a notification tap, an email pill in Search's email) hides the list,
+       not its Search (ADR-IOS-054: a list's `onDisappear` is no "user left" signal). Only the screens
        that open in the detail column read it (`listPresentationBesideDetail`: the selected email,
        `MessageDetailContainer`, and an email pill's email, `PushedMessageDestination`), so an email
        opened inside Search, which carries the list's environment, still takes the request.

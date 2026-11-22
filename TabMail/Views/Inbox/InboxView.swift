@@ -800,9 +800,10 @@ struct InboxView: View {
             BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose: \(request.to.first ?? "")")
         }
         .fullScreenCover(item: $newEmailCover) { ChatNewEmailCoverView(cover: $0) }
-        // The detail column beside the list is behind whatever the list has up.
+        // The detail column beside the list is behind whatever the list has up. Written only as
+        // that changes, never on disappearing: a screen pushed over the list while Search is up
+        // (a notification tap, an email pill in Search's email) hides the list, not its Search.
         .onChange(of: isAnyListPresentation, initial: true) { _, up in listPresentationWriter?.isUp = up }
-        .onDisappear { listPresentationWriter?.isUp = false }
         .toolbarVisibility(chatExpanded && chatInputFocused ? .hidden : .automatic, for: .navigationBar)
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)

@@ -210,10 +210,11 @@ struct MessageDetailView: View {
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
-                // With a sheet or cover of its own up (a new email's included), this screen takes
-                // no request: what is up is not replaced. In the detail column it takes none while
-                // the list beside it has a sheet or cover up (iPad).
-                guard !isAnyCoverPresented, listPresentationBesideDetail?.isUp != true else { return }
+                // Only while it shows: under a screen pushed over it (an email pill's email) it
+                // takes none, that screen does. With a sheet or cover of its own up (a new email's
+                // included), it takes none: what is up is not replaced. In the detail column it
+                // takes none while the list beside it has a sheet or cover up (iPad).
+                guard viewModel.isViewVisible, !isAnyCoverPresented, listPresentationBesideDetail?.isUp != true else { return }
                 guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
                 withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                     chatExpanded = false
