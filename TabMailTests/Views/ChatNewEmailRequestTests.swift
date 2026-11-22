@@ -5,6 +5,7 @@
 import Foundation
 import GRDB
 import SwiftUI
+import Synchronization
 import Testing
 import UIKit
 @testable import TabMail
@@ -321,6 +322,12 @@ struct ChatNewEmailRequestTests {
                 "an email pill's email, which opens in the detail column on iPad, reads it")
         #expect(Self.count("\\.listPresentationBesideDetail", in: navigation) == 2, "and nothing else in the navigation")
         #expect(Self.count("\\.listPresentationWriter", in: navigation) == 1)
+        // A plain property would be a new, empty state each time the navigation is rebuilt, while
+        // the list, which reports only changes, still has its Search up: the detail column beside
+        // it would then take a request behind Search. Held as the navigation's own state, the list
+        // and the detail column share one state for the navigation's life.
+        #expect(Self.count("@State private var listPresentation = ListPresentationState()", in: navigation) == 1,
+                "the navigation holds the one state for its life")
         #expect(Self.count("newEmailCover = .make( request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession, chatAccount: viewModel.primaryAccount, composeAccount: viewModel.primaryAccount)", in: inbox) == 1)
         #expect(Self.count(cover, in: inbox) == 1)
         #expect(Self.count("prefillTo:", in: inbox) == 0, "compose is filled from a request only through the cover")
@@ -557,6 +564,71 @@ struct ChatNewEmailRequestHostedTests {
         }
     }
 
+    // MARK: - An email from a notification that never arrives
+
+    @Test("An email opened from a notification that never arrives: with a new email up over its chat or email screen, the screen does not ask to be left and the new email stays; with nothing over it, it asks", arguments: [true, false])
+    func unresolvedNotificationUnderTheNewEmail(chat: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await unresolvedNotificationBody(chat: chat) }
+    }
+
+    /// A notification's email is opened before it is in the database. When the wait for it runs
+    /// out, the screen shows Message Not Found and asks to be left (the navigation goes back to the
+    /// list), unless something is presented over it, which leaving would close. The new email is
+    /// one of those: the screen tells its model while it is up.
+    ///
+    /// Any timing slip fails rather than passes: a new email that came up only after the wait ran
+    /// out, or a wait that ran out only after Back, would both ask to be left.
+    private func unresolvedNotificationBody(chat: Bool) async throws {
+        let waitSeconds = SyncConfig.notifTapStagedResolveWaitSeconds
+        for covered in [false, true] {
+            let opened = MessageDetailViewModel.notificationTapIdPrefix + ThreadChatTests.accountA + "::never-arrives-\(covered)"
+            let asked = Mutex<[String]>([])
+            let observer = NotificationCenter.default.addObserver(forName: .notificationTapUnresolved, object: nil, queue: .main) { note in
+                guard let id = note.userInfo?["messageId"] as? String, id == opened else { return }
+                asked.withLock { $0.append(id) }
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
+            try await withScreen { _ in
+                if chat {
+                    NavigationStack { ChatThreadView(messageId: opened) }
+                } else {
+                    NavigationStack { MessageDetailView(messageId: opened) }
+                }
+            } body: { screen in
+                guard covered else {
+                    try await ThreadChatTests.wait { ThreadChatTests.shows("Message Not Found", in: screen.view) }
+                    #expect(ThreadChatTests.shows("Message Not Found", in: screen.view), "control: the wait ran out: \(ThreadChatTests.labels(screen.view).prefix(12))")
+                    try await ThreadChatTests.wait { !asked.withLock { $0 }.isEmpty }
+                    let asks = asked.withLock { $0 }
+                    #expect(asks == [opened], "control: with nothing over it, the screen asks to be left")
+                    return
+                }
+                // The link comes while the wait is on: posted until the screen, once shown, takes it.
+                let start = ContinuousClock.now
+                for _ in 0..<20 where screen.topPresented() == nil {
+                    NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                let tookAfter = ContinuousClock.now - start
+                try await ThreadChatTests.wait { Self.newEmailView(screen) != nil }
+                #expect(Self.newEmailView(screen) != nil, "control: the screen took the link, \(tookAfter) after it showed")
+                let stayed = try await Self.keeps(seconds: 2 * waitSeconds) {
+                    asked.withLock { $0 }.isEmpty && Self.newEmailView(screen) != nil
+                }
+                let asks = asked.withLock { $0 }
+                #expect(stayed, "the wait runs out under the new email: the screen does not ask to be left, and the new email stays: \(asks)")
+
+                try await Self.backClosesAndSavesNothing(screen)
+                try await ThreadChatTests.wait { ThreadChatTests.shows("Message Not Found", in: screen.view) }
+                #expect(ThreadChatTests.shows("Message Not Found", in: screen.view), "control: the wait ran out while the new email was up")
+                try await ThreadChatTests.settle()
+                let asksAfter = asked.withLock { $0 }
+                #expect(asksAfter.isEmpty, "nor once the new email is closed: \(asksAfter)")
+            }
+        }
+    }
+
     // MARK: - Compose, with the chat view off
 
     @Test("A cover decided for compose shows compose filled with the link's To, Cc, Bcc, subject and body, whatever the setting is when it shows")
@@ -757,9 +829,9 @@ struct ChatNewEmailRequestHostedTests {
         return view
     }
 
-    /// Whether `condition` holds throughout the next 1.5 seconds, checked every 100 ms.
-    private static func keeps(_ condition: () -> Bool) async throws -> Bool {
-        for _ in 0..<15 {
+    /// Whether `condition` holds throughout the next `seconds` (1.5 unless told), checked every 100 ms.
+    private static func keeps(seconds: TimeInterval = 1.5, _ condition: () -> Bool) async throws -> Bool {
+        for _ in 0..<Int((seconds * 10).rounded(.up)) {
             guard condition() else { return false }
             try await Task.sleep(for: .milliseconds(100))
         }
