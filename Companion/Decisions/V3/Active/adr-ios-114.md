@@ -599,20 +599,24 @@ same AI result, kept as long as the email itself is shown.
    body from the agent, its words are written for the people chosen as Thunderbird's `email_reply`
    writes every reply, for the draft's recipients: the same compose edit, with an empty request
    (`EmailReplyTool`, `onlyToChosen`). If writing fails, with or without a request, the card opens
-   with no words, never the stored suggestion. The card never reads it either: the one presenter
+   with the agent's own body when it gave one, else with no words; never the stored suggestion. The card never reads it either: the one presenter
    (`ComposeRequest.composeView`) sets `ComposeView.onlyToChosen` from the request's field choice,
    and `ComposeDraftGuards.suggestionToShow` then skips the row's suggestion. Recompute on that card
    writes for the card's people and From account as the tool writes (`ComposeView.recomputedReplyForChosen`:
    the compose edit with an empty draft and request, in the card's identity-checked context,
    `composeEditContextForRequest`) and stores nothing. An edit of its suggestion is never stored as
-   the email's: the card never shows the stored value, and the one writer stores an edit only over
-   the exact suggestion it edited (`MessageHeader.replaceSuggestion(with:ifStill:)`), also after the
-   card's recipients go back to everyone. A reply with nobody chosen, from the sheet or another
-   screen, or about another email is unchanged. The compose prompt's "primarily to the last sender"
+   the email's, for the card's whole life: the card's edit decision (`ComposeView.suggestionEdit`,
+   given the card's `onlyToChosen`) names no email to store over, also after the card's recipients
+   go back to everyone. Value equality cannot stand in for that: a Device Sync reply (a body, no
+   text message or change command) can hold the very words written for the people chosen, and the
+   one writer's compare (`MessageHeader.replaceSuggestion(with:ifStill:)`) would then pass. A reply
+   with nobody chosen, from the sheet or another screen, or about another email or another account's
+   copy is unchanged. The compose prompt's "primarily to the last sender"
    is tabmail-backend#213. Before this, a narrowed reply with no request opened on the stored
    suggestion ("Hi all", names of people left out), a failed writing fell back to it, and Recompute
    wrote for everyone and stored the result. Tests: `EmailReplyWordsTests`,
    `ComposeSuggestionPersistTests.cardShowsTheTappedSuggestionNotTheRowsLaterReply`,
+   `ComposeSuggestionPersistTests.cardEditUsesTheCardsOwnInputs`,
    `ComposeRecipientWiringTests.recomputeControlRunsTheRecompute`.
 
 12. **Swipes in the chat (amendment 2026-11-05).** Swiping left

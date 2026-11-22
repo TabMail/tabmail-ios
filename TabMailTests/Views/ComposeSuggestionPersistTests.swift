@@ -876,6 +876,8 @@ struct ComposeSuggestionPersistTests {
         #expect(call.contains("subject: newSubject ?? subject"), "the subject after this edit: \(call)")
         #expect(call.contains("accountId: selectedAccount?.id"), "the From chosen in the card, never the email's account: \(call)")
         #expect(!call.contains("replyTo?.accountId") && !call.contains("reply.accountId"))
+        #expect(call.contains("onlyToChosen: onlyToChosen,"),
+                "a card replying only to the people chosen decides as one, for its whole life: \(call)")
         let disappear = try functionBody("private func performDisappear()", before: "static func cardClosed(", in: source)
         #expect(disappear.contains("Self.cardClosed(recompute: recomputeTask)"), "the card's disappearance closes its Recompute")
     }

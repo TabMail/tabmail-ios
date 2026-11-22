@@ -2426,7 +2426,7 @@ struct ComposeView: View {
         let previous = shownSuggestion
         let edit = Self.suggestionEdit(
             body: newBody, textMessage: textMessage, changeCommand: changeCommand,
-            showingSuggestion: showingSuggestion, isForward: isForward, replyTo: replyTo,
+            showingSuggestion: showingSuggestion, isForward: isForward, onlyToChosen: onlyToChosen, replyTo: replyTo,
             recipients: recipients.pendingCommitted, subject: newSubject ?? subject,
             accountId: selectedAccount?.id, accounts: navigationStore.accounts)
         if let s = newSubject {
@@ -2465,13 +2465,18 @@ struct ComposeView: View {
         let target: MessageHeader?
     }
 
+    /// `onlyToChosen`: the card replies only to the people chosen in the chat's reply field. Its
+    /// words were written for them, never as the email's Reply All suggestion, so no edit of them
+    /// is stored as that suggestion for the card's whole life, even after its recipients are put
+    /// back to everyone and its shown value equals the stored one (ADR-IOS-114 decision 11).
     static func suggestionEdit(
         body newBody: String?, textMessage: String?, changeCommand: String?,
-        showingSuggestion: Bool, isForward: Bool, replyTo: MessageHeader?,
+        showingSuggestion: Bool, isForward: Bool, onlyToChosen: Bool, replyTo: MessageHeader?,
         recipients: ComposeDraftGuards.Recipients, subject: String, accountId: String?, accounts: [Account]
     ) -> SuggestionEdit {
         let edited = newBody.map { ReplyResult(body: $0, textMessage: textMessage, changeCommand: changeCommand) }
         guard edited != nil else { return SuggestionEdit(edited: nil, target: nil) }
+        guard !onlyToChosen else { return SuggestionEdit(edited: edited, target: nil) }
         let target = suggestionEditTarget(
             showingSuggestion: showingSuggestion, isForward: isForward, replyTo: replyTo,
             recipients: recipients, subject: subject, accountId: accountId, accounts: accounts)
