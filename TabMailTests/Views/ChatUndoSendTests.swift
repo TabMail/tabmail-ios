@@ -958,6 +958,8 @@ struct ChatUndoSendTests {
     nonisolated private static let watchPastDeadline: TimeInterval = 1
     /// How often the mounted bubble is read.
     nonisolated private static let readInterval: Duration = .milliseconds(50)
+    /// How many reads (`readInterval` apart) a hosted view gets to pick up a changed Reduce Motion.
+    nonisolated private static let settleReads = 60
 
     @Test("A mounted bubble offers Undo until its deadline and not after it, with motion and under Reduce Motion; past the deadline a queued reply is solid to the top with motion and still pending under Reduce Motion",
           arguments: [false, true])
@@ -974,21 +976,31 @@ struct ChatUndoSendTests {
     private func mountedDeadlineBody(reduceMotion: Bool) async throws {
         let setting = UIAccessibility.isReduceMotionEnabled
         #expect(setting == reduceMotion, "control: Reduce Motion is set as the case asks")
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 300)
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        // A view hosted right after the switch changes can still read the previous setting for a
+        // moment: wait until a view hosted in this window reads the one this case set.
+        let probe = UIHostingController(rootView: ReduceMotionProbe())
+        window.rootViewController = probe
+        window.makeKeyAndVisible()
+        let wanted = ReduceMotionProbe.label(reduceMotion)
+        func probeReads() -> Bool { HostedAccessibility.labels(in: probe.view).contains(wanted) }
+        for _ in 0..<Self.settleReads where !probeReads() { try await Task.sleep(for: Self.readInterval) }
+        let settled = probeReads()
+        #expect(settled, "control: a hosted view reads the Reduce Motion setting this case set")
+
         // Undo ends 2.5 s from now; the reply stays queued past it (a claim buffer, or offline).
         let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + 2.5)
         let reply = ChatUnsentReply(outboxId: "o-mounted", status: .queued, sentAt: nil, holdUntil: hold,
                                     draftId: "d", instanceEpoch: "E1", filed: false, textMessage: "ok, Tuesday works.")
         let deadline = reply.undoDeadline
-        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let window = UIWindow(windowScene: scene)
-        window.frame = CGRect(x: 0, y: 0, width: 393, height: 300)
         let controller = UIHostingController(rootView: ChatUnsentReplyBubble(reply: reply, retry: {}, delete: {}, undo: {}))
         window.rootViewController = controller
-        window.makeKeyAndVisible()
-        defer {
-            window.isHidden = true
-            window.rootViewController = nil
-        }
         func hasUndo() -> Bool {
             HostedAccessibility.identifiers(in: controller.view).contains(ChatUndoSendStatus.undoId)
         }
@@ -1418,6 +1430,19 @@ struct ChatUndoSendTests {
         try await pool.write { db in
             try db.execute(sql: "UPDATE outboxMessage SET holdUntil = ? WHERE id = ?", arguments: [hold, id])
         }
+    }
+}
+
+/// Shows, as its accessibility label, the Reduce Motion setting SwiftUI gives the views it hosts.
+private struct ReduceMotionProbe: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Text("Reduce Motion probe").accessibilityLabel(Self.label(reduceMotion))
+    }
+
+    static func label(_ on: Bool) -> String {
+        on ? "Reduce Motion probe: on" : "Reduce Motion probe: off"
     }
 }
 
