@@ -269,11 +269,14 @@ struct ComposeToolGenerationBoundaryTests {
         var writeCalls: Int { bodies.filter { $0.contains(Backend.writeRequest) && !$0.contains("conversation_state") }.count }
     }
 
-    /// Runs `body` with AI on (the user's opt-out off), then puts the opt-out back.
+    /// Runs `body` with AI on (the AI choice made, not opted out: `AIService.isAIOff` reads both),
+    /// then puts both values back. The opt-out alone leaves AI off while the choice is not made.
+    /// It calls `AITestSetting`'s synchronous save and set rather than `AITestSetting.with`, whose
+    /// nonisolated async body would take this main-actor closure across an isolation boundary.
     private static func withAIOn(_ body: () async throws -> Void) async throws {
-        let saved = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
-        defer { AIService.optOutStore.set(saved, forKey: AIService.optOutAllAIKey) }
-        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+        let restore = AITestSetting.save()
+        defer { restore() }
+        AITestSetting.set(aiOff: false)
         try await body()
     }
 
