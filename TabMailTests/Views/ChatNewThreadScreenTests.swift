@@ -355,6 +355,10 @@ struct ChatNewThreadScreenTests {
     }
 
     private func pickedPeopleBody() async throws {
+        // The app's debug log, on for this test: the screen's own-address read logs there when it
+        // fails, and the last check below reports those lines.
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
+        defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
         let fixture = try fixture()
         defer { finish(fixture) }
         let recorder = QueueRecorder()
@@ -396,7 +400,8 @@ struct ChatNewThreadScreenTests {
             #expect(done.accessibilityActivate(), "Done takes a tap")
             try await Self.waitUntil { Self.topPresented(screen) == nil }
             #expect(Self.topPresented(screen) == nil, "Done closes the sheet")
-            #expect(model.people.map(\.address) == ["maria@example.com"], "the user's own address is not added")
+            let screenLog = AppLogStore.read(channel: .debug).split(separator: "\n").filter { $0.contains("[ChatNewEmail]") }
+            #expect(model.people.map(\.address) == ["maria@example.com"], "the user's own address is not added; the screen's log: \(screenLog.suffix(10))")
         }
     }
 
@@ -808,22 +813,21 @@ struct ChatNewThreadScreenTests {
         return (model.draftId, header)
     }
 
-    /// Runs `body` with the Chat View setting as given and AI on (not opted out, the plan's gate
-    /// open), then puts all three back.
+    /// Runs `body` with the Chat View setting as given and AI on (the AI choice made, not opted
+    /// out, the plan's gate open), then puts all of it back as it was.
     private static func withChatView(_ on: Bool, _ body: () async throws -> Void) async throws {
         let defaults = UserDefaults.standard
         let savedChat = defaults.object(forKey: ChatViewConfig.enabledKey)
-        let savedOptOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
-        let gate = AISubscriptionGate.shared
-        let gateWasActive = gate.isActive
+        let restoreAI = AITestSetting.save()
+        let gate = AIGateTestState()
         defer {
             defaults.set(savedChat, forKey: ChatViewConfig.enabledKey)
-            AIService.optOutStore.set(savedOptOut, forKey: AIService.optOutAllAIKey)
-            if gateWasActive { gate.openGate() } else { gate.closeGate() }
+            restoreAI()
+            gate.restore()
         }
         defaults.set(on, forKey: ChatViewConfig.enabledKey)
-        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
-        gate.openGate()
+        AITestSetting.set(aiOff: false)
+        AISubscriptionGate.shared.openGate()
         try await body()
     }
 
