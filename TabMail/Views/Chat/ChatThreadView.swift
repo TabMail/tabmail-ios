@@ -249,6 +249,7 @@ struct ChatThreadView: View {
                 }
                 .disabled(thread.newest == nil)
                 .accessibilityLabel("Forward")
+                .accessibilityIdentifier(Self.forwardId)
             }
         }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
@@ -308,10 +309,10 @@ struct ChatThreadView: View {
             // suggestion through the outbox.
             ready.compose.composeView(
                 replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
-                onAgentOutcome: { _ in })
+                openedOn: composeScreen(answering: ready.message), onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
-        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
+        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }
         .sheet(isPresented: $showsReplyTo) {
             ChatReplyToSheet(
                 replyPeople: thread.replyPeople, target: replyTarget,
@@ -344,7 +345,7 @@ struct ChatThreadView: View {
                         }
                         // Replies still in the outbox.
                         ForEach(unsentReplies) { reply in
-                            ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })
+                            ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo() })
                         }
                         // The AI Suggestion, where the reply lands once sent: the working bubble
                         // while it is written, then the ghost.
@@ -781,6 +782,9 @@ struct ChatThreadView: View {
     /// The reply field's container, as tests find it.
     static let replyPillId = "chatReplyPill"
 
+    /// The toolbar's Forward, as tests find it.
+    static let forwardId = "chatForward"
+
     /// The AI Suggestion's row, from `suggestionPhase`. The working bubble filling in grows the row
     /// into the ghost over `ChatSuggestionConfig.fillDuration`, and while the landing holds its
     /// target the re-pin scroll runs in the same transaction, so the growing row stays above the
@@ -960,10 +964,30 @@ struct ChatThreadView: View {
     }
 
     private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
-        req.composeView(account: context.accounts.first { $0.id == viewModel.message?.accountId }) { outcome in
+        req.composeView(account: context.accounts.first { $0.id == viewModel.message?.accountId },
+                        openedOn: composeScreen(answering: req.replyTo)) { outcome in
             req.onOutcome(outcome)
             composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)
         }
+    }
+
+    /// The screen this chat records for a compose it opens (`ComposeView.openedOn`).
+    private func composeScreen(answering target: MessageHeader?) -> ComposeScreen? {
+        Self.composeScreen(answering: target, chatMessageIds: messageIds)
+    }
+
+    /// The screen a chat records for a compose it opens, as the compose opens: the chat
+    /// (`ComposeScreen.chat`) only when it shows that compose's send as its bubble, a reply to or a
+    /// forward of one of its own emails. It is decided on the In-Reply-To the send's outbox row will
+    /// carry (`ThreadUtils.outgoingInReplyTo`), by the rule the chat finds its bubbles with
+    /// (`ChatUnsentReply.answers`), so an email whose Message-ID the send cannot carry as the chat
+    /// matches it (blank, or written with spaces inside its brackets) keeps the toast.
+    /// Any other records none, and its send keeps the toast: a new email, and an agent's card for an
+    /// email of another thread (its tools can name any email), whose send shows only in that
+    /// thread's chat. `chatMessageIds`: the normalized Message-IDs of the chat's emails.
+    nonisolated static func composeScreen(answering target: MessageHeader?, chatMessageIds: Set<String>) -> ComposeScreen? {
+        let inReplyTo = ThreadUtils.outgoingInReplyTo(parentRfc822MessageId: target?.rfc822MessageId)
+        return ChatUnsentReply.answers(inReplyTo, in: chatMessageIds) ? .chat : nil
     }
 }
 

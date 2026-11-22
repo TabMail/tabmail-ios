@@ -1786,13 +1786,13 @@ extension AccountManager {
             // design decision from the IOS-PERF-010 audit (Member 5, Proofs A/B/C; memory 104), NOT an
             // oversight and NOT a perf smell to "fix". A future perf pass or linter that re-flags this
             // synchronous @MainActor GRDB write must stop here: converting it re-introduces the
-            // IOS-OUTBOX-006 Undo-Send bug. PendingSendService.undo() reads authority and applies this
+            // IOS-OUTBOX-006 Undo-Send bug. PendingSendService.undoAndReopen() reads authority and applies this
             // discard in ONE @MainActor run before the durable hold's buffered
             // cancellation deadline. Adding an
             // `await` on this write does two irreversible things:
             //   1. It admits a second Undo tap between decision and apply (Proof B, reentrancy).
             //   2. It can overrun the outboxClaimBufferSeconds budget, so the drain's atomicClaim flips
-            //      this row to `.sending` first; the discard then refuses on `.sending`, undo() raises
+            //      this row to `.sending` first; the discard then refuses on `.sending`, the Undo raises
             //      a truthful "cancellation wasn't confirmed" alert after the Undo button is gone — and
             //      the mail is delivered anyway (Proof A, the deadline). That is the IOS-OUTBOX-006 end
             //      state (Outbox Reliability Rules 3 and 10), which nothing recovers.

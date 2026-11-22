@@ -336,7 +336,7 @@ struct OutboxReconcileInFlightSendTests {
     //
     // These PIN WHY `discardOutboxMessageConfirmed` must stay synchronous. Each is
     // GREEN on the current (correct, synchronous) code and asserts the user-facing
-    // end state `PendingSendService.undo()` reaches; neither inspects the
+    // end state `PendingSendService.undoAndReopen()` reaches; neither inspects the
     // `nonisolated`/`@MainActor` shape. They do NOT themselves ship mail or
     // reproduce the IOS-OUTBOX-006 red — that red was observed during development
     // with THROWAWAY `Task.sleep`/`holdUntil` mutations that were then removed.
@@ -354,7 +354,7 @@ struct OutboxReconcileInFlightSendTests {
     //    reentrancy test's synchronous-deletion assertion (`rowGone`), which has no
     //    live drain racing the read.
 
-    /// One queued send whose generation `PendingSendService.undo()` can verify:
+    /// One queued send whose generation `PendingSendService.undoAndReopen()` can verify:
     /// a `Draft` row and an `OutboxMessage` row that agree on `draftId`,
     /// `accountId` and `instanceEpoch`, so `retainedAuthorityOutcome` returns
     /// `.verified` and a successful undo yields a reopenable snapshot.
@@ -449,7 +449,7 @@ struct OutboxReconcileInFlightSendTests {
             let drainTask = Task { await AccountManager.shared.drainOutbox() }
             try? await Task.sleep(nanoseconds: 30_000_000)
 
-            let snapshot = PendingSendService.shared.undo()
+            let snapshot = PendingSendService.shared.tapToastUndo()
 
             #expect(snapshot != nil, """
                 an in-window Undo on a verified generation must return a reopenable snapshot — the user \
@@ -513,8 +513,8 @@ struct OutboxReconcileInFlightSendTests {
 
             // Two taps back to back in ONE synchronous @MainActor run — no await
             // between them, exactly as a double-tap on the synchronous Undo button.
-            let first = PendingSendService.shared.undo()
-            let second = PendingSendService.shared.undo()
+            let first = PendingSendService.shared.tapToastUndo()
+            let second = PendingSendService.shared.tapToastUndo()
 
             #expect(first != nil, """
                 the first Undo confirmed the cancellation of the verified generation and returned a \
