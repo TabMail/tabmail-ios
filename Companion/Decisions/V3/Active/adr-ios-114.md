@@ -1232,7 +1232,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
 22. **A new email starts as an empty chat (amendment 2026-11-21).** With the chat view on, the mailbox
    list's compose button pushes an empty chat (`ChatNewThreadView`, `ChatNewThreadModel`) instead of
    presenting compose; off, compose opens as before (`ChatNewThreadRoute.composeButton`, the setting
-   read once at the tap). The mailbox list (`InboxView`) is the list of every folder, so this is the
+   read once at the tap). Signed out of TabMail (mail only), compose opens too, since the chat's
+   field cannot send then (`signedIn:`, the session read at the tap; amended 2026-11-22). The mailbox list (`InboxView`) is the list of every folder, so this is the
    compose button of the Inbox, Sent, Drafts and every other folder alike. Other ways of starting an
    email (a contact, the email screen, links, the iPad split view) still open compose.
    - *The chat.* The header sits where every chat's header is, with one empty avatar and "Add
@@ -1264,10 +1265,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      follows, and the Sending bubble after the card's Send are later work; until then Send with
      people picked does nothing.
    - *The agent chat.* Each new email's chat has its own session key, in memory only
-     (`ChatNewEmailField.newSessionKey`), never carried into another chat; no chat turn is stored for
-     it (ADR-004).
+     (`ChatNewEmailField.newSessionKey`, held by `ChatNewThreadModel.sessionKey`), never carried into
+     another chat; no chat turn is stored for it (ADR-004). The screen ends it as it closes
+     (`ChatPillState.endSession`), since nothing else would (2026-11-22).
    - *The draft.* Its key is `chat-new:<uuid>` (`Draft.newEmailKey`, `Draft.isNewEmailKey`): local to
-     the device, like every draft key, and never written to a provider or a header (the placeholder
+     the device, like every draft key, and never written to a provider or a wire header (the placeholder
      header's id is made colon-safe from it as for every key); no migration. Nothing is asked when
      leaving: Back and the app going to the background save the draft silently when there is
      something to keep (`ChatNewDraft.needsSave`): a chat with no saved draft saves only words or
@@ -1277,18 +1279,27 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      which compose's Save also uses (`ComposeDraftSave.run`: a fail-closed read, the attachments
      staged, the row saved through the chat's generation (`ComposeGenerationCursor`), staged or
      superseded files removed only after the commit), then `queueDraftSave` (`ChatNewDraftSave.run`);
-     a subject, Cc or Bcc the row already holds is kept. Back leaves
+     a subject, Cc or Bcc the row already holds is kept. In Drafts, a draft with no subject reads
+     "Draft (no subject yet)" in the list and in Triage alike (`MessageRowView.subjectLine`); display
+     only, the stored and uploaded subject stays empty. Back leaves
      only once the save is durable; a refused save keeps the chat open and offers "Leave without
      saving" or "Stay". Back replaces the system Back, so the edge swipe back is off in this chat.
-     While the chat is open its draft is exempt from eviction (`DraftSessionRegistry`).
+     The screen closing any other way (on iPad, another mailbox picked while it is open replaces the
+     list it sits on) saves the draft the same way, unless "Leave without saving" was chosen; a
+     refusal there is only logged, as the screen is gone (2026-11-22). The camera's cover does not
+     close it. While the chat is open its draft is exempt from eviction (`DraftSessionRegistry`),
+     given back only once the closing save is done.
    - *Reopening.* A `chat-new:` draft opened from any path while the chat view is on reopens as its
      chat (`ChatNewThreadRoute.savedDraft`, decided in `DraftComposePresenter` once its preparation
      has checked the row), with the words in the field, the attachments above it, the people its To
      names (an address without a saved name shows its fallback name) and "Draft, saved <time>"
-     (`ChatNewDraft.savedLine`). With the chat view off, or for any other key, the draft opens in
+     (`ChatNewDraft.savedLine`). A person still under the name the draft gives keeps the draft's own
+     spelling on save; one picked again under another name is written as picked (2026-11-22). With
+     the chat view off, signed out, or for any other key, the draft opens in
      compose as before. A draft with no local row (another device, a reinstall) has no `chat-new:`
      key to find, so it is adopted as any server draft is and opens in compose. Attachments that cannot
-     be read block saving from the chat, so the saved files are never replaced by an empty set. The
+     be read block saving from the chat, so the saved files are never replaced by an empty set, and
+     the chat says so as it opens ("Attachments couldn't be loaded", 2026-11-22). The
      saved-draft path of decision 9's 2026-11-15 amendment is unchanged for every other draft.
    - *Later, with the compose card.* The compose card stays today's compose; the chat's draft is
      deleted only once the card's Send has a durable outbox row (never-drop). The card's delivery and

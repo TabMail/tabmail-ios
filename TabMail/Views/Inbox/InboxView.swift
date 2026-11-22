@@ -1105,10 +1105,10 @@ struct InboxView: View {
         }
     }
 
-    /// The compose button: with the chat view on, a new email starts as an empty chat; off,
-    /// today's compose. The setting is read once, at the tap.
+    /// The compose button: with the chat view on and signed in to TabMail, a new email starts as
+    /// an empty chat; otherwise today's compose. The setting and the session are read once, at the tap.
     private func startNewEmail() {
-        switch ChatNewThreadRoute.composeButton(opensInChat: ChatViewConfig.opensInChat) {
+        switch ChatNewThreadRoute.composeButton(opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession) {
         case .newThread:
             newEmail = ChatNewThreadModel(account: viewModel.primaryAccount)
         case .compose:
@@ -1528,6 +1528,7 @@ struct InboxView: View {
                             .opacity(0)
                     }
                     TriageRowView(message: snapshot, isSelected: selectedMessageId == snapshot.id,
+                                  isDraftsFolder: isDraftsContext,
                                   fadeTop: fadeTop, fadeBottom: fadeBottom,
                                   prevTag: prevTag, nextTag: nextTag,
                                   onStripeAction: { executeTaggedAction(snapshot) },

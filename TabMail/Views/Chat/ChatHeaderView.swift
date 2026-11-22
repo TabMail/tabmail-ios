@@ -89,15 +89,22 @@ struct ChatSubjectLine: View {
     let reportContent: () -> String
 
     var body: some View {
-        line
+        ChatSubjectText(subject: subject, labels: labels)
             // Both sides, so the subject stays centred under the names.
             .padding(.horizontal, ChatViewLayout.aiNoticeTapTarget)
             .overlay(alignment: .trailing) {
                 AISummariesNoticeButton(landed: landed, reportContent: reportContent)
             }
     }
+}
 
-    private var line: some View {
+/// The text of the line under a chat's header: the subject, then its labels. A thread's line
+/// (`ChatSubjectLine`) and a new email's (`ChatNewEmailSubjectLine`, no labels) both draw it.
+struct ChatSubjectText: View {
+    let subject: String
+    var labels: [UserLabel] = []
+
+    var body: some View {
         HStack(spacing: 4) {
             Text(subject)
                 .font(.caption)

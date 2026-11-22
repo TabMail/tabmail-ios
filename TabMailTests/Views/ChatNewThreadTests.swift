@@ -22,12 +22,16 @@ struct ChatNewThreadTests {
 
     // MARK: - Where it opens
 
-    @Test("The compose button opens the chat with the chat view on, today's compose with it off")
+    @Test("The compose button opens the chat with the chat view on and signed in; off, or signed out, today's compose")
     func composeButtonRoute() {
-        let on = ChatNewThreadRoute.composeButton(opensInChat: true)
-        let off = ChatNewThreadRoute.composeButton(opensInChat: false)
+        let on = ChatNewThreadRoute.composeButton(opensInChat: true, signedIn: true)
+        let off = ChatNewThreadRoute.composeButton(opensInChat: false, signedIn: true)
+        let signedOut = ChatNewThreadRoute.composeButton(opensInChat: true, signedIn: false)
+        let neither = ChatNewThreadRoute.composeButton(opensInChat: false, signedIn: false)
         #expect(on == .newThread)
         #expect(off == .compose)
+        #expect(signedOut == .compose, "signed out, the chat's field cannot send")
+        #expect(neither == .compose)
     }
 
     @Test("Only a new email started in the chat reopens as its chat, and only with the chat view on")
@@ -37,12 +41,14 @@ struct ChatNewThreadTests {
         let reply = Draft.draftKey(replyTo: "acc1:parent@example.com", isForward: false, newId: nil)
         let forward = Draft.draftKey(replyTo: "acc1:parent@example.com", isForward: true, newId: nil)
         let separate = Draft.separateReplyKey(replyTo: reply)
-        let onNew = ChatNewThreadRoute.savedDraft(id: newEmail, opensInChat: true)
-        let offNew = ChatNewThreadRoute.savedDraft(id: newEmail, opensInChat: false)
+        let onNew = ChatNewThreadRoute.savedDraft(id: newEmail, opensInChat: true, signedIn: true)
+        let offNew = ChatNewThreadRoute.savedDraft(id: newEmail, opensInChat: false, signedIn: true)
+        let signedOutNew = ChatNewThreadRoute.savedDraft(id: newEmail, opensInChat: true, signedIn: false)
         #expect(onNew == .newThread)
         #expect(offNew == .compose, "with the chat view off every draft opens in compose")
+        #expect(signedOutNew == .compose, "signed out, the chat's field cannot send")
         for other in [compose, reply, forward, separate] {
-            let route = ChatNewThreadRoute.savedDraft(id: other, opensInChat: true)
+            let route = ChatNewThreadRoute.savedDraft(id: other, opensInChat: true, signedIn: true)
             #expect(route == .compose, "\(other) opens in compose")
         }
     }
@@ -178,6 +184,11 @@ struct ChatNewThreadTests {
         #expect(Self.count("Text(message.subject)", in: row) == 0, "the row's subject goes through the fallback")
         let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
         #expect(Self.count("showsRecipientInsteadOfSender: isUserAuthoredFolder, isDraftsFolder: isDraftsContext )", in: inbox) == 1)
+        // Triage shows the same subject line.
+        let triage = try Self.source("TabMail/Views/Inbox/TriageCardView.swift")
+        #expect(Self.count("Text(MessageRowView.subjectLine(message.subject, isDraftsFolder: isDraftsFolder))", in: triage) == 1)
+        #expect(Self.count("Text(message.subject)", in: triage) == 0, "the triage row's subject goes through the fallback")
+        #expect(Self.count("TriageRowView(message: snapshot, isSelected: selectedMessageId == snapshot.id, isDraftsFolder: isDraftsContext,", in: inbox) == 1)
     }
 
     @Test("A saved To becomes the people, by name or the address's own; text that is no address is kept apart")
@@ -209,6 +220,34 @@ struct ChatNewThreadTests {
         #expect(readBack.leftovers == ["not an address"])
         let removed = ChatNewDraft.toEntries(people: [reopened.people[1]], authored: reopened.authored, leftovers: [])
         #expect(removed == ["sam@example.com"], "a person taken off is not written")
+    }
+
+    @Test("A reopened draft's person picked again under another name is written under that name; under the same name, as the draft wrote them")
+    func toEntriesRepickedUnderAnotherName() {
+        let reopened = ChatNewDraft.people(fromTo: ["Maria Lee <Maria@Example.com>", "sam@example.com"])
+        let renamed = ChatThread.Person(address: "maria@example.com", name: "Maria Chen")
+        let samNamed = ChatThread.Person(address: "sam@example.com", name: "Sam Park")
+        let written = ChatNewDraft.toEntries(
+            people: [renamed, samNamed], authored: reopened.authored, leftovers: reopened.leftovers)
+        #expect(written == ["\"Maria Chen\" <maria@example.com>", "\"Sam Park\" <sam@example.com>"],
+                "the name picked, never the one the draft gave")
+        let sameAgain = ChatNewDraft.toEntries(
+            people: reopened.people, authored: reopened.authored, leftovers: reopened.leftovers)
+        #expect(sameAgain == ["\"Maria Lee\" <Maria@Example.com>", "sam@example.com"], "unchanged, as the draft wrote them")
+    }
+
+    @Test("The person a saved mailbox names: its address in lower case, under its own name or the address's")
+    func personFromMailbox() {
+        let mailboxes = [
+            RecipientEntry.Recipient(address: "Maria@Example.com", name: "Maria Lee"),
+            RecipientEntry.Recipient(address: "sam@example.com", name: nil),
+            RecipientEntry.Recipient(address: "Kim@Example.com", name: ""),
+        ]
+        let people = mailboxes.map(ChatNewDraft.person)
+        let addresses = people.map(\.address)
+        let names = people.map(\.name)
+        #expect(addresses == ["maria@example.com", "sam@example.com", "kim@example.com"])
+        #expect(names == ["Maria Lee", ChatThread.fallbackName("sam@example.com"), ChatThread.fallbackName("kim@example.com")])
     }
 
     @Test("Add recipient starts from nobody, needs someone, and its Done replaces the people picked")
@@ -258,13 +297,45 @@ struct ChatNewThreadTests {
         #expect(reply.newEmail == nil)
     }
 
-    @Test("Each new email's chat has its own in-memory session, never the inbox's")
+    @Test("Each new email's chat has its own in-memory session, never the inbox's, kept by its chat for as long as it is open")
     func sessionKeys() {
         let first = ChatNewEmailField.newSessionKey()
         let second = ChatNewEmailField.newSessionKey()
         #expect(first != second)
         #expect(first != "inbox")
         #expect(!first.hasPrefix(Draft.newEmailPrefix), "the session is not the draft")
+        let chat = ChatNewThreadModel(account: nil)
+        let other = ChatNewThreadModel(account: nil)
+        #expect(chat.sessionKey == chat.sessionKey, "one chat, one session")
+        #expect(chat.sessionKey != other.sessionKey)
+        #expect(chat.sessionKey != chat.draftId)
+    }
+
+    @Test("Ending a session cancels its running turn, stops counting it as working, and drops it; other sessions stay")
+    func endSession() async {
+        let state = ChatPillState.shared
+        let key = ChatNewEmailField.newSessionKey()
+        let other = ChatNewEmailField.newSessionKey()
+        defer { state.endSession(for: other) }
+        let session = state.session(for: key)
+        session.chatMessages.append(ChatMessage(role: .user, content: "Hi", timestamp: Date()))
+        state.session(for: other).chatMessages.append(ChatMessage(role: .user, content: "Stay", timestamp: Date()))
+        let turn = Task<Void, Never> {
+            while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+        }
+        session.activeChatTask = turn
+        ActiveAgentTracker.shared.setWorking(key)
+        state.endSession(for: key)
+        await turn.value
+        #expect(turn.isCancelled, "the running turn is cancelled")
+        #expect(session.activeChatTask == nil)
+        #expect(!ActiveAgentTracker.shared.workingSessions.contains(key))
+        let fresh = state.session(for: key)
+        #expect(fresh.chatMessages.isEmpty, "the session is gone; asking again starts a new one")
+        #expect(fresh !== session)
+        state.endSession(for: key)
+        #expect(state.session(for: other).chatMessages.first?.content == "Stay")
+        state.endSession(for: "never-made-\(UUID().uuidString)")
     }
 
     @Test("The paperclip offers Photos, Camera and Files, in that order")
@@ -394,11 +465,11 @@ struct ChatNewThreadTests {
 
     // MARK: - Wiring
 
-    @Test("The inbox compose button reads the setting at the tap and pushes the chat; off, compose as before")
+    @Test("The inbox compose button reads the setting and the session at the tap and pushes the chat; otherwise compose as before")
     func inboxWiring() throws {
         let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
         #expect(Self.count("ComposeToolbarButton(onNewCompose: { collapseChat() startNewEmail() })", in: inbox) == 1)
-        #expect(Self.count("switch ChatNewThreadRoute.composeButton(opensInChat: ChatViewConfig.opensInChat) { case .newThread: newEmail = ChatNewThreadModel(account: viewModel.primaryAccount) case .compose: viewModel.showCompose = true }", in: inbox) == 1)
+        #expect(Self.count("switch ChatNewThreadRoute.composeButton(opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession) { case .newThread: newEmail = ChatNewThreadModel(account: viewModel.primaryAccount) case .compose: viewModel.showCompose = true }", in: inbox) == 1)
         #expect(Self.count(".navigationDestination(item: $newEmail) { model in ChatNewThreadView(model: model) }", in: inbox) == 1)
         #expect(Self.count(".fullScreenCover(isPresented: $vm.showCompose) { ComposeView(account: viewModel.primaryAccount) }", in: inbox) == 1,
                 "the chat view off keeps today's compose")
@@ -409,7 +480,9 @@ struct ChatNewThreadTests {
     func draftOpenWiring() throws {
         let presenter = try Self.source("TabMail/Views/Compose/DraftComposePresenter.swift")
         #expect(Self.count("@State private var opensInChat = ChatViewConfig.opensInChat", in: presenter) == 1)
-        #expect(Self.count("if case .ready(let ready) = prepared, ChatNewThreadRoute.savedDraft(id: ready.draft.id, opensInChat: opensInChat) == .newThread { newEmail = ChatNewThreadModel(reopening: ready.draft, account: ready.account) } else { newEmail = nil } outcome = prepared", in: presenter) == 1)
+        #expect(Self.count("if case .ready(let ready) = prepared, ChatNewThreadRoute.savedDraft(id: ready.draft.id, opensInChat: opensInChat, signedIn: signedIn) == .newThread { newEmail = ChatNewThreadModel(reopening: ready.draft, account: ready.account) } else { newEmail = nil } outcome = prepared", in: presenter) == 1)
+        #expect(Self.count("private func prepare() async { let signedIn = hasTabMailSession #if DEBUG", in: presenter) == 1,
+                "the session is read as the open starts, before the preparation suspends")
         #expect(Self.count("if let newEmail { newEmailChat(newEmail) } else { ComposeView(", in: presenter) == 1)
         #expect(Self.count("if presentedAsCover { NavigationStack { ChatNewThreadView(model: model) } } else { ChatNewThreadView(model: model) }", in: presenter) == 1)
         let open = try Self.source("TabMail/Views/Chat/MessageOpenView.swift")
@@ -443,9 +516,12 @@ struct ChatNewThreadTests {
         #expect(Self.count("Button { leave() } label:", in: view) == 1)
         #expect(Self.count("let outcome = await model.saveIfNeeded() isLeaving = false switch outcome { case .saved: dismiss() case .refused(let message): saveRefusal = message }", in: view) == 1)
         #expect(Self.count("if phase == .background { Task { await saveInBackground() } }", in: view) == 1)
-        #expect(Self.count("Button(\"Leave without saving\", role: .destructive) { dismiss() }", in: view) == 1)
-        #expect(Self.count(".onAppear { DraftSessionRegistry.shared.register(model.draftId) }", in: view) == 1)
-        #expect(Self.count(".onDisappear { DraftSessionRegistry.shared.unregister(model.draftId) }", in: view) == 1)
+        #expect(Self.count("Button(\"Leave without saving\", role: .destructive) { leaveWithoutSaving() }", in: view) == 1)
+        #expect(Self.count(".onAppear { opened() }", in: view) == 1)
+        #expect(Self.count(".onDisappear { if !showsCamera { closed() } }", in: view) == 1,
+                "the camera's cover hides the screen without closing it")
+        #expect(Self.count("DraftSessionRegistry.shared.register(model.draftId)", in: view) == 1)
+        #expect(Self.count("DraftSessionRegistry.shared.unregister(model.draftId)", in: view) == 1)
         #expect(Self.count("model.setPeople(ChatNewDraft.people(after: done, current: model.people))", in: view) == 1)
         // The keyboard rule, on this screen itself, as the chat's own thread installs it.
         #expect(Self.count(".defaultScrollAnchor(.bottom) .scrollDismissesKeyboard(.interactively) .frame(maxWidth: .infinity, maxHeight: .infinity) .background(Palette.previewPaneBg) .dismissKeyboardOnTap()", in: view) == 1,
@@ -481,7 +557,7 @@ struct ChatNewThreadHostedTests {
     private static let maria = ChatThread.Person(address: "maria@example.com", name: "Maria")
     private static let sam = ChatThread.Person(address: "sam@example.com", name: "Sam")
 
-    @Test("With nobody picked the header's one button is Add recipient, and it opens the sheet")
+    @Test("With nobody picked the header's one button is Add recipient, with the new email's hint, and a press runs the header's action")
     func hostedEmptyHeader() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await hostedEmptyHeaderBody() }
@@ -532,11 +608,20 @@ struct ChatNewThreadHostedTests {
     }
 
     private func hostedThreadHeaderWithNobodyBody() async throws {
-        let window = try Self.host(ChatHeaderView(people: []) {})
+        // The same render holds a header with someone in it: once its button is on screen, the
+        // empty header beside it has been drawn too.
+        let window = try Self.host(VStack {
+            ChatHeaderView(people: [Self.maria]) {}
+            ChatHeaderView(people: []) {}
+        })
         defer { window.isHidden = true }
-        try await Task.sleep(for: .milliseconds(200))
-        let names = Self.element(ChatHeaderView.namesId, in: window)
-        #expect(names == nil)
+        func buttons() -> [NSObject] {
+            HostedAccessibility.elements(under: window).filter { HostedAccessibility.identifier(of: $0) == ChatHeaderView.namesId }
+        }
+        _ = await Self.waitUntil { !buttons().isEmpty }
+        let shown = buttons().map { $0.accessibilityLabel ?? "" }
+        #expect(shown.count == 1, "only the header with someone has a button: \(shown)")
+        #expect(shown.first?.contains("Maria") == true, "control: the header with someone is drawn")
     }
 
     @Test("The tray's x on an item removes that item")
@@ -607,7 +692,8 @@ struct ChatNewThreadHostedTests {
 }
 
 /// A new email's draft against a real database: what Back and the background write, what a
-/// reopened draft keeps, and every refusal leaving the saved row as it was.
+/// reopened draft keeps, every refusal before the save leaving the saved row as it was, and what
+/// the real queue and push make of it.
 @Suite("New email draft saves", .serialized, .processGlobalState)
 @MainActor
 struct ChatNewDraftSaveTests {
@@ -655,6 +741,19 @@ struct ChatNewDraftSaveTests {
 
     private func makeModel(_ fixture: Fixture, _ recorder: QueueRecorder) -> ChatNewThreadModel {
         ChatNewThreadModel(account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
+    }
+
+    /// A save started, returned once it has run up to its first wait. Both run on the main actor:
+    /// the save's task says it started, then runs straight into `saveIfNeeded` until that first
+    /// suspends, before this resumes, so a save that does not wait has already finished here.
+    private static func startedSave(_ model: ChatNewThreadModel) async -> Task<ChatNewDraftSave.Outcome, Never> {
+        let (started, startedNow) = AsyncStream<Void>.makeStream()
+        let save = Task { @MainActor () -> ChatNewDraftSave.Outcome in
+            startedNow.yield(())
+            return await model.saveIfNeeded()
+        }
+        for await _ in started { break }
+        return save
     }
 
     /// A saved new email's draft, as the chat wrote it earlier, with one attachment unless told
@@ -732,6 +831,51 @@ struct ChatNewDraftSaveTests {
         #expect(saved.instanceEpoch == model.cursor.newEpoch)
         #expect(recorder.calls == ["\(model.draftId)|\(Self.accountId)"])
         #expect(model.savedAt == savedAt)
+    }
+
+    @Test("Through the real queue a saved new email is in Drafts, as a placeholder and a queued save named from its key made colon-safe; its push carries a fresh Message-ID, never the key")
+    func realQueueAndWireIdentity() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        try FolderEpochTestFixture.insertFolder(accountId: Self.accountId, path: "Drafts", role: .drafts, pool: fixture.pool)
+        let model = ChatNewThreadModel(account: fixture.account)
+        model.setPeople([ChatThread.Person(address: "maria@example.com", name: "Maria")])
+        model.words = "Lunch on Friday?"
+        let outcome = await model.saveIfNeeded()
+        #expect(outcome == .saved)
+        let savedRow = try await row(fixture, model.draftId)
+        let saved = try #require(savedRow)
+        let epoch = try #require(saved.instanceEpoch)
+        let headerId = PendingOperation.draftPlaceholderHeaderPK(
+            accountId: Self.accountId, draftsFolderPath: "Drafts", draftId: model.draftId, instanceEpoch: epoch)
+        let headerRow = try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: headerId) }
+        let placeholder = try #require(headerRow, "the Drafts list has the draft")
+        let ops = try await fixture.pool.read { db in
+            try PendingOperation.filter(Column("draftId") == model.draftId).fetchAll(db)
+        }
+        #expect(placeholder.folderPath == "Drafts")
+        #expect(placeholder.snippet.contains("Lunch on Friday?"))
+        #expect(placeholder.to.contains("maria@example.com"))
+        #expect(placeholder.messageId == PendingOperation.draftPlaceholderMessageId(draftId: model.draftId, instanceEpoch: epoch))
+        #expect(!placeholder.messageId.contains(Draft.newEmailPrefix), "the key's colon is not in the header's id")
+        #expect(ops.count == 1, "one queued save")
+        guard ops.count == 1 else { return }
+        #expect(ops[0].type == .saveDraft)
+        #expect(ops[0].instanceEpoch == epoch)
+
+        // The push: what reaches the provider names the email by a fresh Message-ID.
+        let provider = MockEmailProvider(saveDraftResult: .created(.imap(folder: "Drafts", uidValidity: 1, uid: 7)))
+        _ = try? await DraftStore.shared.pushDraftToServer(
+            draftId: model.draftId, expectedInstanceEpoch: epoch, provider: provider,
+            runtimeKind: .imap, draftsFolderPath: "Drafts")
+        let sent = await provider.savedDraftMessages
+        #expect(sent.count == 1, "control: the push reached the provider")
+        guard sent.count == 1 else { return }
+        let wireId = try #require(sent[0].messageId)
+        #expect(!wireId.contains(model.draftId))
+        #expect(!wireId.contains(Draft.newEmailPrefix), "the local key never goes on the wire")
+        #expect(sent[0].body == "Lunch on Friday?")
+        #expect(sent[0].to == ["\"Maria\" <maria@example.com>"])
     }
 
     @Test("Saving again with nothing changed writes nothing; a change writes and queues again")
@@ -1004,8 +1148,7 @@ struct ChatNewDraftSaveTests {
             for await _ in release { break }
             return (data: Data([7, 8, 9]) as Data?, type: UTType.png as UTType?)
         }
-        let save = Task { await model.saveIfNeeded() }
-        for _ in 0..<10 { await Task.yield() }
+        let save = await Self.startedSave(model)
         let rowsWhileLoading = try await rowCount(fixture)
         #expect(rowsWhileLoading == 0, "nothing is written while the photo loads")
         releaseNow.yield(())
@@ -1035,8 +1178,7 @@ struct ChatNewDraftSaveTests {
             for await _ in release { break }
             return (data: Data([7]) as Data?, type: UTType.png as UTType?)
         }
-        let save = Task { await model.saveIfNeeded() }
-        for _ in 0..<10 { await Task.yield() }
+        let save = await Self.startedSave(model)
         let rowsWhileLoading = try await rowCount(fixture)
         #expect(rowsWhileLoading == 0, "the failed items settle, the loading one still holds the save")
         releaseNow.yield(())

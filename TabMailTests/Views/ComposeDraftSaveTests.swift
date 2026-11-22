@@ -25,6 +25,7 @@ struct ComposeDraftSaveTests {
     }
 
     private struct SaveFailed: Error {}
+    private struct ReadFailed: Error {}
 
     private func fixture() throws -> Fixture {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -237,6 +238,40 @@ struct ComposeDraftSaveTests {
         #expect(after.editHistoryJSON == Self.history)
         #expect(stagedDir != liveDir)
         #expect(!stagedRemains, "the failed save's staged directory is removed")
+        #expect(liveData == [Self.oldFile.data], "the live files are untouched")
+    }
+
+    @Test("A read that throws is not absence: the editor's fields are never asked for, nothing is admitted, and the row and its files stay as they were")
+    func failedReadWritesNothing() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let id = "compose-read-failed"
+        let earlier = try await earlierRow(fixture, id: id)
+        let liveDir = try #require(earlier.attachmentsDirName)
+        var asked = 0
+        var admitted = 0
+        let outcome = await ComposeDraftSave.run(
+            draftId: id, accountId: Self.accountId, attachments: [Self.newFile], now: Date().timeIntervalSince1970,
+            read: { _ in throw ReadFailed() },
+            fields: { _ in
+                asked += 1
+                return Self.fields()
+            },
+            admit: { draft in
+                admitted += 1
+                return try await DraftStore.shared.saveAsync(draft, epoch: Self.generation, expectedPredecessor: Self.generation)
+            })
+        let afterRow = try await row(fixture, id)
+        let after = try #require(afterRow)
+        let live = try DraftAttachmentStorage.loadAttachments(dirName: liveDir)
+        let liveData = live.map(\.data)
+        #expect(outcome == .readFailed)
+        #expect(asked == 0, "nothing is built from a read that did not happen")
+        #expect(admitted == 0, "nothing is saved")
+        #expect(after.body == "Old words")
+        #expect(after.updatedAt == earlier.updatedAt)
+        #expect(after.attachmentsDirName == liveDir)
+        #expect(after.editHistoryJSON == Self.history)
         #expect(liveData == [Self.oldFile.data], "the live files are untouched")
     }
 

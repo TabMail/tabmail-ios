@@ -192,6 +192,8 @@ struct DraftComposePresenter: View {
     @State private var outcome: DraftOpenPreparation.Outcome?
     /// The chat view setting, read once at the open (a Settings change applies to the next open).
     @State private var opensInChat = ChatViewConfig.opensInChat
+    /// Signed in to TabMail: read as the open is prepared (`ChatNewThreadRoute.savedDraft`).
+    @Environment(\.hasTabMailSession) private var hasTabMailSession
     /// A new email's chat, made once from the prepared draft; nil for a draft compose opens.
     @State private var newEmail: ChatNewThreadModel?
     @Environment(\.dismiss) private var dismiss
@@ -252,6 +254,7 @@ struct DraftComposePresenter: View {
     }
 
     private func prepare() async {
+        let signedIn = hasTabMailSession
         #if DEBUG
         let prepared = await DraftOpenPreparation.prepare(source, resolver: resolveOpenAuthorityForTesting)
         #else
@@ -260,7 +263,7 @@ struct DraftComposePresenter: View {
         // The chat is made here, once, from the row the preparation checked: the view never
         // reads the draft again.
         if case .ready(let ready) = prepared,
-           ChatNewThreadRoute.savedDraft(id: ready.draft.id, opensInChat: opensInChat) == .newThread {
+           ChatNewThreadRoute.savedDraft(id: ready.draft.id, opensInChat: opensInChat, signedIn: signedIn) == .newThread {
             newEmail = ChatNewThreadModel(reopening: ready.draft, account: ready.account)
         } else {
             newEmail = nil

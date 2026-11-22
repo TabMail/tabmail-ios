@@ -7,22 +7,24 @@ import GRDB
 import UIKit
 import UniformTypeIdentifiers
 
-/// Where a new email opens: with the chat view on, as a chat (`ChatNewThreadView`); off, in
-/// today's compose. Decided once, with the chat view setting read at the tap or the open.
+/// Where a new email opens: with the chat view on and signed in to TabMail, as a chat
+/// (`ChatNewThreadView`); otherwise in today's compose. Signed out (mail only), the chat's field
+/// cannot send, so a new email is written in compose. Decided once, with the chat view setting and
+/// the TabMail session read at the tap or the open.
 enum ChatNewThreadRoute: Equatable {
     case newThread
     case compose
 
     /// The inbox compose button.
-    static func composeButton(opensInChat: Bool) -> ChatNewThreadRoute {
-        opensInChat ? .newThread : .compose
+    static func composeButton(opensInChat: Bool, signedIn: Bool) -> ChatNewThreadRoute {
+        opensInChat && signedIn ? .newThread : .compose
     }
 
     /// A saved draft: a new email started in the chat (`Draft.isNewEmailKey`) reopens as its chat
-    /// while the chat view is on; every other draft, and every draft with the chat view off, opens
-    /// in compose.
-    static func savedDraft(id draftId: String, opensInChat: Bool) -> ChatNewThreadRoute {
-        opensInChat && Draft.isNewEmailKey(draftId) ? .newThread : .compose
+    /// while the chat view is on and the user is signed in; every other draft, and every draft
+    /// with the chat view off or signed out, opens in compose.
+    static func savedDraft(id draftId: String, opensInChat: Bool, signedIn: Bool) -> ChatNewThreadRoute {
+        opensInChat && signedIn && Draft.isNewEmailKey(draftId) ? .newThread : .compose
     }
 }
 
@@ -94,26 +96,30 @@ enum ChatNewDraft {
     /// address are kept apart (`leftovers`) so a save writes them back.
     static func people(fromTo to: [String]) -> (people: [ChatThread.Person], authored: [RecipientEntry.Recipient], leftovers: [String]) {
         let entry = RecipientEntry(to)
-        let people = entry.recipients.map { recipient in
-            let address = recipient.address.lowercased()
-            let name = recipient.name.flatMap { $0.isEmpty ? nil : $0 } ?? ChatThread.fallbackName(address)
-            return ChatThread.Person(address: address, name: name)
-        }
-        return (people, entry.recipients, entry.leftovers)
+        return (entry.recipients.map(person), entry.recipients, entry.leftovers)
+    }
+
+    /// The person a saved draft's mailbox names: its address, under the mailbox's own name, or
+    /// the address's (`ChatThread.fallbackName`) when it has none.
+    static func person(_ mailbox: RecipientEntry.Recipient) -> ChatThread.Person {
+        let address = mailbox.address.lowercased()
+        let name = mailbox.name.flatMap { $0.isEmpty ? nil : $0 } ?? ChatThread.fallbackName(address)
+        return ChatThread.Person(address: address, name: name)
     }
 
     /// The To entries a save writes, each a mailbox that reads back as itself
-    /// (`RecipientEntry.text`, as compose stores them). A person the reopened draft named keeps
-    /// that draft's own name and address as written (`authored`); a person picked here is
-    /// written under the name picked, or as the bare address when that name is only the
-    /// address's own (`ChatThread.fallbackName`). The entries that name no address follow, as written.
+    /// (`RecipientEntry.text`, as compose stores them). A person the reopened draft named, still
+    /// under the name that draft gives them, keeps that draft's own name and address as written
+    /// (`authored`); a person picked here, or picked again under another name, is written under
+    /// the name picked, or as the bare address when that name is only the address's own
+    /// (`ChatThread.fallbackName`). The entries that name no address follow, as written.
     static func toEntries(people: [ChatThread.Person], authored: [RecipientEntry.Recipient], leftovers: [String]) -> [String] {
         var written: [String: RecipientEntry.Recipient] = [:]
         for mailbox in authored where written[mailbox.address.lowercased()] == nil {
             written[mailbox.address.lowercased()] = mailbox
         }
         let mailboxes = people.map { person -> String in
-            if let mailbox = written[person.address.lowercased()] {
+            if let mailbox = written[person.address.lowercased()], Self.person(mailbox).name == person.name {
                 return RecipientEntry.text(name: mailbox.name, address: mailbox.address)
             }
             let name = person.name == ChatThread.fallbackName(person.address) ? nil : person.name
@@ -127,7 +133,9 @@ enum ChatNewDraft {
 /// fail-closed read of the row, the attachments staged in a fresh directory, the row saved
 /// through this chat's generation (`ComposeGenerationCursor`), the staged or superseded directory
 /// removed only after the save committed), then queues the push to the server's Drafts
-/// (`queueDraftSave`). Every refusal leaves the saved row and its attachments as they were.
+/// (`queueDraftSave`). A refusal before the commit leaves the saved row and its attachments as
+/// they were; a queue refusal comes after it, so the new version stays saved on the device and
+/// only its push is missing.
 @MainActor
 enum ChatNewDraftSave {
     enum Outcome: Equatable {
@@ -204,6 +212,9 @@ final class ChatNewThreadModel: Hashable {
 
     let draftId: String
     let account: Account?
+    /// This chat's own agent session, in memory only (`ChatPillState`); the screen ends it as it
+    /// closes (`ChatPillState.endSession`).
+    let sessionKey = ChatNewEmailField.newSessionKey()
     /// The words a reopened draft puts in the field; empty for a new chat.
     let startWords: String
     private(set) var people: [ChatThread.Person]

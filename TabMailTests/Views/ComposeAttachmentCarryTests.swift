@@ -277,6 +277,10 @@ struct ComposeAttachmentCarryTests {
         #expect(body.contains("recordAttachmentPreparationFailure"), "a failed item is surfaced as compose's preparation failure")
         #expect(body.contains("item.supportedContentTypes.first"), "a picked item is typed by its first content type")
         #expect(body.contains("await DraftAttachmentImport.loadPicked("), "compose loads picked items through the loader the chat shares")
+        // What the loader gives compose lands in compose's own list, named by what is there.
+        #expect(body.contains("existingCount: { attachments.count },"), "a picked item is named by the attachments already there")
+        #expect(body.contains("add: { attachments.append($0) },"), "every item that loads is added to the compose")
+        #expect(body.contains("fail: { recordAttachmentPreparationFailure($0) },"), "every item that does not load is surfaced")
     }
 
     @Test("File and camera attachment preparation failures are surfaced")

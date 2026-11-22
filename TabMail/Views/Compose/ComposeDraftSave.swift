@@ -49,11 +49,20 @@ enum ComposeDraftSave {
         case superseded
     }
 
+    /// The one read of the row at the start (step 1).
+    typealias ReadRow = @MainActor (_ draftId: String) async throws -> Draft?
+
+    /// The row as the database holds it; tests give `run` a read that throws.
+    static func readRow(_ draftId: String) async throws -> Draft? {
+        try await AppDatabase.dbPool.read { db in try Draft.fetchOne(db, key: draftId) }
+    }
+
     static func run(
         draftId: String,
         accountId: String,
         attachments: [DraftAttachment],
         now: Double,
+        read: ReadRow = readRow,
         fields: @MainActor (_ existing: Draft?) -> Fields,
         admit: @MainActor (Draft) async throws -> DraftStore.SaveResult
     ) async -> Outcome {
@@ -70,9 +79,7 @@ enum ComposeDraftSave {
         // the user retry. A genuine nil still takes the normal first-save path.
         let readResult: Result<Draft?, Error>
         do {
-            readResult = .success(try await AppDatabase.dbPool.read { db in
-                try Draft.fetchOne(db, key: draftId)
-            })
+            readResult = .success(try await read(draftId))
         } catch {
             readResult = .failure(error)
         }

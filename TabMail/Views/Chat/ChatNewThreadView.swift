@@ -11,12 +11,11 @@ import SwiftUI
 /// the chat's reply field with "Message or ask anything" and a paperclip at the text's end;
 /// attachments wait above the field, each with an x. Nothing is asked when leaving: Back and the
 /// app going to the background save the draft when there is something to keep
-/// (`ChatNewDraft.needsSave`), and Back leaves once that save is durable.
+/// (`ChatNewDraft.needsSave`), and Back leaves once that save is durable. The screen going away
+/// any other way (the mailbox list it sits on replaced) saves it too.
 struct ChatNewThreadView: View {
     let model: ChatNewThreadModel
 
-    /// This chat's own agent session, in memory only.
-    @State private var sessionKey = ChatNewEmailField.newSessionKey()
     /// The field's "e.g." example, picked once as the chat opens, from the new-email set.
     @State private var example = ChatSuggestionConfig.randomExample(from: ChatSuggestionConfig.newEmailExamples)
     @State private var ownAddresses: Set<String> = []
@@ -28,6 +27,12 @@ struct ChatNewThreadView: View {
     /// A save that did not happen, Back's or the background's: shown until the user chooses.
     @State private var saveRefusal: String?
     @State private var isLeaving = false
+    /// "Leave without saving" was chosen: the screen closes with no save.
+    @State private var leavesWithoutSaving = false
+    /// Between the screen's opening and its closing; the camera's cover does not close it.
+    @State private var isOpen = false
+    /// A reopened draft's attachments could not be read: said once, as the chat opens.
+    @State private var showsAttachmentLoadFailure = false
     @State private var showsPhotoPicker = false
     @State private var photoPickerItems: [PhotosPickerItem] = []
     @State private var showsFilePicker = false
@@ -98,10 +103,15 @@ struct ChatNewThreadView: View {
             Text(ChatNewThreadView.askMessage)
         }
         .alert("This draft couldn't be saved", isPresented: refusalShown) {
-            Button("Leave without saving", role: .destructive) { dismiss() }
+            Button("Leave without saving", role: .destructive) { leaveWithoutSaving() }
             Button("Stay", role: .cancel) {}
         } message: {
             Text(saveRefusal ?? "")
+        }
+        .alert(Self.attachmentLoadTitle, isPresented: $showsAttachmentLoadFailure) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(ChatNewThreadModel.attachmentLoadMessage)
         }
         .alert("Couldn't add", isPresented: importFailureShown) {
             Button("OK", role: .cancel) {}
@@ -120,13 +130,14 @@ struct ChatNewThreadView: View {
             if phase == .background { Task { await saveInBackground() } }
         }
         .task { await loadOwnAddresses() }
-        // A draft open here is never evicted while the user writes it, as one open in compose.
-        .onAppear { DraftSessionRegistry.shared.register(model.draftId) }
-        .onDisappear { DraftSessionRegistry.shared.unregister(model.draftId) }
+        .onAppear { opened() }
+        // The camera's cover hides this screen without closing it.
+        .onDisappear { if !showsCamera { closed() } }
     }
 
     static let askTitle = "Who is this to?"
     static let askMessage = "Add at least one recipient to send this email."
+    static let attachmentLoadTitle = "Attachments couldn't be loaded"
 
     private var refusalShown: Binding<Bool> {
         Binding(get: { saveRefusal != nil }, set: { if !$0 { saveRefusal = nil } })
@@ -150,7 +161,7 @@ struct ChatNewThreadView: View {
                     example: example, isNoReply: false, clearCount: 0,
                     newEmail: ChatNewEmailField(
                         startWords: model.startWords,
-                        sessionKey: sessionKey,
+                        sessionKey: model.sessionKey,
                         wordsChanged: { model.words = $0 },
                         send: { _ in send() },
                         attach: attach)))
@@ -215,10 +226,44 @@ struct ChatNewThreadView: View {
         }
     }
 
+    /// "Leave without saving", after a save was refused: the chat closes and nothing is saved.
+    private func leaveWithoutSaving() {
+        leavesWithoutSaving = true
+        dismiss()
+    }
+
     /// The app went to the background: the draft is saved as Back saves it; the chat stays.
     private func saveInBackground() async {
         if case .refused(let message) = await model.saveIfNeeded() {
             saveRefusal = message
+        }
+    }
+
+    /// The screen opened: the draft is kept from eviction while the user writes it, as one open in
+    /// compose, and a reopened draft whose attachments could not be read says so at once.
+    private func opened() {
+        guard !isOpen else { return }
+        isOpen = true
+        DraftSessionRegistry.shared.register(model.draftId)
+        if model.attachmentLoadFailed { showsAttachmentLoadFailure = true }
+    }
+
+    /// The screen closed, by Back or any other way: the chat's session ends, the draft is saved
+    /// when there is something to keep (after Back's save, nothing is left to keep) unless the user
+    /// chose to leave without saving, and only then is it given back to eviction. The screen is
+    /// gone, so a refusal here is only logged.
+    private func closed() {
+        guard isOpen else { return }
+        isOpen = false
+        let model = model
+        let saves = !leavesWithoutSaving
+        ChatPillState.shared.endSession(for: model.sessionKey)
+        Task { @MainActor in
+            if saves, case .refused(let message) = await model.saveIfNeeded(),
+               DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ChatNewEmail] save on close refused for \(model.draftId): \(message)")
+            }
+            DraftSessionRegistry.shared.unregister(model.draftId)
         }
     }
 
@@ -235,18 +280,13 @@ struct ChatNewThreadView: View {
     }
 }
 
-/// The line under a new email's header, where a chat's subject is: it has no subject yet.
+/// The line under a new email's header, where a chat's subject is, drawn as a thread's
+/// (`ChatSubjectText`): it has no subject yet.
 struct ChatNewEmailSubjectLine: View {
     static let text = "New email"
 
     var body: some View {
-        Text(Self.text)
-            .font(.caption)
-            .foregroundStyle(Theme.textSecondary)
-            .lineLimit(1)
-            .padding(.horizontal)
-            .padding(.bottom, ChatViewLayout.subjectLineBottomGap)
-            .frame(maxWidth: .infinity)
+        ChatSubjectText(subject: Self.text)
     }
 }
 

@@ -234,7 +234,8 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
 
     /// A new email's key in the chat view: reopened with the chat view on, its draft opens in the
     /// new email's chat rather than in compose (ADR-IOS-114). The key is local: it names the row
-    /// on this device and never reaches a provider or a header.
+    /// on this device and never reaches a provider or a wire header (the placeholder header's id
+    /// is made colon-safe from it, as from every key).
     static func newEmailKey() -> String {
         "\(newEmailPrefix)\(UUID().uuidString)"
     }

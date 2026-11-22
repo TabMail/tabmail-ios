@@ -422,9 +422,12 @@ actor MockEmailProvider: EmailProvider {
 
     let saveDraftResult: DraftSaveOutcome
     let saveDraftThrows: Error?
+    /// Every draft `saveDraft` was given, in order: what went on the wire.
+    private(set) var savedDraftMessages: [DraftMessage] = []
 
     func saveDraft(_ draft: DraftMessage, existingIdentity: DraftDeleteIdentity?, draftsFolderPath: String) async throws -> DraftSaveOutcome {
         callLog.append("saveDraft(existingIdentity:\(String(describing: existingIdentity)),draftsFolderPath:\(draftsFolderPath))")
+        savedDraftMessages.append(draft)
         if let saveDraftHook { await saveDraftHook() }
         if let error = saveDraftThrows { throw error }
         return saveDraftResult
