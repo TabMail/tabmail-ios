@@ -1358,10 +1358,15 @@ struct DraftServerCopyNamesParentMigrationTests {
         let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(draft)") }
         let column = try #require(columns.first { ($0["name"] as String) == "serverCopyNamesParent" })
         #expect((column["notnull"] as Int) == 0)
-        let drafts = try db.read { try Draft.fetchAll($0) }
+        // Raw columns, not a decoded `Draft`: the record needs columns later migrations add
+        // (`isReplyAll`, v104), so it cannot decode at v94.
+        let drafts = try db.read {
+            try Row.fetchAll($0, sql: "SELECT id, serverCopyNamesParent FROM draft")
+        }
         #expect(drafts.count == 1)
         guard drafts.count == 1 else { return }
-        #expect(drafts[0].serverCopyNamesParent == nil)
+        #expect((drafts[0]["id"] as String) == "reply:acc1:parent@example.com")
+        #expect((drafts[0]["serverCopyNamesParent"] as DatabaseValue).isNull, "unknown is NULL, never false")
     }
 }
 
