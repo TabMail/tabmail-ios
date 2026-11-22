@@ -545,10 +545,8 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
     }
 
     func updateUIGestureRecognizer(_ recognizer: Recognizer, context: Context) {
-        if recognizer.isEnabled != isEnabled {
-            // Debug UI tests only: the pan turned on or off, and its state then (`ChatFieldDragMarker`).
-            ChatFieldDragMarker.panEnabled(isEnabled, state: recognizer.state)
-        }
+        // Debug UI tests only: the pan turned on or off, and its state then (`ChatFieldDragMarker`).
+        ChatFieldDragMarker.panEnabling(recognizer, to: isEnabled)
         recognizer.isEnabled = isEnabled
     }
 
@@ -606,11 +604,10 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         }
 
         #if DEBUG
-        // Debug UI tests only: the pan was cancelled (`ChatFieldDragMarker`).
+        // Debug UI tests only: the pan was cancelled (`ChatFieldDragMarker`; reads the new state
+        // only in a debug build the swipe UI tests launch).
         override var state: UIGestureRecognizer.State {
-            didSet {
-                if state == .cancelled, oldValue != .cancelled { ChatFieldDragMarker.panCancelled() }
-            }
+            didSet { ChatFieldDragMarker.panState(from: oldValue, to: state) }
         }
         #endif
     }
@@ -664,13 +661,14 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             lastTravel = .zero
             lastOffset = text?.contentOffset.y ?? 0
             // A drag that starts with the text at its end is the field's from its start.
-            if let text, text.contentOffset.y >= Self.end(of: text) {
+            let end = text.map { Self.end(of: $0) }
+            if let text, let end, text.contentOffset.y >= end {
                 handOff = .zero
             } else {
                 handOff = nil
             }
             // Debug UI tests only: the hand-off record starts (`ChatFieldDragMarker`).
-            ChatFieldDragMarker.textTouchDown(end: text.map { Self.end(of: $0) }, handedOff: handOff != nil)
+            ChatFieldDragMarker.textTouchDown(end: end, handedOff: handOff != nil)
         }
 
         /// The field's share of `drag` (`ChatFieldDrag.fieldShare`): the drag's travel, both axes,
@@ -834,8 +832,9 @@ struct ChatSwipeCloser: UIViewRepresentable {
             host = view
             self.edgePop = edgePop
             edgePop?.isEnabled = open.id == nil
-            // Debug UI tests only: the back swipe's states and transition (`ChatFieldDragMarker`).
-            ChatFieldDragMarker.watchPop(edgePop)
+            // Debug UI tests only: the back swipe's states and transition while this closer holds
+            // it (`ChatFieldDragMarker`).
+            ChatFieldDragMarker.watchPop(edgePop, owner: self)
         }
 
         func setEdgePop(enabled: Bool) {
@@ -844,6 +843,8 @@ struct ChatSwipeCloser: UIViewRepresentable {
 
         /// Torn down, even mid-drag: the closer holds nothing more.
         func uninstall() {
+            // Debug UI tests only: the back swipe's watch ends with this closer's hold on it.
+            ChatFieldDragMarker.unwatchPop(owner: self)
             host?.removeGestureRecognizer(pan)
             host?.removeGestureRecognizer(tap)
             host = nil

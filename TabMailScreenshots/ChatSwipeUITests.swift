@@ -231,9 +231,16 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertEqual(marker.events, ["open", "cut"],
                        "the opening was requested under the held drag, and the drag was then cut off before the finger lifted")
         XCTAssertFalse(marker.frozen, "the cut-off drag released the freeze")
+        // The open panel turns the field's pan off, and closing it turns the pan back on: the
+        // marker's pan record says which way each went.
+        let panOpen = try XCTUnwrap(marker.pan, "control: the marker reports the field's pan")
+        XCTAssertTrue(panOpen.contains { $0.hasPrefix("off:") }, "the opening turned the field's pan off: \(panOpen)")
         app.buttons["chatClose"].tap()
         XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "control: Close closed the panel")
-        let closed = try XCTUnwrap(settledDragMarker(in: app)?.fieldTop, "control: the marker shows the field again")
+        let closedMarker = try XCTUnwrap(settledDragMarker(in: app), "control: the marker shows again")
+        XCTAssertEqual(closedMarker.pan?.last?.hasPrefix("on:"), true,
+                       "closing the panel turned the field's pan back on: \(String(describing: closedMarker.pan))")
+        let closed = try XCTUnwrap(closedMarker.fieldTop, "control: the marker shows the field again")
         XCTAssertEqual(closed, restingGlass, accuracy: 1, "the field is back at rest, no swell left")
         dragFieldOpen(in: app)
     }
@@ -798,6 +805,15 @@ final class ChatSwipeUITests: XCTestCase {
                        "the held press stayed the text's; the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
         XCTAssertTrue(typedField(containing: Self.shortQuestion, in: app).exists, "and its words")
+        // The press reached the text: its long press put the caret on the words, so a typed mark
+        // lands among them, not after them where the typing left the caret.
+        typedField(containing: Self.shortQuestion, in: app).typeText(Self.lineMark)
+        let marked = typedField(containing: Self.lineMark, in: app)
+        XCTAssertTrue(marked.waitForExistence(timeout: 5), "control: the mark went into the field")
+        let value = marked.value as? String ?? ""
+        XCTAssertEqual(value.replacingOccurrences(of: Self.lineMark, with: ""), Self.shortQuestion,
+                       "control: the field holds the question and the mark")
+        XCTAssertNotEqual(value, Self.shortQuestion + Self.lineMark, "the held press moved the caret onto the words")
     }
 
     /// Longer than UIKit's long press (half a second), so the text view's own long press has begun
@@ -1463,33 +1479,45 @@ final class ChatSwipeUITests: XCTestCase {
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 
-    /// XCUITest types like a hardware keyboard: the simulator drops its software keyboard at the
-    /// first typed key and brings it back about one and a half seconds after the last, and the
-    /// focused field rides down and up with it. A gesture aimed at the field in between lands where
-    /// the field was. Returns once `element` holds still: above the software keyboard once it is
-    /// back, or, on a simulator that shows none, for longer than the keyboard takes to come back.
+    /// XCUITest types like a hardware keyboard: a simulator that shows its software keyboard drops
+    /// it at the first typed key and brings it back about one and a half seconds after the last,
+    /// and the focused field rides down and up with it. A gesture aimed at the field in between
+    /// lands where the field was. Returns once `element` holds still above the software keyboard
+    /// back on screen. Only while no keyboard of a software keyboard's size has been seen in this
+    /// test, on screen or parked below it (a simulator that shows none), does a field holding still
+    /// for longer than the keyboard takes to come back count. A software keyboard that stays parked
+    /// or covers the field fails at the deadline.
     private func waitForTheKeyboardBack(under element: XCUIElement, in app: XCUIApplication) {
         let keyboard = app.keyboards.firstMatch
         var last: CGRect?
+        var keys: CGRect?
         var stillSince = Date()
         let deadline = Date().addingTimeInterval(Self.keyboardBackLimit)
         repeat {
+            // One read of the field, the screen and the keyboard per poll.
             let frame = element.frame
+            let screen = app.frame
+            keys = keyboard.exists ? keyboard.frame : nil
+            if let keys, keys.height > screen.height * Self.keyboardMinShare { sawSoftwareKeyboard = true }
             if frame != last {
                 last = frame
                 stillSince = Date()
-            } else if keyboard.exists, app.frame.intersection(keyboard.frame).height > app.frame.height * Self.keyboardMinShare,
-                      frame.maxY <= keyboard.frame.minY + 1 {
+            } else if let keys, screen.intersection(keys).height > screen.height * Self.keyboardMinShare {
                 // On screen only: while it is away the keyboard still exists, parked below the
-                // screen, and a field resting at the bottom is above that too.
-                return
-            } else if Date().timeIntervalSince(stillSince) > Self.keyboardReturnWindow {
+                // screen, and a field resting at the bottom is above that too. On screen, the field
+                // must rest above it.
+                if frame.maxY <= keys.minY + 1 { return }
+            } else if !sawSoftwareKeyboard, Date().timeIntervalSince(stillSince) > Self.keyboardReturnWindow {
                 return
             }
             RunLoop.current.run(until: Date().addingTimeInterval(Self.keyboardBackPollStep))
         } while Date() < deadline
-        XCTFail("control: the field holds still after the typing (last at \(String(describing: last)))")
+        XCTFail("control: the field holds still above the keyboard after the typing (field \(String(describing: last)), "
+                + "keyboard \(String(describing: keys)), software keyboard seen \(sawSoftwareKeyboard))")
     }
+
+    /// Whether a keyboard of a software keyboard's size was seen in this test (`waitForTheKeyboardBack`).
+    private var sawSoftwareKeyboard = false
 
     /// How long the field may keep moving after typing; how often it is read; the least share of the
     /// screen's height a software keyboard covers (the hardware keyboard's small bar covers less);
@@ -1563,6 +1591,9 @@ final class ChatSwipeUITests: XCTestCase {
         /// Whether the drag tip is waiting for room (eligible, its whole card has none); nil when
         /// the marker does not say.
         let tipWaiting: Bool?
+        /// The field's pan turned on or off (`on:<state>`, `off:<state>`) or cancelled during the
+        /// last drag and since, in order; nil when the marker does not say.
+        let pan: [String]?
     }
 
     /// `<top>:<bottom>`, or nil for "none".
@@ -1590,7 +1621,8 @@ final class ChatSwipeUITests: XCTestCase {
                           dims: fields["dims"].flatMap(Int.init) ?? 0,
                           textPastEnd: fields["over"].flatMap(Double.init).map { CGFloat($0) },
                           events: fields["events"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) },
-                          tipWaiting: fields["wait"].map { $0 == "1" })
+                          tipWaiting: fields["wait"].map { $0 == "1" },
+                          pan: fields["pan"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) })
     }
 
     /// The marker once it has seen `drags` drags and stopped watching the last one.

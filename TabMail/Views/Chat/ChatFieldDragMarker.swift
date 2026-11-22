@@ -128,22 +128,25 @@ enum ChatFieldDragMarker {
         #endif
     }
 
-    /// The field's pan is about to be turned on or off (`enabled`) while in `state`: records
-    /// `on:<state>` or `off:<state>` among the pan's events (`Probe.panEvents`), so a run shows whether turning it
-    /// off under a held drag reached a recognizing pan (debug builds only; nothing in release).
+    /// The field's pan is about to be set on or off (`enabled`): if that turns it on or off, records
+    /// `on:<state>` or `off:<state>` with its state then among the pan's events (`Probe.panEvents`),
+    /// so a run shows whether turning it off under a held drag reached a recognizing pan. Reads the
+    /// pan only in a debug build the swipe UI tests launch (nothing in release).
     @MainActor
-    static func panEnabled(_ enabled: Bool, state: UIGestureRecognizer.State) {
+    static func panEnabling(_ pan: UIGestureRecognizer, to enabled: Bool) {
         #if DEBUG
-        if Probe.isActive { Probe.shared.note("\(enabled ? "on" : "off"):\(name(of: state))") }
+        if Probe.isActive, pan.isEnabled != enabled {
+            Probe.shared.notePan("\(enabled ? "on" : "off"):\(name(of: pan.state))")
+        }
         #endif
     }
 
-    /// The field's pan became cancelled: records `cancelled` among the pan's events (debug builds
-    /// only; nothing in release).
+    /// The field's pan moved from state `old` to `new`: records `cancelled` among the pan's events
+    /// when it became cancelled (debug builds the swipe UI tests launch only; nothing in release).
     @MainActor
-    static func panCancelled() {
+    static func panState(from old: UIGestureRecognizer.State, to new: @autoclosure () -> UIGestureRecognizer.State) {
         #if DEBUG
-        if Probe.isActive { Probe.shared.note("cancelled") }
+        if Probe.isActive, old != .cancelled, new() == .cancelled { Probe.shared.notePan("cancelled") }
         #endif
     }
 
@@ -182,13 +185,23 @@ enum ChatFieldDragMarker {
         }
     }
 
-    /// The navigation controller's back swipe on the chat (`pop`): records its state changes, when
-    /// it is turned on or off, and how its interactive transition ends, to find why a back swipe
-    /// returned to the chat (debug builds only; nothing in release).
+    /// The navigation controller's back swipe on the chat (`pop`), for as long as `owner` (the
+    /// chat's swipe closer) holds it: records its state changes, when it is turned on or off, and
+    /// how its interactive transition ends, to find why a back swipe returned to the chat. A new
+    /// owner starts a new record (debug builds only; nothing in release).
     @MainActor
-    static func watchPop(_ pop: UIGestureRecognizer?) {
+    static func watchPop(_ pop: UIGestureRecognizer?, owner: AnyObject) {
         #if DEBUG
-        if Probe.isActive, let pop { Probe.shared.popWatch.watch(pop) }
+        if Probe.isActive, let pop { Probe.shared.popWatch.watch(pop, for: ObjectIdentifier(owner)) }
+        #endif
+    }
+
+    /// `owner` lets go of the back swipe (`watchPop`): its watch ends and its record is cleared, so
+    /// nothing after it lands in the record (debug builds only; nothing in release).
+    @MainActor
+    static func unwatchPop(owner: AnyObject) {
+        #if DEBUG
+        if Probe.isActive { Probe.shared.popWatch.stop(for: ObjectIdentifier(owner)) }
         #endif
     }
 
@@ -330,11 +343,30 @@ enum ChatFieldDragMarker {
 
         /// What happened to the field's pan itself during the last drag, in order: turned on or off
         /// (`on:<state>`, `off:<state>`), cancelled. Apart from `events`, which the cut-off test
-        /// compares whole.
+        /// compares whole. Noted unobserved (`panLog`), inside the pan's own update and its state
+        /// change, and shown after them (`publishLater`), so a note never updates the marker
+        /// inside the update it records.
         private(set) var panEvents: [String] = []
+        @ObservationIgnored private var panLog: [String] = []
+        private static let panEventLimit = 16
 
-        func note(_ event: String) {
-            panEvents.append(event)
+        func notePan(_ event: String) {
+            if panLog.count < Self.panEventLimit { panLog.append(event) }
+            publishLater()
+        }
+
+        /// Shows the pan's and the back swipe's records (`panLog`, `popLog`) once the current
+        /// update is done: one pending showing at a time, which shows the records as they are then.
+        @ObservationIgnored private var publishPending = false
+
+        private func publishLater() {
+            guard !publishPending else { return }
+            publishPending = true
+            Task { @MainActor in
+                self.publishPending = false
+                self.panEvents = self.panLog
+                self.popEntries = self.popLog
+            }
         }
 
         /// The hand-off record of the last drag over a text (`textTouchDown`, `textShared`): the
@@ -382,9 +414,10 @@ enum ChatFieldDragMarker {
             String(format: "%.0fms", (CACurrentMediaTime() - letGoTime) * Self.millisecondsPerSecond)
         }
 
-        /// The watched text (`watchText`) was asked to do `name` (`scrolls`: a scroll call).
-        func textCall(_ name: String, on view: UIView, scrolls: Bool) {
-            guard callWatchOpen, view === watchedText else { return }
+        /// The object `receiver` names was asked to do `name` (`scrolls`: a scroll call): noted only
+        /// when it is the watched text (`watchText`) and its watch is open.
+        func textCall(_ name: String, receiver: ObjectIdentifier, scrolls: Bool) {
+            guard callWatchOpen, let watchedText, ObjectIdentifier(watchedText) == receiver else { return }
             if textCalls.count < Self.textCallLimit {
                 textCalls.append("\(name)@+\(sinceLetGo)")
             }
@@ -407,14 +440,24 @@ enum ChatFieldDragMarker {
             letGoTime = CACurrentMediaTime()
         }
 
-        /// The back swipe's watch (`watchPop`) and what it saw since the swipe last began.
+        /// The back swipe's watch (`watchPop`) and what it saw since the swipe last began, under its
+        /// current owner. Noted unobserved (`popLog`), from the swipe's callbacks and the closer's
+        /// setup and teardown, and shown after them (`publishLater`).
         let popWatch = PopWatch()
         private(set) var popEntries: [String] = []
+        @ObservationIgnored private var popLog: [String] = []
         private static let popEntryLimit = 16
 
         func notePop(_ entry: String, began: Bool = false) {
-            if began { popEntries = [] }
-            if popEntries.count < Self.popEntryLimit { popEntries.append(entry) }
+            if began { popLog = [] }
+            if popLog.count < Self.popEntryLimit { popLog.append(entry) }
+            publishLater()
+        }
+
+        /// The back swipe's watch changed owner or ended: its record starts empty.
+        func clearPop() {
+            popLog = []
+            publishLater()
         }
 
         /// The text under the last drag: where it was when the drag last read it and at the
@@ -513,6 +556,7 @@ enum ChatFieldDragMarker {
                 textAtWatchEnd = nil
                 textMoveAfterLetGo = nil
                 resetTextCalls(open: false)
+                panLog = []
                 panEvents = []
                 return
             }
@@ -552,13 +596,19 @@ enum ChatFieldDragMarker {
         }
     }
 
-    /// The navigation controller's back swipe, watched for the marker (`watchPop`): each state it
-    /// moves to since it last began as `<state>@+<ms>`, its turning on or off as
-    /// `en:<0|1>@+<ms>@<frame>|…`, and its interactive transition's end as
-    /// `ix:c<cancelled 0|1>:p<percent complete>:v<completion velocity>@+<ms>`.
+    /// The navigation controller's back swipe, watched for the marker (`watchPop`) while one swipe
+    /// closer owns the watch: each state it moves to since it last began as `<state>@+<ms>`, its
+    /// turning on or off as `en:<0|1>@+<ms>@<frame>|…`, and its interactive transition's end as
+    /// `ix:c<cancelled 0|1>:p<percent complete>:v<completion velocity>@+<ms>`. The owner's teardown
+    /// ends the watch (`stop`): the target and the observation come off the swipe, and the record
+    /// is cleared, as it is when a new owner starts one.
     @MainActor
     final class PopWatch: NSObject {
         private weak var pop: UIGestureRecognizer?
+        private var owner: ObjectIdentifier?
+        /// Counts the watches: a transition's callback that arrives after its watch ended (or a new
+        /// one began) records nothing.
+        private var generation = 0
         private var enabledWatch: NSKeyValueObservation?
         private var lastState: UIGestureRecognizer.State = .possible
         private var began: CFTimeInterval = CACurrentMediaTime()
@@ -570,20 +620,37 @@ enum ChatFieldDragMarker {
             String(format: "%.0fms", (CACurrentMediaTime() - began) * Self.millisecondsPerSecond)
         }
 
-        func watch(_ pop: UIGestureRecognizer) {
-            guard pop !== self.pop else { return }
-            self.pop?.removeTarget(self, action: #selector(changed(_:)))
-            enabledWatch?.invalidate()
+        func watch(_ pop: UIGestureRecognizer, for owner: ObjectIdentifier) {
+            guard owner != self.owner || pop !== self.pop else { return }
+            end()
+            self.owner = owner
             self.pop = pop
             lastState = pop.state
             pop.addTarget(self, action: #selector(changed(_:)))
-            enabledWatch = pop.observe(\.isEnabled, options: [.new]) { [weak self] _, change in
+            enabledWatch = pop.observe(\.isEnabled, options: [.old, .new]) { [weak self] _, change in
                 // A recognizer is turned on or off on the main thread.
                 MainActor.assumeIsolated {
-                    guard let self, let on = change.newValue else { return }
+                    // Setting the value it already has notifies too: only a change is recorded.
+                    guard let self, let on = change.newValue, on != change.oldValue else { return }
                     Probe.shared.notePop("en:\(on ? 1 : 0)@+\(self.sinceBegan)@" + Probe.stack(frames: Self.enabledFrames))
                 }
             }
+        }
+
+        /// `owner`'s watch ends; a watch another owner holds is left alone.
+        func stop(for owner: ObjectIdentifier) {
+            guard owner == self.owner else { return }
+            end()
+        }
+
+        private func end() {
+            pop?.removeTarget(self, action: #selector(changed(_:)))
+            enabledWatch?.invalidate()
+            enabledWatch = nil
+            pop = nil
+            owner = nil
+            generation += 1
+            Probe.shared.clearPop()
         }
 
         @objc private func changed(_ pop: UIGestureRecognizer) {
@@ -594,8 +661,9 @@ enum ChatFieldDragMarker {
             Probe.shared.notePop("\(ChatFieldDragMarker.name(of: pop.state))@+\(sinceBegan)", began: isBegan)
             // UIKit's own target ran first and started the interactive pop.
             guard isBegan, let transition = (pop.view?.next as? UINavigationController)?.transitionCoordinator else { return }
+            let generation = generation
             transition.notifyWhenInteractionChanges { [weak self] context in
-                guard let self else { return }
+                guard let self, self.generation == generation else { return }
                 let entry = String(format: "ix:c%d:p%.2f:v%.2f@+", context.isCancelled ? 1 : 0,
                                    context.percentComplete, context.completionVelocity)
                 Probe.shared.notePop(entry + self.sinceBegan)
@@ -604,41 +672,109 @@ enum ChatFieldDragMarker {
     }
 
     /// What the text under the last drag is asked to do after its let-go (`Probe.textCall`):
-    /// swapped in once, for the whole app, only in debug builds launched by the swipe UI tests, and
-    /// recording only for that one text view while its watch is open. Each swapped method calls the
-    /// original first thing after recording, unchanged.
+    /// wrapped once per class, only in debug builds the swipe UI tests launch, and noted only for
+    /// the watched text view while its watch is open. Each wrapper notes the call, then calls the
+    /// implementation the method had before the wrap, once, with the method's own selector and
+    /// every argument unchanged, and returns its result. A class that only inherits a method gets
+    /// the wrapper as its own, so no superclass changes.
     @MainActor
     enum TextCalls {
-        private static var installed = false
+        /// The classes wrapped so far, as `scroll:<class>` and `text:<class>`.
+        private static var wrapped: Set<String> = []
 
-        static func install() {
-            guard !installed else { return }
-            installed = true
-            exchange(UIScrollView.self, #selector(UIScrollView.setContentOffset(_:animated:)),
-                 #selector(UIScrollView.tabMailProbeSetContentOffset(_:animated:)))
-            exchange(UIScrollView.self, #selector(UIScrollView.scrollRectToVisible(_:animated:)),
-                 #selector(UIScrollView.tabMailProbeScrollRectToVisible(_:animated:)))
-            exchange(UITextView.self, #selector(UITextView.scrollRangeToVisible(_:)),
-                 #selector(UITextView.tabMailProbeScrollRangeToVisible(_:)))
-            exchange(UITextView.self, #selector(setter: UITextView.selectedTextRange),
-                 #selector(UITextView.tabMailProbeSetSelectedTextRange(_:)))
-            exchange(UITextView.self, #selector(setter: UITextView.selectedRange),
-                 #selector(UITextView.tabMailProbeSetSelectedRange(_:)))
-            exchange(UITextView.self, #selector(UITextView.becomeFirstResponder),
-                 #selector(UITextView.tabMailProbeBecomeFirstResponder))
+        /// Wraps the scroll calls on `scrollView` and the text calls on `textView`: UIKit's own
+        /// classes in the app, a test's own classes in the unit tests. Each class once.
+        static func install(scrollView: AnyClass = UIScrollView.self, textView: AnyClass = UITextView.self) {
+            if wrapped.insert("scroll:" + NSStringFromClass(scrollView)).inserted {
+                wrap(scrollView, #selector(UIScrollView.setContentOffset(_:animated:)), pointAndFlag("offset", "offsetAnimated"))
+                wrap(scrollView, #selector(UIScrollView.scrollRectToVisible(_:animated:)), rectAndFlag("rect", "rectAnimated"))
+            }
+            if wrapped.insert("text:" + NSStringFromClass(textView)).inserted {
+                wrap(textView, #selector(UITextView.scrollRangeToVisible(_:)), range("rangeToVisible", scrolls: true))
+                wrap(textView, #selector(setter: UITextView.selectedTextRange), object("selectedTextRange"))
+                wrap(textView, #selector(setter: UITextView.selectedRange), range("selectedRange", scrolls: false))
+                wrap(textView, #selector(UITextView.becomeFirstResponder), answer("becomeFirstResponder"))
+            }
         }
 
-        /// `original` on `cls` runs `replacement`'s body, and `replacement`'s name runs the original:
-        /// added on `cls` when it only inherits `original`, so its superclass is left alone.
-        private static func exchange(_ cls: AnyClass, _ original: Selector, _ replacement: Selector) {
-            guard let originalMethod = class_getInstanceMethod(cls, original),
-                  let replacementMethod = class_getInstanceMethod(cls, replacement) else { return }
-            if class_addMethod(cls, original, method_getImplementation(replacementMethod),
-                               method_getTypeEncoding(replacementMethod)) {
-                class_replaceMethod(cls, replacement, method_getImplementation(originalMethod),
-                                    method_getTypeEncoding(originalMethod))
-            } else {
-                method_exchangeImplementations(originalMethod, replacementMethod)
+        /// `selector` on `cls` runs the wrapper `make` builds from the implementation it had and
+        /// the selector: set on `cls`'s own method, or added to `cls` when it only inherits it.
+        private static func wrap(_ cls: AnyClass, _ selector: Selector, _ make: (IMP, Selector) -> Any) {
+            guard let method = class_getInstanceMethod(cls, selector) else { return }
+            let wrapper = imp_implementationWithBlock(make(method_getImplementation(method), selector))
+            if !class_addMethod(cls, selector, wrapper, method_getTypeEncoding(method)) {
+                method_setImplementation(method, wrapper)
+            }
+        }
+
+        /// The original implementations' C shapes: the receiver, the selector, then the arguments
+        /// (`ObjCBool` for Objective-C's `BOOL`).
+        private typealias PointAndFlagCall = @convention(c) (AnyObject, Selector, CGPoint, ObjCBool) -> Void
+        private typealias RectAndFlagCall = @convention(c) (AnyObject, Selector, CGRect, ObjCBool) -> Void
+        private typealias RangeCall = @convention(c) (AnyObject, Selector, NSRange) -> Void
+        private typealias ObjectCall = @convention(c) (AnyObject, Selector, AnyObject?) -> Void
+        private typealias AnswerCall = @convention(c) (AnyObject, Selector) -> ObjCBool
+
+        /// Notes the call `name` on `receiver`. UIKit makes these calls on the main thread; a call
+        /// made off it (a unit test host's own code) is passed on unnoted rather than trapping.
+        nonisolated private static func note(_ name: String, _ receiver: AnyObject, scrolls: Bool) {
+            guard Thread.isMainThread else { return }
+            let receiver = ObjectIdentifier(receiver)
+            MainActor.assumeIsolated { Probe.shared.textCall(name, receiver: receiver, scrolls: scrolls) }
+        }
+
+        nonisolated private static func pointAndFlag(_ name: String, _ animatedName: String) -> (IMP, Selector) -> Any {
+            { original, selector in
+                let call = unsafeBitCast(original, to: PointAndFlagCall.self)
+                let wrapper: @convention(block) (AnyObject, CGPoint, ObjCBool) -> Void = { receiver, point, animated in
+                    TextCalls.note(animated.boolValue ? animatedName : name, receiver, scrolls: true)
+                    call(receiver, selector, point, animated)
+                }
+                return wrapper
+            }
+        }
+
+        nonisolated private static func rectAndFlag(_ name: String, _ animatedName: String) -> (IMP, Selector) -> Any {
+            { original, selector in
+                let call = unsafeBitCast(original, to: RectAndFlagCall.self)
+                let wrapper: @convention(block) (AnyObject, CGRect, ObjCBool) -> Void = { receiver, rect, animated in
+                    TextCalls.note(animated.boolValue ? animatedName : name, receiver, scrolls: true)
+                    call(receiver, selector, rect, animated)
+                }
+                return wrapper
+            }
+        }
+
+        nonisolated private static func range(_ name: String, scrolls: Bool) -> (IMP, Selector) -> Any {
+            { original, selector in
+                let call = unsafeBitCast(original, to: RangeCall.self)
+                let wrapper: @convention(block) (AnyObject, NSRange) -> Void = { receiver, value in
+                    TextCalls.note(name, receiver, scrolls: scrolls)
+                    call(receiver, selector, value)
+                }
+                return wrapper
+            }
+        }
+
+        nonisolated private static func object(_ name: String) -> (IMP, Selector) -> Any {
+            { original, selector in
+                let call = unsafeBitCast(original, to: ObjectCall.self)
+                let wrapper: @convention(block) (AnyObject, AnyObject?) -> Void = { receiver, object in
+                    TextCalls.note(name, receiver, scrolls: false)
+                    call(receiver, selector, object)
+                }
+                return wrapper
+            }
+        }
+
+        nonisolated private static func answer(_ name: String) -> (IMP, Selector) -> Any {
+            { original, selector in
+                let call = unsafeBitCast(original, to: AnswerCall.self)
+                let wrapper: @convention(block) (AnyObject) -> ObjCBool = { receiver in
+                    TextCalls.note(name, receiver, scrolls: false)
+                    return call(receiver, selector)
+                }
+                return wrapper
             }
         }
     }
@@ -659,41 +795,3 @@ enum ChatFieldDragMarker {
     #endif
 }
 
-#if DEBUG
-/// The swipe UI tests' record of what a text view is asked to do (`ChatFieldDragMarker.TextCalls`,
-/// swapped in only by a debug build the tests launch): each notes the call, then calls its own
-/// name, which after the swap runs the original.
-extension UIScrollView {
-    @objc dynamic func tabMailProbeSetContentOffset(_ offset: CGPoint, animated: Bool) {
-        ChatFieldDragMarker.Probe.shared.textCall(animated ? "offsetAnimated" : "offset", on: self, scrolls: true)
-        tabMailProbeSetContentOffset(offset, animated: animated)
-    }
-
-    @objc dynamic func tabMailProbeScrollRectToVisible(_ rect: CGRect, animated: Bool) {
-        ChatFieldDragMarker.Probe.shared.textCall(animated ? "rectAnimated" : "rect", on: self, scrolls: true)
-        tabMailProbeScrollRectToVisible(rect, animated: animated)
-    }
-}
-
-extension UITextView {
-    @objc dynamic func tabMailProbeScrollRangeToVisible(_ range: NSRange) {
-        ChatFieldDragMarker.Probe.shared.textCall("rangeToVisible", on: self, scrolls: true)
-        tabMailProbeScrollRangeToVisible(range)
-    }
-
-    @objc dynamic func tabMailProbeSetSelectedTextRange(_ range: UITextRange?) {
-        ChatFieldDragMarker.Probe.shared.textCall("selectedTextRange", on: self, scrolls: false)
-        tabMailProbeSetSelectedTextRange(range)
-    }
-
-    @objc dynamic func tabMailProbeSetSelectedRange(_ range: NSRange) {
-        ChatFieldDragMarker.Probe.shared.textCall("selectedRange", on: self, scrolls: false)
-        tabMailProbeSetSelectedRange(range)
-    }
-
-    @objc dynamic func tabMailProbeBecomeFirstResponder() -> Bool {
-        ChatFieldDragMarker.Probe.shared.textCall("becomeFirstResponder", on: self, scrolls: false)
-        return tabMailProbeBecomeFirstResponder()
-    }
-}
-#endif
