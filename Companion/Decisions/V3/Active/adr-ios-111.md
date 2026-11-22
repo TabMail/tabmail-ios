@@ -752,8 +752,9 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
 4. **Epoch.** A UIDVALIDITY other than the bookmark's (STATUS or SELECT) is
    `.refused(.addressEpochChanged(served))`: the apply clears the bookmark and the re-read list and,
    only against a KNOWN stored epoch that differs, arms `uidValidityResetPendingAt`; the turnover
-   reaction runs after the folder transaction and is re-driven at the next pass start
-   (`redriveArmedTurnovers`). Every read carries `FolderChanges.addressEpoch`; the apply's binding
+   reaction runs after the folder transaction and is re-driven after the next pass's read, within that
+   read's budget (`redriveArmedTurnovers`, amendment 2026-11-22 (#1287) below; *superseded in place:* "is
+   re-driven at the next pass start"). Every read carries `FolderChanges.addressEpoch`; the apply's binding
    check writes nothing (not even the bookmark) when the folder stores another epoch.
 5. **Untracked folders** report a STATUS observation; the engine compares it with the folder row and
    re-lists a changed folder through the shared listing path (`refreshUntrackedFolder`, the former
@@ -1243,3 +1244,41 @@ folder-list sum). No column, no migration.
 
 Keywords: progressTotal, notKnownYet, updateBackfillProgressForAccount, Fast Sync Waiting, FastSyncAccountCard,
 BackfillProgress, #1273.
+
+### Amendment 2026-11-22 (#1287): the turnover re-drive runs after the read, inside the read's budget
+
+**Context.** Since #974 every change pass re-drove every armed folder of the account
+(`uidValidityResetPendingAt` set) before it read, one reaction after another, inside the account's sync turn and
+with no time limit of its own. A reaction is not short: the write barrier, the purges, a disconnect, a fresh
+login for the epoch observation, and the folder's resync listing (step 6, re-entrant in the same turn). When a
+reaction could not finish (its barrier gave up while an action drain ran, or the caller's timeout cancelled it),
+its flag stayed set and the next pass paid the same cost again. Until every armed folder's reaction completed,
+the account's change reads either timed out (10 s per-account pass, 60 s foreground pass) or started with no
+budget left and read nothing. On a 1.11.5 test build, an IMAP account read changes in 3 of 16 per-account passes
+for the first five minutes after the update (folders armed long before, #1277) and in 30 of 31 after the last
+re-drive. Gmail and Outlook accounts were unaffected.
+
+**Decision.** `SyncEngine.performChangePass` reads and applies first, then calls
+`redriveArmedTurnovers(accountId:until:)` with the pass's read end, computed once at the start of the pass by the
+same `changeReadEnd(turnStart:callerDeadline:)` the read uses. A reaction starts only before that end and while
+the pass is not cancelled; the armed folders not reached stay armed for the next pass. A reaction already
+running at the end runs on until it completes or its pass is cancelled. Every abort leg leaves the flag set
+(unchanged), and the stamp (step 5) clears it before the resync listing (step 6), so a reaction cancelled during
+its listing has still done its job; the folder's next listing fills it. The full sync's re-drive (after its
+listing, syncable folders) and the apply's reaction for a folder its own read found renumbered (after the
+apply) were already after the read and are unchanged.
+
+**Why this placement and not a reaction outside the turn.** The apply already tolerates a reaction running
+outside the turn (its in-transaction armed check and binding epoch check), and the trigger handler spawns one
+that way. But every reaction disconnects the provider's sessions (step 5's connection hygiene), and a re-drive
+running beside the change read would cut that read's session once per armed folder. Inside the turn, after the
+read, a reaction never meets a change read of its own account. A pass that waits for the turn waits at most
+for the read budget plus the one reaction running at its end, which its caller's timeout bounds.
+
+**Consequences.** A pass's change read is never delayed by a re-drive. Re-driving N armed folders spreads over
+as many passes as their reactions need; each completed reaction is permanent. The turnover's new numbering is
+listed after the read instead of before it, so its arrivals show one step later in the same pass. No new
+setting, column or migration.
+
+Keywords: redriveArmedTurnovers, changeReadEnd, runUidValidityResetReaction, uidValidityResetPendingAt, write
+barrier exhausted, turnover re-drive, change read starved, #1287, #974, #1277.

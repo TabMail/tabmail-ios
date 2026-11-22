@@ -4,14 +4,15 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
 /// The engine around the IMAP change reader (ADR-IOS-111, IMAP half), driven
 /// through the engine's own entry points against `FakeIMAPServer`, with the work
 /// queue the ADR-IOS-051 count walk runs on registered: an untracked folder is
-/// re-listed and its ghosts walked away; an armed turnover is re-driven at the
-/// pass start; a provider that cannot say which ids exist deletes nothing; a
+/// re-listed and its ghosts walked away; an armed turnover is re-driven after the
+/// pass's read, within its budget; a provider that cannot say which ids exist deletes nothing; a
 /// tracked folder gets no count walk and no self-heal. Each case asserts the
 /// stored rows (or, for a skip, that the folder was never touched on the wire).
 @Suite("IMAP change engine", .serialized, .processGlobalState)
@@ -23,6 +24,10 @@ struct IMAPChangeEngineTests {
     /// CONDSTORE without QRESYNC or UIDPLUS: no change reader, so every folder
     /// is untracked (with UIDPLUS a CONDSTORE server is read, #755).
     static let condstoreOnly = FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" } + ["CONDSTORE"]
+    /// A custom folder the server renumbered (`epoch` + 1 over the stored
+    /// `epoch`), with its turnover reaction armed: the server holds 201 and 202,
+    /// the device the old numbering's 1 to 3.
+    static let armedPath = "Renumbered"
 
     struct World {
         let server: FakeIMAPServer
@@ -57,11 +62,14 @@ struct IMAPChangeEngineTests {
     static func withWorld(
         _ name: String, capabilities: [String], serverUIDs: [Int], localUIDs: [Int],
         serverEpoch: Int = IMAPChangeEngineTests.epoch, storedEpoch: Int? = IMAPChangeEngineTests.epoch,
-        tracked: Bool = false,
+        tracked: Bool = false, withArmedFolder: Bool = false,
         _ body: (World) async throws -> Void
     ) async throws {
-        let server = FakeIMAPServer(capabilities: capabilities, mailboxes: [path: serverUIDs.map(IMAPChangeReaderTests.message)])
+        var mailboxes = [path: serverUIDs.map(IMAPChangeReaderTests.message)]
+        if withArmedFolder { mailboxes[armedPath] = [201, 202].map(IMAPChangeReaderTests.message) }
+        let server = FakeIMAPServer(capabilities: capabilities, mailboxes: mailboxes)
         server.setUidValidity(serverEpoch, for: path)
+        if withArmedFolder { server.setUidValidity(epoch + 1, for: armedPath) }
         try server.start()
         defer { server.stop() }
 
@@ -72,6 +80,16 @@ struct IMAPChangeEngineTests {
             accountId: name, path: path, role: .inbox, pool: pool,
             totalCount: localUIDs.count, lastKnownUidNext: (localUIDs.max() ?? 0) + 1, lastKnownUidValidity: storedEpoch)
         try FolderEpochTestFixture.insertHeaders(accountId: name, path: path, uids: localUIDs, pool: pool)
+        if withArmedFolder {
+            try FolderEpochTestFixture.insertFolder(
+                accountId: name, path: armedPath, role: .custom, pool: pool,
+                totalCount: 3, lastKnownUidNext: 4, lastKnownUidValidity: epoch)
+            try FolderEpochTestFixture.insertHeaders(accountId: name, path: armedPath, uids: [1, 2, 3], pool: pool)
+            try await pool.write { db in
+                try db.execute(sql: "UPDATE folder SET uidValidityResetPendingAt = ? WHERE id = ?",
+                               arguments: [Date(), "\(name):\(armedPath)"])
+            }
+        }
         if tracked {
             var state = FolderChangeState(raw: nil)
             state.tracking = true
@@ -136,7 +154,7 @@ struct IMAPChangeEngineTests {
 
     // MARK: - Turnover re-drive
 
-    @Test("An armed turnover is re-driven at the start of the change pass: old-epoch rows go, the new epoch is stored, the arm is cleared")
+    @Test("An armed turnover is re-driven by the change pass: old-epoch rows go, the new epoch is stored, the arm is cleared")
     func armedTurnoverIsRedriven() async throws {
         try await Self.withWorld("eng-redrive", capabilities: Self.condstoreOnly,
                                  serverUIDs: [201, 202], localUIDs: [1, 2, 3],
@@ -152,6 +170,74 @@ struct IMAPChangeEngineTests {
             #expect(folder.uidValidityResetPendingAt == nil, "the re-drive completed the reaction")
             #expect(folder.lastKnownUidValidity == Self.epoch + 1)
             #expect(try w.uids().isDisjoint(with: ["1", "2", "3"]), "no old-epoch row survives")
+        }
+    }
+
+    /// RED before #1287: the pass re-drove every armed folder before it read,
+    /// so a reaction that could not finish kept the account's new mail unread.
+    /// The pass reads first: by the time the armed folder's reaction purges, the
+    /// new message is already stored.
+    @Test("A change pass stores the account's new mail before it re-drives an armed folder's turnover")
+    func changePassReadsBeforeTheRedrive() async throws {
+        try await Self.withWorld("eng-redrive-order", capabilities: Self.condstoreOnly,
+                                 serverUIDs: [1, 2, 3, 4], localUIDs: [1, 2, 3], withArmedFolder: true) { w in
+            let armedId = "\(w.account.id):\(Self.armedPath)"
+            let inboxId = w.folderId
+            let pool = w.pool
+            // nil until the reaction reaches its purge: a hook that never runs fails.
+            let storedAtReaction = Mutex<Bool?>(nil)
+            AccountManager.uidValidityResetCheckpointHooksForTesting.withLock {
+                $0[.afterPurgeBeforeStamp(folderId: armedId)] = {
+                    let stored = try await pool.read { db in
+                        try MessageHeader.filter(Column("folderId") == inboxId && Column("messageId") == "4").fetchCount(db)
+                    }
+                    storedAtReaction.withLock { $0 = stored == 1 }
+                }
+            }
+            defer { AccountManager.uidValidityResetCheckpointHooksForTesting.withLock { $0 = [:] } }
+
+            await TestProviderRegistry.withRegisteredProvider(accountId: w.account.id, provider: w.provider) {
+                _ = try? await w.engine.performChangePass(account: w.account, provider: w.provider)
+            }
+
+            let seen = storedAtReaction.withLock { $0 }
+            let armedRow = try await pool.read { db in try Folder.fetchOne(db, key: armedId) }
+            let armed = try #require(armedRow)
+            #expect(seen == true, "the turnover reaction ran before the pass stored the new mail (nil: it never ran)")
+            #expect(try w.uids().contains("4"), "the pass did not store the new mail")
+            #expect(armed.uidValidityResetPendingAt == nil, "the re-drive after the read did not complete the reaction")
+        }
+    }
+
+    /// RED before #1287: the re-drive had no budget of its own, so a pass that
+    /// reached its turn with no time left still ran every armed folder's
+    /// reaction. Now it starts none; the folder stays armed, and the next pass
+    /// with time left completes it.
+    @Test("A pass with no read budget left re-drives no turnover; the next pass with time does")
+    func spentReadBudgetStartsNoRedrive() async throws {
+        try await Self.withWorld("eng-redrive-budget", capabilities: Self.condstoreOnly,
+                                 serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3], withArmedFolder: true) { w in
+            let armedId = "\(w.account.id):\(Self.armedPath)"
+            let pool = w.pool
+            func armed() async throws -> Folder {
+                let row = try await pool.read { db in try Folder.fetchOne(db, key: armedId) }
+                return try #require(row)
+            }
+
+            // A pass that gets its turn at its deadline: its read budget is spent.
+            await TestProviderRegistry.withRegisteredProvider(accountId: w.account.id, provider: w.provider) {
+                _ = try? await w.engine.performChangePass(account: w.account, provider: w.provider, deadline: Date())
+            }
+            let afterSpentPass = try await armed()
+            #expect(afterSpentPass.uidValidityResetPendingAt != nil, "a pass with no read budget left ran the turnover reaction")
+            #expect(afterSpentPass.lastKnownUidValidity == Self.epoch, "a pass with no read budget left stamped the new epoch")
+
+            await TestProviderRegistry.withRegisteredProvider(accountId: w.account.id, provider: w.provider) {
+                _ = try? await w.engine.performChangePass(account: w.account, provider: w.provider)
+            }
+            let afterNextPass = try await armed()
+            #expect(afterNextPass.uidValidityResetPendingAt == nil, "the next pass with time left did not re-drive the folder")
+            #expect(afterNextPass.lastKnownUidValidity == Self.epoch + 1)
         }
     }
 

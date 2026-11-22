@@ -379,7 +379,7 @@ extension SyncEngine {
 
         // A renumbered folder's turnover reaction, armed durably in its folder
         // transaction above, runs now (single-flight; a crash re-drives it from
-        // the armed flag at the next pass start).
+        // the armed flag after the next pass's read).
         for path in armedTurnovers {
             BackgroundSyncLogger.logDebug("[Sync] Change apply: folder \(path) renumbered — turnover reaction")
             await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: path)
