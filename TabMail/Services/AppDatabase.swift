@@ -4448,6 +4448,23 @@ final class AppDatabase: Sendable {
                 t.add(column: "sentAt", .datetime)
             }
         }
+
+        // #1109: a folder a user action landed in is followed: it joins the
+        // syncable set (`SyncEngine.isSyncable`) for good, so it gets change
+        // reads, the catch-up and the epoch re-drive as a favourite does. One
+        // writer (`SyncEngine.markFollowed`), never cleared. Every existing
+        // folder starts unfollowed: a default only, no data conversion. No
+        // existing column can carry the mark, and it needs no index (it is read
+        // only with an account's folder rows): ADR-IOS-111, amendment 2026-11-22.
+        // The number: v105 to v111 are taken by unmerged work, and GRDB runs an
+        // unapplied migration in registration order wherever it sits.
+        migrator.registerTimedMigration(
+            "v112_addFolderIsFollowed", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "folder") { t in
+                t.add(column: "isFollowed", .boolean).notNull().defaults(to: false)
+            }
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

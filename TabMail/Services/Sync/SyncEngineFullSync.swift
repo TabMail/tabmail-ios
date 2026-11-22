@@ -564,15 +564,15 @@ extension SyncEngine {
     }
 
     /// The folders the full sync syncs, the backfill worker's catch-up lists,
-    /// and a per-folder change reader reads (`ChangeFolder.isSynced`): main roles
-    /// and favourites, inbox first, then favourites, then secondary roles. Custom
-    /// non-favourite folders sync on demand when the user navigates to them.
+    /// and a per-folder change reader reads (`ChangeFolder.isSynced`): main roles,
+    /// favourites and followed folders, inbox first, then favourites, then
+    /// secondary roles, then followed folders. Any other folder is listed on
+    /// demand, and the first user action that lands in it makes it followed
+    /// (#1109, `SyncEngine.folderAccessed`).
     nonisolated func syncableFoldersInOrder(_ folders: [Folder]) -> [Folder] {
         let primary = self.primaryRoles
         let secondary = self.secondaryRoles
-        return folders.filter { folder in
-            Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite)
-        }.sorted { a, b in
+        return folders.filter(Self.isSyncable).sorted { a, b in
             func priority(_ f: Folder) -> Int {
                 if primary.contains(f.role) { return 0 }
                 if f.isFavorite { return 1 }
@@ -584,11 +584,13 @@ extension SyncEngine {
     }
 
     /// Whether a folder is in the syncable set (`syncableFoldersInOrder`): a main
-    /// role or a favourite. These are also the only folders the catch-up checks
+    /// role, a favourite, or a folder a user action landed in (`Folder.isFollowed`,
+    /// #1109). These are also the only folders the catch-up checks
     /// (`runCatchUpRun` takes `syncableFolderIds`), so only for them does arming
     /// the catch-up repair anything.
-    nonisolated static func isSyncable(role: FolderRole, isFavorite: Bool) -> Bool {
-        syncedPrimaryRoles.contains(role) || syncedSecondaryRoles.contains(role) || isFavorite
+    nonisolated static func isSyncable(_ folder: Folder) -> Bool {
+        syncedPrimaryRoles.contains(folder.role) || syncedSecondaryRoles.contains(folder.role)
+            || folder.isFavorite || folder.isFollowed
     }
 
     // MARK: - Message Sync

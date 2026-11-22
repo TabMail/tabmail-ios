@@ -85,6 +85,11 @@ The owner's rulings of 2026-11-09:
      folders the full sync syncs (`SyncEngine.syncableFoldersInOrder`, main roles and favourites, in
      the full sync's order), re-read at every slice. The sentence above ("ONCE per full sync pass
      [...] re-read after the folder upsert") is superseded.
+   - *Amended 2026-11-22 (#1109):* the syncable set also holds every followed folder
+     (`Folder.isFollowed`: opened, acted in, or one of its messages opened), and a user action starts a
+     catch-up run for just the folders it landed in (`CatchUpRun.accessedFolderIds`); on IMAP with no
+     mod-sequences such an access lists the folder when its counters moved since its last completed
+     listing. See ADR-IOS-111, amendment 2026-11-22.
    - The provider reads local rows through `CatchUpLocalRowReader`. It gets ids and the read and
      flagged state, never content (ADR-004), and reads by numeric range, by first id, by an id list,
      or as an ordered scan. Nothing loads a whole folder.

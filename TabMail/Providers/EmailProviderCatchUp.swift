@@ -95,6 +95,12 @@ struct CatchUpContext: Sendable {
     /// Longest one catch-up request may take (`SyncConfig.catchUpRequestTimeoutSeconds`).
     /// A test shortens it to time a request out without waiting seconds.
     var requestTimeoutSeconds = SyncConfig.catchUpRequestTimeoutSeconds
+    /// The folders a user action just landed in (#1109): this call belongs to the
+    /// catch-up run that action started (`SyncEngine.folderAccessed`). A provider
+    /// may check such a folder where its own schedule would not yet (IMAP with no
+    /// mod-sequences, `IMAPProvider.catchUpPlan`). Empty for the backfill worker's
+    /// runs.
+    var accessedFolderIds: Set<String> = []
     /// Requests charged so far, shared by every copy of this context.
     private let charged = OSAllocatedUnfairLock<Int>(initialState: 0)
 

@@ -1699,3 +1699,44 @@ struct FolderBackfillVersionNeverRepeatsMigrationTests {
         #expect(seeded > existing, "the inserted row kept or reused version \(seeded); the existing row holds \(existing)")
     }
 }
+
+// MARK: - v112 — folder.isFollowed
+
+/// `v112_addFolderIsFollowed` adds the follow mark (#1109): a folder a user
+/// action landed in joins the syncable set. Every existing folder starts
+/// unfollowed (a column default; nothing is converted), and the column is NOT
+/// NULL, so the model's non-optional field decodes every existing row.
+@Suite("Migration v112 — folder.isFollowed")
+struct FolderIsFollowedMigrationTests {
+    @Test("v112 adds a NOT NULL column defaulting to 0, every existing folder reads unfollowed, and nothing else changes")
+    func existingFoldersAreNotFollowed() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v104_addReplyAllAndMarkSentAt")
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertFolder(db, name: "Starred", path: "Starred", role: .custom)
+        try db.write { try $0.execute(sql: "UPDATE folder SET isFavorite = 1 WHERE path = 'Starred'") }
+
+        try migrator.migrate(db, upTo: "v112_addFolderIsFollowed")
+
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(folder)") }
+        let column = try #require(columns.first { ($0["name"] as String) == "isFollowed" })
+        #expect((column["notnull"] as Int) == 1)
+        #expect((column["type"] as String).uppercased() == "BOOLEAN")
+        #expect((column["dflt_value"] as String?) == "0")
+        let rows = try db.read { try Row.fetchAll($0, sql: "SELECT isFollowed, isFavorite FROM folder ORDER BY path") }
+        #expect(rows.count == 2)
+        guard rows.count == 2 else { return }
+        let followed: [Bool] = rows.map { $0["isFollowed"] }
+        let favourite: [Bool] = rows.map { $0["isFavorite"] }
+        #expect(followed == [false, false], "every existing folder starts unfollowed")
+        #expect(favourite == [false, true], "a favourite stays a favourite: nothing is converted")
+        let decoded = try db.read { try Folder.fetchAll($0) }
+        let decodedFollowed = decoded.map(\.isFollowed)
+        #expect(decodedFollowed == [false, false], "the model reads every existing row as unfollowed")
+    }
+}

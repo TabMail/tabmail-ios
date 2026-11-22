@@ -33,6 +33,13 @@ actor SyncEngine {
     /// `SyncConfig.catchUpSliceIntervalSeconds`. In memory only; a relaunch starts afresh.
     var catchUpSliceWindowEnds: [String: Date] = [:]
 
+    /// Per account: the catch-up run user actions started (#1109,
+    /// `SyncEngine.startAccessCatchUp`), one at a time, and the folders the
+    /// actions landed in that it has not taken yet. In memory only: the folders
+    /// are followed, so the backfill worker's catch-up checks them anyway.
+    var accessCatchUpTasks: [String: Task<Void, Never>] = [:]
+    var accessCatchUpPending: [String: Set<String>] = [:]
+
     #if DEBUG
     /// Test-only seam (`setCatchUpSliceStartHookForTesting`): called with the
     /// folders each catch-up slice asks, as it starts, and awaited, so a test
@@ -375,6 +382,11 @@ actor SyncEngine {
         if let indexTask = bulkIndexTasks.removeValue(forKey: accountId) {
             indexTask.cancel()
             await indexTask.value // wait for cancellation to propagate
+        }
+        accessCatchUpPending.removeValue(forKey: accountId)
+        if let accessTask = accessCatchUpTasks.removeValue(forKey: accountId) {
+            accessTask.cancel()
+            await accessTask.value
         }
     }
 

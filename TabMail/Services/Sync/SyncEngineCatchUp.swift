@@ -193,6 +193,11 @@ extension SyncEngine {
         var listingRangeMessages = SyncConfig.catchUpListingRangeMessages
         /// Longest one catch-up request may take (`CatchUpContext.requestTimeoutSeconds`).
         var requestTimeoutSeconds = SyncConfig.catchUpRequestTimeoutSeconds
+        /// The folders this run is for (#1109): a run a user action started asks
+        /// only these (`CatchUpContext.accessedFolderIds`), the syncable ones among
+        /// them. Nil for the backfill worker's run, which asks every syncable
+        /// folder.
+        var accessedFolderIds: Set<String>?
         /// The clock the slices and the deadline are measured on. Injectable so a
         /// test can spend a slice deterministically; production passes `Date.init`.
         let clock: @Sendable () -> Date
@@ -218,7 +223,8 @@ extension SyncEngine {
             return CatchUpContext(
                 deadline: end, clock: clock,
                 storageLimitInForce: storageLimitInForce, maxRequests: sliceMaxRequests,
-                listingRangeMessages: listingRangeMessages, requestTimeoutSeconds: requestTimeoutSeconds)
+                listingRangeMessages: listingRangeMessages, requestTimeoutSeconds: requestTimeoutSeconds,
+                accessedFolderIds: accessedFolderIds ?? [])
         }
     }
 
@@ -301,7 +307,9 @@ extension SyncEngine {
                 self.catchUpSliceWindowEnds[accountId] = Date().addingTimeInterval(run.intervalSeconds)
                 let folderIds: [String]
                 do {
-                    folderIds = try await self.syncableFolderIds(accountId: accountId).filter { !leftOut.contains($0) }
+                    folderIds = try await self.syncableFolderIds(accountId: accountId).filter {
+                        !leftOut.contains($0) && (run.accessedFolderIds?.contains($0) ?? true)
+                    }
                 } catch {
                     BackgroundSyncLogger.logDebug("[CatchUp] folder read failed: \(error)")
                     return .ran(CatchUpSliceResult())

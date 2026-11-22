@@ -423,7 +423,10 @@ extension AccountManager {
     /// provider that is not in `accounts` is skipped. After its folders, each
     /// account in `accounts` runs one change read (`SyncEngine.backgroundDeltaSync`,
     /// #902); an account not in `accounts`, or one whose connect or re-list failed,
-    /// gets no change read.
+    /// gets no change read. Every folder synced here is followed (#1109,
+    /// `SyncEngine.followFolders`), and after its account's listings and change
+    /// read a catch-up run reconciles the whole of those folders
+    /// (`SyncEngine.startAccessCatchUp`), which this call does not wait for.
     func syncFolders(_ folders: [Folder], connecting accounts: [Account]) async throws {
         let grouped = Dictionary(grouping: folders) { $0.accountId }
         let affectedAccountIds = Array(grouped.keys)
@@ -455,6 +458,12 @@ extension AccountManager {
                     }
                     // Removed while connecting (or connected with no mail provider): nothing to sync.
                     guard let provider else { return }
+                    // The user opened or refreshed these folders: they are followed
+                    // from now on (#1109), written before the listings so a listing
+                    // that fails still leaves them followed, and before the change
+                    // read below, which then reads (or first baselines) them.
+                    let accessed = accountFolders.filter { !$0.path.isEmpty }.map(\.id)
+                    await syncEngine.followFolders(accessed)
                     // Pool creates connections on demand via checkout — no explicit connect needed.
                     for folder in accountFolders where !folder.path.isEmpty {
                         // Every listing goes through the one classifier (#755): an
@@ -496,6 +505,11 @@ extension AccountManager {
                             BackgroundSyncLogger.logDebug("[SyncFolders] change read for account \(accountId.prefix(6)): changed=\(changed) reason=\(reason)")
                         }
                     }
+                    // Then the whole of each folder is reconciled (#1109): a catch-up
+                    // run for these folders, started after the change read so a
+                    // folder the reader has just baselined is one the catch-up may
+                    // list. The refresh does not wait for it.
+                    await syncEngine.startAccessCatchUp(accountId: accountId, folderIds: accessed)
                 }
             }
             try await group.waitForAll()

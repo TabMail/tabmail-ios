@@ -217,7 +217,7 @@ extension IMAPMissingByUIDTests {
                                arguments: [FolderRole.custom.rawValue, folderId])
             }
             let folder = try w.folder()
-            #expect(!SyncEngine.isSyncable(role: folder.role, isFavorite: folder.isFavorite), "#1062: setup: not syncable")
+            #expect(!SyncEngine.isSyncable(folder), "#1062: setup: not syncable")
             try await w.dropLocal([7])
             try await w.markOwed()
             try await w.workerRun()

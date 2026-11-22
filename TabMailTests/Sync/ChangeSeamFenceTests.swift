@@ -171,9 +171,12 @@ struct FolderChangeStateMigrationTests {
         let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(folder)") }
         let column = try #require(columns.first { ($0["name"] as String) == "changeState" })
         #expect((column["notnull"] as Int) == 0)
-        let folder = try #require(try db.read { try Folder.fetchOne($0) })
-        #expect(folder.changeState == nil)
-        #expect(FolderChangeState(raw: folder.changeState).tracking == false)
+        // The raw column, not a `Folder`: the record reads columns later
+        // migrations add (`isFollowed`, v112), which this schema does not have yet.
+        let row = try #require(try db.read { try Row.fetchOne($0, sql: "SELECT changeState FROM folder") })
+        let changeState: String? = row["changeState"]
+        #expect(changeState == nil)
+        #expect(FolderChangeState(raw: changeState).tracking == false)
     }
 
     @Test("The state round-trips, and the untracked empty state is stored as NULL")
@@ -203,8 +206,11 @@ struct FolderChangeCursorMigrationTests {
         let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(folder)") }
         let column = try #require(columns.first { ($0["name"] as String) == "changeCursor" })
         #expect((column["notnull"] as Int) == 0)
-        let folder = try #require(try db.read { try Folder.fetchOne($0) })
-        #expect(folder.changeCursor == nil)
-        #expect(OutlookFolderCursor(raw: folder.changeCursor) == nil)
+        // The raw column, not a `Folder`: the record reads columns later
+        // migrations add (`isFollowed`, v112), which this schema does not have yet.
+        let row = try #require(try db.read { try Row.fetchOne($0, sql: "SELECT changeCursor FROM folder") })
+        let changeCursor: String? = row["changeCursor"]
+        #expect(changeCursor == nil)
+        #expect(OutlookFolderCursor(raw: changeCursor) == nil)
     }
 }

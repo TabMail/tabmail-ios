@@ -181,8 +181,7 @@ extension SyncEngine {
         // IMAP one only checks the rows a folder holds), and the bookmark would
         // move past a cut arrival.
         var cutDropsBookmark = false
-        if recheck.count > SyncConfig.changeRecheckLimit,
-           Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite) {
+        if recheck.count > SyncConfig.changeRecheckLimit, Self.isSyncable(folder) {
             let stored = Set(before.recheck)
             let room = max(0, SyncConfig.changeRecheckLimit - recheck.filter(stored.contains).count)
             var added = 0

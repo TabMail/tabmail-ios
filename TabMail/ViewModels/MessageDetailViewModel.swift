@@ -1483,6 +1483,16 @@ final class MessageDetailViewModel {
         // does NOT bump per-image).
         BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: msg.id))
 
+        // Opening a message is a user action in its folder, wherever it was
+        // opened from (a folder, a search result, a chat or AI answer): the folder
+        // is followed and its whole content reconciled (#1109,
+        // `SyncEngine.folderAccessed`). Off the open's path: nothing here waits.
+        let accessedAccountId = msg.accountId
+        let accessedFolderId = msg.folderId
+        Task.detached(priority: .utility) { [manager] in
+            await manager.syncEngine.folderAccessed(accountId: accessedAccountId, folderIds: [accessedFolderId])
+        }
+
         // Mark-as-read on open lives in `markReadOnOpenIfNeeded()` — called
         // from the view's `.task`/`.onAppear` on its own unstructured Task so
         // that cancellation of this body-load path (GRDB 7.x throws

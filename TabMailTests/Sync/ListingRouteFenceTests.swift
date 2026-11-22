@@ -9,6 +9,7 @@ import Testing
 /// the listing's own transaction (plus synthetic seeds, through the same
 /// writer); and every on-demand listing (folder open, after a send, after a
 /// move, epoch-rebuild step 6) goes through `syncFolderMessages` → `listFolder`.
+/// The follow mark (#1109), column-scoped like the counters, has one writer too.
 /// Reads the working tree at run time.
 @Suite("Listing route fence: one classifier, no other door")
 struct ListingRouteFenceTests {
@@ -80,6 +81,26 @@ struct ListingRouteFenceTests {
             let assigned = Self.hits("Column(\(column)).set(", in: sources)
             #expect(assigned.keys.allSatisfy { $0 == Self.engineFile }, "\(column) assigned outside the owners: \(assigned)")
         }
+    }
+
+    /// The follow mark (`Folder.isFollowed`, #1109) is column-scoped like the
+    /// counters: one writer, `SyncEngine.markFollowed`, which only ever sets it.
+    /// No other code names the column to write it, no production code sets the
+    /// record's field, and no whole record writes it (the encode fence in
+    /// `FolderRoleTests`).
+    @Test("The follow mark: one writer, which only sets it")
+    func followMarkHasOneWriter() throws {
+        let sources = try Self.productionSources()
+        let followFile = "TabMail/Services/Sync/SyncEngineFollowedFolders.swift"
+        #expect(Self.hits("markFollowed(", in: sources) == [followFile: 2],
+                "the writer's definition and its one call, in followFolders")
+        #expect(Self.hits("Column(Folder.followedColumn).set(", in: sources) == [followFile: 1],
+                "the column is set by markFollowed alone")
+        #expect(Self.hits("\"isFollowed\"", in: sources) == ["TabMail/Models/Folder.swift": 1, "TabMail/Services/AppDatabase.swift": 1],
+                "the column's name appears only as its constant and in its migration")
+        #expect(Self.hits(".isFollowed =", in: sources).isEmpty, "no production code sets the record's mark")
+        let follow = try #require(sources.first { $0.path == followFile }?.text)
+        #expect(!follow.contains("set(to: false)"), "the mark is never cleared")
     }
 
     @Test("Every on-demand listing goes through syncFolderMessages (folder open, after a send, after a move, epoch-rebuild step 6)")

@@ -707,7 +707,7 @@ struct ReleaseBoundaryRecheckTests {
         w.server.addFolder(id: customPath, name: "Projects")
         let custom = Folder(name: "Projects", path: customPath, role: .custom, accountId: w.accountId)
         try await w.pool.write { db in try custom.insert(db) }
-        #expect(!SyncEngine.isSyncable(role: custom.role, isFavorite: custom.isFavorite),
+        #expect(!SyncEngine.isSyncable(custom),
                 "precondition: the catch-up never checks this folder")
         return custom
     }
@@ -781,6 +781,31 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
+    /// #1109: once a user action lands in the custom folder it is followed, and
+    /// the catch-up checks it: its list is cut like any checked folder's.
+    @Test("A re-read list over the limit in a custom folder that is followed is cut, arming the catch-up, as in any folder the catch-up checks")
+    func applyOverflowInAFollowedFolderArmsTheCatchUp() async throws {
+        try await Outlook.withWorld { w in
+            let custom = try await Self.addCustomFolder(w)
+            let customId = custom.id
+            try await w.pool.write { db in
+                try SyncEngine.markFollowed(folderIds: [customId], db: db)
+                try db.execute(sql: "UPDATE folder SET catchUpState = '{}' WHERE accountId = ?", arguments: [w.accountId])
+            }
+            let stored = try await w.pool.read { db in try Folder.fetchOne(db, key: customId) }
+            let followed = try #require(stored, "precondition: the folder is stored")
+            #expect(SyncEngine.isSyncable(followed), "precondition: the catch-up checks a followed folder")
+            let ids = (0...SyncConfig.changeRecheckLimit).map { "fo-\($0)" }
+
+            let result = try await w.pool.write { db in
+                try SyncEngine.applyFolderChanges(FolderChanges(folderId: customId, status: .tracked, rereadLater: ids), db: db)
+            }
+            #expect(try w.recheck(Self.customPath).count == SyncConfig.changeRecheckLimit, "the followed folder keeps its first ids")
+            #expect(result.armedCatchUp)
+            #expect(try Self.lapseCount(w.pool, folderId: customId) == 1, "and its catch-up finds the rest")
+        }
+    }
+
     /// #903: a stored list over the limit (the boundary's retired ids) is never
     /// cut by a later pass; only that pass's own additions are, and the
     /// catch-up is armed for them.
@@ -833,7 +858,9 @@ struct ReleaseBoundaryRecheckTests {
             for id in ids { try w.insertRow(id, in: w.inbox, date: Outlook.daysAgo(1)) }
             try await w.baselineAll()
             let inboxId = w.folderId(w.inbox)
-            #expect(SyncEngine.isSyncable(role: .inbox, isFavorite: false), "precondition: the catch-up checks the Inbox")
+            let storedInbox = try await w.pool.read { db in try Folder.fetchOne(db, key: inboxId) }
+            let inboxFolder = try #require(storedInbox, "precondition: the Inbox is stored")
+            #expect(SyncEngine.isSyncable(inboxFolder), "precondition: the catch-up checks the Inbox")
             let headerIds = try ids.map { try #require(try w.row($0, in: w.inbox), "precondition: stored").id }
             #expect(try Self.storedLabels(w.pool, headerId: headerIds[0]) == ["Receipts"], "precondition: the server's category is stored")
             try await w.pool.write { db in
@@ -903,7 +930,7 @@ struct ReleaseBoundaryRecheckTests {
                 try favourite.insert(db)
                 try db.execute(sql: "UPDATE account SET lastHistoryId = 'bookmark' WHERE id = ?", arguments: [w.accountId])
             }
-            #expect(SyncEngine.isSyncable(role: favourite.role, isFavorite: favourite.isFavorite), "precondition: the catch-up checks it")
+            #expect(SyncEngine.isSyncable(favourite), "precondition: the catch-up checks it")
             try await Self.seedCatchUpStates(w.pool, accountId: w.accountId)
             let ids = (0..<(SyncConfig.changeRecheckLimit + 5)).map { "star-\($0)" }
             try Self.queue(w.pool, .markRead, ids: ids, accountId: w.accountId, from: favourite.path)

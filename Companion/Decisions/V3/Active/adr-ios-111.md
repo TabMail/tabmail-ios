@@ -163,7 +163,9 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
      nullable TEXT, NULL = no bookmark yet). The engine writes back `FolderChanges.cursor` in that
      folder's transaction.
    - `ChangeFolder.isSynced`: the folder is in the full sync's syncable set
-     (`SyncEngine.syncableFoldersInOrder`); a per-folder reader reads only these.
+     (`SyncEngine.syncableFoldersInOrder`); a per-folder reader reads only these. *Amended 2026-11-22
+     (#1109):* the set also holds every followed folder (`Folder.isFollowed`, a folder a user action
+     landed in); see the amendment of that date at the end.
    - `ChangeFolder.heldSince`: the start of the folder's held range (`Folder.oldestSyncedDate`), a hint
      only; the apply checks the range again inside the transaction.
    - `ChangeRequest.localRows`: the existing `CatchUpLocalRowReader` (ids and two flags, never content;
@@ -447,7 +449,8 @@ answer in that folder, for a message of any age:
 3. **A list is cut only where the catch-up will find the rest** (added same day, review round 4;
    *amended 2026-11-15, #903: a stored id is never cut, see the amendment below*). Over
    `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`: a main role
-   or a favourite, the same set `syncableFoldersInOrder` gives the full sync and the catch-up run)
+   or a favourite, the same set `syncableFoldersInOrder` gives the full sync and the catch-up run;
+   *amended 2026-11-22, #1109: or a followed folder*)
    keeps its first ids and its catch-up is armed, as decision 3 says. A folder the catch-up never
    checks keeps every id: arming its catch-up is a no-op there (`markCatchUpLapse` updates only a
    non-NULL state, and the catch-up run never takes that folder), so a dropped id would stay wrong for
@@ -1213,3 +1216,98 @@ before); a progress-only bookmark write fails a concurrent crawl range or load-o
 Keywords: IMAPChangeMode, CHANGEDSINCE, flagsChangedSince, messageCount, provenFrom, pendingCheck,
 IMAPRemovalCheckProgress, imapChangeRemovalCheckWindow, numericIdsBelow, IMAPChangeCountMismatch, mustList,
 heldRowsProof, arrivalRowsProof, fromServerInsertAllowed, ChangeInsertPremise, stagedRowProvenGone, heldSyncTurn, #755.
+
+### Amendment 2026-11-22 (#1109): a folder a user action lands in is followed
+
+**Context.** The syncable set (`SyncEngine.isSyncable`: main roles and favourites) decided which folders
+get the full sync's listing, the change read (`ChangeFolder.isSynced`), the catch-up and the UIDVALIDITY
+re-drive. Every other folder was listed only when opened, and only its newest messages (the window
+listing). A delete, move, or read or flag change made elsewhere below those, or a message the device
+never loaded, then stayed wrong for good in a folder the user works in but never starred: an IMAP
+custom folder, an Outlook folder that is not a favourite. Memory 114 records the same predicate's effect
+on the re-drive.
+
+**Decision.**
+1. **The mark.** `Folder.isFollowed` (`v112_addFolderIsFollowed`, `BOOLEAN NOT NULL DEFAULT 0`, no index).
+   A followed folder is in the syncable set (`SyncEngine.isSyncable(_:)`), ordered after the secondary
+   roles (`syncableFoldersInOrder`: Inbox, favourites, secondary roles, followed folders). It therefore
+   gets everything a favourite gets, with no new provider code: the full sync's listing, the change read,
+   the catch-up run (`syncableFolderIds`), the UIDVALIDITY re-drive (the same loop) and the re-read
+   list's overflow cut (rule 3 of the #876 amendment). This amends decision 1 of the 2026-11-12 Outlook
+   amendment (`ChangeFolder.isSynced`) and ADR-IOS-107 decision 1 (the catch-up's folders).
+   - One writer, `SyncEngine.markFollowed(folderIds:db:)`: a column-scoped UPDATE of the named folders not
+     followed yet. It only sets the mark; nothing clears it (no expiry). The column is left out of
+     `Folder.encode(to:)` (`Folder.followedColumn`), as the listing counters are, so a whole-record write
+     from an older read never clears it. Fences: `ListingRouteFenceTests.followMarkHasOneWriter`, the
+     `FolderRoleTests` encode fence.
+   - It is the user's choice, not sync state: both Settings resets keep it, as they keep `isFavorite`
+     (`SettingsSyncStateResetTests`). A renamed or re-created IMAP folder is a new row and starts
+     unfollowed.
+2. **The access points** (`SyncEngine.folderAccessed`: the mark, then an access catch-up run):
+   - opening a folder or pulling to refresh it (`AccountManager.syncFolders`): the mark is written before
+     the listings, so a listing that fails still follows the folder, and the run starts after the change
+     read, so a folder the reader has just baselined may be listed;
+   - a drained move, archive or delete: its source and its destination (`AccountOperationExecutor.finishDrain`,
+     `DrainContext.foldersAccessed`);
+   - opening a message, from a folder, a search result, or a chat or AI answer alike
+     (`MessageDetailViewModel.loadBody`, on a detached task: the open never waits for it).
+   The trigger is not `syncFolderMessages`, the place the issue first proposed: that route also serves
+   the post-send Sent listing and step 6 of the epoch rebuild, which are not user actions in the folder.
+3. **The access catch-up run** (`SyncEngine.startAccessCatchUp`): one per account, detached; folders that
+   arrive while it runs are taken by its next run. Each run is `runCatchUpRun` with
+   `CatchUpRun.accessedFolderIds`: it asks only those folders (the syncable ones among them, so a folder
+   whose mark did not land is not asked), under the account's turn and slice pacing like every slice,
+   until they make no progress or `SyncConfig.accessCatchUpRunSeconds` (120 s) is up. What a large folder
+   still needs then is the backfill worker's, whose catch-up checks every followed folder.
+   `CatchUpContext.accessedFolderIds` tells the provider which folders an action reached (provider-neutral).
+   `SyncEngine.remove(accountId:)` cancels the run.
+4. **IMAP with no mod-sequences** (`IMAPProvider.catchUpPlan`, `counters:`, `accessed:`). Such a folder has
+   no cheap check, so the daily full check alone would leave an accessed folder stale for up to a day. An
+   accessed, untracked folder with no MODSEQ freshness is listed when its stored counters (`totalCount`,
+   the listing's EXISTS, and `lastKnownUidNext`) differ from those its last completed listing started
+   from (`IMAPCatchUpState.completionCounters`, taken from `Listing.firstCounters` before the first range,
+   as `firstStamp` is; inside the opaque state, no column), or when that listing completed longer ago than
+   `SyncConfig.catchUpAccessCheckAgeSeconds` (1 h: a flag change moves no counter). With MODSEQ the MODSEQ
+   check already lists a folder that changed, and a tracked folder's changes come through its change read.
+5. **Outlook keeps its catch-up gate**: a followed folder is synced, so its change read baselines it first,
+   and only then does the catch-up list it. Gmail's change read already covers every label; a followed
+   label gains the catch-up.
+6. **Unchanged:** sync by UID, never by date; the reconcile is a scan and runs on any network, battery level
+   and power mode (header and body loads wait as before, ADR-IOS-107 amendment 2026-11-19); removals go
+   through the one removal core; no mail content is stored; nothing provider-specific above the boundary.
+
+**Why a new column, and why no index.** Every existing field was checked first:
+1. `changeState` is sync progress. The UIDVALIDITY reaction sets it NULL (`AccountManagerUidValidityReset`)
+   and its re-drive loops over the syncable set (`SyncEngineFullSync`), so a mark kept there would take the
+   folder out of the syncable set inside its own epoch reaction: after a success it would lose its change
+   read and catch-up, and after an abort it would not be re-driven (Memory 114). Both Settings resets
+   clear it (`resetSyncStateTxn`), and `FolderChangeState.encoded` stores NULL for a state with nothing in
+   it. Keeping the mark there would mean carving it out of the epoch reaction and both resets.
+2. `catchUpState` and `changeCursor` are provider-opaque JSON the engine cannot read above the boundary;
+   both are dropped on an epoch change, a lapse, the exit rule or a reset, and nil already means "first
+   listing" and "baseline needed".
+3. `isFavorite` is the user's visible favourites list: setting it would add folders to the sidebar.
+4. A per-folder "last synced" time does not exist; `Account.lastSyncedAt` is account-wide.
+5. The listing counters and the walk's columns (`totalCount`, `lastKnownUidNext`, `lastKnownHighestModSeq`,
+   `backfillComplete`, `backfillUidCursor`) are written by paths that are not user actions (the post-send
+   Sent listing, step 6 of the epoch rebuild, the walk over every folder) and invalidated by a reset.
+No index: the mark is read only with an account's folder rows (`syncableFoldersInOrder` filters the rows
+read by `accountId`, tens per account); no query selects by the mark alone.
+
+**Consequences.** A folder the user has acted in is kept current like a favourite, at the cost of its change
+read and catch-up from then on. The set only grows; a folder the user stops using stays followed.
+Limits: an access that comes inside an open slice window waits for it (at most
+`catchUpSliceIntervalSeconds`); on IMAP with no mod-sequences, a flag change made elsewhere below the
+newest listing within an hour of the last completed listing waits for the next access after that hour,
+or the daily check.
+
+Tests: `FollowedFolderTests` (`FollowedFolderMarkTests`: the mark, the order, the access plan;
+`FollowedFolderIMAPTests`: the wire oracle for opening the folder, a move into it and opening one of its
+messages, on a server with no mod-sequences and on a QRESYNC server; `FollowedFolderOutlookTests`: the
+baseline, then the listing), `ReleaseBoundaryRecheckTests.applyOverflowInAFollowedFolderArmsTheCatchUp`,
+`FolderIsFollowedMigrationTests`.
+
+Keywords: isFollowed, followed folder, follow mark, markFollowed, followedColumn, folderAccessed,
+followFolders, startAccessCatchUp, access catch-up run, accessedFolderIds, accessCatchUpRunSeconds,
+catchUpAccessCheckAgeSeconds, completionCounters, firstCounters, Counters, syncable set, isSyncable,
+custom non-favourite folder, sync on demand, v112_addFolderIsFollowed, #1109.
