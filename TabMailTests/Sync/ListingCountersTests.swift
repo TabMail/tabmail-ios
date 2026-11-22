@@ -20,14 +20,22 @@ struct ListingCountersTests {
     static let condstoreNoReader = FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" } + ["ENABLE", "CONDSTORE"]
     static let condstoreNoEnableNoReader = FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" } + ["CONDSTORE"]
 
-    /// A second untracked folder, listed after INBOX in the full sync.
-    static func addArchive(_ w: E.World, serverUIDs: [Int], localUIDs: [Int]) throws {
+    /// A second untracked folder, listed after INBOX in the full sync. With
+    /// `stamped`, every held row carries the folder's UIDVALIDITY as the epoch it
+    /// was synced under, as a row an earlier listing of this epoch wrote does.
+    static func addArchive(_ w: E.World, serverUIDs: [Int], localUIDs: [Int], stamped: Bool = false) throws {
         w.server.setMessages(serverUIDs.map(IMAPChangeReaderTests.message), in: archivePath)
         w.server.setUidValidity(E.epoch, for: archivePath)
         try FolderEpochTestFixture.insertFolder(
             accountId: w.account.id, path: archivePath, role: .archive, pool: w.pool,
             totalCount: localUIDs.count, lastKnownUidNext: (localUIDs.max() ?? 0) + 1, lastKnownUidValidity: E.epoch)
         try FolderEpochTestFixture.insertHeaders(accountId: w.account.id, path: archivePath, uids: localUIDs, pool: w.pool)
+        if stamped {
+            let folderId = archiveId(w)
+            try w.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET observedUidValidity = ? WHERE folderId = ?", arguments: [E.epoch, folderId])
+            }
+        }
     }
 
     static func archive(_ w: E.World) throws -> (uids: Set<String>, folder: Folder) {
@@ -301,7 +309,7 @@ struct ListingCountersTests {
         }
     }
 
-    @Test("Two overlapping listings, windowed: a message above the highest UID the earlier listing fetched survives its write; one gone inside the window is removed and rows below the window are untouched")
+    @Test("Two overlapping listings, windowed: a message at or above the earlier listing's UIDNEXT survives its write; one gone inside the window is removed and rows below the window are untouched")
     func overlappingWindowedListingKeepsAnArrivalAboveItsWindow() async throws {
         try await E.withWorld("lc-overlap-window", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
             // The earlier listing fetches the newest 3 of 1, 2, 3, 5, 6: [3, 5, 6].
@@ -310,9 +318,104 @@ struct ListingCountersTests {
             let folder = try Self.archive(w).folder
             _ = await w.engine.listFolder(folder, provider: w.provider, limit: 3)
             let after = try Self.archive(w)
-            #expect(after.uids.contains("7"), "a message above the listing's fetched window is not judged by it")
+            #expect(after.uids.contains("7"), "a message at or above the listing's own UIDNEXT (7) is not judged by it")
             #expect(!after.uids.contains("4"), "a message gone inside the window is removed")
             #expect(after.uids.isSuperset(of: ["1", "2", "3", "5", "6"]))
+        }
+    }
+
+    /// The window of a proven windowed listing runs from the lowest UID it
+    /// fetched to its own SELECT's UIDNEXT - 1, not to the highest UID it
+    /// fetched: the folder's newest message, deleted on the server after a
+    /// proven listing, sits above the next listing's highest fetched UID but
+    /// below its UIDNEXT (the server reports UIDNEXT as the highest UID ever
+    /// assigned + 1, RFC 3501), and must leave the device in that listing.
+    /// The device holds only the window (no lower rows), so the ADR-IOS-051
+    /// count walk never fires: only the sweep can remove it.
+    @Test("Invariant: after a proven windowed listing the device holds exactly the server's messages from the lowest fetched UID to that SELECT's UIDNEXT - 1: the folder's newest message, deleted on the server, is gone after one full sync")
+    func provenWindowHoldsExactlyTheServersMessagesUpToUidNext() async throws {
+        let limit = SyncConfig.syncMessageLimit
+        let newest = limit + 2
+        try await E.withWorld("lc-window-newest-deleted", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            // The server holds 1...newest, more than the window, so every
+            // listing is windowed; the device holds the newest `limit`
+            // (3...newest).
+            try Self.addArchive(w, serverUIDs: Array(1...newest), localUIDs: Array(3...newest), stamped: true)
+            let folder = try Self.archive(w).folder
+            let first = await w.engine.listFolder(folder, provider: w.provider, limit: limit)
+            if case .proven = first {} else { Issue.record("precondition: the first listing proves its window: \(first)") }
+            let listedUidNext = try Self.archive(w).folder.lastKnownUidNext
+            #expect(listedUidNext == newest + 1, "precondition: the listing stored its UIDNEXT")
+
+            // Deleted on another client: the folder's newest message.
+            w.server.setMessages(Array(1...(newest - 1)).map(IMAPChangeReaderTests.message), in: Self.archivePath)
+            let next = try await w.engine.fullSync(account: w.account, provider: w.provider)
+            #expect(next.listedFolderIds.contains(Self.archiveId(w)), "precondition: the changed count lists the folder")
+
+            let after = try Self.archive(w)
+            #expect(after.folder.lastKnownUidNext == newest + 1,
+                    "precondition: the listing's own UIDNEXT still lies above the deleted UID")
+            // The window is 2...(newest - 1) (the newest `limit` of what the
+            // server holds); UID 1 lies below it and was never held.
+            let expected = Set((2...(newest - 1)).map(String.init))
+            let extra = after.uids.subtracting(expected).sorted()
+            #expect(after.uids == expected,
+                    "exactly the server's messages from the lowest fetched UID to UIDNEXT - 1; extra rows: \(extra)")
+            #expect(!after.uids.contains(String(newest)), "the newest message deleted on the server is removed")
+        }
+    }
+
+    /// A large folder's windowed sweep after a mass deletion on another client.
+    /// The device holds more rows than `staleDetectionMaxFullScan`, so each
+    /// listing takes the windowed slice even though the server proves it spans
+    /// the whole folder. Its window runs to UIDNEXT - 1 and holds more rows
+    /// than that bound: one listing removes exactly the newest `bound` rows
+    /// that are gone (by numeric UID, the deleted newest messages first) and
+    /// keeps every other row; the next windowed listing, after an arrival,
+    /// takes the next `bound` from where the first stopped; once the device
+    /// holds no more than the bound, the listing converges on the server.
+    @Test("A large folder after a mass deletion elsewhere: each windowed listing judges exactly the newest staleDetectionMaxFullScan rows of its window by numeric UID, the deleted newest messages first; the next listing, after an arrival, continues where it stopped; the folder converges")
+    func massDeletionSweepIsBoundedAndConverges() async throws {
+        let bound = SyncConfig.staleDetectionMaxFullScan
+        let newest = 2 * bound + 60
+        let liveTop = Array((2 * bound + 11)...(2 * bound + 40))
+        let live = [5] + liveTop
+        let arrival = newest + 1
+        func ids<S: Sequence>(_ uids: S) -> Set<String> where S.Element == Int { Set(uids.map(String.init)) }
+        try await E.withWorld("lc-mass-deletion", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            try Self.addArchive(w, serverUIDs: Array(1...newest), localUIDs: Array(1...newest), stamped: true)
+            let folder = try Self.archive(w).folder
+            let first = await w.engine.listFolder(folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            if case .proven = first {} else { Issue.record("precondition: the first listing proves its window: \(first)") }
+            let held = try Self.archive(w).uids
+            #expect(held.count == newest, "precondition: nothing was removed while the server held every message")
+
+            // Deleted on another client: all but `live`, the folder's newest messages among them.
+            w.server.setMessages(live.map(IMAPChangeReaderTests.message), in: Self.archivePath)
+            let second = await w.engine.listFolder(try Self.archive(w).folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            if case .proven = second {} else { Issue.record("precondition: the second listing proves its window: \(second)") }
+            let afterSecond = try Self.archive(w)
+            #expect(afterSecond.folder.lastKnownUidNext == newest + 1, "precondition: the listing's UIDNEXT lies above the deleted newest messages")
+            // Judged: the newest `bound` rows in 5...newest, numerically, i.e.
+            // newest...(bound + 61), 30 of them live. Kept: 1...(bound + 60).
+            let expectedSecond = ids(1...(newest - bound)).union(ids(liveTop))
+            let wrongSecond = afterSecond.uids.symmetricDifference(expectedSecond).sorted { Int($0) ?? 0 < Int($1) ?? 0 }
+            #expect(afterSecond.uids == expectedSecond, "exactly the newest \(bound) rows of the window were judged; differs at: \(wrongSecond.prefix(10))")
+
+            // A new message arrives; the next windowed listing judges the next
+            // `bound` rows of its window: the 30 live, then (bound + 60)...91.
+            w.server.setMessages((live + [arrival]).map(IMAPChangeReaderTests.message), in: Self.archivePath)
+            let third = await w.engine.listFolder(try Self.archive(w).folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            if case .proven = third {} else { Issue.record("precondition: the third listing proves its window: \(third)") }
+            let afterThird = try Self.archive(w).uids
+            let expectedThird = ids(1...90).union(ids(liveTop)).union([String(arrival)])
+            let wrongThird = afterThird.symmetricDifference(expectedThird).sorted { Int($0) ?? 0 < Int($1) ?? 0 }
+            #expect(afterThird == expectedThird, "the next listing continues where the first stopped; differs at: \(wrongThird.prefix(10))")
+
+            // The device now holds fewer rows than the bound: the whole-folder branch converges.
+            _ = await w.engine.listFolder(try Self.archive(w).folder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            let converged = try Self.archive(w).uids
+            #expect(converged == ids(live + [arrival]), "the folder converges on the server's messages: \(converged.count) rows")
         }
     }
 
@@ -372,6 +475,20 @@ struct ListingCountersTests {
             } else {
                 #expect(after == ["1", "2", "3", "5"], "no bound at all: nothing is removed")
             }
+        }
+    }
+
+    @Test("A windowed listing with no UIDNEXT: bounded by the highest UID it fetched (4, gone inside the window, removed; 7 above it kept; 1 and 2 below it untouched)")
+    func noUidNextBoundsTheWindowedSweep() async throws {
+        try await E.withWorld("lc-nouidnext-window", capabilities: Self.condstoreNoReader, serverUIDs: [1], localUIDs: [1]) { w in
+            // The listing fetches the newest 3 of 1, 2, 3, 5, 6: [3, 5, 6], with no UIDNEXT.
+            try Self.addArchive(w, serverUIDs: [1, 2, 3, 5, 6], localUIDs: [1, 2, 3, 4, 5, 6, 7], stamped: true)
+            w.server.suppressSelectUidNext(for: Self.archivePath)
+            let folder = try Self.archive(w).folder
+            let listing = await w.engine.listFolder(folder, provider: w.provider, limit: 3)
+            if case .proven = listing {} else { Issue.record("precondition: the listing proves its window: \(listing)") }
+            let after = try Self.archive(w).uids
+            #expect(after == ["1", "2", "3", "5", "6", "7"], "the sweep judges 3...6 only: \(after.sorted())")
         }
     }
 
