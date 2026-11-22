@@ -620,7 +620,7 @@ struct ChatReplyRecoveryTests {
         store.accounts = chat.accounts
         let card = UIHostingController(rootView: AnyView(
             ready.compose.composeView(replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
-                                      onAgentOutcome: { _ in })
+                                      openedOn: .chat, onAgentOutcome: { _ in })
                 .environment(store)
                 .environment(\.hasTabMailSession, true)))
         card.modalPresentationStyle = .fullScreen
