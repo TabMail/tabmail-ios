@@ -1,5 +1,5 @@
 <!-- COMPANION-CURRENT-NOTE-BEGIN -->
-> **Current routing note (2026-09-01):** the two statements below are current authority; their
+> **Current routing note (2026-09-01; third item 2026-11-22):** the statements below are current authority; their
 > frozen predecessor wording remains in the preserved body underneath.
 
 - **`pendingBodyCount`'s predicate gained a fourth conjunct**: `headerComplete=1 AND bodyComplete=0
@@ -12,6 +12,7 @@
   message searchable-but-unopenable (shipped once; that is the bug the quarantine fixed). It
   terminates by being QUARANTINED (`bodyMetadataOversized=1`) instead. The preserved line below
   reads "empty/404/oversized bodies confirm-empty"; do not restore that conflation.
+- **Before the provider's total is known, progress is the database's own (2026-11-22, #1273; ADR-IOS-111 amendment of that date).** `progressTotal` answers `.notKnownYet` for IMAP until a folder list ran in this process and for Outlook until a full sync adopted one. `updateBackfillProgressForAccount` still publishes then: no UID scope, no server total, so `totalEmails` = stored rows, `ftsIndexed` = settled rows, and a walked-complete account with no body owed reads complete ("N messages indexed"). Until 1.11.5 build 390 it published nothing there, and the Fast Sync card read "Waiting..." for IMAP, iCloud and Outlook. The stored folder counters are never a denominator. Regressions: `ProgressTotalSourceTests.walkedCompleteAccountShowsCompletedWithoutAFolderList`, `ListingCountersTests.imapProgressBeforeTheFolderListIsTheDatabases`, `ExchangeFolderTreeTests.progressBeforeTheFolderListIsTheDatabasesThenUsesTheProviderTotal`.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Backfill / Fast Sync Completion — gate on `pendingBodyCount`, NEVER a server total
@@ -22,4 +23,3 @@
   - **IMAP**: unaffected — `uidTotal > 0`, so the server-total override is skipped and `totalEmails = grdbTotal`.
 - **`totalEmails` (server total) is only the progress-BAR denominator while crawling** (`if uidTotal == 0 && !headersDone` in `SyncEngineBackfill.updateBackfillProgressForAccount`). Once `headersDone`, it falls back to `grdbTotal` so the bar reaches 100% consistently with completion. `serverMessageTotal` is cached once per session and never reconciled down.
 - **Symptom of the old bug** (fixed): an Outlook/Exchange account that "never completes sync" — Fast Sync screen stuck below 100% / no "Sync Complete", Settings sync row unfinished, and the chat pill's "agent search results may be incomplete" banner (`DynamicIslandChatButton`, driven by `isBackfillInProgress`) stuck on forever. It is a **completion-criteria/reporting defect, not a runaway loop** — the backfill task itself exits on `isFolderWalkComplete` (headersDone), independent of `isFullyComplete`. The "deleted messages aren't counted right" intuition was exactly correct: `totalItemCount` over-counts deleted/hidden/non-mail items. Regression: `BackfillProgressCompletionTests`.
-- **Before the provider's total is known, progress is the database's own (2026-11-22, #1273; ADR-IOS-111 amendment of that date).** `progressTotal` answers `.notKnownYet` for IMAP until a folder list ran in this process and for Outlook until a full sync adopted one. `updateBackfillProgressForAccount` still publishes then: no UID scope, no server total, so `totalEmails` = stored rows, `ftsIndexed` = settled rows, and a walked-complete account with no body owed reads complete ("N messages indexed"). Until 1.11.5 build 390 it published nothing there, and the Fast Sync card read "Waiting..." for IMAP, iCloud and Outlook. The stored folder counters are never a denominator. Regressions: `ProgressTotalSourceTests.walkedCompleteAccountShowsCompletedWithoutAFolderList`, `ListingCountersTests.imapProgressBeforeTheFolderListIsTheDatabases`, `ExchangeFolderTreeTests.progressBeforeTheFolderListIsTheDatabasesThenUsesTheProviderTotal`.
