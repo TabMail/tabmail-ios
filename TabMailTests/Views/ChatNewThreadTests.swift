@@ -326,8 +326,10 @@ struct ChatNewThreadTests {
         session.activeChatTask = turn
         ActiveAgentTracker.shared.setWorking(key)
         state.endSession(for: key)
-        await turn.value
         #expect(turn.isCancelled, "the running turn is cancelled")
+        // Read before joining: a turn left running fails above, then this cancel lets the join end.
+        turn.cancel()
+        await turn.value
         #expect(session.activeChatTask == nil)
         #expect(!ActiveAgentTracker.shared.workingSessions.contains(key))
         let fresh = state.session(for: key)
@@ -872,8 +874,11 @@ struct ChatNewDraftSaveTests {
         #expect(sent.count == 1, "control: the push reached the provider")
         guard sent.count == 1 else { return }
         let wireId = try #require(sent[0].messageId)
+        let localPart = String(model.draftId.dropFirst(Draft.newEmailPrefix.count)).lowercased()
+        #expect(model.draftId.hasPrefix(Draft.newEmailPrefix) && !localPart.isEmpty, "control: the key is the prefix and its own id")
         #expect(!wireId.contains(model.draftId))
         #expect(!wireId.contains(Draft.newEmailPrefix), "the local key never goes on the wire")
+        #expect(!wireId.lowercased().contains(localPart), "nor its own id, in any spelling of the key: \(wireId)")
         #expect(sent[0].body == "Lunch on Friday?")
         #expect(sent[0].to == ["\"Maria\" <maria@example.com>"])
     }
@@ -977,6 +982,9 @@ struct ChatNewDraftSaveTests {
         let expectedSavedAt = Date(timeIntervalSince1970: draft.updatedAt)
         #expect(model.attachmentLoadFailed == false)
         #expect(model.savedAt == expectedSavedAt)
+        let again = ChatNewThreadModel(reopening: draft, account: fixture.account)
+        #expect(again.draftId == model.draftId, "control: the same draft opened again")
+        #expect(again.sessionKey != model.sessionKey, "each opening has its own in-memory session")
     }
 
     @Test("A reopened draft left unchanged is not written")

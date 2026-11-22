@@ -105,7 +105,7 @@ struct ChatSubjectText: View {
     var labels: [UserLabel] = []
 
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: ChatViewLayout.subjectLabelGap) {
             Text(subject)
                 .font(.caption)
                 .foregroundStyle(Theme.textSecondary)

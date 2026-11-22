@@ -13,7 +13,8 @@ import UIKit
 /// against a real database: what the field shows of a reopened draft, Send's ask and the way from
 /// it to "Add recipient", the header's sheet, the alert a reopened draft with unreadable
 /// attachments shows, and what the app going to the background, Back, "Leave without saving" and
-/// the screen going away any other way save, end and give back.
+/// the screen going away any other way save, end and give back. Also which screen a saved new
+/// email's draft opens in from Drafts (`DraftComposePresenter`).
 @Suite("New email as a chat, the whole screen", .serialized, .processGlobalState)
 @MainActor
 struct ChatNewThreadScreenTests {
@@ -30,10 +31,13 @@ struct ChatNewThreadScreenTests {
     @MainActor
     private final class QueueRecorder {
         var calls: [String] = []
+        /// Whether the draft was still kept from eviction as each save was admitted.
+        var keptAtAdmission: [Bool] = []
         var answer = true
 
         func queue(_ draftId: String, _ accountId: String) -> Bool {
             calls.append("\(draftId)|\(accountId)")
+            keptAtAdmission.append(DraftSessionRegistry.shared.isActive(draftId))
             return answer
         }
     }
@@ -91,8 +95,9 @@ struct ChatNewThreadScreenTests {
     private func reopenedWordsAndSendAsksBody() async throws {
         let fixture = try fixture()
         defer { finish(fixture) }
-        let draft = try await savedDraft(fixture, body: "Lunch on Friday?")
+        let draft = try await savedDraft(fixture, body: "Lunch on Friday?", attachment: Self.menu)
         let model = ChatNewThreadModel(reopening: draft, account: fixture.account, queueDraftSave: { _, _ in true })
+        #expect(model.attachments.map(\.data) == [Self.menu.data], "control: the reopened draft has its file")
         try await withScreen(model) { screen in
             try await Self.waitUntil { Self.fieldText(in: screen.view) == "Lunch on Friday?" }
             #expect(Self.fieldText(in: screen.view) == "Lunch on Friday?", "the reopened words are put in the field")
@@ -107,10 +112,12 @@ struct ChatNewThreadScreenTests {
             try await Self.waitUntil { Self.sheetIsUp(screen) }
             #expect(Self.sheetIsUp(screen), "the ask's Add recipient opens the sheet: \(Self.presentedLabels(screen))")
             #expect(model.words == "Lunch on Friday?", "the words stay")
+            #expect(model.attachments.map(\.filename) == [Self.menu.filename], "the attachment stays")
+            #expect(model.attachments.map(\.data) == [Self.menu.data], "with its bytes")
         }
     }
 
-    @Test("The header's Add recipient opens the sheet titled Add recipient")
+    @Test("The header shows New email as its subject, and its Add recipient opens the sheet titled Add recipient")
     func headerOpensTheSheet() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await headerOpensTheSheetBody() }
@@ -122,6 +129,8 @@ struct ChatNewThreadScreenTests {
         let model = ChatNewThreadModel(account: fixture.account, queueDraftSave: { _, _ in true })
         try await withScreen(model) { screen in
             let names = try #require(Self.names(in: screen.view))
+            #expect(HostedAccessibility.labels(in: screen.view).contains(ChatNewEmailSubjectLine.text),
+                    "the subject line reads New email: \(HostedAccessibility.labels(in: screen.view).prefix(12))")
             #expect(Self.topPresented(screen) == nil, "control: nothing is open yet")
             #expect(names.accessibilityActivate())
             try await Self.waitUntil { Self.sheetIsUp(screen) }
@@ -207,6 +216,7 @@ struct ChatNewThreadScreenTests {
             let saved = try #require(savedRow, "the screen going away saved the draft")
             #expect(saved.body == "Not lost")
             #expect(recorder.calls == ["\(model.draftId)|\(Self.accountId)"])
+            #expect(recorder.keptAtAdmission == [true], "still kept from eviction while the closing save is admitted")
             #expect(!DraftSessionRegistry.shared.isActive(model.draftId), "given back once the save was done")
             #expect(ChatPillState.shared.session(for: model.sessionKey) !== session, "the chat's session ended")
             ChatPillState.shared.endSession(for: model.sessionKey)
@@ -263,6 +273,89 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @Test("Opened from Drafts, a new email's draft reopens as its chat only with the chat view on and signed in; signed out, with the chat view off, and for a draft compose wrote, compose opens")
+    func draftOpenRoutes() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await draftOpenRoutesBody() }
+    }
+
+    private func draftOpenRoutesBody() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let newEmail = try await savedDraft(fixture, body: "Lunch on Friday?")
+        let composed = try await savedDraft(fixture, body: "Written in compose", id: "compose-draft-\(UUID().uuidString)")
+        try await Self.withChatView(true) {
+            let on = ChatViewConfig.opensInChat
+            #expect(on, "control: the chat view is on")
+            let signedIn = try await opened(newEmail, fixture, signedIn: true)
+            let signedOut = try await opened(newEmail, fixture, signedIn: false)
+            let other = try await opened(composed, fixture, signedIn: true)
+            #expect(signedIn == .chat, "on and signed in: the draft's chat")
+            #expect(signedOut == .compose, "signed out: compose, where Send works")
+            #expect(other == .compose, "a draft compose wrote: compose")
+        }
+        try await Self.withChatView(false) {
+            let on = ChatViewConfig.opensInChat
+            #expect(!on, "control: the chat view is off")
+            let off = try await opened(newEmail, fixture, signedIn: true)
+            #expect(off == .compose, "the chat view off: compose")
+        }
+    }
+
+    private enum Opened: Equatable { case chat, compose, neither }
+
+    /// Opens `draft` as the Drafts list does (`DraftComposePresenter`, a cover of its own) and tells
+    /// which screen came up: the chat by its header, compose by its recipient fields. Then closes
+    /// it and waits for its draft to be given back.
+    private func opened(_ draft: Draft, _ fixture: Fixture, signedIn: Bool) async throws -> Opened {
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let navigationStore = NavigationStore()
+        navigationStore.accounts = [fixture.account]
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let root = DraftComposePresenter(source: .draftId(draft.id))
+            .environment(\.hasTabMailSession, signedIn)
+            .environment(navigationStore)
+        window.rootViewController = UIHostingController(rootView: root)
+        window.makeKeyAndVisible()
+        var result = Opened.neither
+        try await Self.waitUntil {
+            if Self.names(in: window) != nil {
+                result = .chat
+            } else if HostedAccessibility.identifiers(in: window).contains(where: { $0.hasPrefix("recipientInput-") }) {
+                result = .compose
+            }
+            return result != .neither
+        }
+        if result == .neither {
+            Issue.record("no screen came up for \(draft.id): \(HostedAccessibility.identifiers(in: window).prefix(20))")
+        }
+        window.rootViewController?.dismiss(animated: false)
+        window.isHidden = true
+        window.rootViewController = nil
+        try await Self.waitUntil { !DraftSessionRegistry.shared.isActive(draft.id) }
+        return result
+    }
+
+    /// Runs `body` with the Chat View setting as given and AI on (not opted out, the plan's gate
+    /// open), then puts all three back.
+    private static func withChatView(_ on: Bool, _ body: () async throws -> Void) async throws {
+        let defaults = UserDefaults.standard
+        let savedChat = defaults.object(forKey: ChatViewConfig.enabledKey)
+        let savedOptOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
+        let gate = AISubscriptionGate.shared
+        let gateWasActive = gate.isActive
+        defer {
+            defaults.set(savedChat, forKey: ChatViewConfig.enabledKey)
+            AIService.optOutStore.set(savedOptOut, forKey: AIService.optOutAllAIKey)
+            if gateWasActive { gate.openGate() } else { gate.closeGate() }
+        }
+        defaults.set(on, forKey: ChatViewConfig.enabledKey)
+        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+        gate.openGate()
+        try await body()
+    }
+
     // MARK: - Fixture
 
     private func fixture() throws -> Fixture {
@@ -286,17 +379,31 @@ struct ChatNewThreadScreenTests {
         try await fixture.pool.read { db in try Draft.fetchCount(db) }
     }
 
-    /// A saved new email's draft to nobody yet, as the chat wrote it earlier; with
-    /// `unreadableAttachment`, its row names an attachments directory that was never written.
-    private func savedDraft(_ fixture: Fixture, body: String, unreadableAttachment: Bool = false) async throws -> Draft {
+    private static let menu = DraftAttachment(filename: "menu.pdf", mimeType: "application/pdf", data: Data([4, 5, 6]))
+
+    /// A saved new email's draft to nobody yet, as the chat wrote it earlier, with `attachment`
+    /// stored in its own directory; with `unreadableAttachment`, its row names an attachments
+    /// directory that was never written. `id` gives another key (a draft compose wrote).
+    private func savedDraft(
+        _ fixture: Fixture, body: String, id: String = Draft.newEmailKey(),
+        attachment: DraftAttachment? = nil, unreadableAttachment: Bool = false
+    ) async throws -> Draft {
         let updatedAt = Date().addingTimeInterval(-60).timeIntervalSince1970
+        var dirName: String?
+        if let attachment {
+            let name = DraftAttachmentStorage.newStagingDirName()
+            try DraftAttachmentStorage.saveAttachments([attachment], dirName: name)
+            dirName = name
+        } else if unreadableAttachment {
+            dirName = DraftAttachmentStorage.newStagingDirName()
+        }
         var draft = Draft(
-            id: Draft.newEmailKey(), accountId: Self.accountId,
+            id: id, accountId: Self.accountId,
             toJSON: Draft.encodeStringArray([]), ccJSON: Draft.encodeStringArray([]),
             bccJSON: Draft.encodeStringArray([]), subject: "", body: body, replyToId: nil,
             isForward: false, editHistoryJSON: nil, createdAt: updatedAt, updatedAt: updatedAt,
             serverDraftId: nil, serverPushStatus: nil, rfc822MessageId: nil,
-            attachmentsDirName: unreadableAttachment ? DraftAttachmentStorage.newStagingDirName() : nil)
+            attachmentsDirName: dirName)
         draft.instanceEpoch = Self.generation
         let toInsert = draft
         try await fixture.pool.write { db in try toInsert.insert(db) }

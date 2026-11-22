@@ -1286,7 +1286,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      saving" or "Stay". Back replaces the system Back, so the edge swipe back is off in this chat.
      The screen closing any other way (on iPad, another mailbox picked while it is open replaces the
      list it sits on) saves the draft the same way, unless "Leave without saving" was chosen; a
-     refusal there is only logged, as the screen is gone (2026-11-22). The camera's cover does not
+     refusal there is only logged, as the screen is gone (2026-11-22; a known gap, ios#1227: a file
+     the store would refuse is to be refused when picked). The camera's cover does not
      close it. While the chat is open its draft is exempt from eviction (`DraftSessionRegistry`),
      given back only once the closing save is done.
    - *Reopening.* A `chat-new:` draft opened from any path while the chat view is on reopens as its
@@ -1314,8 +1315,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      - The undo toast follows the chat's rule for every send: it is hidden only for a send that has
        a Sending bubble, so a new email sent from this chat shows its bubble, not the toast.
    Tests: `ChatNewThreadTests` (routing, the pure decisions, the saves against a real database, the
-   reopen route, the source wiring), `ComposeDraftSaveTests` (the shared writer against a real
-   database), `DraftAttachmentImportTests`.
+   reopen route, the source wiring), `ChatNewThreadScreenTests` (the whole screen hosted: Back,
+   background, closing, the camera's cover, the alerts), `ComposeDraftSaveTests` (the shared writer
+   against a real database), `DraftAttachmentImportTests`.
 
 ## The longer index line (routed 2026-11-09)
 

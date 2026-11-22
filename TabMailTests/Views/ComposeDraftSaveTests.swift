@@ -49,6 +49,11 @@ struct ComposeDraftSaveTests {
         FileManager.default.fileExists(atPath: DraftAttachmentStorage.dirURL(for: name).path)
     }
 
+    /// Every folder in the attachment store, staged or live.
+    private static func attachmentFolders() -> Set<String> {
+        Set((try? FileManager.default.contentsOfDirectory(atPath: DraftAttachmentStorage.baseDir.path)) ?? [])
+    }
+
     private static let oldFile = DraftAttachment(filename: "old.pdf", mimeType: "application/pdf", data: Data([1, 2, 3]))
     private static let newFile = DraftAttachment(filename: "new.txt", mimeType: "text/plain", data: Data([7, 8, 9]))
 
@@ -273,6 +278,45 @@ struct ComposeDraftSaveTests {
         #expect(after.attachmentsDirName == liveDir)
         #expect(after.editHistoryJSON == Self.history)
         #expect(liveData == [Self.oldFile.data], "the live files are untouched")
+    }
+
+    @Test("The real row read failing in the database is a failed read too: nothing asked, admitted or staged, the row and its files as they were")
+    func productionReadFailureWritesNothing() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let id = "compose-production-read-failed"
+        let earlier = try await earlierRow(fixture, id: id)
+        let liveDir = try #require(earlier.attachmentsDirName)
+        let foldersBefore = Self.attachmentFolders()
+        let table = Draft.databaseTableName
+        let hidden = "\(table)_hidden_by_test"
+        try await fixture.pool.write { db in try db.execute(sql: "ALTER TABLE \(table) RENAME TO \(hidden)") }
+        var asked = 0
+        var admitted = 0
+        // The production read (`ComposeDraftSave.readRow`): no read is passed.
+        let outcome = await ComposeDraftSave.run(
+            draftId: id, accountId: Self.accountId, attachments: [Self.newFile], now: Date().timeIntervalSince1970,
+            fields: { _ in
+                asked += 1
+                return Self.fields()
+            },
+            admit: { draft in
+                admitted += 1
+                return try await DraftStore.shared.saveAsync(draft, epoch: Self.generation, expectedPredecessor: Self.generation)
+            })
+        try await fixture.pool.write { db in try db.execute(sql: "ALTER TABLE \(hidden) RENAME TO \(table)") }
+        let afterRow = try await row(fixture, id)
+        let after = try #require(afterRow)
+        let live = try DraftAttachmentStorage.loadAttachments(dirName: liveDir)
+        let liveData = live.map(\.data)
+        #expect(outcome == .readFailed, "a read the database refused is not an absent row")
+        #expect(asked == 0)
+        #expect(admitted == 0)
+        #expect(after.body == "Old words")
+        #expect(after.updatedAt == earlier.updatedAt)
+        #expect(after.attachmentsDirName == liveDir)
+        #expect(liveData == [Self.oldFile.data])
+        #expect(Self.attachmentFolders() == foldersBefore, "no staging folder is left behind")
     }
 
     @Test("A save another editor's generation refuses is a failed save: the row and files stay as they were")

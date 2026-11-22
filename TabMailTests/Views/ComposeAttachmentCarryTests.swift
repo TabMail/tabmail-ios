@@ -255,6 +255,19 @@ struct ComposeAttachmentCarryTests {
         }
         #expect(!body.contains("DraftAttachmentStorage.saveAttachments"), "compose writes only through the shared writer")
         #expect(!chat.contains("DraftAttachmentStorage.saveAttachments"), "the chat writes only through the shared writer")
+        // Every way Save can fail tells the user, and stops there; a refused queue admission keeps
+        // the compose open with its own message.
+        let flat = body.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let failures = [
+            "case .readFailed: sendError = \"Couldn't save this draft — the database was busy. Try again in a moment.\" return",
+            "case .attachmentsNotStaged(let reason): sendError = \"Failed to save attachments: \\(reason)\" return",
+            "case .saveFailed(let reason): sendError = \"Failed to save draft: \\(reason)\" return",
+            "case .superseded: sendError = \"Failed to save draft: \\(DraftStore.DraftEpochAdmissionError.staleOrReserved.localizedDescription)\" return",
+            "onAdmissionFailure: { sendError = \"This draft couldn't be saved to your Drafts folder. Your message is still here — tap Save to try again.\" })",
+        ]
+        for failure in failures {
+            #expect(flat.contains(failure), "compose's Save keeps this failure's message and stop: \(failure)")
+        }
     }
 
     @Test("Photos-picker work joins the same attachment completion boundary")
@@ -281,6 +294,8 @@ struct ComposeAttachmentCarryTests {
         #expect(body.contains("existingCount: { attachments.count },"), "a picked item is named by the attachments already there")
         #expect(body.contains("add: { attachments.append($0) },"), "every item that loads is added to the compose")
         #expect(body.contains("fail: { recordAttachmentPreparationFailure($0) },"), "every item that does not load is surfaced")
+        #expect(body.contains("attachmentCarryGate.completeOne(succeeded: succeeded)"),
+                "each item settles the gate with its own result, so a failed pick holds Save until it is seen")
     }
 
     @Test("File and camera attachment preparation failures are surfaced")
