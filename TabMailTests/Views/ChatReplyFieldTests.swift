@@ -857,6 +857,19 @@ struct ChatReplyFieldTests {
         #expect(compose.prefillSubject == ThreadUtils.replySubject(for: email.subject))
     }
 
+    @Test("The AI Suggestion's card carries the whole suggestion the chat shows: its email, its text version and its change command")
+    func readyCardCarriesTheWholeSuggestion() {
+        let email = Self.groupEmail()
+        let shown = ReplyResult(body: "Hi Alex,\n\nTuesday works.", textMessage: "Tuesday works", changeCommand: "make it shorter")
+        let ready = ChatReadyReply(message: email, suggestion: shown, accounts: [Self.me])
+        #expect(ready.suggestion == shown, "control: the ready reply holds the suggestion as shown")
+        let compose = ready.compose.composeView(
+            replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: .chat, onAgentOutcome: { _ in })
+        // An edit in the card starts from this value and is stored only over it, so a part missing
+        // (its change command) would make the card's edit differ from what is stored.
+        #expect(compose.suggestion == shown, "the card opens on the suggestion as shown: \(String(describing: compose.suggestion))")
+    }
+
     /// The reply request the AI reply tool opens for `arguments`, on an email from
     /// sender@example.com to the user (test@example.com) and team@example.com.
     private static func agentReplyRequest(

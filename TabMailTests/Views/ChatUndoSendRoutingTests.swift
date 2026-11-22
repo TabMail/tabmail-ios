@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import os
 import SwiftUI
 import Testing
 import UIKit
@@ -36,6 +37,12 @@ import UIKit
 ///     on at Send and the toast's with it off.
 ///  1e. A compose keeps the origin it opened with: built again with another while open (a chat
 ///     whose emails changed), its send's Undo goes where the first origin puts it.
+///  1f. The agent's cards the inbox and the email's screen open, about the chat's own email (a
+///     reply on the agent's words, a reply on the stored AI Suggestion, a Forward), sent with the
+///     chat view on, show the toast's Undo, their one Undo: no chat opened them.
+///  1g. The reply card the chat's field asked for: its request hears its send once, the field's sent
+///     words go and the answer hands nothing back; the bubble's Undo and the send again from the
+///     compose it reopens tell the request nothing more and keep the words typed since.
 ///  2. Drawn: the solid blue rises from the bottom edge, inside the bubble's shape; in light mode the
 ///     text is the pending text colour over the tint and white over the solid; under Reduce Motion
 ///     there is no rising fill; a mounted bubble drops its Undo when its deadline passes.
@@ -338,9 +345,10 @@ struct ChatUndoSendRoutingTests {
         var description: String { "bubble \(bubble), toast \(toast)" }
     }
 
-    /// The chat of `fixture.parent` as the app shows it, with RootView's toast presenter
-    /// (`PendingSendToastPresenter`, its mounting fenced in `ChatUndoSendTests.rootViewWiring`) over it.
-    @MainActor private struct MountedChat {
+    /// A screen as the app shows it (the chat of `fixture.parent`, or another screen that opens the
+    /// agent's cards), with RootView's toast presenter (`PendingSendToastPresenter`, its mounting
+    /// fenced in `ChatUndoSendTests.rootViewWiring`) over it.
+    @MainActor private struct MountedScreen {
         let hosted: Hosted
         var controller: UIViewController { hosted.controller }
 
@@ -386,10 +394,19 @@ struct ChatUndoSendRoutingTests {
         #expect(abs(held - queuedHold) < 1, "\(note): the hold Send gave it (\(held) s)")
     }
 
-    /// Mounts the chat, waits until it shows its email, and runs `body`; then closes it and waits for
-    /// the compose it opened to report itself gone. The shared AI queue and compose queue are given
-    /// back on every exit: a failed mount and a cancelled wait included.
-    private static func withMountedChat(_ fixture: Fixture, _ body: @MainActor (MountedChat) async throws -> Void) async throws {
+    /// Mounts the chat, waits until it shows its email, and runs `body` (`withMounted`).
+    private static func withMountedChat(_ fixture: Fixture, _ body: @MainActor (MountedScreen) async throws -> Void) async throws {
+        try await withMounted(
+            NavigationStack { ChatThreadView(messageId: fixture.parent.id) }, showing: Self.parentText, fixture, body)
+    }
+
+    /// Mounts `root` with RootView's toast presenter over it, waits until it shows `text`, and runs
+    /// `body`; then closes it and waits for the compose it opened to report itself gone. The shared
+    /// AI queue and compose queue are given back on every exit: a failed mount and a cancelled wait
+    /// included.
+    private static func withMounted(
+        _ root: some View, showing text: String, _ fixture: Fixture, _ body: @MainActor (MountedScreen) async throws -> Void
+    ) async throws {
         let queue = ActiveAIQueue.shared
         let router = AgentToolRouter.shared
         await queue.setDispatchSuppressedForTesting(true)
@@ -410,15 +427,13 @@ struct ChatUndoSendRoutingTests {
             await queue.clearForTesting()
             router.resetComposeQueueForTesting()
             router.pendingCompose = nil
-            let mounted = try Self.host(
-                NavigationStack { ChatThreadView(messageId: fixture.parent.id) }.modifier(PendingSendToastPresenter()),
-                fixture: fixture)
+            let mounted = try Self.host(root.modifier(PendingSendToastPresenter()), fixture: fixture)
             hosted = mounted
-            let chat = MountedChat(hosted: mounted)
-            func showsItsEmail() -> Bool { HostedAccessibility.labels(in: chat.controller.view).contains { $0.contains(Self.parentText) } }
+            let screen = MountedScreen(hosted: mounted)
+            func showsItsEmail() -> Bool { HostedAccessibility.labels(in: screen.controller.view).contains { $0.contains(text) } }
             for _ in 0..<80 where !showsItsEmail() { try await Task.sleep(for: .milliseconds(100)) }
-            #expect(showsItsEmail(), "control: the chat shows its email")
-            try await body(chat)
+            #expect(showsItsEmail(), "control: the screen shows its email")
+            try await body(screen)
         } catch {
             await restore(hosted)
             throw error
@@ -426,10 +441,14 @@ struct ChatUndoSendRoutingTests {
         await restore(hosted)
     }
 
-    /// The agent opens a card from the chat, as its reply and forward tools do.
-    private static func openAgentCard(_ mode: AgentToolRouter.ComposeRequest.Mode, for email: MessageHeader, body: String?) {
+    /// The agent opens a card on the screen showing, as its reply and forward tools do: on `body`, or
+    /// a reply on the stored AI Suggestion (`suggestion`, no words of its own).
+    private static func openAgentCard(
+        _ mode: AgentToolRouter.ComposeRequest.Mode, for email: MessageHeader, body: String?, suggestion: ReplyResult? = nil
+    ) {
         AgentToolRouter.shared.enqueueCompose(AgentToolRouter.ComposeRequest(
-            mode: mode, replyTo: email, to: ["someone@example.com"], cc: [], bcc: [], subject: nil, body: body))
+            mode: mode, replyTo: email, to: ["someone@example.com"], cc: [], bcc: [], subject: nil, body: body,
+            suggestion: suggestion))
     }
 
     /// The test, not the clock, ends the bubble's window (its row's durable deadline).
@@ -657,6 +676,156 @@ struct ChatUndoSendRoutingTests {
             #expect(row.inReplyTo != nil, "control: a reply to the chat's email")
             let owner = PendingSendService.shared.undoOwner(for: row.id)
             #expect(owner == (openedOnTheChat ? .bubble : .toast), "the origin it opened with decided")
+        }
+    }
+
+    // MARK: - 1f. The agent's cards on the other screens
+
+    /// A screen other than the chat that opens the agent's cards.
+    enum OtherScreen: CaseIterable, CustomTestStringConvertible {
+        case inbox, emailScreen
+        var testDescription: String { "\(self)" }
+    }
+
+    /// An agent's card about the chat's email: a reply on the agent's words, a reply opened on the
+    /// stored AI Suggestion (no words of its own), and a Forward.
+    enum OtherScreenCard: CaseIterable, CustomTestStringConvertible {
+        case reply, replyOnTheStoredSuggestion, forward
+        var testDescription: String { "\(self)" }
+    }
+
+    /// `screen` as the app shows it: the inbox listing the chat's email, or that email's own screen.
+    private static func otherScreen(_ screen: OtherScreen, _ fixture: Fixture) async throws -> AnyView {
+        switch screen {
+        case .inbox:
+            let accountId = Self.account
+            let found = try await fixture.pool.read { db in
+                try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.inbox.rawValue).fetchOne(db)
+            }
+            let inbox = try #require(found, "control: the account's Inbox")
+            return AnyView(NavigationStack {
+                InboxView(title: "Inbox", folders: [inbox], selection: .unified(.inbox),
+                          selectedMessageId: .constant(nil), pushedMessageId: .constant(nil))
+            })
+        case .emailScreen:
+            return AnyView(NavigationStack { MessageDetailView(messageId: fixture.parent.id) })
+        }
+    }
+
+    @Test("A card the agent opens on the inbox or on the email's screen, sent with the chat view on, shows the toast's Undo, its one Undo: no chat opened it, whatever the card",
+          arguments: OtherScreen.allCases, OtherScreenCard.allCases)
+    func otherScreensAgentCardKeepsTheToast(_ screen: OtherScreen, _ card: OtherScreenCard) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the screen's compose")
+        try await withSendEnvironment { fixture, saved in
+            saved.setChatView(on: true)
+            let root = try await Self.otherScreen(screen, fixture)
+            try await Self.withMounted(root, showing: fixture.parent.subject, fixture) { mounted in
+                // About the chat's email: the same card opened from its chat would record the chat.
+                switch card {
+                case .reply:
+                    Self.openAgentCard(.reply, for: fixture.parent, body: "Tuesday works for me.")
+                case .replyOnTheStoredSuggestion:
+                    Self.openAgentCard(.reply, for: fixture.parent, body: nil, suggestion: Self.readySuggestion)
+                case .forward:
+                    Self.openAgentCard(.forward, for: fixture.parent, body: "Passing this on.")
+                }
+                let row = try await Self.tapSend(in: mounted.controller, presented: true, fixture: fixture)
+                #expect(row.isForward == (card == .forward), "control: the card the agent asked for")
+                let answered = row.inReplyTo.map(EmailFilter.normalizeMessageId)
+                #expect(answered == fixture.parent.rfc822MessageId.map(EmailFilter.normalizeMessageId), "control: about the chat's email")
+                let owner = PendingSendService.shared.undoOwner(for: row.id)
+                #expect(owner == .toast, "no chat opened it: the toast offers its Undo")
+                try await mounted.expectUndosOnItsOwnHold(row, Undos(bubble: 0, toast: 1), "the toast's Undo")
+                try await Self.holdOpen(row, fixture)
+                try await mounted.expectUndos(Undos(bubble: 0, toast: 1), "its one Undo is the toast's")
+            }
+        }
+    }
+
+    // MARK: - 1g. The field's own reply card: its send, then its Undo
+
+    /// The outcomes a compose request heard, in order.
+    @MainActor final class HeardOutcomes {
+        private(set) var names: [String] = []
+
+        func record(_ outcome: ComposeOutcome) {
+            switch outcome {
+            case .sent: names.append("sent")
+            case .cancelled: names.append("cancelled")
+            case let .failed(reason): names.append("failed: \(reason)")
+            }
+        }
+    }
+
+    @Test("The reply card the chat's field asked for, sent with the chat view on: its request hears the send once, and the sent words go and do not come back with the answer; the bubble's Undo and the send again from the compose it reopens tell the request nothing more and keep the words typed since")
+    func fieldCardSendThenUndoKeepsTheFieldsWords() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the chat's compose")
+        try await withSendEnvironment { fixture, saved in
+            saved.setChatView(on: true)
+            let rows = OSAllocatedUnfairLock<[String: String]>(initialState: [:])
+            let store = ChatFieldWords(storage: FieldReplyCardWordsTests.storage(rows))
+            let previous = ChatFieldWords.shared
+            ChatFieldWords.shared = store
+            defer { ChatFieldWords.shared = previous }
+            let key = ChatFieldWords.key(for: fixture.parent)
+            let parent = fixture.parent
+            let heard = HeardOutcomes()
+            let since = "And ask about the slides"
+            var sentRow: OutboxMessage?
+            try await Self.withMountedChat(fixture) { chat in
+                // The user sends words from the chat's reply field; its request opens the field's own
+                // reply card through the router, as the reply tool does.
+                store.apply(.put("Tell her Tuesday works"), to: key)
+                store.apply(.sentFromField, to: key)
+                let fieldReply = ChatFieldReply(email: parent, onlyTo: nil)
+                let request = Task { @MainActor in
+                    await AgentToolRouter.shared.enqueueComposeAndAwaitOutcome(fieldWordsKey: key, isFieldsOwnReply: true) { onOutcome, state in
+                        AgentToolRouter.ComposeRequest(
+                            mode: .reply, replyTo: parent, to: ["sender@example.com"], cc: [], bcc: [], subject: nil,
+                            body: "Tuesday works for me.", fieldReply: fieldReply,
+                            onOutcome: { outcome in
+                                heard.record(outcome)
+                                onOutcome(outcome)
+                            },
+                            outcomeState: state)
+                    }
+                }
+                defer { request.cancel() }
+                let row = try await Self.tapSend(in: chat.controller, presented: true, fixture: fixture)
+                sentRow = row
+                // The test, not the clock, ends the window, so the Undo below is inside it.
+                try await Self.holdOpen(row, fixture)
+                for _ in 0..<50 where heard.names.isEmpty { try await Task.sleep(for: .milliseconds(100)) }
+                #expect(heard.names == ["sent"], "the request hears its card's send: \(heard.names)")
+                let owner = PendingSendService.shared.undoOwner(for: row.id)
+                #expect(owner == .bubble, "control: the chat's own card, its Undo on the bubble")
+                let afterSend = store.fill(for: key).words
+                #expect(afterSend == "", "the card's send carried out the field's words: \(afterSend)")
+                // The agent's answer comes once the card is done: the request was carried out, so
+                // nothing is handed back.
+                store.apply(.answered, to: key)
+                let afterAnswer = store.fill(for: key).words
+                #expect(afterAnswer == "", "the answer hands back nothing already sent: \(afterAnswer)")
+                // The user types more while the send waits.
+                store.apply(.put(since), to: key)
+            }
+            let row = try #require(sentRow, "control: the card sent")
+            // Undo on the bubble, as the chat does (`ChatUnsentReply.undo()`), inside the window.
+            let chatIds = fixture.chatMessageIds
+            let bubbles = try await fixture.pool.read { try ChatUnsentReply.fetch(answering: chatIds, db: $0) }
+            let shown = bubbles.first { $0.id == row.id }
+            let bubble = try #require(shown, "control: the chat shows the reply's bubble")
+            bubble.undo()
+            let reopen = try #require(PendingSendService.shared.reopenSnapshot, "the bubble's Undo reopens the compose")
+            #expect(heard.names == ["sent"], "the Undo tells the request nothing: \(heard.names)")
+            let afterUndo = store.fill(for: key).words
+            #expect(afterUndo == since, "the Undo keeps the words typed since: \(afterUndo)")
+            // Sent again from the compose the Undo reopened: the user's own compose, not the request's.
+            let again = try await Self.send(UndoReopenCompose(snapshot: reopen), fixture: fixture)
+            #expect(PendingSendService.shared.undoOwner(for: again.id) == .toast, "control: that compose is not the chat's")
+            #expect(heard.names == ["sent"], "the send again tells the request nothing: \(heard.names)")
+            let afterResend = store.fill(for: key).words
+            #expect(afterResend == since, "and keeps the words typed since: \(afterResend)")
         }
     }
 
