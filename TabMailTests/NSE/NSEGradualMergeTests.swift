@@ -29,6 +29,9 @@ struct NSEGradualMergeTests {
 
     // MARK: - Harness
 
+    /// The staged message date: one day before the run, never a fixed calendar day.
+    private static let stagedDate = Date().addingTimeInterval(-86_400).timeIntervalSince1970
+
     private func makeAppDatabase() throws -> (dir: URL, pool: DatabasePool, previous: AppDatabase?) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -76,7 +79,7 @@ struct NSEGradualMergeTests {
                         ?, 0, 0, 1)
                 """, arguments: [
                     "acc1:\(messageId)", messageId, "rfc-\(messageId)@example.com",
-                    Double(1_710_000_000), processedAt
+                    Self.stagedDate, processedAt
                 ])
         }
     }

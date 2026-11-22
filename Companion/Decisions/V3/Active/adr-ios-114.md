@@ -201,6 +201,15 @@ same AI result, kept as long as the email itself is shown.
    deleted. A search result whose header no longer carries the Message-ID it found goes to the chat
    or the detail, which refuse a replaced message. The chat screen and the Reply to sheet dismiss
    the keyboard on a tap outside it (`dismissKeyboardOnTap`, the keyboard dismiss rule).
+   *Amended 2026-11-22:* "AI on" also needs the AI choice. The chat view is on only after the AI
+   choice is made with AI on: `ChatViewConfig.isAIOn` reads `AIService.isAIOff`, the one device AI
+   setting (ADR-IOS-038, amendment 2026-11-19), through `AIConsentPolicy.isDisabled(choiceMade:optedOut:)`,
+   and the views that observe the setting (`MessageRowView`, `ChatViewToggleRow`) pass their observed
+   values to the same rule. With no choice yet the app shows today's email view, as for an
+   opted-out user, and sends no AI request. During a tutorial run, which view opens follows the run
+   (`ChatViewConfig.followingTutorial`, decision 13); the first sentence's "and during the tutorial"
+   no longer holds. Tests: `ChatSummaryQueueTests.chatViewWaitsForTheAIChoice`, `ChatViewToggleRowTests`
+   (`switchFollowsAI`, its `noChoice` case; `rowFollowsTheOptOut`).
    `ChatThreadView` reuses `MessageDetailViewModel` (body, thread load, mark-read; at first also
    archive, delete and move from today's pill menus, which the reply field drops, decision 10); `ChatThread` is the pure model: drafts left out, one copy per `stableId` (the opened copy,
    else one with a text message), oldest first by (date, id), own = from one of the account addresses
@@ -562,6 +571,13 @@ same AI result, kept as long as the email itself is shown.
    `ChatReplyCompose.make` checks containment once for every agent reply. Tests:
    `ChatReplyFieldTests.agentReplyThatAddsPeopleIsStillReplyAll`,
    `agentReplyFromTheFieldFollowsTheTarget`, `agentReplyFromTheSheetKeepsItsRecipients`.
+   *Amended 2026-11-22:* containment is judged by mailbox address, read as compose reads its
+   fields (`RecipientEntry`). A `"Name" <address>` recipient counts as its address, compared
+   case-insensitively, wherever it appears (To, Cc, Bcc or several of them). An audience entry with
+   no sendable address counts as its text. Before this, whole strings were compared, so a recipient
+   kept with its name (#1039) did not match the same bare address. Tests:
+   `ChatReplyFieldTests.agentReplyThatMovesSomeoneToCcByNameIsStillReplyAll`,
+   `agentReplyAudienceIsComparedAsComposeReadsIt`.
    **Who a field reply is for travels with its request (2026-11-16, current):** whether a reply was
    asked for in the field, and who was chosen in Reply to, are read once, as the field's send
    starts, and travel with the request (`ChatFieldReply`: `ToolInvocation.fieldReply`, stamped on
@@ -716,6 +732,50 @@ same AI result, kept as long as the email itself is shown.
    unknown role passed the sent and draft check, so Trash took such a row, and an unknown opened
    folder was moved as a user folder. Tests: `MessageDetailThreadActionTests.unknownRoleFailsClosed`,
    `systemFoldersByRoleAcrossAccounts`, `sameNamedFolderInAnotherAccountStays`.
+   *Amended 2026-11-21:* the snapshot fixes which rows an action takes and their folder; it is not
+   the source of the action tag that Undo restores. One read when the action starts takes the folder
+   roles and the stored rows together (`MessageDetailViewModel.lookupChatRows`, which replaces
+   `lookupFolderRoles` for the actions; a failed read still moves nothing). An email the store does
+   not hold yet (a notification opened it while its row is still staged) is taken from the staged
+   rows, with the projection the move's resolver uses (`AccountManager.stagedHeadersForAction`).
+   `lookupChatRows` reads the staged rows before the store, and a stored row wins, so an email the
+   merge stores and unstages during that read is in one of them. The move's own resolver
+   (`AccountManager.resolveHeadersForAction`, which takes the same staged projection) keeps its
+   order (store, then the staged rows for the ids the store lacks): it serves every action, so a
+   change to its order belongs in its own change with outcome tests for every caller (tabmail-ios
+   #1149; until then a whole-chat move during the opened email's promotion can leave that email in
+   place, which is no regression: the move's resolver had the same window before this change). A
+   row neither stored nor staged is not taken, since there
+   is no row to move or restore. Each moved row's undo entry records its folder as the chat holds it
+   (the visible location is the undo source) and its action tag and sort order as read, with a
+   pending tag change on top (`AccountManager.overlayAdjustedSnapshot(_:in:)`). The overlay snapshot
+   is taken before the rows are read, so a pending tag whose write lands and whose overlay entry
+   retires during the read is in one of them; both come before the action's own overlay writes.
+   The rule is the same for every row: the opened email, the shown emails and the hidden copies.
+   Before, the tag came from the chat's rows, which can hold an older tag (a row change waits for
+   its display turn or for a freeze to end, a writer posts no per-row change, and a hidden copy is
+   never refreshed), so Undo wrote the older tag back. Hidden copies are still not refreshed on a
+   row change: no writer that posts a per-row change moves a row to another folder (they write AI
+   fields, tags, read, flag or replied state), so a copy's folder stays as the thread load read it,
+   and the next load reads it again. The notification merge's timing is unchanged (ADR-IOS-047: the
+   first pass stores the header without AI fields, the second pass writes the tag, and its
+   `queueSetTagPendingOp` creates the tag's local queue record, settled locally, not a provider
+   write), and Undo writes its recorded pair as before (`AccountManager.undoMove`). So an action
+   between the two passes records the stored "no tag": an Undo before the second pass ends tagged
+   when that pass runs, and an Undo after it brings the email back untagged until the AI tags it
+   again (tabmail-ios #1153: Undo to refill a missing tag from the AI cache, as every other move
+   into the Inbox does; #1154: the second pass can tag a row archived between the passes, cleared
+   by the next sync). Tests (`MessageDetailThreadActionTests`): `archiveUndoKeepsTheLatestTag`,
+   `archiveDuringASwipeRecordsTheLatestTag`, `archiveWhileARefreshWaitsRecordsTheLatestTag`,
+   `archiveAfterAnUnpostedTagWriteRecordsTheStoredTag`, `archiveRecordsAPendingTagChange`,
+   `archiveRecordsAPendingTagClear`, `archiveRecordsAPendingNoneTag`,
+   `archiveRecordsATagThatLandsDuringItsRead`, `trashAndMoveRecordTheStoredTagOnEveryRow`,
+   `trashAndMoveRecordTheStoredTagOnFiledRows`, `archiveRecordsTheFolderTheChatHolds`,
+   `archiveTakesAStagedOpener`, `archiveTakesTheStoredRowOverItsStagedCopy`,
+   `archiveTakesAStoredRowWithNoTagOverItsTaggedStagedCopy`, `resolverTakesStoredAndStagedRowsInTheOrderAsked`,
+   `archiveLeavesOutARowNoLongerStored`, `unreadableRowsMoveNothing`,
+   `archiveRecordsTheStoredTagInEveryAccount`. Related, not changed here: a manual tag write after
+   a mailbox reset between its resolve and its write (tabmail-ios #1150).
    *Amended 2026-11-15:* "Unread from here" and "Read up to here" change, with each email they
    target, its copies from the same snapshot (`MessageDetailViewModel.setRead`: the
    `threadCopies` rows that `excludeCopies` left out under that email's Message-ID), each by its
@@ -751,6 +811,16 @@ same AI result, kept as long as the email itself is shown.
    switch; the edit is "Make it shorter"; the template is "Event RSVP: yes"; compose keeps its Use
    Suggestion step; no attachment chip is seeded for the agenda; the Reply tag opens the chat in
    general, not only in the tutorial.
+   *Amended 2026-11-22:* the tour reads only the opt-out (`TutorialCoordinator.chatViewOnForTutorial`,
+   with Chat View on), not the AI choice, so a tour started before the AI choice teaches the chat
+   view. It is a scripted demo that sends no AI request and touches no mail of the user's. While a
+   run is active, four things follow the run's `teachesChat` through one gate,
+   `ChatViewConfig.followingTutorial`: which view opens (`opensInChat`), the summary at Send
+   (`SentEmailSummary.mayRun`, through `opensInChat`), the inbox rows
+   (`MessageRowView.chatViewActive`) and the Enable Chat View switch (`ChatViewToggleRow`). Outside
+   a run they follow the live setting. The tour never records an AI choice. Tests:
+   `TutorialChatViewRunTests` (`runBeforeTheAIChoice`, `openBeforeTheAIChoice`,
+   `classicRunStaysClassic`, `summaryAtSendFollowsTheRun`).
 
 14. **One TabMail chat per thread (amendment 2026-11-16).** An email's TabMail chat belongs to its
    thread, with the chat view on or off. Decided 2026-11-16: "per-mail chat sessions now should be

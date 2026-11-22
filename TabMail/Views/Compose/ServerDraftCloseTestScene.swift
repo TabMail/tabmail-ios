@@ -122,6 +122,7 @@ struct ServerDraftCloseTestScene: View {
                         var folder = Folder(name: path, path: path, role: role, accountId: accountID)
                         folder.totalCount = role == .drafts ? 1 : 0
                         try folder.save(db)
+                        try SyncEngine.writeListingCounters(ListingCounters(messageCount: folder.totalCount, uidNext: nil, highestModSeq: nil), folderId: folder.id, db: db)
                     }
                     if deleteFixture {
                         for (draft, header) in deleteRows {

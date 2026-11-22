@@ -310,10 +310,10 @@ struct ChatReplyFieldRuntimeTests {
         let oldGate = DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 }
         AppLogStore.fileURLOverride.withLock { $0 = logDirectory.appendingPathComponent("chat.log") }
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = debugLogging }
-        let savedOptOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
-        AIService.writeOptOutFlag(false)
+        let restoreAISetting = AITestSetting.save()
+        AITestSetting.set(aiOff: false)
         defer {
-            AIService.optOutStore.set(savedOptOut, forKey: AIService.optOutAllAIKey)
+            restoreAISetting()
             AppLogStore.fileURLOverride.withLock { $0 = oldURL }
             DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = oldGate }
             try? FileManager.default.removeItem(at: logDirectory)

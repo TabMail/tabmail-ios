@@ -71,10 +71,7 @@ struct ChatSummaryExecutionTests {
     }
 
     static func withAIOn<T>(_ body: () async throws -> T) async rethrows -> T {
-        let saved = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
-        AIService.writeOptOutFlag(false)
-        defer { AIService.optOutStore.set(saved, forKey: AIService.optOutAllAIKey) }
-        return try await body()
+        try await AITestSetting.with(aiOff: false, body)
     }
 
     /// Indexes `header` in the search index, with `body` when given; `nil` leaves it without one.
@@ -517,19 +514,23 @@ struct ChatSummaryExecutionTests {
             return .parked { gate.wait(); return Self.finalEvent("Done.") }
         }
         let backend = BackendClient(llmSession: http.session)
-        let held = (0..<slots).map { _ in
-            Task {
-                _ = try? await backend.sendCompletions(CompletionsRequest(
-                    messages: [CompletionsMessage(role: "system", content: background, vars: [:])],
-                    client_timezone: nil, disable_tools: true))
-            }
-        }
-        #expect(await Self.eventually { http.recordedCalls().count == slots }, "every slot is held")
         func textMessage() async -> String? {
             try? await pool.read { try MessageHeader.fetchOne($0, key: row.id) }?.summaryTextMessage
         }
 
         try await Self.withAIOn {
+            // The holders are real AI requests, so they are sent with AI on, as the app sends them:
+            // with AI off each one is refused before it reaches the backend and holds no slot.
+            let held = (0..<slots).map { _ in
+                Task {
+                    _ = try? await backend.sendCompletions(CompletionsRequest(
+                        messages: [CompletionsMessage(role: "system", content: background, vars: [:])],
+                        client_timezone: nil, disable_tools: true))
+                }
+            }
+            let allHeld = await Self.eventually { http.recordedCalls().count == slots }
+            #expect(allHeld, "every slot is held")
+
             let service = AIService(backendClient: backend, peerProbe: { _ in nil })
             let queue = ActiveAIQueue()
             await queue.setDispatchSuppressedForTesting(true)

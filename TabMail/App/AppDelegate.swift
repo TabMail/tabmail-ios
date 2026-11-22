@@ -310,9 +310,25 @@ enum NotificationActionRouter {
         }
     }
 
-    static func execute(actionId: String, messageId: String, accountId: String) async {
+    /// `notifiedObservedUidValidity` — the UIDVALIDITY the notification's UID
+    /// was observed under (`EmailNotificationBuilder.observedUidValidityUserInfoKey`).
+    /// The tap can come days after delivery, and by then the resolve returns
+    /// whatever occupies that UID, so a witness captured from the resolved row
+    /// cannot refuse an impostor (`IOS-NOTIFY-001` interval 1). The notified
+    /// epoch can: a resolved row whose proven epoch differs was re-seated by a
+    /// UIDVALIDITY turnover and is not the notified message.
+    static func execute(
+        actionId: String, messageId: String, accountId: String,
+        notifiedObservedUidValidity: Int? = nil
+    ) async {
         switch await resolveAfterMerge(messageId: messageId, accountId: accountId) {
         case .found(let header):
+            if let notified = ExpectedMessageIdentity(
+                capturedRfc822MessageId: nil, capturedObservedUidValidity: notifiedObservedUidValidity),
+               !notified.matches(header) {
+                log("[NotificationActionRouter] \(actionId) refused for \(messageId): the row at that UID was re-seated under a different UIDVALIDITY (C3)")
+                return
+            }
             switch actionId {
             case "MARK_READ":
                 await AccountManager.shared.markRead([header])
@@ -369,7 +385,8 @@ enum NotificationActionRouter {
             // correctly-shaped PendingOperation so sync reconciles local state
             // when the message arrives. See the enum doc for the epoch guard.
             await queueColdPendingOperation(
-                actionId: actionId, messageId: messageId, accountId: accountId, source: .canonicalInbox
+                actionId: actionId, messageId: messageId, accountId: accountId, source: .canonicalInbox,
+                notifiedObservedUidValidity: notifiedObservedUidValidity
             )
         case .readFailed(let stagedHeader):
             // A database read failure is uncertainty, never proof of absence:
@@ -387,9 +404,25 @@ enum NotificationActionRouter {
             }
             log("[NotificationActionRouter] durable lookup unresolved (read failure) — retaining \(actionId) for \(messageId)")
             await queueColdPendingOperation(
-                actionId: actionId, messageId: messageId, accountId: accountId, source: source
+                actionId: actionId, messageId: messageId, accountId: accountId, source: source,
+                notifiedObservedUidValidity: notifiedObservedUidValidity
             )
         }
+    }
+
+    /// A cold op stamps the folder's CURRENT epoch onto the notification's bare
+    /// UID. When the notification recorded the epoch it observed that UID under
+    /// and the folder has since moved to a different one, the UID now numbers
+    /// a different message; stamping the fresh epoch would let the drain
+    /// execute against it (C3). False refuses the op. No notified epoch keeps
+    /// today's behaviour.
+    private static func coldAddressStillInNotifiedEpoch(
+        _ notifiedObservedUidValidity: Int?, accountId: String, folderPath: String, db: Database
+    ) throws -> Bool {
+        guard let notified = notifiedObservedUidValidity, notified > 0 else { return true }
+        guard let live = try AccountManager.admissionEpochForNewGesture(
+            accountId: accountId, folderPath: folderPath, db: db) else { return true }
+        return live == notified
     }
 
     /// Durable fallback and retention path: no durable OR staged header could
@@ -403,7 +436,8 @@ enum NotificationActionRouter {
         actionId: String,
         messageId: String,
         accountId: String,
-        source: ColdSourceScope
+        source: ColdSourceScope,
+        notifiedObservedUidValidity: Int?
     ) async {
         do {
             let folders = try await AppDatabase.dbPool.read { db in
@@ -431,6 +465,9 @@ enum NotificationActionRouter {
                     // exactly the shape an unknown epoch can misresolve.
                     guard try !AccountManager.newGestureRefusedForUnknownEpoch(
                         accountId: accountId, folderPath: inboxPath, db: db) else { return false }
+                    guard try coldAddressStillInNotifiedEpoch(
+                        notifiedObservedUidValidity, accountId: accountId, folderPath: inboxPath, db: db)
+                    else { return false }
                     // 🚨 RECORD THE EPOCH THE GUARD ABOVE JUST PROVED (audit A-1).
                     // Read in THIS transaction so the stamp and the row observe one
                     // consistent epoch. Omitting it made the insert self-refuting:
@@ -446,7 +483,7 @@ enum NotificationActionRouter {
                     try markReadOp.insert(db)
                     return true
                 }
-                log("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") markRead PendingOperation for \(messageId)")
+                log("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch, or the notified UID's epoch is gone)") markRead PendingOperation for \(messageId)")
             case "ARCHIVE", "DELETE":
                 let role: FolderRole = actionId == "ARCHIVE" ? .archive : .trash
                 guard let destinationPath = folders.first(where: { $0.role == role })?.path else {
@@ -457,6 +494,9 @@ enum NotificationActionRouter {
                     // T1.3 — see the MARK_READ arm above. Source-scoped.
                     guard try !AccountManager.newGestureRefusedForUnknownEpoch(
                         accountId: accountId, folderPath: inboxPath, db: db) else { return false }
+                    guard try coldAddressStillInNotifiedEpoch(
+                        notifiedObservedUidValidity, accountId: accountId, folderPath: inboxPath, db: db)
+                    else { return false }
                     // Record the proven epoch — see the MARK_READ arm (audit A-1).
                     var moveOp = try PendingOperation(
                         type: .move, messageIds: [messageId], accountId: accountId,
@@ -466,7 +506,7 @@ enum NotificationActionRouter {
                     try moveOp.insert(db)
                     return true
                 }
-                log("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch)") \(actionId) (.move) PendingOperation for \(messageId)")
+                log("[NotificationActionRouter] header not local — \(admitted ? "queued" : "REFUSED (unknown folder epoch, or the notified UID's epoch is gone)") \(actionId) (.move) PendingOperation for \(messageId)")
             default:
                 break
             }
@@ -487,7 +527,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     private let readinessHook: (@MainActor @Sendable () async -> Bool)?
     private var foregroundMergeHook: (@MainActor @Sendable () async -> Void)?
     private var foregroundSyncHook: (@MainActor @Sendable () async -> Void)?
-    private let actionHook: (@MainActor @Sendable (String, String, String) async -> Void)?
+    private let actionHook: (@MainActor @Sendable (String, String, String, Int?) async -> Void)?
 
     override init() {
         readinessHook = nil
@@ -497,7 +537,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
     init(
         readiness: @escaping @MainActor @Sendable () async -> Bool,
-        action: @escaping @MainActor @Sendable (String, String, String) async -> Void,
+        action: @escaping @MainActor @Sendable (String, String, String, Int?) async -> Void,
         foregroundMerge: (@MainActor @Sendable () async -> Void)? = nil,
         foregroundSync: (@MainActor @Sendable () async -> Void)? = nil
     ) {
@@ -618,14 +658,17 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         // ObjC completion handler — inherently thread-safe one-shot callback,
         // but not marked @Sendable. Safe to send to main queue.
         nonisolated(unsafe) let finish = completionHandler
+        // The epoch the notified UID was observed under (tabmail-ios #538).
+        let notifiedEpoch = EmailNotificationBuilder.observedUidValidity(from: userInfo)
 
         #if DEBUG
         // Capture immutable Sendable operations, never the nonisolated delegate.
         let ready: @MainActor @Sendable () async -> Bool = readinessHook ?? {
             await AppStartup.shared.awaitLaunchReady(background: true)
         }
-        let execute: @MainActor @Sendable (String, String, String) async -> Void = actionHook ?? {
-            await NotificationActionRouter.execute(actionId: $0, messageId: $1, accountId: $2)
+        let execute: @MainActor @Sendable (String, String, String, Int?) async -> Void = actionHook ?? {
+            await NotificationActionRouter.execute(
+                actionId: $0, messageId: $1, accountId: $2, notifiedObservedUidValidity: $3)
         }
         #endif
 
@@ -673,10 +716,12 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // window; wait for the DB before touching it (AppStartup).
                 #if DEBUG
                 guard await ready() else { return }
-                await execute(actionId, messageId, accountId)
+                await execute(actionId, messageId, accountId, notifiedEpoch)
                 #else
                 guard await AppStartup.shared.awaitLaunchReady(background: true) else { return }
-                await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
+                await NotificationActionRouter.execute(
+                    actionId: actionId, messageId: messageId, accountId: accountId,
+                    notifiedObservedUidValidity: notifiedEpoch)
                 #endif
             }
             return
@@ -700,10 +745,12 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 // the DB before touching it (AppStartup).
                 #if DEBUG
                 guard await ready() else { return }
-                await execute(actionId, messageId, accountId)
+                await execute(actionId, messageId, accountId, notifiedEpoch)
                 #else
                 guard await AppStartup.shared.awaitLaunchReady(background: true) else { return }
-                await NotificationActionRouter.execute(actionId: actionId, messageId: messageId, accountId: accountId)
+                await NotificationActionRouter.execute(
+                    actionId: actionId, messageId: messageId, accountId: accountId,
+                    notifiedObservedUidValidity: notifiedEpoch)
                 #endif
             }
             return
@@ -964,28 +1011,8 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // state mirror live inside `ensureDatabaseReady` (they touch AppDatabase),
         // so they still run on every launch as they did before the splash work.
         Task { _ = await AppStartup.shared.ensureDatabaseReady() }
-        migrateOptOutFlagToSharedSuite()
         BootProfiler.mark("AppDelegate.didFinishLaunching exit (DB build kicked async)")
         return true
-    }
-
-    /// One-time migration: copy the AI privacy opt-out flag from the main
-    /// app's `UserDefaults.standard` (where it used to live) into the shared
-    /// App Group suite (where it now lives so the NSE can read it). Idempotent:
-    /// if the shared suite already has the key, we assume it's authoritative
-    /// and leave it alone. Without this, an existing opt-out user whose flag
-    /// lived only in `.standard` would silently re-enable AI on first launch
-    /// of this version.
-    private func migrateOptOutFlagToSharedSuite() {
-        let key = AIService.optOutAllAIKey
-        let shared = AIService.optOutStore
-        guard shared.object(forKey: key) == nil else { return }
-        if let legacy = UserDefaults.standard.object(forKey: key) as? Bool {
-            shared.set(legacy, forKey: key)
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[AppDelegate] Migrated opt-out flag to shared suite: \(legacy)")
-            }
-        }
     }
 
     private func registerNotificationCategories() {

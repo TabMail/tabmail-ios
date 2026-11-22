@@ -320,3 +320,52 @@ struct EscapedDrainTransportLifetimeTests {
             "\(unattemptedAtBoundary) durable operation(s) had not been attempted at the teardown boundary")
     }
 }
+
+/// **A test scope must not hand the next one a running outbox drain (#1106).**
+///
+/// `AccountManager.drainOutbox` holds `isDrainingOutbox` through
+/// `SyncConfig.outboxMinSendGapSeconds` after its last send, and `queueSend`
+/// starts that drain in an unawaited `Task`. A test that sends with no undo hold
+/// therefore returns while the latch is still held, and the next test's
+/// `reconcileOutbox()` returns WITHOUT reconciling (by design: IOS-OUTBOX-006,
+/// memory 104), so that test fails for a reason unrelated to what it measures.
+///
+/// This waits in the spirit of IOS-TEST-010 (wait on the real condition, with a
+/// limit; no sleep, retry or loosened assertion); this latch is not ours, so a
+/// caller that depends on a reconcile running must also prove it ran (a row
+/// count), which turns a race into a visible failure.
+enum OutboxDrainLatch {
+    enum Config {
+        /// A drain that sent anything holds the latch through one send gap after
+        /// its last send; the limit is that gap with generous headroom.
+        static let waitSeconds: TimeInterval = SyncConfig.outboxMinSendGapSeconds * 5
+        static let pollIntervalMs = 10
+    }
+
+    /// Waits, up to `Config.waitSeconds`, until no outbox drain owns the outbox.
+    /// Returns whether the latch is clear. Stops early if the task is cancelled.
+    static func waitForClear() async -> Bool {
+        let deadline = Date().addingTimeInterval(Config.waitSeconds)
+        while Date() < deadline, !Task.isCancelled {
+            if await !AccountManager.shared.isDrainingOutbox { return true }
+            do {
+                try await Task.sleep(for: .milliseconds(Config.pollIntervalMs))
+            } catch {
+                break
+            }
+        }
+        return await !AccountManager.shared.isDrainingOutbox
+    }
+
+    /// The scope-boundary form: waits for the latch and records an issue if it
+    /// never clears, so a leaked drain is reported where it was left running.
+    static func settleOrRecord() async {
+        if await waitForClear() { return }
+        Issue.record(
+            """
+            An outbox drain still held isDrainingOutbox \(Config.waitSeconds)s after \
+            the test scope ended. The next test's reconcileOutbox() would skip. \
+            Diagnose what keeps the drain running; do not widen this limit.
+            """)
+    }
+}

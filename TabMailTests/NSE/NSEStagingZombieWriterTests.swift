@@ -429,7 +429,8 @@ struct NSEStagingZombieWriterTests {
                 reminderContent: cached?.reminderContent,
                 dueDate: cached?.reminderDate,
                 dueTime: cached?.reminderTime),
-            accountId: Self.accountId, messageId: successor.messageId)
+            accountId: Self.accountId, messageId: successor.messageId,
+            observedUidValidity: successor.observedUidValidity)
         let delivered = [content.title, content.subtitle, content.body].joined(separator: "\u{1}")
         #expect(
             delivered.contains(token) == false,

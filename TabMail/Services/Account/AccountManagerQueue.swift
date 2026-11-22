@@ -114,7 +114,9 @@ extension AccountManager {
                         deferChain(job, reason: reason)
                         continue
                     case .retire(let diagnostic):
-                        _ = try PendingOperation.deleteOne(db, key: job.id)
+                        if let op = try PendingOperation.fetchOne(db, key: job.id) {
+                            try AccountOperationExecutor.deleteRetiringOperation(op, db: db)
+                        }
                         if let diagnostic { BackgroundSyncLogger.log(diagnostic) }
                         continue
                     case .ready:

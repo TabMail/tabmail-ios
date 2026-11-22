@@ -644,6 +644,79 @@ struct UndoDestructiveActionTests {
         let restored = try #require(try await row(fixture, id: member.id))
         #expect(restored.folderPath == "INBOX")
     }
+
+    /// A member built the way the undo stack builds one: from the pre-move
+    /// snapshot at its SOURCE address, then followed to the destination by the
+    /// drain's re-key, which hands it the destination epoch.
+    @MainActor
+    private func stackedWitnessLessMember(
+        _ fixture: Fixture, destinationUid: String
+    ) throws -> UndoMember {
+        try seedDrainedMove(fixture, destinationUid: destinationUid, rfc822: nil)
+        var snapshot = MessageHeader(
+            messageId: "17", subject: "undo \(destinationUid)", from: "Sender",
+            fromAddress: "sender@example.com", to: "undo@example.com", date: Date(),
+            snippet: "body", folderId: "\(fixture.accountId):INBOX",
+            accountId: fixture.accountId, folderPath: "INBOX", isInInbox: true)
+        snapshot.id = "\(fixture.accountId):INBOX:17"
+        snapshot.observedUidValidity = Self.sourceEpoch
+        snapshot.actionTag = .reply
+        snapshot.tagSortOrder = ActionTag.reply.sortOrder
+        var member = UndoMember(header: snapshot)
+        member.rekey(
+            accountId: fixture.accountId,
+            newHeaderId: "\(fixture.accountId):Archive:\(destinationUid)",
+            newProviderMessageId: destinationUid,
+            newObservedUidValidity: Self.destinationEpoch)
+        return member
+    }
+
+    /// tabmail-ios #538. A member with NO usable Message-ID is witnessed by the
+    /// epoch its address was proven under. A UIDVALIDITY turnover that re-seats
+    /// a different message at the same composite id gives that row a different,
+    /// proven epoch, and Undo must not move it (C3).
+    @Test("Undo refuses a witness-less member whose address was re-seated under a different UIDVALIDITY")
+    @MainActor
+    func undoRefusesAWitnessLessMemberReseatedUnderANewEpoch() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        let member = try stackedWitnessLessMember(fixture, destinationUid: "211")
+        let reseatedEpoch = Self.destinationEpoch + 1
+        try await fixture.pool.write { db in
+            try db.execute(
+                sql: "UPDATE folder SET lastKnownUidValidity = ? WHERE id = ?",
+                arguments: [reseatedEpoch, "\(fixture.accountId):Archive"])
+            try db.execute(
+                sql: "UPDATE messageHeader SET observedUidValidity = ? WHERE id = ?",
+                arguments: [reseatedEpoch, member.originalHeaderId])
+        }
+
+        await AccountManager.shared.undoMove(
+            accountId: fixture.accountId, forwardDestinationPath: "Archive", members: [member])
+
+        let ops = try await operations(fixture)
+        #expect(ops.isEmpty, "no inverse may be queued against a message re-seated under a new epoch")
+        let row = try #require(try await self.row(fixture, id: member.originalHeaderId))
+        #expect(row.folderPath == "Archive", "the impostor must not be moved to INBOX")
+    }
+
+    /// Non-vacuity for the test above: the identical stacked member is still
+    /// reversed when its address epoch is unchanged.
+    @Test("A witness-less stacked member whose address epoch is unchanged is still reversed")
+    @MainActor
+    func witnessLessStackedMemberWithItsOwnEpochIsReversed() async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        let member = try stackedWitnessLessMember(fixture, destinationUid: "212")
+
+        await AccountManager.shared.undoMove(
+            accountId: fixture.accountId, forwardDestinationPath: "Archive", members: [member])
+
+        let ops = try await operations(fixture)
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(ops[0].messageIds == ["212"])
+    }
 }
 
 // MARK: - MessageHeader.stableId legacy characterization (non-queue)

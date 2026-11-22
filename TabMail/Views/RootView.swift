@@ -17,13 +17,15 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var hasTabMailSession = ScreenshotMode.isActive || TabMailAuthService.hasSession()
     @AppStorage(AgeAndTermsConsent.completedKey) private var hasCompletedConsentGate = false
-    @AppStorage("hasSeenAIConsent") private var hasSeenAIConsent = false
+    /// The AI choice, in the App Group suite with the opt-out (`AIConsentPolicy`): the
+    /// notification extension reads both.
+    @AppStorage(AIService.aiChoiceMadeKey, store: AIService.optOutStore) private var hasSeenAIConsent = false
+    /// Opt Out of AI, observed so views that show the device's AI setting redraw.
+    @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var aiOptedOut = false
     @AppStorage("hasSeenPushConsent") private var hasSeenPushConsent = false
-    // Demo Mode gate persistence.
-    // Production gates above stay untouched while demo runs.
+    // The demo's own age and terms flag. The AI choice is the device's
+    // (`hasSeenAIConsent` above), in the demo too.
     @AppStorage("demo.hasCompletedConsentGate") private var demoHasCompletedConsentGate = false
-    @AppStorage("demo.hasSeenAIConsent") private var demoHasSeenAIConsent = false
-    @AppStorage("demo.aiEnabled") private var demoAiEnabled = false
     private var tutorial: TutorialCoordinator { TutorialCoordinator.shared }
     /// The first-launch tutorial welcome (`TutorialProgress.markWelcomePending`).
     @State private var showsTutorialWelcome = TutorialProgress().isWelcomePending
@@ -47,7 +49,11 @@ struct RootView: View {
     /// App Store age assurance (`AppStoreAgeCheck`), asked at launch and on
     /// every foreground. `.minor` / `.unconfirmed` cover the whole app.
     @State private var appStoreAge: AppStoreAgeCheck.Status = .notChecked
-    @State private var isCheckingAppStoreAge = false
+    /// Orders the age check and the significant update notice (`AppStoreAgeCheck.Runner`).
+    @State private var appStoreAgeRunner = AppStoreAgeCheck.Runner()
+    /// Set when an earlier significant update notice for this version never
+    /// returned: the banner offers it instead of an unasked call (#1010).
+    @State private var significantUpdateBannerVersion: String?
     @Environment(\.requestAgeRange) private var requestAgeRange
     /// Set while signing out after a failed age check: the person has just
     /// read why, so the generic "Signed Out" alert is not shown on top.
@@ -75,7 +81,7 @@ struct RootView: View {
         // Debug: reset gate flags on every launch so all gate screens show
         if DEBUG_ALWAYS_SHOW_GATES {
             UserDefaults.standard.set(false, forKey: AgeAndTermsConsent.completedKey)
-            UserDefaults.standard.set(false, forKey: "hasSeenAIConsent")
+            AIService.optOutStore.set(false, forKey: AIService.aiChoiceMadeKey)
             UserDefaults.standard.set(false, forKey: "hasSeenPushConsent")
         }
 
@@ -83,7 +89,7 @@ struct RootView: View {
         // The GRDB data is already on disk — show the inbox immediately with cached data.
         // Fresh installs (no DB, no consent) will go through the normal gated flow.
         let onboardingDone = UserDefaults.standard.bool(forKey: AgeAndTermsConsent.completedKey)
-            && UserDefaults.standard.bool(forKey: "hasSeenAIConsent")
+            && AIService.optOutStore.bool(forKey: AIService.aiChoiceMadeKey)
             && UserDefaults.standard.bool(forKey: "hasSeenPushConsent")
             && !DEBUG_ALWAYS_SHOW_GATES
         let isReturningUser = UserDefaults.standard.bool(forKey: "hasLaunchedBefore")
@@ -106,9 +112,10 @@ struct RootView: View {
                 await checkAppStoreAge()
             }
         } else if demoStore.isActive {
-            // Demo mode wins over all other routing. Runs the SAME consent + AI
-            // gates as production but writes to demo-prefixed AppStorage so
-            // production flags survive demo entry/exit untouched. The guided
+            // Demo mode wins over all other routing. Runs the same age and terms
+            // screen as production with its own demo flag, and the AI screen
+            // only while the device has no AI choice; that answer is the
+            // device's AI setting, used by the demo and the app. The guided
             // tutorial skips both: it is scripted and sends nothing anywhere
             // (ADR-IOS-038 amendment 2026-10-21).
             if !demoHasCompletedConsentGate && !tutorial.isRunning {
@@ -117,12 +124,13 @@ struct RootView: View {
                 }, onIneligible: {
                     await DemoModeService.shared.exit()
                 })
-            } else if !demoHasSeenAIConsent && !tutorial.isRunning {
+            } else if !hasSeenAIConsent && !tutorial.isRunning {
                 AIConsentView { aiEnabled in
-                    demoAiEnabled = aiEnabled
-                    // Critical: NEVER write to AIService.optOutAllAIKey here.
-                    // Demo's AI choice lives entirely in demo.aiEnabled.
-                    withAnimation { demoHasSeenAIConsent = true }
+                    // Records the device's AI choice. Nothing is requeued: the
+                    // demo has no real inbox mail held for the choice. Signing
+                    // in on a device with no mail account clears this answer
+                    // (`TabMailAuthService`), so the real AI screen asks again.
+                    withAnimation { AIService.recordAIChoice(aiEnabled: aiEnabled, resume: {}) }
                 }
             } else if !demoSeedingComplete {
                 DemoSeedingSplash()
@@ -169,6 +177,11 @@ struct RootView: View {
                         if let deletionDate = pendingDeletionDate {
                             DeletionBanner(deletionDate: deletionDate) {
                                 await cancelDeletion()
+                            }
+                        }
+                        if let version = significantUpdateBannerVersion {
+                            SignificantUpdateBanner(version: version) {
+                                Task { await openSignificantUpdateNotice() }
                             }
                         }
                         MailNavigationView(initialSelection: nil)
@@ -229,11 +242,10 @@ struct RootView: View {
                 AddAccountGeneralView()
             } else if !hasSeenAIConsent {
                 AIConsentView { aiEnabled in
-                    // Persist the user's AI opt-out decision. Pre-refactor
-                    // the view called `AIService.writeOptOutFlag` internally;
-                    // we moved it here so demo mode can write to its own flag
-                    // instead.
-                    AIService.writeOptOutFlag(!aiEnabled)
+                    // Persist the user's AI choice (the opt-out, then the
+                    // choice itself) and, with AI enabled, queue the inbox
+                    // mail that arrived while this screen was open.
+                    AIService.recordAIChoice(aiEnabled: aiEnabled)
                     // Arm or disarm the plan-picker latch. Every arm writes
                     // an explicit value — the pre-fix code fell through both
                     // arms for an active subscriber with AI enabled, leaving
@@ -261,6 +273,11 @@ struct RootView: View {
                 if let deletionDate = pendingDeletionDate {
                     DeletionBanner(deletionDate: deletionDate) {
                         await cancelDeletion()
+                    }
+                }
+                if let version = significantUpdateBannerVersion {
+                    SignificantUpdateBanner(version: version) {
+                        Task { await openSignificantUpdateNotice() }
                     }
                 }
                 MailNavigationView()
@@ -378,7 +395,7 @@ struct RootView: View {
             // The tutorial's coach cards carry their own Skip, and it makes
             // no AI calls, so it has no allowance to show.
             if demoStore.isActive && demoSeedingComplete && !demoStore.enteredFromDebugMenu && !tutorial.isRunning {
-                DemoBanner(aiEnabled: demoAiEnabled)
+                DemoBanner(aiEnabled: hasSeenAIConsent && !aiOptedOut)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .ignoresSafeArea(.container, edges: .bottom)
             }
@@ -431,7 +448,9 @@ struct RootView: View {
         // Undo-Send reopen: the Outbox cancellation was confirmed and the Draft
         // row remains durable. UndoReopenCompose resolves the snapshot's exact
         // owner/generation authority and binds the fresh ComposeView to that row;
-        // ADR-IOS-065 owns its retained-draft close/save semantics.
+        // `PendingSendService.undo()` already returned that row to Drafts in the
+        // cancellation's own write, or reports that it did not (the compose then
+        // opens as unsaved).
         .fullScreenCover(item: $reopenSnapshot) { snapshot in
             UndoReopenCompose(snapshot: snapshot)
         }
@@ -726,7 +745,8 @@ struct RootView: View {
             withAnimation {
                 hasTabMailSession = false
                 hasCompletedConsentGate = false
-                // AI consent (hasSeenAIConsent) is device-level — not cleared on sign-out.
+                // AI consent (hasSeenAIConsent) is device-level — not cleared on sign-out
+                // (a sign-in on a device with no mail account clears it).
                 // Apple 5.1.2(i) disclosure is about app behavior, not account identity.
                 pendingDeletionDate = nil
                 pendingDeletionRequestId = nil
@@ -946,18 +966,34 @@ struct RootView: View {
     // MARK: - Age Checks
 
     /// Ask the App Store for the person's age (`AppStoreAgeCheck`). A failed
-    /// region lookup (`.notChecked`) keeps the previous answer.
+    /// region lookup (`.notChecked`) keeps the previous answer. A notice that
+    /// never returns does not hold up later age checks (`AppStoreAgeCheck.Runner`).
     private func checkAppStoreAge() async {
-        guard !ScreenshotMode.isActive, !isCheckingAppStoreAge else { return }
-        isCheckingAppStoreAge = true
-        defer { isCheckingAppStoreAge = false }
-        let status = await AppStoreAgeCheck.run(request: requestAgeRange)
-        let shown = AppStoreAgeCheck.shown(previous: appStoreAge, checked: status)
-        if shown != appStoreAge {
-            withAnimation { appStoreAge = shown }
+        guard !ScreenshotMode.isActive else { return }
+        await appStoreAgeRunner.pass(
+            check: { await AppStoreAgeCheck.run(request: requestAgeRange) },
+            apply: { status in
+                let shown = AppStoreAgeCheck.shown(previous: appStoreAge, checked: status)
+                if shown != appStoreAge {
+                    withAnimation { appStoreAge = shown }
+                }
+            },
+            hasStalledNotice: { AppStoreAgeCheck.SignificantUpdate.hasStalledNotice() },
+            acknowledge: { await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate()) }
+        )
+    }
+
+    /// The banner's tap: the person opens Apple's notice themselves.
+    private func openSignificantUpdateNotice() async {
+        await appStoreAgeRunner.acknowledgeOnly {
+            await applySignificantUpdate(AppStoreAgeCheck.acknowledgeSignificantUpdate(userAsked: true))
         }
-        if status == .allowed {
-            await AppStoreAgeCheck.acknowledgeSignificantUpdate()
+    }
+
+    private func applySignificantUpdate(_ outcome: AppStoreAgeCheck.SignificantUpdate.Outcome) {
+        switch outcome {
+        case .none: significantUpdateBannerVersion = nil
+        case .offerBanner(let version): significantUpdateBannerVersion = version
         }
     }
 

@@ -181,6 +181,17 @@ struct UidValidityResetReactionTests {
                           messageIds: ["55"],
                           accountId: accountId, folderPath: "Archive", pool: pool)
 
+        // A change bookmark and re-read list stored under the old numbering.
+        var oldState = FolderChangeState(raw: nil)
+        oldState.tracking = true
+        oldState.recheck = ["102"]
+        let oldCursor = IMAPChangeCursor(uidValidity: UInt32(Self.oldEpoch), highestModSeq: 5, uidNext: 104).encoded
+        let oldEncoded = oldState.encoded
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE folder SET changeCursor = ?, changeState = ? WHERE id = ?",
+                           arguments: [oldCursor, oldEncoded, "\(accountId):INBOX"])
+        }
+
         let provider = Self.imapProvider(for: server)
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
@@ -209,6 +220,12 @@ struct UidValidityResetReactionTests {
                 "the folder was not re-stamped with the epoch its rows now belong to")
         #expect(folder?.uidValidityResetPendingAt == nil,
                 "the folder is still quarantined after a reaction that completed")
+        #expect(folder?.changeCursor == nil && folder?.changeState == nil,
+                """
+                the reset kept the folder's change bookmark or re-read list. Both name the \
+                discarded numbering: the folder would count as tracked and skip its listing, and \
+                a listed id would re-read whichever message the new numbering put at that UID.
+                """)
 
         let remaining = try Self.opIds(pool)
         #expect(remaining.contains("op-identity"),
@@ -490,9 +507,9 @@ struct UidValidityResetReactionTests {
 
         let folder = try #require(try FolderEpochTestFixture.readFolder(
             accountId: accountId, path: "Archive", pool: pool))
-        let result = try await SyncEngine.runSyncMessages(
+        let result = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
 
         #expect(try FolderEpochTestFixture.headerCount(accountId: accountId, path: "Archive", pool: pool) == 3,
                 """
@@ -625,9 +642,9 @@ struct UidValidityResetReactionTests {
 
         let folder = try #require(try FolderEpochTestFixture.readFolder(
             accountId: accountId, path: "Archive", pool: pool))
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
 
         #expect(fired.withLock { $0 } == 0,
                 "a folder whose SELECT reported no epoch was treated as a turnover — that purges healthy folders")
@@ -948,9 +965,9 @@ struct ProviderAddressMergeAuthorityTests {
 
         let folder = try #require(try FolderEpochTestFixture.readFolder(
             accountId: accountId, path: "Archive", pool: pool))
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
 
         let row = try #require(try Self.storedRow(accountId: accountId, path: "Archive", uid: "901", pool: pool))
         #expect(row.rfc822MessageId == "incoming-b@example.com")
@@ -981,9 +998,9 @@ struct ProviderAddressMergeAuthorityTests {
 
         let folder = try #require(try FolderEpochTestFixture.readFolder(
             accountId: accountId, path: "Archive", pool: pool))
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
 
         let row = try #require(try Self.storedRow(accountId: accountId, path: "Archive", uid: "902", pool: pool))
         #expect(row.from == "Incoming Sender" && row.fromAddress == "incoming-sender@example.com",
@@ -1015,9 +1032,9 @@ struct ProviderAddressMergeAuthorityTests {
 
         let folder = try #require(try FolderEpochTestFixture.readFolder(
             accountId: accountId, path: "Archive", pool: pool))
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
 
         let row = try #require(try Self.storedRow(accountId: accountId, path: "Archive", uid: "903", pool: pool))
         #expect(row.rfc822MessageId == "durable-identity@example.com",
@@ -1082,9 +1099,9 @@ struct PreSyncReclaimIdentityKeepTests {
     private static func runInboxSync(accountId: String, mock: MockEmailProvider, pool: DatabasePool) async throws {
         let folder = try #require(try FolderEpochTestFixture.readFolder(
             accountId: accountId, path: "INBOX", pool: pool))
-        _ = try await SyncEngine.runSyncMessages(
+        _ = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool)
+            dbPool: AppDatabase.dbPool).requireResult()
     }
 
     /// 🚨 RED PROOF CASE.

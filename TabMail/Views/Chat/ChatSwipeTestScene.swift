@@ -245,7 +245,9 @@ struct ChatSwipeTestScene: View {
     /// `TutorialChatViewRunTests` starts one.
     private func seedTutorial() async throws {
         UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
-        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+        // A first-launch tour starts before the AI choice: the fixture clears it (another mode may
+        // have recorded one on an earlier launch) and runs that tour, which teaches the chat view.
+        AIConsentPolicy.clearChoice(in: AIService.optOutStore)
         let coordinator = TutorialCoordinator.shared
         await coordinator.start(.reuseReply, hasTabMailSession: false)
         try await DemoModeService.shared.completeSetup()
@@ -273,9 +275,11 @@ struct ChatSwipeTestScene: View {
                 return
             }
             UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
-            // An open goes to the chat only for a subscriber (`MessageOpenView`); the gate persists
-            // across launches, so every mode opens it and runs alike.
+            // An open goes to the chat only for a subscriber with the AI choice made, AI on
+            // (`MessageOpenView`); the gate and the choice persist across launches, so every mode
+            // sets both and runs alike. Nothing is queued for AI (`resume`).
             AISubscriptionGate.shared.openGate()
+            AIService.recordAIChoice(aiEnabled: true, resume: {})
             let accountID = Self.accountID
             let now = Date()
             try await AppDatabase.dbPool.write { db in

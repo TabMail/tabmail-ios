@@ -79,14 +79,15 @@ struct ChangeApplyTests {
 
     static func rfc(_ id: String) -> String { "\(id)-apply@example.com" }
 
-    static func info(_ id: String, isRead: Bool = false, isFlagged: Bool = false, labels: [String] = []) -> MessageHeaderInfo {
+    static func info(_ id: String, isRead: Bool = false, isFlagged: Bool = false, labels: [String] = [],
+                     isReplied: Bool = false, actionTag: ActionTag? = nil) -> MessageHeaderInfo {
         var info = MessageHeaderInfo(
             messageId: id, rfc822MessageId: rfc(id), inReplyTo: nil,
             references: ["parent-\(id)@example.com"], threadId: nil, subject: "apply \(id)", from: "Sender",
             fromAddress: "sender@example.com", to: "recipient@example.com", cc: "", bcc: "", replyTo: nil,
             date: Date().addingTimeInterval(-2 * 86_400), snippet: "apply snippet",
             isRead: isRead, isFlagged: isFlagged, hasAttachments: false,
-            isReplied: false, isForwarded: false, actionTag: nil)
+            isReplied: isReplied, isForwarded: false, actionTag: actionTag)
         info.userLabelIds = labels
         // Both readers send the message's whole label set (#882).
         info.userLabelIdsAreAuthoritative = true
@@ -404,6 +405,62 @@ struct ChangeApplyTests {
         }
     }
 
+    /// Moves the row keyed in INBOX to Archive, as a no-op optimistic move leaves it.
+    static func leaveInArchive(_ w: World, _ messageId: String) throws {
+        let archiveId = w.archiveId
+        let rowId = "\(w.accountId):INBOX:\(messageId)"
+        try w.pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET folderId = ?, folderPath = 'Archive', isInInbox = 0 WHERE id = ?",
+                           arguments: [archiveId, rowId])
+        }
+    }
+
+    @Test("Stable ids: a row left in another folder under this folder's key is taken back by the record for it")
+    func provenOrphanIsReclaimed() async throws {
+        try await Self.withWorld { w in
+            try w.insertRow("o1", in: w.inboxId, path: "INBOX")
+            try Self.leaveInArchive(w, "o1")
+            let inboxId = w.inboxId
+            await w.script([{ _, request in
+                Self.tracked(request, records: [inboxId: [ChangeRecord(header: Self.info("o1", isRead: true))]])
+            }])
+            try await w.pass()
+            let row = try #require(try w.row("o1", in: w.inboxId), "the row is back in INBOX")
+            #expect(row.id == "\(w.accountId):INBOX:o1" && row.isRead)
+            #expect(try w.row("o1", in: w.archiveId) == nil)
+        }
+    }
+
+    @Test("A pending user tag survives a record that would insert or take back the message: nothing is written, the id is read again")
+    func pendingTagSurvivesInsertAndReclaim() async throws {
+        try await Self.withWorld { w in
+            // Reclaim: the user's tag sits on the row left in Archive.
+            try w.insertRow("tg1", in: w.inboxId, path: "INBOX")
+            try Self.leaveInArchive(w, "tg1")
+            let reclaimId = "\(w.accountId):INBOX:tg1"
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ? WHERE id = ?",
+                               arguments: [ActionTag.reply.rawValue, ActionTag.reply.sortOrder, reclaimId])
+            }
+            try w.insertOp(.setTag, ids: ["tg1"], path: "INBOX")
+            // Insert: a new message whose tag the user is changing.
+            try w.insertOp(.setTag, ids: ["tg2"], path: "INBOX")
+            let inboxId = w.inboxId
+            await w.script([{ _, request in
+                Self.tracked(request, records: [inboxId: [
+                    ChangeRecord(header: Self.info("tg1", isReplied: true)),
+                    ChangeRecord(header: Self.info("tg2", isReplied: true, actionTag: .reply)),
+                ]])
+            }])
+            try await w.pass()
+            let kept = try #require(try await w.pool.read { db in try MessageHeader.fetchOne(db, key: reclaimId) })
+            #expect(kept.actionTag == .reply, "the user's tag is kept")
+            #expect(kept.folderPath == "Archive", "the row is not taken back while the tag op is pending")
+            #expect(try w.row("tg2", in: w.inboxId) == nil, "no row is inserted with a tag of its own")
+            #expect(Set(try w.state(w.inboxId).recheck).isSuperset(of: ["tg1", "tg2"]))
+        }
+    }
+
     @Test("An insert kept back under a pending destructive op or a recent completion goes on the re-read list")
     func insertShieldsRecheck() async throws {
         try await Self.withWorld { w in
@@ -441,6 +498,10 @@ struct ChangeApplyTests {
             try w.insertRow("u1", in: w.inboxId, path: "INBOX")
             try w.insertOp(.markRead, ids: ["u1"], path: "Archive")
             let inboxId = w.inboxId
+            // The folder stores the generation the read names (the binding check).
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 7 WHERE id = ?", arguments: [inboxId])
+            }
             await w.script([{ _, request in Self.tracked(request, addressEpoch: 7, removals: [inboxId: ["u1"]]) }])
             try await w.pass()
             #expect(try w.row("u1", in: w.inboxId) == nil, "the same id in another folder is another message")
@@ -661,11 +722,11 @@ struct ChangeApplyTests {
                 return set
             }])
             let outcome = try await w.outcome()
-            #expect(outcome.appliedFolderList != nil)
             let paths = try await w.pool.read { db in
                 Set(try Folder.filter(Column("accountId") == w.accountId).fetchAll(db).map(\.path))
             }
             #expect(paths == ["INBOX", "Archive", "Label_9"])
+            #expect(outcome.fromReader, "the folder list came through the change reader's pass")
         }
     }
 
@@ -675,5 +736,18 @@ struct ChangeApplyTests {
             let outcome = try await w.outcome()
             #expect(outcome.fromReader == false && outcome.succeeded == false)
         }
+    }
+
+    @Test("A change state stored before the self-heal mark reads back as stored, unmarked; a marked state is stored and reads back marked")
+    func changeStateWithoutTheSelfHealMarkReadsBack() throws {
+        let stored = FolderChangeState(raw: #"{"v":1,"tracking":true,"recheck":["5"]}"#)
+        #expect(stored.tracking, "the tracking a stored state carries is kept")
+        #expect(stored.recheck == ["5"])
+        #expect(!stored.selfHealDue)
+        var marked = FolderChangeState()
+        marked.selfHealOwed = 1
+        let encoded = try #require(marked.encoded, "an untracked state owed a self-heal pass is stored")
+        let readBack = FolderChangeState(raw: encoded)
+        #expect(readBack.selfHealDue && !readBack.tracking)
     }
 }

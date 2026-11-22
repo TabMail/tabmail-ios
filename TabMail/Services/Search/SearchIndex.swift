@@ -1398,20 +1398,6 @@ actor SearchIndex {
         }
     }
 
-    /// Update cc/bcc fields in FTS for existing messages (v10 migration backfill).
-    func updateCcBcc(_ updates: [(contentKey: ContentKey, cc: String, bcc: String)]) throws {
-        ensureReady()
-        guard let dbPool, !updates.isEmpty else { return }
-        try dbPool.write { [self] db in
-            for update in updates {
-                guard let resolved = try resolveRowidAndYear(update.contentKey, db: db) else { continue }
-                let table = ftsTableName(year: resolved.year)
-                try db.execute(sql: "UPDATE \(table) SET cc = ?, bcc = ? WHERE rowid = ?",
-                               arguments: [update.cc, update.bcc, resolved.rowid])
-            }
-        }
-    }
-
     /// One page entry for the orphan-prune cursor walk. A struct (not a
     /// labeled tuple) — tuple arrays crossing the actor boundary trip the
     /// Swift 6 region-isolation checker ("pattern that the region-based

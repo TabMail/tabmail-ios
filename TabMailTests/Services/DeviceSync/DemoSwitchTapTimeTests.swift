@@ -20,7 +20,7 @@ struct DemoSwitchTapTimeTests {
     private func quiet() {
         UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
         DeviceSyncService.shared.disconnect()
-        AIService.writeOptOutFlag(false)
+        AITestSetting.set(aiOff: false)
         DemoModeStore.shared._resetForTests()
     }
 

@@ -1123,6 +1123,195 @@ struct FakeIMAPServerOracleTests {
 
         _ = try client.command(tag: "h7", "LOGOUT")
     }
+
+    /// The session limit admits exactly as many concurrent LOGINs as it has
+    /// room for: the check and the session's count are one step, so two
+    /// connections can never both take the last slot.
+    @Test("concurrent LOGINs against a one-session limit: exactly one is admitted")
+    func concurrentLoginsTakeTheLastSlotOnce() throws {
+        let attempts = 32
+        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+        server.setMaxLoggedInSessions(1)
+        try server.start()
+        defer { server.stop() }
+        var clients: [RawIMAPClient] = []
+        defer { for client in clients { client.close() } }
+        for _ in 0..<attempts {
+            let client = try RawIMAPClient(port: server.port)
+            try client.readGreeting()
+            clients.append(client)
+        }
+        for (index, client) in clients.enumerated() {
+            try client.send(tag: "c\(index)", "LOGIN \(server.username) \(server.password)")
+        }
+        var admitted = 0
+        for (index, client) in clients.enumerated() {
+            if try client.readTagged("c\(index)").contains("c\(index) OK") { admitted += 1 }
+        }
+        #expect(admitted == 1, "admitted \(admitted) LOGINs under a one-session limit")
+        #expect(server.liveSessionCount() == 1)
+    }
+
+    /// `stop()` while a connection's thread is still answering (a stalled
+    /// command) must not free that connection's descriptor: the number would go
+    /// to a socket opened afterwards (a later test's connection), and the late
+    /// answer, written into it, reaches a client that never sent its tag.
+    /// Every free low descriptor number is taken with socket pairs right after
+    /// `stop()`, so a freed one is among them; any byte at a pair's other end
+    /// is that late answer.
+    @Test("stop() keeps a stalled connection's descriptor: its late answer reaches no socket opened after it")
+    func stopNeverHandsALateAnswerToALaterSocket() async throws {
+        let stallSeconds = 1.0
+        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+        try server.start()
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "z1", "LOGIN \(server.username) \(server.password)")
+        server.stallNextCommand(containing: "NOOP", seconds: stallSeconds)
+        try client.send(tag: "z2", "NOOP")
+        let deadline = Date().addingTimeInterval(stallSeconds)
+        while !server.recordedCommands().contains("NOOP"), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(server.recordedCommands().contains("NOOP"), "setup: the server is stalling the NOOP")
+        server.stop()
+
+        var pairs: [[Int32]] = []
+        defer { for pair in pairs { Darwin.close(pair[0]); Darwin.close(pair[1]) } }
+        for _ in 0..<64 {
+            var pair: [Int32] = [0, 0]
+            guard socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0 else { break }
+            for end in pair { _ = fcntl(end, F_SETFL, fcntl(end, F_GETFL) | O_NONBLOCK) }
+            pairs.append(pair)
+        }
+        try await Task.sleep(for: .seconds(stallSeconds + 0.5))
+
+        var stray = ""
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        for pair in pairs {
+            for end in pair {
+                let received = chunk.withUnsafeMutableBytes { Darwin.read(end, $0.baseAddress, 4096) }
+                if received > 0 { stray += String(decoding: chunk[0..<received], as: UTF8.self) }
+            }
+        }
+        #expect(stray.isEmpty, "a stopped server's late answer reached a socket opened after stop(): \(stray)")
+    }
+
+    /// RFC 3501 §6.4.4 / §6.4.8 / §9: a `UID SEARCH UID <set>` answers only UIDs
+    /// in the set, and in `n:*` the `*` is the mailbox's highest UID, so with that
+    /// UID below `n` the range still matches the last message (#1076). Pins the
+    /// default fake, with no opt-in: RED while it answered the whole mailbox.
+    @Test("UID SEARCH answers only UIDs inside the requested UID set, n:* included")
+    func uidSearchAnswersWithinTheRequestedSet() throws {
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [1, 2, 3, 7, 8].map { Self.message(uid: $0, id: "search-set-\($0)@example.com") },
+        ])
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "s1", "LOGIN \(server.username) \(server.password)")
+        _ = try client.command(tag: "s2", "SELECT INBOX")
+
+        // Each case asserts the exact untagged answer (UIDs in mailbox order)
+        // and the tagged OK, so an empty answer is a successful empty SEARCH,
+        // not a failed or unparsed one.
+        let cases: [(criteria: String, expected: [Int])] = [
+            ("UID 2:7", [2, 3, 7]),
+            ("UID 4:6", []),
+            ("UID 1,8", [1, 8]),
+            ("UID 3:*", [3, 7, 8]),
+            // `*` is 8 here, so 20:* is 8:20 and matches the last message only.
+            ("UID 20:*", [8]),
+            // Keys are ANDed (§6.4.4): a header match outside the UID set is no match.
+            ("UID 2:7 HEADER \"Message-ID\" \"<search-set-1@example.com>\"", []),
+            ("UID 1:2 HEADER \"Message-ID\" \"<search-set-1@example.com>\"", [1]),
+            // Two UID keys intersect: 7 is the only UID in both, unlike either one alone.
+            ("UID 2:7 UID 7:8", [7]),
+            // Disjoint UID keys match nothing.
+            ("UID 1:2 UID 7:8", []),
+        ]
+        for (index, item) in cases.enumerated() {
+            let tag = "q\(index)"
+            let reply = try client.command(tag: tag, "UID SEARCH \(item.criteria)")
+            let lines = reply.split(separator: "\r\n", omittingEmptySubsequences: true).map(String.init)
+            let untagged = (["* SEARCH"] + item.expected.map(String.init)).joined(separator: " ")
+            #expect(lines.contains(untagged), "UID SEARCH \(item.criteria) answered \(lines)")
+            #expect(lines.filter { $0.hasPrefix("* SEARCH") }.count == 1, "one SEARCH answer: \(lines)")
+            #expect(lines.contains("\(tag) OK UID SEARCH completed"), "tagged OK for \(item.criteria): \(lines)")
+        }
+        _ = try client.command(tag: "s9", "LOGOUT")
+    }
+
+    /// RFC 3501 §6.4.4: search keys are ANDed, so with date criteria honoured a
+    /// `HEADER "Message-ID"` probe whose UID key matches a message still answers
+    /// nothing when its `SINCE` / `BEFORE` excludes that message (#1076). Pins
+    /// the conjunction of the Message-ID probe with the date keys, which the
+    /// sibling oracle above never enables.
+    @Test("UID SEARCH ANDs a Message-ID probe with SINCE / BEFORE when dates are honoured")
+    func uidSearchANDsMessageIDProbeWithDateCriteria() throws {
+        // Dates relative to today, at UTC noon so the day the fake derives from
+        // INTERNALDATE is unambiguous.
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let todayNoon = utc.date(byAdding: .hour, value: 12, to: utc.startOfDay(for: Date()))!
+        func daysAgo(_ days: Int) -> Date { utc.date(byAdding: .day, value: -days, to: todayNoon)! }
+
+        let header = DateFormatter()
+        header.locale = Locale(identifier: "en_US_POSIX")
+        header.timeZone = TimeZone(identifier: "UTC")
+        header.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        let criterion = DateFormatter()
+        criterion.locale = Locale(identifier: "en_US_POSIX")
+        criterion.timeZone = TimeZone(identifier: "UTC")
+        criterion.dateFormat = "d-MMM-yyyy"
+        func day(_ days: Int) -> String { criterion.string(from: daysAgo(days)) }
+
+        // UID 1 is 20 days old, UID 2 is 10 days old, UID 3 is 2 days old.
+        let ages = [1: 20, 2: 10, 3: 2]
+        let messages = ages.keys.sorted().map { uid in
+            let text = Self.rfc822(messageId: "search-date-\(uid)@example.com")
+                .replacingOccurrences(of: "Date: Thu, 01 Jan 2026 00:00:00 +0000",
+                                      with: "Date: \(header.string(from: daysAgo(ages[uid]!)))")
+            return FakeIMAPServer.makeMessage(uid: uid, rfc822Text: text)
+        }
+        let server = FakeIMAPServer(mailboxes: ["INBOX": messages])
+        server.honorSearchDateCriteria()
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "s1", "LOGIN \(server.username) \(server.password)")
+        _ = try client.command(tag: "s2", "SELECT INBOX")
+
+        let probe = "HEADER \"Message-ID\" \"<search-date-2@example.com>\""
+        let cases: [(criteria: String, expected: [Int])] = [
+            // UID and Message-ID match UID 2, but SINCE is after its date.
+            ("UID 1:3 \(probe) SINCE \(day(5))", []),
+            // UID and Message-ID match UID 2, but BEFORE is before its date.
+            ("UID 1:3 \(probe) BEFORE \(day(15))", []),
+            // Both date keys present, window excludes UID 2 (it is older than 5 days).
+            ("UID 2 \(probe) SINCE \(day(5)) BEFORE \(day(1))", []),
+            // Control: every key matches UID 2.
+            ("UID 1:3 \(probe) SINCE \(day(15)) BEFORE \(day(5))", [2]),
+            ("UID 2 \(probe) SINCE \(day(12))", [2]),
+        ]
+        for (index, item) in cases.enumerated() {
+            let tag = "d\(index)"
+            let reply = try client.command(tag: tag, "UID SEARCH \(item.criteria)")
+            let lines = reply.split(separator: "\r\n", omittingEmptySubsequences: true).map(String.init)
+            let untagged = (["* SEARCH"] + item.expected.map(String.init)).joined(separator: " ")
+            #expect(lines.contains(untagged), "UID SEARCH \(item.criteria) answered \(lines)")
+            #expect(lines.filter { $0.hasPrefix("* SEARCH") }.count == 1, "one SEARCH answer: \(lines)")
+            #expect(lines.contains("\(tag) OK UID SEARCH completed"), "tagged OK for \(item.criteria): \(lines)")
+        }
+        _ = try client.command(tag: "s9", "LOGOUT")
+    }
 }
 
 /// A minimal raw-socket IMAP client: enough to log in, select, and issue a
@@ -1171,6 +1360,16 @@ private final class RawIMAPClient {
     /// Consume the server's `* OK …` connection greeting.
     func readGreeting() throws {
         _ = try readUntil { $0.hasPrefix("* OK") }
+    }
+
+    /// Send `tag SPACE line CRLF` without reading the answer.
+    func send(tag: String, _ line: String) throws {
+        try write("\(tag) \(line)\r\n")
+    }
+
+    /// Read through the tagged response to a command sent with `send`.
+    func readTagged(_ tag: String) throws -> String {
+        try readUntil { $0.contains("\r\n\(tag) ") || $0.hasPrefix("\(tag) ") }
     }
 
     /// Send `tag SPACE line CRLF` and read through the matching tagged response.

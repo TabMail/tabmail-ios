@@ -238,13 +238,20 @@ struct ChatReplyCompose: Equatable {
     ///   was sent): a plain reply to only them, with no Cc or Bcc.
     /// - Otherwise the agent's recipients, a Reply All only when they (To, Cc and Bcc) contain the
     ///   whole Reply All audience, people the agent added included; asked for anywhere but the
-    ///   field, also only when the agent opened it as one.
+    ///   field, also only when the agent opened it as one. The two are compared by mailbox
+    ///   address, so a recipient the agent names with a display name (`"Ann" <ann@example.com>`)
+    ///   counts as its address.
     static func make(agent req: AgentToolRouter.ComposeRequest, accounts: [Account]) -> ChatReplyCompose {
         if let only = req.fieldReply?.onlyTo {
             return ChatReplyCompose(isReplyAll: false, to: only, cc: [], bcc: [])
         }
         let audience = req.replyTo.map { buildReplyAllRecipients(for: $0, allAccounts: accounts) }
-        let addresses = { (list: [String]) in Set(list.map { $0.lowercased() }) }
+        // Read as compose reads its fields (`RecipientEntry`): each mailbox counts as its address,
+        // and an entry that names no sendable address counts as the text written.
+        let addresses = { (list: [String]) -> Set<String> in
+            let entry = RecipientEntry(list)
+            return Set((entry.addresses + entry.leftovers).map { $0.lowercased() })
+        }
         let toWholeAudience = audience.map { addresses(req.to + req.cc + req.bcc).isSuperset(of: addresses($0.to + $0.cc)) } == true
         let isReplyAll = toWholeAudience && (req.fieldReply != nil || req.isReplyAll)
         return ChatReplyCompose(isReplyAll: isReplyAll, to: req.to, cc: req.cc, bcc: req.bcc)
