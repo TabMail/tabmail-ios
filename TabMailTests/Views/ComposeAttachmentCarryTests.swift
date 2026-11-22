@@ -214,6 +214,29 @@ struct ComposeAttachmentCarryTests {
             "pending attachment work is an unsaved change and must prompt before dismissal")
     }
 
+    @Test("Explicit Save writes in order: read fail-closed, stage, save through the generation, clean up after commit, queue only when adopted")
+    func explicitSaveWriteOrder() throws {
+        let body = try functionBody(
+            "private func saveDraftAndDismiss() async {",
+            before: "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
+            in: composeSource())
+        let steps = [
+            "try Draft.fetchOne(db, key: capDraftId)",
+            "ComposeDraftGuards.saveMayMutate(",
+            "DraftAttachmentStorage.saveAttachments(capAttachments, dirName: staging)",
+            "ComposeDraftGuards.draftToSave(",
+            "try await saveThroughGeneration(draftToSave)",
+            "saveApplied: saveResult == .applied",
+            "guard saveResult == .applied else {",
+            "AccountManager.shared.queueDraftSave(",
+        ]
+        let positions = steps.map { body.range(of: $0)?.lowerBound }
+        let found = positions.compactMap { $0 }
+        #expect(found.count == steps.count, "every step of Save is present")
+        guard found.count == steps.count else { return }
+        #expect(found == found.sorted(), "Save's steps run in this order")
+    }
+
     @Test("Photos-picker work joins the same attachment completion boundary")
     func photoPickerPreparationCannotBeSnapshottedMidImport() throws {
         let body = try functionBody(
