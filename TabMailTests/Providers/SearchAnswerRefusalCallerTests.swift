@@ -7,14 +7,25 @@ import Testing
 @testable import TabMail
 
 /// Every SEARCH caller reads its answer through `ExtendedSearchResult.listed(within:)`, the only public read
-/// of a SEARCH answer: an answer that reports matches without listing them,
+/// of a SEARCH answer: an answer that does not list its matches,
 /// or names UIDs outside the request, fails that caller. It never reads as
 /// "nothing found". One test per caller, so reverting any one of them to the
 /// old empty-set default fails here even while the shared reader is intact.
+///
+/// Every answer here carries what the search asked for (`RETURN (COUNT MIN MAX ALL)`;
+/// RFC 4731 section 3.1 requires a requested COUNT always), so SwiftMail accepts it and the app's
+/// own reading is what is tested. An answer that leaves out a requested COUNT, or reports
+/// matches without ALL, is refused by SwiftMail before the app reads it.
 @Suite("SEARCH answers that list nothing fail every caller", .serialized)
 struct SearchAnswerRefusalCallerTests {
     static let capabilities = FakeIMAPServer.defaultCapabilities + ["ESEARCH"]
-    static let unlisted = "COUNT 2"
+    /// Lists two UIDs but counts three: the list contradicts its own COUNT,
+    /// so it does not list the answer's matches.
+    static let unlisted = "COUNT 3 MIN 5 MAX 6 ALL 5:6"
+    /// Names UID 900, outside every request below.
+    static let outOfScope = "COUNT 1 MIN 900 MAX 900 ALL 900"
+    /// RFC 4731's answer to a COUNT request that matched nothing.
+    static let noMatch = "COUNT 0"
 
     static func withProvider(
         _ body: (FakeIMAPServer, IMAPProvider) async throws -> Void
@@ -37,8 +48,8 @@ struct SearchAnswerRefusalCallerTests {
         try await Self.withProvider { server, provider in
             switch answer {
             case "unlisted": server.answerNextUIDSearch(in: "INBOX", esearchData: Self.unlisted)
-            case "outOfScope": server.answerNextUIDSearch(in: "INBOX", all: "900")
-            default: server.answerNextUIDSearch(in: "INBOX", all: "5:6")
+            case "outOfScope": server.answerNextUIDSearch(in: "INBOX", esearchData: Self.outOfScope)
+            default: server.answerNextUIDSearch(in: "INBOX", esearchData: "COUNT 2 MIN 5 MAX 6 ALL 5:6")
             }
             if answer == "control" {
                 let found = try await provider.searchExistingUIDs(folder: "INBOX", from: 1, to: 10)
@@ -58,8 +69,8 @@ struct SearchAnswerRefusalCallerTests {
         try await Self.withProvider { server, provider in
             switch answer {
             case "unlisted": server.answerNextUIDSearch(in: "INBOX", esearchData: Self.unlisted)
-            case "outOfScope": server.answerNextUIDSearch(in: "INBOX", all: "900")
-            default: server.answerNextUIDSearch(in: "INBOX", all: "5")
+            case "outOfScope": server.answerNextUIDSearch(in: "INBOX", esearchData: Self.outOfScope)
+            default: server.answerNextUIDSearch(in: "INBOX", esearchData: "COUNT 1 MIN 5 MAX 5 ALL 5")
             }
             if answer == "control" {
                 let result = try await provider.searchExistingUIDs(folder: "INBOX", uids: [5, 6])
@@ -101,7 +112,7 @@ struct SearchAnswerRefusalCallerTests {
           arguments: ["bracketed", "bare"])
     func appMessageIdLookup(_ which: String) async throws {
         try await Self.withProvider { server, provider in
-            if which == "bare" { server.answerNextUIDSearch(in: "INBOX", esearchData: "") }
+            if which == "bare" { server.answerNextUIDSearch(in: "INBOX", esearchData: Self.noMatch) }
             server.answerNextUIDSearch(in: "INBOX", esearchData: Self.unlisted)
             await #expect(throws: (any Error).self) {
                 _ = try await provider.currentUIDs(rfc822MessageId: "lookup@example.com", folderPath: "INBOX")
