@@ -192,6 +192,9 @@ struct ChatComposeRoutingTests {
         /// The email selected in the inbox's list (`selectedMessageId`): in the collapsed split view
         /// it shows over the inbox, in the expanded one beside it.
         var inboxSelected: String?
+        /// The split view is expanded, so an opened email shows beside the inbox
+        /// (`InboxView.emailsOpenBeside`); the phone turning flips it.
+        var inboxEmailsOpenBeside = false
         /// The email the pushed chat is opened on; nil: the root's email. The chat shows its
         /// thread's newest email either way, and binds a new email's From to the email it opened on.
         var chatOpenedOn: String?
@@ -210,6 +213,19 @@ struct ChatComposeRoutingTests {
                     ChatThreadView(messageId: route.chatOpenedOn ?? chatId)
                 }
             }
+        }
+    }
+
+    /// The inbox as `MailNavigationView` builds it: its layout read from `route` on every update.
+    private struct InboxRoot: View {
+        @Bindable var route: Route
+        let folder: Folder
+        let selected: Binding<String?>
+        let pushed: Binding<String?>
+
+        var body: some View {
+            InboxView(title: "Inbox", folders: [folder], selection: .unified(.inbox),
+                      selectedMessageId: selected, pushedMessageId: pushed, emailsOpenBeside: route.inboxEmailsOpenBeside)
         }
     }
 
@@ -308,9 +324,9 @@ struct ChatComposeRoutingTests {
                 get: { route.inboxSaysPushed ? chatId : nil },
                 set: { route.chatShown = $0 != nil })
             let selected = Binding<String?>(get: { route.inboxSelected }, set: { route.inboxSelected = $0 })
-            rootView = AnyView(Stack(route: route, chatId: chatId, root: InboxView(
-                title: "Inbox", folders: [folder], selection: .unified(.inbox),
-                selectedMessageId: selected, pushedMessageId: pushed, emailsOpenBeside: emailsOpenBeside)))
+            route.inboxEmailsOpenBeside = emailsOpenBeside
+            rootView = AnyView(Stack(route: route, chatId: chatId, root: InboxRoot(
+                route: route, folder: folder, selected: selected, pushed: pushed)))
         case .email:
             rootView = AnyView(Stack(route: route, chatId: chatId, root: MessageDetailView(messageId: chatId)))
         }
@@ -1109,6 +1125,36 @@ struct ChatComposeRoutingTests {
                     subject: "Lunch", body: "Lunch on Friday?", origin: ComposeOrigin(sessionKey: "inbox", screen: .inbox)))
                 let card = try await Self.openedCard(in: screens)
                 #expect(Self.addresses(card["to"]) == [Self.ownCardAddress], "the inbox's card, with the email beside it: \(card)")
+                #expect(router.composeQueueDepth == 0)
+            }
+        }
+    }
+
+    @Test("A card held under an email opens once the phone turns and the email shows beside the inbox")
+    func heldInboxCardOpensWhenTheEmailMovesBeside() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted screens")
+        let backend = Backend(asksForReply: false)
+        try await HostedAccessibility.withAutomation {
+            try await withScreens(.inbox, backend, tag: "nav-turns", chat: false) { screens in
+                let router = AgentToolRouter.shared
+                // Collapsed: a selected and a pushed email show over the inbox, so its card waits.
+                screens.route.inboxSelected = screens.email.id
+                screens.route.inboxNavigationSaysPushed = true
+                router.enqueueCompose(AgentToolRouter.ComposeRequest(
+                    mode: .compose, replyTo: nil, to: [Self.ownCardAddress], cc: [], bcc: [],
+                    subject: "Lunch", body: "Lunch on Friday?", origin: ComposeOrigin(sessionKey: "inbox", screen: .inbox)))
+                // A window for a take that must not happen: it can only miss a late take (and
+                // pass), never fail a correct inbox.
+                try await Task.sleep(for: .seconds(2))
+                let depth = router.composeQueueDepth
+                let underTheEmail = Self.card(in: screens)
+                #expect(depth == 1, "control: the collapsed inbox under an email takes nothing")
+                #expect(underTheEmail.isEmpty, "control: nothing opens: \(underTheEmail)")
+
+                // The phone turns: the split view expands and the email shows beside the inbox.
+                screens.route.inboxEmailsOpenBeside = true
+                let card = try await Self.openedCard(in: screens)
+                #expect(Self.addresses(card["to"]) == [Self.ownCardAddress], "the inbox's card opens beside the email: \(card)")
                 #expect(router.composeQueueDepth == 0)
             }
         }
