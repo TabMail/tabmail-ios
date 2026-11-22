@@ -81,7 +81,7 @@ extension SyncEngine {
         guard Self.untrackedFolderChanged(
             observation: observation, lastKnownUidNext: folder.lastKnownUidNext,
             totalCount: folder.totalCount, lastKnownHighestModSeq: folder.lastKnownHighestModSeq,
-            listingDue: FolderChangeState(raw: folder.changeState).listingDue) else {
+            listingDue: FolderChangeState(raw: folder.changeState).listingDue || observation.mustList) else {
             BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) unchanged (uidNext=\(observation.uidNext), count=\(observation.messageCount), modseq=\(observation.highestModSeq.map(String.init) ?? "-"))")
             // A quiet folder is the one that would otherwise never get an epoch.
             // Bootstrap only (never an overwrite); the binding predicates are
@@ -113,6 +113,9 @@ extension SyncEngine {
         case .unproven:
             BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): listing unproven — skipping")
             return .unproven
+        case .folderGone:
+            BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): folder gone — skipping")
+            return .notListed
         }
         guard let serverCount = result.listedCounters?.messageCount else { return .unproven }
         // Bounded by the pass's deadline: this runs inside the account's turn.

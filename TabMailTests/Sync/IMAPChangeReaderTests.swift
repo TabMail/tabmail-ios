@@ -50,6 +50,9 @@ struct IMAPChangeReaderTests {
             uids(folderId).filter { $0 >= lower }.min()
         }
         func lastNumericId(folderId: String) async throws -> Int? { uids(folderId).max() }
+        func rows(folderId: String, numericIdsBelow upper: Int, limit: Int) async throws -> [CatchUpLocalRow] {
+            Array(uids(folderId).filter { $0 < upper }.sorted(by: >).prefix(limit)).map(row)
+        }
         /// Runs once, at the next held-row lookup (mid-read of a folder).
         private let onHeldLookup = Mutex<(@Sendable () async -> Void)?>(nil)
         func runOnceAtNextHeldLookup(_ hook: @escaping @Sendable () async -> Void) { onHeldLookup.withLock { $0 = hook } }
@@ -388,7 +391,7 @@ struct IMAPChangeReaderTests {
     @Test("STATUS without MESSAGES or UIDNEXT: the untracked folder is unreadable this pass, never changed, never 0")
     func missingStatusFieldIsUnreadable() async throws {
         for omitted in ["MESSAGES", "UIDNEXT"] {
-            try await Self.withWorld(capabilities: FakeIMAPServer.defaultCapabilities + ["CONDSTORE"], inbox: [1, 2]) { w in
+            try await Self.withWorld(capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" } + ["CONDSTORE"], inbox: [1, 2]) { w in
                 w.server.setStatusOmits([omitted], for: Self.inboxPath)
                 let changes = try await Self.inbox(w, Self.read(w))
                 guard case .failed = changes.status else {
@@ -535,9 +538,9 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("No QRESYNC: a CONDSTORE-only server leaves every folder untracked with its STATUS observation and sends no ENABLE")
+    @Test("No QRESYNC and no UIDPLUS: a CONDSTORE server leaves every folder untracked with its STATUS observation and sends no ENABLE")
     func noQResyncIsUntracked() async throws {
-        try await Self.withWorld(capabilities: FakeIMAPServer.defaultCapabilities + ["CONDSTORE"], inbox: [1, 2]) { w in
+        try await Self.withWorld(capabilities: FakeIMAPServer.defaultCapabilities.filter { $0 != "UIDPLUS" } + ["CONDSTORE"], inbox: [1, 2]) { w in
             let changes = try await Self.inbox(w, Self.read(w))
             guard case .untracked(let observation) = changes.status else {
                 Issue.record("expected untracked, got \(changes.status)"); return
@@ -557,17 +560,14 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("QRESYNC advertised without ENABLE: the folder is untracked, no ENABLE is sent, and the pass does not fail")
-    func qresyncWithoutEnableIsUntracked() async throws {
+    /// RFC 7162 §3.2.3: QRESYNC parameters are valid only after ENABLE QRESYNC, so a
+    /// server that advertises QRESYNC but not ENABLE is read in CONDSTORE mode.
+    @Test("QRESYNC advertised without ENABLE: the folder is read in CONDSTORE mode, no ENABLE is sent, and the pass does not fail")
+    func qresyncWithoutEnableReadsCondstore() async throws {
         try await Self.withWorld(capabilities: FakeIMAPServer.defaultCapabilities + ["CONDSTORE", "QRESYNC"], inbox: [1, 2]) { w in
-            for _ in 0..<2 {
-                let changes = try await Self.inbox(w, Self.read(w))
-                guard case .untracked(let observation) = changes.status else {
-                    Issue.record("expected untracked, got \(changes.status)"); return
-                }
-                #expect(observation.messageCount == 2)
-                #expect(changes.cursor == nil, "no failing-since bookmark builds up")
-            }
+            let changes = try await Self.inbox(w, Self.read(w))
+            #expect({ if case .baselineReady = changes.status { return true }; return false }(), "got \(changes.status)")
+            #expect(changes.cursor != nil, "a CONDSTORE bookmark is kept")
             #expect(!w.server.recordedCommands().contains { $0.uppercased().contains("ENABLE") })
         }
     }
@@ -2240,7 +2240,7 @@ struct IMAPChangeReaderTests {
         }
     }
 
-    @Test("A new arrival already marked \\Deleted is neither fetched nor reported")
+    @Test("A new arrival the server reports as \\Deleted is a removal and is neither fetched nor recorded")
     func deletedArrivalIsExcluded() async throws {
         try await Self.withWorld(inbox: [1, 2]) { w in
             let cursor = try await Self.baseline(w)
@@ -2250,12 +2250,12 @@ struct IMAPChangeReaderTests {
             let changes = try await Self.inbox(w, Self.read(w, cursors: [w.inboxId: cursor]))
             #expect(Self.isTracked(changes.status))
             #expect(!changes.records.contains { $0.messageId == "3" })
-            #expect(!changes.removals.contains("3"))
+            #expect(changes.removals.contains("3"), "every server-reported \\Deleted UID is a removal: \(changes.removals)")
             #expect(Self.uidFetches(w, since: start).isEmpty, "the deleted arrival is not fetched: \(Self.uidFetches(w, since: start))")
         }
     }
 
-    @Test("A held message at or above the bookmark's UIDNEXT (a moved-in row) marked \\Deleted is a removal; an unheld one beside it is not")
+    @Test("A held message at or above the bookmark's UIDNEXT (a moved-in row) marked \\Deleted is a removal, and so is an unheld one beside it")
     func deletedHeldArrivalIsRemoved() async throws {
         try await Self.withWorld(inbox: [1, 2]) { w in
             let cursor = try await Self.baseline(w)
@@ -2270,7 +2270,7 @@ struct IMAPChangeReaderTests {
             #expect(Self.isTracked(changes.status))
             #expect(changes.removals.contains("3"), "the held message the server holds as \\Deleted is removed: \(changes.removals)")
             #expect(changes.removals.contains("5"), "above UIDNEXT too: \(changes.removals)")
-            #expect(!changes.removals.contains("4"), "a message the folder does not hold is not reported")
+            #expect(changes.removals.contains("4"), "an unheld \\Deleted UID is a removal too: \(changes.removals)")
             #expect(!changes.records.contains { ["3", "4", "5"].contains($0.messageId) })
             #expect(Self.uidFetches(w, since: start).isEmpty, "none is fetched: \(Self.uidFetches(w, since: start))")
         }

@@ -72,7 +72,10 @@ actor SyncEngine {
     /// The accounts with a sync pass running, and for each the passes waiting
     /// their turn, oldest first (`oneSyncAtATime`).
     var syncPassRunning: Set<String> = []
-    var syncPassWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    var syncPassWaiters: [String: [SyncTurnWaiter]] = [:]
+    var syncTurnWaiterSerial: UInt64 = 0
+    /// Waiters the test harness released after an overrun (`syncTurnWaitWatch`).
+    var overrunSyncTurnWaiters: Set<UInt64> = []
 
     /// Header walks (`runBackfillWalk`) executing now, foreground or job. A walk
     /// admitted before a download gate closed keeps running on its own snapshot,
@@ -976,6 +979,8 @@ actor SyncEngine {
                     .fetchOne(db)?.providerDate ?? Date()
             }
 
+            // The change premise, before the page read (#755).
+            let changePremise = try await dbPool.read { db in try Self.changeInsertPremise(db, folderId: folder.id) }
             let pageLimit = SyncConfig.infiniteScrollFetchLimit
             let fetched: (headers: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage)
             do {
@@ -1032,7 +1037,12 @@ actor SyncEngine {
             }
 
             // Deduplicate and insert
-            let writeResult: (inserted: [MessageHeader], discoveredParents: [String]) = try await dbPool.write { db in
+            let writeResult: (inserted: [MessageHeader], discoveredParents: [String], refused: Bool) = try await dbPool.write { db in
+                // A change read became authoritative for this folder since the
+                // page was read: nothing of it lands, and the page is asked again.
+                guard try Self.fromServerInsertAllowed(db, folderId: folder.id, premise: changePremise) else {
+                    return ([], [], true)
+                }
                 var inserted: [MessageHeader] = []
                 for info in headers {
                     // IOS-IMAP-001 / D3 — a message the server reports with `\Deleted`
@@ -1122,7 +1132,11 @@ actor SyncEngine {
                     insertedRfc822Ids: inserted.compactMap(\.rfc822MessageId),
                     accountId: folder.accountId, db: db)
 
-                return (inserted, discovered)
+                return (inserted, discovered, false)
+            }
+            if writeResult.refused {
+                mayHaveMore = true
+                continue
             }
             let newHeaders = writeResult.inserted
             ReplyParentResolver.postParentNotifications(writeResult.discoveredParents)

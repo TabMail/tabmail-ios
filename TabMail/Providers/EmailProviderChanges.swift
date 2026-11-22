@@ -187,6 +187,9 @@ struct UntrackedObservation: Sendable, Equatable {
     let highestModSeq: Int?
     /// Nil when the server did not report one.
     let uidValidity: Int?
+    /// List this folder this pass whatever the counters say: the reader stopped
+    /// a check it owes for want of budget (#755).
+    var mustList = false
 }
 
 enum FolderChangeStatus: Sendable {
@@ -316,6 +319,21 @@ struct FolderChanges: Sendable {
     /// the bookmark, so a pass with no listing, a failed listing or a crash
     /// before tracking starts never leaves the bookmark without its check.
     var armCatchUpWithBookmark = false
+    /// The folder's rows with numeric ids in `lowerId...upperId` the read
+    /// checked: exactly `checkedIds` (bounded by the check's window). The apply
+    /// reads the folder's held ids in that range again in its transaction; a
+    /// held id the check never examined (a row that came meanwhile, even when
+    /// another one left and the count is unchanged) keeps the stored bookmark.
+    /// A checked row that left does not. Nil = nothing to verify.
+    var heldRowsProof: HeldRowsProof?
+    struct HeldRowsProof: Sendable, Equatable { let lowerId: Int; let upperId: Int; let checkedIds: Set<Int> }
+    /// The same proof for the ids the new bookmark newly covers (an IMAP read's
+    /// arrival range, the stored UIDNEXT up to the new one): the ids the read
+    /// found on the server or held there when it looked. A row inserted in that
+    /// range after the read looked (the notification merge, whose id the stored
+    /// bookmark does not claim yet) was never checked, so the stored bookmark
+    /// stays and the next read checks the row. Nil = nothing newly covered.
+    var arrivalRowsProof: HeldRowsProof?
     /// Set by the engine, never by a reader: the folder bookmark the read was
     /// issued with. A bookmark dropped between the read and the apply
     /// (`SyncEngine.dropChangeBookmark`) is never written back. Nil = not

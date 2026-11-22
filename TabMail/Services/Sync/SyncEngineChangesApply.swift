@@ -101,6 +101,22 @@ extension SyncEngine {
             return result
         }
 
+        // The rows the read checked, read again before any removal: every id
+        // the folder holds in the checked range must be one the check examined.
+        // A row that came meanwhile was not checked (also when another one
+        // left, keeping the count), so the bookmark stays; a checked row that
+        // left (moved out, or a proven removal) does not invalidate it.
+        // The same for the range the new bookmark newly covers: a row the
+        // notification merge inserted there after the read looked would be
+        // covered without ever being checked (#755).
+        let heldRowsHold = try [changes.heldRowsProof, changes.arrivalRowsProof].compactMap { $0 }.allSatisfy { proof in
+            let held = try Int.fetchAll(db, sql: """
+                SELECT CAST(messageId AS INTEGER) FROM messageHeader
+                WHERE folderId = ? AND CAST(messageId AS INTEGER) BETWEEN ? AND ?
+                """, arguments: [folder.id, proof.lowerId, proof.upperId])
+            return held.allSatisfy(proof.checkedIds.contains)
+        }
+
         // Shields, read INSIDE this transaction.
         let snapshot = try PendingOperationSnapshot.load(accountId: accountId, db: db)
         let recentlyCompleted = AccountManager.shared.liveRecentlyCompleted()
@@ -192,7 +208,7 @@ extension SyncEngine {
         // checked (issued with one, none stored now): a reader's own later page
         // of the same folder moves the bookmark forward, never to none.
         let bookmarkMoved = changes.readFrom.map { $0.cursor != nil && folder.changeCursor == nil } ?? false
-        var cursor = bookmarkMoved ? folder.changeCursor : (changes.cursor ?? folder.changeCursor)
+        var cursor = bookmarkMoved || !heldRowsHold ? folder.changeCursor : (changes.cursor ?? folder.changeCursor)
         switch changes.status {
         case .refused(let reason):
             // This folder only: its bookmark is gone, so it is not covered, its
@@ -302,6 +318,25 @@ extension SyncEngine {
                        arguments: [state.encoded, folderId])
         if !selfHealDue { try markCatchUpLapse(folderId: folderId, db: db) }
         try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+    }
+
+    /// A row inserted outside a change read (the notification merge) under an
+    /// id the folder's bookmark claims it already holds contradicts the
+    /// bookmark: the message may be one a read proved gone. The bookmark is
+    /// dropped as a refused read drops it, so the next full sync lists the
+    /// folder and settles the row (#755, ADR-IOS-111). Call inside the insert's
+    /// transaction.
+    nonisolated static func endTrackingIfBookmarkClaimsHeld(folderId: String, messageId: String, db: Database) throws {
+        guard let row = try Row.fetchOne(db, sql: """
+            SELECT folder.changeCursor AS cursor, account.id AS accountId, account.provider AS provider
+            FROM folder JOIN account ON account.id = folder.accountId WHERE folder.id = ?
+            """, arguments: [folderId]),
+              let cursor = String.fromDatabaseValue(row["cursor"] as DatabaseValue),
+              let accountId = String.fromDatabaseValue(row["accountId"] as DatabaseValue),
+              let provider = String.fromDatabaseValue(row["provider"] as DatabaseValue).flatMap(AccountProvider.init(rawValue:)),
+              changeBookmark(cursor, claimsHeld: messageId, accountId: accountId, provider: provider)
+        else { return }
+        try dropChangeBookmark(folderId: folderId, db: db)
     }
 
     /// Arm one folder's catch-up: the same lapse mark `lapseDeltaCursor` sets on

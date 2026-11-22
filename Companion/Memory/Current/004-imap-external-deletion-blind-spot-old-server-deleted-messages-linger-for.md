@@ -14,3 +14,10 @@ Code-verified audit (triggered by the TB FTS drift investigation, see `../tabmai
 - **SwiftMail fork already supports CONDSTORE/QRESYNC/HIGHESTMODSEQ/VANISHED** (STATUS `highestModificationSequence` when `.condStore`; `IdleHandler.swift:120-125`; `SearchCriteria.modSeq`) — the app uses NONE of it for content sync (`IMAPProvider.folderStatus` discards modseq, `IMAPProvider.swift:1528-1532`; `fetchHistory` returns nil `:1536-1540`). `HistoryDelta.swift:8-10`'s "IMAP MODSEQ" comment is aspirational.
 - **FTS wiring is correct on every deletion path** (staleIds → `SearchIndex.removeMessages`, delta deletes, confirmed-gone, budget prune) — fixing GRDB reconciliation automatically fixes search.
 - **Fix directions (mirrors TB's evidence-triggered design, not yet implemented):** (1) use the IDLE `.vanished` UIDSet for targeted deletes (free, library already delivers it); (2) treat the STATUS count mismatch that the windowed sync CAN'T explain as reconcile evidence → chunked full-folder UID SEARCH walk (backfill already has the chunked-UID-SEARCH primitive) diffed against local UIDs — integer set diff, bounded memory; (3) CONDSTORE `CHANGEDSINCE`/QRESYNC where advertised → O(changes). NEVER a date window (ADR-IOS-042).
+
+**2026-11-19 (#755): closed for CONDSTORE servers too.** A server with CONDSTORE and UIDPLUS (no QRESYNC)
+now gets the change reader: an expunge below the listing window, even one that leaves HIGHESTMODSEQ
+unchanged and in a partly loaded folder where no count difference shows, is found by the bookmark's
+message count (owed removals) and a per-UID-proven removal check over a UID window
+(`SyncConfig.imapChangeRemovalCheckWindow`); older rows get the armed catch-up. A server without
+CONDSTORE or UIDPLUS keeps the ADR-IOS-051 count walk. ADR-IOS-111 amendment "CONDSTORE without QRESYNC".

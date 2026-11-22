@@ -222,6 +222,12 @@ extension SyncEngine {
                             }
                             return (inserted: 0, unread: 0, fts: [], parents: [], refused: true)
                         }
+                        // A change read became authoritative for this folder since
+                        // the range was read: nothing of it lands (#755).
+                        if let epochPremise, epochPremise.guardsChange,
+                           try !SyncEngine.fromServerInsertAllowed(db, folderId: folderId, premise: epochPremise.change) {
+                            return (inserted: 0, unread: 0, fts: [], parents: [], refused: true)
+                        }
                         // Load pending destructive IDs to skip messages with optimistic moves.
                         // Scoped to (accountId, folderPath) to prevent IMAP cross-folder UID collisions.
                         let scopedOps = try PendingOperation
