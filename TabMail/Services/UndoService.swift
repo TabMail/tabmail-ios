@@ -179,6 +179,46 @@ struct UndoableAction {
         }
     }
 
+    /// One undo entry for a gesture whose members went to different folders:
+    /// a thread can span accounts, each account's members going to that
+    /// account's own folder, and its members can come from different source
+    /// folders. `AccountManager.undoMove` restores one account, one
+    /// destination and one source folder at a time, so each such group is its
+    /// own command, as `AccountManager.move` gives each its own operation.
+    /// Commands keep the members' first-appearance order. `nil` when there is
+    /// nothing to undo.
+    init?(
+        id: UUID = UUID(),
+        moves: [(message: MessageHeader, destinationPath: String)],
+        timestamp: Date
+    ) {
+        guard let first = moves.first else { return nil }
+        self.id = id
+        self.type = .move(fromPath: first.message.folderPath, toPath: first.destinationPath)
+        self.messages = moves.map(\.message)
+        self.originalFolderId = first.message.folderId
+        self.originalFolderPath = first.message.folderPath
+        self.accountId = first.message.accountId
+        self.timestamp = timestamp
+        var commands: [UndoAccountCommand] = []
+        for move in moves {
+            let member = UndoMember(header: move.message)
+            if let index = commands.firstIndex(where: {
+                $0.accountId == move.message.accountId
+                    && $0.forwardDestinationPath == move.destinationPath
+                    && $0.members.first?.sourceFolderId == member.sourceFolderId
+            }) {
+                commands[index].members.append(member)
+            } else {
+                commands.append(UndoAccountCommand(
+                    accountId: move.message.accountId,
+                    forwardDestinationPath: move.destinationPath,
+                    members: [member]))
+            }
+        }
+        self.commands = commands
+    }
+
     var label: String {
         let count = messages.count
         let noun = count == 1 ? "message" : "messages"

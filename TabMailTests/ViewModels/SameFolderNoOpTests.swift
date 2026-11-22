@@ -309,7 +309,7 @@ struct SameFolderNoOpTests {
         defer { UndoService.shared.dismissAll() }
 
         #expect(vm.archiveThread([archiveId]) == [archiveId])
-        #expect(vm.moveThread([moveId], toFolderPath: archive.path) == [moveId])
+        #expect(vm.moveThread([moveId], toFolderPath: archive.path, accountId: archive.accountId) == [moveId])
         #expect(UndoService.shared.undoStack.isEmpty)
         #expect(AccountManager.shared.snapshotOverlay()[archiveId] == nil)
         #expect(AccountManager.shared.snapshotOverlay()[moveId] == nil)
@@ -345,7 +345,7 @@ struct SameFolderNoOpTests {
         #expect(AccountManager.shared.snapshotOverlay()[inboxArchiveId]?.folderId == archive.id)
 
         let moveSkipped = vm.moveThread(
-            [draftMoveId, inboxMoveId], toFolderPath: archive.path)
+            [draftMoveId, inboxMoveId], toFolderPath: archive.path, accountId: archive.accountId)
         #expect(moveSkipped == [draftMoveId])
         #expect(AccountManager.shared.snapshotOverlay()[draftMoveId] == nil)
         #expect(AccountManager.shared.snapshotOverlay()[inboxMoveId]?.folderId == archive.id)
@@ -1024,7 +1024,7 @@ struct SameFolderNoOpTests {
         defer { UndoService.shared.dismissAll() }
         defer { AccountManager.shared.removeOverlayEntries(ids: [realId]) }
 
-        let skipped = vm.moveThread([realId, ghostId], toFolderPath: archive.path)
+        let skipped = vm.moveThread([realId, ghostId], toFolderPath: archive.path, accountId: archive.accountId)
 
         // EXACTLY the un-recorded member is reported (so exactly its row
         // un-hides); the recorded one legitimately stays hidden under an undo
@@ -1058,7 +1058,7 @@ struct SameFolderNoOpTests {
 
         // The whole-call abort leg: `guard let first = messages.first` used to
         // `return` with the caller holding every id hidden.
-        let skipped = vm.moveThread([ghost1, ghost2], toFolderPath: archive.path)
+        let skipped = vm.moveThread([ghost1, ghost2], toFolderPath: archive.path, accountId: archive.accountId)
 
         #expect(Set(skipped) == Set([ghost1, ghost2]))
         #expect(UndoService.shared.undoStack.isEmpty)
