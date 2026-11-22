@@ -825,6 +825,10 @@ final class ChatSwipeUITests: XCTestCase {
         let typed = typedField(containing: Self.shortQuestion, in: app)
         XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
         waitForTheKeyboardBack(under: typed, in: app)
+        // The caret starts at the text's start (`topLine` taps it there and shows where a mark
+        // lands), away from both places the text's long press can leave it: on the words under the
+        // finger, or at the text's end, where it follows a finger moved above the one-line text.
+        XCTAssertEqual(topLine(of: typed, in: app), Self.shortQuestion, "control: the caret is at the text's start before the press")
         // Both ends from one read of the field's frame (`textScroll`).
         let frame = typed.frame
         let onTheWords = app.coordinate(withNormalizedOffset: .zero)
@@ -835,16 +839,16 @@ final class ChatSwipeUITests: XCTestCase {
                        "the held press stayed the text's; the panel stays shut")
         XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
         XCTAssertTrue(typedField(containing: Self.shortQuestion, in: app).exists, "and its words")
-        // The press reached the text: its long press put the caret on the words, so a typed mark
-        // lands among them, not after them where the typing left the caret.
+        // The press reached the text: its long press moved the caret, so a typed mark no longer
+        // lands at the text's start, where the caret was before the press.
         typedField(containing: Self.shortQuestion, in: app).typeText(Self.lineMark)
         let marked = typedField(containing: Self.lineMark, in: app)
         XCTAssertTrue(marked.waitForExistence(timeout: 5), "control: the mark went into the field")
         let value = marked.value as? String ?? ""
         XCTAssertEqual(value.replacingOccurrences(of: Self.lineMark, with: ""), Self.shortQuestion,
                        "control: the field holds the question and the mark")
-        XCTAssertNotEqual(value, Self.shortQuestion + Self.lineMark,
-                          "the held press moved the caret onto the words: \(dragMarkerLabel(afterDrags: 0, in: app))")
+        XCTAssertNotEqual(value, Self.lineMark + Self.shortQuestion,
+                          "the held press moved the caret off the text's start: \(dragMarkerLabel(afterDrags: 0, in: app))")
     }
 
     /// Longer than UIKit's long press (half a second), so the text view's own long press has begun
