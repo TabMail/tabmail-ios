@@ -34,6 +34,41 @@ enum DraftAttachmentImport {
         "Selected photo or video \(index + 1)"
     }
 
+    /// The photo picker's items, loaded one after another in the order picked. Each item that
+    /// loads becomes an attachment (`pickedAttachment`, counted from `existingCount()` as it
+    /// lands) handed to `add`; each that throws or loads no data is handed to `fail` under its
+    /// label (`pickedFailureLabel`). `settled` is told after each item, after its `add` or `fail`,
+    /// whether it loaded, so the caller settles its carry gate and shows failures. The caller
+    /// counts the items into its gate before calling, and shows the failures its own way.
+    @MainActor
+    static func loadPicked<Item>(
+        _ items: [Item],
+        load: @MainActor (Item) async throws -> (data: Data?, type: UTType?),
+        existingCount: @MainActor () -> Int,
+        add: @MainActor (DraftAttachment) -> Void,
+        fail: @MainActor (String) -> Void,
+        settled: @MainActor (_ succeeded: Bool) -> Void
+    ) async {
+        for (index, item) in items.enumerated() {
+            var succeeded = false
+            do {
+                let loaded = try await load(item)
+                if let data = loaded.data {
+                    add(pickedAttachment(data: data, contentType: loaded.type, existingCount: existingCount()))
+                    succeeded = true
+                } else {
+                    fail(pickedFailureLabel(index: index))
+                }
+            } catch {
+                fail(pickedFailureLabel(index: index))
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[DraftAttachmentImport] Picked item \(index + 1) failed to load: \(error)")
+                }
+            }
+            settled(succeeded)
+        }
+    }
+
     /// The camera's photo as JPEG, named `photo_<n>.jpg` like a picked photo; nil when the image
     /// cannot be encoded (report it under `cameraFailureLabel`).
     static func cameraAttachment(_ image: UIImage, existingCount: Int) -> DraftAttachment? {

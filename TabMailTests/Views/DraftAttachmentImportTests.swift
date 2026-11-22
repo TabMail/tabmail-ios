@@ -119,11 +119,57 @@ struct DraftAttachmentImportTests {
             .deletingLastPathComponent()
         let source = try String(
             contentsOf: root.appendingPathComponent("TabMail/Views/Compose/ComposeView.swift"), encoding: .utf8)
-        #expect(source.contains("DraftAttachmentImport.pickedAttachment("))
+        #expect(source.contains("DraftAttachmentImport.loadPicked("))
+        #expect(!source.contains("DraftAttachmentImport.pickedAttachment("), "picked items load only through loadPicked")
         #expect(source.contains("DraftAttachmentImport.cameraAttachment("))
         #expect(source.contains("DraftAttachmentImport.importFiles("))
         #expect(!source.contains("\"photo_\\("))
         #expect(!source.contains("jpegData(compressionQuality:"))
+    }
+
+    @Test("Picked items load in order: each one that loads is added, named by what is there as it lands; each that throws or has no data fails under its place; each settles after its add or fail")
+    @MainActor
+    func loadPickedOrderNamesAndSettles() async {
+        var attachments = [DraftAttachment(filename: "report.pdf", mimeType: "application/pdf", data: Data([1]))]
+        var events: [String] = []
+        await DraftAttachmentImport.loadPicked(
+            ["first", "broken", "empty", "last"],
+            load: { item in
+                if item == "broken" { throw ReadFailed() }
+                if item == "empty" { return (data: nil, type: UTType.png) }
+                return (data: Data(item.utf8), type: item == "last" ? UTType.quickTimeMovie : UTType.png)
+            },
+            existingCount: { attachments.count },
+            add: { attachment in
+                attachments.append(attachment)
+                events.append("add \(attachment.filename)")
+            },
+            fail: { label in events.append("fail \(label)") },
+            settled: { succeeded in events.append("settled \(succeeded)") })
+        let names = attachments.map(\.filename)
+        let contents = attachments.map(\.data)
+        #expect(names == ["report.pdf", "photo_2.png", "photo_3.mov"])
+        #expect(contents == [Data([1]), Data("first".utf8), Data("last".utf8)])
+        #expect(events == [
+            "add photo_2.png", "settled true",
+            "fail Selected photo or video 2", "settled false",
+            "fail Selected photo or video 3", "settled false",
+            "add photo_3.mov", "settled true",
+        ])
+    }
+
+    @Test("Loading no picked items does nothing")
+    @MainActor
+    func loadPickedNothing() async {
+        var calls = 0
+        await DraftAttachmentImport.loadPicked(
+            [String](),
+            load: { _ in (data: Data([1]), type: UTType.png) },
+            existingCount: { 0 },
+            add: { _ in calls += 1 },
+            fail: { _ in calls += 1 },
+            settled: { _ in calls += 1 })
+        #expect(calls == 0)
     }
 
     @Test("Importing no files gives nothing and no failures")

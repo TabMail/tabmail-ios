@@ -233,6 +233,7 @@ struct ComposeAttachmentCarryTests {
         #expect(publish.lowerBound < cleared.lowerBound, "the picker's selection clears after every item settled")
         #expect(body.contains("recordAttachmentPreparationFailure"), "a failed item is surfaced as compose's preparation failure")
         #expect(body.contains("item.supportedContentTypes.first"), "a picked item is typed by its first content type")
+        #expect(body.contains("await DraftAttachmentImport.loadPicked("), "compose loads picked items through the loader the chat shares")
     }
 
     @Test("File and camera attachment preparation failures are surfaced")

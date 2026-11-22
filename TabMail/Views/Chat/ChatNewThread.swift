@@ -349,9 +349,9 @@ final class ChatNewThreadModel: Hashable {
         attachments.remove(at: index)
     }
 
-    /// Picked photos and videos, added in order as each loads (`DraftAttachmentImport`), the ones
-    /// that do not load reported in `failedImports`. Counted as loading at once, so a save started
-    /// now waits for them. Returns the loading, nil for no items.
+    /// Picked photos and videos, added in order as each loads (`DraftAttachmentImport.loadPicked`),
+    /// the ones that do not load reported in `failedImports`. Counted as loading at once, so a save
+    /// started now waits for them. Returns the loading, nil for no items.
     @discardableResult
     func addPicked<Item>(
         _ items: [Item],
@@ -360,25 +360,12 @@ final class ChatNewThreadModel: Hashable {
         guard !items.isEmpty else { return nil }
         carryGate.begin(items.count)
         return Task { @MainActor in
-            for (index, item) in items.enumerated() {
-                var succeeded = false
-                do {
-                    let loaded = try await load(item)
-                    if let data = loaded.data {
-                        addAttachment(DraftAttachmentImport.pickedAttachment(
-                            data: data, contentType: loaded.type, existingCount: attachments.count))
-                        succeeded = true
-                    } else {
-                        failedImports.append(DraftAttachmentImport.pickedFailureLabel(index: index))
-                    }
-                } catch {
-                    failedImports.append(DraftAttachmentImport.pickedFailureLabel(index: index))
-                    if DebugModeManager.isLoggingEnabled() {
-                        BackgroundSyncLogger.logDebug("[ChatNewDraft] picked item failed to load: \(error)")
-                    }
-                }
-                carryGate.completeOne(succeeded: succeeded)
-            }
+            await DraftAttachmentImport.loadPicked(
+                items, load: load,
+                existingCount: { self.attachments.count },
+                add: { self.addAttachment($0) },
+                fail: { self.failedImports.append($0) },
+                settled: { self.carryGate.completeOne(succeeded: $0) })
         }
     }
 

@@ -1988,28 +1988,16 @@ struct ComposeView: View {
         guard !items.isEmpty else { return }
         attachmentCarryGate.begin(items.count)
         Task { @MainActor in
-            for (index, item) in items.enumerated() {
-                var succeeded = false
-                do {
-                    if let data = try await item.loadTransferable(type: Data.self) {
-                        attachments.append(DraftAttachmentImport.pickedAttachment(
-                            data: data, contentType: item.supportedContentTypes.first,
-                            existingCount: attachments.count))
-                        succeeded = true
-                    } else {
-                        recordAttachmentPreparationFailure(
-                            DraftAttachmentImport.pickedFailureLabel(index: index))
-                    }
-                } catch {
-                    recordAttachmentPreparationFailure(
-                        DraftAttachmentImport.pickedFailureLabel(index: index))
-                    if DebugModeManager.isLoggingEnabled() {
-                        BackgroundSyncLogger.logDebug("[ComposeView] Photo picker import failed: \(error)")
-                    }
-                }
-                attachmentCarryGate.completeOne(succeeded: succeeded)
-                publishAttachmentPreparationFailuresIfSettled()
-            }
+            await DraftAttachmentImport.loadPicked(
+                items,
+                load: { item in (try await item.loadTransferable(type: Data.self), item.supportedContentTypes.first) },
+                existingCount: { attachments.count },
+                add: { attachments.append($0) },
+                fail: { recordAttachmentPreparationFailure($0) },
+                settled: { succeeded in
+                    attachmentCarryGate.completeOne(succeeded: succeeded)
+                    publishAttachmentPreparationFailuresIfSettled()
+                })
             photoPickerItems = []
         }
     }
