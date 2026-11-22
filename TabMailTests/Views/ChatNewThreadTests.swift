@@ -332,6 +332,18 @@ struct ChatNewThreadTests {
         #expect(none == nil, "no items, no loading")
     }
 
+    @Test("A picked item is named by the attachments already there when it lands")
+    func pickedItemCountsWhatIsThere() async {
+        let model = ChatNewThreadModel(account: nil)
+        model.addAttachment(DraftAttachment(filename: "report.pdf", mimeType: "application/pdf", data: Data([1])))
+        let loading = model.addPicked(["photo"]) { _ in (data: Data([2]) as Data?, type: UTType.jpeg as UTType?) }
+        await loading?.value
+        let names = model.attachments.map(\.filename)
+        let types = model.attachments.map(\.mimeType)
+        #expect(names == ["report.pdf", "photo_2.jpeg"])
+        #expect(types == ["application/pdf", "image/jpeg"])
+    }
+
     @Test("A picked item with no data is listed, not added")
     func pickedItemWithoutData() async {
         let model = ChatNewThreadModel(account: nil)
@@ -1007,6 +1019,37 @@ struct ChatNewDraftSaveTests {
         #expect(outcome == .saved)
         #expect(loadedNames == ["photo_1.png"])
         #expect(loadedData == [Data([7, 8, 9])])
+    }
+
+    @Test("A picked item that fails to load does not hold the save: it waits for the rest and saves what loaded")
+    func failedPickLetsTheSaveFinish() async throws {
+        struct LoadFailed: Error {}
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let recorder = QueueRecorder()
+        let model = makeModel(fixture, recorder)
+        let (release, releaseNow) = AsyncStream<Void>.makeStream()
+        let loading = model.addPicked(["broken", "empty", "photo"]) { item in
+            if item == "broken" { throw LoadFailed() }
+            if item == "empty" { return (data: nil, type: UTType.png as UTType?) }
+            for await _ in release { break }
+            return (data: Data([7]) as Data?, type: UTType.png as UTType?)
+        }
+        let save = Task { await model.saveIfNeeded() }
+        for _ in 0..<10 { await Task.yield() }
+        let rowsWhileLoading = try await rowCount(fixture)
+        #expect(rowsWhileLoading == 0, "the failed items settle, the loading one still holds the save")
+        releaseNow.yield(())
+        await loading?.value
+        let outcome = await save.value
+        let savedRow = try await row(fixture, model.draftId)
+        let saved = try #require(savedRow)
+        let loaded = try DraftAttachmentStorage.loadAttachments(dirName: saved.attachmentsDirName)
+        let loadedNames = loaded.map(\.filename)
+        let failures = [0, 1].map { DraftAttachmentImport.pickedFailureLabel(index: $0) }
+        #expect(outcome == .saved)
+        #expect(loadedNames == ["photo_1.png"])
+        #expect(model.failedImports == failures)
     }
 
     @Test("Back and the background saving at once write the draft once")

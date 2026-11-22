@@ -227,6 +227,12 @@ struct ComposeAttachmentCarryTests {
                 "every selected item must be counted before its async load and settled afterward")
         #expect(!body.contains("try? await item.loadTransferable"),
                 "a selected attachment that fails to load must be surfaced, not silently omitted")
+        let publish = try #require(body.range(of: "publishAttachmentPreparationFailuresIfSettled()"))
+        #expect(complete.lowerBound < publish.lowerBound, "failures are published once the item settles")
+        let cleared = try #require(body.range(of: "photoPickerItems = []"))
+        #expect(publish.lowerBound < cleared.lowerBound, "the picker's selection clears after every item settled")
+        #expect(body.contains("recordAttachmentPreparationFailure"), "a failed item is surfaced as compose's preparation failure")
+        #expect(body.contains("item.supportedContentTypes.first"), "a picked item is typed by its first content type")
     }
 
     @Test("File and camera attachment preparation failures are surfaced")
