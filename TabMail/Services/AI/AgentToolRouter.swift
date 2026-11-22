@@ -127,7 +127,8 @@ final class AgentToolRouter {
     static let shared = AgentToolRouter()
 
     /// Bumped whenever a queued compose request may have become takeable: a request
-    /// was queued, or the last compose window closed. The only observable compose
+    /// was queued, the last compose window closed, or a taken card was refused because
+    /// its bound From account is missing (`canOpen`). The only observable compose
     /// state: every host pill watches it and asks `takeCompose(for:)` for its own
     /// requests, so no view ever takes another screen's request (ADR-IOS-053 Phase 2,
     /// replacing the global `pendingCompose` slot that the first observer took).
