@@ -1207,6 +1207,8 @@ struct ChatReplyFieldTests {
         let writes = heightWrites.numberOfMatches(in: chat, range: NSRange(chat.startIndex..., in: chat))
         #expect(writes == 2, "the declaration and the guarded write: nothing else sets the bar's height")
         #expect(Self.count("$pillHeight", in: chat) == 0, "and no binding hands it to a writer elsewhere")
+        #expect(Self.count("_pillHeight", in: chat) == 0, "nor is it written through its storage")
+        #expect(Self.count("&pillHeight", in: chat) == 0, "nor handed on by reference")
         let fieldBar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
         #expect(Self.count(".modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))", in: fieldBar) == 1, "the swell on the glass")
         let editor = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")

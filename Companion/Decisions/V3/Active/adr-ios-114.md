@@ -1311,16 +1311,19 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    earlier crossing after a reversal. Sideways
    travel made while the text had the drag is not the field's, and a drag that reverses until the
    text scrolls again drops the hand-off and takes a new one when the text is back at its end. Only
-   the finger takes the drag back (amended 2026-11-22): the hand-off drops once the finger has come
-   down from its highest point since the hand-off and the text reads short of its end by no more than
-   the farthest it came down (`ChatFieldPan.Coordinator.fingerBroughtTextBack`, within
-   `ChatViewLayout.fieldTextReversalSlack`, 1 pt for a pixel's rounding at 1x: the text's own scroll
-   follows the finger point for point). It is read from the distance, not from a sample's direction,
-   and from the farthest, not from where the finger is now, because the text's scroll and the pan run
-   side by side and UIKit does not say which hears a move first: the text can show a downward move one
-   sample late, when the finger is already going up again, or only at the let-go. A text short by
-   more than the finger came down moved without it, and an earned hand-off survives that move, so the
-   rest of the drag stays the field's. Observed in a UI run, not documented by UIKit: on a layout
+   the finger takes the drag back (amended 2026-11-22): the hand-off drops when the text reads short of
+   its end once the finger has come down from its highest point since the hand-off by more than
+   `ChatViewLayout.fieldTextReversalSlack` (`ChatFieldPan.Coordinator.fingerCameBack`; 1 pt, at most a
+   pixel of text the field keeps). The text's own scroll follows the finger point for point, so a
+   finger that came down took the text back whenever the text shows it. It is read from the finger's
+   distance, not from a sample's direction nor from how far short the text reads, and from the
+   farthest, not from where the finger is now, because the text's scroll and the pan run side by side
+   and UIKit does not say which hears a move first: the text can show a downward move one sample late,
+   when the finger is already going up again, or only at the let-go, and can show its end first in the
+   sample the finger turned down in, so that sample's move down counts too, from the sample before.
+   A text short of its end with the finger not come down moved without it, and an earned hand-off
+   survives that move, so the rest of the drag stays the field's; once the finger has come down, a text
+   short of its end drops the hand-off whatever moved it. Observed in a UI run, not documented by UIKit: on a layout
    after the field was built again under a held drag past the end, UIKit scrolled the field's text to
    its caret at its start, and the let-go read no share and the panel stayed shut; the
    field's segment keeps the more-up-than-sideways rule, and whether the pan begins at all is
@@ -1397,9 +1400,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    share, from a touch-down offset that is not zero; `handOffClearsOnAReversal` and
    `diagonalThenStraightUp` the hand-off's state, both axes; `handOffSurvivesATextScrollTheFingerDidNotMake`
    the hand-off kept through a scroll of the text the finger did not make, a flick let go there, and
-   dropped by the finger coming back down; `handOffDropsWhenTheTextShowsTheFingersMoveLate` the
+   dropped by the finger coming back down, also after such a move; `handOffDropsWhenTheTextShowsTheFingersMoveLate` the
    finger's reversal read when the text shows it a sample late, at a second crossing or at a rested
-   let-go; `reversalSlack` the rule's own boundary; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
+   let-go; `handOffFoundOnAMoveDownCountsThatMove` a reversal in the very sample the text first shows
+   its end; `reversalHistoryEndsWithItsHandOff` each hand-off reading only its own reversal, after a
+   second crossing and in the next drag; `reversalSlack` the rule's own boundary; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
    floating-point remainder; `handOffInsideACrossingSample` and
    `handOffInsideACrossingSampleAfterAReversal` the hand-off inside a sample that crosses the end, where
    the text reached it; `upwardShareCountsFromTheSecondHandOff` the upward share after a reversal,

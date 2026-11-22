@@ -707,17 +707,19 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         /// from the point where the text under it reached its end; none while the text still has
         /// the drag (before it first reaches its end, and after the finger brings it back). The
         /// hand-off is found in the first sample with the text at its end, at the point of that
-        /// sample where the text reached it (`crossing`), and dropped when the finger brings the
-        /// text back from it (`fingerBroughtTextBack`), so a drag that reverses into the text and
-        /// reaches the end again hands off afresh. That is read from how far the finger came down,
-        /// not from the sample's direction: the text's own scroll and this pan run side by side,
-        /// and UIKit does not say which hears a move first, so the text can show a downward move
-        /// one sample late, with the finger already going up again, or only at the let-go. A move
-        /// of the text the finger did not make keeps
-        /// the hand-off, and the rest of the drag stays the field's: seen in a UI run (2026-11-22),
-        /// UIKit scrolled the field's text to its caret on a layout after the field was built
-        /// again while the finger was down. Off the text, all of it. `atLetGo`: the let-go's
-        /// sample (for the debug marker).
+        /// sample where the text reached it (`crossing`), and dropped when the text reads short of
+        /// its end once the finger has come back down (`fingerCameBack`), so a drag that reverses
+        /// into the text and reaches the end again hands off afresh. That is read from how far the
+        /// finger came down since the hand-off, not from the sample's direction nor from how far
+        /// short the text reads: the text's own scroll and this pan run side by side, and UIKit
+        /// does not say which hears a move first, so the text can show a downward move one sample
+        /// late, with the finger already going up again, or only at the let-go, and can show its
+        /// end in the sample the finger turned down in. A text short of its end with the finger not
+        /// come down moved without it, and keeps the hand-off with the rest of the drag the field's:
+        /// seen in a UI run (2026-11-22), UIKit scrolled the field's text to its caret on a layout
+        /// after the field was built again while the finger was down. Once the finger has come
+        /// down, a text short of its end drops the hand-off whatever moved it. Off the text, all of
+        /// it. `atLetGo`: the let-go's sample (for the debug marker).
         func share(_ drag: ChatHorizontalPan.Sample, atLetGo: Bool = false) -> ChatHorizontalPan.Sample {
             guard let text else { return drag }
             let end = Self.end(of: text)
@@ -728,13 +730,15 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
                 farthestDown = max(farthestDown, drag.travel.height - highest)
             }
             if !Self.isAtEnd(offset, end: end) {
-                if handOff != nil, Self.fingerBroughtTextBack(short: end - offset, fingerDown: farthestDown) {
+                if handOff != nil, Self.fingerCameBack(down: farthestDown) {
                     handOff = nil
                 }
             } else if handOff == nil {
                 handOff = Self.crossing(from: lastTravel, textAt: lastOffset, to: drag.travel, end: end)
-                highest = drag.travel.height
-                farthestDown = 0
+                // A text read a sample late shows its end in the sample the finger turned down in:
+                // that move down counts, from the sample before.
+                highest = min(lastTravel.height, drag.travel.height)
+                farthestDown = drag.travel.height - highest
             }
             lastTravel = drag.travel
             lastOffset = min(offset, end)
@@ -768,15 +772,16 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
                           height: last.height - room)
         }
 
-        /// Whether the finger brought a handed-off text back from its end: it came down
-        /// (`fingerDown`, the farthest from its highest point since the hand-off) and the text
-        /// reads `short` of its end by no more than that, within
+        /// Whether the finger came back down from a handed-off text's end: `down`, the farthest it
+        /// came down from its highest point since the hand-off (the sample before it too, when the
+        /// text first read its end on a move down), is more than
         /// `ChatViewLayout.fieldTextReversalSlack`. The text's own scroll follows the finger point
-        /// for point, so a text short by more than the finger came down moved without it, and a
-        /// finger that did not come down moved no text. The farthest, not where the finger is now:
-        /// a text read a sample late shows where the finger was, which may be lower than now.
-        static func fingerBroughtTextBack(short: CGFloat, fingerDown: CGFloat) -> Bool {
-            fingerDown > 0 && short <= fingerDown + ChatViewLayout.fieldTextReversalSlack
+        /// for point, so a finger that came down took the text back with it, whenever the text
+        /// shows it, and a finger that did not come down moved no text. The farthest, not where the
+        /// finger is now: a text read a sample late shows where the finger was, which may be lower
+        /// than now.
+        static func fingerCameBack(down: CGFloat) -> Bool {
+            down > ChatViewLayout.fieldTextReversalSlack
         }
 
         /// Whether the text at scroll position `offset` is at its `end`: within
