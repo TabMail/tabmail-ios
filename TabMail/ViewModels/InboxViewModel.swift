@@ -2104,7 +2104,8 @@ final class InboxViewModel {
     /// Records a whole-thread archive or delete whose members may go to
     /// different folders (`roleFolderMoves`): each member shows in its own
     /// destination at once, ONE undo entry returns every member to its own
-    /// account and folder, and each destination gets its own move.
+    /// account and folder, and each account's destination gets its own read
+    /// and move.
     private func recordThreadRoleMoves(
         _ moves: [(requestedId: String, message: MessageHeader, destinationPath: String)]
     ) {
@@ -2132,17 +2133,30 @@ final class InboxViewModel {
         if let undo = UndoableAction(moves: undoMoves, timestamp: Date()) {
             UndoService.shared.push(undo)
         }
-        var seenPaths = Set<String>()
-        let destinationPaths = moves.map(\.destinationPath).filter { seenPaths.insert($0).inserted }
+        // One read and one move per account and destination, never one call
+        // for several accounts: `markRead` and `move` each write every account
+        // they are given in ONE transaction, so a write one account refuses
+        // would roll back another account's work. Two accounts can name their
+        // role folders alike ("Archive").
+        var groups: [(accountId: String, destinationPath: String, messages: [MessageHeader])] = []
+        for move in moves {
+            if let index = groups.firstIndex(where: {
+                $0.accountId == move.message.accountId && $0.destinationPath == move.destinationPath
+            }) {
+                groups[index].messages.append(move.message)
+            } else {
+                groups.append((
+                    accountId: move.message.accountId,
+                    destinationPath: move.destinationPath,
+                    messages: [move.message]))
+            }
+        }
         manager.enqueueWriteFromSynchronousContext { [manager] in
-            // Read intent BEFORE the move — see `archive(_:)`. Only the
-            // members that are actually unread at execution time get it.
-            await manager.markReadBeforeRoleMove(ids: compositeIds)
-            // `move` files each account's members under their own account,
-            // so one call per destination path covers every account whose
-            // role folder has that path.
-            for path in destinationPaths {
-                await manager.move(moves.filter { $0.destinationPath == path }.map(\.message), to: path)
+            for group in groups {
+                // Read intent BEFORE the move — see `archive(_:)`. Only the
+                // members that are actually unread at execution time get it.
+                await manager.markReadBeforeRoleMove(ids: group.messages.map(\.id))
+                await manager.move(group.messages, to: group.destinationPath)
             }
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }
@@ -2875,7 +2889,10 @@ final class InboxViewModel {
     /// accounts, so only `accountId`'s members move. A thread can span
     /// accounts (see `roleFolderMoves`); a member of another account is
     /// reported skipped rather than moved to a same-named path its own
-    /// account may not have.
+    /// account may not have. A member already in the chosen folder is
+    /// reported skipped too: `AccountManager.move` drops it as a no-op, so it
+    /// must not show as moved or have a part in the Undo, whose reverse move
+    /// would name the folder it never left.
     ///
     /// Returns the ids of `messageIds` that were NOT acted upon (nothing
     /// resolved for them, or the whole call aborted) — the caller (InboxView)
@@ -2891,6 +2908,7 @@ final class InboxViewModel {
         }
         let actionable = resolved.filter {
             $0.message.accountId == accountId
+                && $0.message.folderPath != toFolderPath
                 && lookupFolderRole($0.message.folderId) != .drafts
         }
         let messages = actionable.map(\.message)
@@ -2927,8 +2945,8 @@ final class InboxViewModel {
             await manager.move(messages, to: toFolderPath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }
-        // Members that never resolved were never acted upon — report them
-        // skipped so the caller un-hides exactly those rows.
+        // Members that never resolved or were left out were never acted
+        // upon — report them skipped so the caller un-hides exactly those rows.
         let recorded = Set(actionable.map(\.requestedId))
         return messageIds.filter { !recorded.contains($0) }
     }

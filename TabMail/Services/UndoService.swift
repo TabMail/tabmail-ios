@@ -255,10 +255,17 @@ final class UndoService {
     /// instead of leaving the queued closure with a deleted primary key.
     private var undoInProgressAction: UndoableAction?
     private var undoInProgressRemainingCommands = 0
+    /// Whether any command of the in-progress action moved its members back,
+    /// and whether any was refused. An action can hold several commands (a
+    /// thread spanning accounts or folders), and `undoMove` restores or refuses
+    /// each command whole, so the notice is decided once, after the last one.
+    private var undoInProgressRestoredAny = false
+    private var undoInProgressRefusedAny = false
 
-    /// Set when `AccountManager.undoMove` refused a move Undo, whatever the
-    /// reason: the messages stay where the move put them. RootView shows it as
-    /// one short "Couldn't undo" notice; `dismissUndoFailure()` clears it.
+    /// Set when `AccountManager.undoMove` refused a move Undo, or a part of
+    /// one, whatever the reason: the refused messages stay where the move put
+    /// them. RootView shows it as one short "Couldn't undo" notice;
+    /// `dismissUndoFailure()` clears it.
     private(set) var undoFailureMessage: String? {
         didSet {
             BackgroundSyncLogger.logDebug(
@@ -267,6 +274,8 @@ final class UndoService {
     }
 
     static let moveUndoRefusedMessage = "Nothing was moved back."
+    /// An Undo that moved some members back and was refused for others.
+    static let moveUndoPartlyRefusedMessage = "Some messages were not moved back."
 
     func dismissUndoFailure() {
         undoFailureMessage = nil
@@ -494,6 +503,8 @@ final class UndoService {
         }
         undoInProgressAction = action
         undoInProgressRemainingCommands = action.commands.count
+        undoInProgressRestoredAny = false
+        undoInProgressRefusedAny = false
         if action.commands.isEmpty {
             undoInProgressAction = nil
             return
@@ -536,7 +547,8 @@ final class UndoService {
                         commandIndex: commandIndex)
                 }) else {
                     await MainActor.run {
-                        UndoService.shared.finishInProgressCommand(actionID: actionID)
+                        UndoService.shared.finishInProgressCommand(
+                            actionID: actionID, restored: nil)
                     }
                     return
                 }
@@ -579,11 +591,11 @@ final class UndoService {
                         NotificationCenter.default.post(
                             name: .inboxDataDidChange,
                             object: command.members.map(\.originalHeaderId))
-                        UndoService.shared.undoFailureMessage = UndoService.moveUndoRefusedMessage
                     }
                 }
                 await MainActor.run {
-                    UndoService.shared.finishInProgressCommand(actionID: actionID)
+                    UndoService.shared.finishInProgressCommand(
+                        actionID: actionID, restored: !restoredIds.isEmpty)
                 }
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[UndoStack] UNDO admitted action=\(actionID) restored=\(restoredIds.count)")
@@ -614,10 +626,24 @@ final class UndoService {
         return action.commands[commandIndex]
     }
 
-    private func finishInProgressCommand(actionID: UUID) {
+    /// `restored` is whether `undoMove` moved this command's members back
+    /// (`nil` when the command was gone and nothing was asked). After the last
+    /// command, a refusal raises one notice: "nothing" when no command moved
+    /// anything back, "some" when others did.
+    private func finishInProgressCommand(actionID: UUID, restored: Bool?) {
         guard undoInProgressAction?.id == actionID else { return }
+        switch restored {
+        case true?: undoInProgressRestoredAny = true
+        case false?: undoInProgressRefusedAny = true
+        case nil: break
+        }
         undoInProgressRemainingCommands -= 1
         if undoInProgressRemainingCommands <= 0 {
+            if undoInProgressRefusedAny {
+                undoFailureMessage = undoInProgressRestoredAny
+                    ? Self.moveUndoPartlyRefusedMessage
+                    : Self.moveUndoRefusedMessage
+            }
             undoInProgressRemainingCommands = 0
             undoInProgressAction = nil
         }
