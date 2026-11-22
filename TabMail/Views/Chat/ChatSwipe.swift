@@ -578,10 +578,14 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         }
 
         /// The text the drag's first touch landed in, where it was scrolled then, and the drag's
-        /// sideways travel when the text last reached its end (nil while it can still scroll).
+        /// sideways travel when the text last reached its end (nil while it can still scroll). The
+        /// previous sample's travel and the text's place then, to find where in the next sample
+        /// the text reached its end.
         private weak var text: UIScrollView?
         private var textStart: CGFloat = 0
         private var handOff: CGFloat?
+        private var lastTravel = CGSize.zero
+        private var lastOffset: CGFloat = 0
 
         /// Notes the text under a new drag's first touch.
         func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
@@ -598,6 +602,8 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             text = Self.scrollingText(around: view)
             text?.bouncesVertically = false
             textStart = text?.contentOffset.y ?? 0
+            lastTravel = .zero
+            lastOffset = textStart
             // A drag that starts with the text at its end is the field's from its start.
             if let text, text.contentOffset.y >= Self.end(of: text) {
                 handOff = 0
@@ -608,9 +614,10 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
 
         /// The field's share of `drag` (`ChatFieldDrag.fieldShare`): how far the text under it has
         /// scrolled since the touch, up to its end, is the text's, and so is the sideways travel
-        /// until the text reached its end. The hand-off is taken at the first sample with the text
-        /// at its end and dropped when the text scrolls back from it, so a drag that reverses into
-        /// the text and reaches the end again hands off afresh. Off the text, all of it.
+        /// until the text reached its end. The hand-off is found in the first sample with the text
+        /// at its end, at the point of that sample where the text reached it (`crossing`), and
+        /// dropped when the text scrolls back from it, so a drag that reverses into the text and
+        /// reaches the end again hands off afresh. Off the text, all of it.
         func share(_ drag: ChatHorizontalPan.Sample) -> ChatHorizontalPan.Sample {
             guard let text else { return drag }
             let end = Self.end(of: text)
@@ -618,12 +625,28 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             if offset < end {
                 handOff = nil
             } else if handOff == nil {
-                handOff = drag.travel.width
+                handOff = Self.crossing(from: lastTravel, textAt: lastOffset, to: drag.travel, end: end)
             }
+            lastTravel = drag.travel
+            lastOffset = min(offset, end)
             // Debug UI tests only: how far the text went past its end (`ChatFieldDragMarker`).
             ChatFieldDragMarker.textPastEnd(offset - end)
             return ChatFieldDrag.fieldShare(of: drag, textScrolled: min(offset, end) - textStart,
                                             handOff: handOff)
+        }
+
+        /// The drag's sideways travel where the text reached its end, within the sample that went
+        /// from `last` (the text then at `textAt`) to `travel`: the finger's upward move in that
+        /// sample took the text's remaining room first, and the sideways travel is taken at the
+        /// same point of the move, so neither axis of the field's share counts travel the text had.
+        /// The text's place cannot tell where in the sample the finger was, since the text holds
+        /// still at its end; the finger's travel can. A sample with no upward move hands off at its
+        /// end.
+        static func crossing(from last: CGSize, textAt: CGFloat, to travel: CGSize, end: CGFloat) -> CGFloat {
+            let up = last.height - travel.height
+            guard up > 0 else { return travel.width }
+            let part = min(1, max(0, (end - textAt) / up))
+            return last.width + (travel.width - last.width) * part
         }
 
         /// The scroll position at which `text` shows its end (its top when it does not scroll).

@@ -1055,7 +1055,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    field's share of each sample (`ChatFieldPan.Coordinator.share`, `ChatFieldDrag.fieldShare`):
    the finger's travel less what the text scrolled, counted up to its end; short of the end, no
    upward travel and no velocity, so a flick inside the text never opens the panel. Both axes of
-   the share count from the hand-off, where the text reached its end (amended 2026-11-21): sideways
+   the share count from the hand-off, where the text reached its end, found within the sample that
+   crosses it from the finger's travel (amended 2026-11-21, and 2026-11-22 for the crossing sample): sideways
    travel made while the text had the drag is not the field's, and a drag that reverses until the
    text scrolls again drops the hand-off and takes a new one when the text is back at its end; the
    field's segment keeps the more-up-than-sideways rule, and whether the pan begins at all is
@@ -1123,7 +1124,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    overflowing draft: the typed word replaces the double-tapped one),
    `ChatFieldDragTests.fieldShareOfATextDrag` and `panSharesWithTheTextUnderTheTouch` (the field's
    share, from a touch-down offset that is not zero; `handOffClearsOnAReversal` and
-   `diagonalThenStraightUp` the hand-off's state, both axes; `textUnderTheTouchDoesNotBounce` the
+   `diagonalThenStraightUp` the hand-off's state, both axes; `handOffInsideACrossingSample` and
+   `handOffInsideACrossingSampleAfterAReversal` the hand-off inside a sample that crosses the end, where
+   the text reached it; `textUnderTheTouchDoesNotBounce` the
    no-bounce rule; `textViewOrdering` pins the pan beside the text's scroll and not beside any other
    pan in or on the text view, a selection handle's among them; the first was
    `testDragUpInOverflowingTextScrollsItAndShortTextOpens`, whose short half ran signed out, where

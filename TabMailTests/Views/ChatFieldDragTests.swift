@@ -289,6 +289,66 @@ struct ChatFieldDragTests {
         }
     }
 
+    // A sample that crosses the text's end: from (20, -95), 5 short of the end, to (32, -105), the
+    // finger's 10 up took the last 5 of the text's room first, so on that straight segment the text
+    // reached its end at (26, -100). The field's share counts both axes from there.
+    @Test("In a sample that crosses the text's end, the field's sideways share starts where the text reached it")
+    @MainActor
+    func handOffInsideACrossingSample() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        let start = end / 2
+        // (release x, opens): 65 sideways and 62 up past the end is more sideways than up and stays
+        // shut; 59 sideways and 62 up opens.
+        for (x, opens) in [(CGFloat(91), false), (CGFloat(85), true)] {
+            text.contentOffset = CGPoint(x: 0, y: start)
+            coordinator.touchDown(on: inner)
+            text.contentOffset = CGPoint(x: 0, y: start + 95)
+            let before = coordinator.share(Self.sample(20, -95))
+            #expect(before == Self.sample(0, 0), "control: 5 short of the end the text has the drag")
+            text.contentOffset = CGPoint(x: 0, y: end)
+            let crossing = coordinator.share(Self.sample(32, -105))
+            #expect(crossing == Self.sample(6, -5), "the crossing sample's part past the end: 6 sideways, 5 up")
+            let letGo = coordinator.share(Self.sample(x, -162))
+            #expect(letGo == Self.sample(x - 26, -62), "counted from (26, -100), where the text reached its end")
+            let opened = ChatFieldDrag.opens(letGo: letGo)
+            #expect(opened == opens, "\(x - 26) sideways and 62 up past the end")
+        }
+    }
+
+    @Test("After a reversal back into the text, the next crossing sample hands off where the text reached its end again")
+    @MainActor
+    func handOffInsideACrossingSampleAfterAReversal() {
+        let coordinator = ChatFieldPan.Coordinator()
+        let (text, inner) = Self.longDraft()
+        let end = Self.textEnd
+        let start = end / 2
+        for (x, opens) in [(CGFloat(111), false), (CGFloat(105), true)] {
+            text.contentOffset = CGPoint(x: 0, y: start)
+            coordinator.touchDown(on: inner)
+            text.contentOffset = CGPoint(x: 0, y: start + 95)
+            let before = coordinator.share(Self.sample(20, -95))
+            #expect(before == Self.sample(0, 0), "control: 5 short of the end the text has the drag")
+            text.contentOffset = CGPoint(x: 0, y: end)
+            let first = coordinator.share(Self.sample(32, -105))
+            #expect(first == Self.sample(6, -5), "control: the first crossing hands off at (26, -100)")
+            // Back down into the text: it scrolls back 20 and has the drag again.
+            text.contentOffset = CGPoint(x: 0, y: end - 20)
+            let back = coordinator.share(Self.sample(40, -80))
+            #expect(back == Self.sample(0, 0), "control: back in the text, nothing is the field's")
+            // Up again across the end: the finger's 40 up took the text's last 20 first, so the text
+            // reached its end halfway through the sample, at (46, -100).
+            text.contentOffset = CGPoint(x: 0, y: end)
+            let again = coordinator.share(Self.sample(52, -120))
+            #expect(again == Self.sample(6, -20), "the second crossing's part past the end: 6 sideways, 20 up")
+            let letGo = coordinator.share(Self.sample(x, -162))
+            #expect(letGo == Self.sample(x - 46, -62), "counted from (46, -100), the second hand-off")
+            let opened = ChatFieldDrag.opens(letGo: letGo)
+            #expect(opened == opens, "\(x - 46) sideways and 62 up past the end")
+        }
+    }
+
     @Test("The text under the drag's first touch never bounces vertically")
     @MainActor
     func textUnderTheTouchDoesNotBounce() {
