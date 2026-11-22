@@ -1212,8 +1212,9 @@ struct ChatReplyFieldTests {
                 "the chat reads the reply tool's one decision of the field's own reply (FieldReplyCardWordsTests)")
         #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false }, onAgentCompose: openAgentCompose, composeFromAccountId: viewModel.message?.accountId, composeHostCovered: isAnyPresentation)", in: chat) == 1,
                 "the chat's pill binds the email's account as a new message's From and takes nothing while the chat is covered")
-        // A new message's card opens from the account bound when the turn started.
-        #expect(Self.count("req.composeView(account: navigationStore.accounts.first { $0.id == req.fromAccountId }) { outcome in", in: chat) == 1)
+        // A new message's card opens from the account bound when the turn started, and records the
+        // chat's screen, in the one presenter call.
+        #expect(Self.count("req.composeView(account: navigationStore.accounts.first { $0.id == req.fromAccountId }, openedOn: composeScreen(answering: req.replyTo)) { outcome in", in: chat) == 1)
         // The card and fieldComposeOpened are set only for a request this chat's own pill took
         // (ADR-IOS-053 Phase 2; ChatComposeRoutingTests runs it with the inbox and the email screen mounted).
         #expect(Self.count("private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {", in: chat) == 1)
