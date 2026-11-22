@@ -157,13 +157,21 @@ struct ChatFieldDragTests {
         let far = ChatHorizontalPan.Sample(travel: CGSize(width: 0, height: -70), velocity: CGSize(width: 0, height: -250))
         let farHeld = ChatFieldDrag.letGo(far, rested: 0.3)
         #expect(ChatFieldDrag.opens(letGo: farHeld), "held still past the open distance, it still opens")
+        // Both axes go to rest: a drag that ends more sideways than up (80 across, 65 up), held
+        // after a move back toward the middle (-160 pt/s across), would predict 40 across and 65
+        // up, and open, if its sideways speed were kept.
+        let sideways = ChatHorizontalPan.Sample(travel: CGSize(width: 80, height: -65), velocity: CGSize(width: -160, height: 0))
+        let sidewaysHeld = ChatFieldDrag.letGo(sideways, rested: 0.3)
+        #expect(ChatFieldDrag.opens(letGo: sideways), "control: lifted with that speed, it would open")
+        #expect(sidewaysHeld == ChatHorizontalPan.Sample(travel: sideways.travel, velocity: .zero), "held, its travel is kept and both speeds go to rest")
+        #expect(!ChatFieldDrag.opens(letGo: sidewaysHeld), "held, it ends more sideways than up and settles back")
     }
 
     @Test("The field's pan reads how long the finger held still before it lifted: from its last move, nothing before the lift")
     @MainActor
     func panReadsTheRest() {
         let pan = ChatFieldPan.Recognizer()
-        #expect(pan.restedBeforeLift == 0, "nothing before the finger is down")
+        #expect(pan.restedBeforeLift == 0, "nothing before the finger moves")
         pan.moved(at: 10)
         pan.moved(at: 10.25)
         #expect(pan.restedBeforeLift == 0, "nothing while the finger is down")

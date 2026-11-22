@@ -965,7 +965,9 @@ struct ChatReplyFieldTests {
         // the no-reply notice rather than over them: hung by its bottom from the stack's top edge.
         // Only while the whole card fits between the header and the stack: otherwise nothing, so
         // the tip waits for room and keeps its one showing.
-        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop)) Color.clear.frame(height: 0) // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipWait()) } .frame(height: tipRoom, alignment: .bottom) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
+        // While it waits, the card `ViewThatFits` did not pick is hidden from VoiceOver, which would
+        // otherwise read a card that is not on screen.
+        #expect(Self.count("TipView(ChatFieldDragTip(), arrowEdge: .bottom) .fixedSize(horizontal: false, vertical: true) // `ViewThatFits` keeps the candidate it did not pick in the // accessibility tree: VoiceOver must not read a card that is not // on screen while the stand-in shows. .accessibilityHidden(tipWaitsForRoom) // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop)) Color.clear.frame(height: 0) .onAppear { tipWaitsForRoom = true } .onDisappear { tipWaitsForRoom = false } // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`). .modifier(ChatFieldDragMarker.TipWait()) } .frame(height: tipRoom, alignment: .bottom) } } } .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)", in: chat) == 1)
         let room = try Self.body(of: "private var tipRoom: CGFloat {", in: chat)
         #expect(Self.count("let room = pillTop - headerBottom return room.isFinite ? max(0, room) : 0", in: room) == 1,
                 "the measured space between the header's bottom and the stack's top; none until measured")
@@ -1050,8 +1052,15 @@ struct ChatReplyFieldTests {
         // One bridge for every chat pan: the field's drag reads the swipes' sample and outcome, with
         // no delivery of its own.
         let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
-        #expect(Self.count("ChatHorizontalPan.deliver(recognizer, moved: { moved(coordinator.share($0)) }, ended: { ended(coordinator.share($0), $1) })", in: swipe) == 1,
-                "the field's pan hands on only the field's share of each sample (`ChatFieldPan.Coordinator.share`)")
+        #expect(Self.count("ChatHorizontalPan.deliver(recognizer, moved: { moved(coordinator.share($0)) }, ended: { coordinator.letGo() ended(coordinator.share(ChatFieldDrag.letGo($0, rested: recognizer.restedBeforeLift)), $1) })", in: swipe) == 1,
+                "the field's pan hands on only the field's share of each sample (`ChatFieldPan.Coordinator.share`), its let-go at rest after a hold (`ChatFieldDrag.letGo`)")
+        // The rest is read on the touches' clock from the last move to the lift; a touch coming
+        // down is not a move (a second finger landing during a hold leaves it a hold), and each
+        // new drag starts with nothing.
+        #expect(Self.count("override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) { moved(at: event.timestamp) super.touchesMoved(touches, with: event) }", in: swipe) == 1)
+        #expect(Self.count("override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) { lifted(at: event.timestamp) super.touchesEnded(touches, with: event) }", in: swipe) == 1)
+        #expect(Self.count("override func touchesBegan(", in: swipe) == 0)
+        #expect(Self.count("override func reset() { super.reset() lastMove = nil lift = nil }", in: swipe) == 1)
         #expect(Self.count("static func deliver(", in: swipe) == 2, "the bridge's, and the swipe's sideways reading of it")
         #expect(Self.count("recognizer.translation(in:", in: swipe) == 1, "one place samples a pan")
         // VoiceOver opens the panel with a named action on the text field it focuses, offered only

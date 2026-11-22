@@ -4,6 +4,8 @@
 
 import SwiftUI
 import UIKit
+// The touch callbacks the field's pan (`ChatFieldPan.Recognizer`) overrides.
+import UIKit.UIGestureRecognizerSubclass
 
 /// What the chat's swipes act on (ADR-IOS-114 decision 12).
 enum ChatSwipe {
@@ -384,8 +386,7 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     /// The swipe's pan, asking `delegate` before it starts so a vertical drag stays the scroll
-    /// view's (`Coordinator.gestureRecognizerShouldBegin`). The reply field's drag up builds its
-    /// pan here too (`ChatFieldPan`), with its own delegate.
+    /// view's (`Coordinator.gestureRecognizerShouldBegin`).
     static func makePan(delegate: any UIGestureRecognizerDelegate) -> UIPanGestureRecognizer {
         let pan = UIPanGestureRecognizer()
         pan.delegate = delegate
@@ -572,7 +573,8 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
             return max(0, lift - lastMove)
         }
 
-        /// The finger came down or moved at `time`.
+        /// The finger moved at `time`. A touch coming down is not a move: a pan only begins once
+        /// the finger moved, and a second finger landing during a hold leaves the hold a hold.
         func moved(at time: TimeInterval) {
             lastMove = time
         }
@@ -580,11 +582,6 @@ struct ChatFieldPan: UIGestureRecognizerRepresentable {
         /// The finger lifted at `time`.
         func lifted(at time: TimeInterval) {
             lift = time
-        }
-
-        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-            moved(at: event.timestamp)
-            super.touchesBegan(touches, with: event)
         }
 
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
