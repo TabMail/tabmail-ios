@@ -239,6 +239,8 @@ struct ChatComposeRoutingTests {
         let threadKey: String
         /// The thread's earlier email in the other account (`withScreens(earlier: true)`).
         let earlier: MessageHeader?
+        /// The store the screens and their cards read the app's accounts from.
+        let navigationStore: NavigationStore
         var view: UIView { controller.view }
 
         /// Every view controller presented over the screens, bottom first.
@@ -363,7 +365,8 @@ struct ChatComposeRoutingTests {
             await queue.setDispatchSuppressedForTesting(false)
             if let registeredReply { await registry.register(registeredReply) }
         }
-        let screens = Screens(controller: controller, route: route, email: email, threadKey: threadKey, earlier: earlierEmail)
+        let screens = Screens(controller: controller, route: route, email: email, threadKey: threadKey, earlier: earlierEmail,
+                              navigationStore: navigationStore)
         do {
             // The root screen shows first, with its pill, then the chat is pushed over it.
             if waiting == nil {
@@ -560,6 +563,27 @@ struct ChatComposeRoutingTests {
     /// Every accessibility label of the compose card open over the screens.
     private static func cardLabels(in screens: Screens) -> [String] {
         screens.presented.flatMap { HostedAccessibility.labels(in: $0.view) }
+    }
+
+    /// The open card's labels once its From row (one of the two accounts) is in the accessibility
+    /// tree, or nil when it never joins it. The row is SwiftUI inside the compose card's scroll view,
+    /// whose elements can stay out of the tree while drawn (#1124); the recipient field
+    /// `openedCard` waits for is UIKit and always there. A missing row is that known issue, so the
+    /// caller checks the account only on a card that shows it; the presenters' wiring of the bound
+    /// account is fenced in `ChatReplyFieldTests.recipientsWiring`, which runs every time.
+    private static func cardFromLabels(in screens: Screens) async throws -> [String]? {
+        var labels: [String] = []
+        for _ in 0..<20 {
+            labels = cardLabels(in: screens)
+            if labels.contains(where: { $0.contains(me) || $0.contains(other) }) { return labels }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let accountCount = screens.navigationStore.accounts.count
+        withKnownIssue("The compose card's scroll view can leave its rows out of the accessibility tree (#1124)",
+                       isIntermittent: true) {
+            Issue.record("the card's From row is not in the accessibility tree (the screens hold \(accountCount) accounts): \(labels)")
+        }
+        return nil
     }
 
     // MARK: - 1. The chat over another screen opens its own card, addressed as asked
@@ -1231,11 +1255,12 @@ struct ChatComposeRoutingTests {
                 let card = try await Self.openOwnCard(
                     ComposeOrigin(sessionKey: screens.threadKey, screen: screen, fromAccountId: Self.otherAccount), in: screens)
                 #expect(Self.addresses(card["to"]) == [Self.ownCardAddress], "control: the new email's card: \(card)")
-                let labels = Self.cardLabels(in: screens)
-                let fromBound = labels.contains { $0.contains(Self.other) }
-                let fromFirst = labels.contains { $0.contains(Self.me) }
-                #expect(fromBound, "the card sends from the account bound when the turn started: \(labels)")
-                #expect(!fromFirst, "never from the app's first account: \(labels)")
+                if let labels = try await Self.cardFromLabels(in: screens) {
+                    let fromBound = labels.contains { $0.contains(Self.other) }
+                    let fromFirst = labels.contains { $0.contains(Self.me) }
+                    #expect(fromBound, "the card sends from the account bound when the turn started: \(labels)")
+                    #expect(!fromFirst, "never from the app's first account: \(labels)")
+                }
             }
         }
     }
@@ -1266,11 +1291,12 @@ struct ChatComposeRoutingTests {
                     router.composePresentationDidEnd()
                     let card = try await Self.openedCard(in: screens)
                     #expect(Self.addresses(card["to"]) == [Backend.newEmailTo], "the chat's new email: \(card)")
-                    let labels = Self.cardLabels(in: screens)
-                    let fromOpener = labels.contains { $0.contains(Self.other) }
-                    let fromNewest = labels.contains { $0.contains(Self.me) }
-                    #expect(fromOpener, "the card sends from the opener's account: \(labels)")
-                    #expect(!fromNewest, "never from the newest email's account: \(labels)")
+                    if let labels = try await Self.cardFromLabels(in: screens) {
+                        let fromOpener = labels.contains { $0.contains(Self.other) }
+                        let fromNewest = labels.contains { $0.contains(Self.me) }
+                        #expect(fromOpener, "the card sends from the opener's account: \(labels)")
+                        #expect(!fromNewest, "never from the newest email's account: \(labels)")
+                    }
                 }
             }
         }
@@ -1284,9 +1310,10 @@ struct ChatComposeRoutingTests {
             try await withScreens(.inbox, backend, tag: "from-inbox", chat: false, earlier: true) { screens in
                 let card = try await Self.openOwnCard(Self.rootOrigin(.inbox, screens), in: screens)
                 #expect(Self.addresses(card["to"]) == [Self.ownCardAddress], "control: the new email's card: \(card)")
-                let labels = Self.cardLabels(in: screens)
-                let fromFirst = labels.contains { $0.contains(Self.me) }
-                #expect(fromFirst, "the inbox's new email picks the app's first account: \(labels)")
+                if let labels = try await Self.cardFromLabels(in: screens) {
+                    let fromFirst = labels.contains { $0.contains(Self.me) }
+                    #expect(fromFirst, "the inbox's new email picks the app's first account: \(labels)")
+                }
             }
         }
     }
@@ -1419,11 +1446,12 @@ struct ChatComposeRoutingTests {
                     screens.route.chatShown = false
                     let card = try await Self.openedCard(in: screens)
                     #expect(Self.addresses(card["to"]) == [Backend.newEmailTo], "the email screen's new email: \(card)")
-                    let labels = Self.cardLabels(in: screens)
-                    let fromBound = labels.contains { $0.contains(Self.me) }
-                    let fromChat = labels.contains { $0.contains(Self.other) }
-                    #expect(fromBound, "the card sends from the account bound when the turn started: \(labels)")
-                    #expect(!fromChat, "never from the account of the chat that resumed it: \(labels)")
+                    if let labels = try await Self.cardFromLabels(in: screens) {
+                        let fromBound = labels.contains { $0.contains(Self.me) }
+                        let fromChat = labels.contains { $0.contains(Self.other) }
+                        #expect(fromBound, "the card sends from the account bound when the turn started: \(labels)")
+                        #expect(!fromChat, "never from the account of the chat that resumed it: \(labels)")
+                    }
                     #expect(router.composeQueueDepth == 0)
                 }
             }
