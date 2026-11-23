@@ -96,7 +96,9 @@ struct ChatNewThreadView: View {
         // added the user's own address.
         .sheet(isPresented: $showsAddRecipient) { [ownAddresses] in
             ChatReplyToSheet(replyPeople: model.people, target: .replyAll, ownAddresses: ownAddresses,
-                             title: ChatReplyToSheet.addRecipientTitle) { done in
+                             title: ChatReplyToSheet.addRecipientTitle,
+                             recentPeople: { await ChatRecentPeople.load(pool: AppDatabase.rawPool, ownAddresses: ownAddresses,
+                                                                           demoActive: DemoModeStore.isDemoActive) }) { done in
                 model.setPeople(ChatNewDraft.people(after: done, current: model.people))
             }
         }
