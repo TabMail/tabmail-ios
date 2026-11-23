@@ -69,6 +69,27 @@ enum DraftAttachmentImport {
         }
     }
 
+    /// A photo or video the photo library picker handed over as an item provider
+    /// (`PhotoLibraryPickerView`), loaded for `loadPicked`: the bytes of its first type that holds
+    /// data, whole, typed by that type. A provider with no such type loads no data, so it is
+    /// reported like any picked item that did not load.
+    @MainActor
+    static func providedItem(_ provider: NSItemProvider) async throws -> (data: Data?, type: UTType?) {
+        guard let type = provider.registeredContentTypes.first(where: { $0.conforms(to: .data) }) else {
+            return (nil, nil)
+        }
+        let data: Data? = try await withCheckedThrowingContinuation { continuation in
+            _ = provider.loadDataRepresentation(for: type) { data, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: data)
+                }
+            }
+        }
+        return (data, type)
+    }
+
     /// The camera's photo as JPEG, named `photo_<n>.jpg` like a picked photo; nil when the image
     /// cannot be encoded (report it under `cameraFailureLabel`).
     static func cameraAttachment(_ image: UIImage, existingCount: Int) -> DraftAttachment? {

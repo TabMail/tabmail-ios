@@ -12,6 +12,12 @@ extension Notification.Name {
     static let chatScrollPhaseForTesting = Notification.Name("chatScrollPhaseForTesting")
     /// Test fixture only: the jump button was tapped (its animated scroll starts now).
     static let chatJumpTappedForTesting = Notification.Name("chatJumpTappedForTesting")
+    /// Test seam only: a pick for the reply field's paperclip (a `ComposeAttachmentPick`), as if a
+    /// picker gave it and closed.
+    static let chatPaperclipPickForTesting = Notification.Name("chatPaperclipPickForTesting")
+    /// Test seam only: a choice in the reply field's paperclip menu (a
+    /// `ChatNewEmailField.AttachSource`), which opens its picker as the menu does.
+    static let chatPaperclipOpenForTesting = Notification.Name("chatPaperclipOpenForTesting")
 }
 #endif
 
@@ -117,6 +123,16 @@ struct ChatThreadView: View {
     /// (`ChatNewEmailCover`).
     @State private var newEmailCover: ChatNewEmailCover?
     @Environment(\.hasTabMailSession) private var hasTabMailSession
+    /// The reply field's paperclip (ADR-IOS-114 decision 10): its pickers, and the card a pick
+    /// made, held until its picker has closed.
+    @State private var showsPhotoPicker = false
+    @State private var showsFilePicker = false
+    @State private var showsCamera = false
+    @State private var pendingAttachCard: ChatReadyReply?
+    /// A paperclip picker is open: from the menu's choice until its `onDismiss`. A pick that lands
+    /// while it is waits for that `onDismiss`; one a picker reports after it (the Files picker can
+    /// close itself first) opens at once, since nothing is closing any more.
+    @State private var paperclipPickerOpen = false
     @Environment(\.dismiss) private var dismiss
     /// The app's accounts: a new email's card opens from its bound account, looked up here.
     @Environment(NavigationStore.self) private var navigationStore
@@ -192,6 +208,7 @@ struct ChatThreadView: View {
     private var isAnyPresentation: Bool {
         cardMessage != nil || readyReply != nil || agentCompose != nil
             || forwardMessage != nil || showsReplyTo || showsMove || newEmailCover != nil
+            || showsPhotoPicker || showsFilePicker || showsCamera || pendingAttachCard != nil
     }
 
     // MARK: - Body
@@ -342,13 +359,12 @@ struct ChatThreadView: View {
         }
         .fullScreenCover(item: $readyReply) { ready in
             let _ = ChatThreadView.logReadyCard(ready)
-            // Today's Reply All compose, with the AI Suggestion in its box: the full reply of the
-            // row the ghost showed, read with it, so the card holds the reply that was tapped. It
-            // leaves the field alone: the field's words are not what it sends, and a sent reply retires the
+            // Today's reply compose: the ghost's, Reply All with the AI Suggestion in its box (the
+            // full reply of the row the ghost showed, read with it, so the card holds the reply
+            // that was tapped), or the paperclip's, with what was picked. It leaves the field
+            // alone: the field's words are not what it sends, and a sent reply retires the
             // suggestion through the outbox.
-            ready.compose.composeView(
-                replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
-                openedOn: composeScreen(answering: ready.message), onAgentOutcome: { _ in })
+            ready.composeView(openedOn: composeScreen(answering: ready.message)) { outcome in readyCardEnded(outcome) }
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
         .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }
@@ -358,6 +374,34 @@ struct ChatThreadView: View {
                 replyPeople: thread.replyPeople, target: replyTarget,
                 ownAddresses: context.ownAddresses) { replyTarget = $0 }
         }
+        // The reply field's paperclip: a pick makes the reply's card, which opens once its picker
+        // has closed (each picker's `onDismiss`): UIKit refuses the card's cover while the picker
+        // is still closing.
+        .sheet(isPresented: $showsPhotoPicker, onDismiss: openPendingAttachCard) {
+            PhotoLibraryPickerView { providers in attachPicked(.photos(providers)) }
+        }
+        .sheet(isPresented: $showsFilePicker, onDismiss: openPendingAttachCard) {
+            FilePickerView { urls in attachPicked(.files(urls)) }
+        }
+        .fullScreenCover(isPresented: $showsCamera, onDismiss: openPendingAttachCard) {
+            CameraPickerView { image in attachPicked(.camera(image)) }
+        }
+        #if DEBUG
+        // Test seam: a hosted test cannot drive the system pickers, so it hands over a pick here
+        // and closes the picker as a picker does: the pick, then its `onDismiss`. Production never
+        // posts it.
+        .onReceive(NotificationCenter.default.publisher(for: .chatPaperclipPickForTesting)) { note in
+            guard let pick = note.object as? ComposeAttachmentPick else { return }
+            attachPicked(pick)
+            openPendingAttachCard()
+        }
+        // Test seam: the paperclip's menu is a system menu a hosted test cannot open, so the test
+        // makes the menu's choice here and then drives the real picker. Production never posts it.
+        .onReceive(NotificationCenter.default.publisher(for: .chatPaperclipOpenForTesting)) { note in
+            guard let source = note.object as? ChatNewEmailField.AttachSource else { return }
+            attachFromField(source)
+        }
+        #endif
         .sheet(isPresented: $showsMove) {
             if let opened = viewModel.message {
                 MoveFolderPicker(accountId: opened.accountId, currentFolderPath: opened.folderPath) { path in
@@ -940,7 +984,7 @@ struct ChatThreadView: View {
     /// Debug-gated: each build of the ready card's content, with the draft it names.
     static func logReadyCard(_ ready: ChatReadyReply) {
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) suggestionLen=\(ready.suggestion.body.count)")
+            BackgroundSyncLogger.logDebug("[Chat] ready card built draftId=\(ready.draftId) suggestionLen=\(ready.suggestion?.body.count ?? -1) picked=\(ready.pick != nil)")
         }
     }
 
@@ -962,6 +1006,11 @@ struct ChatThreadView: View {
         let isOwn = thread.items.last?.isOwn ?? false
         let isNoReply = !isOwn && EmailFilter.isNoReply(newest.fromAddress)
         let shown = shownSuggestion(on: newest, thread: thread)
+        // The paperclip's card goes to the reply's people, so the paperclip shows only once the chat
+        // can tell the user's own addresses from theirs: the thread loaded and the email's own
+        // account read (`isLoaded` alone is also set when the context read failed).
+        let knowsAudience = viewModel.hasLoadedThread && context.isLoaded
+            && context.accounts.contains(where: { $0.id == newest.accountId })
         return VStack(spacing: 8) {
             if let only = replyTarget.only, !chatExpanded {
                 replyingOnlyTo(only)
@@ -989,7 +1038,9 @@ struct ChatThreadView: View {
                     // action), on the text field VoiceOver focuses; not over the panel or the tutorial.
                     showChat: chatExpanded || TutorialCoordinator.shared.isRunning
                         ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } },
-                    suggestion: shown),
+                    suggestion: shown,
+                    // A closure, as `showChat`'s: the method itself is MainActor-isolated.
+                    attach: knowsAudience ? { attachFromField($0) } : nil),
                 onFieldSend: { _ in fieldComposeOpened = false },
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: viewModel.message?.accountId,
@@ -1156,6 +1207,48 @@ struct ChatThreadView: View {
     private func agentAnswered() {
         guard !fieldComposeOpened else { return }
         withAnimation(Self.pillSpring) { chatExpanded = true }
+    }
+
+    /// A choice in the reply field's paperclip (ADR-IOS-114 decision 10): the picker it names. The
+    /// tutorial's mail actions are off.
+    private func attachFromField(_ source: ChatNewEmailField.AttachSource) {
+        guard TutorialCoordinator.shared.admits(.other) else { return }
+        paperclipPickerOpen = true
+        switch source {
+        case .photos: showsPhotoPicker = true
+        case .camera: showsCamera = true
+        case .files: showsFilePicker = true
+        }
+    }
+
+    /// Something picked with the paperclip: the reply's compose card with it, read as the pick
+    /// lands, as a send from the field is: on the newest email, to whom the field's reply goes, with
+    /// the suggestion the chat shows (`ChatReadyReply(attaching:)`). It opens once the picker has
+    /// closed (`openPendingAttachCard`), at once if it already has.
+    private func attachPicked(_ pick: ComposeAttachmentPick) {
+        guard let newest = thread.newest else { return }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Chat] paperclip pick message=\(newest.id) onlyTo=\(replyTarget.only?.count ?? -1)")
+        }
+        pendingAttachCard = ChatReadyReply(
+            attaching: pick, to: newest, onlyTo: replyTarget.only,
+            shown: shownSuggestion(on: newest, thread: thread), accounts: context.accounts)
+        if !paperclipPickerOpen { openPendingAttachCard() }
+    }
+
+    /// The paperclip's picker has closed: the card its pick made, if any, opens now.
+    private func openPendingAttachCard() {
+        paperclipPickerOpen = false
+        guard let card = pendingAttachCard else { return }
+        pendingAttachCard = nil
+        readyReply = card
+    }
+
+    /// The ghost's or the paperclip's card closed. Its words were never the field's, so the field
+    /// stays as it is; a reply sent clears "Replying only to", so the next one is a Reply All again.
+    private func readyCardEnded(_ outcome: ComposeOutcome) {
+        guard case .sent = outcome else { return }
+        replyTarget = .replyAll
     }
 
     /// A compose card from the chat closed. Sent: a reply shows as its queued email's bubble, read

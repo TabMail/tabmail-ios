@@ -172,6 +172,46 @@ struct DraftAttachmentImportTests {
         #expect(calls == 0)
     }
 
+    @Test("A photo library item loads whole, typed by its first type that holds data")
+    @MainActor
+    func providedItemLoadsWhole() async throws {
+        let bytes = Data((0..<300_000).map { UInt8($0 % 251) })
+        let provider = NSItemProvider()
+        // A type that holds no data comes first, so the item is typed by the first one that does.
+        provider.registerDataRepresentation(for: UTType.folder, visibility: .all) { completion in
+            completion(Data([9]), nil)
+            return nil
+        }
+        provider.registerDataRepresentation(for: UTType.png, visibility: .all) { completion in
+            completion(bytes, nil)
+            return nil
+        }
+        let loaded = try await DraftAttachmentImport.providedItem(provider)
+        #expect(loaded.type == UTType.png)
+        #expect(loaded.data == bytes, "the bytes are kept whole: \(loaded.data?.count ?? -1) of \(bytes.count)")
+    }
+
+    @Test("A photo library item with no type that holds data loads nothing, so it is reported as not loaded")
+    @MainActor
+    func providedItemWithoutData() async throws {
+        let loaded = try await DraftAttachmentImport.providedItem(NSItemProvider())
+        #expect(loaded.data == nil)
+        #expect(loaded.type == nil)
+    }
+
+    @Test("A photo library item that fails to load throws, so it is reported as not loaded")
+    @MainActor
+    func providedItemFailure() async {
+        let provider = NSItemProvider()
+        provider.registerDataRepresentation(for: UTType.jpeg, visibility: .all) { completion in
+            completion(nil, ReadFailed())
+            return nil
+        }
+        await #expect(throws: (any Error).self) {
+            _ = try await DraftAttachmentImport.providedItem(provider)
+        }
+    }
+
     @Test("Importing no files gives nothing and no failures")
     func importNoFiles() {
         let result = DraftAttachmentImport.importFiles([]) { _ in Data() }

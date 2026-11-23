@@ -224,7 +224,8 @@ struct ComposeSuggestionPersistTests {
         let fresh = try #require(prepopulate.range(of: "freshSuggestion: {"))
         #expect(prepopulate[decision.upperBound..<fresh.lowerBound].contains("onlyToChosen: onlyToChosen,"),
                 "the card's own choice decides whether it may read the row's reply")
-        let closure = try #require(prepopulate.range(of: "guard let reply = replyTo else { return nil }"))
+        // A chat card reads no stored suggestion (`offersStoredSuggestion`): it shows the chat's or none.
+        let closure = try #require(prepopulate.range(of: "guard offersStoredSuggestion, let reply = replyTo else { return nil }"))
         let stored = try #require(prepopulate.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
         #expect(closure.lowerBound < stored.lowerBound,
                 "the closure reads the stored suggestion from the row at reply.id")
@@ -251,9 +252,11 @@ struct ComposeSuggestionPersistTests {
             message: email, suggestion: ReplyResult(body: Self.cardSuggestion, textMessage: nil), accounts: [account])
         let accepted = ComposeDraftGuards.acceptingVisibleSuggestion(.init(
             messageBody: "", showingSuggestion: true, currentSuggestion: Self.cardSuggestion))
-        let existing = try await db.read { try Draft.fetchOne($0, key: card.draftId) }
+        // The card holds a pick (not Sendable), so the database read gets only its draft's key.
+        let draftId = card.draftId
+        let existing = try await db.read { try Draft.fetchOne($0, key: draftId) }
         let row = ComposeDraftGuards.draftToSave(
-            existing: existing, id: card.draftId, accountId: account.id,
+            existing: existing, id: draftId, accountId: account.id,
             recipients: (card.compose.to, card.compose.cc, card.compose.bcc), subject: "Re: Test Subject",
             body: accepted.messageBody, replyTo: email, isForward: false, isReplyAll: false,
             attachmentsDirName: nil, now: Date().timeIntervalSince1970)

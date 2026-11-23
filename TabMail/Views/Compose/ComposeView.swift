@@ -1254,6 +1254,10 @@ struct ComposeView: View {
     /// The reply's stored AI Suggestion as it showed (the chat's ghost), as one value; it wins over
     /// `suggestedBody`, a body alone (the agent's).
     var suggestion: ReplyResult?
+    /// Whether a reply opened with no suggestion reads the email's stored AI Suggestion into its
+    /// box. The chat's cards pass false: they show the suggestion the chat showed, or none (the
+    /// chat hides it on the user's turn and while the reply goes only to some of the people).
+    var offersStoredSuggestion: Bool = true
     var account: Account?
     var isForward: Bool = false
     /// Opened as Reply All (#915). Persisted on the draft row and the outbox row
@@ -1273,6 +1277,9 @@ struct ComposeView: View {
     /// (PendingSendService.undo) to restore attachments the user had when
     /// they tapped Send.
     var prefillAttachments: [DraftAttachment]?
+    /// Picked before the card opened (the chat's paperclip): added once the draft has loaded,
+    /// after the fields' starting state is recorded, so Close asks before losing it.
+    var attachmentPick: ComposeAttachmentPick?
     /// When true, the initial-state snapshot is taken BEFORE prefill values
     /// are applied, so any prefilled content counts as "unsaved changes" in
     /// closeCompose. This makes the Undo-Send reopen flow naturally ask the
@@ -1315,6 +1322,7 @@ struct ComposeView: View {
         replyTo: MessageHeader? = nil,
         suggestedBody: String? = nil,
         suggestion: ReplyResult? = nil,
+        offersStoredSuggestion: Bool = true,
         account: Account? = nil,
         isForward: Bool = false,
         isReplyAll: Bool = false,
@@ -1325,6 +1333,7 @@ struct ComposeView: View {
         prefillSubject: String? = nil,
         prefillBody: String? = nil,
         prefillAttachments: [DraftAttachment]? = nil,
+        attachmentPick: ComposeAttachmentPick? = nil,
         prefillTreatAsUnsavedChanges: Bool = false,
         prefillDraftId: String? = nil,
         openAuthority: LocallyAuthoredDraftOpenAuthority? = nil,
@@ -1336,6 +1345,7 @@ struct ComposeView: View {
         self.replyTo = replyTo
         self.suggestedBody = suggestedBody
         self.suggestion = suggestion
+        self.offersStoredSuggestion = offersStoredSuggestion
         self.account = account
         self.isForward = isForward
         self.isReplyAll = isReplyAll
@@ -1346,6 +1356,7 @@ struct ComposeView: View {
         self.prefillSubject = prefillSubject
         self.prefillBody = prefillBody
         self.prefillAttachments = prefillAttachments
+        self.attachmentPick = attachmentPick
         self.prefillTreatAsUnsavedChanges = prefillTreatAsUnsavedChanges
         self.prefillDraftId = prefillDraftId
         self.openAuthority = openAuthority
@@ -1978,15 +1989,7 @@ struct ComposeView: View {
                 handleFileImport(result)
             }
             .fullScreenCover(isPresented: $showCamera) {
-                CameraPickerView { image in
-                    guard let attachment = DraftAttachmentImport.cameraAttachment(
-                        image, existingCount: attachments.count) else {
-                        recordAttachmentPreparationFailure(DraftAttachmentImport.cameraFailureLabel)
-                        publishAttachmentPreparationFailuresIfSettled()
-                        return
-                    }
-                    attachments.append(attachment)
-                }
+                CameraPickerView { image in addCameraPhoto(image) }
             }
             .dismissKeyboardOnTap()
         }
@@ -2055,21 +2058,10 @@ struct ComposeView: View {
     }
 
     private func handlePhotoPickerItemsChange(_ items: [PhotosPickerItem]) {
-        guard !items.isEmpty else { return }
-        attachmentCarryGate.begin(items.count)
-        Task { @MainActor in
-            await DraftAttachmentImport.loadPicked(
-                items,
-                load: { item in (try await item.loadTransferable(type: Data.self), item.supportedContentTypes.first) },
-                existingCount: { attachments.count },
-                add: { attachments.append($0) },
-                fail: { recordAttachmentPreparationFailure($0) },
-                settled: { succeeded in
-                    attachmentCarryGate.completeOne(succeeded: succeeded)
-                    publishAttachmentPreparationFailuresIfSettled()
-                })
-            photoPickerItems = []
-        }
+        addPickedPhotos(
+            items,
+            load: { item in (try await item.loadTransferable(type: Data.self), item.supportedContentTypes.first) },
+            then: { photoPickerItems = [] })
     }
 
     /// ADR-IOS-030: Track ComposeView lifecycle so AgentToolRouter's FIFO queue
@@ -2941,6 +2933,7 @@ struct ComposeView: View {
 
             BackgroundSyncLogger.logDebug("[ComposeView] Loaded draft: id=\(draftId) subject=\(subject.prefix(40))")
             snapshotInitialState()
+            addAttachmentPick()
             return
         }
 
@@ -2952,6 +2945,7 @@ struct ComposeView: View {
         }
         BackgroundSyncLogger.logDebug("[ComposeView] No draft found for draftId=\(draftId), falling back to prepopulate")
         prepopulate()
+        addAttachmentPick()
     }
 
     /// Record the fields as loaded or prefilled, for Close to compare against
@@ -3349,12 +3343,12 @@ struct ComposeView: View {
         // paths) always wins. For reply mode, fall back to fresh cachedReply
         // from DB — protects against caller-side staleness when background AI,
         // P2P sync, or a prior in-place edit updated cachedReply after the
-        // caller's snapshot was captured.
+        // caller's snapshot was captured. A chat card reads nothing (`offersStoredSuggestion`).
         let suggestionToShow = ComposeDraftGuards.suggestionToShow(
             given: Self.givenSuggestion(suggestion, suggestedBody: suggestedBody), isReply: replyTo != nil && !isForward,
             onlyToChosen: onlyToChosen,
             freshSuggestion: {
-                guard let reply = replyTo else { return nil }
+                guard offersStoredSuggestion, let reply = replyTo else { return nil }
                 // Only while the row is still the email replied to: another email seated at its
                 // address (a UIDVALIDITY reset) never lends this card its suggestion.
                 return try? dbPool.read { db -> ReplyResult? in
@@ -3543,6 +3537,60 @@ struct ComposeView: View {
         </blockquote>
         \(belowSigHTML)
         """, true)
+    }
+
+    // MARK: - Camera, and what was picked before opening
+
+    /// The camera's photo, as the card's Camera button adds it.
+    private func addCameraPhoto(_ image: UIImage) {
+        guard let attachment = DraftAttachmentImport.cameraAttachment(
+            image, existingCount: attachments.count) else {
+            recordAttachmentPreparationFailure(DraftAttachmentImport.cameraFailureLabel)
+            publishAttachmentPreparationFailuresIfSettled()
+            return
+        }
+        attachments.append(attachment)
+    }
+
+    /// What was picked before the card opened (`attachmentPick`), added as the card's own
+    /// Photos, Camera or Files button adds it. Called once, after the draft loaded and the
+    /// fields' starting state was recorded.
+    private func addAttachmentPick() {
+        guard let attachmentPick else { return }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[ComposeView] adding the pick made before opening instance=\(instanceToken) draftId=\(draftId)")
+        }
+        switch attachmentPick {
+        case .photos(let providers): addPickedPhotos(providers, load: { try await DraftAttachmentImport.providedItem($0) })
+        case .camera(let image): addCameraPhoto(image)
+        case .files(let urls): handleFileImport(.success(urls))
+        }
+    }
+
+    /// Photos and videos picked, with the card's own Photos button or with the chat's paperclip
+    /// before it opened: all counted into the carry gate at once, so Send waits for them, then
+    /// loaded one after another through the shared loader; each one settles the gate whether it
+    /// loaded or not, and one that did not is reported. `then` runs once every item has settled.
+    private func addPickedPhotos<Item>(
+        _ items: [Item],
+        load: @escaping @MainActor (Item) async throws -> (data: Data?, type: UTType?),
+        then done: @escaping @MainActor () -> Void = {}
+    ) {
+        guard !items.isEmpty else { return }
+        attachmentCarryGate.begin(items.count)
+        Task { @MainActor in
+            await DraftAttachmentImport.loadPicked(
+                items,
+                load: load,
+                existingCount: { attachments.count },
+                add: { attachments.append($0) },
+                fail: { recordAttachmentPreparationFailure($0) },
+                settled: { succeeded in
+                    attachmentCarryGate.completeOne(succeeded: succeeded)
+                    publishAttachmentPreparationFailuresIfSettled()
+                })
+            done()
+        }
     }
 
     // MARK: - File Import

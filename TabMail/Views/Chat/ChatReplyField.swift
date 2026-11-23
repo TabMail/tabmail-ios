@@ -33,6 +33,14 @@ struct ChatReplyField {
     /// A new email's chat (`ChatNewThreadView`): the field has no email to reply to; nil in a
     /// thread's chat.
     var newEmail: ChatNewEmailField? = nil
+    /// A thread's chat: a choice in the paperclip's menu, which opens the reply's compose card once
+    /// something is picked (`ChatReadyReply(attaching:)`); nil shows no paperclip.
+    var attach: ((ChatNewEmailField.AttachSource) -> Void)? = nil
+
+    /// The paperclip's choice at the text's end: a new email's or a thread's; nil, none.
+    var paperclip: ((ChatNewEmailField.AttachSource) -> Void)? {
+        newEmail?.attach ?? attach
+    }
 
     var placeholder: String {
         if newEmail != nil { return ChatNewEmailField.placeholder }
@@ -463,20 +471,23 @@ struct ChatReplyCompose: Equatable {
     }
 
     /// The compose card, opened in this kind, as main's Reply All entries open it. `draftId`: the
-    /// draft it saves to; nil, the reply's usual one. `openedOn`: the screen the chat records for it
+    /// draft it saves to; nil, the reply's usual one. `attachmentPick`: added once it has loaded
+    /// (`ComposeView.attachmentPick`). `openedOn`: the screen the chat records for it
     /// (`ChatThreadView.composeScreen`).
     @MainActor
     func composeView(
         replyTo message: MessageHeader?, suggestedBody: String? = nil, suggestion: ReplyResult? = nil,
-        draftId: String? = nil, openedOn: ComposeScreen?, onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
+        offersStoredSuggestion: Bool = true, draftId: String? = nil, attachmentPick: ComposeAttachmentPick? = nil,
+        openedOn: ComposeScreen?, onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
     ) -> ComposeView {
         // The fields exactly as given, an empty one included: a reply whose To is empty (an edit
         // removed everyone, or the only Reply-To is the user's own) opens with To empty, never
         // refilled from the reply.
         ComposeView(
-            replyTo: message, suggestedBody: suggestedBody, suggestion: suggestion, isReplyAll: isReplyAll,
+            replyTo: message, suggestedBody: suggestedBody, suggestion: suggestion,
+            offersStoredSuggestion: offersStoredSuggestion, isReplyAll: isReplyAll,
             prefillTo: to, prefillCc: cc, prefillBcc: bcc, prefillSubject: subject,
-            prefillDraftId: draftId, openedOn: openedOn, onAgentOutcome: onAgentOutcome)
+            attachmentPick: attachmentPick, prefillDraftId: draftId, openedOn: openedOn, onAgentOutcome: onAgentOutcome)
     }
 }
 
@@ -511,22 +522,63 @@ extension AgentToolRouter.ComposeRequest {
     }
 }
 
-/// The ready AI Suggestion's compose card: the email it answers, the suggestion as the ghost showed
-/// it, and its envelope (`ChatReplyCompose.suggestionEnvelope`).
+/// A reply compose card the chat opens on its newest email: the ready AI Suggestion's (a tap on the
+/// ghost), or the paperclip's (something picked in the reply field). It holds the email it answers,
+/// the suggestion in its box as the chat showed it, its envelope and what was picked.
 struct ChatReadyReply: Identifiable {
     let message: MessageHeader
-    let suggestion: ReplyResult
+    /// The suggestion in the card's box, as the chat showed it; nil: none, and the card reads no
+    /// other (`ComposeView.offersStoredSuggestion`).
+    let suggestion: ReplyResult?
     let compose: ChatReplyCompose
     /// A draft of its own: the chat leaves the reply draft already saved for this email alone
     /// (it stays in Drafts), so the card never opens, saves over or deletes it.
     let draftId: String
+    /// The paperclip's pick, added once the card has loaded; nil for the ghost's card.
+    let pick: ComposeAttachmentPick?
     var id: MessageHeader.ID { message.id }
 
+    /// The ghost's card: Reply All with the suggestion the ghost showed (`ChatReplyCompose.suggestionEnvelope`).
     init(message: MessageHeader, suggestion: ReplyResult, accounts: [Account]) {
         self.message = message
         self.suggestion = suggestion
         compose = ChatReplyCompose.suggestionEnvelope(for: message, accounts: accounts)
-        draftId = Draft.separateReplyKey(replyTo: "\(message.accountId):\(message.stableId)")
+        draftId = Self.ownDraftId(message)
+        pick = nil
+    }
+
+    /// The paperclip's card: a reply to `message` to whom the field's reply goes, with `pick`
+    /// attached. Reply All is the suggestion's envelope with the suggestion the chat shows
+    /// (`shown`); "Replying only to" is a plain reply to only those people with no suggestion,
+    /// since the suggestion was written for everyone.
+    init(attaching pick: ComposeAttachmentPick, to message: MessageHeader, onlyTo: [ChatThread.Person]?,
+         shown: ReplyResult?, accounts: [Account]) {
+        self.message = message
+        self.pick = pick
+        if let onlyTo {
+            compose = ChatReplyCompose.onlyTo(onlyTo.map(\.address), replying: message)
+            suggestion = nil
+        } else {
+            compose = ChatReplyCompose.suggestionEnvelope(for: message, accounts: accounts)
+            suggestion = shown
+        }
+        draftId = Self.ownDraftId(message)
+    }
+
+    private static func ownDraftId(_ message: MessageHeader) -> String {
+        Draft.separateReplyKey(replyTo: "\(message.accountId):\(message.stableId)")
+    }
+
+    /// The card as the chat presents it: its envelope, its suggestion and nothing stored in its
+    /// place, its own draft and its pick. `openedOn`: the screen the chat records for it
+    /// (`ChatThreadView.composeScreen`).
+    @MainActor
+    func composeView(
+        openedOn: ComposeScreen?, onOutcome: @escaping @MainActor (ComposeOutcome) -> Void
+    ) -> ComposeView {
+        compose.composeView(
+            replyTo: message, suggestion: suggestion, offersStoredSuggestion: false, draftId: draftId,
+            attachmentPick: pick, openedOn: openedOn, onAgentOutcome: onOutcome)
     }
 }
 
