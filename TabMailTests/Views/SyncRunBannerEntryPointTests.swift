@@ -342,6 +342,10 @@ struct SyncRunBannerEntryPointTests {
             #expect(bannerAfterPolls == InboxErrorBanner.genericMessage, "a background poll with a busy account cleared the banner")
 
             _ = await AccountManager.shared.followUpRun(world.accountA, mayStart: { true })
+            // The follow-up's pass started A's backfill worker, whose catch-up
+            // takes A's turn soon after, even with nothing to catch up; the last
+            // poll below needs A free (#1340).
+            await engine.stopBackfillWorkerForTesting(accountId: accountId)
             waitEnd = Date().addingTimeInterval(10)
             while AccountManagerState.shared.lastSyncCompletedAt == nil, Date() < waitEnd {
                 try await Task.sleep(for: .milliseconds(10))
@@ -358,6 +362,8 @@ struct SyncRunBannerEntryPointTests {
             try await waitForAsks(2, of: accountId, stages)
 
             _ = await AccountManager.shared.foregroundPollRun()
+            let finalReads = await world.providerA.changeRequests.count
+            #expect(finalReads == 2, "non-vacuity: the last poll read A: \(finalReads) reads")
             #expect(banner == nil, "non-vacuity: a run that syncs every account clears")
         } }
     }
@@ -427,12 +433,23 @@ struct SyncRunBannerEntryPointTests {
             release.continuation.yield()
             if let pass = held.withLock({ $0 }) { await pass.value }
             _ = await AccountManager.shared.followUpRun(world.accountA, mayStart: { true })
+            // The follow-up's pass started A's backfill worker, whose catch-up
+            // takes A's turn soon after, even with nothing to catch up; the last
+            // refresh below needs A free (#1340).
+            await engine.stopBackfillWorkerForTesting(accountId: accountId)
+            let followUpReads = await world.providerA.changeRequests.count
+            let stillWanted = await engine.followUpWanted(accountId: accountId)
+            let flagServed = !stillWanted
+            #expect(followUpReads == 1, "the follow-up did not read the busy account once: \(followUpReads) reads")
+            #expect(flagServed, "the follow-up left the flag set")
             let settle = Date().addingTimeInterval(10)
             while await engine.syncPassRunning.contains(accountId), Date() < settle {
                 try await Task.sleep(for: .milliseconds(10))
             }
             try await waitForAsks(2, of: accountId, stages)
             await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
+            let finalReads = await world.providerA.changeRequests.count
+            #expect(finalReads == 2, "non-vacuity: the same refresh read A: \(finalReads) reads")
             #expect(banner == nil, "non-vacuity: the same refresh with A free clears")
         } }
     }
