@@ -132,7 +132,6 @@ struct OutlookChangeReadingTests {
         func foregroundPass() async throws {
             try await pool.write { db in
                 _ = try Account.filter(Column("id") == accountId).updateAll(db,
-                    Column("lastSyncedAt").set(to: nil as Date?),
                     Column("lastFullSyncAt").set(to: nil as Date?))
             }
             let engine = SyncEngine()

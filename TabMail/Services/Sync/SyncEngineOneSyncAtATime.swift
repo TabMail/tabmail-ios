@@ -125,7 +125,7 @@ extension SyncEngine {
     /// attempt may have moved); `nil` once the account has been removed. A pass never acts on sync
     /// state its caller read before the turn: a pass ahead of it may have moved
     /// the delta cursor (`Account.lastHistoryId`) or run the full sync
-    /// (`lastFullSyncAt`, `lastSyncedAt`) meanwhile, and a pass that waited and
+    /// (`lastFullSyncAt`) meanwhile, and a pass that waited and
     /// then used the caller's copy could clear a cursor that pass had just
     /// captured, or run a full sync again. Every write of the delta cursor runs
     /// inside a pass, so nothing moves it while the pass holds the turn.

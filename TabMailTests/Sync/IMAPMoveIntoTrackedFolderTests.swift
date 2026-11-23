@@ -86,10 +86,6 @@ struct IMAPMoveIntoTrackedFolderTests {
         /// sync does: within it the listing keeps the row on purpose.
         func normalSync() async throws {
             await AccountManager.shared.clearRecentlyCompletedForTesting()
-            let accountId = accountId
-            try await pool.write { db in
-                try db.execute(sql: "UPDATE account SET lastSyncedAt = NULL WHERE id = ?", arguments: [accountId])
-            }
             _ = try? await engine.sync(account: try account())
             _ = await engine.runCatchUpRun(account: try account(), run: .snapshot(deadline: Date().addingTimeInterval(30)))
         }

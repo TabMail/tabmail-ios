@@ -3828,12 +3828,9 @@ struct GmailCatchUpTests {
         return (seeds, local)
     }
 
-    /// One foreground poll, past the recent-sync guard.
+    /// One foreground poll.
     private static func syncPass(_ world: World, engine: SyncEngine? = nil) async throws {
         let accountId = world.accountId
-        try await world.pool.write { db in
-            _ = try Account.filter(Column("id") == accountId).updateAll(db, Column("lastSyncedAt").set(to: nil as Date?))
-        }
         let account = try #require(try await world.pool.read { db in try Account.fetchOne(db, key: accountId) })
         _ = try await (engine ?? world.engine).sync(account: account)
     }
