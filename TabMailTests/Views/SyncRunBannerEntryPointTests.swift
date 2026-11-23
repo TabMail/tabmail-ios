@@ -368,8 +368,10 @@ struct SyncRunBannerEntryPointTests {
     /// listed the folders on screen). RED while a busy change read counted as
     /// read, and with a busy refresh left out of the completion stamp. A pass
     /// that queued behind A's listing takes A's turn when the listing ends, so
-    /// A's change read, which follows its listing, finds it held. With A free,
-    /// the same refresh clears.
+    /// A's change read, which follows its listing, finds it held. The refresh
+    /// also starts the access run of the folders on screen (#1109), which waits
+    /// behind the held pass; after it, the flag's follow-up reads A once,
+    /// before the next refresh. With A free, the same refresh clears.
     @Test("a unified-inbox refresh whose change read finds an account busy never clears")
     func busyChangeReadRefreshNeverClears() async throws {
         try await withWorld { world in try await withAppSchedulerRecording { stages in
@@ -433,10 +435,17 @@ struct SyncRunBannerEntryPointTests {
             while await engine.syncPassWaiters[accountId]?.count != 1, Date() < runInLine {
                 try await Task.sleep(for: .milliseconds(5))
             }
+            let accessRunWaits = await engine.syncPassWaiters[accountId]?.count == 1
+            #expect(accessRunWaits, "the busy refresh started the access run of the folders on screen, which waits behind the held pass")
             release.continuation.yield()
             if let pass = held.withLock({ $0 }) { await pass.value }
+            guard accessRunWaits else { return }
             await engine.awaitAccessCatchUpForTesting(accountId: accountId)
+            let readsBeforeFollowUp = await world.providerA.changeRequests.count
             _ = await AccountManager.shared.followUpRun(world.accountA, mayStart: { true })
+            let followUpReads = await world.providerA.changeRequests.count - readsBeforeFollowUp
+            #expect(readsBeforeFollowUp == 0, "precondition: nothing read A before its follow-up")
+            #expect(followUpReads == 1, "the follow-up stage 2 read A once, after the held pass and before the next refresh: \(followUpReads) reads")
             let settle = Date().addingTimeInterval(10)
             while await engine.syncPassRunning.contains(accountId), Date() < settle {
                 try await Task.sleep(for: .milliseconds(10))

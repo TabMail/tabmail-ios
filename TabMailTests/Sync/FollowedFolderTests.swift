@@ -682,71 +682,75 @@ struct FollowedFolderIMAPTests {
     @Test("A pull that finds its account busy still reconciles the folder after the running pass, with all of its run's time")
     @MainActor
     func aBusyPullReconcilesTheFolderAfterTheRunningPass() async throws {
+        // The app's scheduler takes the follow-up asks (the busy read's, and the
+        // release of each slice while the flag is set) and starts nothing: this
+        // test is about the access run. It is restored only after the world's
+        // teardown has taken the account out of the engine, so an ask still on
+        // its way to the main actor then finds no account.
+        let scheduler = SyncScheduler.shared
+        let saved = (scheduler.applicationStateForTesting, scheduler.foregroundReadinessHook, scheduler.stageTwoHook)
+        scheduler.applicationStateForTesting = .active
+        scheduler.foregroundReadinessHook = { true }
+        scheduler.stageTwoHook = { _ in }
+        defer {
+            scheduler.applicationStateForTesting = saved.0
+            scheduler.foregroundReadinessHook = saved.1
+            scheduler.stageTwoHook = saved.2
+        }
         try await Self.withWorld("busy-pull", .plain) { w in
             w.changeBelowTheNewest()
             let engine = await AccountManager.shared.syncEngine
             let accountId = w.accountId
             let offset = ClockOffset()
             await engine.setAccessCatchUpClockForTesting { offset.now() }
-            // The app's scheduler takes the follow-up the busy read asks for and
-            // starts nothing: this test is about the access run.
-            let scheduler = SyncScheduler.shared
-            let saved = (scheduler.applicationStateForTesting, scheduler.foregroundReadinessHook, scheduler.stageTwoHook)
-            scheduler.applicationStateForTesting = .active
-            scheduler.foregroundReadinessHook = { true }
-            scheduler.stageTwoHook = { _ in }
-            defer {
-                scheduler.applicationStateForTesting = saved.0
-                scheduler.foregroundReadinessHook = saved.1
-                scheduler.stageTwoHook = saved.2
-            }
             let log = OneSyncAtATimeTests.PassLog()
             let release = AsyncStream<Void>.makeStream()
-            // A test that stops early still ends its held pass.
-            defer { release.continuation.finish() }
-
-            // The pull's listing of the folder is held at the server, inside its turn.
             let opened = try w.folder(w.folderId)
             let account = try w.account()
-            w.server.holdNextFetchAfterSnapshot(in: Self.path)
-            defer { w.server.releaseFetchAfterSnapshot(in: Self.path) }
-            let pull = Task { try await AccountManager.shared.syncFolders([opened], connecting: [account]) }
-            var waitEnd = Date().addingTimeInterval(10)
-            while !w.server.isHoldingFetchAfterSnapshot(in: Self.path), Date() < waitEnd {
-                try await Task.sleep(for: .milliseconds(5))
+            var pull: Task<Bool, Error>?
+            var holder: Task<Void, Never>?
+            // A precondition that fails ends the test here: the held listing and
+            // the held pass are let go, and both tasks are waited for.
+            func stop(_ reason: Comment) async {
+                Issue.record(reason)
+                w.server.releaseFetchAfterSnapshot(in: Self.path)
+                release.continuation.finish()
+                await holder?.value
+                _ = await pull?.result
             }
-            let listingHeld = w.server.isHoldingFetchAfterSnapshot(in: Self.path)
-            #expect(listingHeld, "precondition: the pull's listing is held at the server")
+
+            // The pull's listing of the folder is held at the server, inside its turn.
+            w.server.holdNextFetchAfterSnapshot(in: Self.path)
+            pull = Task { try await AccountManager.shared.syncFolders([opened], connecting: [account]) }
+            guard await OneSyncAtATimeTests.eventually({ w.server.isHoldingFetchAfterSnapshot(in: Self.path) }) else {
+                return await stop("precondition: the pull's listing is held at the server")
+            }
 
             // A pass arrives meanwhile: it takes the turn when the listing ends.
-            let holder = OneSyncAtATimeTests.heldPass(
+            holder = OneSyncAtATimeTests.heldPass(
                 engine: engine, accountId: accountId, name: "held", log: log, release: release.stream)
-            waitEnd = Date().addingTimeInterval(10)
-            while await engine.syncPassWaiters[accountId]?.count != 1, Date() < waitEnd {
-                try await Task.sleep(for: .milliseconds(5))
+            guard await OneSyncAtATimeTests.eventually({ await engine.syncPassWaiters[accountId]?.count == 1 }) else {
+                return await stop("precondition: the pass waits behind the listing")
             }
-            let passInLine = await engine.syncPassWaiters[accountId]?.count == 1
-            #expect(passInLine, "precondition: the pass waits behind the listing")
             w.server.releaseFetchAfterSnapshot(in: Self.path)
-            let busy = try await pull.value
-            let holding = log.snapshot == ["start held"]
-            #expect(busy, "precondition: the pull's change read found the account busy")
-            #expect(holding, "precondition: the pass holds the turn after the pull returned")
+            guard case .success(true) = await pull?.result else {
+                return await stop("precondition: the pull returned, its change read having found the account busy")
+            }
+            guard await OneSyncAtATimeTests.eventually({ log.snapshot == ["start held"] }) else {
+                return await stop("precondition: the pass took the turn when the listing ended, and holds it")
+            }
 
             // The pull's access run waits for the turn behind the pass, and its
             // clock moves on twice the run's time meanwhile.
-            waitEnd = Date().addingTimeInterval(10)
-            while await engine.syncPassWaiters[accountId]?.count != 1, Date() < waitEnd {
-                try await Task.sleep(for: .milliseconds(5))
+            guard await OneSyncAtATimeTests.eventually({ await engine.syncPassWaiters[accountId]?.count == 1 }) else {
+                return await stop("the busy pull started the folder's access run, which waits for the turn")
             }
-            let runInLine = await engine.syncPassWaiters[accountId]?.count == 1
-            #expect(runInLine, "the busy pull started the folder's access run, which waits for the turn")
             offset.add(2 * SyncConfig.accessCatchUpRunSeconds)
             let slicesWhileHeld = w.recorder.all.count
             #expect(slicesWhileHeld == 0, "no slice ran while the pass held the turn")
 
             release.continuation.yield()
-            await holder.value
+            await holder?.value
             await w.settle()
             try w.expectFollowed([w.folderId], "busy pull")
             try w.expectReconciled("busy pull")
@@ -755,9 +759,6 @@ struct FollowedFolderIMAPTests {
             let openedId = w.folderId
             let onlyOpened = !asked.isEmpty && asked.allSatisfy { $0 == [openedId] }
             #expect(onlyOpened, "the access run asked the opened folder alone, after the pass: \(asked)")
-            // A follow-up ask already on its way to the main actor lands before
-            // the scheduler is restored.
-            try await Task.sleep(for: .milliseconds(200))
         }
     }
 
