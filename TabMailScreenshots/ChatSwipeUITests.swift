@@ -914,11 +914,13 @@ final class ChatSwipeUITests: XCTestCase {
     private static let firstWord = "Line"
     private static let replacementWord = "Row"
 
-    /// The focused field with words: a press held until the text view's own long press takes it
-    /// (the loupe, caret placement), then moved up past the open distance, stays the text's. The
-    /// field's drag waits for the text view's long presses, so the panel stays shut and the field
-    /// keeps its focus and its words. Without that wait the drag would take the moving finger and
-    /// open the panel.
+    /// The focused field with words: a press held until the text view's own long press takes it,
+    /// then moved up past the open distance, stays the text's. The field's drag waits for the text
+    /// view's long presses, so the panel stays shut and the field keeps its focus and its words.
+    /// Without that wait the drag would take the moving finger and open the panel. The text's long
+    /// press shows its edit menu and leaves the caret where it was: it moves the caret only for a
+    /// finger moved along the line (UI run 2026-11-23: held with no move, or moved 10 or 200
+    /// points up, the caret stayed and the menu showed; moved 30 points sideways, the caret moved).
     func testLongPressThenDragUpInTheFocusedFieldStaysTheTexts() {
         let app = launchIntoChat()
         let field = replyField(in: app)
@@ -928,9 +930,8 @@ final class ChatSwipeUITests: XCTestCase {
         let typed = typedField(containing: Self.shortQuestion, in: app)
         XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
         waitForTheKeyboardBack(under: typed, in: app)
-        // The caret starts at the text's start (`caretToTheStart`), away from both places the
-        // text's long press can leave it: on the words under the finger, or at the text's end,
-        // where it follows a finger moved above the one-line text.
+        // From the caret at the text's start, with no edit menu showing (`caretToTheStart` checks
+        // both), so a menu after the held press is the press's own.
         caretToTheStart(of: typed, holding: Self.shortQuestion, in: app)
         // Both ends from one read of the field's frame (`textScroll`).
         let frame = typed.frame
@@ -940,10 +941,13 @@ final class ChatSwipeUITests: XCTestCase {
                          thenDragTo: onTheWords.withOffset(CGVector(dx: 0, dy: -Self.pastTheOpenDistance)))
         XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2),
                        "the held press stayed the text's; the panel stays shut")
+        // The press reached the text: the text view's own long press showed its edit menu
+        // (`editMenu`, which `testEditMenuCheckSeesTheMenuADoubleTapShows` proves sees a shown menu).
+        XCTAssertTrue(editMenu(in: app).waitForExistence(timeout: Self.editMenuAppearLimit),
+                      "the text's long press took the held press: its edit menu shows: \(dragMarkerLabel(afterDrags: 0, in: app))")
         XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
         XCTAssertTrue(typedField(containing: Self.shortQuestion, in: app).exists, "and its words")
-        // The press reached the text: its long press moved the caret, so a typed mark no longer
-        // lands at the text's start, where the caret was before the press.
+        // The words are whole: a typed mark goes in once, beside the question.
         typedField(containing: Self.shortQuestion, in: app).typeText(Self.lineMark)
         let marked = typedField(containing: Self.lineMark, in: app)
         XCTAssertTrue(marked.waitForExistence(timeout: 5), "control: the mark went into the field")
@@ -951,13 +955,13 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertEqual(value.components(separatedBy: Self.lineMark).count - 1, 1, "control: the field holds one mark: \(value)")
         XCTAssertEqual(value.replacingOccurrences(of: Self.lineMark, with: ""), Self.shortQuestion,
                        "control: the field holds the question and the mark")
-        XCTAssertNotEqual(value, Self.lineMark + Self.shortQuestion,
-                          "the held press moved the caret off the text's start: \(dragMarkerLabel(afterDrags: 0, in: app))")
     }
 
     /// Longer than UIKit's long press (half a second), so the text view's own long press has begun
     /// before the finger moves.
     private static let textLongPressHold: TimeInterval = 1.0
+    /// How long the text's edit menu may take to show once the held press lets go.
+    private static let editMenuAppearLimit: TimeInterval = 3
     /// Into the field from its leading edge, on the short question's words.
     private static let onTheWordsDx: CGFloat = 0.1
     /// Well past the app's open distance (`ChatViewLayout.fieldDragOpenDistance`, 60 pt), as the
