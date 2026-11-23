@@ -76,7 +76,8 @@ struct ThreadChatTests {
 
     /// The fake backend: answers each chat request "Answer N" (N counts the answers), or, for a
     /// request whose words contain `cardWords`, raises a template card first and answers
-    /// "Template saved." once it is answered. `hold` keeps the first round until signalled.
+    /// "Template saved." once it is answered. `hold` keeps the first round until signalled;
+    /// `holdAnswers` keeps every plain answer until signalled (`asked` says it arrived).
     final class Backend: @unchecked Sendable {
         let http = FakeHTTP.Scenario()
         let asked = DispatchSemaphore(value: 0)
@@ -89,7 +90,7 @@ struct ThreadChatTests {
         }
         private let record = Record()
 
-        init(cardWords: String? = nil, templateName: String = "", hold: Bool = false) {
+        init(cardWords: String? = nil, templateName: String = "", hold: Bool = false, holdAnswers: Bool = false) {
             http.register(path: "/completions/chat", method: "POST") { [record, asked, proceed] request in
                 let body = String(decoding: request.body ?? Data(), as: UTF8.self)
                 record.bodies.withLock { $0.append(body) }
@@ -109,6 +110,10 @@ struct ThreadChatTests {
                 } else if cardWords != nil, body.contains("conversation_state") {
                     final = ["assistant": "Template saved."]
                 } else {
+                    if holdAnswers {
+                        asked.signal()
+                        _ = proceed.wait(timeout: .now() + 20)
+                    }
                     let number = record.answers.withLock { count in
                         count += 1
                         return count
@@ -171,7 +176,7 @@ struct ThreadChatTests {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded, isWorking: $host.working,
                 replyField: inChatView && host.message != nil
-                    ? ChatReplyField(example: nil, isNoReply: false, clearCount: 0) : nil)
+                    ? ChatReplyField(example: nil, isNoReply: false) : nil)
             .environment(\.hasTabMailSession, true)
         }
     }

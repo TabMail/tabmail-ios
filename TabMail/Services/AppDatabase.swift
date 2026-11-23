@@ -4523,6 +4523,21 @@ final class AppDatabase: Sendable {
                 t.add(column: "replyChangeCommand", .text)
             }
         }
+
+        // v109 (ADR-IOS-117, #979): a chat field's unsent words, kept on this iPhone under the
+        // thread's chat key (`ChatFieldWords`), so Back and a closed app do not lose them. One row
+        // per chat with words; never synced or sent. Numbered after v108, which the chat view's
+        // `v108_addReplyChangeCommand` takes in the same release. A new, empty table: an upgrade and
+        // a fresh install converge on it.
+        migrator.registerTimedMigration(
+            "v109_addChatFieldWords", foreignKeyChecks: .immediate
+        ) { db in
+            try db.create(table: "chatFieldWords") { t in
+                t.primaryKey("sessionId", .text)
+                t.column("words", .text).notNull()
+                t.column("updatedAt", .datetime).notNull()
+            }
+        }
     }
 
     /// Move per-email chat turns to their thread's key (v107). Shared by the migration and its

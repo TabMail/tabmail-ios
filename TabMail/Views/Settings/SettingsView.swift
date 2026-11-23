@@ -701,8 +701,12 @@ struct SettingsView: View {
     /// Execute the user-visible local-index deletion as one transaction: the
     /// deletes above, then every account's sync state through the one list both
     /// Settings resets share, so each folder's backfill re-walks from the top and
-    /// the change bookmarks go with the rows (ADR-IOS-111).
+    /// the change bookmarks go with the rows (ADR-IOS-111). First, while the headers are still
+    /// here, every chat's unsent field words whose thread has an email are re-stamped
+    /// (`ChatFieldWords.restampLive`, ADR-IOS-117), so the orphan pass gives them the full grace
+    /// for the resync to bring their thread back.
     nonisolated static func localIndexWipeTxn(_ db: Database) throws {
+        try ChatFieldWords.restampLive(db: db, now: Date())
         for sql in localIndexWipeStatements {
             try db.execute(sql: sql)
         }

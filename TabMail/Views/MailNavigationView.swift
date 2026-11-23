@@ -582,7 +582,8 @@ struct MailNavigationView: View {
             // (inbox, folder, settings, etc), not just the inbox case. See
             // `pushedMessageId` doc comment above for why pill opens use this
             // instead of `selectedMessageId`.
-            MailContentColumn(selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId)
+            MailContentColumn(selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId,
+                              emailsOpenBeside: sizeClass == .regular)
                 .navigationDestination(item: $pushedMessageId) { id in
                     PushedMessageDestination(messageId: id)
                 }
@@ -1041,12 +1042,15 @@ private struct MailContentColumn: View {
     let selection: MailboxSelection?
     @Binding var selectedMessageId: String?
     @Binding var pushedMessageId: String?
+    /// The split view is expanded: an opened email shows beside the content column, not over it.
+    let emailsOpenBeside: Bool
 
     var body: some View {
         switch selection {
         case .unified, .folder:
             if let selection {
-                InboxColumnResolver(selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId)
+                InboxColumnResolver(selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId,
+                                    emailsOpenBeside: emailsOpenBeside)
                     .id(selection)
             }
         case .outbox:
@@ -1103,11 +1107,13 @@ private struct InboxColumnResolver: View {
     let selection: MailboxSelection
     @Binding var selectedMessageId: String?
     @Binding var pushedMessageId: String?
+    let emailsOpenBeside: Bool
     @Environment(NavigationStore.self) private var navigationStore
 
     var body: some View {
         let (title, matchingFolders) = resolve(selection)
-        InboxView(title: title, folders: matchingFolders, selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId)
+        InboxView(title: title, folders: matchingFolders, selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId,
+                  emailsOpenBeside: emailsOpenBeside)
     }
 
     private func resolve(_ selection: MailboxSelection) -> (String, [Folder]) {

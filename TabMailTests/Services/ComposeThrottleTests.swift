@@ -324,7 +324,7 @@ struct PendingSendServiceLifecycleTests {
             outboxId: pending.id, draftId: replacement.id, instanceEpoch: "E1",
             toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
-        #expect(svc.undo() == nil)
+        #expect(svc.tapToastUndo() == nil)
         #expect(try fixture.0.read {
             try OutboxMessage.fetchOne($0, key: pending.id)
         } == nil)
@@ -353,7 +353,7 @@ struct PendingSendServiceLifecycleTests {
             outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
             toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
-        let snapshot = try #require(svc.undo())
+        let snapshot = try #require(svc.tapToastUndo())
         #expect(snapshot.authority == .init(
             draftId: retained.id, accountId: "acc1", instanceEpoch: "E1"))
         #expect(try fixture.0.read {
@@ -388,7 +388,7 @@ struct PendingSendServiceLifecycleTests {
             outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
             toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
-        #expect(svc.undo() == nil)
+        #expect(svc.tapToastUndo() == nil)
         #expect(try fixture.0.read {
             try OutboxMessage.fetchOne($0, key: pending.id)
         } != nil)
@@ -444,7 +444,7 @@ struct PendingSendServiceLifecycleTests {
             try db.execute(sql: "DROP TABLE draft")
         }
 
-        #expect(svc.undo() == nil)
+        #expect(svc.tapToastUndo() == nil)
         // (a) the durable Send intention survives. No cancellation was accepted
         // or promised, so its ordinary queued/send path remains authoritative.
         #expect(try fixture.0.read {
@@ -457,9 +457,9 @@ struct PendingSendServiceLifecycleTests {
         #expect(svc.undoFailureMessage != nil)
     }
 
-    // MARK: - R16-9 — every exit of undo() speaks
+    // MARK: - R16-9 — every exit of the toast's Undo speaks
 
-    /// Whether this `undo()` return left the user with ANYTHING to observe.
+    /// Whether this Undo tap (`undoAndReopen()`) left the user with ANYTHING to observe.
     /// The three channels are the only ones the surface has: a reopen snapshot
     /// (compose comes back), a cleared toast (the send is visibly gone), or an
     /// `undoFailureMessage` (the user is told it did not take). A `nil` return
@@ -471,7 +471,7 @@ struct PendingSendServiceLifecycleTests {
     }
 
     /// 🚨 THE INVARIANT, asserted as the SYSTEM PROPERTY rather than the fix's
-    /// mechanism (`MIS-015`): **every exit of `PendingSendService.undo()` leaves an
+    /// mechanism (`MIS-015`): **every exit of `PendingSendService.undoAndReopen()` leaves an
     /// observable end state** — a reopen snapshot, a cleared toast, or a non-nil
     /// `undoFailureMessage`. Never a `nil` return with the toast still up and
     /// nothing said.
@@ -496,16 +496,18 @@ struct PendingSendServiceLifecycleTests {
     /// not the refusal, so every refusal case below still asserts that the Outbox
     /// row and the toast SURVIVE.
     ///
-    /// Enumerated by counting `return` statements inside `undo()` — six — rather
-    /// than by the enum, so a seventh exit cannot join the silent set unnoticed.
-    @Test("Every exit of undo() leaves an observable end state")
+    /// Enumerated by counting the exits of `undoAndReopen()` and the private `undo(_:)` it
+    /// calls — six: its guard return, and `undo(_:)`'s five returns — rather than by the enum,
+    /// so a seventh exit cannot join the silent set unnoticed. (Until 2026-11 the toast called a
+    /// separate `undo()`, whose `guard let p = current` was the sixth; it was removed.)
+    @Test("Every exit of the toast's Undo leaves an observable end state")
     func everyUndoExitLeavesAnObservableEndState() throws {
-        // EXIT 1 — `guard let p = current`. Nothing to observe because there was no
+        // EXIT 1 — `undoAndReopen()`'s guard (no toast). Nothing to observe because there was no
         // toast to begin with; the cleared-toast channel is satisfied trivially.
         do {
             let service = makeFreshService()
             service.dismiss()
-            let snapshot = service.undo()
+            let snapshot = service.tapToastUndo()
             #expect(leftAnObservableEndState(service, snapshot: snapshot),
                     "no toast: an undo with nothing pending must still be an observable no-op")
             #expect(service.current == nil)
@@ -531,7 +533,7 @@ struct PendingSendServiceLifecycleTests {
                 try db.execute(sql: "DROP TABLE draft")
             }
 
-            let snapshot = service.undo()
+            let snapshot = service.tapToastUndo()
             #expect(leftAnObservableEndState(service, snapshot: snapshot),
                     "readFailed: an undecidable read must still tell the user")
             #expect(service.undoFailureMessage != nil)
@@ -555,11 +557,21 @@ struct PendingSendServiceLifecycleTests {
                 outboxId: pending.id, draftId: replacement.id, instanceEpoch: "E1",
                 toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
-            let snapshot = service.undo()
+            let snapshot = service.tapToastUndo()
             #expect(leftAnObservableEndState(service, snapshot: snapshot))
             #expect(service.current == nil)
             #expect(service.undoFailureMessage == nil,
                     "a confirmed cancellation is not a failure — warning here would be the mirror image")
+
+            // EXIT 1 again, the already-undone arm of the guard: a repeated tap on the same send
+            // (a bubble's second tap, which names the send itself) does nothing and says nothing.
+            // Without it the row is gone, the discard cannot be confirmed, and a false
+            // "couldn't undo" would show for a send that WAS cancelled.
+            service.undoAndReopen(PendingSendService.Pending(
+                id: pending.id, draftId: replacement.id, instanceEpoch: "E1", toSummary: "",
+                presentedAt: Date(), holdUntil: pending.holdUntil))
+            #expect(service.undoFailureMessage == nil, "a repeated Undo of a cancelled send raises no notice")
+            #expect(service.reopenSnapshot == nil, "and reopens nothing")
         }
 
         // EXIT 4 — `.mismatchOrAbsent`, cancellation REFUSED (R16-9 leg A).
@@ -579,7 +591,7 @@ struct PendingSendServiceLifecycleTests {
                 outboxId: pending.id, draftId: replacement.id, instanceEpoch: "E1",
                 toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
-            let snapshot = service.undo()
+            let snapshot = service.tapToastUndo()
             #expect(leftAnObservableEndState(service, snapshot: snapshot),
                     "mismatch + refused discard: the user tapped Undo, nothing was cancelled, nothing reopened, and the toast stayed up — so this exit MUST say so or the tap is dead")
             #expect(service.undoFailureMessage != nil,
@@ -607,7 +619,7 @@ struct PendingSendServiceLifecycleTests {
                 outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
                 toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
-            let snapshot = service.undo()
+            let snapshot = service.tapToastUndo()
             #expect(leftAnObservableEndState(service, snapshot: snapshot),
                     "verified + refused discard: nothing cancelled, nothing reopened, toast still up — this exit MUST say so")
             #expect(service.undoFailureMessage != nil)
@@ -634,7 +646,7 @@ struct PendingSendServiceLifecycleTests {
                 outboxId: pending.id, draftId: retained.id, instanceEpoch: "E1",
                 toSummary: "To: to@example.com", holdUntil: pending.holdUntil)
 
-            let snapshot = service.undo()
+            let snapshot = service.tapToastUndo()
             #expect(leftAnObservableEndState(service, snapshot: snapshot))
             #expect(snapshot != nil, "non-vacuity: a confirmed undo must still reopen")
             #expect(service.current == nil)
@@ -799,8 +811,13 @@ struct UndoWindowTimingTests {
 @MainActor
 struct UndoAffordanceHoldInvariantTests {
 
+    /// The shared service with no toast and no send's Undo owner left by an earlier case. The
+    /// latency sweep and the slow-persist case present one outbox id (`presentAfterPersist`), and
+    /// closing a toast inside its window hands that send's Undo to its chat bubble, so without the
+    /// reset a later present of that id would find it already owned by a bubble and show no toast.
     private func freshService() -> PendingSendService {
         PendingSendService.shared.dismiss()
+        PendingSendService.shared.resetUndoOwnersForTesting()
         return PendingSendService.shared
     }
 

@@ -15,7 +15,7 @@ import GRDB
 /// `.shared` access from the test body. This eliminates the cross-suite
 /// contention that made these tests flaky when they ran in parallel with
 /// `EmailComposeToolOutcomeTests` and `AgentToolRouterTests` (all of which
-/// touched the singleton's `pendingCompose` / `composeQueue` /
+/// touched the singleton's compose slot / `composeQueue` /
 /// `recentlySentCompose`). With per-test routers the contention is
 /// structurally impossible, not just policy-protected.
 @Suite("EmailReplyTool blocking contract")
@@ -30,21 +30,21 @@ struct EmailReplyToolTests {
         return (ctx, db, translator, router)
     }
 
-    /// Wait for the helper to populate `pendingCompose` on the MainActor.
-    /// The tool's `execute()` does translator + db awaits before reaching
-    /// the helper, so a fixed number of `Task.yield()` calls is unreliable.
-    /// Polls cooperatively until the request appears or we exceed the
-    /// timeout (failure surfaces as the nil-guard in each test).
+    /// Wait for the helper to queue the request, and take it as the inbox chat's pill does
+    /// (`ComposeTestOrigin`). The tool's `execute()` does translator + db awaits before reaching
+    /// the helper, so a fixed number of `Task.yield()` calls is unreliable. Polls cooperatively
+    /// until the request is taken or we exceed the timeout (failure surfaces as the nil-guard in
+    /// each test).
     private func waitForPendingCompose(
         on router: AgentToolRouter,
         timeout seconds: Double = 2.0
     ) async -> AgentToolRouter.ComposeRequest? {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
-            if let req = router.pendingCompose { return req }
+            if let req = router.takeCompose(for: ComposeTestOrigin.inboxHost) { return req }
             await Task.yield()
         }
-        return router.pendingCompose
+        return router.takeCompose(for: ComposeTestOrigin.inboxHost)
     }
 
     @Test("Tool name is email_reply")
@@ -64,12 +64,12 @@ struct EmailReplyToolTests {
 
         let tool = EmailReplyTool(context: ctx)
         let task = Task { @MainActor () -> String in
-            try await tool.execute(arguments: ["unique_id": .int(1)])
+            try await tool.execute(arguments: ["unique_id": .int(1)], invocation: ComposeTestOrigin.invocation)
         }
         // Let execute() reach the helper's suspension (translator + db awaits
-        // complete first, then the helper sets pendingCompose).
+        // complete first, then the helper queues the request).
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel()
             _ = try? await task.value
             return
@@ -92,10 +92,10 @@ struct EmailReplyToolTests {
 
         let tool = EmailReplyTool(context: ctx)
         let task = Task { @MainActor () -> String in
-            try await tool.execute(arguments: ["unique_id": .int(1)])
+            try await tool.execute(arguments: ["unique_id": .int(1)], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel()
             _ = try? await task.value
             return
@@ -116,10 +116,10 @@ struct EmailReplyToolTests {
 
         let tool = EmailReplyTool(context: ctx)
         let task = Task { @MainActor () -> String in
-            try await tool.execute(arguments: ["unique_id": .int(2)])
+            try await tool.execute(arguments: ["unique_id": .int(2)], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel()
             _ = try? await task.value
             return
@@ -140,10 +140,10 @@ struct EmailReplyToolTests {
 
         let tool = EmailReplyTool(context: ctx)
         let task = Task { @MainActor () -> String in
-            try await tool.execute(arguments: ["unique_id": .int(3)])
+            try await tool.execute(arguments: ["unique_id": .int(3)], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel()
             _ = try? await task.value
             return
@@ -170,7 +170,6 @@ struct EmailReplyToolTests {
         #expect(result.hasPrefix("Failed: "))
         #expect(result.contains("missing or invalid unique_id"))
         #expect(router.composeQueueDepth == 0)
-        #expect(router.pendingCompose == nil)
     }
 
     @Test("Unknown numeric ID → 'Failed: Email not found for unique_id N'")
@@ -208,10 +207,10 @@ struct EmailReplyToolTests {
 
         let tool = EmailReplyTool(context: ctx)
         let task = Task { @MainActor () -> String in
-            try await tool.execute(arguments: ["unique_id": .int(10)])
+            try await tool.execute(arguments: ["unique_id": .int(10)], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel(); _ = try? await task.value; return
         }
         req.onOutcome(.sent)
@@ -235,25 +234,23 @@ struct EmailReplyToolTests {
         // First round: user sends.
         let tool = EmailReplyTool(context: ctx)
         let firstTask = Task { @MainActor () -> String in
-            try await tool.execute(arguments: ["unique_id": .int(11)])
+            try await tool.execute(arguments: ["unique_id": .int(11)], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             firstTask.cancel(); _ = try? await firstTask.value; return
         }
         req.onOutcome(.sent)
         _ = try await firstTask.value
 
-        // Clear pendingCompose as the view normally would on teardown.
-        router.pendingCompose = nil
+        // Clear the queue as the compose window's teardown would.
         router.resetComposeQueueForTesting()
 
         // Round 2 HTTP fails → chat turn retries → tool fires again with the
         // same unique_id. Cache should short-circuit.
-        let retryResult = try await tool.execute(arguments: ["unique_id": .int(11)])
+        let retryResult = try await tool.execute(arguments: ["unique_id": .int(11)], invocation: ComposeTestOrigin.invocation)
         #expect(retryResult.contains("already sent"))
         #expect(router.composeQueueDepth == 0)
-        #expect(router.pendingCompose == nil)
     }
 
     @Test(".cancelled does NOT mark the dedup cache (user must be able to retry)")
@@ -266,10 +263,10 @@ struct EmailReplyToolTests {
 
         let tool = EmailReplyTool(context: ctx)
         let task = Task { @MainActor () -> String in
-            try await tool.execute(arguments: ["unique_id": .int(12)])
+            try await tool.execute(arguments: ["unique_id": .int(12)], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel(); _ = try? await task.value; return
         }
         req.onOutcome(.cancelled)
@@ -281,5 +278,50 @@ struct EmailReplyToolTests {
             accountId: header.accountId, stableId: header.stableId, mode: .reply
         )
         #expect(router.recentlySentCompose.isRecentlySent(key) == false)
+    }
+
+    // MARK: - Where the card opens (ADR-IOS-053 Phase 2)
+
+    @Test("A reply asked with no chat screen fails fast and queues nothing")
+    func noOriginFailsFast() async throws {
+        let (ctx, db, translator, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "msgR20", subject: "Hi")
+        await translator.seed(header.id, as: 20)
+
+        let result = try await ComposeTestOrigin.runWithoutOrigin(EmailReplyTool(context: ctx), arguments: ["unique_id": .int(20)])
+        #expect(result == ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM)
+        #expect(router.composeQueueDepth == 0, "no card waits for a screen that can never take it")
+    }
+
+    @Test("The reply request carries the chat that asked, and only that chat takes it")
+    func requestCarriesItsOrigin() async throws {
+        let (ctx, db, translator, router) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "msgR21", subject: "Hi")
+        await translator.seed(header.id, as: 21)
+        let asked = ComposeOrigin(sessionKey: "thread:acc1:t-21", screen: .chat)
+        let invocation = ToolInvocation(composeOrigin: asked)
+
+        let tool = EmailReplyTool(context: ctx)
+        let task = Task { @MainActor () -> String in
+            try await tool.execute(arguments: ["unique_id": .int(21)], invocation: invocation)
+        }
+        let deadline = Date().addingTimeInterval(2.0)
+        while router.composeQueueDepth == 0 && Date() < deadline {
+            await Task.yield()
+        }
+        #expect(router.firstQueuedRequestForTesting?.origin == asked, "the request names the chat that asked")
+        let inbox = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+        #expect(inbox == nil, "the inbox never takes the chat's request")
+        let email = router.takeCompose(for: AgentToolRouter.ComposeHost(screen: .email, sessionKeys: [asked.sessionKey]))
+        #expect(email == nil, "nor the email screen of the same thread")
+        let req = router.takeCompose(for: AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: ["thread:acc1:newer", asked.sessionKey]))
+        #expect(req?.origin == asked, "the chat that asked takes it, by any key of its thread")
+        req?.onOutcome(.cancelled)
+        if req == nil { task.cancel() }
+        _ = try? await task.value
     }
 }

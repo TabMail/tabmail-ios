@@ -640,6 +640,8 @@ extension AccountManager {
             NSEDataBridge.mirrorAccountIdentity()
             throw error
         }
+        // The delete committed, the account's chat words with it: the store forgets them too (ADR-IOS-117).
+        await ChatFieldWords.shared.forgetAccount(acctId)
 
         // Converge the mirrors now that the delete has committed. This is NOT a
         // second attempt at the pre-commit clearing above — that clearing is
@@ -744,6 +746,8 @@ extension AccountManager {
         // Clean up non-cascaded tables first
         try PendingOperation.filter(Column("accountId") == accountId).deleteAll(db)
         try db.execute(sql: "DELETE FROM messageAICache WHERE key LIKE ? || ':%'", arguments: [accountId])
+        // The account's chats' unsent words go with its AI data (ADR-IOS-117).
+        try ChatFieldWords.deleteAccount(accountId, db: db)
         // `messageBody` is keyed by CONTENT key, not by `messageHeader.id`, and
         // Stage D (`v70_dropMessageBodyHeaderFK`) removed the FK that used to carry
         // it out on the cascade. Without this the removed account's cached email

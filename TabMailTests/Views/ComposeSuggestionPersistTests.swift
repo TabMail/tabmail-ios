@@ -180,7 +180,7 @@ struct ComposeSuggestionPersistTests {
             changeCommand: "Make it Thursday instead.")
         var rowRead = false
         let shown = ComposeDraftGuards.suggestionToShow(
-            given: tapped, isReply: true,
+            given: tapped, isReply: true, onlyToChosen: false,
             freshSuggestion: { rowRead = true; return later })
         #expect(shown == tapped)
         #expect(!rowRead, "the row is not consulted when the card was handed a suggestion")
@@ -191,15 +191,26 @@ struct ComposeSuggestionPersistTests {
         // A card that is not a reply (an agent's new email or forward) still shows the value handed in,
         // and never reads a row.
         #expect(ComposeDraftGuards.suggestionToShow(
-            given: tapped, isReply: false, freshSuggestion: { rowRead = true; return later }) == tapped,
+            given: tapped, isReply: false, onlyToChosen: false, freshSuggestion: { rowRead = true; return later }) == tapped,
                 "a new email or forward shows the suggestion it was handed")
         #expect(!rowRead, "a card that is not a reply never consults a row")
 
         // Control: with nothing handed in, a reply reads the row's whole value; a new message never does.
         #expect(ComposeDraftGuards.suggestionToShow(
-            given: nil, isReply: true, freshSuggestion: { later }) == later)
+            given: nil, isReply: true, onlyToChosen: false, freshSuggestion: { later }) == later)
         #expect(ComposeDraftGuards.suggestionToShow(
-            given: nil, isReply: false, freshSuggestion: { later }) == nil)
+            given: nil, isReply: false, onlyToChosen: false, freshSuggestion: { later }) == nil)
+
+        // A reply only to the people chosen in the chat's Reply to never reads the row: the stored
+        // suggestion was written for everyone. What it was handed (its own words) still shows.
+        var narrowedRead = false
+        #expect(ComposeDraftGuards.suggestionToShow(
+            given: nil, isReply: true, onlyToChosen: true, freshSuggestion: { narrowedRead = true; return later }) == nil,
+                "a reply only to the people chosen offers no stored suggestion")
+        #expect(!narrowedRead, "a reply only to the people chosen never consults the row")
+        #expect(ComposeDraftGuards.suggestionToShow(
+            given: tapped, isReply: true, onlyToChosen: true, freshSuggestion: { later }) == tapped,
+                "a reply only to the people chosen shows the words it was handed")
 
         let prepopulate = try functionBody(
             "private func prepopulate() {",
@@ -209,6 +220,10 @@ struct ComposeSuggestionPersistTests {
         // A Forward never offers the parent's AI reply, and the reply read is the email compose opened for.
         #expect(prepopulate.contains("given: Self.givenSuggestion(suggestion, suggestedBody: suggestedBody), isReply: replyTo != nil && !isForward,"),
                 "only a reply, never a forward, reads the row's reply")
+        let decision = try #require(prepopulate.range(of: "ComposeDraftGuards.suggestionToShow("))
+        let fresh = try #require(prepopulate.range(of: "freshSuggestion: {"))
+        #expect(prepopulate[decision.upperBound..<fresh.lowerBound].contains("onlyToChosen: onlyToChosen,"),
+                "the card's own choice decides whether it may read the row's reply")
         let closure = try #require(prepopulate.range(of: "guard let reply = replyTo else { return nil }"))
         let stored = try #require(prepopulate.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
         #expect(closure.lowerBound < stored.lowerBound,
@@ -396,7 +411,7 @@ struct ComposeSuggestionPersistTests {
         // adopts the suggestion synchronously before the send task is created.
         let gate = try #require(body.range(of: ".useSuggestion, accountId: replyTo?.accountId"))
         let accept = try #require(body.range(of: "acceptVisibleSuggestionIfOffered()"))
-        let send = try #require(body.range(of: "Task { await send() }"))
+        let send = try #require(body.range(of: "startSend()"))
         #expect(gate.lowerBound < accept.lowerBound && accept.lowerBound < send.lowerBound,
                 "tutorial gate, then adoption, then the send task")
 
@@ -777,6 +792,14 @@ struct ComposeSuggestionPersistTests {
         let save = try #require(edit.range(of: "await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: dbPool)"))
         let fade = try #require(edit.range(of: "withAnimation(.easeOut(duration: 0.4)) {"))
         #expect(gate.lowerBound < save.lowerBound && save.lowerBound < fade.lowerBound)
+        // The one write runs only for the email the decision named, never the card's own email
+        // in its place: an edit the decision keeps in the card is never stored.
+        let target = try #require(edit.range(of: "if let value = edit.edited, let reply = edit.target {"))
+        let between = String(edit[target.upperBound..<save.lowerBound])
+        #expect(gate.lowerBound < target.lowerBound && between.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the write sits directly inside the decision's target: \(between)")
+        #expect(edit.components(separatedBy: "writeCachedReplyToDB").count - 1 == 1, "one write, the gated one")
+        #expect(!edit.contains("edit.target ??"), "no other email stands in for the decision's target")
         #expect(!edit.contains("Task {"), "the save is awaited by the edit, never detached")
         // The card shows the stored whole value, so a second edit starts from (and replaces) this one.
         let shown = try #require(edit.range(of: "if showingSuggestion {"))
@@ -861,6 +884,8 @@ struct ComposeSuggestionPersistTests {
         #expect(call.contains("subject: newSubject ?? subject"), "the subject after this edit: \(call)")
         #expect(call.contains("accountId: selectedAccount?.id"), "the From chosen in the card, never the email's account: \(call)")
         #expect(!call.contains("replyTo?.accountId") && !call.contains("reply.accountId"))
+        #expect(call.contains("onlyToChosen: onlyToChosen,"),
+                "a card replying only to the people chosen decides as one, for its whole life: \(call)")
         let disappear = try functionBody("private func performDisappear()", before: "static func cardClosed(", in: source)
         #expect(disappear.contains("Self.cardClosed(recompute: recomputeTask)"), "the card's disappearance closes its Recompute")
     }

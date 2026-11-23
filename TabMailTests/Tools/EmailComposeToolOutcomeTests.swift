@@ -45,10 +45,10 @@ struct EmailComposeToolOutcomeTests {
     ) async -> AgentToolRouter.ComposeRequest? {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
-            if let req = router.pendingCompose { return req }
+            if let req = router.takeCompose(for: ComposeTestOrigin.inboxHost) { return req }
             await Task.yield()
         }
-        return router.pendingCompose
+        return router.takeCompose(for: ComposeTestOrigin.inboxHost)
     }
 
     /// THE SYSTEM PROPERTY: an agent's new email with a compose request is written by the model as a
@@ -75,14 +75,20 @@ struct EmailComposeToolOutcomeTests {
                 "subject": .string("Agent subject"),
                 "body": .string("Agent body"),
                 "request": .string("ask Pat about Friday"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
-        let card = await waitForPendingCompose(on: router)
-        card?.onOutcome(.cancelled)
+        guard let opened = await waitForPendingCompose(on: router) else {
+            // A missed take ends the tool, so the test fails here instead of waiting for a card no
+            // host takes.
+            task.cancel()
+            _ = try? await task.value
+            Issue.record("the card opens")
+            return
+        }
+        opened.onOutcome(.cancelled)
         _ = try await task.value
 
         #expect(modes.withLock { $0 } == ["edit_new"], "the model is asked once, for a new email")
-        let opened = try #require(card, "the card opens")
         #expect(opened.mode == .compose && opened.to == ["pat@example.com"])
         if editSucceeds {
             #expect(opened.subject == "Friday" && opened.body == body, "the card holds the model's draft")
@@ -108,10 +114,10 @@ struct EmailComposeToolOutcomeTests {
                 "to": .array([.string("a@b.com")]),
                 "subject": .string("Hello"),
                 "body": .string("Body text"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel()
             _ = try? await task.value
             return
@@ -136,10 +142,10 @@ struct EmailComposeToolOutcomeTests {
             try await tool.execute(arguments: [
                 "to": .array([.string("a@b.com")]),
                 "subject": .string("Bye"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel()
             _ = try? await task.value
             return
@@ -159,10 +165,10 @@ struct EmailComposeToolOutcomeTests {
             try await tool.execute(arguments: [
                 "to": .array([.string("a@b.com")]),
                 "subject": .string("Fail"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         guard let req = await waitForPendingCompose(on: router) else {
-            Issue.record("Helper did not populate pendingCompose")
+            Issue.record("Helper did not queue a request the asking chat could take")
             task.cancel()
             _ = try? await task.value
             return
@@ -193,7 +199,6 @@ struct EmailComposeToolOutcomeTests {
         #expect(result.hasPrefix("Failed: "))
         #expect(result.contains("recipients"))
         #expect(router.composeQueueDepth == 0)
-        #expect(router.pendingCompose == nil)
     }
 
     @Test("Missing recipients arg → uniform 'Failed: ' shape, never enqueues")
@@ -207,6 +212,259 @@ struct EmailComposeToolOutcomeTests {
         ])
         #expect(result.hasPrefix("Failed: "))
         #expect(router.composeQueueDepth == 0)
-        #expect(router.pendingCompose == nil)
+    }
+
+    @Test("A compose asked with no chat screen fails fast and queues nothing")
+    func noOriginFailsFast() async throws {
+        let (ctx, _, router) = try makeContext()
+        let result = try await ComposeTestOrigin.runWithoutOrigin(EmailComposeTool(context: ctx), arguments: [
+            "to": .array([.string("a@example.com")]),
+            "subject": .string("Hello"),
+        ])
+        #expect(result == ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM)
+        #expect(router.composeQueueDepth == 0, "no card waits for a screen that can never take it")
+    }
+
+    @Test("The compose request carries the chat that asked")
+    func requestCarriesItsOrigin() async throws {
+        let (ctx, _, router) = try makeContext()
+        let tool = EmailComposeTool(context: ctx)
+        let task = Task { @MainActor () -> String in
+            try await tool.execute(arguments: [
+                "to": .array([.string("a@example.com")]),
+                "subject": .string("Hello"),
+            ], invocation: ComposeTestOrigin.invocation)
+        }
+        guard let req = await waitForPendingCompose(on: router) else {
+            Issue.record("Helper did not queue a request the asking chat could take")
+            task.cancel()
+            _ = try? await task.value
+            return
+        }
+        #expect(req.origin == ComposeTestOrigin.inbox)
+        req.onOutcome(.cancelled)
+        _ = try await task.value
+    }
+}
+
+/// ADR-IOS-053 Phase 2, at the content-generation boundary: a compose tool asked with no screen to
+/// open its card on fails before it writes anything.
+///
+/// THE SYSTEM PROPERTY pinned here: `email_compose`, `email_reply` and `email_forward` invoked with
+/// no compose origin (a non-interactive caller, or the compose editor's own chat) make no model call
+/// for the email's words, queue no card, and return the no-screen failure the model reads, even
+/// when asked to write the words (`request`). Each tool's model calls go to a fake backend through
+/// the compose edit it is given (`composeEdit`, the production call on that backend), which counts them; the control shows the same arguments with an
+/// origin make exactly one call, so a count of zero is the tool's own choice. The compose editor's
+/// case runs its real inline-edit request with a fake tool call answered by the registered tool.
+@Suite("Compose tools with no screen write nothing", .serialized, .processGlobalState)
+@MainActor
+struct ComposeToolGenerationBoundaryTests {
+    enum Kind: String, CaseIterable, Sendable {
+        case compose
+        case reply
+        case forward
+    }
+
+    /// The fake backend: answers every model call with a compose edit the inline-edit parser reads
+    /// (`ComposeEditJSON`, the 2.0.0 edit JSON) and records its body. For the compose editor's case,
+    /// its first request (the editor's own instruction) is answered with a call to `email_compose`
+    /// asking for words.
+    final class Backend: @unchecked Sendable {
+        /// What a tool asks the model to write.
+        static let writeRequest = "Say that Friday works for everyone"
+        /// What the user asks the compose editor's chat.
+        static let editorInstruction = "Also send a note to Sam"
+
+        let http = FakeHTTP.Scenario()
+        final class Record: Sendable {
+            let bodies = Mutex<[String]>([])
+        }
+        private let record = Record()
+
+        init() {
+            http.register(path: "/completions/chat", method: "POST") { [record] request in
+                let body = String(decoding: request.body ?? Data(), as: UTF8.self)
+                record.bodies.withLock { $0.append(body) }
+                let final: [String: Any]
+                if body.contains(Backend.editorInstruction) && !body.contains("conversation_state") {
+                    let arguments: [String: Any] = [
+                        "to": ["sam@example.com"], "subject": "Friday",
+                        "request": Backend.writeRequest,
+                    ]
+                    let argumentsText = String(decoding: try! JSONSerialization.data(withJSONObject: arguments), as: UTF8.self)
+                    final = [
+                        "assistant": "",
+                        "tool_calls": [["id": "tc-compose", "function": ["name": "email_compose", "arguments": argumentsText]]],
+                        "conversation_state": ["harmony_messages": [], "current_round": 1],
+                    ]
+                } else {
+                    final = ["assistant": ComposeEditJSON.make(response: "Done.")]
+                }
+                let text = String(decoding: try! JSONSerialization.data(withJSONObject: final), as: UTF8.self)
+                return .bytes(Data("event: final\ndata: \(text)\n\n".utf8), contentType: "text/event-stream")
+            }
+        }
+
+        var service: AIService {
+            AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+        }
+
+        /// The compose edit the tools here run: the production call (`performInlineEdit`, as
+        /// `EmailReplyTool.chatComposeEdit` makes it) on this backend's service, so every model
+        /// call a tool makes for its words is recorded here.
+        var composeEdit: EmailReplyTool.ComposeEdit {
+            let service = service
+            return { context, subject, body, request in
+                try await service.performInlineEdit(
+                    currentSubject: subject, currentBody: body, context: context, instruction: request, chatHistory: [])
+            }
+        }
+
+        var bodies: [String] { record.bodies.withLock { $0 } }
+
+        /// The model calls that wrote an email's words for a tool: they carry the tool's request.
+        var writeCalls: Int { bodies.filter { $0.contains(Backend.writeRequest) && !$0.contains("conversation_state") }.count }
+    }
+
+    /// Runs `body` with AI on (the AI choice made, not opted out: `AIService.isAIOff` reads both),
+    /// then puts both values back. The opt-out alone leaves AI off while the choice is not made.
+    /// It calls `AITestSetting`'s synchronous save and set rather than `AITestSetting.with`, whose
+    /// nonisolated async body would take this main-actor closure across an isolation boundary.
+    private static func withAIOn(_ body: () async throws -> Void) async throws {
+        let restore = AITestSetting.save()
+        defer { restore() }
+        AITestSetting.set(aiOff: false)
+        try await body()
+    }
+
+    /// The tool of `kind` on `backend`, its card going to `router`, and the arguments a model asking
+    /// it to write the words sends.
+    private static func tool(
+        _ kind: Kind, backend: Backend, router: AgentToolRouter
+    ) async throws -> (any AgentTool, [String: JSONValue]) {
+        let db = try TestDatabase.make()
+        let translator = MockChatIdTranslator()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "msgG\(kind.rawValue)", subject: "Plans")
+        await translator.seed(header.id, as: 30)
+        let ctx = ToolContext(db: db, translator: translator, router: router)
+        switch kind {
+        case .compose:
+            return (EmailComposeTool(context: ctx, composeEdit: backend.composeEdit), [
+                "to": .array([.string("sam@example.com")]), "subject": .string("Friday"), "request": .string(Backend.writeRequest),
+            ])
+        case .reply:
+            return (EmailReplyTool(context: ctx, composeEdit: backend.composeEdit), ["unique_id": .int(30), "request": .string(Backend.writeRequest)])
+        case .forward:
+            return (EmailForwardTool(context: ctx, composeEdit: backend.composeEdit), [
+                "unique_id": .int(30), "to": .array([.string("sam@example.com")]), "request": .string(Backend.writeRequest),
+            ])
+        }
+    }
+
+    /// The invocation the compose editor's chat runs its inline edit with: its session's card sink
+    /// and key, and no compose origin (its host is a compose window, which opens no agent card).
+    private static func editorInvocation() -> ToolInvocation {
+        let key = ActiveAgentTracker.composeSessionKey(draftId: "draft-boundary", epoch: "1")
+        return ToolInvocation(uiSink: SessionUISink(session: ChatPillState.shared.session(for: key)), sessionKey: key)
+    }
+
+    @Test("A compose tool with no screen makes no model call for the words, queues no card, and fails plainly", arguments: Kind.allCases)
+    func noOriginWritesNothing(kind: Kind) async throws {
+        try await Self.withAIOn {
+            let backend = Backend()
+            defer { backend.http.close() }
+            let router = AgentToolRouter()
+            let (tool, arguments) = try await Self.tool(kind, backend: backend, router: router)
+            let noScreen = ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM
+            for invocation in [ToolInvocation.noninteractive, Self.editorInvocation()] {
+                // Bounded: a tool that waits for a card is cancelled after five seconds and the wait
+                // ends even if the tool ignores that, so a regression fails here instead of hanging the run.
+                let run = Task { @MainActor in try await tool.execute(arguments: arguments, invocation: invocation) }
+                guard let finished = await BoundedWait.result(of: run, within: .seconds(5)) else {
+                    Issue.record("\(kind.rawValue): the tool did not return within five seconds")
+                    continue
+                }
+                let result = try finished.get()
+                #expect(result == noScreen, "\(kind.rawValue): the plain no-screen failure: \(result)")
+            }
+            let calls = backend.bodies.count
+            #expect(calls == 0, "\(kind.rawValue): no model call writes words for a card no screen can open")
+            #expect(router.composeQueueDepth == 0, "\(kind.rawValue): no card waits")
+        }
+    }
+
+    @Test("Control: the same compose tool asked from a screen makes one model call for the words, then queues its card", arguments: Kind.allCases)
+    func withOriginWritesOnce(kind: Kind) async throws {
+        try await Self.withAIOn {
+            let backend = Backend()
+            defer { backend.http.close() }
+            let router = AgentToolRouter()
+            let (tool, arguments) = try await Self.tool(kind, backend: backend, router: router)
+            let task = Task { @MainActor () -> String in
+                try await tool.execute(arguments: arguments, invocation: ComposeTestOrigin.invocation)
+            }
+            let deadline = Date().addingTimeInterval(5)
+            while router.composeQueueDepth == 0, Date() < deadline, !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            guard let request = router.takeCompose(for: ComposeTestOrigin.inboxHost) else {
+                Issue.record("\(kind.rawValue): the card was never queued")
+                task.cancel()
+                _ = try? await task.value
+                return
+            }
+            let writes = backend.writeCalls
+            #expect(writes == 1, "\(kind.rawValue): one model call wrote the words: \(backend.bodies.count) calls")
+            request.onOutcome(.cancelled)
+            _ = try? await task.value
+        }
+    }
+
+    @Test("The compose editor's chat: a compose tool the model calls there writes nothing and queues no card")
+    func composeEditorToolCallWritesNothing() async throws {
+        try await Self.withAIOn {
+            let backend = Backend()
+            defer { backend.http.close() }
+            let router = AgentToolRouter()
+            let registry = ToolRegistry.shared
+            await registry.ensureDefaultToolsRegistered()
+            let registered = await registry.tool(named: "email_compose")
+            let (tool, _) = try await Self.tool(.compose, backend: backend, router: router)
+            await registry.register(tool)
+
+            let context = ComposeEditContext(
+                recipients: ["alex@example.com"], toRecipients: ["alex@example.com"], ccRecipients: [], bccRecipients: [],
+                toDisplayNames: [:], ccDisplayNames: [:], bccDisplayNames: [:],
+                senderName: "Me", senderEmail: "me@example.com", mode: "edit_new",
+                compositionPrompt: "", kbText: "", relatedDate: "", relatedSubject: "",
+                relatedFrom: "", relatedTo: "", relatedCc: "", bodyText: "")
+            // Bounded: a tool that waits for a card is cancelled after five seconds and the wait ends
+            // even if the edit ignores that, so a regression fails here instead of hanging the run.
+            let service = backend.service
+            let invocation = Self.editorInvocation()
+            let run = Task { @MainActor in
+                try await service.performInlineEdit(
+                    currentSubject: "Friday", currentBody: "", context: context,
+                    instruction: Backend.editorInstruction, chatHistory: [], invocation: invocation)
+            }
+            let finished = await BoundedWait.result(of: run, within: .seconds(5))
+            if let registered { await registry.register(registered) }
+            guard let finished else {
+                Issue.record("the editor's edit did not return within five seconds")
+                return
+            }
+            _ = try finished.get()
+
+            let bodies = backend.bodies
+            #expect(bodies.count == 2, "the editor's request and the round with the tool's result, nothing else: \(bodies.count)")
+            let writes = backend.writeCalls
+            #expect(writes == 0, "the tool wrote no words")
+            let answered = bodies.last?.contains(ComposeOrigin.noScreenReason) == true
+            #expect(answered, "the model reads the tool's no-screen failure")
+            #expect(router.composeQueueDepth == 0, "no card waits")
+        }
     }
 }

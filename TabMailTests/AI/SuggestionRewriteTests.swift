@@ -185,6 +185,10 @@ struct ComposeEditMarkerTests {
 @MainActor
 struct SuggestionRewriteRouteTests {
 
+    /// The field's requests are asked in the chat view, which takes their cards (ADR-IOS-053 Phase 2).
+    static let asked = ComposeOrigin(sessionKey: "thread:chat", screen: .chat)
+    static let chatHost = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [asked.sessionKey])
+
     nonisolated static let shown = "Hi Sam,\n\nCount me in!\n\nAlex"
     nonisolated static let shownText = "Count me in!"
     nonisolated static let shownReply = ReplyResult(body: shown, textMessage: shownText)
@@ -227,7 +231,8 @@ struct SuggestionRewriteRouteTests {
             }
         }
         if imap {
-            header = try #require(try await db.read { try MessageHeader.fetchOne($0, key: id) })
+            let fetched = try await db.read { try MessageHeader.fetchOne($0, key: id) }
+            header = try #require(fetched)
         }
         let translator = MockChatIdTranslator()
         await translator.seed(header.id, as: 1)
@@ -258,20 +263,21 @@ struct SuggestionRewriteRouteTests {
     }
 
     func invocation(_ header: MessageHeader, onlyTo: [String]? = nil, suggestion: ReplyResult? = shownReply) -> ToolInvocation {
-        ToolInvocation(fieldReply: ChatFieldReply(email: header, onlyTo: onlyTo, suggestion: suggestion))
+        ToolInvocation(fieldReply: ChatFieldReply(email: header, onlyTo: onlyTo, suggestion: suggestion), composeOrigin: Self.asked)
     }
 
     func row(_ db: DatabaseQueue, _ id: MessageHeader.ID) async throws -> MessageHeader {
-        try #require(try await db.read { try MessageHeader.fetchOne($0, key: id) })
+        let fetched = try await db.read { try MessageHeader.fetchOne($0, key: id) }
+        return try #require(fetched)
     }
 
     func waitForCard(_ router: AgentToolRouter) async -> AgentToolRouter.ComposeRequest? {
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline {
-            if let request = router.pendingCompose { return request }
+            if let request = router.takeCompose(for: Self.chatHost) { return request }
             await Task.yield()
         }
-        return router.pendingCompose
+        return router.takeCompose(for: Self.chatHost)
     }
 
     let request: [String: JSONValue] = ["unique_id": .int(1), "request": .string("more formal")]
@@ -295,7 +301,7 @@ struct SuggestionRewriteRouteTests {
         #expect(row.suggestion == ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand))
         #expect(ChatReplyField.shown(newest: row, usersTurn: false, onlyTo: nil)?.textMessage == Self.editedText,
                 "the ghost shows the edit's text version")
-        #expect(fixture.router.pendingCompose == nil, "no compose card opens")
+        #expect(fixture.router.composeQueueDepth == 0, "no compose card opens")
         #expect(output.contains("in place") && output.contains(Self.editedText) && output.contains("Nothing was sent"))
     }
 
@@ -310,7 +316,7 @@ struct SuggestionRewriteRouteTests {
         #expect(result.ok)
         #expect(calls.all.first?.body == Self.shown, "the field's suggestion reaches the edit through dispatch")
         #expect(try await row(fixture.db, fixture.header.id).cachedReply == Self.editedBody)
-        #expect(fixture.router.pendingCompose == nil)
+        #expect(fixture.router.composeQueueDepth == 0)
         #expect(result.output.contains("in place"))
     }
 
@@ -324,7 +330,26 @@ struct SuggestionRewriteRouteTests {
         #expect(card.body == Self.editedBody && card.subject == "Re: Offsite")
         #expect(try await row(fixture.db, fixture.header.id).suggestion == Self.shownReply)
         card.onOutcome(.cancelled)
-        #expect(try await task.value.contains("Opened the reply card"))
+        #expect(try await task.value.contains("goes to the reply card"))
+    }
+
+    /// The card's outcome is the agent's only word on it: a card refused before any screen showed
+    /// it (its account removed while it waited, `AgentToolRouter.endComposeRequestsOfRemovedAccounts`)
+    /// is reported as that refusal, never as a card that opened.
+    @Test("A reply card refused before it shows is reported as refused, never as opened")
+    func refusedCardIsNotReportedOpened() async throws {
+        let fixture = try await fixture()
+        let email = try await row(fixture.db, fixture.header.id)
+        let envelope = ChatReplyCompose.suggestionEnvelope(for: email, accounts: [])
+        let refusal = ComposeOutcome.failed("the account was removed").describeForLLM
+        let output = await EmailReplyTool.finishSuggestionEdit(
+            Self.edit(subject: "Re: New plan"), shown: Self.shownReply, start: envelope, suggestionEnvelope: envelope,
+            email: email, rewritesInPlace: true, store: Self.store(fixture.db),
+            openCard: { @Sendable _, _ in refusal })
+        #expect(output.hasSuffix(refusal), "the card's own outcome is what the agent reads: \(output)")
+        #expect(!output.localizedCaseInsensitiveContains("opened"), "nothing claims the card opened: \(output)")
+        let stored = try await row(fixture.db, fixture.header.id).suggestion
+        #expect(stored == Self.shownReply, "control: the stored suggestion is unchanged")
     }
 
     /// What the card for one edit beyond the suggestion holds.
@@ -383,9 +408,8 @@ struct SuggestionRewriteRouteTests {
             keys.append(key)
             #expect(try await row(fixture.db, fixture.header.id).suggestion == Self.shownReply)
             card.onOutcome(.cancelled)
-            #expect(try await task.value.contains("Opened the reply card"), "the outcome says which path ran")
+            #expect(try await task.value.contains("goes to the reply card"), "the outcome says which path ran")
             // No compose view appears in this test, so the router is cleared for the next card.
-            fixture.router.pendingCompose = nil
             fixture.router.resetComposeQueueForTesting()
         }
         #expect(Set(keys).count == 2, "each card has its own draft: \(keys)")
@@ -411,7 +435,7 @@ struct SuggestionRewriteRouteTests {
         let output = try await tool(fixture, calls: Calls(), answer: nil).run(
             arguments: request, invocation: invocation(fixture.header), rewritesInPlace: true)
         #expect(try await row(fixture.db, fixture.header.id).suggestion == Self.shownReply)
-        #expect(fixture.router.pendingCompose == nil)
+        #expect(fixture.router.composeQueueDepth == 0)
         #expect(output.lowercased().contains("unchanged"))
     }
 
@@ -441,7 +465,7 @@ struct SuggestionRewriteRouteTests {
         #expect(try await row(fixture.db, fixture.header.id).suggestion
                     == ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand),
                 "the subject stayed \"Re: Offsite\", so the edit is still the suggestion")
-        #expect(fixture.router.pendingCompose == nil && output.contains("in place"), "no card: \(output)")
+        #expect(fixture.router.composeQueueDepth == 0 && output.contains("in place"), "no card: \(output)")
 
         // No suggestion showing: the fresh reply's card opens with "Re: Offsite".
         let fresh = try await self.fixture()
@@ -508,7 +532,7 @@ struct SuggestionRewriteRouteTests {
             #expect(calls.all.first?.body == (suggestionShows ? Self.shown : ""))
             if suggestionShows {
                 #expect(stored == ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand))
-                #expect(fixture.router.pendingCompose == nil && output.contains("in place"))
+                #expect(fixture.router.composeQueueDepth == 0 && output.contains("in place"))
             } else {
                 #expect(card != nil, "a fresh reply opens its card")
                 #expect(stored == Self.shownReply)
@@ -601,7 +625,7 @@ struct SuggestionRewriteRouteTests {
         let accounts = try await fixture.db.read { try Account.fetchAll($0) }
         let ready = ChatReadyReply(message: email, suggestion: Self.shownReply, accounts: accounts)
         let card = ready.compose.composeView(
-            replyTo: email, suggestion: ready.suggestion, draftId: ready.draftId, onAgentOutcome: { _ in })
+            replyTo: email, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: .chat, onAgentOutcome: { _ in })
         // `nil` would let compose fill To from the reply's Reply-To, the user's own address.
         #expect(card.prefillTo == [], "To stays empty")
         #expect(card.prefillCc == ["pat@example.com"], "the outside Cc stays in Cc")
@@ -642,11 +666,17 @@ struct SuggestionRewriteRouteTests {
             let card = try #require(await waitForCard(fixture.router))
             #expect((card.fieldReply?.onlyTo == ["sender@example.com"]) == keepsAudience)
             #expect(calls.all.first?.body == "", "the field's suggestion is not this copy's draft")
+            // Who the reply goes to follows the audience alone: only the chosen person on the same
+            // account's copy, everyone on another account's copy, for the model and for the card.
+            let audience: Set<String> = keepsAudience ? ["sender@example.com"] : ["sender@example.com", "recipient@example.com"]
+            let call = try #require(calls.all.first)
+            #expect(Set(call.context.toRecipients + call.context.ccRecipients) == audience,
+                    "the model's draft goes to \(audience): \(call.context.toRecipients) cc \(call.context.ccRecipients)")
+            #expect(Set(card.to + card.cc) == audience, "the card goes to \(audience): \(card.to) cc \(card.cc)")
             #expect(try await row(fixture.db, copy.id).suggestion == Self.shownReply, "no suggestion edit stored on a copy")
             card.onOutcome(.cancelled)
             _ = try await task.value
             // No compose view appears in this test, so the router is cleared for the next card.
-            fixture.router.pendingCompose = nil
             fixture.router.resetComposeQueueForTesting()
         }
     }
@@ -696,7 +726,8 @@ struct SuggestionRewriteRouteTests {
         let newer = try TestDatabase.insertMessageHeader(fixture.db, messageId: "s9", subject: "Re: Offsite")
         for (value, expected) in [(ReplyResult.filtered, nil), (late, ReplyResult.filtered)] as [(ReplyResult, ReplyResult?)] {
             let outcome = try await fixture.db.write { db -> AIWriteOutcome in
-                let target = try #require(try AIWriteTarget.capture(message: newer, db: db))
+                let captured = try AIWriteTarget.capture(message: newer, db: db)
+                let target = try #require(captured)
                 return try AccountManager.storeSuggestion(value, replacing: expected, target: target, db: db)
             }
             #expect(outcome == .written)
@@ -799,7 +830,7 @@ struct SuggestionRewriteRouteTests {
         let calls = Calls()
         let tool = tool(fixture, calls: calls, answer: nil)
         let task = Task { @MainActor in
-            try await tool.run(arguments: ["unique_id": .int(1)], invocation: ToolInvocation(), rewritesInPlace: true)
+            try await tool.run(arguments: ["unique_id": .int(1)], invocation: ToolInvocation(composeOrigin: Self.asked), rewritesInPlace: true)
         }
         let card = try #require(await waitForCard(fixture.router))
         #expect(calls.all.isEmpty, "no request: no model edit runs")
@@ -879,7 +910,7 @@ struct SuggestionRewriteRouteTests {
         for (index, step) in edits.enumerated() {
             let edit = ComposeView.suggestionEdit(
                 body: step.body, textMessage: step.text, changeCommand: step.command,
-                showingSuggestion: true, isForward: false, replyTo: header,
+                showingSuggestion: true, isForward: false, onlyToChosen: false, replyTo: header,
                 recipients: envelope.recipients, subject: envelope.subject, accountId: nil, accounts: [])
             let expected = ReplyResult(body: step.body, textMessage: step.text, changeCommand: step.command)
             #expect(edit.edited == expected, "edit \(index): the card shows the whole edited value")
@@ -921,7 +952,7 @@ struct SuggestionRewriteRouteTests {
             let previous = shown
             let edit = ComposeView.suggestionEdit(
                 body: body, textMessage: text, changeCommand: command,
-                showingSuggestion: true, isForward: false, replyTo: header,
+                showingSuggestion: true, isForward: false, onlyToChosen: false, replyTo: header,
                 recipients: envelope.recipients.applying(to: to, cc: cc, bcc: bcc), subject: newSubject ?? subject,
                 accountId: nil, accounts: [])
             if let newSubject { subject = newSubject }
@@ -1288,5 +1319,144 @@ struct SuggestionSinglePathFenceTests {
             "TabMail/Views/Message/MessageDetailView.swift",
         ])
         #expect(try Self.lines(matching: #"composeViewForAgentRequest"#, in: files).isEmpty)
+    }
+}
+
+/// A field request's reply card owns the field's sent words (ADR-IOS-117).
+///
+/// THE SYSTEM PROPERTY pinned here, through `EmailReplyTool` and the field-words store: a reply
+/// card the field's request opens for the email the field showed, any copy of it in any account,
+/// the card of an edit of its AI Suggestion included, owns the send's completion. Closed unsent,
+/// the request's answer hands the sent words back to the user, kept for the next app run. A reply
+/// card for another email does not own it: the answer empties them.
+@Suite("A field request's reply card owns the field's sent words", .serialized, .processGlobalState)
+@MainActor
+struct FieldReplyCardWordsTests {
+
+    /// Which reply card the field's request opens.
+    enum Card: String, CaseIterable, CustomTestStringConvertible {
+        /// The edit of the AI Suggestion shown, beyond its envelope (a new subject): the edit's own card.
+        case suggestionEdit
+        /// A reply to another account's copy of the email shown, where the field's audience does not apply.
+        case otherAccountCopy
+        /// A reply to the email shown in another folder of the same account (its copy there), not
+        /// the row the field showed.
+        case sameAccountCopy
+        /// Control: a reply to another email in the same account.
+        case otherEmail
+        /// Control: a reply to an older, distinct email of the same thread: the same chat, not the
+        /// email the field showed.
+        case olderEmailInThread
+        var testDescription: String { rawValue }
+        var isFieldsOwn: Bool { self != .otherEmail && self != .olderEmailInThread }
+    }
+
+    /// Field words kept in memory as the database keeps them: a new store on the same rows is the
+    /// next app run.
+    static func storage(_ rows: OSAllocatedUnfairLock<[String: String]>) -> ChatFieldWords.Storage {
+        ChatFieldWords.Storage(
+            read: { key in rows.withLock { $0[key] } },
+            write: { batch in
+                rows.withLock { stored in
+                    for (key, write) in batch { stored[key] = write.words.isEmpty ? nil : write.words }
+                }
+            })
+    }
+
+    @Test("A reply card the field asked for, closed unsent, then the answer: the sent words are the user's again, kept for the next run; a card for another email: the answer empties them",
+          arguments: Card.allCases)
+    func closedUnsentCardThenAnswer(_ card: Card) async throws {
+        let routes = SuggestionRewriteRouteTests()
+        let fixture = try await routes.fixture()
+        // The email the field shows (re-read when the case gives it a thread).
+        var shownEmail = fixture.header
+        let number: Int
+        switch card {
+        case .suggestionEdit:
+            number = 1
+        case .otherAccountCopy:
+            try TestDatabase.insertAccount(fixture.db, id: "acc2", email: "second@example.com")
+            try TestDatabase.insertFolder(fixture.db, accountId: "acc2")
+            let copy = try TestDatabase.insertMessageHeader(
+                fixture.db, messageId: "s3", subject: "Offsite", folderId: "acc2:INBOX", accountId: "acc2",
+                rfc822MessageId: "<offsite@example.com>")
+            await fixture.translator.seed(copy.id, as: 2)
+            number = 2
+        case .sameAccountCopy:
+            try TestDatabase.insertFolder(fixture.db, name: "Archive", path: "Archive", role: .archive)
+            let copy = try TestDatabase.insertMessageHeader(
+                fixture.db, messageId: "s5", subject: "Offsite", folderId: "acc1:Archive", folderPath: "Archive",
+                isInInbox: false, rfc822MessageId: "<offsite@example.com>")
+            #expect(copy.id != fixture.header.id, "control: another row of the same email")
+            await fixture.translator.seed(copy.id, as: 4)
+            number = 4
+        case .otherEmail:
+            let other = try TestDatabase.insertMessageHeader(
+                fixture.db, messageId: "s4", subject: "Lunch", rfc822MessageId: "<lunch@example.com>")
+            await fixture.translator.seed(other.id, as: 3)
+            number = 3
+        case .olderEmailInThread:
+            let earlier = try #require(Calendar.current.date(byAdding: .day, value: -1, to: fixture.header.date))
+            let older = try TestDatabase.insertMessageHeader(
+                fixture.db, messageId: "s6", subject: "Offsite", date: earlier, rfc822MessageId: "<offsite-plan@example.com>")
+            let shownId = fixture.header.id, olderId = older.id
+            // The chat's key reads the thread the inbox groups by (`computedThreadId`).
+            try await fixture.db.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET threadId = ?, computedThreadId = ? WHERE id IN (?, ?)",
+                               arguments: ["offsite-thread", "offsite-thread", shownId, olderId])
+            }
+            let shownRow = try await fixture.db.read { try MessageHeader.fetchOne($0, key: shownId) }
+            let olderFetched = try await fixture.db.read { try MessageHeader.fetchOne($0, key: olderId) }
+            shownEmail = try #require(shownRow)
+            let olderRow = try #require(olderFetched)
+            #expect(ChatFieldWords.key(for: olderRow) == ChatFieldWords.key(for: shownEmail), "control: one chat")
+            await fixture.translator.seed(older.id, as: 5)
+            number = 5
+        }
+        let rows = OSAllocatedUnfairLock<[String: String]>(initialState: [:])
+        let store = ChatFieldWords(storage: Self.storage(rows))
+        let previous = ChatFieldWords.shared
+        ChatFieldWords.shared = store
+        defer { ChatFieldWords.shared = previous }
+
+        // The field sends the user's words about the email it shows, its AI Suggestion showing.
+        let key = ChatFieldWords.key(for: shownEmail)
+        let sent = "Make it more formal"
+        store.apply(.put(sent), to: key)
+        store.apply(.sentFromField, to: key)
+        let invocation = ToolInvocation(
+            fieldReply: ChatFieldReply(email: shownEmail, onlyTo: nil, suggestion: SuggestionRewriteRouteTests.shownReply),
+            composeOrigin: SuggestionRewriteRouteTests.asked, fieldWordsKey: key)
+        let tool = routes.tool(fixture, calls: SuggestionRewriteRouteTests.Calls(),
+                               answer: SuggestionRewriteRouteTests.edit(subject: "Re: New plan"))
+        let arguments: [String: JSONValue] = ["unique_id": .int(number), "request": .string(sent)]
+        let task = Task { @MainActor in try await tool.run(arguments: arguments, invocation: invocation, rewritesInPlace: true) }
+        let opened = await routes.waitForCard(fixture.router)
+        let request = try #require(opened, "control: the reply card opened")
+        let onOwnDraft = request.draftId != nil
+        #expect(onOwnDraft == (card == .suggestionEdit), "control: only the suggestion edit's card opens on a draft of its own")
+        // One decision of the field's own reply, on the request: the chat that opens the card reads it
+        // too, so after the field's own card (any copy, any account) its closing answer opens nothing.
+        #expect(request.isFieldsOwnReply == card.isFieldsOwn, "the request carries whether it is the field's own reply")
+        if card == .otherAccountCopy {
+            #expect(request.fieldReply == nil, "control: the field's audience does not apply in another account")
+        }
+        let composing = store.fill(for: key).composing
+        #expect(composing == card.isFieldsOwn, "only the field's own reply card owns the send: \(store.fill(for: key))")
+        request.onOutcome(.cancelled)
+        _ = try await task.value
+        let shown = try await routes.row(fixture.db, fixture.header.id).suggestion
+        #expect(shown == SuggestionRewriteRouteTests.shownReply, "control: the stored suggestion is unchanged")
+
+        // The request's answer comes once the card is done.
+        store.apply(.answered, to: key)
+        let expected = card.isFieldsOwn ? sent : ""
+        let fill = store.fill(for: key)
+        #expect(fill.words == expected && fill.unsent == expected, "after the answer: \(fill)")
+        await store.written()
+        let next = ChatFieldWords(storage: Self.storage(rows))
+        await next.load(key)
+        let nextWords = next.fill(for: key).words
+        #expect(nextWords == expected, "the next app run: \(nextWords)")
     }
 }

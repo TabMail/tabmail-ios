@@ -294,8 +294,8 @@ struct ChatReplyFieldTests {
 
     @Test("The placeholder offers a reply only when the sender takes replies")
     func placeholder() {
-        #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).placeholder == "Reply or ask anything")
-        #expect(ChatReplyField(example: nil, isNoReply: true, clearCount: 0).placeholder == "Ask anything")
+        #expect(ChatReplyField(example: nil, isNoReply: false).placeholder == "Reply or ask anything")
+        #expect(ChatReplyField(example: nil, isNoReply: true).placeholder == "Ask anything")
     }
 
     // MARK: - 2. The "e.g." line
@@ -482,8 +482,11 @@ struct ChatReplyFieldTests {
 
     @Test("A completion empties only the words that were sent, or none; newer words stay")
     func completionClearsOnlyTheSentWords() {
-        // Nothing sent yet (a reply sent from a bubble's compose card): the words empty.
-        #expect(Self.fill(Self.typed("Anything"), .completed).words == "")
+        // No send open (a reply sent from a bubble's compose card, or nothing sent): no
+        // completion, card or answer touches the user's words.
+        #expect(Self.fill(Self.typed("Anything"), .completed).words == "Anything")
+        #expect(Self.fill(Self.typed("Anything"), .confirmationCard).words == "Anything")
+        #expect(Self.fill(Self.typed("Anything"), .answered).words == "Anything")
 
         // Sent from the collapsed field, then a newer draft typed in the open sheet.
         var fill = Self.fill(Self.typed("First request"), .sentFromField)
@@ -492,11 +495,44 @@ struct ChatReplyFieldTests {
         fill.apply(.completed)
         #expect(fill.words == "My newer draft", "words written after the send are newer")
         #expect(fill.atSend == nil)
-        // Once completed, the next completion has no send to protect.
+        // Once completed, the same request's later transitions have no send left to complete:
+        // a second compose's Send, a later confirmation card and the closing answer keep the
+        // newer draft.
         fill.apply(.completed)
-        #expect(fill.words == "")
+        #expect(fill.words == "My newer draft", "a second compose's Send keeps the newer draft")
+        fill.apply(.confirmationCard)
+        #expect(fill.words == "My newer draft", "a later confirmation card keeps the newer draft")
+        fill.apply(.answered)
+        #expect(fill.words == "My newer draft", "the closing answer keeps the newer draft")
+        #expect(fill.unsent == "My newer draft", "the newer draft is what is kept")
+        // Control: the same sequences with the sent words unchanged empty them once.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed, .completed).words == "")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed, .confirmationCard).words == "")
         // The words sent, still there: the completion empties them.
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, .completed).words == "")
+        // A compose card's Send completed the field's send; the request's closing answer after it
+        // has nothing left to complete: newer words stay.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, Self.typed("Newer"), .completed, .answered).words == "Newer")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer"), .completed, .answered).words == "Newer")
+        // An answer to a send still open empties the words sent.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .answered).words == "")
+        // A compose card that opened and closed without sending: the closing answer empties
+        // nothing and hands the words back to the user, so they are kept.
+        let closed = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, .answered)
+        #expect(closed.words == "Ask" && closed.atSend == nil && !closed.composing && closed.unsent == "Ask")
+        // A compose card closed unsent, then a new field send before any answer: that send's
+        // answer empties its sent words (the new send is not the closed card's).
+        let resent = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, Self.typed("Ask again"), .sentFromField, .answered)
+        #expect(resent.words == "" && resent.atSend == nil && !resent.composing, "\(resent)")
+        // A compose card opened for the send, then the same request raises a confirmation card for
+        // another step: the compose card owns the completion, so the confirmation empties nothing,
+        // and once the card closed unsent the answer hands the words back.
+        let confirmed = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, .confirmationCard)
+        #expect(confirmed.words == "Ask" && confirmed.atSend == "Ask" && confirmed.composing, "\(confirmed)")
+        let handedBack = Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, .confirmationCard, .answered)
+        #expect(handedBack.words == "Ask" && handedBack.unsent == "Ask", "\(handedBack)")
+        // Control: the compose card's own Send still completes the send and empties the sent words.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .composeOpened, .confirmationCard, .completed).words == "")
 
         // From the open sheet the words go at once; a draft typed next stays through the completion.
         let sheet = Self.fill(Self.typed("Ask"), .sentFromSheet)
@@ -506,6 +542,60 @@ struct ChatReplyFieldTests {
         let card = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard)
         #expect(card.words == "" && card.atSend == "Ask")
         #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Newer"), .confirmationCard).words == "Newer")
+    }
+
+    @Test("Sent words a confirmation card took off the field come back when the field's own card then closes unsent; an edit since, or a completion, keeps them gone")
+    func confirmationBeforeTheOwnCardHandsTheWordsBack() {
+        // A confirmation card first (an archive), then the field's own reply card, closed unsent:
+        // the answer hands the words back as it does when they stayed in the field.
+        let taken = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard)
+        #expect(taken.words == "" && taken.unsent == "" && taken.atSend == "Ask", "the card took them: \(taken)")
+        let handedBack = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .answered)
+        #expect(handedBack.words == "Ask" && handedBack.unsent == "Ask" && handedBack.atSend == nil
+                    && !handedBack.composing, "\(handedBack)")
+        // Once handed back the send is over: a later answer or completion leaves them.
+        let after = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .answered, .completed, .answered)
+        #expect(after.words == "Ask", "\(after)")
+        // A second confirmation before the card finds them taken already.
+        let twice = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .confirmationCard, .composeOpened, .answered)
+        #expect(twice.words == "Ask", "\(twice)")
+        // The user's edit after the card took them is the user's: nothing comes back over it.
+        let edited = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, Self.typed("x"), Self.typed(""), .composeOpened, .answered)
+        #expect(edited.words == "", "\(edited)")
+        let newer = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, Self.typed("Newer"), .composeOpened, .answered)
+        #expect(newer.words == "Newer", "\(newer)")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .said("more"), .composeOpened, .answered).words
+                    == DictationController.appending("more", to: ""))
+        // A live transcript is the user's too, also when it writes while the card is open.
+        let heard = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .startHearing, .heard("Lunch instead"),
+                              .composeOpened, .answered)
+        #expect(heard.words == DictationController.appending("Lunch instead", to: ""), "\(heard)")
+        let heardWhileOpen = Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .startHearing,
+                                       .heard("Lunch instead"), .answered)
+        #expect(heardWhileOpen.words == DictationController.appending("Lunch instead", to: ""), "\(heardWhileOpen)")
+        // With no card of the field's own the answer completes the send; a card's Send completes it.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .answered).words == "")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .confirmationCard, .composeOpened, .completed, .answered).words == "")
+    }
+
+    @Test("Words cleared and retyped to the sent text after Send are newly written: kept, never emptied by the send")
+    func retypedSentTextIsNewWords() {
+        // Unchanged sent words: not kept, and the send's answer empties them.
+        let unchanged = Self.fill(Self.typed("Ask"), .sentFromField)
+        #expect(unchanged.unsent == "")
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .answered).words == "")
+        // A binding's echo of the same text is no edit.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, Self.typed("Ask")).unsent == "")
+        // Cleared and retyped identically while the send is open: newly written words.
+        let retyped = Self.fill(Self.typed("Ask"), .sentFromField, Self.typed(""), Self.typed("Ask"))
+        #expect(retyped.words == "Ask" && retyped.unsent == "Ask", "the retyped words are kept")
+        for ending in [ChatFieldFill.Change.answered, .completed, .confirmationCard] {
+            var fill = retyped
+            fill.apply(ending)
+            #expect(fill.words == "Ask" && fill.unsent == "Ask", "the older send never empties newly written words")
+        }
+        // Said words, too, are an edit.
+        #expect(Self.fill(Self.typed("Ask"), .sentFromField, .said("more"), .answered).words != "")
     }
 
     @Test("A live transcript adds to the words it started on, and is dropped once anything else changed them")
@@ -524,8 +614,14 @@ struct ChatReplyFieldTests {
         #expect(fill.words == "My own words")
         fill.apply(.heard("there friend, later"))
         #expect(fill.words == "My own words")
-        // So does any other change: a completion, a send, an Edit, a dictation's text.
-        for change in [ChatFieldFill.Change.completed, .sentFromSheet, .put("Edited"), .said("said")] {
+        // So does any other change: a send, an Edit, a dictation's text.
+        // A completion that empties the sent words is a change too.
+        var completed = Self.fill(Self.typed("Hi"), .sentFromField, .startHearing)
+        completed.apply(.completed)
+        #expect(completed.words == "", "control: the completion emptied the sent words")
+        completed.apply(.heard("one"))
+        #expect(completed.words == "", "a transcript after the completion is dropped")
+        for change in [ChatFieldFill.Change.sentFromSheet, .put("Edited"), .said("said")] {
             var other = Self.fill(Self.typed("Hi"), .startHearing, .heard("one"))
             other.apply(change)
             let after = other.words
@@ -594,27 +690,25 @@ struct ChatReplyFieldTests {
         #expect(Self.count("TextField(placeholder, text: typedText,", in: text) == 1)
         #expect(Self.count("Binding(get: { inputText }, set: { fieldFill.apply(.put($0)) })", in: text) == 1)
         #expect(Self.count("dictation.isActive || speech.isRecording || speech.isStarting", in: text) == 1)
-        // ONE API: the view only reads the words; every change is a `fieldFill.apply`.
+        // ONE API: the view only reads the words and whether they are the sent words (both
+        // read-only state); every change is a `fieldFill.apply`.
         #expect(Self.count("var inputText: String { fieldFill.words }", in: text) == 1)
         #expect(Self.count("var inputText", in: text) == 1)
         #expect(Self.count("fieldFill.", in: text)
-                == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text),
+                == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text)
+                    + Self.count("fieldFill.holdsSentWords", in: text),
                 "nothing else touches the field's state")
-        // Each change, where it happens: typing (above), both dictations, both sends, the
-        // completion, a confirmation card, and an Edit.
+        // Each change, where it happens: typing (above), both dictations, both sends, and an Edit.
         #expect(Self.count("fieldFill.apply(.startHearing) speech.start(locale: speechLocale, auto: auto) { transcript in fieldFill.apply(.heard(transcript))", in: text) == 1)
         #expect(Self.count("{ text in fieldFill.apply(.said(text))", in: text) == 1)
-        #expect(Self.count("fieldSentText = nil // Words written after the send this completes are newer, and stay (`ChatFieldFill`). fieldFill.apply(.completed)", in: text) == 1)
-        // A confirmation card raises the sheet and ends the field's pulse over the earlier send
-        // (the sheet rising is also run for real: `ChatReplyFieldRuntimeTests.confirmationCardOpensTheSheet`).
-        // It watches the thread's whole chat, so a card raised for an earlier email of the thread counts.
-        #expect(Self.count(".onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in guard hasCard, replyField != nil, !isExpanded else { return } fieldFill.apply(.confirmationCard) fieldSentText = nil withAnimation(expandSpring) { isExpanded = true } }", in: text) == 1)
+        // The completion and a confirmation card land on the sent request's chat key in
+        // `ChatFieldWords`, never through this view (`ChatReplyFieldRuntimeTests.clearWiring`).
         #expect(Self.count("dictation.inputSent(inputText) // From the open sheet the input empties as it goes; a newer draft is what is typed next. fieldFill.apply(.sentFromSheet)", in: text) == 1)
         #expect(Self.count("isTextFieldFocused = false fieldFill.apply(.sentFromField) dictation.inputSent(inputText)", in: text) == 1)
         #expect(Self.count("fieldFill.apply(.put(text)) isTextFieldFocused = true", in: text) == 1)
         // The "e.g." line's change goes in as words and is never sent from here.
         #expect(Self.count("func putExample(_ example: String) { fieldFill.apply(.put(example)) inputSelection = .init(insertionPoint: inputText.endIndex) }", in: text) == 1)
-        #expect(Self.count("fieldFill.apply(", in: text) == 10)
+        #expect(Self.count("fieldFill.apply(", in: text) == 8)
     }
 
     @Test("The field's Send sends the words to the agent; nothing in the field opens compose")
@@ -643,8 +737,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("composeEnded(.", in: text) == 0 && Self.count("{ _ in composeEnded", in: text) == 0)
         // The AI Suggestion's card is not a send from the field: its outcome leaves the field's
         // words alone (a completion with no field send would empty them).
-        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId, onAgentOutcome: { _ in })", in: text) == 1,
-                "the card holds the suggestion the ghost showed and never completes the field")
+        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: composeScreen(answering: ready.message), onAgentOutcome: { _ in })", in: text) == 1,
+                "the card holds the suggestion the ghost showed, records the chat's screen and never completes the field")
         #expect(Self.count("@State private var example = ChatSuggestionConfig.randomExample()", in: text) == 1,
                 "one example per chat open, kept across redraws")
         #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
@@ -671,13 +765,14 @@ struct ChatReplyFieldTests {
                 "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
         #expect(Self.count("guard case .sent = outcome else { return }", in: ended) == 1)
-        #expect(Self.count("fieldClearCount += 1", in: ended) == 1, "only after a send")
+        #expect(Self.count("ChatFieldWords", in: ended) == 0 && Self.count("fieldFill", in: ended) == 0,
+                "the view never completes the field: the request does, on its own key (ChatFieldWordsRuntimeTests)")
         // The bubbles are the database's: one observation keyed by the chat's Message-IDs.
         #expect(Self.count("for try await found in ChatUnsentReply.changes(answering: messageIds) {", in: text) == 1)
         // A reply filed or gone reloads the chat's emails, so a sent reply's copy takes its place.
         #expect(Self.count("unsentReplies = found if left || found.contains(where: \\.filed) { viewModel.reloadThread() }", in: text) == 1)
         #expect(Self.count("unsentReplies = ", in: text) == 1, "nothing else writes them")
-        #expect(Self.count("ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })", in: text) == 1,
+        #expect(Self.count("ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo() })", in: text) == 1,
                 "a failed send's Retry and Delete act on its own row")
     }
 
@@ -763,12 +858,25 @@ struct ChatReplyFieldTests {
     /// The compose card the chat opens for the AI Suggestion, as the chat's cover builds it.
     private static func card(_ message: MessageHeader, accounts: [Account] = [me]) -> ComposeView {
         let ready = ChatReadyReply(message: message, suggestion: message.suggestion ?? .filtered, accounts: accounts)
-        return ready.compose.composeView(replyTo: message, suggestion: ready.suggestion, draftId: ready.draftId, onAgentOutcome: { _ in })
+        return ready.compose.composeView(
+            replyTo: message, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: .chat, onAgentOutcome: { _ in })
     }
 
     /// The compose card the chat opens for the agent's reply, as the chat's cover builds it.
     private static func card(agent request: AgentToolRouter.ComposeRequest, accounts: [Account]) -> ComposeView {
-        request.composeView(account: accounts.first, onOutcome: { _ in })
+        request.composeView(account: accounts.first, openedOn: .chat, onOutcome: { _ in })
+    }
+
+    @Test("The one presenter opens the agent's new email from the account the host gives it, the bound From account")
+    func presenterOpensANewEmailFromTheAccountGiven() {
+        let second = Account(emailAddress: "second@example.com", displayName: "Second", provider: .gmail)
+        let request = AgentToolRouter.ComposeRequest(
+            mode: .compose, replyTo: nil, to: ["david@example.com"], cc: [], bcc: [], subject: "Friday",
+            body: "Friday works", origin: ComposeOrigin(sessionKey: "chat", screen: .chat, fromAccountId: second.id))
+        let bound = request.composeView(account: second, onOutcome: { _ in })
+        #expect(bound.account?.id == second.id, "the card sends from the account given, never the primary")
+        let control = request.composeView(account: Self.me, onOutcome: { _ in })
+        #expect(control.account?.id == Self.me.id && Self.me.id != second.id, "control: another account given, another From")
     }
 
     /// Where the agent's reply was asked for: the open sheet, or the reply field with who was
@@ -788,6 +896,19 @@ struct ChatReplyFieldTests {
         #expect(compose.prefillSubject == ThreadUtils.replySubject(for: email.subject))
     }
 
+    @Test("The AI Suggestion's card carries the whole suggestion the chat shows: its email, its text version and its change command")
+    func readyCardCarriesTheWholeSuggestion() {
+        let email = Self.groupEmail()
+        let shown = ReplyResult(body: "Hi Alex,\n\nTuesday works.", textMessage: "Tuesday works", changeCommand: "make it shorter")
+        let ready = ChatReadyReply(message: email, suggestion: shown, accounts: [Self.me])
+        #expect(ready.suggestion == shown, "control: the ready reply holds the suggestion as shown")
+        let compose = ready.compose.composeView(
+            replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: .chat, onAgentOutcome: { _ in })
+        // An edit in the card starts from this value and is stored only over it, so a part missing
+        // (its change command) would make the card's edit differ from what is stored.
+        #expect(compose.suggestion == shown, "the card opens on the suggestion as shown: \(String(describing: compose.suggestion))")
+    }
+
     /// The reply request the AI reply tool opens for `arguments`, on an email from
     /// sender@example.com to the user (test@example.com) and team@example.com.
     private static func agentReplyRequest(
@@ -803,16 +924,19 @@ struct ChatReplyFieldTests {
         let tool = EmailReplyTool(context: ToolContext(db: db, translator: translator, router: router))
         var fieldReply: ChatFieldReply?
         if case .field(let onlyTo) = origin { fieldReply = ChatFieldReply(email: header, onlyTo: onlyTo) }
-        let invocation = ToolInvocation(fieldReply: fieldReply)
+        // Asked in the chat view, which takes the request (ADR-IOS-053 Phase 2).
+        let asked = ComposeOrigin(sessionKey: "thread:chat", screen: .chat)
+        let invocation = ToolInvocation(fieldReply: fieldReply, composeOrigin: asked)
         let task = Task { @MainActor () -> String in
             try await tool.execute(
                 arguments: ["unique_id": .int(1), "body": .string("Friday works")].merging(arguments) { $1 }, invocation: invocation)
         }
         defer { task.cancel() }
         var pending: AgentToolRouter.ComposeRequest?
+        let host = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [asked.sessionKey])
         let deadline = Date().addingTimeInterval(5)
         while pending == nil, Date() < deadline {
-            pending = router.pendingCompose
+            pending = router.takeCompose(for: host)
             await Task.yield()
         }
         let req = try #require(pending, "the tool opens a reply")
@@ -1030,7 +1154,8 @@ struct ChatReplyFieldTests {
                 subject: envelope.subject)
             let request = AgentToolRouter.ComposeRequest(
                 mode: .reply, replyTo: email, to: edited.to, cc: edited.cc, bcc: edited.bcc,
-                subject: edited.subject, body: "Friday works", isReplyAll: edited.isReplyAll)
+                subject: edited.subject, body: "Friday works", origin: ComposeOrigin(sessionKey: "chat", screen: .chat),
+                isReplyAll: edited.isReplyAll)
             let compose = Self.card(agent: request, accounts: [Self.me])
             #expect(compose.isReplyAll == item.whole, "\(item.name): Reply All is \(item.whole)")
             let fields: [(name: String, card: [String]?, agent: [String])] = [
@@ -1342,7 +1467,7 @@ struct ChatReplyFieldTests {
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         // The field itself; the suggestion's rule takes them too (`shownSuggestion`, pinned above).
-        #expect(Self.count("clearCount: fieldClearCount, onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
+        #expect(Self.count("isNoReply: isNoReply, onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
         // Both reply cards open through the one helper, read as the card opens: Reply All exactly
         // when the reply goes to everyone, and the recipients with it.
         #expect(Self.count("agentCompose = req", in: chat) == 1,
@@ -1350,16 +1475,28 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ChatReplyCompose.", in: chat) == 0, "the chat builds no envelope of its own")
         #expect(Self.count("isReplyAll", in: chat) == 0,
                 "no card decides the kind or the Reply All recipients itself")
+        #expect(Self.count("openedOn: composeScreen(answering: req.replyTo)", in: chat) == 1,
+                "the agent's reply and forward cards record the chat's screen as they open")
         // A card from a field request: the agent's closing words open nothing; a field send starts afresh.
-        #expect(Self.count("fieldComposeOpened = req.fieldReply != nil", in: chat) == 1)
-        #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false })", in: chat) == 1)
+        #expect(Self.count("fieldComposeOpened = req.isFieldsOwnReply", in: chat) == 1,
+                "the chat reads the reply tool's one decision of the field's own reply (FieldReplyCardWordsTests)")
+        #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false }, onAgentCompose: openAgentCompose, composeFromAccountId: viewModel.message?.accountId, composeHostCovered: isAnyPresentation)", in: chat) == 1,
+                "the chat's pill binds the email's account as a new message's From and takes nothing while the chat is covered")
+        // A new message's card opens from the account bound when the turn started, and records the
+        // chat's screen, in the one presenter call.
+        #expect(Self.count("req.composeView(account: navigationStore.accounts.first { $0.id == req.fromAccountId }, openedOn: composeScreen(answering: req.replyTo)) { outcome in", in: chat) == 1)
+        // The card and fieldComposeOpened are set only for a request this chat's own pill took
+        // (ADR-IOS-053 Phase 2; ChatComposeRoutingTests runs it with the inbox and the email screen mounted).
+        #expect(Self.count("private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {", in: chat) == 1)
+        #expect(Self.count("guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } fieldComposeOpened = req.isFieldsOwnReply agentCompose = req }", in: chat) == 1,
+                "a new email's bound account is looked up as the card is taken, before anything is set")
         #expect(Self.count("private func agentAnswered() { guard !fieldComposeOpened else { return }", in: chat) == 1)
         #expect(Self.count("fieldComposeOpened = true", in: chat) == 0)
         #expect(Self.count("if replyTo != nil { replyTarget = .replyAll }", in: chat) == 1, "a sent reply clears it")
         #expect(Self.count("ownAddresses: context.ownAddresses) { replyTarget = $0 }", in: chat) == 1, "Done sets it")
         #expect(Self.count("ChatHeaderView(thread: thread) { guard TutorialCoordinator.shared.admits(.other) else { return } showsReplyTo = true }", in: chat) == 1)
         #expect(Self.count("Button { guard TutorialCoordinator.shared.admits(.other) else { return } forwardMessage = thread.newest }", in: chat) == 1)
-        #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }", in: chat) == 1)
+        #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }", in: chat) == 1)
         #expect(Self.count(".onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }", in: chat) == 1,
                 "a new newest email resets the choice, even one whose UID matches the last")
 
@@ -1367,16 +1504,97 @@ struct ChatReplyFieldTests {
         #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) }", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
         #expect(Self.count("let fieldReply = field?.fieldReply", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: fieldReply)", in: island) == 1,
+        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: sessionKey, fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey)", in: island) == 1,
                 "and travel with the request to the agent's tools")
+        // With the chat that asked, read as the send starts; the field's request belongs to the chat view.
+        #expect(Self.count("let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)", in: island) == 1)
+        #expect(Self.count("return ComposeOrigin(sessionKey: sessionKey, screen: fieldReply != nil ? .chat : screen, fromAccountId: composeFromAccountId)", in: island) == 1)
+        // A covered screen does not take: the pill takes only while its screen shows and nothing covers it.
+        #expect(Self.count("let host = (composeHostShown ?? composeHostAppeared) && !composeHostCovered", in: island) == 1)
         // A recovered send keeps them: the resume carries the cut-off send's request, the retry the
         // failed send as it was sent (ChatReplyRecoveryTests sends both through the real chat).
-        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: fieldReply)", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, fieldReply: resume.fieldReply)", in: island) == 1)
-        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, fieldReply: resume.fieldReply)", in: island) == 1)
-        #expect(Self.count("lastFailedSend = .init(text: text, field: field)", in: island) == 1)
-        #expect(Self.count("sendAgentChat(failed.text, field: failed.field)", in: island) == 1)
+        #expect(Self.count("pendingResume = .init( request: resumable.resumeRequest, fieldReply: fieldReply, origin: origin, fieldWordsKey: fieldWordsKey)", in: island) == 1)
+        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: resume.fieldWordsKey), sessionKey: sessionKey, fieldReply: resume.fieldReply, composeOrigin: origin, fieldWordsKey: resume.fieldWordsKey)", in: island) == 1)
+        // A resume continues its turn: the origin the turn started with, from any screen of the thread.
+        #expect(Self.count("let origin = resume.origin", in: island) == 1)
+        #expect(Self.count("composeOrigin(sessionKey: capturedSessionKey,", in: island) == 1, "only the send reads the pill's origin")
+        // No screen takes another screen's compose request: no global slot is left to race for.
+        for path in ["TabMail/Views/Chat/ChatThreadView.swift", "TabMail/Views/Inbox/InboxView.swift", "TabMail/Views/Message/MessageDetailView.swift"] {
+            let text = try Self.source(path)
+            #expect(Self.count("pendingCompose", in: text) == 0, "\(path) takes compose requests only through its pill")
+        }
+        let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
+        let detail = try Self.source("TabMail/Views/Message/MessageDetailView.swift")
+        #expect(Self.count("onAgentCompose: { agentCompose = $0 }, composeHostCovered: isAnyPresentation, composeHostShown: composeHostShown)", in: inbox) == 1,
+                "the inbox says from its navigation whether it shows, and passes its own sheets, covers and alert")
+        #expect(Self.count("private var composeHostShown: Bool { emailsOpenBeside || (selectedMessageId == nil && pushedMessageId == nil) }", in: inbox) == 1)
+        // Whether an opened email shows beside the inbox comes from the split view's own width, read
+        // outside its columns, and reaches the inbox through the content column.
+        let navigation = try Self.source("TabMail/Views/MailNavigationView.swift")
+        #expect(Self.count("@Environment(\\.horizontalSizeClass) private var sizeClass", in: navigation) == 1, "the split view's horizontal width")
+        #expect(Self.count("emailsOpenBeside: sizeClass == .regular)", in: navigation) == 1, "the expanded split view opens an email beside the inbox")
+        #expect(Self.count("emailsOpenBeside: emailsOpenBeside)", in: navigation) == 2, "through the content column to the inbox")
+        #expect(Self.count("showSearch || labelMenuMessage != nil || showLabelFilterPicker || moveMessageId != nil || moveThreadGroup != nil || replyMessage != nil || draftOpen != nil || agentCompose != nil || contactComposeRequest != nil || viewModel.showCompose || showUndoAlert }", in: inbox) == 1,
+                "every sheet, cover and alert of the inbox holds a compose card")
+        #expect(Self.count("showCompose || contactComposeRequest != nil || replyMessage != nil || replyAllMessage != nil || forwardMessage != nil || agentCompose != nil || moveMessage != nil || labelMenuMessage != nil }", in: detail) == 1,
+                "every sheet and cover of the email screen holds a compose card")
+        #expect(Self.count("onAgentCompose: openAgentCompose, composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)", in: detail) == 1)
+        #expect(Self.count(".fullScreenCover(item: $agentCompose) { req in req.composeView(account: fromAccount(of: req), onOutcome: req.onOutcome) }", in: detail) == 1,
+                "the email screen's new message opens from its bound account, through the one presenter")
+        let detailActions = try Self.source("TabMail/Views/Message/MessageDetailView+Actions.swift")
+        #expect(Self.count("guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } agentCompose = req", in: detailActions) == 1)
+        #expect(Self.count("navigationStore.accounts.first { $0.id == req.fromAccountId }", in: detailActions) == 1)
+        #expect(Self.count("pendingResume = .init( request: resumable.resumeRequest, fieldReply: resume.fieldReply, origin: resume.origin, fieldWordsKey: resume.fieldWordsKey)", in: island) == 1)
+        #expect(Self.count("lastFailedSend = .init(text: text, field: field, ownsFieldWords: fieldWordsKey != nil)", in: island) == 1)
+        #expect(Self.count("sendAgentChat(failed.text, field: failed.field, ownsFieldWords: failed.ownsFieldWords)", in: island) == 1)
+        // Re-send of the last turn sends it with its email and choice: the bubble keeps the field's
+        // send and the menu passes it on (ChatComposeRoutingTests checks the bubble keeps it); it owns
+        // none of the field's words (ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField).
+        #expect(Self.count("chatMessages.append(ChatMessage(role: .user, content: text, timestamp: Date(), fieldSend: field))", in: island) == 1)
+        #expect(Self.count("resendLastUserMessage(text: msg.content, field: msg.fieldSend, afterIndex: index)", in: island) == 1)
+        // Rewind trims the later turns and sends the chosen turn again as a fresh turn, which names
+        // the screen that asked (an earlier field turn's recipients choice is not kept with it).
+        #expect(Self.count("rewindToMessage(text: msg.content, atIndex: index)", in: island) >= 1, "the menu's Rewind reaches the rewind")
+        #expect(Self.count("private func rewindToMessage(text: String, atIndex index: Int) { trimForRewind(atIndex: index) lastFailedSend = nil sendAgentChat(text) }", in: island) == 1,
+                "Rewind sends the turn again through the send that names the screen")
+        #expect(Self.count("trimForResendLast(atIndex: index) lastFailedSend = nil sendAgentChat(text, field: field, ownsFieldWords: false)", in: island) == 1)
         #expect(Self.count("replyField?.onlyTo", in: island) == 0 && Self.count("replyField?.isNoReply", in: island) == 0,
                 "no send reads the field's choice later")
+    }
+
+    /// ADR-IOS-053 Phase 2: the census of the turns that can reach a compose tool. Every invocation
+    /// the app builds is one of three: the pill's send and its resume, which name the screen that
+    /// asked (every send, retry, resend, rewind and tutorial prompt goes through `sendAgentChat`),
+    /// and the compose editor's chat, whose host is a compose window and opens no agent card, so a
+    /// compose tool there fails fast. Every other caller (reply precompute, inline edit, the BYOK
+    /// check) runs `.noninteractive`, where a compose tool fails fast too. A new turn that builds
+    /// its own invocation fails here until it names its screen or is added with its reason.
+    @Test("Every agent turn that could open a compose card names the screen that asked")
+    func everyTurnNamesItsScreen() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sources = try #require(FileManager.default.enumerator(at: projectRoot.appendingPathComponent("TabMail"), includingPropertiesForKeys: nil))
+        var built: [String: Int] = [:]
+        for case let url as URL in sources where url.pathExtension == "swift" && url.lastPathComponent != "ToolInvocation.swift" {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let count = Self.count("ToolInvocation(", in: text)
+            if count > 0 { built[url.lastPathComponent] = count }
+        }
+        #expect(built == ["DynamicIslandChatButton.swift": 3], "only the pill builds invocations: \(built)")
+
+        let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        #expect(Self.count("composeOrigin: origin, fieldWordsKey:", in: island) == 2, "the send and the resume name the screen that asked")
+        #expect(Self.count("invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey) )", in: island) == 1,
+                "the compose editor's chat, which opens no card, names none")
+        #expect(Self.count("guard onAgentCompose != nil, composeContext == nil else { return nil }", in: island) == 1,
+                "a compose editor's pill has no compose screen")
+        // Every turn of the pill starts in one of the two.
+        // A fresh send names its screen; a resume reuses the origin its turn started with.
+        #expect(Self.count("let origin = composeOrigin(", in: island) == 1)
+        #expect(Self.count("let origin = resume.origin", in: island) == 1)
+        #expect(Self.count("activeChatTask = Task {", in: island) == Self.count("let origin = composeOrigin(", in: island) + Self.count("let origin = resume.origin", in: island) + 1,
+                "one turn task per send and per resume, and the compose editor's")
     }
 }

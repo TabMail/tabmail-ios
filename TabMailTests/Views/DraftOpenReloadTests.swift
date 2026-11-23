@@ -2329,10 +2329,8 @@ struct DraftOpenReloadTests {
         try await withInstalledPool { pool in
             let header = try await pool.write { try insertOutlookHeader($0, owned: true) }
             let router = AgentToolRouter.shared
-            router.pendingCompose = nil
             router.resetComposeQueueForTesting()
             defer {
-                router.pendingCompose = nil
                 router.resetComposeQueueForTesting()
             }
             let started = Mutex(false)
@@ -2340,7 +2338,7 @@ struct DraftOpenReloadTests {
             defer { release.finish() }
             let request = AgentToolRouter.ComposeRequest(
                 mode: .compose, replyTo: nil, to: ["next@example.com"], cc: [], bcc: [],
-                subject: "Next compose", body: nil)
+                subject: "Next compose", body: nil, origin: ComposeTestOrigin.inbox)
             let presenter = DraftComposePresenter(source: .header(header))
                 .environment(\.draftOpenResolverForTesting, {
                     started.withLock { $0 = true }
@@ -2352,12 +2350,17 @@ struct DraftOpenReloadTests {
                 #expect(started.withLock { $0 }, "precondition: the resolver is parked")
                 #expect(frame(window) == .opening, "precondition: no inner compose exists")
                 router.enqueueCompose(request)
-                #expect(router.pendingCompose == nil, "the agent must wait while the draft is opening")
+                let early = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+                #expect(early == nil, "the agent must wait while the draft is opening")
                 #expect(router.composeQueueDepth == 1)
             }
             release.finish()
-            try await wait { router.pendingCompose?.id == request.id }
-            #expect(router.pendingCompose?.id == request.id,
+            var taken: AgentToolRouter.ComposeRequest?
+            try await wait {
+                taken = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+                return taken != nil
+            }
+            #expect(taken?.id == request.id,
                     "closing the opening view must let the queued compose proceed")
         }
     }
