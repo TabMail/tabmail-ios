@@ -82,9 +82,12 @@ extension SyncEngine {
     ///   (no pass is running to clear it); and a due mark alone
     ///   (`FolderChangeState.listingDue`) does not list the folder, only counters
     ///   that moved or a check the reader owes (`UntrackedObservation.mustList`).
-    ///   A deletion check cut by a slice's end leaves that mark, and honouring it
-    ///   would list the folder again in every run; the weekly full check of the
-    ///   catch-up removes what the check would have.
+    ///   The listing runs no deletion check (its walk can take longer than a
+    ///   slice) and leaves any due mark as it is; the catch-up's weekly
+    ///   whole-folder check of an other folder removes what the check would
+    ///   have. *Superseded (#1110):* "A deletion check cut by a slice's end
+    ///   leaves that mark, and honouring it would list the folder again in every
+    ///   run".
     func refreshUntrackedFolder(
         folderId: String, observation: UntrackedObservation, account: Account, provider: any EmailProvider,
         deadline: Date? = nil, pass: UUID? = nil, otherFolderSlice: ChangeContext? = nil
@@ -147,6 +150,10 @@ extension SyncEngine {
             return .notListed
         }
         guard let serverCount = result.listedCounters?.messageCount else { return .unproven }
+        // An other-folder run's listing ends here (#1110): the deletion check
+        // can walk the whole folder, longer than a slice, and the catch-up's
+        // weekly whole-folder check of an other folder removes what it would.
+        guard otherFolderSlice == nil else { return .listed }
         // Bounded by the pass's deadline: this runs inside the account's turn.
         await reconcileDeletionsAfterListing(
             folder: folder, provider: provider, serverCount: serverCount, logPrefix: "[Sync] Untracked", deadline: deadline)

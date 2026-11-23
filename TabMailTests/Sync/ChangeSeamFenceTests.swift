@@ -76,6 +76,12 @@ struct ChangeSeamFenceTests {
         ] {
             #expect(!source.contains(term), "SyncEngineOtherFolders.swift names \(term)")
         }
+        // The runner its slices go through reads no download gate either (it
+        // names no concrete provider: `missingMessageRepairIsProviderBlind`).
+        let runner = try Self.file(Self.sources(), "TabMail/Services/Sync/SyncEngineCatchUp.swift")
+        for term in ["checkExpensive", "isExpensiveNetwork", "batteryLevel", "batteryState", "isLowPowerModeEnabled"] {
+            #expect(!runner.contains(term), "SyncEngineCatchUp.swift names \(term)")
+        }
     }
 
     @Test("the engine's older-mail check and the repair of missing messages name no concrete provider and test no account provider (#1061)")

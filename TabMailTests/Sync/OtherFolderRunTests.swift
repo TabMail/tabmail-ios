@@ -38,6 +38,7 @@ struct OtherFolderRuleTests {
         let daily = SyncConfig.catchUpFullCheckIntervalSeconds
         let weekly = SyncConfig.catchUpOtherFolderFullCheckIntervalSeconds
         #expect(weekly > daily, "precondition: the other folders' check is the rarer one")
+        #expect(weekly == 7 * 24 * 60 * 60, "the other folders' whole-folder check is weekly")
         let pastDaily = IMAPCatchUpState(epoch: 1, lastCompletedAt: now.addingTimeInterval(-daily - 60))
         let pastWeekly = IMAPCatchUpState(epoch: 1, lastCompletedAt: now.addingTimeInterval(-weekly - 60))
         let armed = IMAPCatchUpState(epoch: 1, lastCompletedAt: now, lapseCount: 1)
@@ -241,8 +242,6 @@ struct OtherFolderIMAPTests {
         let accountId: String
         let recorder = FollowedFolderIMAPTests.SliceRecorder()
         let offset = FollowedFolderIMAPTests.ClockOffset()
-        /// Whether the app is in the foreground, for the engine's other-folder runs.
-        let foreground = OtherFolderShared<Bool>(true)
 
         func id(_ path: String) -> String { "\(accountId):\(path)" }
         func path(ofId folderId: String) -> String { String(folderId.dropFirst(accountId.count + 1)) }
@@ -413,10 +412,6 @@ struct OtherFolderIMAPTests {
         await world.watchSlices()
         let offset = world.offset
         await engine.setOtherFolderRunClockForTesting { offset.now() }
-        // The app is in the foreground unless a test says otherwise, whatever
-        // state the test host's own lifecycle is in.
-        let foreground = world.foreground
-        await engine.setOtherFolderRunForegroundForTesting { foreground.get }
         func teardown() async {
             await engine.remove(accountId: accountId)
             await engine.setCatchUpSliceStartHookForTesting(nil)
@@ -589,16 +584,22 @@ struct OtherFolderIMAPTests {
                 try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, alphaId])
             }
             let secondStart = HeldWorkFlag()
+            let keptItsRun = OtherFolderShared<Bool>(false)
             let account = try w.account()
+            let accountId = w.accountId
             let engine = w.engine
             await w.watchSlices { _ in
                 guard !secondStart.set() else { return }
                 // A pass due by its clock ends while the run's first slice goes on.
+                let running = await engine.otherFolderRunTasks[accountId]
                 await engine.startOtherFolderRun(account: account)
+                let after = await engine.otherFolderRunTasks[accountId]
+                keptItsRun.set(running != nil && after == running)
             }
             let start = w.server.recordedCommands().count
             try await w.runOnce()
             #expect(secondStart.isSet, "setup: a second start came during the run")
+            #expect(keptItsRun.get, "the second start left the running run as the account's one run")
             for path in Self.others {
                 let sent = w.commands(naming: path, since: start)
                 let statuses = sent.filter { Self.isStatus($0, of: path) }
@@ -624,65 +625,28 @@ struct OtherFolderIMAPTests {
         }
     }
 
-    // MARK: Foreground only
-
-    @Test("A run starts, and takes each slice, only while the app is in the foreground: a pass that ends after the app has left starts none, a slice whose slot comes after the app left reads nothing, and a run whose app leaves during a slice takes no further slice")
-    func aRunReadsInTheForegroundOnly() async throws {
-        try await Self.withWorld("foreground", .plain) { w in
-            let account = try w.account()
-            let accountId = w.accountId
-            func otherStatuses() -> Int { Self.others.map { w.statusCount($0) }.reduce(0, +) }
-
-            // 1. Out of the foreground: no run is started.
-            w.foreground.set(false)
-            await w.engine.startOtherFolderRun(account: account)
-            let started = await w.engine.otherFolderRunTasks[accountId] != nil
-            await w.settle()
-            let readOutside = otherStatuses()
-            #expect(!started, "no run started out of the foreground")
-            #expect(w.runSlices.isEmpty && readOutside == 0, "nothing was read")
-
-            // 2. The app leaves after a slice's turn, before its slot: that
-            // slice reads nothing, and the run ends.
-            w.foreground.set(true)
-            let foreground = w.foreground
-            await w.watchSlices { _ in foreground.set(false) }
-            await w.engine.startOtherFolderRun(account: account)
-            await w.settle()
-            let readAtSlot = otherStatuses()
-            #expect(w.runSlices.count == 1, "the run took its first slice's turn, then ended")
-            #expect(readAtSlot == 0, "and that slice read nothing")
-
-            // 3. The app leaves during a slice: the slice ends as it would, and
-            // the run takes no further slice.
-            w.recorder.reset()
-            w.foreground.set(true)
-            let first = OtherFolderShared<String?>(nil)
-            await w.watchSlices { folderIds in
-                guard first.get == nil, let firstId = folderIds.first else { return }
-                let path = w.path(ofId: firstId)
-                first.set(path)
-                w.holdStatus(of: path)
+    @Test("With no change tracking, a run lists a changed folder and runs no deletion check after it: the check's walk could outlast the slice, and the weekly whole-folder check removes what it would")
+    func aRunsListingRunsNoDeletionCheck() async throws {
+        try await Self.withWorld("no-deletion-check", .plain) { w in
+            // Alpha owes a deletion check (a due mark), and a rule files a new
+            // message there, so the run lists it.
+            let alphaId = w.id(Self.alpha)
+            try await w.pool.write { db in
+                var state = FolderChangeState(raw: nil)
+                state.markListingDue()
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, alphaId])
             }
-            await w.engine.startOtherFolderRun(account: account)
-            guard await OneSyncAtATimeTests.eventually({ w.isHoldingStatus(of: first.get) }) else {
-                Issue.record("precondition: the run's first slice is held at its first folder's read")
-                w.releaseStatus(of: first.get)
-                await w.settle()
-                return
-            }
-            // The slice's time runs out while its read is held, so it reads
-            // this folder only; the app leaves meanwhile.
-            w.offset.add(SyncConfig.catchUpSliceSeconds + 1)
-            w.foreground.set(false)
-            w.releaseStatus(of: first.get)
-            await w.settle()
-            let slices = w.runSlices.map(\.folderIds)
-            #expect(slices.count == 1, "no slice after the app left: \(slices)")
-            for path in Self.others where path != first.get {
-                let reads = w.statusCount(path)
-                #expect(reads == 0, "\(path): not read once the app had left")
-            }
+            let uid = w.nextUid(in: Self.alpha)
+            w.deliver(uid, to: Self.alpha)
+            let start = w.server.recordedCommands().count
+            try await w.runOnce()
+            let arrived = try w.holds(uid, in: Self.alpha)
+            #expect(arrived, "the run listed Alpha, and its new message arrived")
+            let searches = w.commands(naming: Self.alpha, since: start).filter { $0.uppercased().contains("SEARCH") }
+            #expect(searches.isEmpty, "no deletion check in the run: \(searches)")
+            let alpha = try w.folder(Self.alpha)
+            let stillOwed = FolderChangeState(raw: alpha.changeState).listingDue
+            #expect(stillOwed, "the owed check is left as it was")
         }
     }
 

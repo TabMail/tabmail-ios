@@ -224,11 +224,6 @@ extension SyncEngine {
         /// (`CatchUpSliceResult.finishedFolderIds`), a slice reads nothing new,
         /// or its working time (`workSeconds`) is spent.
         var readsOtherFolders = false
-        /// What the run needs to take a slice (#1110: an other-folder run, the app
-        /// in the foreground), asked at each slice's turn and again when the slice
-        /// gets its slot of the provider work queue: false ends the run there. Nil
-        /// for the backfill worker's runs and the access runs, which ask nothing.
-        var inForeground: (@Sendable () -> Bool)?
         /// The clock the slices and the deadline are measured on. Injectable so a
         /// test can spend a slice deterministically; production passes `Date.init`.
         let clock: @Sendable () -> Date
@@ -286,9 +281,7 @@ extension SyncEngine {
     /// yet done in this run, in `otherFolderReadOrder`. A folder read once, or
     /// whose read failed, is not asked again in the run, which ends at the turn
     /// that finds none left (before it opens a window or asks for a slot), after
-    /// a slice that read nothing, or when its working time is spent. It runs in
-    /// the foreground only (`CatchUpRun.inForeground`): a turn, or a slot, that
-    /// finds the app has left ends it before its slice reads anything.
+    /// a slice that read nothing, or when its working time is spent.
     /// A foreground cycle (`run.deadline == nil`, no working time) runs one slice; the background
     /// processing job runs slices until its deadline, and stops after a slice
     /// whose folders made no progress and that left no folder out it had not
@@ -363,9 +356,6 @@ extension SyncEngine {
             let workedSoFar = worked
             let slice: CatchUpSliceOutcome = await oneSyncAtATime(accountId: accountId) {
                 let turnTaken = ContinuousClock.now
-                // A run that may go on only in the foreground (#1110) ends at the
-                // turn that finds the app has left, before it opens a window.
-                if let inForeground = run.inForeground, !inForeground() { return .runOver }
                 if let end = self.catchUpSliceWindowEnds[accountId], end > Date() {
                     // No slice can start before the run's deadline: the run ends
                     // now rather than wait past it.
@@ -424,9 +414,7 @@ extension SyncEngine {
                 do {
                     sliceWork = try await queue.execute(priority: .headerFetch) { () -> CatchUpSliceWork in
                         let admitted = ContinuousClock.now
-                        // The app may have left while the slice waited for its slot (#1110).
-                        let mayGoOn = run.inForeground?() ?? true
-                        guard mayGoOn, var context = run.sliceStartingNow(worked: workedSoFar) else {
+                        guard var context = run.sliceStartingNow(worked: workedSoFar) else {
                             return CatchUpSliceWork(queueWait: asked.duration(to: admitted))
                         }
                         context.otherFolderIds = otherFolderIds
