@@ -602,7 +602,15 @@ struct OneSyncAtATimeTests {
         var snapshot: [String] { entries.withLock { $0 } }
     }
 
-    static func eventually(seconds: Double = 10, _ condition: () async -> Bool) async -> Bool {
+    /// `isolation: isolated (any Actor)? = #isolation` keeps `condition` on the
+    /// caller's isolation, so a `@MainActor` test can pass a closure that reads
+    /// its own state without sending it across an actor boundary (the target
+    /// builds with `SWIFT_STRICT_CONCURRENCY: complete`).
+    static func eventually(
+        seconds: Double = 10,
+        isolation: isolated (any Actor)? = #isolation,
+        _ condition: () async -> Bool
+    ) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
             if await condition() { return true }
