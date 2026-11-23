@@ -289,8 +289,10 @@ struct ChatSwipeTestScene: View {
             let accountID = Self.accountID
             let now = Date()
             try await AppDatabase.dbPool.write { db in
-                // Each launch owns only this synthetic account's fixture rows.
+                // Each launch owns only this synthetic account's fixture rows, its kept words
+                // included, so every run starts with an empty field.
                 try MessageHeader.filter(Column("accountId") == accountID).deleteAll(db)
+                try ChatFieldWords.deleteAccount(accountID, db: db)
                 if Self.savedDraft { try Draft.filter(Column("accountId") == accountID).deleteAll(db) }
                 var account = Account(emailAddress: "me@example.com", displayName: "Chat swipe fixture", provider: .imap)
                 account.id = accountID
