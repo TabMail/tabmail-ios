@@ -18,27 +18,42 @@ import GRDB
 /// folder alike.
 extension SyncEngine {
 
+    /// The folders of `folderIds` that are not followed yet.
+    nonisolated static func unfollowedFolderIds(_ folderIds: [String], db: Database) throws -> [String] {
+        let ids = Array(Set(folderIds))
+        guard !ids.isEmpty else { return [] }
+        let unfollowed = Folder.filter(keys: ids).filter(Column(Folder.followedColumn) == false)
+        return try String.fetchAll(db, unfollowed.select(Column("id")))
+    }
+
     /// The one writer of `Folder.isFollowed`: marks every folder of `folderIds`
     /// that is not followed yet, column-scoped (no other column, so no backfill
     /// version bump). Never clears a mark. Returns the folders marked now.
     @discardableResult
     nonisolated static func markFollowed(folderIds: [String], db: Database) throws -> [String] {
-        let ids = Array(Set(folderIds))
-        guard !ids.isEmpty else { return [] }
-        let unfollowed = Folder.filter(keys: ids).filter(Column(Folder.followedColumn) == false)
-        let marked = try String.fetchAll(db, unfollowed.select(Column("id")))
+        let marked = try unfollowedFolderIds(folderIds, db: db)
         guard !marked.isEmpty else { return [] }
         try Folder.filter(keys: marked).updateAll(db, Column(Folder.followedColumn).set(to: true))
         return marked
     }
 
-    /// Marks the folders followed (`markFollowed`). A failed write is logged and
-    /// marks nothing: the folders stay as they were until the next action that
-    /// lands in them.
+    /// Marks the folders followed (`markFollowed`). A failed read or write is
+    /// logged and marks nothing: the folders stay as they were until the next
+    /// action that lands in them.
+    ///
+    /// It reads first and opens a write only when some folder is not followed
+    /// yet. A mark is never cleared, so a read that finds them all followed
+    /// proves there is nothing to write, and the usual case (a folder opened
+    /// again, the Inbox at each launch, every pull of a followed folder) never
+    /// waits for the database's one writer, which a header batch or an apply
+    /// may hold, before the pull's first read (`AccountManager.syncFolders`).
+    /// The write checks again inside its transaction (`markFollowed`).
     func followFolders(_ folderIds: [String]) async {
         guard !folderIds.isEmpty else { return }
         do {
-            let marked = try await dbPool.write { db in try Self.markFollowed(folderIds: folderIds, db: db) }
+            let unfollowed = try await dbPool.read { db in try Self.unfollowedFolderIds(folderIds, db: db) }
+            guard !unfollowed.isEmpty else { return }
+            let marked = try await dbPool.write { db in try Self.markFollowed(folderIds: unfollowed, db: db) }
             if !marked.isEmpty, DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[Follow] followed now: \(marked)")
             }
@@ -63,8 +78,10 @@ extension SyncEngine {
     /// Each run asks only its folders (the syncable ones among them, so a
     /// folder whose mark did not land is not asked), under the account's turn
     /// and slice pacing like every catch-up slice, until they make no progress
-    /// or its slices have spent `SyncConfig.accessCatchUpRunSeconds` inside the
-    /// turn (`CatchUpRun.workSeconds`: a wait for the turn is not counted).
+    /// or its slices have spent `SyncConfig.accessCatchUpRunSeconds` of working
+    /// time (`CatchUpRun.workSeconds`: each slice's time counts from its slot of
+    /// the provider work queue, so neither the wait for the turn nor the wait
+    /// for the slot is counted).
     func startAccessCatchUp(accountId: String, folderIds: [String]) {
         guard !folderIds.isEmpty else { return }
         accessCatchUpPending[accountId, default: []].formUnion(folderIds)

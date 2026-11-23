@@ -4877,6 +4877,59 @@ struct GmailCatchUpTests {
         }
     }
 
+    /// Removing the account (`SyncEngine.remove(accountId:)`, which a
+    /// re-authentication or re-adding an account runs before it connects again)
+    /// ends its access run at once, even while the run's slice waits for a slot
+    /// of the provider work queue: the removal does not wait for the slot,
+    /// nothing is sent then or after, the turn is free, and no run and no
+    /// waiting folder is left for the account. RED with the removal not
+    /// cancelling the run (it then waits until the slot comes free, and the run
+    /// goes on asking), and with the waiting folders kept.
+    @Test("Removing the account ends its access run while the run waits for a slot, and drops the folders waiting for the next run")
+    func removingTheAccountEndsItsAccessRun() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.rangesWorld(clock, count: 8)
+        try await Self.withWorld("gcu-access-remove", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let engine = world.engine
+            let accountId = world.accountId
+            let inbox = world.folderId(inboxPath)
+            let queue = try await Self.workQueue(world)
+            // Holds the queue's only slot; let go on every way out below.
+            let holder = SlotHolder(queue, adding: 0, to: AddedTime())
+            let held = await holder.take()
+            await engine.startAccessCatchUp(accountId: accountId, folderIds: [inbox])
+            let queued = await OneSyncAtATimeTests.eventually {
+                guard await engine.syncPassRunning.contains(accountId) else { return false }
+                return await queue.waitingCount == 1
+            }
+            // A second access while the run waits: its folder waits for the next run.
+            await engine.startAccessCatchUp(accountId: accountId, folderIds: [inbox])
+            let pendingBefore = await engine.accessCatchUpPending[accountId]
+            let removed = Mutex(false)
+            let removal = Task {
+                await engine.remove(accountId: accountId)
+                removed.withLock { $0 = true }
+            }
+            let removedWhileHeld = await OneSyncAtATimeTests.eventually(seconds: 5) { removed.withLock { $0 } }
+            let runLeft = await engine.accessCatchUpTasks[accountId] != nil
+            let pendingLeft = await engine.accessCatchUpPending[accountId]
+            let turnFree = !(await engine.syncPassRunning.contains(accountId))
+            let slotStillHeld = holder.isHeld
+            await holder.release()
+            await Self.ended(removal, "the removal")
+
+            let sent = world.server.http.recordedCalls().count
+            #expect(held, "precondition: the test holds the queue's only slot")
+            #expect(queued, "precondition: the access run's slice waited in the queue for the held slot")
+            #expect(pendingBefore == [inbox], "precondition: the second access waits for the next run: \(String(describing: pendingBefore))")
+            #expect(removedWhileHeld && slotStillHeld, "the removal ended the run without waiting for the slot")
+            #expect(!runLeft, "no access run is left for the removed account")
+            #expect(pendingLeft == nil, "the folders waiting for the next run were dropped: \(String(describing: pendingLeft))")
+            #expect(turnFree, "the run freed the account's turn")
+            #expect(sent == 0, "nothing was sent, before the removal or after the slot came free: \(sent)")
+        }
+    }
+
     /// A slice refused by a work queue that was closed while the slice waited
     /// for its slot (the account's teardown, `ProviderWorkQueue.invalidate`, not
     /// a cancellation) ends the run there: nothing more is sent, the earlier

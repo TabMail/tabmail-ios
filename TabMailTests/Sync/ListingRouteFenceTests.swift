@@ -85,7 +85,7 @@ struct ListingRouteFenceTests {
 
     /// The follow mark (`Folder.isFollowed`, #1109) is column-scoped like the
     /// counters: one writer, `SyncEngine.markFollowed`, which only ever sets it.
-    /// No other code names the column to write it, no production code sets the
+    /// No other code names the column or its constant to write it, no production code sets the
     /// record's field, and no whole record writes it (the encode fence in
     /// `FolderRoleTests`).
     @Test("The follow mark: one writer, which only sets it")
@@ -96,6 +96,12 @@ struct ListingRouteFenceTests {
                 "the writer's definition and its one call, in followFolders")
         #expect(Self.hits("Column(Folder.followedColumn).set(", in: sources) == [followFile: 1],
                 "the column is set by markFollowed alone")
+        // Every use of the column constant, however it is written to (a raw SQL
+        // write that interpolates it would not spell the column's name): its
+        // declaration, the read of the folders not followed yet, and the one set.
+        let constantUses = Self.hits("followedColumn", in: sources)
+        #expect(constantUses == ["TabMail/Models/Folder.swift": 1, followFile: 2],
+                "a new use of the column constant is reviewed against the one writer: \(constantUses)")
         #expect(Self.hits("\"isFollowed\"", in: sources) == ["TabMail/Models/Folder.swift": 1, "TabMail/Services/AppDatabase.swift": 1],
                 "the column's name appears only as its constant and in its migration")
         // Every mention of the field or column, however it is spelled (a Swift

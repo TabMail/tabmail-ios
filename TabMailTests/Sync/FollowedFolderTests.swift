@@ -782,6 +782,51 @@ struct FollowedFolderIMAPTests {
         }
     }
 
+    /// Following a folder that is already followed never waits for the
+    /// database's one writer: `followFolders` reads first and opens a write
+    /// only for a folder not followed yet, so a pull of a followed folder
+    /// (`AccountManager.syncFolders` follows its folders before its first read)
+    /// is not held behind a write in flight. RED with a write opened every time.
+    @Test("Following a folder that is already followed returns while another write holds the database's writer")
+    @MainActor
+    func followingAFollowedFolderNeverWaitsForTheWriter() async throws {
+        try await Self.withWorld("follow-read-first", .plain) { w in
+            let engine = AccountManager.shared.syncEngine
+            let folderId = w.folderId
+            await engine.followFolders([folderId])
+            try w.expectFollowed([folderId], "precondition: the first access follows the folder")
+            // Another write holds the writer on a thread of its own until let go
+            // (at most 10 s, so a failing run still ends).
+            let pool = w.pool
+            let writerHeld = Mutex(false)
+            let writerEnded = Mutex(false)
+            let letGo = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                try? pool.write { _ in
+                    writerHeld.withLock { $0 = true }
+                    _ = letGo.wait(timeout: .now() + .seconds(10))
+                }
+                writerEnded.withLock { $0 = true }
+            }
+            let held = await OneSyncAtATimeTests.eventually(seconds: 5) { writerHeld.withLock { $0 } }
+            let followed = Mutex(false)
+            let follow = Task {
+                await engine.followFolders([folderId])
+                followed.withLock { $0 = true }
+            }
+            let returnedWhileHeld = await OneSyncAtATimeTests.eventually(seconds: 2) { followed.withLock { $0 } }
+            let stillHeld = !writerEnded.withLock { $0 }
+            letGo.signal()
+            await follow.value
+            let ended = await OneSyncAtATimeTests.eventually(seconds: 5) { writerEnded.withLock { $0 } }
+
+            #expect(held, "precondition: another write holds the database's writer")
+            #expect(returnedWhileHeld && stillHeld, "following a followed folder did not wait for the writer")
+            #expect(ended, "the held write ended once let go")
+            try w.expectFollowed([folderId], "the folder stays followed")
+        }
+    }
+
     @Test("A listing that spans runs records the counters it started from, so a change made during it is listed at the next access")
     @MainActor
     func completionKeepsTheCountersItsListingStartedFrom() async throws {

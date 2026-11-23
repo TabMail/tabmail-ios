@@ -1350,7 +1350,10 @@ on the re-drive.
 2. **The access points** (`SyncEngine.folderAccessed`: the mark, then an access catch-up run):
    - opening a folder or pulling to refresh it (`AccountManager.syncFolders`): the mark is written first,
      before the connect and the listings, so an open while offline, or a listing that fails, still follows
-     the folder; the run starts after the change read, so a folder the reader has just baselined may be
+     the folder. `followFolders` reads first and opens a write only when some folder is not followed yet:
+     a mark is never cleared, so the usual pull (a folder already followed) never waits for the database's
+     one writer before its first read. *(Amended in review 2026-11-23: it first opened a write on every
+     pull.)* The run starts after the change read, so a folder the reader has just baselined may be
      listed. When that read finds the account busy (it sets the account's follow-up flag and reads
      nothing, #1289), the run starts all the same and waits for the turn; it may take the turn before
      the follow-up stage 2, and an Outlook folder the follow-up has yet to baseline is then not listed by
@@ -1388,7 +1391,9 @@ on the re-drive.
    turn, and could wait for another pacing window, before it found its time spent. Every catch-up slice,
    the backfill's included, now starts its clock at its slot: ADR-IOS-107, amendment 2026-11-23 (#1109).)*
    `CatchUpContext.accessedFolderIds` tells the provider which folders an action reached (provider-neutral).
-   `SyncEngine.remove(accountId:)` cancels the run.
+   `SyncEngine.remove(accountId:)` drops the folders waiting for a run and cancels the running one, so a
+   disconnect that keeps the account's credentials (a re-authentication, re-adding an account) does not
+   wait for it.
 4. **IMAP access check** (`IMAPProvider.catchUpPlan`, `counters:`, `accessed:`). An untracked folder with no
    mod-sequences has no cheap check, so the daily full check alone would leave an accessed folder stale for
    up to a day. An accessed, untracked folder is listed when its stored counters (`totalCount`, the
@@ -1445,6 +1450,8 @@ the #1268 label sets and the #1276 cost, as their bullets say):
   the folder's last listing stored, so a change made elsewhere since then waits for the folder's next
   open (whose listing refreshes them), the next access after the hour, or the daily check; a tracked folder's changes wait for its next change
   read; a listing that throws ends that run.
+- A pull whose connect, listing or change read throws starts no access run, nor does one whose account
+  is gone by then: the folders are already followed, so the backfill worker's catch-up reconciles them.
 - A message whose body is still queued (the poll path: a background body queue, cancelled reads, an
   address the provider is blocking) starts its access when the load hands over to the poll, so the poll's
   next read (every 2 s) can wait behind at most one catch-up request on the folder's connection or
@@ -1484,14 +1491,17 @@ no mod-sequences and on a QRESYNC server, each against the scenario's expected s
 the action's own `UID MOVE` the only change sent to the server, each run asking only the accessed
 folders and a quiet re-open listing nothing, the message's body requested before any catch-up slice, a
 second access during a run taken by the next run (and never asked alone, with a pause between the
-handovers), an open while offline that still follows the folder, a pull whose change read finds the
+handovers), an open while offline that still follows the folder, following a followed folder while
+another write holds the database's writer (no wait), a pull whose change read finds the
 account busy (its access run waits behind the running pass, asks nothing meanwhile, then reconciles the
 folder with all of its time although its clock moved on twice that time while it waited), and a completion that keeps the
 counters its listing started from across slices; `FollowedFolderOutlookTests`: through the production change read, the gated access sends no
 request for the folder and writes no listing, then the baseline, then the listing),
 `ReleaseBoundaryRecheckTests.applyOverflowInAFollowedFolderArmsTheCatchUp` (the first ids are kept),
 `FolderIsFollowedMigrationTests`, `ListingRouteFenceTests.followMarkHasOneWriter` (every production
-mention of the mark, and the detail view model's production init turning the access on).
+mention of the mark and of its column constant, and the detail view model's production init turning the
+access on), `GmailCatchUpTests.removingTheAccountEndsItsAccessRun` (removing the account ends a run waiting
+for its slot at once, sends nothing, and drops the folders waiting for the next run).
 
 Keywords: isFollowed, followed folder, follow mark, markFollowed, followedColumn, folderAccessed,
 followFolders, startAccessCatchUp, access catch-up run, accessedFolderIds, accessCatchUpRunSeconds,

@@ -151,18 +151,21 @@ extension SyncEngine {
         let task = Self.currentTaskIdentity()
         if let task, Self.heldSyncTurn[accountId] == task { return try await pass() }
         if !syncPassRunning.insert(accountId).inserted {
-            let behind = syncTurnHolders[accountId] ?? "unknown"
-            let waitStart = ContinuousClock.now
+            // Debug-gated (#1109): with debug logging on, how long a pass that
+            // waits for the turn (a listing, the follow-up stage 2,
+            // `sync(account:)`, a catch-up slice) waited, and what held the
+            // turn when it got in line. With it off, nothing is read or timed.
+            let trace: (behind: String, start: ContinuousClock.Instant)? = DebugModeManager.isLoggingEnabled()
+                ? (syncTurnHolders[accountId] ?? "unknown", ContinuousClock.now) : nil
             let ownsTurn = await waitForSyncTurn(accountId: accountId, caller: "\(caller):\(line)")
-            let waited = waitStart.duration(to: .now)
-            // Debug-gated (#1109): how long a pass that waits for the turn (a
-            // listing, the follow-up stage 2, `sync(account:)`, a catch-up
-            // slice) waited, and what held the turn when it got in line.
-            BackgroundSyncLogger.logDebug("[SyncTurnWait] \(accountId.prefix(8)): \(caller):\(line) waitedMs=\(MigrationTimingLedger.wholeMilliseconds(waited)) behind=\(behind)")
+            if let trace {
+                let waited = trace.start.duration(to: .now)
+                BackgroundSyncLogger.logDebug("[SyncTurnWait] \(accountId.prefix(8)): \(caller):\(line) waitedMs=\(MigrationTimingLedger.wholeMilliseconds(waited)) behind=\(trace.behind)")
+            }
             // Only after a test-harness overrun: that test has already failed.
             if !ownsTurn { return try await pass() }
         }
-        syncTurnHolders[accountId] = "\(caller):\(line)"
+        recordSyncTurnHolder(accountId: accountId, "\(caller):\(line)")
         defer { handOverSyncPass(accountId: accountId) }
         var held = Self.heldSyncTurn
         held[accountId] = task
@@ -308,7 +311,19 @@ extension SyncEngine {
         }
         let next = waiting.removeFirst()
         syncPassWaiters[accountId] = waiting.isEmpty ? nil : waiting
-        syncTurnHolders[accountId] = next.caller
+        recordSyncTurnHolder(accountId: accountId, next.caller)
         next.continuation.resume()
+    }
+
+    /// Debug-gated (#1109): with debug logging on, records where the pass now
+    /// holding the account's turn was started, for `[SyncTurnWait]`. With it
+    /// off nothing is rendered or stored, and any label left from a time it
+    /// was on is dropped, so a later wait never names a stale holder.
+    private func recordSyncTurnHolder(accountId: String, _ holder: @autoclosure () -> String) {
+        guard DebugModeManager.isLoggingEnabled() else {
+            syncTurnHolders[accountId] = nil
+            return
+        }
+        syncTurnHolders[accountId] = holder()
     }
 }

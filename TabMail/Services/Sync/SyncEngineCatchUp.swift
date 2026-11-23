@@ -320,7 +320,8 @@ extension SyncEngine {
         // again in this run. In memory only, gone when the run ends.
         var inFlight = Set<String>()
         // The run's working time so far (`CatchUpRun.workSeconds`): only the
-        // slices' time inside the turn.
+        // slices' time from their slot of the provider work queue, so neither
+        // a wait for the turn nor a wait for the slot is counted.
         var worked: TimeInterval = 0
         runLoop: while !Task.isCancelled {
             let leftOut = inFlight
