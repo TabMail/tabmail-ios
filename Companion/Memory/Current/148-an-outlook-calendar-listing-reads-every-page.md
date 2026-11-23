@@ -64,3 +64,28 @@ two properties.
 
 `GoogleCalendarProvider.listEvents` also reads one page (`maxResults` is Google's page size and
 its `nextPageToken` is not followed); a separate issue, not this one.
+
+## The assistant's read tools name what they could not read (#1293, 2026-11-23)
+
+This holds for every provider, not only Outlook. `CalendarToolHelpers.fetchEventsFromAllCalendars` returns,
+beside the events, `unread`: each visible calendar whose `listEvents` threw and each account whose
+`listCalendars` threw (`listingIncomplete` and `missingScope` included; the catch is untyped, so no provider
+type is named above the provider), sorted. `calendar_read`, `calendar_search` (every page) and
+`calendar_event_read` by start time append one line naming them, after their results or in place of their
+plain "nothing found" text; `calendar_event_read` by id names an account whose calendars could not be listed
+in its scan's error. Nothing is retried. When every calendar is read, every output is exactly what it was.
+
+The text, for the Thunderbird add-on's matching fix (TabMail/tabmail-thunderbird#466) to copy:
+- a calendar: `"<calendar name>" (<account address>)`, the name falling back to the calendar id;
+- an account: `every calendar of <account address>`;
+- the line: `These calendars could not be read, so their events are not listed: <label>; <label>. Tell the user they could not be read; do not say they have no events.`
+- the empty texts: `No calendar events found in the requested date range in the calendars that could be read.`,
+  `No calendar events found matching '<query>' in the requested date range in the calendars that could be read.`,
+  `No entries matched in the calendars that could be read.`, and by id
+  `Event not found in the calendars that could be read.` (inside the JSON `error`).
+
+Tests: `CalendarUnreadCalendarTests` (each tool through its entry point, one or more accounts failing).
+Not covered by this: `calendar_event_read` by id still skips, without saying so, a calendar whose `getEvent`
+fails with an error other than not found, because the scan sends one provider's id to every other provider
+and a foreign id often fails that way (Google refuses a CalDAV href, Graph answers 400, CalDAV refuses an
+occurrence id), so such a failure cannot be told apart from "not this provider's event".
