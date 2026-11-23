@@ -45,8 +45,11 @@ import Synchronization
 // - That stage 2, the follow-up, is asked for when the flag is first set. It
 //   waits in line for the turn behind the running work, like work that is not a
 //   trigger, so it starts as soon as that work ends, even when the work takes
-//   the turn again at once (a catch-up's next slice). It runs only if the flag
-//   is still set when it gets the turn: a stage 2 that ran in between served it.
+//   the turn again at once (a catch-up's next slice). That holds from the moment
+//   it is in line: work that asks for the turn during its first steps (the
+//   account read and the connection check) goes first (#1329). It runs only if
+//   the flag is still set when it gets the turn: a stage 2 that ran in between
+//   served it.
 // - Only an account that is free takes the quick-sync-only route.
 // - In the background a set flag waits for the next opening of the app: stage 2
 //   never starts in the background. The follow-up checks this when it is asked
@@ -58,7 +61,10 @@ import Synchronization
 // - On a launch the follow-up waits for the first paint, as the poll does. It
 //   stands in for the trigger's own read, so after a read that found changes it
 //   also mirrors the delta cursors for the notification extension, and it
-//   reloads the inbox once it read.
+//   reloads the inbox once it read. Fast Sync does not hold it back: the
+//   trigger's own read never waited for Fast Sync to end, so during Fast Sync
+//   the follow-up reads between two catch-up slices. The poll and its stage 2
+//   for every account (#1313, #1314) still skip their reads during Fast Sync.
 // - The poll does not wait for a busy account either. It sets the flag and goes
 //   straight on to the queued work (actions, outbox, calendar), which never
 //   depended on stage 2: each gesture and a network restore already start that
@@ -80,10 +86,12 @@ import Synchronization
 // one; only its own connection check (`AccountManager.ensureConnected`) runs
 // inside its limit before it takes or flags the turn, as before. The follow-up
 // waits, so its quick sync's deadline (`SyncConfig.perAccountSyncTimeoutSeconds`)
-// starts when it gets the turn. Like stage 2 from Settings it has no outer time
-// limit, so a full sync that is due runs to its end. In v1.11.4 a stage 2 queued
-// behind stage 1 counted that wait against its limit and had no time left
-// (#1289).
+// starts when it gets the turn. It has no outer time limit, like stage 2 from
+// Settings: a timeout around a pass that waits would clear the flag unread. Its
+// deadline bounds its quick sync and the deadline-bounded steps of a due full
+// sync, as for the poll's stage 2; what a full sync could not finish in time is
+// owed to the next listing (ADR-IOS-111). In v1.11.4 a stage 2 queued behind
+// stage 1 counted that wait against its limit and had no time left (#1289).
 //
 // No recent-sync guard, of any length. A return to the app runs stage 1's quick
 // sync and then stage 2's own quick sync. They take turns, so they never collide,

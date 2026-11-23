@@ -1079,12 +1079,21 @@ final class SyncScheduler {
 
     // MARK: - Follow-up stage 2 (the sync design block in SyncEngineOneSyncAtATime.swift)
 
-    /// Whether a stage 2 may start now: only in the foreground, and never while
-    /// the poll itself would not sync (demo mode, the background processing
-    /// job's fast sync).
-    private var stageTwoMayStart: Bool {
+    /// Whether the follow-up stage 2 may start now: only in the foreground, and
+    /// never in demo mode. Fast Sync does not hold it back: it stands in for a
+    /// trigger's own read, which never waited for Fast Sync to end (it waited
+    /// for the running catch-up slice, then read), so during Fast Sync it reads
+    /// between two slices. In the background, where the processing job's fast
+    /// sync runs, it does not start anyway.
+    private var followUpMayStart: Bool {
         isForeground && !Self.syncDisabled && !DemoModeStore.shared.isActive
-            && !AccountManagerState.shared.fastSyncModeActive
+    }
+
+    /// Whether the poll's stage 2 for every account may start now
+    /// (`stageTwoForEveryAccount`): the follow-up's gate, and not during Fast
+    /// Sync, when the poll skips its own reads.
+    private var pollStageTwoMayStart: Bool {
+        followUpMayStart && !AccountManagerState.shared.fastSyncModeActive
     }
 
     /// Runs the one stage 2 an account's follow-up flag asks for
@@ -1093,15 +1102,16 @@ final class SyncScheduler {
     /// flag set. It waits for the work holding the turn to end. When a stage 2
     /// may not start, as in the background, it starts nothing: the flag stays
     /// set, and the next opening's stage 1 asks again when it ends. The same
-    /// gate is checked again when it gets the turn (`SyncEngine.followUpPass`):
-    /// the app may have left while it waited. It stands in for the trigger's
-    /// own read, so it keeps that read's gate and side steps: it waits for the
-    /// first paint, as the opening's reads do (the startup budget); when it
-    /// read, the inbox reloads, as after a push's own read (`backgroundPoll`:
-    /// the trigger's reload came before this read), and when it found changes
-    /// the notification extension's cursors are mirrored again.
+    /// gate (`followUpMayStart`) is checked again when it gets the turn
+    /// (`SyncEngine.followUpPass`): the app may have left while it waited. It
+    /// stands in for the trigger's own read, so it keeps that read's gate and
+    /// side steps: it waits for the first paint, as the opening's reads do (the
+    /// startup budget); when it read, the inbox reloads, as after a push's own
+    /// read (`backgroundPoll`: the trigger's reload came before this read), and
+    /// when it found changes the notification extension's cursors are mirrored
+    /// again.
     func runSyncFollowUp(accountId: String) async {
-        guard stageTwoMayStart else {
+        guard followUpMayStart else {
             BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): no stage 2 now, the flag waits")
             return
         }
@@ -1112,7 +1122,7 @@ final class SyncScheduler {
         guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: accountId) }),
               account.isActive else { return }
         BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): stage 2")
-        guard let result = await manager.followUpRun(account, mayStart: { self.stageTwoMayStart }) else { return }
+        guard let result = await manager.followUpRun(account, mayStart: { self.followUpMayStart }) else { return }
         if result.hadChanges { NSEDataBridge.mirrorLastHistoryIds() }
         NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
     }
@@ -1123,7 +1133,7 @@ final class SyncScheduler {
     /// runs it now; one that is busy gets its follow-up flag. The running work
     /// does the rest (the queued work, the push re-subscribe).
     private func stageTwoForEveryAccount(trigger: String) async {
-        guard stageTwoMayStart else { return }
+        guard pollStageTwoMayStart else { return }
         BackgroundSyncLogger.logDebug("[SyncFollowUp] \(trigger): stage 2 for every account")
         #if DEBUG
         if let stageTwoHook { await stageTwoHook(trigger); return }

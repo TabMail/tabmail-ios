@@ -44,8 +44,8 @@ struct SyncFollowUpTests {
             /// earlier stage 2 had cleared the flag, or the app had left) or
             /// "threw".
             var outcomes: [String] = []
-            /// The app's state for the runner, as the scheduler's stage 2 gate
-            /// (`SyncScheduler.stageTwoMayStart`): checked at the ask and again
+            /// The app's state for the runner, as the scheduler's follow-up gate
+            /// (`SyncScheduler.followUpMayStart`): checked at the ask and again
             /// at the turn.
             var foreground = true
         }
@@ -138,30 +138,36 @@ struct SyncFollowUpTests {
         case stageTwo
     }
 
-    /// For each trigger that returned, in order: whether it read nothing.
+    /// For each trigger that returned, in order: "nothing" (it found the
+    /// account busy and read nothing), "read", or "threw".
     final class Returns: Sendable {
-        let readNothing = Mutex<[Bool]>([])
-        var snapshot: [Bool] { readNothing.withLock { $0 } }
+        let outcomes = Mutex<[String]>([])
+        var snapshot: [String] { outcomes.withLock { $0 } }
     }
 
     /// Runs `burst` triggers of `kind` one after another in a task and records
-    /// each result; a trigger that waits for the turn never records.
+    /// each result; a trigger that waits for the turn never records. A throw is
+    /// recorded as such, never as a busy account.
     private static func fire(
         _ kind: Trigger, burst: Int, engine: SyncEngine, account: Account, deadline: Date? = nil
     ) -> Returns {
         let returns = Returns()
         Task {
             for _ in 0..<burst {
-                switch kind {
-                case .changeRead:
-                    let read = try? await engine.backgroundDeltaSync(account: account)
-                    let nothing = read == nil
-                    returns.readNothing.withLock { $0.append(nothing) }
-                case .stageTwo:
-                    let ran = try? await engine.syncOrFollowUp(account: account, deadline: deadline)
-                    let nothing = ran == nil
-                    returns.readNothing.withLock { $0.append(nothing) }
+                let outcome: String
+                do {
+                    switch kind {
+                    case .changeRead:
+                        let read = try await engine.backgroundDeltaSync(account: account)
+                        outcome = read == nil ? "nothing" : "read"
+                    case .stageTwo:
+                        let ran = try await engine.syncOrFollowUp(account: account, deadline: deadline)
+                        outcome = ran == nil ? "nothing" : "read"
+                    }
+                } catch {
+                    outcome = "threw"
                 }
+                returns.outcomes.withLock { $0.append(outcome) }
             }
         }
         return returns
@@ -194,11 +200,11 @@ struct SyncFollowUpTests {
 
             let results = Self.fire(kind, burst: burst, engine: engine, account: account)
             let returned = await O.eventually(seconds: 5) { results.snapshot.count == burst }
-            let readNothing = results.snapshot
+            let outcomes = results.snapshot
             let wanted = await engine.syncFollowUpWanted
             let inLine = await Self.waitingInLine(engine, 1)
             #expect(returned, "a trigger waited for the turn instead of setting the follow-up flag")
-            #expect(readNothing == Array(repeating: true, count: burst), "a busy trigger ran a pass")
+            #expect(outcomes == Array(repeating: "nothing", count: burst), "a busy trigger did not return having read nothing: \(outcomes)")
             #expect(wire.snapshot.historyStarts.isEmpty, "a busy trigger read changes")
             #expect(followUps.asks == [Self.accountId], "setting the flag did not ask for one follow-up, however many triggers came")
             #expect(wanted == [Self.accountId], "the busy account's follow-up flag is not set")
@@ -523,7 +529,7 @@ struct SyncFollowUpTests {
                 let stageOne = Task { try await engine.backgroundDeltaSync(account: account) }
                 #expect(await O.eventually { log.snapshot.contains("read 1500") }, "precondition: stage 1 is reading")
                 let poll = Self.fire(.stageTwo, burst: 1, engine: engine, account: account)
-                #expect(await O.eventually(seconds: 5) { poll.snapshot == [true] },
+                #expect(await O.eventually(seconds: 5) { poll.snapshot == ["nothing"] },
                         "precondition: the poll's stage 2 found stage 1 running")
                 gate.signal()
                 _ = try await stageOne.value
@@ -832,18 +838,25 @@ struct SyncFollowUpTests {
     func returnDuringAReturnRunsStageTwo() async throws {
         let stages = Stages()
         let painted = AsyncStream<Bool>.makeStream()
+        // A test that stops early still ends the parked stage 2.
+        defer { painted.continuation.finish() }
         let scheduler = SyncScheduler(
             foreground: true,
             foregroundReady: {
+                stages.gateReached = true
                 for await ready in painted.stream { return ready }
                 return false
             },
             stageTwo: { stages.triggers.append($0) })
         scheduler.stageTwoForReturnDuringReturn()
-        try await Task.sleep(for: .milliseconds(200))
+        var deadline = Date().addingTimeInterval(5)
+        while !stages.gateReached, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(stages.gateReached, "precondition: the stage 2 reached the first-paint gate")
         #expect(stages.triggers.isEmpty, "the stage 2 started before the inbox painted")
         painted.continuation.yield(true)
-        let deadline = Date().addingTimeInterval(5)
+        deadline = Date().addingTimeInterval(5)
         while stages.triggers.isEmpty, Date() < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -875,6 +888,43 @@ struct SyncFollowUpTests {
         await scheduler.runSyncFollowUp(accountId: "follow-up-account")
         let expected = state == .background ? [] : ["follow-up follow-up-account"]
         #expect(stages.triggers == expected, "app state \(state.rawValue)")
+    }
+
+    /// The app's mode for the stage 2 gates.
+    enum GateMode: String, CaseIterable, Sendable {
+        case normal
+        case fastSync
+        case demo
+    }
+
+    /// Fast Sync and demo mode against the two stage 2 gates. The follow-up
+    /// stands in for a trigger's own read, which Fast Sync never held back (it
+    /// waited for the running catch-up slice, then read), so only demo mode
+    /// stops it. The stage 2 for every account (a poll tick during a poll,
+    /// #1313) keeps the poll's gate, which Fast Sync stops too: the poll skips
+    /// its own reads then. RED with the Fast Sync term in the follow-up's gate (a
+    /// push during Fast Sync read nothing until the next poll after it), with it
+    /// dropped from the poll's, or with demo mode left out of the follow-up's.
+    @Test("Fast Sync holds back the poll's stage 2 but not the follow-up; demo mode holds back both",
+          arguments: GateMode.allCases)
+    @MainActor
+    func stageTwoGatesForFastSyncAndDemo(mode: GateMode) async {
+        let stages = Stages()
+        let state = AccountManagerState.shared
+        let demo = DemoModeStore.shared
+        let saved = (state.fastSyncModeActive, demo.isActive)
+        state.fastSyncModeActive = mode == .fastSync
+        demo.isActive = mode == .demo
+        defer {
+            state.fastSyncModeActive = saved.0
+            demo.isActive = saved.1
+        }
+        let scheduler = SyncScheduler(foreground: true, pollActive: true, stageTwo: { stages.triggers.append($0) })
+        await scheduler.runSyncFollowUp(accountId: "follow-up-account")
+        await scheduler.poll()
+        let followUp = mode == .demo ? [] : ["follow-up follow-up-account"]
+        let tick = mode == .normal ? ["poll tick during a poll"] : []
+        #expect(stages.triggers == followUp + tick, "mode \(mode.rawValue)")
     }
 
     /// RED without the first-paint gate: the follow-up's stage 2 could start

@@ -763,16 +763,17 @@ actor SyncEngine {
     /// slice). It runs stage 2 only if the flag is still set when it gets the
     /// turn, and returns nil, doing nothing, when a stage 2 that ran in between
     /// served it: two asks for one flag run one stage 2. `mayStart` is the
-    /// scheduler's stage 2 gate (`SyncScheduler.stageTwoMayStart`: foreground
+    /// scheduler's follow-up gate (`SyncScheduler.followUpMayStart`: foreground
     /// only), checked again at the turn, before the flag is cleared: a
     /// follow-up admitted in the foreground can get the turn after the app has
     /// left. Not allowed then, it returns nil with the flag still set; the
     /// release asks again, and the scheduler starts nothing until a stage 2 may
-    /// start (the next opening). Its change read's deadline is taken at its
-    /// turn, 60 s on (`SyncConfig.perAccountSyncTimeoutSeconds`). No outer
-    /// timeout, as Settings' stage 2: a due full sync runs to its end, and a
-    /// waiter it cancelled would still take the turn and clear the flag without
-    /// reading.
+    /// start (the next opening). Its deadline is taken at its turn, 60 s on
+    /// (`SyncConfig.perAccountSyncTimeoutSeconds`), and bounds its change read
+    /// and a due full sync's deadline-bounded steps, as for the poll's stage 2;
+    /// what those could not finish is owed to the next listing. No outer
+    /// timeout, as Settings' stage 2: a waiter it cancelled would still take the
+    /// turn and clear the flag without reading.
     func followUpPass(
         accountId: String, mayStart: @escaping @MainActor @Sendable () -> Bool
     ) async throws -> Bool? {

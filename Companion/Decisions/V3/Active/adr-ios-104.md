@@ -177,7 +177,8 @@ account gets one follow-up stage 2.** The design, its reasons and its history ar
    follow-up (`syncFollowUp` -> `SyncScheduler.runSyncFollowUp` -> `AccountManager.followUpRun` ->
    `SyncEngine.followUpPass`). The follow-up waits in line for the turn (`oneSyncAtATime`), so it starts as
    soon as the work holding the turn ends, even when that work takes the turn again at once (a catch-up's
-   next slice: at most one slice, as when the trigger itself waited). At its turn it runs stage 2 only if
+   next slice: at most one slice once it is in line, as when the trigger itself waited; work that asks for
+   the turn during its first steps, the account read and the connection check, goes first, #1329). At its turn it runs stage 2 only if
    the flag is still set. Stage 2 clears the flag as its first step inside the turn (`foregroundPass`), so
    however many triggers arrived, one stage 2 serves them and its read starts after each of them; it runs
    the full sync when it is due (the #1275 amendment). A follow-up whose flag an earlier stage 2 served
@@ -187,10 +188,15 @@ account gets one follow-up stage 2.** The design, its reasons and its history ar
    (`NSEDataBridge.mirrorLastHistoryIds`, as `SyncScheduler.backgroundPoll` does). When the turn becomes free with the flag still set (`handOverSyncPass`, the branch with
    no waiter), the engine asks again: that serves a flag set in the background, whose first ask started
    nothing, at the next opening. Removing an account (`SyncEngine.remove`) drops its flag.
-4. **Foreground only.** Stage 2 starts only in the foreground (`SyncScheduler.stageTwoMayStart`: the app
-   is not in the background, read from `UIApplication.applicationState`, so inactive, a sheet or Control
-   Center over the app, counts as foreground; the silent-push path's own check is narrower, `.active`
-   only; sync is not disabled, no demo mode, no background processing fast sync). In the background
+4. **Foreground only.** The follow-up starts only in the foreground (`SyncScheduler.followUpMayStart`: the
+   app is not in the background, read from `UIApplication.applicationState`, so inactive, a sheet or
+   Control Center over the app, counts as foreground; the silent-push path's own check is narrower,
+   `.active` only; sync is not disabled, no demo mode). Fast Sync does not hold it back: it stands in for
+   the trigger's own read, which never waited for Fast Sync to end (in v1.11.2 it waited for the running
+   catch-up slice, then read), so during Fast Sync it reads between two slices; the processing job's fast
+   sync runs in the background, where it does not start anyway. Item 5's stage 2 for every account keeps
+   the poll's gate (`SyncScheduler.pollStageTwoMayStart`: also not during Fast Sync, when the poll skips
+   its own reads). In the background
    the flag waits: the next opening's stage 1 frees the account and asks again. The follow-up checks the
    same gate when it is asked for and again inside its turn, before it clears the flag
    (`followUpPass`'s `mayStart`): if the app left while it waited, it starts nothing and the flag stays set;
@@ -207,7 +213,8 @@ account gets one follow-up stage 2.** The design, its reasons and its history ar
    whose change read found an account busy (`AccountManager.syncFolders` returns it). The follow-up
    reports its own account as a partial run. A poll run with a skipped account also does not advance
    "Updated" (`AccountManagerState.lastSyncCompletedAt`, display only): the follow-up does, once its read
-   completes.
+   completes. A pull to refresh whose change read found an account busy still advances it: it listed the
+   folders on screen, so what the user sees is fresh.
 7. **No time limit counts a wait for another pass's turn.** A trigger never waits for one: its caller's
    time limit (`SyncConfig.perAccountSyncTimeoutSeconds` for the poll's stage 2 and pull to refresh's
    change read, `SyncConfig.backgroundPerAccountTimeoutSeconds` for stage 1) and the deadline its change
@@ -215,8 +222,9 @@ account gets one follow-up stage 2.** The design, its reasons and its history ar
    (`AccountManager.ensureConnected`, unchanged). The follow-up waits, so it takes its change read's
    deadline (`perAccountSyncTimeoutSeconds` from its turn) when it gets the turn. It has no outer timeout,
    like `sync(account:)` from Settings: a waiter cancelled by a timeout would still take the turn and clear
-   the flag without reading. Its change read is bounded from its turn; a due full sync in it runs to its
-   end. In v1.11.4 a stage 2 queued behind stage 1 could reach its turn with no time left and read nothing
+   the flag without reading. Its deadline bounds its change read and the deadline-bounded steps of a due
+   full sync (`FullSyncPlan`), as for the poll's stage 2; what a full sync could not finish in time, such as
+   an IMAP folder's deletion reconcile, is owed to the next listing (ADR-IOS-111). In v1.11.4 a stage 2 queued behind stage 1 could reach its turn with no time left and read nothing
    (#1289).
 8. **What still waits** (first in first out, item 4): the follow-up stage 2 (item 3); `sync(account:)` for
    Settings, a new account and the epoch rebuild; single-folder listings (`syncFolderMessages`: pull to
