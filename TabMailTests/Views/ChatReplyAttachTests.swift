@@ -131,11 +131,42 @@ struct ChatReplyAttachTests {
         #expect(!narrowedReplyAll, "a plain reply, so the send records a reply on the original")
         #expect(narrowed.prefillTo == ["david@example.com"] && narrowed.prefillCc == [] && narrowed.prefillBcc == [])
 
+        // The box holds the chat's suggestion or none, never the email's stored one, decided as compose
+        // decides it when the card loads. `stored` stands for the email's stored AI Suggestion.
+        let stored = ReplyResult(body: "Stored, written for everyone", textMessage: "Stored")
+        let shownBox = Self.boxSuggestion(compose, stored: stored)
+        #expect(shownBox == Self.suggestion, "Reply All: the suggestion the chat shows")
+        let narrowedStoredOffered = narrowed.offersStoredSuggestion
+        let narrowedBox = Self.boxSuggestion(narrowed, stored: stored)
+        #expect(!narrowedStoredOffered && narrowed.suggestion == nil, "a reply only to some carries no suggestion")
+        #expect(narrowedBox == nil, "a reply only to some shows none, the stored one included: \(String(describing: narrowedBox))")
+        let bare = ChatReadyReply(attaching: pick, to: email, onlyTo: nil, shown: nil, accounts: [Self.me])
+            .composeView(openedOn: .chat, onOutcome: { _ in })
+        let bareReplyAll = bare.isReplyAll
+        let bareStoredOffered = bare.offersStoredSuggestion
+        let bareBox = Self.boxSuggestion(bare, stored: stored)
+        #expect(bareReplyAll && !bareStoredOffered && bare.suggestion == nil, "the chat shows none: none given")
+        #expect(bareBox == nil, "the chat shows none: none in the card, the stored one included: \(String(describing: bareBox))")
+        // The same decision reads the stored suggestion for every other reply, so the checks above can fail.
+        let plainBox = Self.boxSuggestion(ComposeView(replyTo: email), stored: stored)
+        #expect(plainBox == stored, "another reply shows the stored suggestion")
+
         // The ghost's card: the same builder, nothing picked, nothing stored read either.
         let ghost = ChatReadyReply(message: email, suggestion: Self.suggestion, accounts: [Self.me]).composeView(openedOn: .chat, onOutcome: { _ in })
         #expect(ghost.attachmentPick == nil && !ghost.offersStoredSuggestion && ghost.suggestion == Self.suggestion)
         // Every other reply still reads the row's suggestion.
         #expect(ComposeView(replyTo: email).offersStoredSuggestion)
+    }
+
+    /// What a compose card's suggestion box holds when it loads: compose's own decision
+    /// (`ComposeDraftGuards.suggestionToShow`, as `ComposeView`'s load calls it), with `stored` as the
+    /// email's stored AI Suggestion where the card reads it.
+    private static func boxSuggestion(_ card: ComposeView, stored: ReplyResult) -> ReplyResult? {
+        ComposeDraftGuards.suggestionToShow(
+            given: ComposeView.givenSuggestion(card.suggestion, suggestedBody: card.suggestedBody),
+            isReply: card.replyTo != nil && !card.isForward,
+            onlyToChosen: card.onlyToChosen,
+            freshSuggestion: { card.offersStoredSuggestion ? stored : nil })
     }
 
     @Test("The card the chat presents hands its outcome to the chat, so a sent reply can clear Replying only to")
