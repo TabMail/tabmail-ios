@@ -34,12 +34,17 @@ extension SyncEngine {
     func performChangePass(
         account: Account, provider: any EmailProvider, inboxOnly: Bool = false, deadline: Date? = nil, pass: UUID? = nil
     ) async throws -> ChangePassOutcome {
-        await redriveArmedTurnovers(accountId: account.id)
-        if let outcome = try await readAndApplyChanges(
-            account: account, provider: provider, scope: inboxOnly ? .inboxOnly : .all, deadline: deadline, pass: pass) {
-            return outcome
-        }
-        return ChangePassOutcome()
+        // The pass reads first. The armed turnovers are re-driven after the read,
+        // and a reaction starts only while the read's budget lasts: the request's
+        // one read end bounds both. A reaction that cannot finish never keeps this
+        // pass's changes unread, and none starts once that budget is spent. A
+        // read that throws skips the re-drive for this pass (#1287).
+        let request = try await makeChangeRequest(
+            accountId: account.id, scope: inboxOnly ? .inboxOnly : .all, deadline: deadline)
+        let outcome = try await readAndApplyChanges(
+            account: account, provider: provider, request: request, deadline: deadline, pass: pass)
+        await redriveArmedTurnovers(accountId: account.id, until: request.context.deadline)
+        return outcome ?? ChangePassOutcome()
     }
 
     /// Publish downloading phase for a specific account.

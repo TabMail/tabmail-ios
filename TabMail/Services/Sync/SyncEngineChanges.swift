@@ -177,13 +177,15 @@ extension SyncEngine {
 
     /// Read and apply the provider's changes. Nil = the provider has no change
     /// reader; the caller keeps that provider's remaining change path.
+    /// - Parameter request: the pass's request (`makeChangeRequest`), built once
+    ///   in its turn before the read; its read end also bounds the pass's
+    ///   turnover re-drive.
     /// - Parameter deadline: the caller's own deadline for the whole pass (its
     ///   timeout), or nil when the caller sets none. It is not account sync state.
     func readAndApplyChanges(
-        account: Account, provider: any EmailProvider, scope: ChangeScope, deadline: Date? = nil, pass: UUID? = nil
+        account: Account, provider: any EmailProvider, request: ChangeRequest, deadline: Date? = nil, pass: UUID? = nil
     ) async throws -> ChangePassOutcome? {
         let accountId = account.id
-        let request = try await makeChangeRequest(accountId: accountId, scope: scope, deadline: deadline)
         let outOfTime = !request.context.hasBudget()
         guard let firstRead = try await provider.fetchChanges(
             since: ChangeCursor(account: account.lastHistoryId), request: request) else { return nil }
@@ -244,8 +246,11 @@ extension SyncEngine {
         return min(cap, lastStart)
     }
 
-    /// Built ONCE when the pass's turn starts (snapshot rule).
-    private func makeChangeRequest(accountId: String, scope: ChangeScope, deadline: Date?) async throws -> ChangeRequest {
+    /// Built ONCE when the pass's turn starts (snapshot rule). Its read end
+    /// (`context.deadline`) is sampled after the folder snapshot, just before
+    /// the first request, and is the one end of the pass's read budget: the
+    /// pass's turnover re-drive starts reactions only before it (#1287).
+    func makeChangeRequest(accountId: String, scope: ChangeScope, deadline: Date?) async throws -> ChangeRequest {
         let folders = try await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId).fetchAll(db)
         }
@@ -378,8 +383,10 @@ extension SyncEngine {
         }
 
         // A renumbered folder's turnover reaction, armed durably in its folder
-        // transaction above, runs now (single-flight; a crash re-drives it from
-        // the armed flag at the next pass start).
+        // transaction above, runs now (single-flight). One stopped before it
+        // stamps the new epoch, or lost to a crash, leaves the flag set: a later
+        // pass's re-drive retries it after that pass's read, while its read
+        // budget lasts.
         for path in armedTurnovers {
             BackgroundSyncLogger.logDebug("[Sync] Change apply: folder \(path) renumbered — turnover reaction")
             await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: path)

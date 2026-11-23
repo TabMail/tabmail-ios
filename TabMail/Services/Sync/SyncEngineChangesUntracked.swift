@@ -17,20 +17,34 @@ import GRDB
 // is permanent for servers without change tracking.
 //
 // The turnover re-drive: a folder whose UIDVALIDITY reset reaction is armed
-// (`Folder.uidValidityResetPendingAt`) and was interrupted is re-driven at the
-// start of every change pass, every armed folder of the account (count the
-// predicate, not the call sites: Memory 114).
+// (`Folder.uidValidityResetPendingAt`) and was interrupted is re-driven by every
+// change pass whose read did not throw, after that read, every armed folder of
+// the account (count the predicate, not the call sites: Memory 114), while the
+// read's budget lasts (#1287). A folder the pass does not reach stays armed for
+// a later pass.
 
 extension SyncEngine {
 
-    /// Re-drive every armed folder of the account before the pass reads.
-    func redriveArmedTurnovers(accountId: String) async {
-        let armed = (try? await dbPool.read { db in
+    /// Re-drive the account's armed folders, one after another, after the pass
+    /// has read. A reaction starts only before `end`, the end of the read budget
+    /// the pass sampled for its read (`changeReadEnd`, before the caller's own
+    /// deadline). A reaction already running at `end` runs on until it completes
+    /// or its pass is cancelled (the caller's timeout). One stopped before it
+    /// stamps the new epoch leaves the folder armed for a later re-drive; one
+    /// stopped after the stamp leaves it unarmed under the new epoch, its old
+    /// rows purged and the new ones not yet listed (unless the listing committed
+    /// some before it stopped), until its next listing fills it.
+    func redriveArmedTurnovers(accountId: String, until end: Date) async {
+        let armed = ((try? await dbPool.read { db in
             try Folder
                 .filter(Column("accountId") == accountId && Column("uidValidityResetPendingAt") != nil)
                 .fetchAll(db)
-        }) ?? []
-        for folder in armed where !folder.path.isEmpty {
+        }) ?? []).filter { !$0.path.isEmpty }
+        for (index, folder) in armed.enumerated() {
+            guard changeReadClock() < end else {
+                BackgroundSyncLogger.logDebug("[Sync] Change pass: read budget spent; \(armed.count - index) armed folder(s) wait for the next pass")
+                return
+            }
             BackgroundSyncLogger.logDebug("[Sync] Change pass: re-driving the turnover reaction of \(folder.name)")
             await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: folder.path)
         }
