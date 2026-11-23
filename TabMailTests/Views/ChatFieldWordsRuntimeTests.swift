@@ -739,12 +739,16 @@ struct ChatFieldWordsRuntimeTests {
         var testDescription: String { rawValue }
     }
 
+    /// The chat view that asks, field and sheet alike, and takes the compose (ADR-IOS-053 Phase 2).
+    static let chatAsked = TabMail.ComposeOrigin(sessionKey: "thread:words", screen: .chat)
+    static let chatHost = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [chatAsked.sessionKey])
+
     /// The invocation the field's send builds for `email` (`DynamicIslandChat.sendAgentChat`), or, from
     /// elsewhere, none of the field's.
     static func invocation(_ origin: ComposeOrigin, email: MessageHeader, suggestion: ReplyResult? = nil) -> ToolInvocation {
-        guard origin != .sheet else { return ToolInvocation() }
+        guard origin != .sheet else { return ToolInvocation(composeOrigin: chatAsked) }
         return ToolInvocation(fieldReply: ChatFieldReply(email: email, onlyTo: nil, suggestion: suggestion),
-                              fieldWordsKey: ChatFieldWords.key(for: email))
+                              composeOrigin: chatAsked, fieldWordsKey: ChatFieldWords.key(for: email))
     }
 
     /// Runs `producer`'s tool with `invocation` on a router of its own (no view presents the compose)
@@ -757,8 +761,12 @@ struct ChatFieldWordsRuntimeTests {
         let router = AgentToolRouter()
         let context = ToolContext(db: pool, translator: translator, router: router)
         let task = Task { @MainActor in try await producer.run(invocation, context: context) }
-        try await ThreadChatTests.wait { router.pendingCompose != nil }
-        let request = try #require(router.pendingCompose, "control: \(producer) opened its compose")
+        var taken: AgentToolRouter.ComposeRequest?
+        try await ThreadChatTests.wait {
+            taken = taken ?? router.takeCompose(for: chatHost)
+            return taken != nil
+        }
+        let request = try #require(taken, "control: \(producer) opened its compose")
         request.onOutcome(outcome)
         return try await task.value
     }

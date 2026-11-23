@@ -101,6 +101,8 @@ struct ChatThreadView: View {
     @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
     @Environment(\.dismiss) private var dismiss
+    /// The app's accounts: a new email's card opens from its bound account, looked up here.
+    @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Held only while a grow is pending: set when the AI Suggestion's row becomes Writing, cleared
     /// inside the fill's `withAnimation` (`showSuggestion`), so the working bubble filling in is one
@@ -285,14 +287,6 @@ struct ChatThreadView: View {
         .onReceive(NotificationCenter.default.publisher(for: .aiQueueRebuilt).receive(on: DispatchQueue.main)) { _ in
             guard didInitialScroll, isOnScreen else { return }
             askForSummaries()
-        }
-        .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
-            guard newId != nil, let req = AgentToolRouter.shared.pendingCompose else { return }
-            // Asked for in a reply field: the agent's closing words open nothing. Who the card goes
-            // to travels with the request (`fieldReply`); this chat's own state decides nothing.
-            fieldComposeOpened = req.fieldReply != nil
-            agentCompose = req
-            AgentToolRouter.shared.pendingCompose = nil
         }
         .sheet(item: $cardMessage) { msg in
             // Today's detail of that email, from the bottom; swipe down to return.
@@ -901,7 +895,10 @@ struct ChatThreadView: View {
                     onlyTo: replyTarget.only,
                     tutorialMove: tutorialMove(thread),
                     suggestion: shown),
-                onFieldSend: { _ in fieldComposeOpened = false })
+                onFieldSend: { _ in fieldComposeOpened = false },
+                onAgentCompose: openAgentCompose,
+                composeFromAccountId: viewModel.message?.accountId,
+                composeHostCovered: isAnyPresentation)
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.replyPillId)
@@ -945,6 +942,19 @@ struct ChatThreadView: View {
             .overlay(Capsule().stroke(Palette.separator, lineWidth: 0.5))
     }
 
+    /// A compose card this chat's agent asked for, taken by this chat's pill (ADR-IOS-053 Phase 2),
+    /// never one another screen asked for. The reply the reply field asked for
+    /// (`ComposeRequest.isFieldsOwnReply`, any copy of its email, in any account): the agent's
+    /// closing words open nothing. Who the card goes to travels with the request (`fieldReply`);
+    /// this chat's own state decides nothing.
+    private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
+        // A new email opens from the account bound when its turn started, looked up in the app's
+        // accounts as the card is taken; when it is not there the request ends and nothing opens.
+        guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return }
+        fieldComposeOpened = req.isFieldsOwnReply
+        agentCompose = req
+    }
+
     /// The agent finished a request from the field with something to say: the sheet rises with
     /// the request and the answer. After a compose card the reply was the point, so nothing opens.
     /// The field's words are the request's to complete, on its own chat key (`ChatFieldWords`,
@@ -963,8 +973,10 @@ struct ChatThreadView: View {
         if replyTo != nil { replyTarget = .replyAll }
     }
 
+    /// A new email opens from the account bound when its turn started (`ComposeRequest.fromAccountId`),
+    /// read from the same accounts `openAgentCompose` checked, never whichever email this chat shows.
     private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
-        req.composeView(account: context.accounts.first { $0.id == viewModel.message?.accountId },
+        req.composeView(account: navigationStore.accounts.first { $0.id == req.fromAccountId },
                         openedOn: composeScreen(answering: req.replyTo)) { outcome in
             req.onOutcome(outcome)
             composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)

@@ -37,10 +37,10 @@ struct ComposeEditRecipientRolesTests {
     private func waitForPendingCompose(on router: AgentToolRouter, timeout seconds: Double = 5.0) async -> AgentToolRouter.ComposeRequest? {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
-            if let req = router.pendingCompose { return req }
+            if let req = router.takeCompose(for: ComposeTestOrigin.inboxHost) { return req }
             await Task.yield()
         }
-        return router.pendingCompose
+        return router.takeCompose(for: ComposeTestOrigin.inboxHost)
     }
 
     /// Runs the tool `run` builds with the capturing edit call, closes the compose card it opens,
@@ -118,7 +118,7 @@ struct ComposeEditRecipientRolesTests {
                 "cc": .array([.string(Self.copied)]),
                 "bcc": .array([.string(Self.blind)]),
                 "request": .string("Ask about moving the offsite to Friday"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         expectRolesKept(contexts, expectTo: Self.primary)
         guard contexts.count == 1 else { return }
@@ -135,7 +135,7 @@ struct ComposeEditRecipientRolesTests {
                 "recipients": .array([.dictionary(["name": .string("Sam Lee"), "email": .string(Self.primary)])]),
                 "cc": .array([.dictionary(["name": .string("Pat Kim"), "email": .string(Self.copied)])]),
                 "request": .string("Ask about moving the offsite to Friday"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         #expect(contexts.count == 1)
         guard contexts.count == 1 else { return }
@@ -161,7 +161,7 @@ struct ComposeEditRecipientRolesTests {
                 "cc": .array([.string(Self.copied)]),
                 "bcc": .array([.string(Self.blind)]),
                 "request": .string("Let them know Friday works"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         expectRolesKept(contexts, expectTo: Self.primary)
         guard contexts.count == 1 else { return }
@@ -196,7 +196,8 @@ struct ComposeEditRecipientRolesTests {
         arguments.merge(extraArguments) { _, new in new }
         let finalArguments = arguments
         return try await captureEditContexts(router: router) { composeEdit in
-            try await EmailReplyTool(context: ctx, composeEdit: composeEdit).execute(arguments: finalArguments)
+            try await EmailReplyTool(context: ctx, composeEdit: composeEdit).execute(
+                arguments: finalArguments, invocation: ComposeTestOrigin.invocation)
         }
     }
 
@@ -257,7 +258,7 @@ struct ComposeEditRecipientRolesTests {
                 "cc": .array([Self.namedObject(Self.copied)]),
                 "bcc": .array([Self.namedObject(Self.blind)]),
                 "request": .string("Ask about moving the offsite to Friday"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         #expect(Self.cardNames(captured.to) == [Self.primary: "Sam Lee"])
         #expect(Self.cardNames(captured.cc) == [Self.copied: "Pat Kim"])
@@ -279,7 +280,7 @@ struct ComposeEditRecipientRolesTests {
                 "cc": .array([Self.namedObject(Self.copied)]),
                 "bcc": .array([Self.namedObject(Self.blind)]),
                 "request": .string("Let them know Friday works"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         let contexts = captured.contexts
         #expect(contexts.count == 1)
@@ -313,7 +314,7 @@ struct ComposeEditRecipientRolesTests {
                 "add_cc": .array([Self.namedObject(Self.copied)]),
                 "add_bcc": .array([Self.namedObject(Self.blind)]),
                 "request": .string("Say Friday works"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         let contexts = captured.contexts
         #expect(contexts.count == 1)
@@ -348,7 +349,7 @@ struct ComposeEditRecipientRolesTests {
                 "unique_id": .int(16),
                 "add_cc": .array([.dictionary(["name": .string("Kim Cho"), "email": .string(mixedCase)])]),
                 "request": .string("Say Friday works"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         let contexts = captured.contexts
         #expect(contexts.count == 1)
@@ -376,7 +377,7 @@ struct ComposeEditRecipientRolesTests {
                 "unique_id": .int(15),
                 "add_recipients": .array([Self.namedObject(Self.primary)]),
                 "request": .string("Say Friday works"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         #expect(captured.contexts.count == 1)
         guard captured.contexts.count == 1 else { return }

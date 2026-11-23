@@ -7,8 +7,8 @@ import GRDB
 
 /// Client-side `email_forward` FSM tool matching TB addon's `email_forward.js`.
 /// Opens a forward compose window for a specific email.
-/// On iOS, this sets `AgentToolRouter.pendingCompose` which the UI observes
-/// and presents ComposeView in forward mode.
+/// On iOS, this queues a `ComposeRequest` for the chat that asked (`ComposeOrigin`),
+/// whose screen presents ComposeView in forward mode (ADR-IOS-053 Phase 2).
 struct EmailForwardTool: AgentTool, Sendable {
     let name = "email_forward"
     private let ctx: ToolContext
@@ -25,6 +25,8 @@ struct EmailForwardTool: AgentTool, Sendable {
         try await execute(arguments: arguments, invocation: .noninteractive)
     }
 
+    /// `invocation.composeOrigin`: the chat that asked, where the forward's compose card opens
+    /// (ADR-IOS-053 Phase 2). Without one no screen can open it, so the tool fails fast.
     /// `invocation.fieldWordsKey`: the request was sent from the chat's reply field; a sent card
     /// completes that send in `ChatFieldWords` (ADR-IOS-117).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
@@ -80,6 +82,9 @@ struct EmailForwardTool: AgentTool, Sendable {
 
         if composeRequest == nil && explicitBody == nil {
             return ComposeOutcome.failed("request parameter is required and must contain the content request for the forward").describeForLLM
+        }
+        guard let origin = invocation.composeOrigin else {
+            return ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM
         }
 
         let recipientsFormatted = to.joined(separator: ", ")
@@ -146,6 +151,7 @@ struct EmailForwardTool: AgentTool, Sendable {
                 bcc: bcc,
                 subject: generatedSubject,
                 body: generatedBody,
+                origin: origin,
                 onOutcome: onOutcome,
                 outcomeState: state
             )

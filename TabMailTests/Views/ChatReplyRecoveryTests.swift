@@ -185,7 +185,6 @@ struct ChatReplyRecoveryTests {
         await queue.clearForTesting()
         let router = AgentToolRouter.shared
         router.resetComposeQueueForTesting()
-        router.pendingCompose = nil
         ChatPillState.shared.removeAllSessions()
         ChatPillState.shared.aiService = backend.service
         // A new app run's field-word store: nothing in memory from an earlier test.
@@ -196,7 +195,6 @@ struct ChatReplyRecoveryTests {
             ChatFieldWords.shared = ChatFieldWords()
             backend.http.close()
             router.resetComposeQueueForTesting()
-            router.pendingCompose = nil
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -372,6 +370,9 @@ struct ChatReplyRecoveryTests {
                 let request = try #require(router.firstQueuedRequestForTesting)
                 #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == ["david@example.com"],
                         "the reply carries the choice made when the request was sent: \(String(describing: request.fieldReply))")
+                let chatOrigin = ComposeOrigin(sessionKey: ChatThreadKey.key(for: chat.email), screen: .chat, fromAccountId: Self.account)
+                #expect(request.origin == chatOrigin,
+                        "the recovered turn's card opens in the chat view that asked: \(request.origin)")
                 let reply = (isReplyAll: request.isReplyAll, to: request.to, cc: request.cc, bcc: request.bcc)
                 #expect(!reply.isReplyAll && reply.to == ["david@example.com"] && reply.cc.isEmpty && reply.bcc.isEmpty,
                         "a plain reply to only David: \(reply)")
@@ -494,6 +495,9 @@ struct ChatReplyRecoveryTests {
                 let request = try #require(router.firstQueuedRequestForTesting)
                 #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == nil,
                         "the reply carries the choice made when the request was sent, nobody: \(String(describing: request.fieldReply))")
+                let chatOrigin = ComposeOrigin(sessionKey: ChatThreadKey.key(for: chat.email), screen: .chat, fromAccountId: Self.account)
+                #expect(request.origin == chatOrigin,
+                        "the recovered turn's card opens in the chat view that asked: \(request.origin)")
                 let reply = (isReplyAll: request.isReplyAll, to: request.to, cc: request.cc, bcc: request.bcc)
                 #expect(reply.isReplyAll, "a Reply All: \(reply)")
 
@@ -609,7 +613,8 @@ struct ChatReplyRecoveryTests {
     /// chat. The ghost's button itself does not take an accessibility activation in a hosted test,
     /// so the card is opened the way the tap opens it.
     private static func openGhostCard(_ shown: ReplyResult, in chat: Chat) async throws {
-        let message = try #require(try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) })
+        let fetched = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
+        let message = try #require(fetched)
         let ready = ChatReadyReply(message: message, suggestion: shown, accounts: chat.accounts)
         let store = NavigationStore()
         store.accounts = chat.accounts
@@ -680,7 +685,7 @@ struct ChatReplyRecoveryTests {
                         "the ghost shows the edit: \(Self.ghosts(in: chat.view).map(\.text))")
                 let stored = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
                 #expect(stored?.suggestion == edited, "the edit is stored whole, its command included")
-                #expect(router.composeQueueDepth == 0 && router.pendingCompose == nil && chat.controller.presentedViewController == nil,
+                #expect(router.composeQueueDepth == 0 && chat.controller.presentedViewController == nil,
                         "an edit in place opens no card")
 
                 // The ghost's card is the exact Reply All, with the edit.
@@ -955,8 +960,10 @@ struct ChatReplyRecoveryTests {
         }
     }
 
-    /// The sheet's "Re-send message" and "Rewind and re-send" send with no field and leave the
-    /// field's sent words in place; when that request is cut off, its recovery carries no field key
+    /// The sheet's "Re-send message" and "Rewind and re-send" own none of the field's words (Rewind
+    /// sends with no field; Re-send carries its turn's email and Reply to choice but no words key,
+    /// `ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField`), so they leave the field's sent words
+    /// in place; when that request is cut off, its recovery carries no field key
     /// (`cutOffRecoveryNamesTheFieldOnlyForItsOwnRequest`). The re-sends are reached only through a
     /// bubble's long-press menu, so this test gives the field each recovery and checks its rule.
     @Test("The field's unchanged sent words offer Send, not Retry, when the cut-off request is not the field's own",
@@ -981,7 +988,8 @@ struct ChatReplyRecoveryTests {
                 session.lastFailedSend = nil
                 if session.pendingResume == nil {
                     session.pendingResume = .init(
-                        request: CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil), fieldReply: nil)
+                        request: CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil), fieldReply: nil,
+                        origin: nil)
                 }
                 session.pendingResume?.fieldWordsKey = nil
                 try await Self.waitUntil {

@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note:** **2026-11-21: the routing half is done (ADR-IOS-053 Phase 2, see its current note).** `pendingCompose` and `dispatchNextIfIdle` no longer exist. Requests carry `ComposeOrigin`, and the asking screen's pill takes them with `takeCompose(for:)` when `composeOffer` moves. The FIFO, `presentationCount`, `awaitingAppear`, the stale-skip (now a drop on take) and the `composePresentationDidBegin/End` hooks described below are unchanged. Where the body says the hosting views observe `pendingCompose`, read: the asking pill takes its own request.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-030: Agent Compose Tool FIFO Queue
 
