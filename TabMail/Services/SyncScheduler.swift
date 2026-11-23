@@ -852,6 +852,10 @@ final class SyncScheduler {
                 return
             }
             for account in accounts {
+                // A refused password never turns IDLE on (#1349): IDLE would sign
+                // in with it again. The password update starts the account's IDLE
+                // (`AccountManager.liveProviderConnected`).
+                if await manager.authFailedAccounts.contains(account.id) { continue }
                 await startIdle(for: account)
             }
             if !accounts.isEmpty {

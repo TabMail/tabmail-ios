@@ -511,6 +511,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// with no LOGOUT in between — the abandoned-session class
         /// `liveSessionCount()` cannot see (its doc comment above).
         var everLoggedInFds: Set<Int32> = []
+        /// The fd of the session whose LOGIN was accepted last;
+        /// `dropLastLoggedInSession()` ends it.
+        var lastLoggedInFd: Int32?
         /// R12-F1: every fd whose LOGOUT command was actually processed
         /// (set in the `LOGOUT` command handler, consulted+removed in
         /// `closeClientFd`) — the "ended cleanly" half of the
@@ -1232,6 +1235,26 @@ final class FakeIMAPServer: @unchecked Sendable {
             sendLine(fd: fd, "* BYE Server shutting down\r\n")
             shutdown(fd, SHUT_RDWR)
         }
+    }
+
+    /// Drops the session whose LOGIN was accepted last, from the server's side and
+    /// with no command in flight, as a network or server drops an open connection:
+    /// the socket is shut down, so the client finds it closed before its next
+    /// command. The close is marked test-initiated (see `testInitiatedCloseFds`),
+    /// so it is not counted as an abandoned session. Returns false when that
+    /// session has already ended.
+    @discardableResult
+    func dropLastLoggedInSession() -> Bool {
+        let fd = withState { state -> Int32? in
+            guard let fd = state.lastLoggedInFd, state.loggedInFds.contains(fd) else { return nil }
+            state.lastLoggedInFd = nil
+            _ = state.loggedInFds.remove(fd)
+            _ = state.testInitiatedCloseFds.insert(fd)
+            return fd
+        }
+        guard let fd else { return false }
+        shutdown(fd, SHUT_RDWR)
+        return true
     }
 
     /// Sends one untagged response (`* 2 EXISTS`, `* VANISHED 1`) to every
@@ -2507,6 +2530,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                 // field's doc comment for why (it gets cleared early by
                 // LOGOUT/kill, so it can't answer "did this fd EVER log in").
                 _ = state.everLoggedInFds.insert(fd)
+                state.lastLoggedInFd = fd
                 return nil
             }
             if let limitRefusal { return "\(tag) NO \(limitRefusal)\r\n" }
