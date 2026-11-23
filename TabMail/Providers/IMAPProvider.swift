@@ -3645,7 +3645,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             } catch let error as IMAPError where error.isSignInRefusal {
                 // The server refused the password (#1349): the sign-in of
                 // `createServer`, or the sign-in SwiftMail repeats inside the
-                // INBOX SELECT when it reopened a dropped connection. A refusal for
+                // INBOX SELECT or the IDLE command when it reopened a dropped
+                // connection (both throw inside this `do`). A refusal for
                 // now is not this: `createServer` rethrows it as
                 // `ProviderTemporaryRefusal`, and the repeated sign-in throws it as
                 // a `loginFailed` that `isSignInRefusal` rules out, so both keep

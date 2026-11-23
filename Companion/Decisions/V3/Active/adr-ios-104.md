@@ -325,7 +325,8 @@ when the server answers, as it already did for a provider `startImapIdle` found 
 A refused password hands nothing off, so IDLE never retries it; the password update hands off the accepted
 provider. A password the server refuses later, while the app is open, stops IDLE as well (#1349): a credentials
 refusal in `IMAPProvider.launchIdleConnection` (an `IMAPError` whose `isSignInRefusal` holds: the sign-in of
-`createServer`, or the one SwiftMail repeats inside the INBOX select on a reopened connection; a refusal for now is
+`createServer`, or the one SwiftMail repeats inside the INBOX select or the IDLE command on a reopened connection; a
+refusal for now is
 `createServer`'s `ProviderTemporaryRefusal` or a `loginFailed` that `isSignInRefusal` rules out) calls the existing
 `stopIdle` instead of the 10 s retry, and `startImapIdle`
 skips an account in `authFailedAccounts`, so IDLE never sends a refused password again. A refusal for now, a
