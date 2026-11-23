@@ -372,6 +372,54 @@ struct SyncFollowUpTests {
         }
     }
 
+    /// The other side of `stageTwoAfterALongStageOneReads`: the follow-up's time
+    /// limit, `SyncConfig.perAccountSyncTimeoutSeconds` from its turn, bounds its
+    /// due full sync too. The turn's clock reads the whole limit and half a
+    /// minute back, so the limit has passed when the count check (the
+    /// deadline-bounded walk after a listing) would start: the walk sends no
+    /// SEARCH, removes nothing, and leaves the folder due for the next listing.
+    /// RED with a follow-up that takes no deadline, or one that never passes:
+    /// the walk ran past the limit and removed the ghost.
+    @Test("A follow-up's time limit, counted from its turn, bounds its due full sync")
+    func followUpTimeLimitBoundsItsFullSync() async throws {
+        typealias L = ListingCountersTests
+        let back = SyncConfig.perAccountSyncTimeoutSeconds + 30
+        try await IMAPChangeEngineTests.withWorld(
+            "follow-up-limit", capabilities: L.condstoreNoReader, serverUIDs: [1], localUIDs: [1],
+            changeReadClock: { Date().addingTimeInterval(-back) }
+        ) { w in
+            try L.addArchive(w, serverUIDs: L.belowWindowServer, localUIDs: L.belowWindowHeld)
+            let accountId = w.account.id
+            let log = O.PassLog()
+            let release = AsyncStream<Void>.makeStream()
+            // A test that stops early still ends its held pass.
+            defer { release.continuation.finish() }
+            let holder = O.heldPass(engine: w.engine, accountId: accountId, name: "held", log: log, release: release.stream)
+            #expect(await O.eventually { log.snapshot == ["start held"] }, "precondition: the turn is held")
+            let busy = await w.engine.oneSyncAtATimeOrFollowUp(accountId: accountId) { true }
+            let flagged = busy == nil
+            #expect(flagged, "precondition: the trigger found the account busy and set the flag")
+            release.continuation.yield()
+            await holder.value
+            let dueBefore = try L.archiveDue(w)
+            #expect(!dueBefore, "precondition: no walk is owed before the follow-up")
+
+            let start = w.server.recordedCommands().count
+            let ran = try await w.engine.followUpPass(accountId: accountId, mayStart: { true })
+            // Only the count walk's UID SEARCH counts: the backfill crawl sends
+            // date SEARCHes on its own schedule.
+            let searches = w.server.recordedCommands().dropFirst(start).filter { $0.uppercased().hasPrefix("UID SEARCH UID") }
+            let wanted = await w.engine.followUpWanted(accountId: accountId)
+            let tookTheTurn = ran != nil
+            #expect(tookTheTurn, "precondition: the follow-up took the turn and ran its stage 2")
+            #expect(!wanted, "precondition: the follow-up served the flag")
+            #expect(searches.isEmpty, "the follow-up's walk ran past its time limit: \(Array(searches))")
+            #expect(try L.archive(w).uids.contains("1"), "the follow-up's walk removed a row past its time limit")
+            #expect(try L.archiveDue(w), "the walk the follow-up's time limit cut is not owed to the next listing")
+            await w.engine.remove(accountId: accountId)
+        }
+    }
+
     /// What served the flag before a follow-up got its turn.
     enum ServedBy: String, CaseIterable, Sendable {
         /// A second ask for the same flag: the account became free with the

@@ -924,6 +924,14 @@ struct SyncRunBannerEntryPointTests {
             let inLine = await engine.syncPassWaiters[accountId]?.count == 1
             #expect(inLine, "precondition: the follow-up waits in line")
 
+            let state = AccountManagerState.shared
+            let completedBefore = Date(timeIntervalSinceNow: -60)
+            state.lastSyncCompletedAt = completedBefore
+            let events = Events()
+            let observer = NotificationCenter.default.addObserver(forName: .inboxDataDidChange, object: nil, queue: nil) { _ in
+                events.append("reload")
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
             switch flip {
             case .background: scheduler.applicationStateForTesting = .background
             case .demo: demo.isActive = true
@@ -935,6 +943,9 @@ struct SyncRunBannerEntryPointTests {
             let wantedAway = await engine.followUpWanted(accountId: accountId)
             #expect(readsAway == 0, "the follow-up read after the gate closed (\(flip.rawValue))")
             #expect(wantedAway, "the follow-up cleared the flag with nothing read (\(flip.rawValue))")
+            #expect(state.lastSyncCompletedAt == completedBefore,
+                    "the follow-up refused at its turn advanced \"Updated\" with nothing read (\(flip.rawValue))")
+            #expect(events.snapshot.isEmpty, "the follow-up refused at its turn reloaded the inbox (\(flip.rawValue))")
             // The flag, and the release of the still-flagged account. Under demo
             // mode the app's scheduler refuses that release's ask at its own
             // gate, before it records it: the ask lands while demo mode is on.
@@ -950,8 +961,93 @@ struct SyncRunBannerEntryPointTests {
             await scheduler.runSyncFollowUp(accountId: accountId)
             let reads = await world.providerA.changeRequests.count
             let wanted = await engine.followUpWanted(accountId: accountId)
+            let advanced = state.lastSyncCompletedAt.map { $0 > completedBefore } == true
             #expect(reads == 1, "the next foreground follow-up did not read once: \(reads) reads")
             #expect(!wanted, "the next foreground follow-up left the flag set")
+            #expect(advanced, "non-vacuity: the next foreground follow-up did not advance \"Updated\"")
+            #expect(events.snapshot == ["reload"], "non-vacuity: the next foreground follow-up did not reload the inbox once: \(events.snapshot)")
+        } }
+    }
+
+    /// A follow-up whose read fails (here a lost connection whose retry fails
+    /// too, with no full sync due) reports a failed run: it does not advance
+    /// "Updated". It took the turn, so the flag is served; the next trigger
+    /// reads. RED with the follow-up's run always reported as completed:
+    /// "Updated" moved with nothing read.
+    @Test("a follow-up whose read fails does not advance \"Updated\"")
+    func failedFollowUpDoesNotAdvanceUpdated() async throws {
+        try await withWorld { world in try await withAppSchedulerRecording { stages in
+            let engine = try await registerA(world, reader: { _, _ in throw ProviderError.notConnected })
+            let accountId = world.accountA.id
+            let log = OneSyncAtATimeTests.PassLog()
+            let release = AsyncStream<Void>.makeStream()
+            defer { release.continuation.finish() }
+            let holder = OneSyncAtATimeTests.heldPass(
+                engine: engine, accountId: accountId, name: "held", log: log, release: release.stream)
+            try await waitUntil { !log.snapshot.isEmpty }
+            #expect(log.snapshot == ["start held"], "precondition: account A's turn is held")
+            let busy = try await engine.backgroundDeltaSync(account: world.accountA)
+            let busyReadNothing = busy == nil
+            #expect(busyReadNothing, "precondition: the trigger found the account busy")
+
+            let state = AccountManagerState.shared
+            let completedBefore = Date(timeIntervalSinceNow: -60)
+            state.lastSyncCompletedAt = completedBefore
+            release.continuation.yield()
+            await holder.value
+            await SyncScheduler(foreground: true).runSyncFollowUp(accountId: accountId)
+            let reads = await world.providerA.changeRequests.count
+            let wanted = await engine.followUpWanted(accountId: accountId)
+            #expect(reads > 0, "precondition: the follow-up tried to read the account")
+            #expect(!wanted, "precondition: the follow-up took the turn and served the flag")
+            #expect(state.lastSyncCompletedAt == completedBefore, "a follow-up whose read failed advanced \"Updated\"")
+            // The flag, and the release of the still-flagged account.
+            try await waitForAsks(2, of: accountId, stages)
+        } }
+    }
+
+    /// The follow-up of an account that is turned off reads nothing and keeps
+    /// the flag; once the account is on again, the next follow-up reads. RED
+    /// without the scheduler's check of the account: the follow-up read an
+    /// account that is off.
+    @Test("the follow-up of an inactive account reads nothing and keeps the flag")
+    func inactiveAccountFollowUpReadsNothing() async throws {
+        try await withWorld { world in try await withAppSchedulerRecording { stages in
+            let engine = try await registerA(world)
+            let accountId = world.accountA.id
+            let log = OneSyncAtATimeTests.PassLog()
+            let release = AsyncStream<Void>.makeStream()
+            defer { release.continuation.finish() }
+            let holder = OneSyncAtATimeTests.heldPass(
+                engine: engine, accountId: accountId, name: "held", log: log, release: release.stream)
+            try await waitUntil { !log.snapshot.isEmpty }
+            #expect(log.snapshot == ["start held"], "precondition: account A's turn is held")
+            let busy = try await engine.backgroundDeltaSync(account: world.accountA)
+            let busyReadNothing = busy == nil
+            #expect(busyReadNothing, "precondition: the trigger found the account busy")
+            release.continuation.yield()
+            await holder.value
+
+            try await world.pool.write { db in
+                _ = try Account.filter(Column("id") == accountId).updateAll(db, Column("isActive").set(to: false))
+            }
+            let scheduler = SyncScheduler(foreground: true)
+            await scheduler.runSyncFollowUp(accountId: accountId)
+            let readsOff = await world.providerA.changeRequests.count
+            let wantedOff = await engine.followUpWanted(accountId: accountId)
+            #expect(readsOff == 0, "the follow-up read an inactive account")
+            #expect(wantedOff, "the follow-up of an inactive account cleared the flag")
+            // The flag, and the release of the still-flagged account.
+            try await waitForAsks(2, of: accountId, stages)
+
+            try await world.pool.write { db in
+                _ = try Account.filter(Column("id") == accountId).updateAll(db, Column("isActive").set(to: true))
+            }
+            await scheduler.runSyncFollowUp(accountId: accountId)
+            let reads = await world.providerA.changeRequests.count
+            let wanted = await engine.followUpWanted(accountId: accountId)
+            #expect(reads == 1, "non-vacuity: the follow-up of the account on again did not read once: \(reads) reads")
+            #expect(!wanted, "non-vacuity: the follow-up of the account on again left the flag set")
         } }
     }
 
