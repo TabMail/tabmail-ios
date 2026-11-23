@@ -303,8 +303,9 @@ extension SyncEngine {
     ///
     /// The request rate: a slice sends at most `run.sliceMaxRequests`, and opens a
     /// window of `run.intervalSeconds` (real time) in `catchUpSliceWindowEnds`,
-    /// from its turn and, once it ran, again from when its provider work started
-    /// (#1109: a slice that waited for its slot still has its whole slice, so its
+    /// from its turn and, once it ran, again from when it got its slot of the
+    /// provider work queue, before its folder read and its first request (#1109:
+    /// a slice that waited for its slot still has its whole slice, so its
     /// window must not have run out meanwhile); no
     /// slice of the account, from this run or another, starts before the window
     /// ends. The wait happens outside the turn, so a delta is never held by it,
@@ -383,11 +384,12 @@ extension SyncEngine {
                     accountId: accountId, run: run, outcome: sliceWork.result == nil ? "runOver" : "ran",
                     work: sliceWork, turnTaken: turnTaken)
                 guard let result = sliceWork.result else { return .runOver }
-                // A slice that ran opens its window from when its provider work
-                // started, so the next slice of the account starts at least one
-                // window after this one's requests began, however long this one
-                // waited for its slot. The window opened at the turn stays for a
-                // slice that found the run over at its slot.
+                // A slice that ran opens its window again from when it got its
+                // slot (before its folder read and its first request), so the
+                // next slice of the account starts at least one window after
+                // that, however long this one waited for its slot. The window
+                // opened at the turn stays for a slice that found the run over at
+                // its slot.
                 if let admittedAt = sliceWork.admittedAt {
                     self.catchUpSliceWindowEnds[accountId] = admittedAt.addingTimeInterval(run.intervalSeconds)
                 }
@@ -481,8 +483,9 @@ extension SyncEngine {
         var result: CatchUpSliceResult?
         /// The slice's working time on the run's clock (`CatchUpRun.workSeconds`).
         var spent: TimeInterval = 0
-        /// When the slice's provider work started (real time, the pacing
-        /// window's clock); nil when it did not run.
+        /// When the slice got its slot, before its folder read and its first
+        /// request (real time, the pacing window's clock); nil when it did not
+        /// run.
         var admittedAt: Date?
         /// How long the slice waited for a slot of the provider work queue.
         var queueWait: Duration
