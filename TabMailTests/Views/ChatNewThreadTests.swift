@@ -22,12 +22,12 @@ struct ChatNewThreadTests {
 
     // MARK: - Where it opens
 
-    @Test("The compose button opens the chat with the chat view on and signed in; off, or signed out, today's compose")
-    func composeButtonRoute() {
-        let on = ChatNewThreadRoute.composeButton(opensInChat: true, signedIn: true)
-        let off = ChatNewThreadRoute.composeButton(opensInChat: false, signedIn: true)
-        let signedOut = ChatNewThreadRoute.composeButton(opensInChat: true, signedIn: false)
-        let neither = ChatNewThreadRoute.composeButton(opensInChat: false, signedIn: false)
+    @Test("A new email opens the chat with the chat view on and signed in; off, or signed out, today's compose")
+    func newEmailRoute() {
+        let on = ChatNewThreadRoute.newEmail(opensInChat: true, signedIn: true)
+        let off = ChatNewThreadRoute.newEmail(opensInChat: false, signedIn: true)
+        let signedOut = ChatNewThreadRoute.newEmail(opensInChat: true, signedIn: false)
+        let neither = ChatNewThreadRoute.newEmail(opensInChat: false, signedIn: false)
         #expect(on == .newThread)
         #expect(off == .compose)
         #expect(signedOut == .compose, "signed out, the chat's field cannot send")
@@ -484,7 +484,7 @@ struct ChatNewThreadTests {
         // button: the compose button starts a new email in every folder, Drafts included.
         #expect(Self.count("ToolbarItem(placement: .topBarTrailing) { ComposeToolbarButton(onNewCompose: { collapseChat() startNewEmail() }) .tutorialLockedNavigation() .transaction { $0.disablesAnimations = true } }", in: inbox) == 1)
         #expect(Self.count("ComposeToolbarButton(", in: inbox) == 1, "one compose button in the mailbox")
-        #expect(Self.count("switch ChatNewThreadRoute.composeButton(opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession) { case .newThread: newEmail = ChatNewThreadModel(account: viewModel.primaryAccount) case .compose: viewModel.showCompose = true }", in: inbox) == 1)
+        #expect(Self.count("switch ChatNewThreadRoute.newEmail(opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession) { case .newThread: newEmail = ChatNewThreadModel(account: viewModel.primaryAccount) case .compose: viewModel.showCompose = true }", in: inbox) == 1)
         #expect(Self.count(".navigationDestination(item: $newEmail) { model in ChatNewThreadView(model: model) }", in: inbox) == 1)
         #expect(Self.count(".fullScreenCover(isPresented: $vm.showCompose) { ComposeView(account: viewModel.primaryAccount) }", in: inbox) == 1,
                 "the chat view off keeps today's compose")
@@ -1140,7 +1140,7 @@ struct ChatNewDraftSaveTests {
         #expect(recorder.calls.isEmpty)
     }
 
-    @Test("A draft another session saved after the chat opened is never overwritten from the chat")
+    @Test("A draft another session saved after the chat opened is never overwritten from the chat, and going back to what was opened then saves nothing")
     func newerSessionWins() async throws {
         let fixture = try fixture()
         defer { finish(fixture) }
@@ -1160,6 +1160,51 @@ struct ChatNewDraftSaveTests {
         if case .refused = outcome { refused = true } else { refused = false }
         #expect(refused)
         #expect(after.body == "Written in compose")
+        #expect(recorder.calls.isEmpty)
+
+        // A refused save wrote nothing, so the chat still compares with what it opened: going
+        // back to the draft's own words saves nothing and leaves the other session's row as it is.
+        model.words = "Lunch on Friday?"
+        let again = await model.saveIfNeeded()
+        let finalRow = try await row(fixture, draft.id)
+        let final = try #require(finalRow)
+        #expect(again == .saved, "back to what was opened: nothing to save")
+        #expect(final.body == "Written in compose")
+        #expect(recorder.calls.isEmpty)
+    }
+
+    @Test("A save that a newer save of the draft already beat on disk is refused, writes nothing, and leaves the chat comparing with what it opened")
+    func supersededSaveKeepsWhatWasOpened() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let draft = try await savedDraft(fixture, attachments: [])
+        let recorder = QueueRecorder()
+        let model = ChatNewThreadModel(reopening: draft, account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
+        let id = draft.id
+        // A newer save of the same draft, in this session: the row on disk is later than any
+        // snapshot the chat takes now, so the store keeps it and does not apply the chat's.
+        let later = Date().addingTimeInterval(3600).timeIntervalSince1970
+        try await fixture.pool.write { db in
+            try db.execute(sql: "UPDATE draft SET updatedAt = ?, body = ? WHERE id = ?",
+                           arguments: [later, "Saved later", id])
+        }
+        model.words = "Written in the chat"
+        let outcome = await model.saveIfNeeded()
+        let afterRow = try await row(fixture, draft.id)
+        let after = try #require(afterRow)
+        let refused: Bool
+        if case .refused = outcome { refused = true } else { refused = false }
+        #expect(refused, "the chat's save was not applied: \(outcome)")
+        #expect(after.body == "Saved later")
+        #expect(recorder.calls.isEmpty)
+
+        // Nothing of the chat's was written, so going back to the draft's own words saves nothing.
+        model.words = "Lunch on Friday?"
+        let again = await model.saveIfNeeded()
+        let finalRow = try await row(fixture, draft.id)
+        let final = try #require(finalRow)
+        #expect(again == .saved, "back to what was opened: nothing to save")
+        #expect(final.body == "Saved later")
         #expect(recorder.calls.isEmpty)
     }
 

@@ -136,6 +136,9 @@ struct MailNavigationView: View {
     @State private var columnVisibility = NavigationSplitViewVisibility.automatic
     @State private var expandedAccounts: Set<String> = []
     @State private var templateSheetItem: TemplateSheetItem?
+    /// Whether the list has a sheet or cover up, written by the list and read by the detail
+    /// column's screens as a new-email request arrives (`ListPresentationState`).
+    @State private var listPresentation = ListPresentationState()
     private var manager: AccountManager { AccountManager.shared }
     private var state: AccountManagerState { AccountManagerState.shared }
 
@@ -584,8 +587,11 @@ struct MailNavigationView: View {
             // instead of `selectedMessageId`.
             MailContentColumn(selection: selection, selectedMessageId: $selectedMessageId, pushedMessageId: $pushedMessageId,
                               emailsOpenBeside: sizeClass == .regular)
+                .environment(\.listPresentationWriter, listPresentation)
                 .navigationDestination(item: $pushedMessageId) { id in
+                    // On iPad an email pill's email opens in the detail column, beside the list.
                     PushedMessageDestination(messageId: id)
+                        .environment(\.listPresentationBesideDetail, listPresentation)
                 }
                 .navigationDestination(isPresented: $pushedShowsAccount) {
                     // Mirrors SettingsContentColumn's `.account` case.
@@ -601,6 +607,7 @@ struct MailNavigationView: View {
             // SwiftUI skips MessageDetailContainer.body when selectedMessageId
             // hasn't changed, even if the parent re-renders.
             MessageDetailContainer(selectedMessageId: selectedMessageId, notificationOpenedId: notificationOpenedId)
+                .environment(\.listPresentationBesideDetail, listPresentation)
         }
         .background(Palette.previewPaneBg)
         .onChange(of: selection) { oldValue, newValue in

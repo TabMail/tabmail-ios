@@ -1546,9 +1546,9 @@ struct ChatReplyFieldTests {
         #expect(Self.count("@Environment(\\.horizontalSizeClass) private var sizeClass", in: navigation) == 1, "the split view's horizontal width")
         #expect(Self.count("emailsOpenBeside: sizeClass == .regular)", in: navigation) == 1, "the expanded split view opens an email beside the inbox")
         #expect(Self.count("emailsOpenBeside: emailsOpenBeside)", in: navigation) == 2, "through the content column to the inbox")
-        #expect(Self.count("showSearch || labelMenuMessage != nil || showLabelFilterPicker || moveMessageId != nil || moveThreadGroup != nil || replyMessage != nil || draftOpen != nil || agentCompose != nil || contactComposeRequest != nil || viewModel.showCompose || showUndoAlert }", in: inbox) == 1,
+        #expect(Self.count("showSearch || labelMenuMessage != nil || showLabelFilterPicker || moveMessageId != nil || moveThreadGroup != nil || replyMessage != nil || draftOpen != nil || agentCompose != nil || newEmailCover != nil || viewModel.showCompose || showUndoAlert }", in: inbox) == 1,
                 "every sheet, cover and alert of the inbox holds a compose card")
-        #expect(Self.count("showCompose || contactComposeRequest != nil || replyMessage != nil || replyAllMessage != nil || forwardMessage != nil || agentCompose != nil || moveMessage != nil || labelMenuMessage != nil }", in: detail) == 1,
+        #expect(Self.count("newEmailCover != nil || replyMessage != nil || replyAllMessage != nil || forwardMessage != nil || agentCompose != nil || moveMessage != nil || labelMenuMessage != nil }", in: detail) == 1,
                 "every sheet and cover of the email screen holds a compose card")
         #expect(Self.count("onAgentCompose: openAgentCompose, composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)", in: detail) == 1)
         #expect(Self.count(".fullScreenCover(item: $agentCompose) { req in req.composeView(account: fromAccount(of: req), onOutcome: req.onOutcome) }", in: detail) == 1,

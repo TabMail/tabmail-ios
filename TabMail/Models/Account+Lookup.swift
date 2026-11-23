@@ -60,4 +60,20 @@ extension Account {
             return a.createdAt < b.createdAt
         }
     }
+
+    /// The account a new email starts from when nothing else chose one: the active primary
+    /// account, or else the oldest active account. The mailbox list's compose button and every
+    /// other start of a new email (the email screen's compose button, a contact, a `mailto:` link)
+    /// read it, so they all start from the same account.
+    static func primary(in db: Database) throws -> Account? {
+        if let primary = try Account.filter(Column("isActive") == true && Column("isPrimary") == true).fetchOne(db) {
+            return primary
+        }
+        return try Account.filter(Column("isActive") == true).order(Column("createdAt")).fetchOne(db)
+    }
+
+    /// `primary(in:)` from `pool`; nil when there is none or the read fails.
+    static func primary(pool: PrioritizedDatabase = AppDatabase.dbPool) -> Account? {
+        try? pool.read { db in try primary(in: db) }
+    }
 }

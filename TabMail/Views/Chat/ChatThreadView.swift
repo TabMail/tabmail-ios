@@ -113,10 +113,16 @@ struct ChatThreadView: View {
     @State private var headerBottom = -CGFloat.infinity
     @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
+    /// A new email asked for by a contact pill or a `mailto:` link while this chat is on top
+    /// (`ChatNewEmailCover`).
+    @State private var newEmailCover: ChatNewEmailCover?
+    @Environment(\.hasTabMailSession) private var hasTabMailSession
     @Environment(\.dismiss) private var dismiss
     /// The app's accounts: a new email's card opens from its bound account, looked up here.
     @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// In the detail column: whether the list beside it has a sheet or cover up (`ListPresentationState`).
+    @Environment(\.listPresentationBesideDetail) private var listPresentationBesideDetail
     /// Held only while a grow is pending: set when the AI Suggestion's row becomes Writing, cleared
     /// inside the fill's `withAnimation` (`showSuggestion`), so the working bubble filling in is one
     /// animated transaction with its re-pin. A ready suggestion with nothing held is the ghost, so
@@ -185,7 +191,7 @@ struct ChatThreadView: View {
 
     private var isAnyPresentation: Bool {
         cardMessage != nil || readyReply != nil || agentCompose != nil
-            || forwardMessage != nil || showsReplyTo || showsMove
+            || forwardMessage != nil || showsReplyTo || showsMove || newEmailCover != nil
     }
 
     // MARK: - Body
@@ -305,6 +311,22 @@ struct ChatThreadView: View {
         .onReceive(NotificationCenter.default.publisher(for: .emailPillTapped).receive(on: DispatchQueue.main)) { _ in
             withAnimation(Self.pillSpring) { chatExpanded = false }
         }
+        // A contact pill or a `mailto:` link: one screen takes each request, the one on top. This
+        // chat takes it while it shows and nothing is presented over it; its email card's screen
+        // takes it while that card is up, and a pushed screen (`isOnScreen`) takes it itself. In
+        // the detail column it takes none while the list beside it has a sheet or cover up (iPad).
+        // Nor while a compose, a draft or a preview is up anywhere (`composeOrPreviewIsUp`).
+        .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
+            guard isOnScreen, !isAnyPresentation, listPresentationBesideDetail?.isUp != true,
+                  !ChatNewEmailCover.composeOrPreviewIsUp else { return }
+            guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
+            withAnimation(Self.pillSpring) { chatExpanded = false }
+            newEmailCover = .make(
+                request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession,
+                chatAccount: Account.primary(), composeAccount: Account.primary())
+            // Without the request's recipients: the log is kept on the device and can be shared.
+            BackgroundSyncLogger.logDebug("[ChatThread] Contact pill compose")
+        }
         // The queue was rebuilt from the database (every sync start, AI re-enable): what it held
         // for this chat may be gone, so the shown chat checks its rows again.
         .onReceive(NotificationCenter.default.publisher(for: .aiQueueRebuilt).receive(on: DispatchQueue.main)) { _ in
@@ -330,6 +352,7 @@ struct ChatThreadView: View {
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
         .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }
+        .fullScreenCover(item: $newEmailCover) { ChatNewEmailCoverView(cover: $0) }
         .sheet(isPresented: $showsReplyTo) {
             ChatReplyToSheet(
                 replyPeople: thread.replyPeople, target: replyTarget,

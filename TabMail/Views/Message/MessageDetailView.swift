@@ -30,8 +30,9 @@ struct MessageDetailView: View {
     @State var moveMessage: MessageHeader?
     @State var sideButtonsReady = true
     @State var agentCompose: AgentToolRouter.ComposeRequest?
-    @State private var showCompose = false
-    @State var contactComposeRequest: MailtoRequest?
+    /// A new email asked for here, by the compose button, a contact pill or a `mailto:` link:
+    /// today's compose or the new email's chat, decided as it is asked for (`ChatNewEmailCover`).
+    @State private var newEmailCover: ChatNewEmailCover?
     @State private var labelMenuMessage: MessageHeader?
     /// The message whose card is most visible in the viewport — used as chat context and action target.
     @State var chatContextMessage: MessageHeader?
@@ -68,6 +69,8 @@ struct MessageDetailView: View {
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) var optOutAllAI = false
     @Environment(\.dismiss) var dismiss
     @Environment(\.hasTabMailSession) var hasTabMailSession
+    /// In the detail column: whether the list beside it has a sheet or cover up (`ListPresentationState`).
+    @Environment(\.listPresentationBesideDetail) private var listPresentationBesideDetail
     /// The app's accounts: a new email's card opens from its bound account, looked up here.
     @Environment(NavigationStore.self) var navigationStore
 
@@ -76,22 +79,30 @@ struct MessageDetailView: View {
     }
 
     /// True while ANY of this view's sheets/fullScreenCovers is presented.
-    /// Combines ALL EIGHT presentation states in one computed value so a
+    /// Combines ALL SEVEN presentation states in one computed value so a
     /// single `.onChange` (see body) keeps `viewModel.hasActivePresentation`
     /// current — covers do NOT fire the presenting view's
     /// `onAppear`/`onDisappear`, and the VM must not post the unresolved-tap
     /// pop while a cover (worst case: an open compose draft) sits on top.
-    /// One computed + ONE onChange, not eight — the body's modifier chain is
+    /// One computed + ONE onChange, not seven — the body's modifier chain is
     /// type-checker-budget-sensitive.
     private var isAnyCoverPresented: Bool {
-        showCompose
-            || contactComposeRequest != nil
+        newEmailCover != nil
             || replyMessage != nil
             || replyAllMessage != nil
             || forwardMessage != nil
             || agentCompose != nil
             || moveMessage != nil
             || labelMenuMessage != nil
+    }
+
+    /// A new email from this screen: the compose button (`request` nil) or a contact pill or
+    /// `mailto:` link. With the chat view on and signed in, the new email's chat from the primary
+    /// account; otherwise today's compose, as before. Read once, now.
+    private func askForNewEmail(_ request: MailtoRequest?) {
+        newEmailCover = .make(
+            request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession,
+            chatAccount: Account.primary(), composeAccount: nil)
     }
 
     /// `expectedRfc822MessageId` — the content witness of the message the OPENER
@@ -177,14 +188,12 @@ struct MessageDetailView: View {
                                 chatExpanded = false
                             }
                         }
-                        showCompose = true
+                        askForNewEmail(nil)
                     })
                     .tutorialLockedNavigation()
                 }
             }
-            .fullScreenCover(isPresented: $showCompose) {
-                ComposeView()
-            }
+            .fullScreenCover(item: $newEmailCover) { ChatNewEmailCoverView(cover: $0) }
             .dismissKeyboardOnTap()
             .onReceive(NotificationCenter.default.publisher(for: .openMessageWithChat).receive(on: DispatchQueue.main)) { notification in
                 guard let msgId = notification.userInfo?["messageId"] as? String,
@@ -203,12 +212,20 @@ struct MessageDetailView: View {
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
+                // Only while it shows: under a screen pushed over it (an email pill's email) it
+                // takes none, that screen does. With a sheet or cover of its own up (a new email's
+                // included), it takes none: what is up is not replaced. In the detail column it
+                // takes none while the list beside it has a sheet or cover up (iPad). Nor while a
+                // compose, a draft or a preview is up anywhere (`composeOrPreviewIsUp`).
+                guard viewModel.isViewVisible, !isAnyCoverPresented, listPresentationBesideDetail?.isUp != true,
+                      !ChatNewEmailCover.composeOrPreviewIsUp else { return }
                 guard let request = MailtoRequest.from(userInfo: notification.userInfo) else { return }
                 withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                     chatExpanded = false
                 }
-                contactComposeRequest = request
-                BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose: \(request.to.first ?? "")")
+                askForNewEmail(request)
+                // Without the request's recipients: the log is kept on the device and can be shared.
+                BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose")
             }
             .task {
                 // Mark-read runs on its own unstructured Task so that
@@ -263,7 +280,7 @@ struct MessageDetailView: View {
                 // is how the VM learns a presentation is up, so its
                 // unresolved-tap pop can't tear down a view (and force-dismiss
                 // an open compose draft) beneath a live cover. One combined
-                // onChange for all eight presentation states — see
+                // onChange for all seven presentation states — see
                 // isAnyCoverPresented.
                 viewModel.hasActivePresentation = active
             }
@@ -299,20 +316,6 @@ struct MessageDetailView: View {
                 // typically within the push animation — skeleton, not a spinner,
                 // so the swap to content doesn't jump.
                 MessageDetailSkeleton()
-            }
-        }
-        .fullScreenCover(isPresented: Binding(
-            get: { contactComposeRequest != nil },
-            set: { if !$0 { contactComposeRequest = nil } }
-        )) {
-            if let request = contactComposeRequest {
-                ComposeView(
-                    prefillTo: request.to,
-                    prefillCc: request.cc.isEmpty ? nil : request.cc,
-                    prefillBcc: request.bcc.isEmpty ? nil : request.bcc,
-                    prefillSubject: request.subject,
-                    prefillBody: request.body
-                )
             }
         }
         .fullScreenCover(item: $replyMessage) { msg in
