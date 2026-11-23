@@ -73,14 +73,18 @@ extension SyncEngine {
     }
 
     /// The account's other folders as they are now (`isSyncable` false, a
-    /// non-empty path), those whose read finished or failed longest ago first
-    /// (never first of all), else in stored order.
+    /// non-empty path), those whose read finished, moved or failed longest ago
+    /// first (never first of all), else in stored order. The account's attempt
+    /// times keep only the folders it still has, so a deleted folder's time
+    /// neither stays in memory nor passes to a folder made later at its id.
     func otherFolderReadOrder(accountId: String) async throws -> [String] {
         let folders = try await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId).fetchAll(db)
         }
         let others = folders.filter { !Self.isSyncable($0) && !$0.path.isEmpty }
-        let attempted = otherFolderAttemptedAt[accountId] ?? [:]
+        let liveIds = Set(folders.map(\.id))
+        let attempted = (otherFolderAttemptedAt[accountId] ?? [:]).filter { liveIds.contains($0.key) }
+        otherFolderAttemptedAt[accountId] = attempted
         return CatchUpSchedule.leastRecentlyAttemptedFirst(others) { attempted[$0.id] }.map(\.id)
     }
 
@@ -205,15 +209,19 @@ extension SyncEngine {
         // the run goes on to the next folders and the next run reads it again:
         // a cut first folder never stops the run (#1358).
         if !slice.progressed, slice.inFlightFolderIds.isEmpty { slice.inFlightFolderIds = cut }
-        stampOtherFolderAttempts(accountId: accountId, folderIds: slice.finishedFolderIds.union(slice.inFlightFolderIds))
+        // A baseline that moved is stamped too, not only the folders done or
+        // failed: a long baseline first in the order would otherwise keep its
+        // never-stamped place and take every slice's read share before a folder
+        // never reached, run after run. It stays pending and resumes after them.
+        stampOtherFolderAttempts(accountId: accountId, folderIds: slice.progressedFolderIds.union(slice.inFlightFolderIds))
         BackgroundSyncLogger.logDebug(
             "[OtherFolders] \(accountId.prefix(8)): slice asked \(folders.count), finished \(slice.finishedFolderIds.count), "
             + "moved \(slice.progressedFolderIds.count - slice.finishedFolderIds.count), failed or tried \(slice.inFlightFolderIds.count), cut \(cut.count)")
         return slice
     }
 
-    /// Records that these folders' reads finished or failed now, for the order
-    /// of the next runs (`otherFolderReadOrder`).
+    /// Records that these folders' reads finished, moved or failed now, for the
+    /// order of the run's next slices and of the next runs (`otherFolderReadOrder`).
     private func stampOtherFolderAttempts(accountId: String, folderIds: Set<String>) {
         guard !folderIds.isEmpty else { return }
         let now = Date()

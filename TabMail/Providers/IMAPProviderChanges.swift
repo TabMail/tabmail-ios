@@ -756,15 +756,16 @@ extension IMAPProvider {
 
     // MARK: - Reads on the current selection
 
-    /// Full records for these UIDs (one header FETCH). A `\Deleted` message is
-    /// left out (never inserted); a record that cannot be mapped is read later.
+    /// Full records for these UIDs (one header FETCH, at most `requestTimeout`).
+    /// A `\Deleted` message is left out (never inserted); a record that cannot
+    /// be mapped is read later.
     private func fullRecords(
-        _ uids: [UInt32], server: IMAPServer
+        _ uids: [UInt32], server: IMAPServer, requestTimeout: TimeInterval
     ) async throws -> (records: [ChangeRecord], returned: Set<UInt32>, deleted: Set<UInt32>, unreadable: [String]) {
         var set = UIDSet()
         for uid in uids { set.insert(UID(uid)) }
         let requested = set
-        let infos = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+        let infos = try await withTimeout(seconds: requestTimeout) {
             try await server.fetchMessageInfosBulk(using: requested)
         }
         var records: [ChangeRecord] = []
@@ -792,10 +793,12 @@ extension IMAPProvider {
     /// The re-read list's answer: full records; a `\Deleted` message is a
     /// removal; a UID the FETCH did not return is removed only when `UID SEARCH`
     /// on the same selection confirms it is gone, otherwise it is read again.
+    /// Each request waits at most `requestTimeout`.
     func rereadIds(
-        _ ids: [UInt32], server: IMAPServer, context: ChangeContext
+        _ ids: [UInt32], server: IMAPServer, context: ChangeContext,
+        requestTimeout: TimeInterval = SyncConfig.changeReadRequestTimeoutSeconds
     ) async throws -> (records: [ChangeRecord], removals: [String], unreadable: [String]) {
-        let fetched = try await fullRecords(ids, server: server)
+        let fetched = try await fullRecords(ids, server: server, requestTimeout: requestTimeout)
         var removals = fetched.deleted.sorted().map(String.init)
         var unreadable = fetched.unreadable
         let missing = ids.filter { !fetched.returned.contains($0) }
@@ -806,7 +809,7 @@ extension IMAPProvider {
             var set = UIDSet()
             for uid in missing { set.insert(UID(uid)) }
             let missingSet = set
-            let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+            let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: requestTimeout) {
                 try await server.extendedSearch(identifierSet: missingSet, criteria: [.all])
             }
             let confirmed = Self.confirmMissing(missing, present: try found.listed(within: missingSet))

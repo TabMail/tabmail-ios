@@ -697,7 +697,12 @@ extension SyncEngine {
         _ folder: Folder, provider: any EmailProvider, limit: Int, pass: UUID? = nil, bound: ListingRequestBound? = nil
     ) async -> ListingOutcome {
         let outcome = await Self.runListing(for: folder, provider: provider, limit: limit, dbPool: dbPool, bound: bound)
-        if case .unproven = outcome {
+        // The other-folder run's listing (`bound`, #1110) owes nothing when it
+        // proves nothing: only a proven listing writes the folder's counters, so
+        // they still show it changed and a later run lists it again. The deep
+        // pass and the due mark are the passes' (a full sync never lists an
+        // other folder, and the run ignores a due mark).
+        if case .unproven = outcome, bound == nil {
             if let pass { unprovenListingPasses.insert(pass) }
             Self.oweDeepListing(folderId: folder.id)
             do {

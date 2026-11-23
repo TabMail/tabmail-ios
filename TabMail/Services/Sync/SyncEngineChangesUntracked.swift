@@ -79,9 +79,13 @@ extension SyncEngine {
     ///   slice this refresh belongs to (#1110), nil for a pass. A listing starts
     ///   only while the slice has budget (`.listingNotStarted` otherwise: the run
     ///   lists the folder in a later slice), and each of its requests is bounded
-    ///   as a request of the older-mail check (`ListingRequestBound`): one the
-    ///   slice's end or the request limit cuts proves nothing (`.unproven`), the
-    ///   folder stays changed, and a later run lists it; the listing shows no download count
+    ///   as a request of the older-mail check (`ListingRequestBound`): a window
+    ///   read the slice's end leaves unstarted (`ListingRequestBound.Cut`, after
+    ///   the epoch check) is a listing not started (`.listingNotStarted`); one
+    ///   the request limit cuts proves nothing (`.unproven`). Either way the
+    ///   folder's counters stay as they were, so it stays changed and a later
+    ///   slice or run lists it, and the run's listing owes no deep pass and
+    ///   marks nothing due (`listFolder`); the listing shows no download count
     ///   (no pass is running to clear it); and a due mark alone
     ///   (`FolderChangeState.listingDue`) does not list the folder, only counters
     ///   that moved or a check the reader owes (`UntrackedObservation.mustList`).
@@ -146,6 +150,12 @@ extension SyncEngine {
         case .notListable:
             BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): not listable — skipping")
             return .notListed
+        case .unproven(_, _, let error?) where error is ListingRequestBound.Cut:
+            // The slice ended before the window read could start (after the
+            // epoch check): nothing of the listing was asked, so it has not
+            // started, and a later slice lists the folder.
+            BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): slice ended before its window read — later slice")
+            return .listingNotStarted
         case .unproven:
             BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): listing unproven — skipping")
             return .unproven
@@ -176,19 +186,25 @@ enum UntrackedRefresh: Sendable, Equatable {
     /// EXISTS 0 not confirmed): the pass's full-sync stamp is withheld.
     case unproven
     /// Changed, but the other-folder run's slice had no time left to start its
-    /// listing (#1110): the run lists it in a later slice. Never for a pass.
+    /// listing, or its window read after the epoch check (#1110): the run lists
+    /// it in a later slice. Never for a pass.
     case listingNotStarted
 }
 
 /// The bound of a listing in an other-folder run's slice (#1110), the same as
-/// a request of the older-mail check: each of the listing's requests to the
-/// server (the epoch check's FETCH, the listing's read) starts only while the
-/// slice has time, and gets at most `timeoutSeconds` (the run's
+/// a request of the older-mail check (`IMAPProvider.catchUpFolder`). A request
+/// is one provider call (the epoch check's sample, the listing's window read),
+/// bounded as a whole: the call starts only while the slice has time, and the
+/// listing waits for it at most `timeoutSeconds` (the run's
 /// `CatchUpContext.requestTimeoutSeconds`, `SyncConfig.catchUpRequestTimeoutSeconds`).
-/// So a slice holds the account's turn at most to its end plus one request,
-/// as an older-mail slice does. A read cut or timed out throws before the
-/// listing writes anything: the listing proved nothing, the folder stays
-/// changed, and a later run lists it.
+/// The limit covers everything inside the call: the connection checkout, a
+/// connect and login on a cold session, SELECT, and the FETCH or SEARCH, and
+/// `withTimeout` returns at the limit whether or not the call stops at once.
+/// So a command of a call that started before the slice's end may start after
+/// it, and the slice holds the account's turn at most to its end plus one
+/// request, as an older-mail slice does. A read cut or timed out throws before
+/// the listing writes anything: the listing proved nothing, the folder stays
+/// changed, and a later slice or run lists it.
 struct ListingRequestBound: Sendable {
     /// The slice's time.
     let slice: ChangeContext
