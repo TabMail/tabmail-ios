@@ -326,6 +326,20 @@ enum CanaryKit {
         await waitUntil(timeout) { probe.events.contains { $0.callback == "didFinish" } }
     }
 
+    /// Upper bound for a hosted view's initial load. A cold WebContent process can take far
+    /// longer than a few seconds to launch on a loaded host; the wait returns as soon as the
+    /// document is loaded, so a generous bound costs nothing when the host is idle.
+    static let initialLoadTimeout: TimeInterval = 45
+
+    /// Waits until the web view's initial document has finished loading. Use it instead of
+    /// a fixed sleep before reading the document or installing a probe on the coordinator:
+    /// a sleep that ends before the load does lets the load's own callbacks reach the probe.
+    /// Not discardable: callers assert it, so a load that never finishes fails as itself.
+    static func waitForInitialLoad(_ wv: WKWebView,
+                                   _ timeout: TimeInterval = initialLoadTimeout) async -> Bool {
+        await waitUntil(timeout) { wv.url != nil && !wv.isLoading && wv.estimatedProgress == 1 }
+    }
+
     /// Evaluate in the **page world** — the document's own world.
     ///
     /// ⚠️ Since P3 this is the ATTACKER's vantage point, not the app's. The render pipeline
@@ -622,7 +636,8 @@ struct EmailRenderSecurityCanaryTests {
         }
         defer { host.tearDown() }
         let wv = host.webView
-        try? await Task.sleep(for: .seconds(3))
+        #expect(await CanaryKit.waitForInitialLoad(wv),
+                "the document must finish loading within the bounded wait")
 
         let authorRan = await CanaryKit.eval(wv, "String(window.__tmCanaryAuthorRan)")
         let authorDOM = await CanaryKit.eval(wv, "String(document.documentElement.getAttribute('data-author'))")
@@ -693,7 +708,10 @@ struct EmailRenderSecurityCanaryTests {
         }
         defer { host.tearDown() }
         let wv = host.webView
-        try? await Task.sleep(for: .seconds(4))   // past deferredImageLoadJS's 1500 ms failsafe
+        #expect(await CanaryKit.waitForInitialLoad(wv),
+                "the document must finish loading within the bounded wait")
+        // Past deferredImageLoadJS's 1500 ms failsafe, which the script arms during the load.
+        try? await Task.sleep(for: .seconds(2))
 
         let dataAttr = await CanaryKit.eval(wv,
             "String(document.getElementById('remote').getAttribute('data-tmsrc'))")
@@ -1134,7 +1152,10 @@ struct EmailRenderSecurityCanaryTests {
         }
         defer { host.tearDown() }
         let wv = host.webView
-        try? await Task.sleep(for: .seconds(3))
+        // The probe below must see only the recovery reload: if it is installed while the
+        // initial load is still running, that load's start/commit/finish reach it too.
+        #expect(await CanaryKit.waitForInitialLoad(wv),
+                "the initial document must finish loading before the probe is installed")
 
         let coordinator = wv.navigationDelegate
         #expect(coordinator != nil, "the production view installs a navigation delegate")
@@ -1434,7 +1455,8 @@ struct EmailRenderSecurityCanaryTests {
         }
         defer { host.tearDown() }
         let wv = host.webView
-        try? await Task.sleep(for: .seconds(4))
+        #expect(await CanaryKit.waitForInitialLoad(wv),
+                "the document must finish loading within the bounded wait")
 
         #expect(await CanaryKit.eval(wv, "String(document.getElementById('inline').naturalWidth)") == "1",
                 "img-src's data: source: an inline image still decodes under the shipped policy")
@@ -1495,7 +1517,10 @@ struct EmailRenderSecurityCanaryTests {
         }
         defer { host.tearDown() }
         let wv = host.webView
-        try? await Task.sleep(for: .milliseconds(800))
+        // WebKit starts a meta refresh's delay only once the load is complete, so installing
+        // the probe right after the load leaves it the whole 3 seconds.
+        #expect(await CanaryKit.waitForInitialLoad(wv),
+                "the initial document must finish loading before the probe is installed")
 
         let coordinator = wv.navigationDelegate
         #expect(coordinator != nil, "the production view installs a navigation delegate")
@@ -1548,9 +1573,8 @@ struct EmailRenderSecurityCanaryTests {
             // A cold WebContent process may take longer than three seconds to
             // launch. Wait for navigation completion, then assert the same URL,
             // origin and rendered-body invariants (including incorrect loads).
-            #expect(await CanaryKit.waitUntil {
-                wv.url != nil && !wv.isLoading && wv.estimatedProgress == 1
-            }, "\(label): the document must finish loading within the bounded wait")
+            #expect(await CanaryKit.waitForInitialLoad(wv),
+                    "\(label): the document must finish loading within the bounded wait")
 
             let baseURI = await CanaryKit.eval(wv, "document.baseURI")
             let origin = await CanaryKit.eval(wv, "String(window.origin)")
@@ -1588,7 +1612,8 @@ struct EmailRenderSecurityCanaryTests {
         }
         defer { host.tearDown() }
         let wv = host.webView
-        try? await Task.sleep(for: .seconds(3))
+        #expect(await CanaryKit.waitForInitialLoad(wv),
+                "the document must finish loading within the bounded wait")
 
         let before = await CanaryKit.eval(wv, "location.href")
         _ = await CanaryKit.eval(wv, "document.getElementById('lnk').click(); 'clicked'")
