@@ -323,7 +323,13 @@ the provider's sign-in reporter before it throws) or the account was removed. A 
 a timeout or a temporary refusal then gets IDLE at once, and IDLE's own launch retry (every 10 s) brings it up
 when the server answers, as it already did for a provider `startImapIdle` found installed but not connected.
 A refused password hands nothing off, so IDLE never retries it; the password update hands off the accepted
-provider. Accepted: a server that wrongly refuses the sign-in at a cold launch and accepts the same password
+provider. A password the server refuses later, while the app is open, stops IDLE as well (#1349): a credentials
+refusal in `IMAPProvider.launchIdleConnection` (`IMAPError.loginFailed`; `createServer` reports a refusal for
+now as `ProviderTemporaryRefusal`) calls the existing `stopIdle` instead of the 10 s retry, and `startImapIdle`
+skips an account in `authFailedAccounts`, so IDLE never sends a refused password again. A refusal for now, a
+network error and a dropped stream keep the retry. Accepted: a server that wrongly refuses a correct password
+leaves IDLE off until the next return to the app or a password update (an accepted login clears
+`authFailedAccounts` but does not restart IDLE). Accepted: a server that wrongly refuses the sign-in at a cold launch and accepts the same password
 later gets IDLE at the next return. A provider that goes live in the background (no timer) starts nothing. A background transition that lands between the timer check and
 the provider's IDLE start can leave that IDLE on until the app is suspended, the same window
 `startImapIdle` has; it is harmless extra work and the next return and background transition put it right. A provider started twice keeps one IDLE connection: `launchIdleConnection` returns
@@ -371,7 +377,9 @@ after the last was removed and a second account, each through `addIMAPAccount`; 
 `updatePassword`; no IDLE from a connect while polling is off (before any start, after the app left); a cold
 launch whose first connect and first IDLE launch are refused for now gets IDLE live through IDLE's retry
 with no return, and one whose password is refused
-gets no IDLE start; a provider started twice, while launching and once live, sends IDLE once on one
+gets no IDLE start; a password refused at IDLE's sign-in while the app is open gets that one sign-in and no
+retry past 10 s, a return starts IDLE for a working account and skips the refused one, and the password update
+brings its IDLE back; IDLE's sign-in refused for now twice keeps retrying until it is live (#1349); a provider started twice, while launching and once live, sends IDLE once on one
 connection; IDLE's events on a real IDLE session (EXISTS reads the new message now; VANISHED deletes the row
 it names while another pass holds the account, and its read asks for the follow-up); and a source fence:
 every place in `TabMail/Services/Account` that makes a connected mail provider live calls

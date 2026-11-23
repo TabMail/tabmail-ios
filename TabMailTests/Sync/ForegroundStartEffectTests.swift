@@ -17,6 +17,9 @@ import UIKit
 /// - a connect while foreground polling is off starts no IDLE;
 /// - a cold launch's first connect that fails for now still gets IDLE, which comes up
 ///   once the server answers; a refused password gets none;
+/// - a password refused while the app is open gets one IDLE sign-in and no retry, a
+///   return skips that account while a working one keeps IDLE, and the password update
+///   brings its IDLE back; a refusal for now keeps IDLE's 10 s retry (#1349);
 /// - a provider started twice keeps one IDLE connection;
 /// - an IDLE event reads now: EXISTS reads the new message, VANISHED deletes the one it
 ///   names (the event handler `startIdle(for:)` installs);
@@ -332,6 +335,97 @@ struct ForegroundStartEffectTests {
             await settle()
             let refusedIdle = world.idleStarts(refused)
             #expect(refusedIdle == 0, "a refused sign-in started IDLE, which would retry the refused password")
+        }
+    }
+
+    // MARK: - A refused password never keeps IDLE signing in (#1349)
+
+    /// A password the server refuses while the app is open: IDLE's sign-in is refused
+    /// once and IDLE stops, with no retry every 10 s; a return to the app starts IDLE
+    /// for the account whose password works and skips the refused one; the password
+    /// update brings the refused account's IDLE back.
+    @Test("A refused password gets one IDLE sign-in and no retry, a return skips it while a working account keeps IDLE, and a password update brings its IDLE back")
+    func refusedPasswordStopsIdle() async throws {
+        try await withWorld(realIdle: true) { world in
+            let server = world.server
+            let manager = AccountManager.shared
+            func logins() -> Int { server.recordedCommands().filter { $0.hasPrefix("LOGIN") }.count }
+            func idleCommands() -> Int { server.recordedCommands().filter { $0.hasPrefix("IDLE") }.count }
+            // The refused account connected while its password worked; the working
+            // one connects after the start.
+            let refused = try await world.addAccount(connect: true)
+            let working = try await world.addAccount(connect: false)
+
+            // The password stops working before IDLE signs in: the start's IDLE
+            // sign-in is refused.
+            server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials")
+            let state = ScreenState(accounts: 2)
+            let window = try Self.host(state, start: { world.scheduler.startForegroundPolling() })
+            defer { Self.close(window) }
+            let refusedOnce = await eventually(seconds: 5) { server.consumedInjectedFailureCount() == 1 }
+            try #require(refusedOnce, "precondition: IDLE's sign-in was refused")
+            await settle()
+            let marked = await manager.authFailedAccounts.contains(refused.id)
+            #expect(marked, "the refusal reached the sign-in record")
+            let loginsAfterRefusal = logins()
+
+            // Past IDLE's 10 s retry: no second sign-in with the refused password.
+            try? await Task.sleep(for: .seconds(12))
+            let retried = logins() - loginsAfterRefusal
+            #expect(retried == 0, "IDLE signed in \(retried) more time(s) with the refused password")
+            let liveOnRefused = idleCommands()
+            #expect(liveOnRefused == 0, "IDLE went live after its sign-in was refused")
+
+            // The working account goes live in the open app and gets IDLE.
+            try await manager.connectAccount(working)
+            let workingLive = await eventually(seconds: 5) { idleCommands() == 1 }
+            #expect(workingLive, "the working account's IDLE went live")
+
+            // A return to the app: the start's IDLE covers the working account and
+            // skips the refused one.
+            world.scheduler.stopPolling()
+            await settle()
+            world.scheduler.startForegroundPolling()
+            let workingAgain = await eventually(seconds: 5) { world.idleStarts(working) == 2 }
+            #expect(workingAgain, "the return started the working account's IDLE")
+            await settle()
+            let refusedStarts = world.idleStarts(refused)
+            #expect(refusedStarts == 1, "the return started IDLE for the refused account (\(refusedStarts) starts)")
+
+            // The password update: the refused account's IDLE comes back.
+            let replaced = await manager.provider(for: refused)
+            try await manager.updatePassword(server.password, for: refused)
+            let back = await eventually(seconds: 5) { idleCommands() == 2 }
+            #expect(back, "the password update brought the refused account's IDLE back")
+            let refusedStartsAfterUpdate = world.idleStarts(refused)
+            #expect(refusedStartsAfterUpdate == 2)
+            try? await replaced?.disconnect()
+        }
+    }
+
+    @Test("IDLE whose sign-in is refused for now keeps its 10 s retry until the server answers")
+    func refusedForNowKeepsRetrying() async throws {
+        try await withWorld(realIdle: true) { world in
+            let server = world.server
+            let account = try await world.addAccount(connect: true)
+            // IDLE's first two sign-ins are refused for now.
+            server.failNextCommand(containing: "LOGIN", message: "[UNAVAILABLE] Try again later")
+            server.failNextCommand(containing: "LOGIN", message: "[UNAVAILABLE] Try again later")
+            let state = ScreenState(accounts: 1)
+            let window = try Self.host(state, start: { world.scheduler.startForegroundPolling() })
+            defer { Self.close(window) }
+            let first = await eventually(seconds: 5) { server.consumedInjectedFailureCount() == 1 }
+            try #require(first, "precondition: IDLE's first sign-in was refused for now")
+            let second = await eventually(seconds: 15) { server.consumedInjectedFailureCount() == 2 }
+            #expect(second, "IDLE retried after its first refusal for now")
+            let live = await eventually(seconds: 15) {
+                server.recordedCommands().contains { $0.hasPrefix("IDLE") }
+            }
+            #expect(live, "IDLE kept retrying until the server answered")
+            let marked = await AccountManager.shared.authFailedAccounts.contains(account.id)
+            #expect(!marked, "a refusal for now is not a refused sign-in")
+            let starts = world.idleStarts(account)
+            #expect(starts == 1, "the retries are IDLE's own, not new starts")
         }
     }
 

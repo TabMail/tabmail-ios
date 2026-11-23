@@ -3642,6 +3642,19 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // itself (`stopIdle`/`markDirty` read `idleServer` directly);
                 // if not, nothing was ever planted — no retry, the cancellation
                 // was intentional.
+            } catch IMAPError.loginFailed {
+                // The server refused the password (#1349). `createServer` reports a
+                // refusal for now as `ProviderTemporaryRefusal`, so this one is a
+                // refusal of the credentials, already recorded for "sign in again".
+                // A retry would send the refused password every 10 s while the app
+                // is open, so IDLE stops here: `stopIdle` clears the wish, so
+                // nothing relaunches it. A password update makes a new provider
+                // live and hands it to the scheduler, which starts its IDLE; a
+                // return to the app skips the account while its sign-in stays
+                // refused (`SyncScheduler.startImapIdle`). A refusal for now, a
+                // network error and a dropped stream keep the retry below.
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Sign-in refused — IDLE stops until the password is updated") }
+                await self.stopIdle()
             } catch {
                 if let claimed {
                     if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Error: \(error) — reconnecting in 10s") }
