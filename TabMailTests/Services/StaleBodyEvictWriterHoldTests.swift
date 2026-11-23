@@ -124,21 +124,33 @@ struct StaleBodyEvictWriterHoldTests {
         configuration.automaticMemoryManagement = false
         configuration.persistentReadOnlyConnections = true
         configuration.prepareDatabase { db in connections.register(db) }
-        let pool = try DatabasePool(
-            path: directory.appendingPathComponent("test.sqlite").path,
-            configuration: configuration)
-        try AppDatabase.runMigrations(on: pool)
+        let pool: DatabasePool
+        do {
+            pool = try DatabasePool(
+                path: directory.appendingPathComponent("test.sqlite").path,
+                configuration: configuration)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
         let fixture = Fixture(pool: pool, directory: directory, connections: connections)
-        try pool.write { db in
-            var account = Account(
-                emailAddress: "\(fixture.accountId)@example.com", displayName: "T", provider: .imap)
-            account.id = fixture.accountId
-            try account.insert(db)
-            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: fixture.accountId).insert(db)
-            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: fixture.accountId).insert(db)
-            if buildsDeferredIndexes {
-                try SyncEngine.createDeferredIndexes(db)
+        do {
+            try AppDatabase.runMigrations(on: pool)
+            try pool.write { db in
+                var account = Account(
+                    emailAddress: "\(fixture.accountId)@example.com", displayName: "T", provider: .imap)
+                account.id = fixture.accountId
+                try account.insert(db)
+                try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: fixture.accountId).insert(db)
+                try Folder(name: "Archive", path: "Archive", role: .archive, accountId: fixture.accountId).insert(db)
+                if buildsDeferredIndexes {
+                    try SyncEngine.createDeferredIndexes(db)
+                }
             }
+        } catch {
+            // A setup that fails leaves no pool open and no directory behind.
+            TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: directory)
+            throw error
         }
         return fixture
     }
@@ -225,7 +237,7 @@ struct StaleBodyEvictWriterHoldTests {
     static func measuredRun(
         _ fixture: Fixture, meter: WriterWorkMeter
     ) throws -> (writes: WriterWorkMeter.Reading, pagesRead: Int) {
-        try fixture.pool.writeWithoutTransaction { db in meter.start(db) }
+        fixture.pool.writeWithoutTransaction { db in meter.start(db) }
         let before = fixture.connections.pagesSoFar
         SyncEngine.runEvictStaleBodies(
             dbPool: PrioritizedDatabase(pool: fixture.pool, priority: .background), undoProtectedBodyIds: [])
@@ -237,7 +249,7 @@ struct StaleBodyEvictWriterHoldTests {
         _ meter: WriterWorkMeter
     ) throws -> Fixture {
         let fixture = try makeFixture()
-        try fixture.pool.writeWithoutTransaction { db in
+        fixture.pool.writeWithoutTransaction { db in
             db.add(transactionObserver: meter, extent: .observerLifetime)
         }
         return fixture
