@@ -349,8 +349,15 @@ final class ChatSwipeUITests: XCTestCase {
         // Closing the panel clears the focus, and nothing gives it back to the field afterwards.
         app.buttons["chatClose"].tap()
         XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "Close closed the panel")
+        let restored = typedField(containing: Self.shortQuestion, in: app)
+        XCTAssertTrue(restored.waitForExistence(timeout: 3), "control: the field holds the draft again")
         XCTAssertTrue(markerReads(focused: false, in: app), "the field came back without the keyboard")
         XCTAssertFalse(markerReads(focused: true, in: app), "and does not take it back")
+        // Read from the field itself and from the screen too, so a focus that bypasses the pill's own
+        // focus value (and its marker) is caught: a software keyboard that showed for the field is
+        // down, after the marker's waits have let it go.
+        XCTAssertFalse(waitForFocus(restored, true, timeout: 1), "the field does not read focused itself")
+        XCTAssertTrue(keyboardStaysDown(in: app), "the keyboard stays down after Close")
     }
 
     /// Signed in, the field without the keyboard: the drag up opens the panel with its editor and
@@ -367,11 +374,25 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(markerReads(focused: false, in: app), "control: the app's marker reads the panel's editor")
         XCTAssertFalse(markerReads(focused: true, in: app), "the panel's editor did not take the keyboard")
         XCTAssertFalse(waitForFocus(editor, true, timeout: 1), "nor does it read focused itself")
-        let keyboard = app.keyboards.firstMatch
-        let keyboardOnScreen = keyboard.exists
-            && app.frame.intersection(keyboard.frame).height > app.frame.height * Self.keyboardMinShare
-        XCTAssertFalse(keyboardOnScreen, "the keyboard stays down")
+        XCTAssertTrue(keyboardStaysDown(in: app), "the keyboard stays down")
     }
+
+    /// Whether no keyboard of a software keyboard's size is on screen at any read for
+    /// `keyboardDownWindow` (a keyboard parked below the screen counts as down).
+    private func keyboardStaysDown(in app: XCUIApplication) -> Bool {
+        let keyboard = app.keyboards.firstMatch
+        let deadline = Date().addingTimeInterval(Self.keyboardDownWindow)
+        repeat {
+            if keyboard.exists, app.frame.intersection(keyboard.frame).height > app.frame.height * Self.keyboardMinShare {
+                return false
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.keyboardBackPollStep))
+        } while Date() < deadline
+        return true
+    }
+
+    /// How long a keyboard must stay off screen to count as down.
+    private static let keyboardDownWindow: TimeInterval = 2
 
     /// The signed-in field's hint (`ChatReplyField.placeholder`), the open panel's input's hint
     /// (`PillDictationMode.placeholder`), and the open panel's sign-in bar.
@@ -819,7 +840,7 @@ final class ChatSwipeUITests: XCTestCase {
     /// Puts the caret at the start of the one-line `original` with the long press of
     /// `testLongPressInTheFocusedFieldMovesTheCaret`, and checks it: a mark typed next lands first,
     /// its Delete gives back exactly `original` with the field still focused, and no edit menu is
-    /// left for the next gesture. It waits for the keyboard back as `topLine` does. A tap would not
+    /// left for the next gesture (`editMenu`). It waits for the keyboard back as `topLine` does. A tap would not
     /// do: on a one-line text whose caret is already at its end, the tap at its start shows the edit
     /// menu and leaves the caret at the end (UI run 2026-11-23).
     private func caretToTheStart(of text: XCUIElement, holding original: String, in app: XCUIApplication,
@@ -833,12 +854,39 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertEqual(marked, Self.lineMark + original, "control: the long press put the caret at the text's start", file: file, line: line)
         XCTAssertEqual(text.value as? String, original, "control: the mark's Delete gave the text back as it was", file: file, line: line)
         XCTAssertTrue(markerReads(focused: true, in: app), "control: the field kept its focus", file: file, line: line)
-        XCTAssertFalse(app.descendants(matching: .any)[Self.editMenuItem].exists,
-                       "control: no edit menu is left for the held press", file: file, line: line)
+        XCTAssertFalse(editMenu(in: app).exists, "control: no edit menu is left for the held press", file: file, line: line)
     }
 
-    /// An item of the text's edit menu (Select, Select All, AutoFill), found by its label.
-    private static let editMenuItem = "Select All"
+    /// The text's edit menu, if one shows: XCUITest gives its commands as menu items or as buttons
+    /// (`KeyboardFocusRaceUITests.editMenuItem`), so any menu item, or a button named for one of the
+    /// menu's commands. `testEditMenuCheckSeesTheMenuADoubleTapShows` proves it finds a shown menu.
+    private func editMenu(in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any).matching(NSPredicate(
+            format: "elementType == %d OR (elementType == %d AND label IN %@)",
+            XCUIElement.ElementType.menuItem.rawValue, XCUIElement.ElementType.button.rawValue,
+            Self.editMenuCommands)).firstMatch
+    }
+
+    /// The text edit menu's commands: at a caret (Select, Select All, AutoFill, Paste) and on a
+    /// selection (Cut, Copy, Look Up, Translate).
+    private static let editMenuCommands = ["Select", "Select All", "AutoFill", "Paste", "Cut", "Copy", "Look Up", "Translate"]
+
+    /// The edit menu check of `caretToTheStart` sees a shown menu, on the same chat: a double tap on
+    /// the focused field's first word selects it and shows the menu (Copy, ...), the gesture of
+    /// `testDoubleTapInOverflowingTextSelectsAWordToReplace`. Before it, the check finds nothing.
+    func testEditMenuCheckSeesTheMenuADoubleTapShows() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        field.tap()
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.caretPhrase)
+        let typed = typedField(containing: Self.caretPhrase, in: app)
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the phrase is in the field")
+        waitForTheKeyboardBack(under: typed, in: app)
+        XCTAssertFalse(editMenu(in: app).exists, "control: the check finds no edit menu before the double tap")
+        typed.coordinate(withNormalizedOffset: .zero).withOffset(Self.insideTheTextsCorner).doubleTap()
+        XCTAssertTrue(editMenu(in: app).waitForExistence(timeout: 3), "the check sees the edit menu the double tap shows")
+    }
 
     /// One short line, typed so the caret ends after it, and its last word.
     private static let caretPhrase = "Lunch works"
