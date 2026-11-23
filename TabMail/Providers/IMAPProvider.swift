@@ -3289,10 +3289,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// generation), at every teardown call site that could plausibly log out a
     /// connection some OTHER task still holds: `disconnect()` and `markDirty()`
     /// — the two EXTERNAL teardowns (cross-field invariant #1's void set).
-    /// It also fires for the IDLE connection's teardown in `stopIdle()` and
-    /// `evictIdleConnection()`, which share `markDirty()`'s IDLE path
-    /// (`tearDownIdleConnection`); the IDLE connection is never checked out,
-    /// so those calls can never look like a held connection being logged out.
+    /// It also fires for the IDLE connection's teardown in `stopIdle()`, which
+    /// shares `markDirty()`'s IDLE path (`tearDownIdleConnection`); the IDLE
+    /// connection is never checked out, so that call can never look like a
+    /// held connection being logged out. `evictIdleConnection()` logs its IDLE
+    /// connection out on its own path, without this hook.
     ///
     /// NOT wired into `releaseActionConnection(healthy:false)` /
     /// `releaseFolderConnection(healthy:false)`: those are the exclusive
@@ -3514,8 +3515,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         tearDownIdleConnection()
     }
 
-    /// The ONE way an IDLE session is ended from outside its listener
-    /// (`markDirty()`, `stopIdle()`, `evictIdleConnection()`): cancel the
+    /// The way `markDirty()` and `stopIdle()` end an IDLE session from outside
+    /// its listener (`evictIdleConnection()` has its own teardown and must not
+    /// use this one: the relaunch below would undo the 30 s back-off and take
+    /// back the slot the eviction freed): cancel the
     /// listener, clear the slot, then a detached DONE followed by LOGOUT on the
     /// tracked connection. SwiftMail's `executeCommandBody` calls
     /// `waitForIdleCompletionIfNeeded()` before EVERY command including LOGOUT,
@@ -3558,7 +3561,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ///
     /// T3.7 PORT (D-20 / R7-F3) — this function is deliberately callable
     /// concurrently: its own callers (`startIdle`, `onIdleStreamEnded`'s retry
-    /// timer, `evictIdleConnection`'s post-eviction relaunch) are not mutually
+    /// timer, `retryLaunchIdleConnection`'s timer, `evictIdleConnection`'s
+    /// post-eviction relaunch, `tearDownIdleConnection`'s relaunch for
+    /// `markDirty()`) are not mutually
     /// exclusive, so two overlapping calls landing while `idleServer` is still
     /// nil (neither `createServer()` RTT has resolved) both reach the claim
     /// below. Pre-fix, the created connection was planted via an unconditional
