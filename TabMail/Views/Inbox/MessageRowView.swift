@@ -17,6 +17,10 @@ struct MessageRowView: View {
     /// instead of the sender — the sender is always the user, so showing it
     /// adds no information.
     var showsRecipientInsteadOfSender: Bool = false
+    /// In Drafts, a draft kept before it has a subject (a new email left from the chat view's
+    /// new thread, or compose left with the subject empty) reads `draftWithoutSubject` instead
+    /// of a blank line. Display only: the stored and uploaded subject stays empty.
+    var isDraftsFolder: Bool = false
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
     /// The AI choice, observed with the opt-out for the row's own chat-style decision (`chatViewActive`, as `AIService.isAIOff` reads them).
     @AppStorage(AIService.aiChoiceMadeKey, store: AIService.optOutStore) private var aiChoiceMade = false
@@ -56,6 +60,15 @@ struct MessageRowView: View {
             return "To: \(to)"
         }
         return message.from
+    }
+
+    static let draftWithoutSubject = "Draft (no subject yet)"
+
+    /// The subject line: a subjectless draft in Drafts reads `draftWithoutSubject`; everything
+    /// else shows its subject as stored.
+    static func subjectLine(_ subject: String, isDraftsFolder: Bool) -> String {
+        guard isDraftsFolder, subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return subject }
+        return draftWithoutSubject
     }
 
     /// Effective tag: thread aggregate tag overrides individual message tag.
@@ -140,7 +153,7 @@ struct MessageRowView: View {
                 }
 
                 // Subject
-                Text(message.subject)
+                Text(Self.subjectLine(message.subject, isDraftsFolder: isDraftsFolder))
                     .font(.subheadline)
                     .fontWeight(.regular)
                     .foregroundStyle(Theme.textUnread)

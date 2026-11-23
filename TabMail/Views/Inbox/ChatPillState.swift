@@ -49,6 +49,20 @@ final class ChatPillState {
         sessions.removeValue(forKey: key)
     }
 
+    /// End a session for good, as the screen holding it closes: a turn still running is cancelled and no
+    /// longer counted as working, then the session goes (as compose's Discard ends its own). A new
+    /// email's chat (`ChatNewThreadView`) ends its session this way; nothing else would, since
+    /// `evictIdleSessions` runs only when a chat expands.
+    func endSession(for key: String) {
+        if let session = sessions[key] {
+            session.activeChatTask?.cancel()
+            session.activeChatTask = nil
+            session.pendingResume = nil
+        }
+        ActiveAgentTracker.shared.clearWorking(key)
+        removeSession(for: key)
+    }
+
     /// Drop ALL in-memory sessions. Called on demo entry/exit
     /// (`DemoModeService`) so the demo and real chat pills never share
     /// in-memory state (loaded session pages, live turns, reminder buffers).

@@ -28,6 +28,8 @@ enum ActionTagDisplay {
 struct TriageRowView: View {
     let message: MessageSnapshot
     let isSelected: Bool
+    /// In Drafts, a subjectless draft reads as `MessageRowView.subjectLine` says, as in the list.
+    var isDraftsFolder: Bool = false
     var fadeTop: Bool = false
     var fadeBottom: Bool = false
     var prevTag: ActionTag?
@@ -92,7 +94,7 @@ struct TriageRowView: View {
 
                     // Subject + tag action button
                     HStack(alignment: .bottom) {
-                        Text(message.subject)
+                        Text(MessageRowView.subjectLine(message.subject, isDraftsFolder: isDraftsFolder))
                             .font(.subheadline)
                             .fontWeight(.regular)
                             .foregroundStyle(Theme.textUnread)

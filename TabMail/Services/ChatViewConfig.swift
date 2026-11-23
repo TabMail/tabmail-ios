@@ -58,6 +58,8 @@ enum ChatViewLayout {
     static let highlightDuration: Duration = .seconds(1.2)
     static let avatarSize: CGFloat = 28
     static let headerAvatarSize: CGFloat = 32
+    /// A new email's empty avatar: its person glyph's size, as a share of the avatar's.
+    static let emptyAvatarGlyphScale: CGFloat = 0.45
     /// The header lists this many names, then "+N".
     static let headerNameCount = 2
     /// A bubble shows this many attachment chips, then one "+N" chip for the rest.
@@ -84,6 +86,8 @@ enum ChatViewLayout {
     static let subjectLineSpacing: CGFloat = 2
     /// Room under the subject line, inside the header's bar, so its letters clear the bar's edge.
     static let subjectLineBottomGap: CGFloat = 6
+    /// Room between the subject and each label chip after it on the subject line.
+    static let subjectLabelGap: CGFloat = 4
     /// The AI summaries glyph at the subject line's trailing edge, before Dynamic Type scales it.
     static let aiNoticeGlyphSize: CGFloat = 13
     /// Its tap target, full size whatever the glyph's size (Apple's 44-point minimum).
@@ -141,6 +145,22 @@ enum ChatViewLayout {
     static let fieldLineHeight: CGFloat = 22
     /// The collapsed reply field's corner: a capsule at one line (42 / 2), then fixed as it grows.
     static let fieldCornerRadius: CGFloat = 21
+    /// A new email's paperclip, at the text's end: its glyph's width at the body size. Its tap
+    /// width is the mic's (`fieldMicTapWidth`).
+    static let fieldPaperclipGlyphWidth: CGFloat = 13
+    /// A new email's attachments waiting above the field: a photo's thumbnail side, a file chip's
+    /// height and widest name, their corner, the room between them, and the remove button's size.
+    static let trayThumbnailSize: CGFloat = 56
+    static let trayChipHeight: CGFloat = 40
+    static let trayChipMaxWidth: CGFloat = 180
+    static let trayCornerRadius: CGFloat = 10
+    static let traySpacing: CGFloat = 8
+    static let trayRemoveSize: CGFloat = 20
+    /// How far the remove button stands out past an item's top trailing corner, and its backdrop.
+    static let trayRemoveOffset: CGFloat = 6
+    static let trayRemoveBackdropOpacity: Double = 0.6
+    /// A file chip's icon to its name.
+    static let trayChipIconGap: CGFloat = 6
     /// Dragging the reply field up (`ChatFieldDrag`): how far the field may swell under the
     /// finger, and the swell (or a flick's predicted swell) that opens the panel on let-go. The
     /// movement before it counts as a drag is UIKit's own pan's (`ChatFieldPan`).
@@ -230,6 +250,19 @@ enum ChatSuggestionConfig {
         "say I'll call them tomorrow",
         "agree and ask what is next",
         "ask who else should join",
+    ]
+
+    /// What a new email's field can ask for (`ChatNewEmailField`), shown the same way: a new email
+    /// has nothing to reply to, so each is an email to write.
+    static let newEmailExamples = [
+        "ask for the Q2 numbers",
+        "invite them to lunch on Friday",
+        "thank them for yesterday's meeting",
+        "ask when they are free next week",
+        "send them the slides from today",
+        "ask how the launch went",
+        "remind them about Thursday's review",
+        "introduce yourself and ask for a call",
     ]
 
     /// One example from `examples`, at random; nil for an empty set.

@@ -698,7 +698,8 @@ struct ChatReplyFieldTests {
                 == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text)
                     + Self.count("fieldFill.holdsSentWords", in: text),
                 "nothing else touches the field's state")
-        // Each change, where it happens: typing (above), both dictations, both sends, and an Edit.
+        // Each change, where it happens: typing (above), both dictations, both sends, an Edit, the
+        // "e.g." line, and a new email's saved words.
         #expect(Self.count("fieldFill.apply(.startHearing) speech.start(locale: speechLocale, auto: auto) { transcript in fieldFill.apply(.heard(transcript))", in: text) == 1)
         #expect(Self.count("{ text in fieldFill.apply(.said(text))", in: text) == 1)
         // The completion and a confirmation card land on the sent request's chat key in
@@ -708,10 +709,17 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldFill.apply(.put(text)) isTextFieldFocused = true", in: text) == 1)
         // The "e.g." line's change goes in as words and is never sent from here.
         #expect(Self.count("func putExample(_ example: String) { fieldFill.apply(.put(example)) inputSelection = .init(insertionPoint: inputText.endIndex) }", in: text) == 1)
-        #expect(Self.count("fieldFill.apply(", in: text) == 8)
+        // A new email's saved words go in once, as its chat first opens; the screen hidden and
+        // shown again keeps what was typed since (ChatNewThreadScreenTests.hiddenAndShownKeepsTyping).
+        // Then its reply field takes the keyboard: the panel's input, which `isTextFieldFocused`
+        // focuses, is never there in a new email's chat. Only the forked chat's put focuses the panel.
+        #expect(Self.count("guard let newEmail = replyField?.newEmail, !newEmailStarted else { return } newEmailStarted = true if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) } focusedInput = .replyField }", in: text) == 1)
+        #expect(Self.count("focusedInput = .replyField", in: text) == 1, "the new email's opening is the only one that focuses the reply field")
+        #expect(Self.count("isTextFieldFocused = true", in: text) == 1, "the forked chat's put is the only one that focuses the panel's input")
+        #expect(Self.count("fieldFill.apply(", in: text) == 9)
     }
 
-    @Test("The field's Send sends the words to the agent; nothing in the field opens compose")
+    @Test("The field's Send sends the words to the agent, except in a new email's chat, which takes its own Send; nothing in the field opens compose")
     func fieldSendWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         // Collapsed, the reply field's Send takes the field's route; the open sheet keeps the chat's.
@@ -719,7 +727,11 @@ struct ChatReplyFieldTests {
         // Send refuses only an empty input, and the collapsed field then takes its own route.
         #expect(message.hasPrefix(" let text = inputText.trimmingCharacters(in: .whitespaces) guard !text.isEmpty else { return } if let replyField, !isExpanded { sendFromReplyField(text, replyField) return }"))
         let send = try Self.body(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {", in: text)
-        #expect(Self.count("return", in: send) == 0, "every send from the field goes to the agent")
+        // A new email's chat takes the words first and only (what its Send does is driven in
+        // ChatNewThreadScreenTests); every other send from the field goes to the agent.
+        #expect(send.hasPrefix(" // A new email's chat decides what its Send does; the words stay until it acts on them. if let newEmail = field.newEmail { newEmail.send(text) return } isTextFieldFocused = false"),
+                "a new email's chat takes its own Send, first")
+        #expect(Self.count("return", in: send) == 1, "every other send from the field goes to the agent")
         #expect(Self.count("onSendReadyReply", in: text) == 0 && Self.count("ChatReplyField.route", in: text) == 0)
         #expect(Self.count("onFieldSend?(text)", in: send) == 1)
         #expect(Self.count("sendAgentChat(text, field: send)", in: send) == 1)

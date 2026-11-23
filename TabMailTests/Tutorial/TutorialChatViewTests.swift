@@ -683,7 +683,8 @@ struct TutorialChatViewRunTests {
                 try await HostedAccessibility.withAutomation {
                     let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
                     let window = UIWindow(windowScene: scene)
-                    let controller = UIHostingController(rootView: NavigationStack { MessageOpenView(messageId: priya.id) })
+                    let controller = UIHostingController(rootView: NavigationStack { MessageOpenView(messageId: priya.id) }
+                        .environment(NavigationStore()))
                     window.rootViewController = controller
                     window.makeKeyAndVisible()
                     defer {
@@ -898,7 +899,8 @@ struct TutorialChatViewRunTests {
                 try await HostedAccessibility.withAutomation {
                     let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
                     let window = UIWindow(windowScene: scene)
-                    let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) })
+                    let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) }
+                        .environment(NavigationStore()))
                     window.rootViewController = controller
                     window.makeKeyAndVisible()
                     defer {

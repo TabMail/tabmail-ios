@@ -176,29 +176,45 @@ struct LocallyAuthoredDraftOpenAuthority: Sendable, Equatable {
 /// row from its server copy, ADR-IOS-091), then the compose appears already
 /// holding the draft (#309, #326). No empty, editable compose is ever shown.
 ///
+/// A new email started in the chat view reopens as its chat instead while the chat view is on
+/// (`ChatNewThreadRoute.savedDraft`), with the words in the field and the attachments above it.
+///
 /// Usage: `DraftComposePresenter(source: .header(header))`
 struct DraftComposePresenter: View {
     let source: DraftOpenPreparation.Source
+    /// True where it is a cover of its own; false where it is pushed inside a navigation
+    /// (`MessageOpenView`), so a new email's chat takes that navigation's bar and Back.
+    var presentedAsCover = true
     #if DEBUG
     @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
     #endif
     /// Nil while the open is prepared, and again while Try Again prepares it.
     @State private var outcome: DraftOpenPreparation.Outcome?
+    /// The chat view setting, read once at the open (a Settings change applies to the next open).
+    @State private var opensInChat = ChatViewConfig.opensInChat
+    /// Signed in to TabMail: read as the open is prepared (`ChatNewThreadRoute.savedDraft`).
+    @Environment(\.hasTabMailSession) private var hasTabMailSession
+    /// A new email's chat, made once from the prepared draft; nil for a draft compose opens.
+    @State private var newEmail: ChatNewThreadModel?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         Group {
             switch outcome {
             case .ready(let prepared):
-                ComposeView(
-                    replyTo: prepared.replyTo,
-                    account: prepared.account,
-                    isForward: prepared.draft.isForward,
-                    isReplyAll: prepared.draft.isReplyAll,
-                    prefillDraftId: prepared.draft.id,
-                    openAuthority: prepared.openAuthority,
-                    preparedDraft: prepared.draft
-                )
+                if let newEmail {
+                    newEmailChat(newEmail)
+                } else {
+                    ComposeView(
+                        replyTo: prepared.replyTo,
+                        account: prepared.account,
+                        isForward: prepared.draft.isForward,
+                        isReplyAll: prepared.draft.isReplyAll,
+                        prefillDraftId: prepared.draft.id,
+                        openAuthority: prepared.openAuthority,
+                        preparedDraft: prepared.draft
+                    )
+                }
             case .nothingToOpen:
                 // Draft doesn't exist (yet) — auto-dismiss
                 Color.clear.onAppear { dismiss() }
@@ -228,12 +244,31 @@ struct DraftComposePresenter: View {
         }
     }
 
+    @ViewBuilder
+    private func newEmailChat(_ model: ChatNewThreadModel) -> some View {
+        if presentedAsCover {
+            NavigationStack { ChatNewThreadView(model: model) }
+        } else {
+            ChatNewThreadView(model: model)
+        }
+    }
+
     private func prepare() async {
+        let signedIn = hasTabMailSession
         #if DEBUG
-        outcome = await DraftOpenPreparation.prepare(source, resolver: resolveOpenAuthorityForTesting)
+        let prepared = await DraftOpenPreparation.prepare(source, resolver: resolveOpenAuthorityForTesting)
         #else
-        outcome = await DraftOpenPreparation.prepare(source)
+        let prepared = await DraftOpenPreparation.prepare(source)
         #endif
+        // The chat is made here, once, from the row the preparation checked: the view never
+        // reads the draft again.
+        if case .ready(let ready) = prepared,
+           ChatNewThreadRoute.savedDraft(id: ready.draft.id, opensInChat: opensInChat, signedIn: signedIn) == .newThread {
+            newEmail = ChatNewThreadModel(reopening: ready.draft, account: ready.account)
+        } else {
+            newEmail = nil
+        }
+        outcome = prepared
     }
 }
 

@@ -1236,6 +1236,7 @@ struct AttachmentFilenameContainmentTests {
             "TabMail/Views/Message/AttachmentListView.swift",
             "TabMail/Views/Message/EmlAttachmentPreview.swift",
             "TabMail/Views/Compose/ComposeView.swift",
+            "TabMail/Views/Chat/ChatNewThreadView.swift",
         ]
         // A line that both RENDERS and mentions a filename.
         let renderers = ["Text(", ".navigationTitle("]
@@ -1260,11 +1261,11 @@ struct AttachmentFilenameContainmentTests {
                 )
             }
         }
-        // Non-vacuity: the scan must actually have found the sites. Four are known
-        // (the attachment row, the .eml nested strip, the .eml sheet title and the
-        // compose chip); a lower bound rather than an equality so adding a site does
-        // not fail the wrong test.
-        #expect(sites >= 4, "the source scan matched \(sites) render sites, so it proves nothing")
+        // Non-vacuity: the scan must actually have found the sites. Five are known
+        // (the attachment row, the .eml nested strip, the .eml sheet title, the
+        // compose chip and the new email chat's file chip); a lower bound rather than
+        // an equality so adding a site does not fail the wrong test.
+        #expect(sites >= 5, "the source scan matched \(sites) render sites, so it proves nothing")
     }
 
     /// The invariant: **the label and the ACTION agree.** A row the user is told is

@@ -271,8 +271,15 @@ struct ComposeSuggestionPersistTests {
             "private func saveDraftAndDismiss() async {",
             before: "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
             in: composeSource())
-        #expect(save.contains("ComposeDraftGuards.draftToSave("), "Save persists the row the decision builds")
+        #expect(save.contains("ComposeDraftSave.run("), "Save writes through the shared writer")
         #expect(save.contains("body: capBody,"), "with the body Save captured")
+        let writer = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("TabMail/Views/Compose/ComposeDraftSave.swift"),
+            encoding: .utf8)
+        #expect(writer.contains("ComposeDraftGuards.draftToSave("), "the writer persists the row the decision builds")
+        #expect(writer.contains("body: written.body,"), "with the body its editor gave")
     }
 
     @Test("Save's row: an existing row keeps its history and stamps; an insert takes the stamps from the header")

@@ -4,7 +4,8 @@
 
 import Foundation
 
-struct DraftAttachment: Sendable {
+/// Equal when every field is, the bytes included.
+struct DraftAttachment: Sendable, Equatable {
     let filename: String
     let mimeType: String
     let data: Data

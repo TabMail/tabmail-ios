@@ -1979,16 +1979,13 @@ struct ComposeView: View {
             }
             .fullScreenCover(isPresented: $showCamera) {
                 CameraPickerView { image in
-                    guard let data = image.jpegData(compressionQuality: 0.85) else {
-                        recordAttachmentPreparationFailure("Camera photo")
+                    guard let attachment = DraftAttachmentImport.cameraAttachment(
+                        image, existingCount: attachments.count) else {
+                        recordAttachmentPreparationFailure(DraftAttachmentImport.cameraFailureLabel)
                         publishAttachmentPreparationFailuresIfSettled()
                         return
                     }
-                    attachments.append(DraftAttachment(
-                        filename: "photo_\(attachments.count + 1).jpg",
-                        mimeType: "image/jpeg",
-                        data: data
-                    ))
+                    attachments.append(attachment)
                 }
             }
             .dismissKeyboardOnTap()
@@ -2061,32 +2058,16 @@ struct ComposeView: View {
         guard !items.isEmpty else { return }
         attachmentCarryGate.begin(items.count)
         Task { @MainActor in
-            for (index, item) in items.enumerated() {
-                var succeeded = false
-                do {
-                    if let data = try await item.loadTransferable(type: Data.self) {
-                        let mimeType = item.supportedContentTypes.first?.preferredMIMEType
-                            ?? "application/octet-stream"
-                        let ext = item.supportedContentTypes.first?.preferredFilenameExtension
-                            ?? "dat"
-                        let filename = "photo_\(attachments.count + 1).\(ext)"
-                        attachments.append(DraftAttachment(
-                            filename: filename, mimeType: mimeType, data: data))
-                        succeeded = true
-                    } else {
-                        recordAttachmentPreparationFailure(
-                            "Selected photo or video \(index + 1)")
-                    }
-                } catch {
-                    recordAttachmentPreparationFailure(
-                        "Selected photo or video \(index + 1)")
-                    if DebugModeManager.isLoggingEnabled() {
-                        BackgroundSyncLogger.logDebug("[ComposeView] Photo picker import failed: \(error)")
-                    }
-                }
-                attachmentCarryGate.completeOne(succeeded: succeeded)
-                publishAttachmentPreparationFailuresIfSettled()
-            }
+            await DraftAttachmentImport.loadPicked(
+                items,
+                load: { item in (try await item.loadTransferable(type: Data.self), item.supportedContentTypes.first) },
+                existingCount: { attachments.count },
+                add: { attachments.append($0) },
+                fail: { recordAttachmentPreparationFailure($0) },
+                settled: { succeeded in
+                    attachmentCarryGate.completeOne(succeeded: succeeded)
+                    publishAttachmentPreparationFailuresIfSettled()
+                })
             photoPickerItems = []
         }
     }
@@ -3200,123 +3181,35 @@ struct ComposeView: View {
         let capSubject = subject
         let capBody = messageBody
 
-        // PORT — v2final `saveDraftAndDismiss`'s "N2: ONE throwing draft read at
-        // the TOP, BEFORE any disk or DB mutation". This replaces the TWO separate
-        // `try?` reads this forward-port carried (one for `attachmentsDirName`, one
-        // for the merge base), each of which turned a THROWN read into "absent":
-        //   - the dir read fell through to the raw `draftId` path and DELETED the
-        //     live attachment directory it had merely failed to see;
-        //   - the merge read fell through to the INSERT branch, whose
-        //     `editHistoryJSON: nil` then clobbered the row's stored AI edit history
-        //     through `DraftStore.applySave`'s merge.
-        // A thrown read is NOT absence: FAIL CLOSED with nothing written, and let
-        // the user retry. A genuine nil still takes the normal first-save path.
-        let readResult: Result<Draft?, Error>
-        do {
-            readResult = .success(try await AppDatabase.dbPool.read { db in
-                try Draft.fetchOne(db, key: capDraftId)
-            })
-        } catch {
-            readResult = .failure(error)
-        }
-        guard ComposeDraftGuards.saveMayMutate(
-            readState: ComposeDraftGuards.readState(readResult)) else {
-            sendError = "Couldn't save this draft — the database was busy. Try again in a moment."
+        // The write itself, in compose's order (fail-closed read, staging, the save
+        // through this compose's generation, cleanup after commit), is
+        // `ComposeDraftSave.run`, shared with the chat view's new email.
+        let written = await ComposeDraftSave.run(
+            draftId: capDraftId, accountId: account.id, attachments: capAttachments, now: now,
+            fields: { _ in
+                ComposeDraftSave.Fields(
+                    to: capTo, cc: capCc, bcc: capBcc,
+                    subject: capSubject, body: capBody, replyTo: replyTo,
+                    isForward: isForward, isReplyAll: isReplyAll)
+            },
+            admit: { draft in try await saveThroughGeneration(draft) })
+        switch written {
+        case .committed(let previousPushStatus):
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[ComposeView] ⚠ Save-path draft read THREW for draftId=\(capDraftId) — failing closed (no disk/DB write)")
+                BackgroundSyncLogger.logDebug("[ComposeView] Saved draft on cancel: id=\(draftId) prevStatus=\(previousPushStatus ?? "nil")")
             }
+        case .readFailed:
+            sendError = "Couldn't save this draft — the database was busy. Try again in a moment."
             return
-        }
-        let existing: Draft?
-        if case .success(let value) = readResult { existing = value } else { existing = nil }
-        let previousDirName = existing?.attachmentsDirName
-
-        // PORT — v2final `saveDraftAndDismiss`'s F0d COPY-ON-WRITE attachment
-        // staging. Persist attachments to disk BEFORE the DB write (file I/O
-        // outside GRDB transactions), but into a FRESH, opaque-UUID staging dir —
-        // NEVER the live dir. The superseded call site wrote into
-        // `existingDirName ?? capDraftId`, which (a) DELETED the live set before
-        // rewriting it, so a failed/rolled-back save left the row pointing at
-        // destroyed or half-written files, and (b) used the raw `draftId` as a path
-        // component — and a draftId may contain `/` (a `reply:<acct>:<Message-ID>`
-        // key, an Exchange base64 id), which `appendingPathComponent` treats as a
-        // SEPARATOR and silently nests outside the intended slot. See
-        // `DraftAttachmentStorage.newStagingDirName()`.
-        //
-        // ORPHAN-ON-CRASH: a kill after this staging write but before the row adopts
-        // it leaves an unreferenced opaque-UUID dir. That is a bounded disk leak —
-        // never data loss — and does not grow during crash-free operation.
-        let stagingDirName: String?
-        if capAttachments.isEmpty {
-            // N→0 (drop-all) or 0→0: the row will carry a nil dir; the OLD dir (if
-            // any) is destroyed ONLY post-commit. No staging dir here.
-            stagingDirName = nil
-        } else {
-            let staging = DraftAttachmentStorage.newStagingDirName()
-            do {
-                try DraftAttachmentStorage.saveAttachments(capAttachments, dirName: staging)
-            } catch {
-                // Staging write failed — nothing durable changed. Best-effort clean
-                // the partial staging dir; the live dir is UNTOUCHED.
-                DraftAttachmentStorage.deleteAttachments(dirName: staging)
-                sendError = "Failed to save attachments: \(error.localizedDescription)"
-                return
-            }
-            stagingDirName = staging
-        }
-
-        // Persist before dismiss — if save fails, show error and do NOT dismiss.
-        // This follows the "persist before acknowledge" principle (CLAUDE.md).
-        //
-        // Route through DraftStore.shared.save (NOT raw GRDB write): the store's
-        // save() marks serverPushStatus "pushed" → "dirty" so pushDraftToServer
-        // doesn't early-return. Without this, a 2nd-save-onwards draft never
-        // actually reaches the server — queueDraftSave drains but pushDraft
-        // sees `serverPushStatus == "pushed"` (from the previous push) and
-        // bails before sending the update. `existing` was read fail-closed above.
-        let draftToSave = ComposeDraftGuards.draftToSave(
-            existing: existing, id: capDraftId, accountId: account.id,
-            recipients: (capTo, capCc, capBcc), subject: capSubject, body: capBody,
-            replyTo: replyTo, isForward: isForward, isReplyAll: isReplyAll,
-            attachmentsDirName: stagingDirName, now: now)
-
-        // The staging-cleanup catch covers ONLY the save. Once the save has
-        // COMMITTED (either result), the staging dir's fate is decided by the
-        // disposition below and NOTHING afterward (queueDraftSave, dismiss…) may
-        // delete it — deleting it post-commit would destroy the now-LIVE dir.
-        let saveResult: DraftStore.SaveResult
-        do {
-            saveResult = try await saveThroughGeneration(draftToSave)
-        } catch {
-            // The save threw / rolled back — nothing durable adopted our staging
-            // dir. Delete ONLY the staging dir; leave the live dir UNTOUCHED
-            // (persist-before-destroy).
-            if case .deleteStaging(let dir) = ComposeDraftGuards.attachmentDisposition(
-                saveApplied: false, stagingDir: stagingDirName, previousDir: previousDirName) {
-                DraftAttachmentStorage.deleteAttachments(dirName: dir)
-            }
-            sendError = "Failed to save draft: \(error.localizedDescription)"
+        case .attachmentsNotStaged(let reason):
+            sendError = "Failed to save attachments: \(reason)"
             return
-        }
-        // Disposition-driven attachment cleanup (persist-before-destroy). The DB
-        // has durably committed; only NOW is it safe to destroy files.
-        switch ComposeDraftGuards.attachmentDisposition(
-            saveApplied: saveResult == .applied,
-            stagingDir: stagingDirName, previousDir: previousDirName
-        ) {
-        case .deleteSuperseded(let dir), .deleteStaging(let dir):
-            DraftAttachmentStorage.deleteAttachments(dirName: dir)
-        case .noCleanup:
-            break
-        }
-        guard saveResult == .applied else {
-            // A newer snapshot already won on disk — our snapshot was NOT adopted.
-            // Its staging dir was destroyed above; the live dir is intact.
+        case .saveFailed(let reason):
+            sendError = "Failed to save draft: \(reason)"
+            return
+        case .superseded:
             sendError = "Failed to save draft: \(DraftStore.DraftEpochAdmissionError.staleOrReserved.localizedDescription)"
             return
-        }
-        if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[ComposeView] Saved draft on cancel: id=\(draftId) prevStatus=\(existing?.serverPushStatus ?? "nil")")
         }
         // POST-COMMIT (outside the staging-cleanup catch). A throw here must NOT
         // reach any attachment-dir delete. Queue server push via PendingOperation
@@ -3657,22 +3550,10 @@ struct ComposeView: View {
     private func handleFileImport(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
-            for url in urls {
-                guard url.startAccessingSecurityScopedResource() else {
-                    recordAttachmentPreparationFailure(url.lastPathComponent)
-                    continue
-                }
-                defer { url.stopAccessingSecurityScopedResource() }
-                do {
-                    let data = try Data(contentsOf: url)
-                    let mimeType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
-                    attachments.append(DraftAttachment(filename: url.lastPathComponent, mimeType: mimeType, data: data))
-                } catch {
-                    recordAttachmentPreparationFailure(url.lastPathComponent)
-                    if DebugModeManager.isLoggingEnabled() {
-                        BackgroundSyncLogger.logDebug("[ComposeView] File import failed for \(url.lastPathComponent): \(error)")
-                    }
-                }
+            let imported = DraftAttachmentImport.importFiles(urls)
+            attachments.append(contentsOf: imported.attachments)
+            for label in imported.failures {
+                recordAttachmentPreparationFailure(label)
             }
             publishAttachmentPreparationFailuresIfSettled()
         case .failure(let error):

@@ -111,9 +111,12 @@ struct ComposeRecipientWiringTests {
         #expect(Self.count("to: finalTo, cc: finalCc, bcc: finalBcc,", in: text) == 2)
         #expect(Self.count("finalBcc", in: text) == 4)
         #expect(text.contains("let (capTo, capCc, capBcc) = recipients.stored"))
-        // Save builds its row in `ComposeDraftGuards.draftToSave`, which takes the captured
-        // recipients whole and writes each field from its own role on both branches.
-        #expect(text.contains("recipients: (capTo, capCc, capBcc),"))
+        // Save hands the captured recipients, each in its own role, to the shared writer
+        // `ComposeDraftSave.run`, whose own mapping into the row `ComposeDraftSaveTests` pins; it
+        // builds the row in `ComposeDraftGuards.draftToSave`, which writes each field from its own
+        // role on both branches.
+        #expect(text.contains("ComposeDraftSave.Fields( to: capTo, cc: capCc, bcc: capBcc,"),
+                "Save passes To, Cc and Bcc each in its own role")
         #expect(Self.count("capBcc", in: text) == 2)
         #expect(text.contains(
             "e.toJSON = Draft.encodeStringArray(recipients.to) e.ccJSON = Draft.encodeStringArray(recipients.cc) e.bccJSON = Draft.encodeStringArray(recipients.bcc)"))

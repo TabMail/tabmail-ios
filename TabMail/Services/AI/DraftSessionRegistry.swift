@@ -26,8 +26,9 @@ import Synchronization
 /// (`enforceTurnBudgets` via `appendTurn`, `evictHistoryBeyondCapImpl`,
 /// `evictComposeSessionsImpl`) until later the same day — the rule is a statement
 /// about every consumer, so the census is
-/// `rg -ln 'DraftSessionRegistry' TabMail/` (4 production files: this one, the two
-/// stores, and `ComposeView` as the sole producer). Use the snapshot as a cheap
+/// `rg -ln 'DraftSessionRegistry' TabMail/` (5 production files: this one, the two
+/// stores, and the two producers, `ComposeView` and `ChatNewThreadView`, a new
+/// email's chat in the chat view). Use the snapshot as a cheap
 /// first filter if you like, but re-ask `isActive(_:)` / `activeComposeSessionIds()`
 /// INSIDE the write block — both are nonisolated synchronous `Mutex` reads precisely
 /// so that is legal.

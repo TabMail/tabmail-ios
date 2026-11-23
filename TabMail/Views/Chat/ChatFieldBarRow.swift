@@ -42,8 +42,9 @@ struct ChatFieldBarRow<Mic: View, Field: View, Send: View>: View {
 }
 
 /// A field button laid out at its glyph's width and one line's height, its tap area centred on it.
-/// The button's own label is `tapWidth` by `ChatViewLayout.fieldTapSize`.
-private struct FieldButtonSlot: ViewModifier {
+/// The button's own label is `tapWidth` by `ChatViewLayout.fieldTapSize`. A new email's paperclip, inside
+/// the text, uses it too (`ChatPaperclipButton`).
+struct FieldButtonSlot: ViewModifier {
     let glyphWidth: CGFloat
     let tapWidth: CGFloat
     let lineHeight: CGFloat

@@ -913,7 +913,7 @@ private final class ProductionDetailHost {
                 messageId: messageId,
                 testBypassesDisclosureOpenAnchorDisarm: testBypassesDisclosureOpenAnchorDisarm
             )
-        }
+        }.environment(NavigationStore())
         let controller = UIHostingController(rootView: root)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)

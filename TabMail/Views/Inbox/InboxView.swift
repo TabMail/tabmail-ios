@@ -420,6 +420,9 @@ struct InboxView: View {
     /// migration + Drafts sync while compose is open, so the presentation must
     /// never depend on re-fetching it.
     @State private var draftOpen: DraftOpenRequest?
+    /// A new email the compose button started as a chat (chat view on): pushed on the inbox's
+    /// navigation, with its own Back.
+    @State private var newEmail: ChatNewThreadModel?
     private var archiveOldEmailsTip = ArchiveOldEmailsTip()
     private var enableInboxPushTip = EnableInboxPushTip()
     private var undoService: UndoService { UndoService.shared }
@@ -877,7 +880,7 @@ struct InboxView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 ComposeToolbarButton(onNewCompose: {
                     collapseChat()
-                    viewModel.showCompose = true
+                    startNewEmail()
                 })
                 .tutorialLockedNavigation()
                 .transaction { $0.disablesAnimations = true }
@@ -885,6 +888,9 @@ struct InboxView: View {
         }
         .fullScreenCover(isPresented: $vm.showCompose) {
             ComposeView(account: viewModel.primaryAccount)
+        }
+        .navigationDestination(item: $newEmail) { model in
+            ChatNewThreadView(model: model)
         }
         .sheet(isPresented: Binding(
             get: { moveMessageId != nil || moveThreadGroup != nil },
@@ -1118,6 +1124,17 @@ struct InboxView: View {
         }
     }
 
+    /// The compose button: with the chat view on and signed in to TabMail, a new email starts as
+    /// an empty chat; otherwise today's compose. The setting and the session are read once, at the tap.
+    private func startNewEmail() {
+        switch ChatNewThreadRoute.composeButton(opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession) {
+        case .newThread:
+            newEmail = ChatNewThreadModel(account: viewModel.primaryAccount)
+        case .compose:
+            viewModel.showCompose = true
+        }
+    }
+
     private func collapseChat() {
         if chatExpanded {
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
@@ -1264,7 +1281,8 @@ struct InboxView: View {
                                 viewModel.toggleThreadExpansion(group.id)
                             }
                         },
-                        showsRecipientInsteadOfSender: isUserAuthoredFolder
+                        showsRecipientInsteadOfSender: isUserAuthoredFolder,
+                        isDraftsFolder: isDraftsContext
                     )
                 }
                 .compositingGroup()
@@ -1529,6 +1547,7 @@ struct InboxView: View {
                             .opacity(0)
                     }
                     TriageRowView(message: snapshot, isSelected: selectedMessageId == snapshot.id,
+                                  isDraftsFolder: isDraftsContext,
                                   fadeTop: fadeTop, fadeBottom: fadeBottom,
                                   prevTag: prevTag, nextTag: nextTag,
                                   onStripeAction: { executeTaggedAction(snapshot) },

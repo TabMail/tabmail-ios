@@ -45,10 +45,12 @@ struct ChatReplyToChoice: Equatable {
     }
 }
 
-/// "Reply to", from the bottom when the chat header's names are tapped.
+/// "Reply to", from the bottom when the chat header's names are tapped. A new email's chat opens it
+/// as "Add recipient", starting with the people already picked (none at first).
 struct ChatReplyToSheet: View {
     let replyPeople: [ChatThread.Person]
     let ownAddresses: Set<String>
+    let title: String
     let onDone: (ChatReplyTarget) -> Void
 
     @State private var choice: ChatReplyToChoice
@@ -57,10 +59,14 @@ struct ChatReplyToSheet: View {
     @FocusState private var queryFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
+    static let replyToTitle = "Reply to"
+    static let addRecipientTitle = "Add recipient"
+
     init(replyPeople: [ChatThread.Person], target: ChatReplyTarget, ownAddresses: Set<String>,
-         onDone: @escaping (ChatReplyTarget) -> Void) {
+         title: String = Self.replyToTitle, onDone: @escaping (ChatReplyTarget) -> Void) {
         self.replyPeople = replyPeople
         self.ownAddresses = ownAddresses
+        self.title = title
         self.onDone = onDone
         self._choice = State(initialValue: ChatReplyToChoice(replyPeople: replyPeople, target: target))
     }
@@ -98,7 +104,7 @@ struct ChatReplyToSheet: View {
                     }
                 }
             }
-            .navigationTitle("Reply to")
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

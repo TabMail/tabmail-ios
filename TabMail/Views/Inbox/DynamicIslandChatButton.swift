@@ -99,6 +99,8 @@ struct DynamicIslandChat: View {
         return ChatFieldWords.key(for: message)
     }
     @State var fieldPulse = false
+    /// A new email's chat has put its draft's words in the field (`ChatNewEmailField.startWords`).
+    @State private var newEmailStarted = false
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
     /// Dictation for a user opted out of AI: Apple's recognition on this iPhone only (`PillDictationMode`).
@@ -144,8 +146,8 @@ struct DynamicIslandChat: View {
     @State private var showDictationPrompt = false
 
     private var isComposeMode: Bool { composeContext != nil }
-    /// The inbox's own chat: not about a message, not editing a draft.
-    private var isInboxChat: Bool { composeContext == nil && message == nil }
+    /// The inbox's own chat: not about a message, not editing a draft, not a new email's chat.
+    private var isInboxChat: Bool { composeContext == nil && message == nil && replyField?.newEmail == nil }
     private var isBackfillInProgress: Bool {
         AccountManagerState.shared.backfillProgressByAccount.values.contains { !$0.isFullyComplete }
     }
@@ -160,6 +162,7 @@ struct DynamicIslandChat: View {
                 draftId: draftId ?? "default", epoch: cursor.newEpoch)
         }
         if let message { return ChatThreadKey.key(for: message) }
+        if let newEmail = replyField?.newEmail { return newEmail.sessionKey }
         return "inbox"
     }
     /// The keys of the thread's chat (`ThreadChatReader.keys`), own key first.
@@ -296,7 +299,7 @@ struct DynamicIslandChat: View {
 
     /// Whether swipeable session history is available (inbox context, >1 session loaded).
     private var hasSessionHistory: Bool {
-        !isComposeMode && message == nil && loadedSessions.count > 1
+        isInboxChat && loadedSessions.count > 1
     }
 
     /// Whether the active page is the live (current/newest) session or the "new session" page.
@@ -581,7 +584,7 @@ struct DynamicIslandChat: View {
                 ChatPillState.shared.evictIdleSessions()
                 // 30s idle clear: ONLY for inbox sessions. Message-detail and compose
                 // sessions persist across pill opens (tied to their email/draft).
-                if !isComposeMode && message == nil,
+                if isInboxChat,
                    let lastActivity = lastChatActivity,
                    Date().timeIntervalSince(lastActivity) > 30,
                    !chatMessages.isEmpty,
@@ -638,7 +641,7 @@ struct DynamicIslandChat: View {
                 }
 
                 // Load session history on expand (inbox context only, once per open cycle).
-                if !isComposeMode && message == nil {
+                if isInboxChat {
                     loadSessionHistory()
                 }
 
@@ -680,7 +683,7 @@ struct DynamicIslandChat: View {
                 // Double buffer: swap Buffer 2 → Buffer 1 on expand (instant, no flicker).
                 // Then pre-fetch a new Buffer 2 in the background for the next swap.
                 // Once shown, Buffer 1 is stable until the next expand.
-                if !isComposeMode && message == nil {
+                if isInboxChat {
                     expandedReminderHash = nil
                     if let buffered = nextReminders {
                         activeReminders = buffered
@@ -741,6 +744,10 @@ struct DynamicIslandChat: View {
         // the request. The field's words are not changed here: the request's own transitions
         // (card, answer, sent compose) land on the chat key it was sent under, in `ChatFieldWords`
         // (`SessionUISink`, `sendAgentChat`, `AgentToolRouter.enqueueComposeAndAwaitOutcome`).
+        // A new email's chat: a reopened draft's words are put in the field once, the field takes
+        // focus as the chat opens, and every change of the words goes to the draft.
+        .task(id: replyField?.newEmail?.sessionKey) { startNewEmail() }
+        .onChange(of: inputText) { _, words in replyField?.newEmail?.wordsChanged(words) }
         // The thread's chat, read as the pill appears and whenever it is about a newer email, so a
         // card raised in any key of the thread opens the sheet while collapsed (ADR-IOS-114).
         .task(id: message?.id) {
@@ -820,17 +827,17 @@ struct DynamicIslandChat: View {
             }
         }
         .task {
-            guard !isComposeMode && message == nil else { return }
+            guard isInboxChat else { return }
             await session.observeMessageReminders()
         }
         .onChange(of: PromptStore.shared.rawKB) { _, _ in
             // KB changed (user edit, Device Sync, agent tool) — triggers reminder regeneration
-            guard !isComposeMode && message == nil else { return }
+            guard isInboxChat else { return }
             regenerateReminders()
         }
         .onReceive(NotificationCenter.default.publisher(for: .remindersDidChange).receive(on: DispatchQueue.main)) { _ in
             // Reminder data changed (message count, dismiss/enable) — regenerate Buffer 2
-            guard !isComposeMode && message == nil else { return }
+            guard isInboxChat else { return }
             regenerateReminders()
         }
         .onChange(of: ActiveAgentTracker.shared.workingSessions) { _, sessions in
@@ -1243,7 +1250,7 @@ struct DynamicIslandChat: View {
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
                 // Indexing warning (agent search results may be incomplete)
-                if showIndexingWarning && isBackfillInProgress && !isComposeMode && message == nil {
+                if showIndexingWarning && isBackfillInProgress && isInboxChat {
                     HStack(spacing: 6) {
                         Image(systemName: "arrow.trianglehead.2.clockwise")
                             .font(.caption)
@@ -1259,7 +1266,7 @@ struct DynamicIslandChat: View {
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
                 // Reminder cards (inbox context, live or past sessions with snapshots)
-                if !reminders.isEmpty && !isComposeMode && message == nil {
+                if !reminders.isEmpty && isInboxChat {
                     VStack(alignment: .leading, spacing: 6) {
                         // Warning if proactive notifications won't actually fire — either
                         // disabled in-app or blocked at the iOS permission level.
@@ -1667,6 +1674,11 @@ struct DynamicIslandChat: View {
     /// the field, pulsing, while it works. The field empties when the reply goes out or the agent
     /// answers in the sheet; a closed compose card leaves the words.
     private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {
+        // A new email's chat decides what its Send does; the words stay until it acts on them.
+        if let newEmail = field.newEmail {
+            newEmail.send(text)
+            return
+        }
         isTextFieldFocused = false
         fieldFill.apply(.sentFromField)
         dictation.inputSent(inputText)
@@ -1679,6 +1691,16 @@ struct DynamicIslandChat: View {
             MessageChatCollapseTip.hasStartedMessageChat = true
             sendAgentChat(text, field: send)
         }
+    }
+
+    /// A new email's chat opening: its draft's words, once, then its reply field takes the
+    /// keyboard (`InputFocus.replyField`: the panel, which `isTextFieldFocused` focuses, never
+    /// opens in a new email's chat).
+    private func startNewEmail() {
+        guard let newEmail = replyField?.newEmail, !newEmailStarted else { return }
+        newEmailStarted = true
+        if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) }
+        focusedInput = .replyField
     }
 
     /// A dictation is recording, transcribing, or starting: its words are coming to the field.
@@ -2542,7 +2564,7 @@ struct DynamicIslandChat: View {
         // After this, the session page shows the snapshot; Buffer 1 is free for the __new__ page.
         // Also encode for persistence so past sessions show their reminders after restart.
         var remindersSnapshotJSON: String?
-        if !isComposeMode && message == nil, let sid = currentSessionId,
+        if isInboxChat, let sid = currentSessionId,
            sessionReminderSnapshots[sid] == nil {
             sessionReminderSnapshots[sid] = activeReminders
             remindersSnapshotJSON = ChatStore.encodeRemindersSnapshot(activeReminders)

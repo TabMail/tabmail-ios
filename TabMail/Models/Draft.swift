@@ -12,6 +12,7 @@ import GRDB
 /// - Reply: `"reply:{replyTo.id}"`
 /// - Forward: `"forward:{replyTo.id}"`
 /// - New compose: `"new:{uuid}"`
+/// - New email in the chat view: `"chat-new:{uuid}"` (`newEmailKey`)
 struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     static let databaseTableName = "draft"
 
@@ -233,6 +234,22 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// uuid names the parent as a reply key's does (`replyKeyTail`).
     static func separateReplyKey(replyTo parentKey: String) -> String {
         "\(separateReplyPrefix)\(UUID().uuidString):\(parentKey)"
+    }
+
+    /// The prefix of a new email started in the chat view (`newEmailKey`).
+    static let newEmailPrefix = "chat-new:"
+
+    /// A new email's key in the chat view: reopened with the chat view on, its draft opens in the
+    /// new email's chat rather than in compose (ADR-IOS-114). The key is local: it names the row
+    /// on this device and never reaches a provider or a wire header (the placeholder header's id
+    /// is made colon-safe from it, as from every key).
+    static func newEmailKey() -> String {
+        "\(newEmailPrefix)\(UUID().uuidString)"
+    }
+
+    /// Whether `draftKey` is a new email started in the chat view (`newEmailKey`).
+    static func isNewEmailKey(_ draftKey: String) -> Bool {
+        draftKey.hasPrefix(newEmailPrefix)
     }
 
     /// The `{accountId}:{stableId}` tail naming a reply's parent: after the prefix of

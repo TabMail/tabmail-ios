@@ -214,6 +214,67 @@ struct ComposeAttachmentCarryTests {
             "pending attachment work is an unsaved change and must prompt before dismissal")
     }
 
+    @Test("Explicit Save writes in order: read fail-closed, stage, save through the generation, clean up after commit, queue only when adopted")
+    func explicitSaveWriteOrder() throws {
+        let body = try functionBody(
+            "private func saveDraftAndDismiss() async {",
+            before: "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
+            in: composeSource())
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let writer = try String(
+            contentsOf: root.appendingPathComponent("TabMail/Views/Compose/ComposeDraftSave.swift"), encoding: .utf8)
+        let chat = try String(
+            contentsOf: root.appendingPathComponent("TabMail/Views/Chat/ChatNewThread.swift"), encoding: .utf8)
+        let writerSteps = [
+            "try Draft.fetchOne(db, key: draftId)",
+            "ComposeDraftGuards.saveMayMutate(",
+            "DraftAttachmentStorage.saveAttachments(attachments, dirName: staging)",
+            "ComposeDraftGuards.draftToSave(",
+            "saveResult = try await admit(draft)",
+            "saveApplied: saveResult == .applied",
+            "guard saveResult == .applied else {",
+            "return .committed(previousPushStatus:",
+        ]
+        let composeSteps = [
+            "await ComposeDraftSave.run(",
+            "admit: { draft in try await saveThroughGeneration(draft) })",
+            "case .committed(let previousPushStatus):",
+            "AccountManager.shared.queueDraftSave(",
+        ]
+        let chatSteps = [
+            "await ComposeDraftSave.run(",
+            "case .committed:",
+            "guard await queueDraftSave(draftId, accountId) else {",
+        ]
+        for (name, source, steps) in [("writer", writer[...], writerSteps), ("compose", body, composeSteps), ("chat", chat[...], chatSteps)] {
+            let found = steps.compactMap { source.range(of: $0)?.lowerBound }
+            #expect(found.count == steps.count, "every step of the \(name)'s save is present")
+            guard found.count == steps.count else { continue }
+            #expect(found == found.sorted(), "the \(name)'s steps run in this order")
+        }
+        #expect(!body.contains("DraftAttachmentStorage.saveAttachments"), "compose writes only through the shared writer")
+        #expect(!chat.contains("DraftAttachmentStorage.saveAttachments"), "the chat writes only through the shared writer")
+        // Every way Save can fail tells the user, and stops there; a refused queue admission keeps
+        // the compose open with its own message.
+        let flat = body.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let failures = [
+            "case .readFailed: sendError = \"Couldn't save this draft — the database was busy. Try again in a moment.\" return",
+            "case .attachmentsNotStaged(let reason): sendError = \"Failed to save attachments: \\(reason)\" return",
+            "case .saveFailed(let reason): sendError = \"Failed to save draft: \\(reason)\" return",
+            "case .superseded: sendError = \"Failed to save draft: \\(DraftStore.DraftEpochAdmissionError.staleOrReserved.localizedDescription)\" return",
+            "onAdmissionFailure: { sendError = \"This draft couldn't be saved to your Drafts folder. Your message is still here — tap Save to try again.\" })",
+        ]
+        for failure in failures {
+            #expect(flat.contains(failure), "compose's Save keeps this failure's message and stop: \(failure)")
+        }
+        // A save the queue admitted closes compose: the push, then the real dismissal, and the
+        // refusal's message otherwise (`ComposeDraftGuards.runCheckedDurableSaveThenDismiss`, whose
+        // own tests drive both arms).
+        #expect(flat.contains("await ComposeDraftGuards.runCheckedDurableSaveThenDismiss( save: { await AccountManager.shared.queueDraftSave( draftId: draftId, accountId: account.id) }, dismiss: { dismiss() }, onAdmissionFailure: {"),
+                "compose's Save pushes, then dismisses compose itself")
+    }
+
     @Test("Photos-picker work joins the same attachment completion boundary")
     func photoPickerPreparationCannotBeSnapshottedMidImport() throws {
         let body = try functionBody(
@@ -227,6 +288,24 @@ struct ComposeAttachmentCarryTests {
                 "every selected item must be counted before its async load and settled afterward")
         #expect(!body.contains("try? await item.loadTransferable"),
                 "a selected attachment that fails to load must be surfaced, not silently omitted")
+        let publish = try #require(body.range(of: "publishAttachmentPreparationFailuresIfSettled()"))
+        #expect(complete.lowerBound < publish.lowerBound, "failures are published once the item settles")
+        let cleared = try #require(body.range(of: "photoPickerItems = []"))
+        #expect(publish.lowerBound < cleared.lowerBound, "the picker's selection clears after every item settled")
+        #expect(body.contains("recordAttachmentPreparationFailure"), "a failed item is surfaced as compose's preparation failure")
+        #expect(body.contains("item.supportedContentTypes.first"), "a picked item is typed by its first content type")
+        #expect(body.contains("await DraftAttachmentImport.loadPicked("), "compose loads picked items through the loader the chat shares")
+        // What the loader gives compose lands in compose's own list, named by what is there.
+        #expect(body.contains("existingCount: { attachments.count },"), "a picked item is named by the attachments already there")
+        #expect(body.contains("add: { attachments.append($0) },"), "every item that loads is added to the compose")
+        #expect(body.contains("fail: { recordAttachmentPreparationFailure($0) },"), "every item that does not load is surfaced")
+        #expect(body.contains("attachmentCarryGate.completeOne(succeeded: succeeded)"),
+                "each item settles the gate with its own result, so a failed pick holds Save until it is seen")
+        // The whole closure, so nothing wraps the call: a failed item that skipped it would leave
+        // the gate waiting for it forever, and Save with it.
+        let flat = body.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        #expect(flat.contains("settled: { succeeded in attachmentCarryGate.completeOne(succeeded: succeeded) publishAttachmentPreparationFailuresIfSettled() })"),
+                "every item settles the gate, failed or not, then failures are published")
     }
 
     @Test("File and camera attachment preparation failures are surfaced")

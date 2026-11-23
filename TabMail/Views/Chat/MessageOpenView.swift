@@ -63,7 +63,7 @@ struct MessageOpenView: View {
     var body: some View {
         switch route(pool: AppDatabase.dbPool) {
         case .draftEditor(let header):
-            DraftComposePresenter(source: .header(header))
+            DraftComposePresenter(source: .header(header), presentedAsCover: false)
         case .chat:
             chat
         case .detail:
