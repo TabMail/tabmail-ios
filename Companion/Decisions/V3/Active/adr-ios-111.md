@@ -1545,14 +1545,28 @@ pass's history read reports every label.
    through the provider's change reader with the new scope `ChangeScope.otherFolders` (every folder of the
    request is read: `ChangeFolder.isSynced` true), for at most half the slice (`otherFolderReadShare`), and
    applies the answer with the passes' one generic apply (`applyChangeSet`). Readers read the request's
-   folders in its order and report a folder they did not reach as `.notRun`, which stays pending.
+   folders in its order and report a folder they did not reach as `.notRun`, which stays pending. A folder
+   whose read was started and cut by the slice's time is kept apart from one not reached (#1358): the IMAP
+   reader, which always sends a run's folder its STATUS (or SELECT) first, reports it `.notRun` with
+   `FolderChanges.readCut`; the engine also counts as cut an Outlook baseline that neither moved nor failed
+   and an untracked folder whose listing could not start. A cut folder stays pending while the slice moved
+   or failed another folder (the next slice reads it first); a slice that did nothing else counts it as
+   tried (`inFlightFolderIds`: left out of the rest of the run, behind the others in the next run's order),
+   so the run goes on to the next folders. Before this, on a slow link a changed first folder's STATUS could
+   use the whole read share every run: no slice moved, the run ended, and the folders after it were never
+   read while the link stayed slow.
    - IMAP with QRESYNC or CONDSTORE: each folder's own bookmark (`Folder.changeCursor`). A first read stores
      it (`.baselineReady`) and arms the folder's catch-up check (decision 5).
    - IMAP with no change tracking: each folder's STATUS. A folder whose counters moved is listed
      (`refreshUntrackedFolder`, `otherFolderSlice:`) only while the slice has time to start a listing
-     (`.listingNotStarted` otherwise: a later slice of the run lists it). A listing once started (the
-     50-message window a pass lists) runs to completion, so a slice can end later than its time by that
-     listing, as an older-mail slice ends after the request it started. The listing runs no deletion check:
+     (`.listingNotStarted` otherwise: a later slice of the run lists it). The listing (the 50-message window
+     a pass lists) is bounded as a request of the older-mail check is (`ListingRequestBound`, decided
+     2026-11-23): each of its requests (the epoch check's FETCH, the listing's read) starts only while the
+     slice has time and gets `SyncConfig.catchUpRequestTimeoutSeconds`, so a slice holds the turn at most to
+     its end plus one request, as an older-mail slice does. A listing cut or given up writes nothing: it is
+     unproven, the folder's counters stay as they were, and a later run lists it. *Superseded (2026-11-23):*
+     "A listing once started runs to completion, so a slice can end later than its time by that listing"
+     (the listing's connection, SELECT and FETCH had no bound of their own). The listing runs no deletion check:
      its walk can take longer than a slice, and the weekly whole-folder check (decision 5) removes what it
      would. A due mark (`FolderChangeState.listingDue`) alone lists nothing in a run and is left as it is.
      *Superseded (2026-11-23):* "the listing's deletion check is bounded by the slice"; "a check cut by a
@@ -1569,7 +1583,9 @@ pass's history read reports every label.
    account's full sync due; it arms the catch-up check as always. That includes a bookmark dropped because a
    read took the folder's re-read list over `changeRecheckLimit`.
 4. **The end rule.** A run ends at the first of: every other folder read once in it (a folder whose baseline
-   a slice's end cut stays pending); a slice that reads nothing new and leaves no new folder out; its
+   a slice's end cut stays pending while the slice moved another); a slice that reads nothing new and leaves
+   no new folder out (a slice whose only work was a folder its time cut leaves that folder out, decision 2,
+   so a cut first folder never ends the run; a reader that reads nothing, Gmail's, still ends it at once); its
    working time spent (`SyncConfig.otherFolderRunSeconds`, 120 s, slice time only: the waits for the turn,
    the slot and the pacing window do not count, as for the access run of #1109); the account removed
    (`remove(accountId:)` cancels and awaits it). A folder the run did not finish is read first by the next.
@@ -1607,6 +1623,11 @@ Limits:
   check, or at once when the user opens the folder (which then follows it, #1109).
 - A folder whose read keeps failing is left out for the rest of its run and goes behind the others in the
   next.
+- A new-mail follow-up asked for during a slice takes the account's turn in the order the turn's line keeps
+  (first come, first served): it waits for the slice holding the turn plus the slices of the other runs
+  already waiting for it (the older-mail worker, an access run, the other-folder run: at most one each), each
+  at most about 5 s. ios#1360 makes the turn hand the follow-up ahead of them; this change leaves the
+  hand-over as it is (decided 2026-11-23).
 
 Tests: `OtherFolderRunTests` (`OtherFolderRuleTests`: the weekly and daily check, the order, Outlook's
 folders, Gmail's empty read, the dropped bookmark; `OtherFolderIMAPTests`, against `FakeIMAPServer` with and
@@ -1614,8 +1635,12 @@ without QRESYNC: rule-filed mail arrives after a clock-due pass, the passes send
 folders, a listing-only full sync starts no run, the account's clocks and the folders' coverage stay as they
 were, a quiet folder costs one STATUS, a trigger during a slice gets its stage 2 before the run's next slice,
 waiting is not working time, a folder not reached is read first next run, a listing starts only within the
-slice, a failed folder is left out of the run, a run's listing runs no deletion check;
-`OtherFolderRuleTests.outlookRunKeepsTheEnginesOrder`; `OtherFolderOutlookTests`: baseline, then new,
+slice, a failed folder is left out of the run, a run's listing runs no deletion check, a cut first folder
+does not stop the run (#1358, both modes, run after run), a run's listing is bounded as an older-mail request,
+an other folder's whole-folder check is weekly end to end;
+`OtherFolderRuleTests.outlookRunKeepsTheEnginesOrder`, `OtherFolderRuleTests.listingRequestBound`;
+`OtherFolderSliceRuleTests`: what a slice reports for cut, not reached, moved and failed folders, the
+account parts it ignores, a reader that throws or none; `OtherFolderOutlookTests`: baseline, then new,
 deleted and read changes), `ReleaseBoundaryRecheckTests.applyOverflowIsCutInEveryFolder`, and
 `ChangeSeamFenceTests.otherFolderRunIsProviderBlindAndUngated`. *Superseded (2026-11-23):* "a run starts
 and takes each slice only in the foreground".
@@ -1624,4 +1649,5 @@ Keywords: other folder, other-folder run, startOtherFolderRun, readOtherFolders,
 otherFolderReadOrder, otherFolderAttemptedAt, otherFolderRunSeconds, otherFolderReadShare, ChangeScope
 otherFolders, catchUpOtherFolderFullCheckIntervalSeconds, otherFolderIds, catchUpFolderIds,
 listingNotStarted, listedByFullSync, changeRecheckLimit, later wakes, rule-filed mail, folder outside the
-syncable set, 15-minute clock, clockDue, #1110.
+syncable set, 15-minute clock, clockDue, readCut, cut folder, tried, slow link, ListingRequestBound,
+listing bound, catchUpRequestTimeoutSeconds, #1110, #1358.

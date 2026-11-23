@@ -286,13 +286,18 @@ extension SyncEngine {
     /// `SyncEngine.resetEmptyFolderCrawlEpoch` can clear the column back to nil, but
     /// only for a ZERO-HEADER folder, which step 1 also returns on (the blind
     /// bootstrap path owns it).
+    ///
+    /// `bound`: the request bound of a listing in an other-folder run's slice
+    /// (#1110, `ListingRequestBound`); the sample FETCH is one of its requests,
+    /// and a FETCH it cuts or times out is a failure like any other.
     @discardableResult
     nonisolated static func verifyAndBootstrapPrePopulatedFolderEpoch(
         folderId: String,
         folderPath: String,
         accountId: String,
         provider: any EmailProvider,
-        dbPool: PrioritizedDatabase
+        dbPool: PrioritizedDatabase,
+        bound: ListingRequestBound? = nil
     ) async -> EpochVerificationOutcome {
         // ── Step 1: cheap early-out + sample, in ONE read.
         let sampled: [EpochVerificationSample]
@@ -343,8 +348,15 @@ extension SyncEngine {
         // ── Step 2: the sample FETCH (network).
         let fetched: (messages: [MessageHeaderInfo], observedEpoch: UInt32?)
         do {
-            fetched = try await provider.sampleHeadersForEpochVerification(
-                folder: folderPath, uids: sampled.map(\.uid))
+            let uids = sampled.map(\.uid)
+            let sample: @Sendable () async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?) = {
+                try await provider.sampleHeadersForEpochVerification(folder: folderPath, uids: uids)
+            }
+            if let bound {
+                fetched = try await bound.request(sample)
+            } else {
+                fetched = try await sample()
+            }
         } catch {
             // A network/protocol failure is not evidence of anything. Do nothing.
             if DebugModeManager.isLoggingEnabled() {

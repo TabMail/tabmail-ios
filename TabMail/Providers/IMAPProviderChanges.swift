@@ -55,7 +55,8 @@ import SwiftMail
 // (`.failed`, bookmark kept, no failure time); a budget run out leaves them `.notRun`.
 // A slice of an other-folder run (`ChangeScope.otherFolders`, #1110) reads the
 // request's folders in its order, the same way, and reports a folder it did not
-// reach `.notRun` whatever stopped it.
+// reach `.notRun` whatever stopped it, and a folder whose read it started and the
+// slice's time cut `.notRun` with `FolderChanges.readCut` (#1358).
 
 /// IMAP's opaque per-folder change bookmark, stored as JSON in
 /// `Folder.changeCursor`. Three server-assigned integers about the mailbox
@@ -229,8 +230,13 @@ extension IMAPProvider {
                             if changeReadLast == folder.id { changeReadLast = nil }
                         }
                         do {
-                            results[folder.id] = try await self.readChangeFolder(
+                            var read = try await self.readChangeFolder(
                                 folder, server: server, mode: mode, request: request)
+                            // A run's folder is always sent its STATUS (or SELECT)
+                            // first: one that comes back not run was cut by the
+                            // slice's time, not left unreached (#1358).
+                            if request.scope == .otherFolders, case .notRun = read.status { read.readCut = true }
+                            results[folder.id] = read
                             if folder.role == .inbox { changeInboxTimeouts = 0 }
                         } catch {
                             // The folder's read failed, whatever the cause: it keeps its

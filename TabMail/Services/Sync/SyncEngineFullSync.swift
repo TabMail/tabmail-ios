@@ -691,9 +691,12 @@ extension SyncEngine {
     /// whose listings return no counters (a date-window provider's) has no such
     /// counters to skip on and no count check to clear the debt, so it owes none. It counts against a pass's full-sync stamp only for
     /// the pass that ran it (`pass`); an on-demand listing (nil) belongs to no
-    /// pass and never withholds a scheduled pass's stamp.
-    func listFolder(_ folder: Folder, provider: any EmailProvider, limit: Int, pass: UUID? = nil) async -> ListingOutcome {
-        let outcome = await Self.runListing(for: folder, provider: provider, limit: limit, dbPool: dbPool)
+    /// pass and never withholds a scheduled pass's stamp. `bound`: an
+    /// other-folder run's listing (#1110, `ListingRequestBound`).
+    func listFolder(
+        _ folder: Folder, provider: any EmailProvider, limit: Int, pass: UUID? = nil, bound: ListingRequestBound? = nil
+    ) async -> ListingOutcome {
+        let outcome = await Self.runListing(for: folder, provider: provider, limit: limit, dbPool: dbPool, bound: bound)
         if case .unproven = outcome {
             if let pass { unprovenListingPasses.insert(pass) }
             Self.oweDeepListing(folderId: folder.id)
@@ -1348,11 +1351,16 @@ extension SyncEngine {
     /// DB write transaction. No MainActor state accessed.
     /// PRIVATE: only the one classifier (`runListing`) calls it, so no route can
     /// publish a listing's rows or counters without its `ListingOutcome`.
+    /// `bound`: the request bound of a listing in an other-folder run's slice
+    /// (#1110, `ListingRequestBound`): the epoch check's FETCH and the listing's
+    /// own read each start only while the slice has time and get its request
+    /// limit. A cut or timed-out read throws, before anything is written.
     private nonisolated static func runSyncMessages(
         for folder: Folder,
         provider: any EmailProvider,
         limit: Int,
-        dbPool: PrioritizedDatabase
+        dbPool: PrioritizedDatabase,
+        bound: ListingRequestBound? = nil
     ) async throws -> SyncMessagesResult {
         // T1.2b — SELECT-sourced epoch capture, BOUND to this pass's own fetch.
         // `fetchMessagesWithObservedEpoch` SELECTs the folder
@@ -1407,10 +1415,18 @@ extension SyncEngine {
         // this listing waited) is not read from the server at all.
         let verification = await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
             folderId: folder.id, folderPath: folder.path, accountId: folder.accountId,
-            provider: provider, dbPool: dbPool)
+            provider: provider, dbPool: dbPool, bound: bound)
         if verification == .folderGone { throw FolderGoneBeforeListing() }
-        let fetched = try await provider.fetchMessagesWithObservedEpoch(
-            folder: folder.path, limit: limit, offset: 0)
+        let path = folder.path
+        let read: @Sendable () async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) = {
+            try await provider.fetchMessagesWithObservedEpoch(folder: path, limit: limit, offset: 0)
+        }
+        let fetched: (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage)
+        if let bound {
+            fetched = try await bound.request(read)
+        } else {
+            fetched = try await read()
+        }
         let messages = fetched.messages
         // COVERAGE — what the SERVER said about the window, bound to this fetch and
         // computed before any client-side narrowing. Every "did we see the whole
@@ -2728,10 +2744,11 @@ extension SyncEngine {
     /// The one classifier of a folder listing. Never throws: a cancelled pass
     /// reads as unproven here and the caller checks cancellation itself.
     nonisolated static func runListing(
-        for folder: Folder, provider: any EmailProvider, limit: Int, dbPool: PrioritizedDatabase
+        for folder: Folder, provider: any EmailProvider, limit: Int, dbPool: PrioritizedDatabase,
+        bound: ListingRequestBound? = nil
     ) async -> ListingOutcome {
         do {
-            let result = try await runSyncMessages(for: folder, provider: provider, limit: limit, dbPool: dbPool)
+            let result = try await runSyncMessages(for: folder, provider: provider, limit: limit, dbPool: dbPool, bound: bound)
             if result.proven { return .proven(result) }
             return result.notListable ? .notListable(result) : .unproven(result, connectionLost: false, error: nil)
         } catch is FolderGoneBeforeListing {

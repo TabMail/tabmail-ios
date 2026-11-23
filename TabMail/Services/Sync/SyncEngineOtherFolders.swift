@@ -14,7 +14,10 @@ import GRDB
 // beside the older-mail worker. The run is a catch-up run
 // (`CatchUpRun.readsOtherFolders`, `runCatchUpRun`): each slice takes the
 // account's turn, a `.headerFetch` slot and at most one slice of work, hands the
-// turn on and waits outside it, so a new-mail read waits at most one slice. No
+// turn on and waits outside it, so a new-mail read waits at most one slice: its
+// change read stops at its share of the slice, and its listings are bounded as
+// the older-mail check's requests are (none starts after the slice's end, each
+// gets `SyncConfig.catchUpRequestTimeoutSeconds`, `ListingRequestBound`). No
 // timer, scheduler, queue, gate or turn of its own. The passes (poll, IDLE, push,
 // pull, return) are unchanged.
 //
@@ -27,7 +30,9 @@ import GRDB
 //
 // End rule of a run, whichever comes first: every other folder has been read
 // once in it (a folder whose first read is still going, an Outlook baseline cut
-// by the slice's end, stays pending), a slice reads nothing new, its working time
+// by the slice's end, stays pending), a slice reads nothing new (a slice whose
+// only work was a folder its time cut counts that folder as tried and goes on,
+// #1358), its working time
 // (`SyncConfig.otherFolderRunSeconds`, slice time only) is spent, or the account
 // is removed. A folder the run did not finish is read in the next run. A run
 // under way when the app leaves the screen goes on in the app's later wakes, as
@@ -84,18 +89,24 @@ extension SyncEngine {
     /// folders now), in that order, for its share of the slice
     /// (`SyncConfig.otherFolderReadShare`), then the passes' apply, then the
     /// listing of each changed folder no bookmark covers while the slice
-    /// (`context.deadline`) has time to start one. A changed folder not listed
-    /// stays pending: a later slice of the run reads it again, and each slice
-    /// lists the first changed folder it reads.
+    /// (`context.deadline`) has time to start one, each of its requests bounded
+    /// as an older-mail request is (`ListingRequestBound`: none starts after
+    /// the slice's end, each gets `context.requestTimeoutSeconds`). A changed
+    /// folder not listed stays pending: a later slice of the run reads it
+    /// again, and each slice lists the first changed folder it reads.
     ///
     /// The result, by folder: read once (`finishedFolderIds`, also progressed):
     /// a read with a bookmark, a first or refused bookmark, an untracked folder
     /// unchanged, listed, or whose listing proved nothing (listed again next
     /// run). Progressed and still pending: a baseline that moved. Failed
     /// (`inFlightFolderIds`, left out of the rest of the run): a read or a
-    /// listing that failed. Pending with nothing: not reached, or changed with
-    /// no time left to start its listing. A read that throws, or a provider
-    /// with no change reader, reads nothing new, and the run ends.
+    /// listing that failed. Pending with nothing: not reached. Cut by the
+    /// slice's time (a read the reader started, `FolderChanges.readCut`; a
+    /// baseline that neither moved nor failed; changed with no time left to
+    /// start its listing): pending while the slice moved or failed another
+    /// folder, else tried (`inFlightFolderIds`), so the run goes on (#1358). A
+    /// read that throws, or a provider with no change reader, reads nothing new,
+    /// and the run ends.
     func readOtherFolders(
         account: Account, provider: any EmailProvider, folderIds: [String], context: CatchUpContext
     ) async -> CatchUpSliceResult {
@@ -154,15 +165,22 @@ extension SyncEngine {
             return slice
         }
 
+        // Folders whose read or listing the slice's time cut (#1358).
+        var cut: Set<String> = []
         for changes in changeSet.folders {
             let folderId = changes.folderId
             switch changes.status {
             case .notRun:
-                continue
+                if changes.readCut { cut.insert(folderId) }
             case .failed:
                 slice.inFlightFolderIds.insert(folderId)
             case .baselining:
-                if changes.cursor != nil || !changes.records.isEmpty { slice.progressedFolderIds.insert(folderId) }
+                // A baseline read that neither moved nor failed was cut.
+                if changes.cursor != nil || !changes.records.isEmpty {
+                    slice.progressedFolderIds.insert(folderId)
+                } else {
+                    cut.insert(folderId)
+                }
             case .tracked, .baselineReady, .refused:
                 slice.finishedFolderIds.insert(folderId)
             case .untracked(let observation):
@@ -170,8 +188,8 @@ extension SyncEngine {
                     let refresh = try await refreshUntrackedFolder(
                         folderId: folderId, observation: observation, account: account, provider: provider,
                         deadline: Date().addingTimeInterval(sliceContext.secondsLeft), pass: nil,
-                        otherFolderSlice: sliceContext)
-                    if refresh != .listingNotStarted { slice.finishedFolderIds.insert(folderId) }
+                        otherFolderSlice: ListingRequestBound(slice: sliceContext, timeoutSeconds: context.requestTimeoutSeconds))
+                    if refresh == .listingNotStarted { cut.insert(folderId) } else { slice.finishedFolderIds.insert(folderId) }
                 } catch {
                     BackgroundSyncLogger.logDebug("[OtherFolders] \(accountId.prefix(8)): listing of \(folderId.suffix(12)) failed: \(error)")
                     slice.inFlightFolderIds.insert(folderId)
@@ -179,10 +197,16 @@ extension SyncEngine {
             }
         }
         slice.progressedFolderIds.formUnion(slice.finishedFolderIds)
+        // A cut folder stays pending while the slice moved or failed another:
+        // the next slice reads it first. A slice that did nothing else counts
+        // it as tried, left out of the rest of the run like a failed read, so
+        // the run goes on to the next folders and the next run reads it again:
+        // a cut first folder never stops the run (#1358).
+        if !slice.progressed, slice.inFlightFolderIds.isEmpty { slice.inFlightFolderIds = cut }
         stampOtherFolderAttempts(accountId: accountId, folderIds: slice.finishedFolderIds.union(slice.inFlightFolderIds))
         BackgroundSyncLogger.logDebug(
             "[OtherFolders] \(accountId.prefix(8)): slice asked \(folders.count), finished \(slice.finishedFolderIds.count), "
-            + "moved \(slice.progressedFolderIds.count - slice.finishedFolderIds.count), failed \(slice.inFlightFolderIds.count)")
+            + "moved \(slice.progressedFolderIds.count - slice.finishedFolderIds.count), failed or tried \(slice.inFlightFolderIds.count), cut \(cut.count)")
         return slice
     }
 

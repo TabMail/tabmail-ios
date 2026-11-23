@@ -126,6 +126,45 @@ struct OtherFolderRuleTests {
         }
     }
 
+    /// What one request under `bound` came to.
+    static func outcome(_ bound: ListingRequestBound, _ operation: @escaping @Sendable () async throws -> Int) async -> String {
+        do {
+            let value = try await bound.request(operation)
+            return "answered \(value)"
+        } catch is ListingRequestBound.Cut {
+            return "cut"
+        } catch is TimeoutError {
+            return "timed out"
+        } catch {
+            return "failed: \(error)"
+        }
+    }
+
+    @Test("A run's listing request starts only while the slice has time, and is given up at its request limit")
+    func listingRequestBound() async {
+        let started = OtherFolderShared<Bool>(false)
+        let over = ListingRequestBound(
+            slice: ChangeContext(deadline: Date().addingTimeInterval(-1), clock: { Date() }, onProgress: { _ in }),
+            timeoutSeconds: 60)
+        let afterTheEnd = await Self.outcome(over) {
+            started.set(true)
+            return 1
+        }
+        #expect(afterTheEnd == "cut", "a request after the slice's end is not started")
+        #expect(!started.get, "and nothing of it ran")
+
+        let open = ListingRequestBound(
+            slice: ChangeContext(deadline: Date().addingTimeInterval(60), clock: { Date() }, onProgress: { _ in }),
+            timeoutSeconds: 0.2)
+        let answered = await Self.outcome(open) { 7 }
+        let stalled = await Self.outcome(open) {
+            try await Task.sleep(for: .seconds(30))
+            return 0
+        }
+        #expect(answered == "answered 7", "a request within the slice is sent and answered")
+        #expect(stalled == "timed out", "a request with no answer is given up at its limit")
+    }
+
     @Test("A dropped bookmark of an other folder arms its catch-up check and leaves the account's full sync as it was; a syncable folder's makes the full sync due")
     func droppedBookmarkOfAnOtherFolder() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -676,8 +715,11 @@ struct OtherFolderIMAPTests {
                 }) ?? 0
                 rowAtLaterSlices.set(rowAtLaterSlices.get + [count == 1])
             }
+            // A failure path disarms the slice hook first, so no later slice
+            // holds a read nobody releases.
             func stop(_ reason: Comment) async {
                 Issue.record(reason)
+                await w.watchSlices()
                 w.releaseStatus(of: first.get)
                 await w.settle()
             }
@@ -696,6 +738,7 @@ struct OtherFolderIMAPTests {
             do {
                 trigger = try await engine.syncOrFollowUp(account: account, deadline: nil)
             } catch {
+                await w.watchSlices()
                 w.releaseStatus(of: first.get)
                 await w.settle()
                 throw error
@@ -786,6 +829,7 @@ struct OtherFolderIMAPTests {
             await w.engine.startOtherFolderRun(account: account)
             guard await OneSyncAtATimeTests.eventually({ w.isHoldingStatus(of: first.get) }) else {
                 Issue.record("precondition: the run's first slice is held at its first folder's read")
+                await w.watchSlices()
                 w.releaseStatus(of: first.get)
                 await w.settle()
                 return
@@ -831,12 +875,14 @@ struct OtherFolderIMAPTests {
             await w.engine.startOtherFolderRun(account: account)
             guard await OneSyncAtATimeTests.eventually({ holdingListing() }) else {
                 Issue.record("precondition: the first changed folder's listing is held at the server")
+                await w.watchSlices()
                 if let path = first.get { server.releaseFetchAfterSnapshot(in: path) }
                 await w.settle()
                 return
             }
             guard let firstPath = first.get else {
                 Issue.record("precondition: the first slice named its first folder")
+                await w.watchSlices()
                 await w.settle()
                 return
             }
@@ -861,6 +907,185 @@ struct OtherFolderIMAPTests {
                 let arrived = try w.holds(uid, in: path)
                 #expect(arrived, "\(path): its new message arrived")
             }
+        }
+    }
+
+    // MARK: Progress on a slow link (#1358)
+
+    /// Runs in a row whose first folder's read the slice's time cuts.
+    static let cutRuns = 2
+
+    @Test("A run whose first folder's read the slice's time cuts counts that folder as tried and reads the next folders, run after run; a later run reads the cut folder first and brings its mail",
+          arguments: Server.allCases)
+    func aCutFolderDoesNotStopTheRun(server kind: Server) async throws {
+        try await Self.withWorld("cut", kind) { w in
+            if kind == .qresync {
+                // Each folder's bookmark first, as in `ruleFiledMailArrives`, so
+                // every read below is a read from a bookmark.
+                try await w.runOnce()
+                try await w.drainCatchUp()
+            }
+            var cutPath: String?
+            var cutUids: [Int] = []
+            for runNumber in 1...Self.cutRuns {
+                w.recorder.reset()
+                let uids = Self.others.map { w.nextUid(in: $0) }
+                for (path, uid) in zip(Self.others, uids) { w.deliver(uid, to: path) }
+                // The run's first slice: its first folder's read is held.
+                let first = OtherFolderShared<String?>(nil)
+                await w.watchSlices { folderIds in
+                    guard first.get == nil, folderIds.count == Self.others.count else { return }
+                    let path = w.path(ofId: folderIds[0])
+                    first.set(path)
+                    w.holdStatus(of: path)
+                }
+                let account = try w.account()
+                await w.engine.startOtherFolderRun(account: account)
+                guard await OneSyncAtATimeTests.eventually({ w.isHoldingStatus(of: first.get) }) else {
+                    Issue.record("run \(runNumber): precondition: the run's first slice holds its first folder's read")
+                    await w.watchSlices()
+                    w.releaseStatus(of: first.get)
+                    await w.settle()
+                    return
+                }
+                // The slice's time runs out while that read is held.
+                w.offset.add(SyncConfig.catchUpSliceSeconds + 1)
+                w.releaseStatus(of: first.get)
+                await w.settle()
+                await w.watchSlices()
+
+                let held = try #require(first.get)
+                let otherPath = Self.others.first { $0 != held }
+                let other = try #require(otherPath)
+                if let cutPath {
+                    #expect(held == cutPath, "run \(runNumber): the folder cut last run is read first again")
+                }
+                cutPath = held
+                let heldUid = uids[Self.others.firstIndex(of: held) ?? 0]
+                let otherUid = uids[Self.others.firstIndex(of: other) ?? 0]
+                cutUids.append(heldUid)
+                let otherArrived = try w.holds(otherUid, in: other)
+                let heldArrived = try w.holds(heldUid, in: held)
+                let asked = w.runSlices.map(\.folderIds)
+                let expected = [[w.id(held), w.id(other)], [w.id(other)]]
+                #expect(otherArrived, "run \(runNumber): the run went on past the cut folder and brought \(other)'s new mail")
+                #expect(!heldArrived, "run \(runNumber): precondition: the cut folder's read brought nothing")
+                #expect(asked == expected,
+                        "run \(runNumber): a slice for both folders, then one for the folder after the cut one: \(asked)")
+            }
+
+            // The next run, on a link that answers: the cut folder first, and its mail arrives.
+            let cut = try #require(cutPath)
+            w.recorder.reset()
+            try await w.runOnce()
+            let firstAsked = w.runSlices.first?.folderIds.first
+            let cutId = w.id(cut)
+            #expect(firstAsked == cutId, "the next run reads the folder cut in every earlier run first")
+            for uid in cutUids {
+                let arrived = try w.holds(uid, in: cut)
+                #expect(arrived, "\(cut): its message \(uid) arrived")
+            }
+        }
+    }
+
+    // MARK: The listing's bound (sync timing promise 1)
+
+    /// The request limit a test gives a run's listing, so a held listing is
+    /// given up without seconds of waiting.
+    static let shortRequestSeconds: TimeInterval = 0.5
+
+    @Test("With no change tracking, a run's listing is bounded as an older-mail request: one the server does not answer is given up at the request limit, the run ends without its answer and still lists the other folder, and a later run lists the folder")
+    func aRunsListingIsBoundedLikeAnOlderMailRequest() async throws {
+        try await Self.withWorld("listing-bound", .plain) { w in
+            let server = w.server
+            let uids = Self.others.map { w.nextUid(in: $0) }
+            for (path, uid) in zip(Self.others, uids) { w.deliver(uid, to: path) }
+            let first = OtherFolderShared<String?>(nil)
+            await w.watchSlices { folderIds in
+                guard first.get == nil, folderIds.count == Self.others.count else { return }
+                let path = w.path(ofId: folderIds[0])
+                first.set(path)
+                server.holdNextFetchAfterSnapshot(in: path)
+            }
+            var run = SyncEngine.CatchUpRun(
+                storageLimitInForce: false, deadline: nil, sliceSeconds: SyncConfig.catchUpSliceSeconds,
+                intervalSeconds: 0, clock: { Date() })
+            run.workSeconds = SyncConfig.otherFolderRunSeconds
+            run.readsOtherFolders = true
+            run.requestTimeoutSeconds = Self.shortRequestSeconds
+            let theRun = run
+            let account = try w.account()
+            let engine = w.engine
+            let ended = OtherFolderShared<Bool>(false)
+            let runTask = Task {
+                _ = await engine.runCatchUpRun(account: account, run: theRun)
+                ended.set(true)
+            }
+            func releaseAndEnd() async {
+                await w.watchSlices()
+                if let path = first.get { server.releaseFetchAfterSnapshot(in: path) }
+                await runTask.value
+            }
+            func holdingListing() -> Bool {
+                guard let path = first.get else { return false }
+                return server.isHoldingFetchAfterSnapshot(in: path)
+            }
+            guard await OneSyncAtATimeTests.eventually({ holdingListing() }) else {
+                Issue.record("precondition: the first changed folder's listing is held at the server")
+                return await releaseAndEnd()
+            }
+            let endedWhileHeld = await OneSyncAtATimeTests.eventually { ended.get }
+            #expect(endedWhileHeld, "the run ended while the listing's answer was still held: the listing did not hold the turn")
+            await releaseAndEnd()
+
+            let held = try #require(first.get)
+            let otherPath = Self.others.first { $0 != held }
+            let other = try #require(otherPath)
+            let heldUid = uids[Self.others.firstIndex(of: held) ?? 0]
+            let otherUid = uids[Self.others.firstIndex(of: other) ?? 0]
+            let heldArrived = try w.holds(heldUid, in: held)
+            let otherArrived = try w.holds(otherUid, in: other)
+            let counters = try w.folder(held).lastKnownUidNext
+            #expect(!heldArrived, "the listing given up wrote nothing")
+            #expect(counters == Self.held.count + 1, "and \(held)'s counters stay as they were, so it stays changed")
+            #expect(otherArrived, "the run still listed \(other), and its new mail arrived")
+
+            try await w.runOnce()
+            let arrivedLater = try w.holds(heldUid, in: held)
+            #expect(arrivedLater, "the next run listed \(held), and its new mail arrived")
+        }
+    }
+
+    // MARK: The weekly whole-folder check, end to end
+
+    @Test("With no change tracking, the older-mail check removes a message gone from a syncable folder a day after the folder's last check, and one gone from an other folder only a week after")
+    func otherFolderWholeCheckIsWeeklyEndToEnd() async throws {
+        try await Self.withWorld("weekly", .plain) { w in
+            let gone = Self.held[2]
+            for path in ["INBOX", Self.alpha] {
+                w.server.setMessages(w.server.messages(in: path).filter { $0.uid != gone }, in: path)
+            }
+            let accountId = w.accountId
+            let epoch = UInt32(Self.epoch)
+            func lastCheck(daysAgo days: Double, _ paths: [String]) async throws {
+                let state = IMAPCatchUpState(epoch: epoch, lastCompletedAt: Date().addingTimeInterval(-days * 86_400)).encoded()
+                try await w.pool.write { db in
+                    for path in paths {
+                        try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [state, "\(accountId):\(path)"])
+                    }
+                }
+            }
+            try await lastCheck(daysAgo: 2, ["INBOX", Self.alpha])
+            try await w.drainCatchUp()
+            let inboxKept = try w.holds(gone, in: "INBOX")
+            let alphaKeptAfterADay = try w.holds(gone, in: Self.alpha)
+            #expect(!inboxKept, "the Inbox's check, due a day after its last, removed the message gone from it")
+            #expect(alphaKeptAfterADay, "Alpha's check is not due before a week: its row stays")
+
+            try await lastCheck(daysAgo: 8, [Self.alpha])
+            try await w.drainCatchUp()
+            let alphaKeptAfterAWeek = try w.holds(gone, in: Self.alpha)
+            #expect(!alphaKeptAfterAWeek, "a week after Alpha's last check, its check removed the message gone from it")
         }
     }
 }
@@ -947,6 +1172,173 @@ struct OtherFolderOutlookTests {
             #expect(after.lastFullSyncAt == before.lastFullSyncAt, "the full sync's clock is untouched")
             #expect(after.lastHistoryId == before.lastHistoryId, "the account's bookmark is untouched")
             #expect(!covered && !folder.isFollowed, "the folder's coverage stays off, and it is not followed")
+        }
+    }
+}
+
+// MARK: - What a slice reports
+
+/// What one slice of an other-folder run reports (#1110, #1358), with a
+/// scripted reader. A folder whose read the reader started and the slice's
+/// time cut (`FolderChanges.readCut`), or a baseline that neither moved nor
+/// failed, is tried (left out of the rest of the run, and behind the others in
+/// the next run's order) when the slice did nothing else, and stays pending
+/// while the slice moved or failed another folder. A folder the reader sent
+/// nothing for stays pending, so a slice that read nothing ends the run. The
+/// run never takes the reader's account bookmark or folder list, and a reader
+/// that throws, or none, reads nothing.
+@Suite("Other folders: what a slice reports (#1110)", .serialized, .processGlobalState)
+struct OtherFolderSliceRuleTests {
+
+    struct Failure: Error {}
+
+    struct World: Sendable {
+        let pool: DatabasePool
+        let accountId: String
+        let mock: MockEmailProvider
+
+        var inboxId: String { "\(accountId):INBOX" }
+        var alphaId: String { "\(accountId):Alpha" }
+        var betaId: String { "\(accountId):Beta" }
+
+        func account() throws -> Account {
+            let accountId = accountId
+            let account = try pool.read { db in try Account.fetchOne(db, key: accountId) }
+            return try #require(account)
+        }
+
+        /// One slice over Alpha then Beta on `engine`, the reader answering
+        /// with `answer` (nil: no reader).
+        func slice(
+            on engine: SyncEngine, _ answer: (@Sendable (ChangeRequest) throws -> ChangeSet?)?
+        ) async throws -> CatchUpSliceResult {
+            if let answer {
+                await mock.setChangeReader { _, request in try answer(request) }
+            } else {
+                await mock.setChangeReader(nil)
+            }
+            let account = try account()
+            return await engine.readOtherFolders(
+                account: account, provider: mock, folderIds: [alphaId, betaId],
+                context: CatchUpContext(deadline: .distantFuture, clock: { Date() }))
+        }
+    }
+
+    static func withWorld(_ body: (World) async throws -> Void) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "other-slice-\(UUID().uuidString.prefix(8).lowercased())"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE account SET lastHistoryId = '100' WHERE id = ?", arguments: [accountId])
+        }
+        for (path, role) in [("INBOX", FolderRole.inbox), ("Alpha", .custom), ("Beta", .custom)] {
+            try FolderEpochTestFixture.insertFolder(
+                accountId: accountId, path: path, role: role, pool: pool, lastKnownUidNext: 1, lastKnownUidValidity: 1)
+        }
+        await AccountManager.shared.clearRecentlyCompletedForTesting()
+        try await body(World(pool: pool, accountId: accountId, mock: MockEmailProvider()))
+        await AccountManager.shared.clearRecentlyCompletedForTesting()
+        await UnreadCountManager.shared.awaitIdleForTesting()
+    }
+
+    /// The reader's answer: `statuses` by folder id, `.notRun` (nothing sent) for the rest.
+    static func answer(_ request: ChangeRequest, _ statuses: [String: FolderChanges]) -> ChangeSet {
+        ChangeSet(account: .keep, folderList: nil, folders: request.folders.map {
+            statuses[$0.id] ?? FolderChanges(folderId: $0.id, status: .notRun)
+        })
+    }
+
+    /// A folder whose read the reader started and the slice's time cut.
+    static func cut(_ folderId: String) -> FolderChanges {
+        var changes = FolderChanges(folderId: folderId, status: .notRun)
+        changes.readCut = true
+        return changes
+    }
+
+    struct Case: Sendable {
+        let name: String
+        let statuses: [String: FolderChanges]
+        let inFlight: Set<String>
+        let progressed: Set<String>
+        let finished: Set<String>
+        /// The next run's order after this slice.
+        let nextOrder: [String]
+    }
+
+    @Test("A cut folder is tried when the slice did nothing else and stays pending while it moved or failed another; a folder not reached stays pending")
+    func cutFoldersAndFoldersNotReached() async throws {
+        try await Self.withWorld { w in
+            let alpha = w.alphaId
+            let beta = w.betaId
+            let cases = [
+                Case(name: "a cut read, then a folder not reached",
+                     statuses: [alpha: Self.cut(alpha)],
+                     inFlight: [alpha], progressed: [], finished: [], nextOrder: [beta, alpha]),
+                Case(name: "a baseline that neither moved nor failed, then a folder not reached",
+                     statuses: [alpha: FolderChanges(folderId: alpha, status: .baselining)],
+                     inFlight: [alpha], progressed: [], finished: [], nextOrder: [beta, alpha]),
+                Case(name: "a read, then a cut read",
+                     statuses: [alpha: FolderChanges(folderId: alpha, status: .tracked), beta: Self.cut(beta)],
+                     inFlight: [], progressed: [alpha], finished: [alpha], nextOrder: [beta, alpha]),
+                Case(name: "a baseline that moved, then a cut read",
+                     statuses: [alpha: FolderChanges(folderId: alpha, status: .baselining, cursor: "moved"), beta: Self.cut(beta)],
+                     inFlight: [], progressed: [alpha], finished: [], nextOrder: [alpha, beta]),
+                Case(name: "a failed read, then a cut read",
+                     statuses: [alpha: FolderChanges(folderId: alpha, status: .failed(Failure())), beta: Self.cut(beta)],
+                     inFlight: [alpha], progressed: [], finished: [], nextOrder: [beta, alpha]),
+                Case(name: "nothing sent to either folder",
+                     statuses: [:],
+                     inFlight: [], progressed: [], finished: [], nextOrder: [alpha, beta]),
+            ]
+            for item in cases {
+                // A fresh engine: the run's order is kept in memory per engine.
+                let engine = SyncEngine()
+                let statuses = item.statuses
+                let result = try await w.slice(on: engine) { request in Self.answer(request, statuses) }
+                let order = try await engine.otherFolderReadOrder(accountId: w.accountId)
+                #expect(result.inFlightFolderIds == item.inFlight, "\(item.name): tried or failed")
+                #expect(result.progressedFolderIds == item.progressed, "\(item.name): moved")
+                #expect(result.finishedFolderIds == item.finished, "\(item.name): read once")
+                #expect(order == item.nextOrder, "\(item.name): the next order")
+            }
+        }
+    }
+
+    @Test("A slice takes no account bookmark and no folder list from its reader, and asks for the other-folder scope only")
+    func aSliceIgnoresTheAccountParts() async throws {
+        try await Self.withWorld { w in
+            let before = try w.account().lastHistoryId
+            let result = try await w.slice(on: SyncEngine()) { request in
+                ChangeSet(account: .set("999"), folderList: .complete([]), folders: request.folders.map {
+                    FolderChanges(folderId: $0.id, status: .tracked)
+                })
+            }
+            let after = try w.account().lastHistoryId
+            let accountId = w.accountId
+            let folderIds = try w.pool.read { db in
+                try String.fetchAll(db, sql: "SELECT id FROM folder WHERE accountId = ?", arguments: [accountId])
+            }
+            let asked = await w.mock.changeRequests.last?.request
+            let askedIds = asked?.folders.map(\.id)
+            let others: Set<String> = [w.alphaId, w.betaId]
+            let all: Set<String> = [w.inboxId, w.alphaId, w.betaId]
+            let order = [w.alphaId, w.betaId]
+            #expect(result.finishedFolderIds == others, "both folders read once")
+            #expect(after == before, "the account's bookmark is untouched")
+            #expect(Set(folderIds) == all, "an empty complete folder list removed nothing")
+            #expect(asked?.scope == .otherFolders, "the read was asked for the other folders")
+            #expect(askedIds == order, "in the run's order")
+        }
+    }
+
+    @Test("A slice whose reader throws, or a provider with no reader, reads nothing, so the run ends")
+    func aReaderThatThrowsOrNoneReadsNothing() async throws {
+        try await Self.withWorld { w in
+            let thrown = try await w.slice(on: SyncEngine()) { _ in throw Failure() }
+            let none = try await w.slice(on: SyncEngine(), nil)
+            #expect(!thrown.progressed && thrown.inFlightFolderIds.isEmpty, "a throwing reader: nothing read, nothing tried")
+            #expect(!none.progressed && none.inFlightFolderIds.isEmpty, "no reader: nothing read, nothing tried")
         }
     }
 }
