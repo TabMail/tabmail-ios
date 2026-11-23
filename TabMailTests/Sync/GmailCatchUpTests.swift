@@ -3692,13 +3692,15 @@ struct GmailCatchUpTests {
 
     /// A run stops after a slice that moved nothing forward, so a folder whose
     /// requests keep failing is tried again at the worker's next cycle, never at
-    /// network rate until the deadline. That slice still got its slot and ran, so
-    /// it opened the account's pacing window again from its slot (#1109): after
-    /// the slice started and no later than its first request. A second slice
-    /// cancels the run, so a run that would retry fails at once. RED with the
-    /// run going on after a slice that made no progress, with the window opened
-    /// again only by a slice that made progress, and with it opened again from
-    /// the end of a slice that made none.
+    /// network rate until the deadline. The folder starts with no saved state, so
+    /// the first slice's failed request still saves the listing it started (that
+    /// is progress); the second slice moves nothing, and the run stops there. That
+    /// slice still got its slot and ran, so it opened the account's pacing window
+    /// again from its slot (#1109): after the slice started and no later than its
+    /// first request. A third slice cancels the run, so a run that would retry
+    /// fails at once. RED with the run going on after a slice that made no
+    /// progress, with the window opened again only by a slice that made progress,
+    /// and with it opened again from the end of a slice that made none.
     @Test("A run stops after a slice that made no progress; it does not retry a failing folder until its deadline")
     func runStopsWithoutProgress() async throws {
         let clock = Clock()
@@ -3716,7 +3718,7 @@ struct GmailCatchUpTests {
             // the window, before the slice asked for its slot), and the
             // requests sent before it.
             let sliceStarts = Mutex<[(at: Date, sent: Int)]>([])
-            // A second slice means the run did not stop: it is cancelled there,
+            // A third slice means the run did not stop: it is cancelled there,
             // so a run that would retry until its deadline fails at once.
             let runTask = Mutex<Task<Bool, Never>?>(nil)
             await engine.setCatchUpSliceStartHookForTesting { _ in
@@ -3724,29 +3726,30 @@ struct GmailCatchUpTests {
                     $0.append((at: Date(), sent: server.http.recordedCalls().count))
                     return $0.count
                 }
-                if count > 1 { runTask.withLock { $0 }?.cancel() }
+                if count > 2 { runTask.withLock { $0 }?.cancel() }
             }
             let sentAtCreation = server.http.recordedCalls().count
             // Its deadline 40 requests away, its window one slice long.
             let run = Self.clockedRun(world, slice: slice, deadline: 40, interval: interval, added: added)
             let catchUp = Task { await engine.runCatchUpRun(account: account, run: run) }
             runTask.withLock { $0 = catchUp }
-            _ = await catchUp.value
+            _ = await Self.ended(catchUp, "the run")
             await engine.setCatchUpSliceStartHookForTesting(nil)
             let lists = server.listRequests().count
             let windowAfter = await engine.catchUpSliceWindowEnds[accountId]
             let starts = sliceStarts.withLock { $0 }
             #expect(lists >= 1, "precondition: the folder was tried")
             #expect(lists <= 2, "the run stopped once a slice made no progress: \(lists) list requests")
-            #expect(starts.count == 1, "the run took one slice: \(starts.count)")
+            #expect(starts.count == 2, "the run took the slice that started the listing and the one that moved nothing: \(starts.count)")
             #expect(try Self.state(world, inboxPath)?.lastCompletedAt == nil)
-            guard let window = windowAfter, let started = starts.last else {
-                Issue.record("the run started a slice and the account has a pacing window")
+            guard let window = windowAfter, let started = starts.last, starts.count == 2 else {
+                Issue.record("the run started two slices and the account has a pacing window")
                 return
             }
             // The window's end against the two bounds moved on by the same
-            // interval: after the slice started, and no later than its last
-            // clock read before its first request (after it got its slot).
+            // interval: after the slice that made no progress started, and no
+            // later than its last clock read before its first request (after it
+            // got its slot).
             let reopened = window >= started.at.addingTimeInterval(interval)
             let firstCheck = added.lastRead(sent: started.sent - sentAtCreation, since: started.at) ?? .distantPast
             let byFirstRequest = window <= firstCheck.addingTimeInterval(interval)
@@ -3778,6 +3781,30 @@ struct GmailCatchUpTests {
         func lastRead(sent: Int, since start: Date) -> Date? {
             reads.withLock { $0.filter { $0.sent == sent && $0.at >= start }.map(\.at).max() }
         }
+    }
+
+    /// The longest a test waits for a catch-up run it started to end, in
+    /// seconds: far longer than any of these runs takes.
+    private static let runEndBoundSeconds: Double = 20
+
+    /// Waits for a run's task to end, at most `runEndBoundSeconds`; past that it
+    /// records an issue and cancels the run (its loop stops at its next check),
+    /// then waits for it to end. A run that would never end, such as one that
+    /// keeps taking the turn without starting a slice, fails its test instead of
+    /// holding the suite.
+    private static func ended<T: Sendable>(_ task: Task<T, Never>, _ what: String) async -> T {
+        let done = Mutex(false)
+        let watcher = Task { () async -> T in
+            let value = await task.value
+            done.withLock { $0 = true }
+            return value
+        }
+        let inTime = await eventually(seconds: runEndBoundSeconds) { done.withLock { $0 } }
+        if !inTime {
+            Issue.record("\(what) did not end within \(runEndBoundSeconds) s, so it was cancelled")
+            task.cancel()
+        }
+        return await watcher.value
     }
 
     /// An access run (#1109) of the Inbox whose slices are `slice` requests long
@@ -3846,7 +3873,7 @@ struct GmailCatchUpTests {
             }
             release.continuation.finish()
             if let pass = queued.withLock({ $0 }) { await pass.value }
-            let progressed = await catchUp.value
+            let progressed = await Self.ended(catchUp, "the access run")
             await engine.setCatchUpSliceStartHookForTesting(nil)
 
             let slices = starts.withLock { $0 }
@@ -3859,6 +3886,38 @@ struct GmailCatchUpTests {
             #expect(ranges == 3, "two ranges in the first slice and one in the cut last slice: \(ranges)")
             #expect(listingOpen, "precondition: the listing needs more than the run's time")
             #expect(endedWhileHeld, "the run ended with the slice that spent its time, while a pass that queued behind that slice held the turn")
+        }
+    }
+
+    /// An access run counts what each slice spent, not the slice's length: with
+    /// slices of six requests capped at two requests each, and eight requests of
+    /// working time, every slice makes progress, sends its two requests and
+    /// spends two seconds, so the run takes four slices and sends eight
+    /// requests. RED with a slice counted at its full length (the run ends after
+    /// two slices and four requests).
+    @Test("An access run counts the time its slices spent, not their length")
+    func accessRunCountsWhatItsSlicesSpent() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.rangesWorld(clock, count: 8)
+        try await Self.withWorld("gcu-access-spent", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let account = try await Self.account(world)
+            let engine = world.engine
+            let starts = Mutex(0)
+            await engine.setCatchUpSliceStartHookForTesting { _ in starts.withLock { $0 += 1 } }
+            var run = Self.accessRun(world, slice: 6, work: 8, interval: 0.05, added: AddedTime())
+            run.sliceMaxRequests = 2
+            let capped = run
+            let catchUp = Task { await engine.runCatchUpRun(account: account, run: capped) }
+            let progressed = await Self.ended(catchUp, "the access run")
+            await engine.setCatchUpSliceStartHookForTesting(nil)
+
+            let slices = starts.withLock { $0 }
+            let sent = world.server.http.recordedCalls().count
+            let listingOpen = try Self.state(world, inboxPath)?.listing != nil
+            #expect(progressed, "the run made progress")
+            #expect(slices == 4, "the run took four slices of two requests: \(slices)")
+            #expect(sent == 8, "the run sent its eight requests of working time: \(sent)")
+            #expect(listingOpen, "precondition: the listing needs more than the run's time")
         }
     }
 
@@ -3907,7 +3966,7 @@ struct GmailCatchUpTests {
             // hook queued late is waited for too.
             func finish() async -> Bool {
                 for release in releases { release.continuation.finish() }
-                let progressed = await catchUp.value
+                let progressed = await Self.ended(catchUp, "the access run")
                 for pass in queued.withLock({ $0 }) { await pass.value }
                 await engine.setCatchUpSliceStartHookForTesting(nil)
                 return progressed
@@ -4103,7 +4162,7 @@ struct GmailCatchUpTests {
             }
             let sentWhileHeld = world.server.http.recordedCalls().count
             await holder.release()
-            let progressed = await catchUp.value
+            let progressed = await Self.ended(catchUp, "the access run")
             await engine.setCatchUpSliceStartHookForTesting(nil)
 
             let slices = starts.withLock { $0 }
@@ -4152,7 +4211,7 @@ struct GmailCatchUpTests {
             let sentWhileHeld = world.server.http.recordedCalls().count
             let freed = Date()
             await holder.release()
-            let progressed = await catchUp.value
+            let progressed = await Self.ended(catchUp, "the cycle")
             await engine.setCatchUpSliceStartHookForTesting(nil)
 
             let slices = starts.withLock { $0 }
@@ -4237,7 +4296,7 @@ struct GmailCatchUpTests {
                 release.continuation.finish()
                 await holder.release()
                 if cancelling { catchUp.cancel() }
-                _ = await catchUp.value
+                _ = await Self.ended(catchUp, "the run")
                 if let pass = behind.withLock({ $0 }) { await pass.value }
                 await engine.setCatchUpSliceStartHookForTesting(nil)
             }
@@ -4333,7 +4392,7 @@ struct GmailCatchUpTests {
             try? await Task.sleep(for: .milliseconds(100))
             let freed = Date()
             await holder.release()
-            let progressed = await catchUp.value
+            let progressed = await Self.ended(catchUp, "the job")
             await engine.setCatchUpSliceStartHookForTesting(nil)
 
             let sent = world.server.http.recordedCalls().count
@@ -4435,7 +4494,7 @@ struct GmailCatchUpTests {
             func finish() async {
                 for release in releases { release.continuation.finish() }
                 await holder.release()
-                _ = await catchUp.value
+                _ = await Self.ended(catchUp, "the run")
                 for pass in passes.withLock({ $0 }) { await pass.value }
                 await engine.setCatchUpSliceStartHookForTesting(nil)
             }
@@ -4472,8 +4531,9 @@ struct GmailCatchUpTests {
                 Issue.record("precondition: a second pass waits in line behind the run")
                 return await finish()
             }
-            let handedOn = Date()
             releases[0].continuation.finish()
+            // Sampled after the pass was let go, so the release came no later.
+            let handedOn = Date()
             // The run takes the turn, finds the window open and lets the turn go
             // with no slice started: the second pass holds it, the run out of
             // line.
@@ -4561,7 +4621,7 @@ struct GmailCatchUpTests {
             try? await Task.sleep(for: .milliseconds(300))
             let freed = Date()
             await holder.release()
-            _ = await accessRun.value
+            _ = await Self.ended(accessRun, "the access run")
             // The access slice has ended.
             let accessEnded = Date()
             let windowAfterAccess = await engine.catchUpSliceWindowEnds[accountId]
@@ -4569,14 +4629,14 @@ struct GmailCatchUpTests {
 
             // Its deadline a tenth of a request away: inside the window.
             let short = Self.clockedRun(world, slice: 3, deadline: 0.1, interval: window, added: AddedTime())
-            let shortProgressed = await engine.runCatchUpRun(account: account, run: short)
+            let shortProgressed = await Self.ended(Task { await engine.runCatchUpRun(account: account, run: short) }, "the first job")
             let shortEnded = Date()
             let sentByShort = world.server.http.recordedCalls().count - sentByAccess
             // Its deadline three requests away: past what is left of the window
             // at its turn, and exactly one slice, so the turn after that slice
             // ends the job (its clock has reached the deadline).
             let long = Self.clockedRun(world, slice: 3, deadline: 3, interval: window, added: AddedTime())
-            let longProgressed = await engine.runCatchUpRun(account: account, run: long)
+            let longProgressed = await Self.ended(Task { await engine.runCatchUpRun(account: account, run: long) }, "the later job")
             await engine.setCatchUpSliceStartHookForTesting(nil)
 
             let starts = startedAt.withLock { $0 }
@@ -4626,7 +4686,7 @@ struct GmailCatchUpTests {
         let (seeds, local) = Self.rangesWorld(clock, count: 8)
         // Long enough that the job's turn comes well inside the window the
         // access slice opened again.
-        let window = 2.0
+        let window = 3.0
         try await Self.withWorld("gcu-pacing-queued-run", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
             let account = try await Self.account(world)
             let engine = world.engine
@@ -4639,9 +4699,11 @@ struct GmailCatchUpTests {
                 Issue.record("precondition: other provider work holds the queue's slot")
                 return
             }
-            // The job's clock also counts the access slice's three requests, so
-            // its deadline six is one slice of its own.
-            let jobRun = Self.clockedRun(world, slice: 3, deadline: 6, interval: window, added: AddedTime())
+            // The job's clock also counts the access slice's three requests. Its
+            // deadline, six and a half requests away, leaves it one slice of its
+            // own; at its first turn the window (less than three seconds left)
+            // still ends half a second or more before it, so the job waits.
+            let jobRun = Self.clockedRun(world, slice: 3, deadline: 6.5, interval: window, added: AddedTime())
             let job = Mutex<Task<Bool, Never>?>(nil)
             let log = OneSyncAtATimeTests.PassLog()
             let release = AsyncStream<Void>.makeStream()
@@ -4668,9 +4730,9 @@ struct GmailCatchUpTests {
             func finish() async -> Bool {
                 release.continuation.finish()
                 await holder.release()
-                _ = await accessRun.value
-                let jobTask = job.withLock { $0 }
-                let jobProgressed = await jobTask?.value ?? false
+                _ = await Self.ended(accessRun, "the access run")
+                var jobProgressed = false
+                if let jobTask = job.withLock({ $0 }) { jobProgressed = await Self.ended(jobTask, "the job") }
                 if let pass = witness.withLock({ $0 }) { await pass.value }
                 await engine.setCatchUpSliceStartHookForTesting(nil)
                 return jobProgressed
@@ -4789,7 +4851,7 @@ struct GmailCatchUpTests {
             let sentBefore = world.server.http.recordedCalls().count
             // Its deadline a second before it starts.
             let run = Self.clockedRun(world, slice: 3, deadline: -1, interval: 0.05, added: AddedTime())
-            let progressed = await engine.runCatchUpRun(account: account, run: run)
+            let progressed = await Self.ended(Task { await engine.runCatchUpRun(account: account, run: run) }, "the job")
             await engine.setCatchUpSliceStartHookForTesting(nil)
 
             let slices = starts.withLock { $0 }
@@ -4845,8 +4907,8 @@ struct GmailCatchUpTests {
                 release.continuation.finish()
                 await holder.release()
                 await pass.value
-                let jobTask = job.withLock { $0 }
-                let progressed = await jobTask?.value ?? false
+                var progressed = false
+                if let jobTask = job.withLock({ $0 }) { progressed = await Self.ended(jobTask, "the job") }
                 await engine.setCatchUpSliceStartHookForTesting(nil)
                 return progressed
             }
@@ -4881,6 +4943,204 @@ struct GmailCatchUpTests {
             #expect(slices == 0, "the job started no slice: \(slices)")
             #expect(sent == 0, "the job sent nothing: \(sent)")
             #expect(windowAfter == windowBefore, "the job opened no pacing window")
+        }
+    }
+
+    /// A run woken from its pacing wait reads the window again at the turn it
+    /// gets: an access run's first slice opens the window; its next turn finds
+    /// it open, and the run sleeps while a pass it handed the turn to holds it.
+    /// While it sleeps, the background job asks for the turn behind that pass.
+    /// Once the window has ended the run wakes and waits in line behind the job;
+    /// the pass ends, the job's turn finds the window over, and its slice opens
+    /// it again. The run's next turn finds that window open and waits again, so
+    /// its second slice starts at least one window after the job's slice
+    /// started. RED with the window check skipped on the first turn after a
+    /// pacing wait.
+    @Test("A run woken from its pacing wait waits again for a window another run's slice opened meanwhile")
+    func aWokenRunWaitsForAWindowOpenedWhileItSlept() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.rangesWorld(clock, count: 8)
+        // Long enough that the job is in line before the run wakes, and that the
+        // run's next turn comes well inside the window the job's slice opened.
+        let window = 3.0
+        try await Self.withWorld("gcu-pacing-woken", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let account = try await Self.account(world)
+            let engine = world.engine
+            let accountId = world.accountId
+            let log = OneSyncAtATimeTests.PassLog()
+            let releases = (0..<2).map { _ in AsyncStream<Void>.makeStream() }
+            let firstStream = releases[0].stream
+            let passes = Mutex<[Task<Void, Never>]>([])
+            let startedAt = Mutex<[Date]>([])
+            // A pass queues behind the access run's first slice, inside its turn.
+            await engine.setCatchUpSliceStartHookForTesting { _ in
+                let slice = startedAt.withLock { $0.append(Date()); return $0.count }
+                guard slice == 1 else { return }
+                let pass = OneSyncAtATimeTests.heldPass(
+                    engine: engine, accountId: accountId, name: "first", log: log, release: firstStream)
+                passes.withLock { $0.append(pass) }
+                _ = await OneSyncAtATimeTests.eventually { await engine.syncPassWaiters[accountId]?.count == 1 }
+            }
+            // Two slices of working time.
+            let access = Self.accessRun(world, slice: 3, work: 6, interval: window, added: AddedTime())
+            let accessTask = Task { await engine.runCatchUpRun(account: account, run: access) }
+            let jobTask = Mutex<Task<Bool, Never>?>(nil)
+            // Every way out lets the passes go and waits for the runs, then for
+            // the passes.
+            func finish() async {
+                for release in releases { release.continuation.finish() }
+                _ = await Self.ended(accessTask, "the access run")
+                if let job = jobTask.withLock({ $0 }) { _ = await Self.ended(job, "the job") }
+                for pass in passes.withLock({ $0 }) { await pass.value }
+                await engine.setCatchUpSliceStartHookForTesting(nil)
+            }
+            func stop(_ reason: Comment) async {
+                Issue.record(reason)
+                await finish()
+            }
+
+            // The first pass holds the turn after the run's first slice, with the
+            // run in line behind it; a second pass queues behind the run.
+            guard await OneSyncAtATimeTests.eventually({
+                guard log.snapshot == ["start first"] else { return false }
+                return await engine.syncPassWaiters[accountId]?.count == 1
+            }) else { return await stop("precondition: the run waits for the turn behind a pass after its first slice") }
+            let firstWindow = await engine.catchUpSliceWindowEnds[accountId]
+            let second = OneSyncAtATimeTests.heldPass(
+                engine: engine, accountId: accountId, name: "second", log: log, release: releases[1].stream)
+            passes.withLock { $0.append(second) }
+            guard await OneSyncAtATimeTests.eventually({ await engine.syncPassWaiters[accountId]?.count == 2 }) else {
+                return await stop("precondition: a second pass waits in line behind the run")
+            }
+            releases[0].continuation.finish()
+            // The run's turn finds its first slice's window open and the run
+            // sleeps: the second pass holds the turn, the run out of line.
+            guard await OneSyncAtATimeTests.eventually({
+                guard log.snapshot.contains("start second"), startedAt.withLock({ $0.count }) == 1 else { return false }
+                return (await engine.syncPassWaiters[accountId]?.count ?? 0) == 0
+            }) else { return await stop("precondition: the run went to its pacing wait") }
+            // The job asks for the turn while the run sleeps. One slice of time:
+            // its turn after that slice ends it.
+            let job = Self.clockedRun(world, slice: 3, deadline: 3, interval: window, added: AddedTime())
+            jobTask.withLock { $0 = Task { await engine.runCatchUpRun(account: account, run: job) } }
+            guard await OneSyncAtATimeTests.eventually({ await engine.syncPassWaiters[accountId]?.count == 1 }),
+                  let firstEnd = firstWindow, Date() < firstEnd else {
+                return await stop("precondition: the job waits in line for the turn before the run's window has ended")
+            }
+            // The run wakes once the window has ended and waits behind the job.
+            guard await OneSyncAtATimeTests.eventually({ await engine.syncPassWaiters[accountId]?.count == 2 }) else {
+                return await stop("precondition: the run woke and waits in line behind the job")
+            }
+            releases[1].continuation.finish()
+            await finish()
+
+            let starts = startedAt.withLock { $0 }
+            let sent = world.server.http.recordedCalls().count
+            #expect(sent == 9, "the run's two slices and the job's one sent three requests each: \(sent)")
+            #expect(starts.count == 3, "two slices for the run, one for the job: \(starts.count)")
+            guard starts.count == 3 else { return }
+            // The job's slice (the second) opened the window again from its slot,
+            // after it started; the run's second slice (the third) starts no
+            // earlier than that window's end.
+            let gap = starts[2].timeIntervalSince(starts[1])
+            #expect(starts[2] >= starts[1].addingTimeInterval(window), "the run's second slice started \(gap) s after the job's slice, inside the window that slice opened")
+        }
+    }
+
+    /// A job in line for the turn weighs its deadline against the window it
+    /// finds at its turn, not the one there when it asked: a pass holds the turn
+    /// after a one-slice access run whose window is one second; a second access
+    /// run, its window ten seconds, and then the job ask for the turn. The job's
+    /// deadline, six requests away, could wait out the one-second window; but
+    /// once that window has ended the second access run's slice opens the
+    /// ten-second one, and at its turn the job (three requests on its clock)
+    /// finds its deadline inside that window and ends there: no slice, no
+    /// request, the window as the access slice left it. RED with what is left of
+    /// the window read before the job's wait for the turn, and with a job that
+    /// waits for a window past its deadline.
+    @Test("A job whose deadline falls inside a window opened while it waited for the turn ends at its turn")
+    func aJobEndsAtItsTurnWhenAWindowOpenedMeanwhileOutlastsItsDeadline() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.rangesWorld(clock, count: 8)
+        let shortWindow = 1.0
+        let longWindow = 10.0
+        try await Self.withWorld("gcu-job-window-at-turn", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let account = try await Self.account(world)
+            let engine = world.engine
+            let accountId = world.accountId
+            let log = OneSyncAtATimeTests.PassLog()
+            let release = AsyncStream<Void>.makeStream()
+            let releaseStream = release.stream
+            let held = Mutex<Task<Void, Never>?>(nil)
+            let starts = Mutex(0)
+            // A pass queues behind the first access run's slice, inside its turn.
+            await engine.setCatchUpSliceStartHookForTesting { _ in
+                let slice = starts.withLock { $0 += 1; return $0 }
+                guard slice == 1 else { return }
+                let pass = OneSyncAtATimeTests.heldPass(
+                    engine: engine, accountId: accountId, name: "held", log: log, release: releaseStream)
+                held.withLock { $0 = pass }
+                _ = await OneSyncAtATimeTests.eventually { await engine.syncPassWaiters[accountId]?.count == 1 }
+            }
+            let first = Self.accessRun(world, slice: 3, work: 3, interval: shortWindow, added: AddedTime())
+            let firstTask = Task { await engine.runCatchUpRun(account: account, run: first) }
+            let later = Mutex<[Task<Bool, Never>]>([])
+            // Every way out lets the pass go and waits for the runs, then for
+            // the pass.
+            func finish() async {
+                release.continuation.finish()
+                _ = await Self.ended(firstTask, "the first access run")
+                for task in later.withLock({ $0 }) { _ = await Self.ended(task, "a run that waited for the turn") }
+                if let pass = held.withLock({ $0 }) { await pass.value }
+                await engine.setCatchUpSliceStartHookForTesting(nil)
+            }
+            func stop(_ reason: Comment) async {
+                Issue.record(reason)
+                await finish()
+            }
+
+            // The first run ended with its slice, and the pass holds the turn.
+            guard await OneSyncAtATimeTests.eventually({ log.snapshot == ["start held"] }) else {
+                return await stop("precondition: the pass took the turn after the first run's slice")
+            }
+            let oldWindow = await engine.catchUpSliceWindowEnds[accountId]
+            let second = Self.accessRun(world, slice: 3, work: 3, interval: longWindow, added: AddedTime())
+            later.withLock { $0.append(Task { await engine.runCatchUpRun(account: account, run: second) }) }
+            guard await OneSyncAtATimeTests.eventually({ await engine.syncPassWaiters[accountId]?.count == 1 }) else {
+                return await stop("precondition: the second access run waits in line for the turn")
+            }
+            // Its clock also counts the second access run's three requests.
+            let jobRun = Self.clockedRun(world, slice: 3, deadline: 6, interval: longWindow, added: AddedTime())
+            let jobEnded = Mutex<Date?>(nil)
+            let job = Task {
+                let progressed = await engine.runCatchUpRun(account: account, run: jobRun)
+                jobEnded.withLock { $0 = Date() }
+                return progressed
+            }
+            later.withLock { $0.append(job) }
+            guard await OneSyncAtATimeTests.eventually({ await engine.syncPassWaiters[accountId]?.count == 2 }),
+                  let oldEnd = oldWindow else {
+                return await stop("precondition: the first slice opened a window, and the job waits in line behind the second access run")
+            }
+            // The one-second window ends before the pass lets the turn go, so the
+            // second access run's turn runs its slice.
+            try? await Task.sleep(for: .seconds(max(0, oldEnd.timeIntervalSinceNow) + shortWindow / 10))
+            release.continuation.finish()
+            await finish()
+
+            let slices = starts.withLock { $0 }
+            let sent = world.server.http.recordedCalls().count
+            let windowAfter = await engine.catchUpSliceWindowEnds[accountId]
+            let jobProgressed = await job.value
+            #expect(slices == 2, "one slice for each access run, none for the job: \(slices)")
+            #expect(sent == 6, "each access run's slice sent three requests, the job none: \(sent)")
+            #expect(!jobProgressed, "the job made no progress")
+            guard let reopened = windowAfter, let jobEnd = jobEnded.withLock({ $0 }) else {
+                Issue.record("the second access run's slice opened a window, and the job ended")
+                return
+            }
+            #expect(reopened > oldEnd, "precondition: the second access run's slice opened the window again")
+            #expect(jobEnd < reopened, "the job ended at its turn, without waiting for the window that outlasts its deadline")
         }
     }
 
