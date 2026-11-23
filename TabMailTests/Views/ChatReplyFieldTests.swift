@@ -698,8 +698,8 @@ struct ChatReplyFieldTests {
                 == Self.count("fieldFill.apply(", in: text) + Self.count("fieldFill.words", in: text)
                     + Self.count("fieldFill.holdsSentWords", in: text),
                 "nothing else touches the field's state")
-        // Each change, where it happens: typing (above), both dictations, both sends, an Edit, and
-        // a new email's saved words.
+        // Each change, where it happens: typing (above), both dictations, both sends, an Edit, the
+        // "e.g." line, and a new email's saved words.
         #expect(Self.count("fieldFill.apply(.startHearing) speech.start(locale: speechLocale, auto: auto) { transcript in fieldFill.apply(.heard(transcript))", in: text) == 1)
         #expect(Self.count("{ text in fieldFill.apply(.said(text))", in: text) == 1)
         // The completion and a confirmation card land on the sent request's chat key in
@@ -711,7 +711,11 @@ struct ChatReplyFieldTests {
         #expect(Self.count("func putExample(_ example: String) { fieldFill.apply(.put(example)) inputSelection = .init(insertionPoint: inputText.endIndex) }", in: text) == 1)
         // A new email's saved words go in once, as its chat first opens; the screen hidden and
         // shown again keeps what was typed since (ChatNewThreadScreenTests.hiddenAndShownKeepsTyping).
-        #expect(Self.count("guard let newEmail = replyField?.newEmail, !newEmailStarted else { return } newEmailStarted = true if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) }", in: text) == 1)
+        // Then its reply field takes the keyboard: the panel's input, which `isTextFieldFocused`
+        // focuses, is never there in a new email's chat. Only the forked chat's put focuses the panel.
+        #expect(Self.count("guard let newEmail = replyField?.newEmail, !newEmailStarted else { return } newEmailStarted = true if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) } focusedInput = .replyField }", in: text) == 1)
+        #expect(Self.count("focusedInput = .replyField", in: text) == 1, "the new email's opening is the only one that focuses the reply field")
+        #expect(Self.count("isTextFieldFocused = true", in: text) == 1, "the forked chat's put is the only one that focuses the panel's input")
         #expect(Self.count("fieldFill.apply(", in: text) == 9)
     }
 

@@ -385,6 +385,7 @@ struct ThreadChatTests {
             ChatPillState.shared.removeAllSessions()
 
             let screen = NavigationStack { MessageDetailView(messageId: older.id) }
+                .environment(NavigationStore())
                 .environment(\.hasTabMailSession, true)
             try await Self.mount(screen) { view in
                 try await Self.wait { HostedAccessibility.identifiers(in: view).contains("chatPill") }

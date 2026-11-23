@@ -1693,12 +1693,14 @@ struct DynamicIslandChat: View {
         }
     }
 
-    /// A new email's chat opening: its draft's words, once, then the field takes focus.
+    /// A new email's chat opening: its draft's words, once, then its reply field takes the
+    /// keyboard (`InputFocus.replyField`: the panel, which `isTextFieldFocused` focuses, never
+    /// opens in a new email's chat).
     private func startNewEmail() {
         guard let newEmail = replyField?.newEmail, !newEmailStarted else { return }
         newEmailStarted = true
         if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) }
-        isTextFieldFocused = true
+        focusedInput = .replyField
     }
 
     /// A dictation is recording, transcribing, or starting: its words are coming to the field.

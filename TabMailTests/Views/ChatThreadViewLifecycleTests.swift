@@ -186,7 +186,7 @@ struct ChatThreadViewLifecycleTests {
         window.frame = CGRect(x: 0, y: 0, width: 393, height: height)
         let controller = UIHostingController(rootView: NavigationStack {
             ChatThreadView(messageId: headers[openedIndex].id, highlightsOpenedMessage: highlights)
-        })
+        }.environment(NavigationStore()))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -333,7 +333,7 @@ struct ChatThreadViewLifecycleTests {
         gate.arm()
         let controller = UIHostingController(rootView: NavigationStack {
             ChatThreadView(messageId: headers[Self.length - 1].id)
-        })
+        }.environment(NavigationStore()))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -466,7 +466,7 @@ struct ChatThreadViewLifecycleTests {
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        let controller = UIHostingController(rootView: NavigationStack { open })
+        let controller = UIHostingController(rootView: NavigationStack { open }.environment(NavigationStore()))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -775,7 +775,7 @@ struct ChatThreadViewLifecycleTests {
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
         let controller = UIHostingController(rootView: NavigationStack {
             ChatThreadView(messageId: newest.id)
-        }.environment(\.hasTabMailSession, true))
+        }.environment(NavigationStore()).environment(\.hasTabMailSession, true))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -976,7 +976,7 @@ struct ChatThreadViewLifecycleTests {
             window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
             let controller = UIHostingController(rootView: NavigationStack {
                 ChatThreadView(messageId: newest.id)
-            }.environment(\.hasTabMailSession, true))
+            }.environment(NavigationStore()).environment(\.hasTabMailSession, true))
             window.rootViewController = controller
             window.makeKeyAndVisible()
             defer {
@@ -1181,7 +1181,8 @@ struct ChatThreadViewLifecycleTests {
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
         hold.arm()
-        let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: seeded.id) })
+        let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: seeded.id) }
+            .environment(NavigationStore()))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -1274,7 +1275,7 @@ struct ChatThreadViewLifecycleTests {
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
         let controller = UIHostingController(rootView: NavigationStack {
             ChatThreadView(messageId: parent.id)
-        }.environment(\.hasTabMailSession, true))
+        }.environment(NavigationStore()).environment(\.hasTabMailSession, true))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
