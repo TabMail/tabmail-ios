@@ -50,6 +50,9 @@ actor SyncEngine {
     /// anything is applied, and awaited, so a test can hold a slice that has
     /// read the server inside its turn. Nil outside tests.
     var catchUpAfterReadHookForTesting: (@Sendable ([String]) async -> Void)?
+    /// Test-only seam (`setAccessCatchUpClockForTesting`): the clock access
+    /// catch-up runs are measured on. Nil outside tests: the real clock.
+    var accessCatchUpClockForTesting: (@Sendable () -> Date)?
     #endif
 
     /// Generation counter per account — prevents stale task defer from clearing

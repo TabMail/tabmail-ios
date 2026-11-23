@@ -515,9 +515,12 @@ extension AccountManager {
                     // folder the reader has just baselined is one the catch-up may
                     // list. The refresh does not wait for it. When the read found
                     // the account busy, the run starts all the same: it waits in
-                    // line like the follow-up, lists an untracked folder by its
-                    // access rule, and a tracked one's changes come through the
-                    // follow-up's read.
+                    // line like the follow-up (its time counts only inside the
+                    // turn), lists an untracked folder by its access
+                    // rule, and a tracked one's changes come through the
+                    // follow-up's read. It may take the turn before the follow-up:
+                    // a folder the follow-up has yet to baseline is then left to
+                    // the ordinary catch-up.
                     await syncEngine.startAccessCatchUp(accountId: accountId, folderIds: accessed)
                     if DebugModeManager.isLoggingEnabled() {
                         let outcome = read.map { "changed=\($0.changed) reason=\($0.reason)" } ?? "busy, follow-up wanted"

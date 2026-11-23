@@ -178,7 +178,8 @@ extension SyncEngine {
         /// run started.
         let storageLimitInForce: Bool
         /// The background processing job's deadline: slices run until it. Nil for
-        /// a foreground backfill cycle, which runs exactly one slice.
+        /// a foreground backfill cycle, which runs exactly one slice, and for an
+        /// access run, which runs on its working time (`workSeconds`).
         let deadline: Date?
         /// How long one slice may spend (`SyncConfig.catchUpSliceSeconds`), and the
         /// window the next slice of the account waits for.
@@ -198,27 +199,38 @@ extension SyncEngine {
         /// them. Nil for the backfill worker's run, which asks every syncable
         /// folder.
         var accessedFolderIds: Set<String>?
+        /// An access run's time (#1109, `SyncConfig.accessCatchUpRunSeconds`):
+        /// its slices run until their time inside the account's turn adds up to
+        /// this. A wait for the turn, and the pacing wait between slices, are
+        /// not counted: waiting is not working time. Nil for the backfill
+        /// worker's runs.
+        var workSeconds: TimeInterval?
         /// The clock the slices and the deadline are measured on. Injectable so a
         /// test can spend a slice deterministically; production passes `Date.init`.
         let clock: @Sendable () -> Date
 
         /// The production snapshot, taken now.
-        static func snapshot(deadline: Date?) -> CatchUpRun {
+        static func snapshot(deadline: Date?, clock: @escaping @Sendable () -> Date = { Date() }) -> CatchUpRun {
             CatchUpRun(
                 storageLimitInForce: StorageEstimator.budgetMB != Int.max,
                 deadline: deadline, sliceSeconds: SyncConfig.catchUpSliceSeconds,
-                intervalSeconds: SyncConfig.catchUpSliceIntervalSeconds, clock: { Date() })
+                intervalSeconds: SyncConfig.catchUpSliceIntervalSeconds, clock: clock)
         }
 
-        /// The context of a slice that starts now: it ends one slice from now, or
-        /// at the run's deadline if that comes first. Nil once the deadline has
-        /// passed.
-        func sliceStartingNow() -> CatchUpContext? {
+        /// The context of a slice that starts now, when the run has `worked` so
+        /// far: it ends one slice from now, or at the run's deadline, or when its
+        /// working time is spent, whichever comes first. Nil once the deadline
+        /// has passed or the working time is spent.
+        func sliceStartingNow(worked: TimeInterval = 0) -> CatchUpContext? {
             let now = clock()
             var end = now.addingTimeInterval(sliceSeconds)
             if let deadline {
                 guard now < deadline else { return nil }
                 end = min(end, deadline)
+            }
+            if let workSeconds {
+                guard worked < workSeconds else { return nil }
+                end = min(end, now.addingTimeInterval(workSeconds - worked))
             }
             return CatchUpContext(
                 deadline: end, clock: clock,
@@ -231,10 +243,15 @@ extension SyncEngine {
     /// The catch-up of older mail, run by the backfill worker after the folders'
     /// walk (ADR-IOS-107, #766), in slices. Each slice takes the account's
     /// one-sync-at-a-time turn (`oneSyncAtATime`, ADR-IOS-104), so it never runs
-    /// beside a delta, a full sync or a lapse, and releases it at the slice's end,
-    /// so a push or silent-push delta that arrives meanwhile waits at most one
-    /// slice. The slice's clock starts when its turn starts, never while it waits.
-    /// A foreground cycle (`run.deadline == nil`) runs one slice; the background
+    /// beside a delta, a full sync or a lapse, and releases it at the slice's end:
+    /// a sync trigger that arrives meanwhile does not wait, it sets the account's
+    /// follow-up flag (#1289), and the stage 2 it asks for waits at most one
+    /// slice. *Superseded (#1289):* "so a push or silent-push delta that arrives
+    /// meanwhile waits at most one slice". The slice's clock starts when its turn
+    /// starts, never while it waits. An access run's time (`CatchUpRun.workSeconds`,
+    /// #1109) is its slices' time inside the turn: neither the wait for the turn
+    /// nor the pacing wait between slices counts.
+    /// A foreground cycle (`run.deadline == nil`, no working time) runs one slice; the background
     /// processing job runs slices until its deadline, and stops after a slice
     /// whose folders made no progress and that left no folder out it had not
     /// left out before, so a folder whose requests keep failing is retried at
@@ -292,8 +309,12 @@ extension SyncEngine {
         // The folders whose request may still be in flight (#1062): never asked
         // again in this run. In memory only, gone when the run ends.
         var inFlight = Set<String>()
+        // The run's working time so far (`CatchUpRun.workSeconds`): only the
+        // slices' time inside the turn.
+        var worked: TimeInterval = 0
         runLoop: while !Task.isCancelled {
             let leftOut = inFlight
+            let workedSoFar = worked
             let slice: CatchUpSliceOutcome = await oneSyncAtATime(accountId: accountId) {
                 if let end = self.catchUpSliceWindowEnds[accountId], end > Date() {
                     // No slice can start before the run's deadline: the run ends
@@ -303,7 +324,8 @@ extension SyncEngine {
                     }
                     return .windowOpen(until: end)
                 }
-                guard let context = run.sliceStartingNow() else { return .runOver }
+                guard let context = run.sliceStartingNow(worked: workedSoFar) else { return .runOver }
+                let sliceStart = run.clock()
                 self.catchUpSliceWindowEnds[accountId] = Date().addingTimeInterval(run.intervalSeconds)
                 let folderIds: [String]
                 do {
@@ -312,7 +334,7 @@ extension SyncEngine {
                     }
                 } catch {
                     BackgroundSyncLogger.logDebug("[CatchUp] folder read failed: \(error)")
-                    return .ran(CatchUpSliceResult())
+                    return .ran(CatchUpSliceResult(), spent: run.clock().timeIntervalSince(sliceStart))
                 }
                 #if DEBUG
                 await self.catchUpSliceStartHookForTesting?(folderIds)
@@ -320,14 +342,15 @@ extension SyncEngine {
                 let ran = (try? await queue.execute(priority: .headerFetch) {
                     await self.runCatchUp(provider: provider, folderIds: folderIds, context: context)
                 }) ?? CatchUpSliceResult()
-                return .ran(ran)
+                return .ran(ran, spent: run.clock().timeIntervalSince(sliceStart))
             }
             switch slice {
             case .windowOpen(until: let end):
                 try? await Task.sleep(for: .seconds(max(0, end.timeIntervalSinceNow)))
             case .runOver:
                 break runLoop
-            case .ran(let ran):
+            case .ran(let ran, spent: let spent):
+                worked += spent
                 madeProgress = madeProgress || ran.progressed
                 // Abandoning a request that may still be in flight ended its
                 // folder's session when it was on the wire (one still waiting
@@ -353,7 +376,9 @@ extension SyncEngine {
                 // the slice left out is one it added.
                 let addedInFlight = !ran.inFlightFolderIds.isSubset(of: inFlight)
                 inFlight.formUnion(ran.inFlightFolderIds)
-                guard !ran.progressedFolderIds.isEmpty || addedInFlight, run.deadline != nil else { break runLoop }
+                // A foreground cycle (no deadline, no working time) ends here.
+                guard !ran.progressedFolderIds.isEmpty || addedInFlight,
+                      run.deadline != nil || run.workSeconds != nil else { break runLoop }
             }
         }
         return madeProgress
@@ -390,8 +415,9 @@ extension SyncEngine {
         /// or after it.
         case runOver
         /// A slice ran: the folders whose applied result made progress, and
-        /// those whose request may still be in flight.
-        case ran(CatchUpSliceResult)
+        /// those whose request may still be in flight; and the time it spent
+        /// inside the turn (an access run's working time).
+        case ran(CatchUpSliceResult, spent: TimeInterval)
     }
 
     /// The account's syncable folders as they are now (`syncableFoldersInOrder`,

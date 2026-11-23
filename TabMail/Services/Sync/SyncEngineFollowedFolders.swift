@@ -63,7 +63,8 @@ extension SyncEngine {
     /// Each run asks only its folders (the syncable ones among them, so a
     /// folder whose mark did not land is not asked), under the account's turn
     /// and slice pacing like every catch-up slice, until they make no progress
-    /// or `SyncConfig.accessCatchUpRunSeconds` is up.
+    /// or its slices have spent `SyncConfig.accessCatchUpRunSeconds` inside the
+    /// turn (`CatchUpRun.workSeconds`: a wait for the turn is not counted).
     func startAccessCatchUp(accountId: String, folderIds: [String]) {
         guard !folderIds.isEmpty else { return }
         accessCatchUpPending[accountId, default: []].formUnion(folderIds)
@@ -76,9 +77,14 @@ extension SyncEngine {
     /// empty check, so a folder handed over after it starts a new task.
     private func runAccessCatchUps(accountId: String) async {
         while !Task.isCancelled, let folderIds = accessCatchUpPending.removeValue(forKey: accountId), !folderIds.isEmpty {
-            // The run's settings and deadline are taken first, when the batch is
-            // taken, and the run reads only this snapshot.
-            var run = CatchUpRun.snapshot(deadline: Date().addingTimeInterval(SyncConfig.accessCatchUpRunSeconds))
+            // The run's settings are taken first, when the batch is taken, and
+            // the run reads only this snapshot. Its time is working time
+            // (`CatchUpRun.workSeconds`), so the wait for the account's turn
+            // (behind a pass a pull found running, say) spends none of it.
+            // *Superseded:* a deadline 120 s from when the batch was taken, which
+            // a long wait for the first slice's turn could spend whole.
+            var run = CatchUpRun.snapshot(deadline: nil, clock: accessCatchUpClock)
+            run.workSeconds = SyncConfig.accessCatchUpRunSeconds
             run.accessedFolderIds = folderIds
             let account: Account?
             do {
@@ -98,10 +104,25 @@ extension SyncEngine {
         accessCatchUpTasks[accountId] = nil
     }
 
+    /// The clock an access run is measured on: the real one, or in a test the
+    /// one it installed (`setAccessCatchUpClockForTesting`).
+    private var accessCatchUpClock: @Sendable () -> Date {
+        #if DEBUG
+        if let clock = accessCatchUpClockForTesting { return clock }
+        #endif
+        return { Date() }
+    }
+
     #if DEBUG
     /// Test seam: waits until the account's access catch-up runs are done.
     func awaitAccessCatchUpForTesting(accountId: String) async {
         while let task = accessCatchUpTasks[accountId] { await task.value }
+    }
+
+    /// Test seam: the clock the next access runs are measured on (nil: the
+    /// real one), so a test can move time on while a run waits for its turn.
+    func setAccessCatchUpClockForTesting(_ clock: (@Sendable () -> Date)?) {
+        accessCatchUpClockForTesting = clock
     }
     #endif
 }

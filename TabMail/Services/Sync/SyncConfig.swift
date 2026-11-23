@@ -853,9 +853,11 @@ enum SyncConfig {
     /// listing can be when the user comes back to the folder.
     static let catchUpAccessCheckAgeSeconds: TimeInterval = 3_600
     /// How long the catch-up run a user action starts for the folders it landed
-    /// in may take (seconds, #1109): slices run, paced like every other catch-up
-    /// slice of the account, until the folders make no progress or this time is
-    /// up. What a large folder still needs then is the backfill worker's, which
+    /// in may work (seconds, #1109): slices run, paced like every other catch-up
+    /// slice of the account, until the folders make no progress or the slices'
+    /// time inside the account's turn adds up to this (`CatchUpRun.workSeconds`:
+    /// the wait for the turn and the pacing wait between slices do not count).
+    /// What a large folder still needs then is the backfill worker's, which
     /// checks every followed folder.
     static let accessCatchUpRunSeconds: TimeInterval = 120
     /// About how many messages one IMAP listing range holds (`UID FETCH lo:hi

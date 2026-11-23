@@ -1351,7 +1351,10 @@ on the re-drive.
    - opening a folder or pulling to refresh it (`AccountManager.syncFolders`): the mark is written first,
      before the connect and the listings, so an open while offline, or a listing that fails, still follows
      the folder; the run starts after the change read, so a folder the reader has just baselined may be
-     listed;
+     listed. When that read finds the account busy (it sets the account's follow-up flag and reads
+     nothing, #1289), the run starts all the same and waits for the turn; it may take the turn before
+     the follow-up stage 2, and an Outlook folder the follow-up has yet to baseline is then not listed by
+     this run (decision 5) but by the ordinary catch-up once it is baselined;
    - a drained move, archive or delete: its source and its destination (`AccountOperationExecutor.finishDrain`,
      `DrainContext.foldersAccessed`);
    - opening a message, from a folder, a search result, or a chat or AI answer alike
@@ -1369,8 +1372,13 @@ on the re-drive.
    arrive while it runs are taken by its next run. Each run is `runCatchUpRun` with
    `CatchUpRun.accessedFolderIds`: it asks only those folders (the syncable ones among them, so a folder
    whose mark did not land is not asked), under the account's turn and slice pacing like every slice,
-   until they make no progress or `SyncConfig.accessCatchUpRunSeconds` (120 s) is up. What a large folder
-   still needs then is the backfill worker's, whose catch-up checks every followed folder.
+   until they make no progress or their slices have spent `SyncConfig.accessCatchUpRunSeconds` (120 s)
+   inside the account's turn (`CatchUpRun.workSeconds`): the wait for the turn and the pacing wait
+   between slices are not counted, because waiting is not working time. What a large folder still needs
+   then is the backfill worker's, whose catch-up checks every followed folder. *(Amended in review
+   2026-11-23: the run first had a deadline 120 s from when it took its folders, so a run whose first
+   slice waited behind a long pass, as after a pull that found its account busy, could spend it all
+   waiting and ask nothing.)*
    `CatchUpContext.accessedFolderIds` tells the provider which folders an action reached (provider-neutral).
    `SyncEngine.remove(accountId:)` cancels the run.
 4. **IMAP access check** (`IMAPProvider.catchUpPlan`, `counters:`, `accessed:`). An untracked folder with no
@@ -1468,7 +1476,9 @@ no mod-sequences and on a QRESYNC server, each against the scenario's expected s
 the action's own `UID MOVE` the only change sent to the server, each run asking only the accessed
 folders and a quiet re-open listing nothing, the message's body requested before any catch-up slice, a
 second access during a run taken by the next run (and never asked alone, with a pause between the
-handovers), an open while offline that still follows the folder, and a completion that keeps the
+handovers), an open while offline that still follows the folder, a pull whose change read finds the
+account busy (its access run waits behind the running pass, asks nothing meanwhile, then reconciles the
+folder with all of its time although its clock moved on twice that time while it waited), and a completion that keeps the
 counters its listing started from across slices; `FollowedFolderOutlookTests`: through the production change read, the gated access sends no
 request for the folder and writes no listing, then the baseline, then the listing),
 `ReleaseBoundaryRecheckTests.applyOverflowInAFollowedFolderArmsTheCatchUp` (the first ids are kept),
