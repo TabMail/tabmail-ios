@@ -171,9 +171,13 @@ enum CalendarToolHelpers {
     /// calendar's accessRole, plus a calendar name lookup. accessRole is the
     /// Google-style string ("owner" / "writer" / "reader" / "freeBusyReader");
     /// nil for providers that don't model the concept (CalDAV/Exchange).
-    /// Error resilient: logs and skips failing accounts/calendars without
-    /// blocking others. `maxResults` is per-calendar (CalendarSearchTool=250,
-    /// CalendarReadTool=2500).
+    /// A failing account or calendar does not block the others. Each one whose
+    /// listing failed (`listCalendars` for an account, `listEvents` for a
+    /// calendar, including an Outlook listing past its page cap) is named in
+    /// `unread` (`unreadAccountLabel` / `unreadCalendarLabel`, sorted), so the
+    /// tools report it as not read instead of as a calendar with no events
+    /// (#1293). Nothing is retried. `maxResults` is per-calendar
+    /// (CalendarSearchTool=250, CalendarReadTool=2500).
     static func fetchEventsFromAllCalendars(
         backends: [(provider: any CalendarProvider, account: Account)],
         timeMin: Date?,
@@ -182,17 +186,20 @@ enum CalendarToolHelpers {
         singleEvents: Bool = true,
         maxResults: Int = 250,
         orderBy: String = "startTime"
-    ) async -> (events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)], calendarNames: [String: String]) {
+    ) async -> (events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)], calendarNames: [String: String], unread: [String]) {
         var allEvents: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = []
         var calendarNames: [String: String] = [:]
+        var allUnread: [String] = []
 
-        await withTaskGroup(of: ([(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)], [String: String]).self) { group in
+        await withTaskGroup(of: ([(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)], [String: String], [String]).self) { group in
             for backend in backends {
                 let provider = backend.provider
                 let accountId = backend.account.id
+                let accountEmail = backend.account.emailAddress
                 group.addTask {
                     var events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = []
                     var names: [String: String] = [:]
+                    var unread: [String] = []
                     BackgroundSyncLogger.logDebug("[CalendarToolHelpers] account=\(accountId) provider=\(type(of: provider)) listCalendars starting")
                     do {
                         let allCalendars = try await provider.listCalendars()
@@ -243,23 +250,48 @@ enum CalendarToolHelpers {
                                 }
                             } catch {
                                 BackgroundSyncLogger.logDebug("[CalendarToolHelpers] listEvents FAILED for calendar '\(calendar.id)' acct=\(accountId): \(error)")
+                                unread.append(Self.unreadCalendarLabel(calendar, accountEmail: accountEmail))
                             }
                         }
                     } catch {
                         BackgroundSyncLogger.logDebug("[CalendarToolHelpers] listCalendars FAILED for account=\(accountId): \(error)")
+                        unread.append(Self.unreadAccountLabel(accountEmail))
                     }
-                    return (events, names)
+                    return (events, names, unread)
                 }
             }
-            for await (events, names) in group {
+            for await (events, names, unread) in group {
                 allEvents.append(contentsOf: events)
                 calendarNames.merge(names) { _, new in new }
+                allUnread.append(contentsOf: unread)
             }
         }
 
         allEvents.sort { ($0.event.startDate ?? .distantPast) < ($1.event.startDate ?? .distantPast) }
-        BackgroundSyncLogger.logDebug("[CalendarToolHelpers] fetchEventsFromAllCalendars: \(allEvents.count) events from \(backends.count) accounts, \(calendarNames.count) calendars")
-        return (allEvents, calendarNames)
+        allUnread.sort()
+        BackgroundSyncLogger.logDebug("[CalendarToolHelpers] fetchEventsFromAllCalendars: \(allEvents.count) events from \(backends.count) accounts, \(calendarNames.count) calendars, \(allUnread.count) not read")
+        return (allEvents, calendarNames, allUnread)
+    }
+
+    // MARK: - Calendars that could not be read (#1293)
+
+    /// How a calendar whose events could not be listed is named in a tool's result.
+    static func unreadCalendarLabel(_ calendar: GCalCalendar, accountEmail: String) -> String {
+        "\"\(calendar.summary ?? calendar.id)\" (\(accountEmail))"
+    }
+
+    /// How an account whose calendars could not be listed is named in a tool's result.
+    static func unreadAccountLabel(_ accountEmail: String) -> String {
+        "every calendar of \(accountEmail)"
+    }
+
+    /// `output`, followed by the calendars that could not be read when there are any,
+    /// so the assistant tells the user rather than reading their absence as no events.
+    static func withUnreadNote(_ output: String, unread: [String]) -> String {
+        guard !unread.isEmpty else { return output }
+        return output + "\n\n" + "These calendars could not be read, so their events are not listed: "
+            + unread.joined(separator: "; ")
+            + ". Tell the user they could not be read; do not say they have no events."
     }
 
     /// For each unique `recurringEventId` referenced by the supplied events,
