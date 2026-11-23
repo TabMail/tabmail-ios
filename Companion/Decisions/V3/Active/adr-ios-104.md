@@ -167,21 +167,27 @@ account gets one follow-up stage 2.** The design, its reasons and its history ar
 1. **Which calls are triggers.** Stage 1, the quick sync (`backgroundDeltaSync`: a return to the app,
    silent push, the open-app push, IMAP IDLE, background refresh and processing, and pull to refresh's
    change read), and stage 2 when a trigger runs it (`syncOrFollowUp`: the poll's tick, a return's herd,
-   and the follow-up itself).
+   item 5's triggers). The follow-up stage 2 (item 3) is not a trigger: it waits.
 2. **Take or flag.** A trigger takes the account's turn only when it is free
    (`oneSyncAtATimeOrFollowUp`). When anything else holds it (a pass, a listing, a catch-up slice, a
    reset), the trigger sets the account's in-memory follow-up flag (`SyncEngine.syncFollowUpWanted`),
    reads nothing and returns nil at once. A call from the task that holds the turn still runs in it (the
    re-entrancy amendment above).
-3. **One stage 2 per flag.** When the account's turn becomes free with the flag set (`handOverSyncPass`,
-   the branch with no waiter), the engine asks for one stage 2 (`syncFollowUp` ->
-   `SyncScheduler.runSyncFollowUp` -> `AccountManager.followUpRun`). Stage 2 clears the flag as its first
-   step inside the turn (`foregroundPass`), so however many triggers arrived, one stage 2 serves them and
-   its read starts after each of them; it runs the full sync when it is due (the #1275 amendment). A stage
-   2 that finds the account busy again leaves the flag for that pass's end. Every free release asks again
-   while the flag is set.
-4. **Foreground only.** Stage 2 starts only in the foreground (`SyncScheduler.stageTwoMayStart`: the poll
-   timer runs, sync is not disabled, no demo mode, no background processing fast sync). In the background
+3. **One stage 2 per flag, waiting in the trigger's place.** Setting the flag asks for one stage 2, the
+   follow-up (`syncFollowUp` -> `SyncScheduler.runSyncFollowUp` -> `AccountManager.followUpRun` ->
+   `SyncEngine.followUpPass`). The follow-up waits in line for the turn (`oneSyncAtATime`), so it starts as
+   soon as the work holding the turn ends, even when that work takes the turn again at once (a catch-up's
+   next slice: at most one slice, as when the trigger itself waited). At its turn it runs stage 2 only if
+   the flag is still set. Stage 2 clears the flag as its first step inside the turn (`foregroundPass`), so
+   however many triggers arrived, one stage 2 serves them and its read starts after each of them; it runs
+   the full sync when it is due (the #1275 amendment). A follow-up whose flag an earlier stage 2 served
+   does nothing and reports nothing; one that ran reloads the inbox (`.inboxDataDidChange`), as a push's
+   own read does. When the turn becomes free with the flag still set (`handOverSyncPass`, the branch with
+   no waiter), the engine asks again: that serves a flag set in the background, whose first ask started
+   nothing, at the next opening. Removing an account (`SyncEngine.remove`) drops its flag.
+4. **Foreground only.** Stage 2 starts only in the foreground (`SyncScheduler.stageTwoMayStart`: the app
+   is not in the background, read from `UIApplication.applicationState` as the silent-push path reads it,
+   sync is not disabled, no demo mode, no background processing fast sync). In the background
    the flag waits: the next opening's stage 1 frees the account and asks again. The flag is not stored; a
    launch runs every account's stage 1 and stage 2 anyway.
 5. **A trigger that finds its own work running.** A poll tick that lands during a poll (#1313) and a
@@ -190,25 +196,37 @@ account gets one follow-up stage 2.** The design, its reasons and its history ar
    flagged. The running work does the rest (the queued work, the push re-subscribe).
 6. **The poll never waits for a busy account.** It reports the account `skipped`
    (`AccountManager.SyncResult.skipped`) and goes on to the queued work (actions, outbox, calendar). A run
-   with a skipped account is partial, so it never clears the inbox error banner; the follow-up reports its
-   own account as a partial run.
-7. **Time limits count from the turn.** A trigger never waits, so its caller's time limit
-   (`SyncConfig.perAccountSyncTimeoutSeconds` for stage 2 and pull to refresh's change read,
-   `SyncConfig.backgroundPerAccountTimeoutSeconds` for stage 1) and the deadline its change read is
-   measured against (the 2026-11-12 amendment) start when its pass takes the turn. In v1.11.4 a stage 2
-   queued behind stage 1 could reach its turn with no time left and read nothing (#1289).
-8. **What still waits** (first in first out, no time cap, item 4): `sync(account:)` for Settings, a new
-   account and the epoch rebuild; single-folder listings (`syncFolderMessages`: pull to refresh's folders
-   on screen, message detail and its other callers); catch-up slices; the Settings resets
-   (`withSyncTurns`). None is a trigger, and none has a time limit that counts the wait. Pull to refresh's
-   listing therefore still waits for a running stage 2, which its own limit bounds (60 s from its turn,
-   plus the time to stop after cancellation).
+   with a skipped account is partial, so it never clears the inbox error banner. So is a pull to refresh
+   whose change read found an account busy (`AccountManager.syncFolders` returns it). The follow-up
+   reports its own account as a partial run.
+7. **No time limit counts a wait for another pass's turn.** A trigger never waits for one: its caller's
+   time limit (`SyncConfig.perAccountSyncTimeoutSeconds` for the poll's stage 2 and pull to refresh's
+   change read, `SyncConfig.backgroundPerAccountTimeoutSeconds` for stage 1) and the deadline its change
+   read is measured against (the 2026-11-12 amendment) start before only its own connection check
+   (`AccountManager.ensureConnected`, unchanged). The follow-up waits, so it takes its change read's
+   deadline (`perAccountSyncTimeoutSeconds` from its turn) when it gets the turn. It has no outer timeout,
+   like `sync(account:)` from Settings: a waiter cancelled by a timeout would still take the turn and clear
+   the flag without reading. Its change read is bounded from its turn; a due full sync in it runs to its
+   end. In v1.11.4 a stage 2 queued behind stage 1 could reach its turn with no time left and read nothing
+   (#1289).
+8. **What still waits** (first in first out, item 4): the follow-up stage 2 (item 3); `sync(account:)` for
+   Settings, a new account and the epoch rebuild; single-folder listings (`syncFolderMessages`: pull to
+   refresh's folders on screen, message detail and its other callers); catch-up slices; the Settings
+   resets (`withSyncTurns`). None is a trigger, and none has a time limit that counts the wait. Pull to
+   refresh's listing therefore still waits for a running stage 2: the poll's is bounded by its 60 s limit
+   from its turn plus the time to stop after cancellation; a follow-up, or a stage 2 from Settings, has no
+   outer timeout, so a due full sync in it is waited for to its end.
 
 **Cost:** at an opening, an account flagged before the opening's poll reached it runs one extra quick
 read (its follow-up stage 2 runs when its stage 1 ends, then the poll's stage 2 reads again and finds the
-full sync recorded). **Rejected:** a wait cap; dropping a busy trigger (a dropped new-mail signal); a timer,
-debounce gap or recent-sync guard (#1275); starting stage 2 in the background (a silent push already
-schedules background work, and the next push, poll or opening reads the rest); storing the flag.
+full sync recorded). Per flag set in the foreground, one MainActor task that reads the account row,
+checks the connection and waits in line. **Rejected:** a wait cap; dropping a busy trigger (a dropped
+new-mail signal); a timer, debounce gap or recent-sync guard (#1275); starting stage 2 in the background (a
+silent push already schedules background work, and the next push, poll or opening reads the rest); storing
+the flag; a follow-up that takes or flags the turn like a trigger (first draft of this amendment: work that
+takes the turn again at once, a catch-up's back-to-back slices, beat it at every release, so its read
+waited for the whole catch-up instead of one slice, and each free release asked again, running a second
+stage 2 for one flag); a timeout around the waiting follow-up (a cancelled waiter clears the flag unread).
 
 Superseded wording, kept: in item 1, "A pass that arrives while another of the same account runs waits its
 turn and then runs; a caller's timeout includes the wait" (only work that is not a trigger waits now, and
@@ -222,17 +240,24 @@ is now `sync(account:)`; a trigger is flagged); in the #1275 amendment's tests, 
 behind the first" (the `sync(account:)` pass only).
 
 Tests: `SyncFollowUpTests`: `busyTriggersGetOneStageTwo` (stage 1 or the poll's stage 2, alone or in a
-burst of three, returns at once while the account is busy and reads nothing; the release asks for one stage
-2, which reads once from the fresh cursor and runs the due full sync once), `flagWaitsForAStageTwo` (a flag
-no stage 2 answered stays set, and every release asks again until a stage 2 runs and clears it),
-`stageTwoAfterALongStageOneReads` (a stage 2 asked for during a stage 1 that outlasts its time limit still
-reads, its limit counted from its turn), `openingRunsTheFullSyncOnceAndReadsLast` (at an opening the due
-full sync runs once per account, and each account's last read starts after its stage 1 ends: the poll
-during stage 1, an account flagged before the opening, the poll first), `pollTickDuringAPollRunsStageTwo`
-(#1313), `returnDuringAReturnRunsStageTwo` and `herdSkipBranchAsksForStageTwo` (#1314),
-`followUpRunsInTheForegroundOnly`; `SyncRunBannerEntryPointTests.busyAccountPollNeverClears` (a poll with a
-busy account returns at once and does not clear the banner, nor does the account's follow-up; a later full
-run does); `GmailCatchUpTests.sliceHandsTheTurnOn` and `jobHandsTheTurnOnBetweenSlices` (a trigger during a
-catch-up is flagged, and the follow-up is asked for at the next slice boundary). `OneSyncAtATimeTests`'
+burst of three, returns at once while the account is busy and reads nothing; the flag asks once for one
+follow-up, which waits in line, reads once from the fresh cursor when the turn is released and runs the due
+full sync once), `flagWaitsForAStageTwo` (a flag no stage 2 answered stays set, and every release asks
+again until a stage 2 runs and clears it), `stageTwoAfterALongStageOneReads` (a follow-up asked for during a
+stage 1 that outlasts its time limit still reads, its limit counted from its turn),
+`servedFollowUpReadsNothing` (a follow-up whose flag a second follow-up or a stage 2 from Settings served
+first reads nothing), `removingAnAccountDropsItsFlag`, `openingRunsTheFullSyncOnceAndReadsLast` (at an
+opening the due full sync runs once per account, and each account's last read starts after its stage 1
+ends: the poll during stage 1, an account flagged before the opening, the poll first),
+`fuzzEveryTriggerGetsALaterRead` (seeded triggers, poll passes and held work with read latency and a clock
+that jumps past every limit: every trigger gets a change read that starts after it, passes never overlap,
+the flag ends empty), `pollTickDuringAPollRunsStageTwo` (#1313), `returnDuringAReturnRunsStageTwo` and
+`herdSkipBranchAsksForStageTwo` (#1314), `followUpRunsInTheForegroundOnly`;
+`SyncRunBannerEntryPointTests.busyAccountPollNeverClears` (a poll with a busy account returns at once, reads
+nothing and does not clear the banner, nor does the account's follow-up, which reads it once; a later full
+run does) and `busyChangeReadRefreshNeverClears` (a unified-inbox pull whose change read finds an account
+busy does not clear; with the account free it does); `GmailCatchUpTests.sliceHandsTheTurnOn` and
+`jobHandsTheTurnOnBetweenSlices` (a trigger during a catch-up is flagged, and its follow-up reads at the
+next slice boundary, within one slice). `OneSyncAtATimeTests`'
 waiting cases (`secondPassWaitsForTheFirst`, `waitingPassKeepsTheFreshCursor`, `throwingPassHandsTheTurnOn`,
 `removedWhileWaitingDoesNothing`) now queue `sync(account:)`, the form that still waits.

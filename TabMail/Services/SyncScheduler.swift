@@ -245,18 +245,20 @@ final class SyncScheduler {
         isPollActive = pollActive
     }
 
-    private var foregroundForTesting = false
+    /// nil outside the harness below: the app's own state decides.
+    private var foregroundForTesting: Bool?
     private var foregroundReadinessHook: (@MainActor @Sendable () async -> Bool)?
     private var stageTwoHook: (@MainActor @Sendable (_ trigger: String) async -> Void)?
 
     /// Test harness for the follow-up stage 2 (the sync design block in
-    /// SyncEngineOneSyncAtATime.swift): `foreground` stands for the poll timer
-    /// running, `foregroundReady` for the first-paint gate, and `stageTwo`
-    /// records each stage 2 the scheduler starts instead of running it.
+    /// SyncEngineOneSyncAtATime.swift): `foreground` stands for the app's
+    /// state, `foregroundReady` for the first-paint gate, and `stageTwo`,
+    /// when given, records each stage 2 the scheduler starts instead of
+    /// running it.
     init(
         foreground: Bool, pollActive: Bool = false,
         foregroundReady: @escaping @MainActor @Sendable () async -> Bool = { true },
-        stageTwo: @escaping @MainActor @Sendable (_ trigger: String) async -> Void
+        stageTwo: (@MainActor @Sendable (_ trigger: String) async -> Void)? = nil
     ) {
         foregroundForTesting = foreground
         isPollActive = pollActive
@@ -265,13 +267,16 @@ final class SyncScheduler {
     }
     #endif
 
-    /// The app is in the foreground: the poll timer runs from
-    /// `startForegroundPolling` until `stopPolling`.
+    /// The app is in the foreground now, read from the app's own state as the
+    /// silent-push path reads it, not from the poll timer (the timer can be
+    /// missing while the app is in front, and a tick already sent can still
+    /// run after `stopPolling`). Inactive (a sheet or Control Center over the
+    /// app) counts as foreground: the app is on screen.
     private var isForeground: Bool {
         #if DEBUG
-        if foregroundForTesting { return true }
+        if let foregroundForTesting { return foregroundForTesting }
         #endif
-        return timer != nil
+        return UIApplication.shared.applicationState != .background
     }
 
     /// The first-paint gate of a foreground return (`AppStartup.awaitLaunchReady`).
@@ -1075,11 +1080,14 @@ final class SyncScheduler {
             && !AccountManagerState.shared.fastSyncModeActive
     }
 
-    /// Runs the one stage 2 an account's follow-up flag asks for, when the work
-    /// that held its turn has ended (`SyncEngine.handOverSyncPass`). When a
-    /// stage 2 may not start, as in the background, it starts nothing: the flag
-    /// stays set, and the next opening's stage 1 asks again when it ends. When
-    /// another pass took the turn first, the flag stays set for that pass's end.
+    /// Runs the one stage 2 an account's follow-up flag asks for
+    /// (`AccountManager.followUpRun` -> `SyncEngine.followUpPass`), asked when a
+    /// trigger sets the flag and again when the account becomes free with the
+    /// flag set. It waits for the work holding the turn to end. When a stage 2
+    /// may not start, as in the background, it starts nothing: the flag stays
+    /// set, and the next opening's stage 1 asks again when it ends. When the
+    /// follow-up read, the inbox reloads, as after a push's own read
+    /// (`backgroundPoll`): the trigger's reload came before this read.
     func runSyncFollowUp(accountId: String) async {
         guard stageTwoMayStart else {
             BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): no stage 2 now, the flag waits")
@@ -1091,7 +1099,8 @@ final class SyncScheduler {
         guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: accountId) }),
               account.isActive else { return }
         BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): stage 2")
-        _ = await manager.followUpRun(account)
+        guard await manager.followUpRun(account) != nil else { return }
+        NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
     }
 
     /// Stage 2 for every account, for a trigger that found the work it would

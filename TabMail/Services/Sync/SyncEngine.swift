@@ -381,6 +381,9 @@ actor SyncEngine {
     func remove(accountId: String) async {
         providers.removeValue(forKey: accountId)
         workQueues.removeValue(forKey: accountId)
+        // No follow-up is owed to a removed account. With its work queue gone no
+        // trigger can set the flag again (each returns before the turn).
+        syncFollowUpWanted.remove(accountId)
 
         // Cancel and await background tasks to ensure no stale references remain active
         if let backfillTask = headerBackfillTasks.removeValue(forKey: accountId) {
@@ -729,14 +732,14 @@ actor SyncEngine {
 
         // The work queue has several slots and does not serialize passes: a pass
         // of the same account running now finishes first (`oneSyncAtATime`).
-        // Settings, a new account and the epoch rebuild wait here; the poll and
-        // the follow-up use `syncOrFollowUp`, which never waits.
+        // Settings, a new account and the epoch rebuild wait here; the poll uses
+        // `syncOrFollowUp`, which never waits, and the follow-up `followUpPass`.
         return try await oneSyncAtATime(accountId: account.id) {
             try await self.foregroundPass(accountId: account.id, queue: queue, provider: provider, deadline: deadline)
         }
     }
 
-    /// Stage 2 as a sync trigger, for the poll and the follow-up stage 2: it runs
+    /// Stage 2 as a sync trigger, for the poll: it runs
     /// only when the account's turn is free, and returns nil, with the account's
     /// follow-up flag set, when another pass holds it (`oneSyncAtATimeOrFollowUp`;
     /// the sync design block in SyncEngineOneSyncAtATime.swift). It never waits
@@ -749,6 +752,30 @@ actor SyncEngine {
         let provider = queue.provider
         return try await oneSyncAtATimeOrFollowUp(accountId: account.id) {
             try await self.foregroundPass(accountId: account.id, queue: queue, provider: provider, deadline: deadline)
+        }
+    }
+
+    /// The follow-up stage 2 a set flag asks for (`SyncScheduler.runSyncFollowUp`
+    /// -> `AccountManager.followUpRun`; the sync design block in
+    /// SyncEngineOneSyncAtATime.swift). Unlike a trigger it waits in line for the
+    /// account's turn, so it starts as soon as the work holding the turn ends,
+    /// even when that work takes the turn again at once (a catch-up's next
+    /// slice). It runs stage 2 only if the flag is still set when it gets the
+    /// turn, and returns nil, doing nothing, when a stage 2 that ran in between
+    /// served it: two asks for one flag run one stage 2. Its time limit starts at
+    /// its turn (the change read's deadline is taken there). No outer timeout: a
+    /// waiter it cancelled would still take the turn and clear the flag without
+    /// reading.
+    func followUpPass(accountId: String) async throws -> Bool? {
+        guard let queue = workQueues[accountId] else { return nil }
+        let provider = queue.provider
+        return try await oneSyncAtATime(accountId: accountId) {
+            guard self.syncFollowUpWanted.contains(accountId) else {
+                BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): served by an earlier stage 2")
+                return nil
+            }
+            let deadline = self.changeReadClock().addingTimeInterval(SyncConfig.perAccountSyncTimeoutSeconds)
+            return try await self.foregroundPass(accountId: accountId, queue: queue, provider: provider, deadline: deadline)
         }
     }
 

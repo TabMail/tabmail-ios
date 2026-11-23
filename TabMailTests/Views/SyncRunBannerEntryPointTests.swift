@@ -88,6 +88,10 @@ struct SyncRunBannerEntryPointTests {
     }
 
     private func tearDown(_ world: World, _ saved: (String?, Date?, Bool)) async {
+        // A test that registered an account with the sync engine (no-op otherwise).
+        let engine = await AccountManager.shared.syncEngine
+        await engine.remove(accountId: world.accountA.id)
+        await engine.remove(accountId: world.accountB.id)
         await AccountManager.shared.unregisterProviderForTesting(accountId: world.accountA.id)
         await AccountManager.shared.unregisterProviderForTesting(accountId: world.accountB.id)
         await AccountManager.shared.clearAuthFailed(world.accountA.id)
@@ -256,6 +260,10 @@ struct SyncRunBannerEntryPointTests {
     /// The follow-up stage 2 reports as a partial run, so it never clears either;
     /// the next run that syncs every account does. RED while a poll waited for a
     /// busy account, and while a skipped account counted as a success.
+    ///
+    /// Account A is registered with the sync engine here (the other tests leave
+    /// the engine out), so its passes take the account's turn and the held turn
+    /// makes it busy; its reader answers with no changes.
     @Test("a poll with a busy account returns at once and never clears; nor does the account's follow-up")
     func busyAccountPollNeverClears() async throws {
         try await withWorld { world in
@@ -264,6 +272,18 @@ struct SyncRunBannerEntryPointTests {
             await world.setFailing(false)
             let engine = await AccountManager.shared.syncEngine
             let accountId = world.accountA.id
+            try await world.pool.write { db in
+                _ = try Account.filter(Column("id") == accountId)
+                    .updateAll(db, Column("lastHistoryId").set(to: "100"), Column("lastFullSyncAt").set(to: Date()))
+            }
+            await world.providerA.setChangeReader { _, request in
+                ChangeSet(account: .set("200"), folderList: nil, folders: request.folders.map {
+                    FolderChanges(folderId: $0.id, status: .tracked, addressEpoch: nil, records: [], removals: [])
+                })
+            }
+            await engine.register(
+                accountId: accountId, provider: world.providerA,
+                workQueue: ProviderWorkQueue(provider: world.providerA, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
             let log = OneSyncAtATimeTests.PassLog()
             let release = AsyncStream<Void>.makeStream()
             let holder = OneSyncAtATimeTests.heldPass(
@@ -285,6 +305,16 @@ struct SyncRunBannerEntryPointTests {
             while runs.withLock({ $0.count }) < 2, Date() < waitEnd { try await Task.sleep(for: .milliseconds(10)) }
             let returnedWhileHeld = runs.withLock { $0.count } == 2
             #expect(returnedWhileHeld, "a poll waited for the busy account's turn")
+            let readsWhileHeld = await world.providerA.changeRequests.count
+            #expect(readsWhileHeld == 0, "a poll read the busy account")
+            let bannerAfterPolls = banner
+
+            // The account's follow-up stage 2 once the turn is free: the one the
+            // engine asked the app's scheduler for (it starts only while the test
+            // host is in the foreground), or this one, whichever takes the turn
+            // first; the other finds the flag served. Once both polls have
+            // returned, only a follow-up's report sets the completion time.
+            AccountManagerState.shared.lastSyncCompletedAt = nil
             release.continuation.yield()
             await holder.value
             let bannerAfterForeground = await polls.value
@@ -292,21 +322,140 @@ struct SyncRunBannerEntryPointTests {
             let everyRunSkipped = results.count == 2 && results.allSatisfy(\.skipped)
             #expect(everyRunSkipped, "a run with a busy account did not report it skipped")
             #expect(bannerAfterForeground == InboxErrorBanner.genericMessage, "a foreground poll with a busy account cleared the banner")
-            #expect(banner == InboxErrorBanner.genericMessage, "a background poll with a busy account cleared the banner")
+            #expect(bannerAfterPolls == InboxErrorBanner.genericMessage, "a background poll with a busy account cleared the banner")
 
-            // The account's follow-up stage 2, now that it is free.
-            var followUp: AccountManager.SyncResult?
+            _ = await AccountManager.shared.followUpRun(world.accountA)
             waitEnd = Date().addingTimeInterval(10)
-            while followUp == nil, Date() < waitEnd {
-                followUp = await AccountManager.shared.followUpRun(world.accountA)
-                if followUp == nil { try await Task.sleep(for: .milliseconds(20)) }
+            while AccountManagerState.shared.lastSyncCompletedAt == nil, Date() < waitEnd {
+                try await Task.sleep(for: .milliseconds(10))
             }
-            let followUpRan = followUp != nil
-            #expect(followUpRan, "the follow-up stage 2 never ran")
+            let followUpReported = AccountManagerState.shared.lastSyncCompletedAt != nil
+            let followUpReads = await world.providerA.changeRequests.count
+            let stillWanted = await engine.followUpWanted(accountId: accountId)
+            let flagServed = !stillWanted
+            #expect(followUpReported, "the follow-up stage 2 never ran to its report")
+            #expect(followUpReads == 1, "the follow-up did not read the busy account once: \(followUpReads) reads")
+            #expect(flagServed, "the follow-up left the flag set")
             #expect(banner == InboxErrorBanner.genericMessage, "the follow-up, a partial run, cleared the banner")
 
             _ = await AccountManager.shared.foregroundPollRun()
             #expect(banner == nil, "non-vacuity: a run that syncs every account clears")
+        }
+    }
+
+    /// A unified-inbox refresh whose change read finds an account busy (its
+    /// follow-up flag set instead) did not read that account: it is a partial
+    /// run and never clears the banner. RED while a busy change read counted as
+    /// read. A pass that queued behind A's listing takes A's turn when the
+    /// listing ends, so A's change read, which follows its listing, finds it
+    /// held. With A free, the same refresh clears.
+    @Test("a unified-inbox refresh whose change read finds an account busy never clears")
+    func busyChangeReadRefreshNeverClears() async throws {
+        try await withWorld { world in
+            await raiseThroughRefresh(world)
+            #expect(banner == InboxErrorBanner.genericMessage)
+            await world.setFailing(false)
+            let engine = await AccountManager.shared.syncEngine
+            let accountId = world.accountA.id
+            try await world.pool.write { db in
+                _ = try Account.filter(Column("id") == accountId)
+                    .updateAll(db, Column("lastHistoryId").set(to: "100"), Column("lastFullSyncAt").set(to: Date()))
+            }
+            await world.providerA.setChangeReader { _, request in
+                ChangeSet(account: .set("200"), folderList: nil, folders: request.folders.map {
+                    FolderChanges(folderId: $0.id, status: .tracked, addressEpoch: nil, records: [], removals: [])
+                })
+            }
+            await engine.register(
+                accountId: accountId, provider: world.providerA,
+                workQueue: ProviderWorkQueue(provider: world.providerA, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
+
+            let log = OneSyncAtATimeTests.PassLog()
+            let release = AsyncStream<Void>.makeStream()
+            let held = Mutex<Task<Void, Never>?>(nil)
+            await world.providerA.setFetchMessagesHook { _ in
+                let first = held.withLock { $0 == nil }
+                guard first else { return }
+                let pass = OneSyncAtATimeTests.heldPass(
+                    engine: engine, accountId: accountId, name: "held", log: log, release: release.stream)
+                held.withLock { $0 = pass }
+                // In line behind the listing before the listing ends.
+                let inLine = Date().addingTimeInterval(10)
+                while await engine.syncPassWaiters[accountId]?.count != 1, Date() < inLine {
+                    try? await Task.sleep(for: .milliseconds(5))
+                }
+            }
+            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
+            await world.providerA.setFetchMessagesHook(nil)
+            let heldAfterListing = log.snapshot == ["start held"]
+            let readsWhileHeld = await world.providerA.changeRequests.count
+            let wanted = await engine.followUpWanted(accountId: accountId)
+            #expect(heldAfterListing, "precondition: a pass took A's turn when its listing ended")
+            #expect(readsWhileHeld == 0 && wanted, "precondition: A's change read found the account busy")
+            #expect(banner == InboxErrorBanner.genericMessage, "a refresh that did not read a busy account cleared the banner")
+
+            // The flag's follow-up (the app's scheduler's, when the test host is
+            // in the foreground, or this one), then the same refresh with A free.
+            release.continuation.yield()
+            if let pass = held.withLock({ $0 }) { await pass.value }
+            _ = await AccountManager.shared.followUpRun(world.accountA)
+            let settle = Date().addingTimeInterval(10)
+            while await engine.syncPassRunning.contains(accountId), Date() < settle {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
+            #expect(banner == nil, "non-vacuity: the same refresh with A free clears")
+        }
+    }
+
+    /// When the follow-up stage 2 read, the inbox reloads, as after a push's own
+    /// read: the trigger that set the flag reloaded before this read. RED
+    /// without the reload: what the follow-up read stayed off screen until the
+    /// next reload. Driven through the scheduler's own follow-up
+    /// (`SyncScheduler.runSyncFollowUp`, in the foreground); the app's scheduler
+    /// may serve the flag first, and its reload counts the same.
+    @Test("the follow-up stage 2 reloads the inbox once it read")
+    func followUpReloadsTheInbox() async throws {
+        try await withWorld { world in
+            let engine = await AccountManager.shared.syncEngine
+            let accountId = world.accountA.id
+            try await world.pool.write { db in
+                _ = try Account.filter(Column("id") == accountId)
+                    .updateAll(db, Column("lastHistoryId").set(to: "100"), Column("lastFullSyncAt").set(to: Date()))
+            }
+            await world.providerA.setChangeReader { _, request in
+                ChangeSet(account: .set("200"), folderList: nil, folders: request.folders.map {
+                    FolderChanges(folderId: $0.id, status: .tracked, addressEpoch: nil, records: [], removals: [])
+                })
+            }
+            await engine.register(
+                accountId: accountId, provider: world.providerA,
+                workQueue: ProviderWorkQueue(provider: world.providerA, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
+            let log = OneSyncAtATimeTests.PassLog()
+            let release = AsyncStream<Void>.makeStream()
+            let holder = OneSyncAtATimeTests.heldPass(
+                engine: engine, accountId: accountId, name: "held", log: log, release: release.stream)
+            var waitEnd = Date().addingTimeInterval(10)
+            while log.snapshot.isEmpty, Date() < waitEnd { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(log.snapshot == ["start held"], "precondition: account A's turn is held")
+            let busy = try await engine.backgroundDeltaSync(account: world.accountA)
+            let busyReadNothing = busy == nil
+            #expect(busyReadNothing, "precondition: the trigger found the account busy")
+
+            let reloads = Mutex(0)
+            let observer = NotificationCenter.default.addObserver(forName: .inboxDataDidChange, object: nil, queue: nil) { _ in
+                reloads.withLock { $0 += 1 }
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
+            release.continuation.yield()
+            await holder.value
+            await SyncScheduler(foreground: true).runSyncFollowUp(accountId: accountId)
+            waitEnd = Date().addingTimeInterval(10)
+            while reloads.withLock({ $0 }) == 0, Date() < waitEnd { try await Task.sleep(for: .milliseconds(10)) }
+            let followUpReads = await world.providerA.changeRequests.count
+            let reloaded = reloads.withLock { $0 }
+            #expect(followUpReads == 1, "precondition: the follow-up read the account once: \(followUpReads) reads")
+            #expect(reloaded >= 1, "the follow-up read, and the inbox did not reload")
         }
     }
 

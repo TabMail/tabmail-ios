@@ -423,8 +423,12 @@ extension AccountManager {
     /// provider that is not in `accounts` is skipped. After its folders, each
     /// account in `accounts` runs one change read (`SyncEngine.backgroundDeltaSync`,
     /// #902); an account not in `accounts`, or one whose connect or re-list failed,
-    /// gets no change read.
-    func syncFolders(_ folders: [Folder], connecting accounts: [Account]) async throws {
+    /// gets no change read. Returns whether a change read found its account busy
+    /// (its follow-up flag set instead): the pull did not read that account, so
+    /// its run is not a success for every account (it never clears the inbox
+    /// banner).
+    @discardableResult
+    func syncFolders(_ folders: [Folder], connecting accounts: [Account]) async throws -> Bool {
         let grouped = Dictionary(grouping: folders) { $0.accountId }
         let affectedAccountIds = Array(grouped.keys)
         let accountsById = Dictionary(accounts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -436,7 +440,7 @@ extension AccountManager {
                 }
             }
         }
-        try await withThrowingTaskGroup(of: Void.self) { group in
+        return try await withThrowingTaskGroup(of: Bool.self) { group in
             for (accountId, accountFolders) in grouped {
                 let connected = providers[accountId]
                 let account = accountsById[accountId]
@@ -454,7 +458,7 @@ extension AccountManager {
                         provider = await self.provider(accountId: accountId)
                     }
                     // Removed while connecting (or connected with no mail provider): nothing to sync.
-                    guard let provider else { return }
+                    guard let provider else { return false }
                     // Pool creates connections on demand via checkout — no explicit connect needed.
                     for folder in accountFolders where !folder.path.isEmpty {
                         // Every listing goes through the one classifier (#755): an
@@ -485,25 +489,36 @@ extension AccountManager {
                     // turn: when another pass of the account runs, it sets the
                     // account's follow-up flag and reads nothing, and one stage 2
                     // follows when that pass ends (the sync design block in
-                    // SyncEngineOneSyncAtATime.swift; #1289). So its time limit counts
-                    // from when it runs. The pass reports a failed read in its
+                    // SyncEngineOneSyncAtATime.swift; #1289). So it never counts a
+                    // wait for another pass's turn. The pass reports a failed read in its
                     // result (the refresh still succeeds, as in the background); a
                     // timeout or what it rethrows (a database error, a failed retry
                     // after a connection error) fails the refresh.
-                    if let account {
-                        let timeout = SyncConfig.perAccountSyncTimeoutSeconds
-                        let deadline = Date().addingTimeInterval(timeout)
-                        let read = try await withTimeout(seconds: timeout) {
-                            try await syncEngine.backgroundDeltaSync(account: account, deadline: deadline)
-                        }
-                        if DebugModeManager.isLoggingEnabled() {
-                            let outcome = read.map { "changed=\($0.changed) reason=\($0.reason)" } ?? "busy, follow-up wanted"
-                            BackgroundSyncLogger.logDebug("[SyncFolders] change read for account \(accountId.prefix(6)): \(outcome)")
-                        }
+                    guard let account else { return false }
+                    let timeout = SyncConfig.perAccountSyncTimeoutSeconds
+                    let deadline = Date().addingTimeInterval(timeout)
+                    let read = try await withTimeout(seconds: timeout) {
+                        try await syncEngine.backgroundDeltaSync(account: account, deadline: deadline)
                     }
+                    if DebugModeManager.isLoggingEnabled() {
+                        let outcome = read.map { "changed=\($0.changed) reason=\($0.reason)" } ?? "busy, follow-up wanted"
+                        BackgroundSyncLogger.logDebug("[SyncFolders] change read for account \(accountId.prefix(6)): \(outcome)")
+                    }
+                    return read == nil
                 }
             }
-            try await group.waitForAll()
+            // Every account runs to the end; the first error is rethrown after
+            // all of them (#689), as `waitForAll` does.
+            var busy = false
+            var firstError: (any Error)?
+            while let result = await group.nextResult() {
+                switch result {
+                case .success(let skipped): busy = busy || skipped
+                case .failure(let error): if firstError == nil { firstError = error }
+                }
+            }
+            if let firstError { throw firstError }
+            return busy
         }
     }
 }

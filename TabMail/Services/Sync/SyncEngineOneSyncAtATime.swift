@@ -22,8 +22,9 @@ import Synchronization
 //   background processing read every folder. It is the lean path the startup,
 //   push and background budgets depend on (iOS memory 042).
 // - Stage 2 is `SyncEngine.foregroundPass`, run for each account by
-//   `SyncScheduler.poll()` (`syncOrFollowUp`) or by Settings, a new account and
-//   the epoch rebuild (`sync(account:)`): a quick sync, then the full sync when
+//   `SyncScheduler.poll()` (`syncOrFollowUp`), by the follow-up below
+//   (`followUpPass`) or by Settings, a new account and the epoch rebuild
+//   (`sync(account:)`): a quick sync, then the full sync when
 //   `lastFullSyncAt` says it is due or the read needs a listing. Only the
 //   foreground starts it:
 //   opening the app, the 5-minute poll timer (stopped when the app leaves the
@@ -41,6 +42,11 @@ import Synchronization
 //   in line and is never dropped. However many arrive, the account runs ONE
 //   stage 2 when the running work ends, which runs the full sync if it is due.
 //   The flag is cleared when that sync starts.
+// - That stage 2, the follow-up, is asked for when the flag is first set. It
+//   waits in line for the turn behind the running work, like work that is not a
+//   trigger, so it starts as soon as that work ends, even when the work takes
+//   the turn again at once (a catch-up's next slice). It runs only if the flag
+//   is still set when it gets the turn: a stage 2 that ran in between served it.
 // - Only an account that is free takes the quick-sync-only route.
 // - In the background a set flag waits for the next opening of the app: stage 2
 //   never starts in the background. A silent push already schedules background
@@ -54,15 +60,19 @@ import Synchronization
 //   listing (pull to refresh's folders on screen, message detail), a catch-up
 //   slice, a Settings reset, and stage 2 from Settings, a new account or the
 //   epoch rebuild (`sync(account:)`).
-// - Code: `oneSyncAtATimeOrFollowUp` sets the flag; `handOverSyncPass` asks for
-//   the stage 2 each time the account becomes free while the flag is set;
-//   `foregroundPass` clears it when it starts; `SyncScheduler.runSyncFollowUp`
-//   runs it, in the foreground only.
+// - Code: `oneSyncAtATimeOrFollowUp` sets the flag and asks for the follow-up
+//   when it sets it; `handOverSyncPass` asks again each time the account becomes
+//   free while the flag is set (a flag set in the background, whose ask started
+//   nothing); `followUpPass` waits for the turn and runs stage 2 if the flag is
+//   still set; `foregroundPass` clears the flag when it starts;
+//   `SyncScheduler.runSyncFollowUp` runs the follow-up, in the foreground only.
 //
-// Every time limit counts from when the sync starts running, never from when it
-// was asked for. Stage 2's limit (`SyncConfig.perAccountSyncTimeoutSeconds`)
-// starts when stage 2 takes the account's turn. In v1.11.4 it counted the wait
-// for the turn, so a stage 2 queued behind stage 1 had no time left (#1289).
+// No time limit counts a wait for another pass's turn. A trigger never waits for
+// one; only its own connection check (`AccountManager.ensureConnected`) runs
+// inside its limit before it takes or flags the turn, as before. The follow-up
+// waits, so it takes its limit (`SyncConfig.perAccountSyncTimeoutSeconds`) when
+// it gets the turn. In v1.11.4 a stage 2 queued behind stage 1 counted that wait
+// against its limit and had no time left (#1289).
 //
 // No recent-sync guard, of any length. A return to the app runs stage 1's quick
 // sync and then stage 2's own quick sync. They take turns, so they never collide,
@@ -131,20 +141,28 @@ extension SyncEngine {
     /// design block above; #1289): runs `pass` only when the account's turn is
     /// free. When another pass holds it, it sets the account's follow-up flag
     /// and returns nil at once: the trigger never waits in line, and it is not
-    /// dropped, because one stage 2 runs when the running work ends
-    /// (`handOverSyncPass`). Its caller's time limit therefore counts from
-    /// when its pass takes the turn. Re-entrant like `oneSyncAtATime`.
+    /// dropped, because one stage 2 runs when the running work ends. Setting
+    /// the flag asks for that stage 2 (`followUpPass`), which waits in line in
+    /// the trigger's place; while the flag stays set, later triggers only find
+    /// it set. Re-entrant like `oneSyncAtATime`.
     func oneSyncAtATimeOrFollowUp<T>(
         accountId: String, caller: String = #fileID, line: Int = #line, _ pass: () async throws -> T
     ) async rethrows -> T? {
         let task = Self.currentTaskIdentity()
         let heldByThisTask = task != nil && Self.heldSyncTurn[accountId] == task
         if !heldByThisTask && syncPassRunning.contains(accountId) {
-            syncFollowUpWanted.insert(accountId)
+            let first = syncFollowUpWanted.insert(accountId).inserted
             BackgroundSyncLogger.logDebug("[SyncTurn] \(accountId.prefix(8)): busy, follow-up wanted (\(caller):\(line))")
+            if first { syncFollowUp(accountId) }
             return nil
         }
         return try await oneSyncAtATime(accountId: accountId, caller: caller, line: line, pass)
+    }
+
+    /// Whether a follow-up stage 2 is still owed, so a follow-up asked for twice
+    /// does no work before its wait when the first already served the flag.
+    func followUpWanted(accountId: String) -> Bool {
+        syncFollowUpWanted.contains(accountId)
     }
 
     /// Waits for the account's turn; false only when the test harness released
@@ -243,10 +261,12 @@ extension SyncEngine {
     #endif
 
     /// Ends a pass: the oldest waiter takes the turn, or the account is free.
-    /// Once it is free, a trigger that found it busy gets its one stage 2: the
-    /// flag asks for it here, and the stage 2 clears the flag when it takes the
-    /// turn (`foregroundPass`). Until then every release asks again, so a
-    /// flag set in the background is asked for by the next opening's stage 1.
+    /// Once it is free with the flag still set, it asks for the follow-up stage 2
+    /// again (`followUpPass`, which clears the flag when it takes the turn). A
+    /// foreground flag's follow-up is usually already waiting, so the turn went
+    /// to it above; this ask serves a flag set in the background, whose first ask
+    /// started nothing, at the next opening's first release. A second ask for one
+    /// flag runs nothing: `followUpPass` finds the flag served.
     private func handOverSyncPass(accountId: String) {
         guard var waiting = syncPassWaiters[accountId], !waiting.isEmpty else {
             syncPassRunning.remove(accountId)
