@@ -54,3 +54,9 @@
 - Migrations that drop indexes must include the `ANALYZE` call and document what was superseded, so future readers understand why the index no longer exists.
 
 ---
+
+## Amendment 2026-11-23 (#1354): `messageBody_staleEvict`
+
+**Rule 1 applied.** `messageBody_staleEvict` on `messageBody(fetchedAt)` serves the stale-body evict step's keyset page (`SyncEngine.staleBodyPageSQL`: the next `pruneChunkSize` bodies older than the cache cutoff after a `(fetchedAt, rowid)` cursor, in index order). `EXPLAIN QUERY PLAN` before: `SCAN messageBody` (the old page, `LIMIT … OFFSET …`, walked the table from its start inside its write, through the overflow pages of every kept body, since `fetchedAt` is stored after the HTML). After: `SEARCH messageBody USING INDEX messageBody_staleEvict ((fetchedAt,rowid)>(?,?) AND fetchedAt<?)`, no scan, no temp B-tree; the first page is `(fetchedAt<?)`. Before it, `messageBody` had only its primary-key autoindex, and nothing else records when a body was cached, so no existing index could carry the predicate. A full index, not a partial one (rule 2): the stale set does not drain to empty (the rules keep inbox and recent bodies) and its bound moves with the clock. No index is dropped (rules 3 and 4). Only the evict step queries `fetchedAt`; every other `messageBody` access is by primary key, so no other plan can move to it.
+
+**Built deferred, rule 5 by the amended timing.** The index is in `SyncEngine.deferredIndexes` (IOS-PERF-005), not a migration, because building it reads every cached body once. The build is DDL, so the same maintenance pass's `runRefreshPlannerStatisticsIfStale` (which runs after it) refreshes the statistics. The evict step runs only once the index exists (`runEvictStaleBodiesIfIndexed`), so its page never runs unindexed. Detail: IOS-PERF-002 amendment of the same date.

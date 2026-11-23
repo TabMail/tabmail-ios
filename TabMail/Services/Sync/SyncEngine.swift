@@ -474,7 +474,7 @@ actor SyncEngine {
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
+            runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
         }
         let t2 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {

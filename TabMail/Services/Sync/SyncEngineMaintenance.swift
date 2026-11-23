@@ -206,6 +206,42 @@ extension SyncEngine {
         BackgroundSyncLogger.logDebug("[Prune] Done — now \(String(format: "%.1f", StorageEstimator.totalSizeMB()))MB")
     }
 
+    /// The stale-body evict step's page: the next `limit` bodies older than the
+    /// cutoff after the cursor, in `messageBody_staleEvict` order (`fetchedAt`, then
+    /// `rowid`), so it is a seek on that index, never a scan or a sort (#1354).
+    /// Arguments: `[cutoff, limit]` for the first page, and
+    /// `[cutoff, cursor fetchedAt, cursor rowid, limit]` after it.
+    nonisolated static func staleBodyPageSQL(afterCursor: Bool) -> String {
+        """
+        SELECT rowid AS bodyRowId, id, fetchedAt FROM messageBody
+        WHERE fetchedAt < ?\(afterCursor ? " AND (fetchedAt, rowid) > (?, ?)" : "")
+        ORDER BY fetchedAt, rowid LIMIT ?
+        """
+    }
+
+    /// The evict step as the maintenance pass runs it: only once its index
+    /// (`staleBodyIndexName`) exists. Returns whether it ran.
+    ///
+    /// Without the index every page would scan and sort the whole table inside its
+    /// write, the #1354 hold made worse. The index is deferred, built later in the
+    /// same pass (`runBuildDeferredIndexesIfMissing`), so the first pass after an
+    /// upgrade skips the step and the next one evicts; stale bodies stay cached one
+    /// pass longer, which changes nothing but disk use. A schema that cannot be read
+    /// counts as missing (retried next pass).
+    @discardableResult
+    nonisolated static func runEvictStaleBodiesIfIndexed(
+        dbPool: PrioritizedDatabase, undoProtectedBodyIds: Set<String>
+    ) -> Bool {
+        guard let missing = missingDeferredIndexes(dbPool), !missing.contains(staleBodyIndexName) else {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[BodyCache] evict waits for \(staleBodyIndexName)")
+            }
+            return false
+        }
+        runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
+        return true
+    }
+
     /// Nonisolated evict — runs entirely off the main thread.
     ///
     /// 🚨 THE FOURTH SWEEP. `994c5ca8f` (Stage C) gated three sweeps that decided
@@ -227,37 +263,56 @@ extension SyncEngine {
     /// `206ec48cf` had to repair `backfillFolderIdsIfNeeded` because the Stage C
     /// gate added a third per-row outcome to a loop whose variant assumed every row
     /// LEAVES the queried set each pass. That loop was UNCURSORED. This one is not:
-    /// its page is `LIMIT chunkSize OFFSET skipCount`, and every row of a batch
-    /// increments exactly one of `batchEvicted` (leaves the set) or `batchSkipped`
-    /// (advances the offset past it). So with `R` = rows still older than the TTL
-    /// cutoff and `S` = `skipCount`, each pass returns `min(chunk, R − S)` rows and
-    /// drives `R − S` down by exactly that many; it is bounded below by 0, and the
-    /// batch goes empty at `S ≥ R`. A KEEP outcome that counts as a SKIP therefore
-    /// sits INSIDE the existing variant and needs no measured counterpart — which is
-    /// why this gate does not repeat `206ec48cf`'s shape. The variant holds however
-    /// the uncursored page happens to be ordered, because only the COUNT of rows
-    /// returned enters it.
+    /// its page is the next `chunkSize` stale bodies after a cursor in
+    /// `(fetchedAt, rowid)` order (`staleBodyPageSQL`), and the cursor moves to the
+    /// page's last row whatever the rules did with each row, so a KEEP outcome needs
+    /// no counterpart. Every key visited is strictly greater than the one before and
+    /// below `(cutoff, ·)`. A body written during the run with a fresh `fetchedAt`
+    /// is above the cutoff and never enters, and one written with an old
+    /// `fetchedAt` is a single new key. So the run ends at its first empty page,
+    /// and no row is read twice.
+    ///
+    /// ## What one write holds (#1354)
+    ///
+    /// Until #1354 the page was `LIMIT chunkSize OFFSET skipCount`, searched INSIDE
+    /// the write, with `skipCount` growing by every body kept. `messageBody` had no
+    /// index on `fetchedAt`, and `fetchedAt` is stored after the HTML, so each page
+    /// walked the table from its start through the overflow pages of every kept
+    /// body while holding SQLite's single writer: 14-16 s per page on a device,
+    /// with Send's `.priority` writes queued behind it. The page is now a seek on
+    /// `messageBody_staleEvict` (a deferred index; `runEvictStaleBodiesIfIndexed`
+    /// runs this step only once it exists). A write reads at most `chunkSize` index
+    /// entries and those rows' leading `id` (never a kept body's HTML), the rules'
+    /// per-row lookups, and the pages it frees for the bodies it deletes. What one
+    /// write holds is therefore independent of the number of stale bodies kept and
+    /// of the table's size, and a run reads only the stale bodies. A `VACUUM` during a run can renumber `rowid`s. Only rows that share
+    /// the cursor's `fetchedAt` can then be read again (the rules keep a kept row
+    /// again) or skipped (a later run evicts it).
     nonisolated static func runEvictStaleBodies(dbPool: PrioritizedDatabase, undoProtectedBodyIds: Set<String>) {
         let ttlCutoff = Calendar.current.date(byAdding: .hour, value: -SyncConfig.bodyCacheTTLHours, to: Date()) ?? Date.distantPast
         let recentPerFolder = SyncConfig.bodyCacheRecentPerFolder
         let chunkSize = SyncConfig.pruneChunkSize
 
-        let totalStale = (try? dbPool.read { db in
-            try MessageBody.filter(Column("fetchedAt") < ttlCutoff).fetchCount(db)
-        }) ?? 0
-        guard totalStale > 0 else { return }
-
         var recentCache: [String: Set<String>] = [:]
         var evicted = 0
-        var skipCount = 0
+        // The last body looked at, as stored: `fetchedAt` is compared in the
+        // column's own representation, never re-encoded through `Date`.
+        var cursor: (fetchedAt: DatabaseValue, rowId: Int64)?
         while !Task.isCancelled {
+            let pageSQL = staleBodyPageSQL(afterCursor: cursor != nil)
+            let pageArguments: StatementArguments
+            if let cursor {
+                pageArguments = [ttlCutoff, cursor.fetchedAt, cursor.rowId, chunkSize]
+            } else {
+                pageArguments = [ttlCutoff, chunkSize]
+            }
             do {
-                let batchResult = try dbPool.write { db -> (evicted: Int, skipped: Int, batchEmpty: Bool) in
-                    let batch = try MessageBody
-                        .filter(Column("fetchedAt") < ttlCutoff)
-                        .limit(chunkSize, offset: skipCount)
-                        .fetchAll(db)
-                    guard !batch.isEmpty else { return (0, 0, true) }
+                let pageResult = try dbPool.write { db -> (evicted: Int, last: (fetchedAt: DatabaseValue, rowId: Int64)?) in
+                    let page = try Row.fetchAll(db, sql: pageSQL, arguments: pageArguments)
+                    guard let lastRow = page.last else { return (0, nil) }
+                    let lastFetchedAt: DatabaseValue = lastRow["fetchedAt"]
+                    let lastRowId: Int64 = lastRow["bodyRowId"]
+                    let batch: [ContentKey] = page.map { ContentKey(rawValue: $0["id"]) }
 
                     // The orphan leg's gate, computed ONCE per page and only for the
                     // keys that would take it. One batched existence probe replaces
@@ -266,12 +321,12 @@ extension SyncEngine {
                     // candidates, so `protectedKeys` is asked about exactly those.
                     // A throw here aborts the batch and deletes nothing — the
                     // fail-safe direction.
-                    let batchIds = batch.map(\.id.rawValue)
+                    let batchIds = batch.map(\.rawValue)
                     let existingHeaderIds = try Set(String.fetchAll(
                         db,
                         MessageHeader.select(Column("id")).filter(batchIds.contains(Column("id")))
                     ))
-                    let orphanCandidates = batch.map(\.id).filter {
+                    let orphanCandidates = batch.filter {
                         !existingHeaderIds.contains($0.rawValue)
                     }
                     // 🚨 FAIL-SAFE DIRECTION. `protectedKeys` throws only when the
@@ -288,9 +343,8 @@ extension SyncEngine {
                     }
 
                     var batchEvicted = 0
-                    var batchSkipped = 0
-                    for body in batch {
-                        // ⚠ STAGE E1 — TWO CROSSINGS IN FOUR LINES. `body.id` is a
+                    for key in batch {
+                        // ⚠ STAGE E1 — TWO CROSSINGS IN FOUR LINES. `key` is a
                         // CONTENT key; `undoProtectedBodyIds` holds `messageHeader.id`s
                         // (`UndoService.undoStack … messages.map(\.id)`) and the
                         // `fetchOne` below addresses `messageHeader` by primary key.
@@ -301,27 +355,24 @@ extension SyncEngine {
                         // `DatabaseValueConvertible`, so neither crossing is
                         // compiler-visible — `.rawValue` is spelled out to make them
                         // greppable.
-                        if undoProtectedBodyIds.contains(body.id.rawValue) {
-                            batchSkipped += 1
+                        if undoProtectedBodyIds.contains(key.rawValue) {
                             continue
                         }
-                        guard let header = try MessageHeader.fetchOne(db, key: body.id.rawValue) else {
+                        guard let header = try MessageHeader.fetchOne(db, key: key.rawValue) else {
                             // "No header holds this id" is a HEADER-space answer to a
                             // CONTENT-space question. It survives only as a PROTECTION
                             // term — it can no longer authorize the delete on its own.
                             // The ownership gate decides, and a key it cannot prove
-                            // dead is KEPT (counted as a skip, so the page cursor
-                            // still advances past it and the loop still terminates).
-                            guard !protectedOrphans.contains(body.id) else {
-                                batchSkipped += 1
+                            // dead is KEPT (the cursor still moves past it, so the
+                            // loop still terminates).
+                            guard !protectedOrphans.contains(key) else {
                                 continue
                             }
-                            try body.delete(db)
+                            try MessageBody.deleteOne(db, key: key.rawValue)
                             batchEvicted += 1
                             continue
                         }
                         if header.isInInbox {
-                            batchSkipped += 1
                             continue
                         }
                         if recentCache[header.folderId] == nil {
@@ -335,17 +386,16 @@ extension SyncEngine {
                             recentCache[header.folderId] = recentIds
                         }
                         if recentCache[header.folderId]?.contains(header.id) == true {
-                            batchSkipped += 1
                             continue
                         }
-                        try body.delete(db)
+                        try MessageBody.deleteOne(db, key: key.rawValue)
                         batchEvicted += 1
                     }
-                    return (batchEvicted, batchSkipped, false)
+                    return (batchEvicted, (lastFetchedAt, lastRowId))
                 }
-                if batchResult.batchEmpty { break }
-                evicted += batchResult.evicted
-                skipCount += batchResult.skipped
+                guard let last = pageResult.last else { break }
+                evicted += pageResult.evicted
+                cursor = last
             } catch {
                 BackgroundSyncLogger.logDebug("[BodyCache] Eviction failed: \(error)")
                 break
@@ -832,8 +882,26 @@ extension SyncEngine {
                 CREATE INDEX IF NOT EXISTS messageHeader_bodyRepopulateV2
                 ON messageHeader(isInInbox, headerComplete, bodyComplete,
                                  bodyEmptyConfirmed, bodyMetadataOversized, date)
+                """),
+        // #1354: the stale-body evict step's page (`staleBodyPageSQL`) seeks
+        // `fetchedAt < cutoff` after its cursor in this index's order, so a run reads
+        // the stale bodies' index entries and rows and never the rest of the table.
+        // Without it every page read every body, overflow pages included, because
+        // `fetchedAt` is stored after the HTML. Deferred, not built in a migration:
+        // the build reads every body once, seconds on a large cache, before any UI
+        // if it ran at launch. Its absence changes no result and nothing names it in
+        // an `INDEXED BY`; `runEvictStaleBodiesIfIndexed` runs the step only once it
+        // exists, so until this pass builds it stale bodies simply wait a pass.
+        DeferredIndex(
+            name: staleBodyIndexName,
+            sql: """
+                CREATE INDEX IF NOT EXISTS messageBody_staleEvict
+                ON messageBody(fetchedAt)
                 """)
     ]
+
+    /// The index the stale-body evict step seeks (`deferredIndexes`).
+    nonisolated static let staleBodyIndexName = "messageBody_staleEvict"
 
     /// Creates every deferred index that does not already exist, inside the caller's
     /// transaction.
