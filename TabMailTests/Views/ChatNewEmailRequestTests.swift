@@ -740,7 +740,7 @@ struct ChatNewEmailRequestHostedTests {
 
     // MARK: - Something up out of the screen's sight
 
-    @Test("While a new email opened out of the screen's sight is up, or an attachment preview, an open chat or the email screen takes no link; once it closes nothing comes up, and the screen takes the next", arguments: [false, true])
+    @Test("While a new email opened out of the screen's sight is up, a compose is counted as up, or an attachment preview is up, an open chat or the email screen takes no link; once the new email closes nothing comes up, and the screen takes the next", arguments: [false, true])
     func linkUnderSomethingOutOfSight(chat: Bool) async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await linkUnderSomethingOutOfSightBody(chat: chat) }
@@ -751,6 +751,9 @@ struct ChatNewEmailRequestHostedTests {
     /// same way, is presented above the screen's navigation, out of its sight. A screen that took
     /// the link anyway would ask for a cover UIKit cannot show while the other is up: it would come
     /// up once the other closes, or never, and the screen would then take no other link. Both fail.
+    /// In this setup the link is held while that cover is up even without the count of composes
+    /// up, so the count is also checked alone: raised while nothing is presented over the screen,
+    /// as while a compose's cover is still coming up, the way the preview's freeze is raised below.
     private func linkUnderSomethingOutOfSightBody(chat: Bool) async throws {
         let elsewhere = Elsewhere()
         try await withScreen { seed in
@@ -785,6 +788,22 @@ struct ChatNewEmailRequestHostedTests {
             try await ThreadChatTests.wait { !AgentToolRouter.shared.isComposeUp }
             let nothing = try await Self.keeps { screen.topPresented() == nil }
             #expect(nothing, "nothing comes up once it is closed")
+
+            // A compose counted as up while the screen still counts itself shown.
+            let router = AgentToolRouter.shared
+            router.composePresentationDidBegin()
+            let notTaken: Bool
+            do {
+                #expect(router.isComposeUp, "control: a compose is counted as up")
+                NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
+                notTaken = try await Self.keeps { screen.topPresented() == nil }
+            } catch {
+                router.composePresentationDidEnd()
+                throw error
+            }
+            router.composePresentationDidEnd()
+            #expect(notTaken, "the screen takes no link while a compose is counted as up")
+            #expect(!router.isComposeUp, "control: the count is down again")
 
             // An attachment preview is presented by UIKit, outside every screen's sight.
             PreviewFreezeGate.shared.begin()
