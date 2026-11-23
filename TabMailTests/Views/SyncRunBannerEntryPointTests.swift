@@ -423,9 +423,19 @@ struct SyncRunBannerEntryPointTests {
             #expect(stamped, "a refresh that found an account busy did not advance \"Updated\"")
 
             // The flag's follow-up (the app's scheduler only records its asks),
-            // then the same refresh with A free.
+            // then the same refresh with A free. The refresh also started the
+            // access run of the folders on screen (#1109), which waits behind the
+            // held pass: the order is fixed so the asks are the same every run.
+            // The pass hands the turn to the run's slice; the slice ends with the
+            // turn free and the flag still set, which asks again; then the
+            // follow-up below finds the turn free.
+            let runInLine = Date().addingTimeInterval(10)
+            while await engine.syncPassWaiters[accountId]?.count != 1, Date() < runInLine {
+                try await Task.sleep(for: .milliseconds(5))
+            }
             release.continuation.yield()
             if let pass = held.withLock({ $0 }) { await pass.value }
+            await engine.awaitAccessCatchUpForTesting(accountId: accountId)
             _ = await AccountManager.shared.followUpRun(world.accountA, mayStart: { true })
             let settle = Date().addingTimeInterval(10)
             while await engine.syncPassRunning.contains(accountId), Date() < settle {
