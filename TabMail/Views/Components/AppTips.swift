@@ -221,6 +221,30 @@ struct ChatPillTip: Tip {
     }
 }
 
+/// Shown once above the chat view's reply field, inline (a `TipView` in an overlay, never a popover,
+/// so it takes no touch from the field): a drag up opens the TabMail chat about the conversation
+/// (ADR-IOS-114 decision 22). Gone for good on the first drag, a tap that focuses the field, the
+/// panel opening, or its own close button (`invalidate`).
+struct ChatFieldDragTip: Tip {
+    static let text = "Drag up to see what you asked TabMail about this conversation."
+
+    var title: Text { Text(Self.text) }
+    var image: Image? { Image(systemName: "hand.draw") }
+
+    var rules: [Rule] {
+        #Rule(OnboardingTipGate.$onboardingComplete) { $0 == true }
+    }
+
+    var options: [any TipOption] {
+        MaxDisplayCount(1)
+    }
+
+    /// The user dragged or focused the field, or the panel opened: the tip never comes back.
+    static func close() {
+        ChatFieldDragTip().invalidate(reason: .actionPerformed)
+    }
+}
+
 /// Shown on the chat pill in compose view.
 struct ComposeChatPillTip: Tip {
     var title: Text { Text("Edit with AI") }

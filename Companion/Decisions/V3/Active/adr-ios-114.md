@@ -357,6 +357,19 @@ same AI result, kept as long as the email itself is shown.
      geometry log: without the re-issue the chat showed 488 and 386 points past its bottom, and with
      it the landing came back 2 ms after the jump. A phone check before the chat view merges to
      main is the check.
+   - The bottom inset in the re-issue's key (2026-11-21): the keyboard's arrival changes only the
+     bottom inset, neither the scroll view's size nor its content's. `ChatThreadViewLifecycleTests`
+     `bottomLandingFollowsABottomInset` and `unreadLandingKeepsItsAnchorThroughABottomInset` grow
+     only the bottom safe area (the hosting controller's additional safe-area inset, about a
+     keyboard's height), check that the field rose and the scroll view kept its size, and require
+     the landing to hold: the chat at its bottom, neither short of it nor pulled past it, with the
+     newest bubble as far above the risen field as it was above the field at the landing; the
+     Unread line where it landed; both for half a second of frames after. Where the platform keeps
+     the scroll offset the newest bubble would end under the risen field, and where it keeps the
+     bottom the Unread line would move up with it, so the two tests see the bottom-inset term
+     wherever the platform does not hold the landing by itself (amended 2026-11-22: they do not
+     prove that it never does; if both hold without the term, its removal is invisible on that
+     input).
 
    **Superseded 2026-11-09: the chat asks for the emails in view (decided 2026-11-06).**
    In the decision's words: "add a safety bound that you load up to something like 10 emails from the current visible
@@ -1127,7 +1140,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    and the ghost fades in (`ghostFadeDuration`, 0.2 s), as the mock's M2. A ghost with no working
    bubble before it still shows at once: the working bubble is held only while a grow is pending, so
    opening on a ready suggestion never shows it, and the ghost's removal always follows its
-   transaction. The dots cap at 30 fps. The arrival rise of the new email is not built here.
+   transaction. The dots cap at 30 fps. The arrival rise of the new email is not built here (it is decision 23).
+   On an arrival in a landed chat (decision 23) the swap back to Writing rides the arrival's rise
+   (at once under Reduce Motion); the fill and its re-pin stay their own, on Writing to ready.
 
    **Writing rule (2026-11-20):** Writing shows when the newest email meets the inbox row's one shared
    predicate, `AIWorkingRule` (tagged with no reply processed, or untagged in the Inbox with an AI
@@ -1290,6 +1305,292 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
       one builder, rather than of each caller. The rejected alternative was patching each caller with its
       own guard: review found a new missed caller in each round.
     Decided 2026-11-18.
+
+19. **The field, compact (amendment 2026-11-20).** Every open field bar (the chat's reply field,
+   the opened pill's input bar in the inbox, over a draft and on an email, and the tutorial's
+   copy) draws one row, `ChatFieldBarRow`, with the `ChatViewLayout.field*` values: the mic glyph
+   12 pt in from the field's edge, 10 pt from glyph to text, the 28 pt Send circle 6 pt in, 10 pt
+   above and below the text. The buttons sit on the text's LAST line, not its middle, and stay
+   there as the field grows; each lays out at its glyph's width and one line's height while its
+   tap area stays 44 pt tall and may reach past the field's edge. One line is 42 pt, the collapsed
+   field's corner `min(height / 2, 21)`. The collapsed Chat pill keeps its size. The line height
+   scales with the text size (`@ScaledMetric`), so at the largest sizes the buttons still centre
+   on the last line. The Stop and Retry glyphs keep their size. Tests:
+   `ChatThreadLayoutTests.fieldButtonsOnTheLastLine` and `signedInEmptyField` (the "e.g." line is
+   the last line, as in the option-B drawing), `ChatReplyFieldTests.everyOpenBarSharesTheRow`,
+   `statusLinePadding` and `tutorialArrowOnTheMic`.
+
+20. **The field is the chat's bottom bar (amendment 2026-11-20).** The reply field is the scroll
+   view's `.safeAreaBar(edge: .bottom, spacing: 0)`, as the header is its top bar (decision 15), so
+   the chat scrolls under it and the system blurs the strip below it, as in Messages; no field
+   floats over the chat in a `ZStack` any more. There is one field, always in the bar: the bar is a
+   slot of the collapsed field's measured height, and the opened pill grows upward out of it as an
+   overlay, so the bar's inset, and the chat under the panel, do not move when it opens. The field
+   keeps its 8 pt above the safe-area line (or the keyboard) inside the bar. The last row keeps only
+   `pillGap` (the inset keeps the field's room), and the landing is issued again when the bottom
+   inset changes (the field's height and the keyboard arrive as that inset). Tests:
+   `ChatThreadLayoutTests.chatScrollsBehindTheField` and `openingThePillKeepsTheChat`,
+   `ChatReplyFieldTests.messagesLayout` (the bottom bar, no plain bottom inset).
+
+21. **Drag the field up to open the TabMail chat (amendment 2026-11-20).** Until now the panel
+   opened only on an agent answer, a confirmation card or `.openMessageWithChat`. A drag up on the
+   collapsed reply field now opens it too, and the field itself swells into the panel: while the
+   finger moves, the field's top follows it (`ChatReplyField.drag`, `ChatFieldDrag.swell`, at most
+   `ChatViewLayout.fieldDragMaxSwell`); on let-go the panel opens with the pill's spring once the
+   swell, or a flick's predicted swell, reaches `fieldDragOpenDistance`, and otherwise the field
+   settles back. Only a drag more up than sideways counts, so the chat's sideways swipes are
+   unchanged. The swell is not the field's room: `pill(on:)` takes it back out of the layout right
+   after the field (`ChatFieldDrag.Swell(model: fieldDrag, sign: -1)`; formerly
+   `.padding(.top, -fieldDragProgress.swell)`), so the field's glass grows upward while its
+   measured height, the bar, its inset and the chat stay put; the two paddings read the same drag
+   state and spring back in the same reset transaction, so they cancel through the settle too.
+   They cancel only up to floating point (amended 2026-11-22): at some swells the measured height
+   reads an ulp off (a UI run: 158.287109375 as 158.28710937500003 under a 125 pt swell), which set
+   the bar's height, ran the chat's body and built the reply field again under a held drag; the
+   bar takes a measured height only once it moved by `ChatViewLayout.fieldHeightTolerance` (0.1 pt,
+   `ChatThreadView.pillHeightMoved`). **The drag state is read only in modifiers (amended 2026-11-22):** it lives in an observable
+   model (`ChatFieldDrag.Model`, held by `ChatThreadView.fieldDrag`) that only the two `Swell`
+   paddings, the drag's start and end watch (`ChatFieldDrag.Watch`) and the debug marker read, so a
+   moving finger redraws those modifiers and never rebuilds the chat's body or the reply field
+   (a UI run showed the field's text scrolling to its caret after the let-go, on the first layout
+   after builds made while the finger moved). While the field is dragged up, its swollen glass grows over the "Replying only to" line or
+   the no-reply notice above it, and the bar, the chat and its inset stay still, as designed. *Superseded 2026-11-21 (the compensation below needed three fixes and was deleted
+   for the padding above):* "from the drag's start until its swell has settled
+   (`ChatThreadView.fieldDragSettle`, the pill spring's own `settlingDuration`, so the two cannot
+   drift apart) the bar keeps its resting height, so the chat does not move during the swell or the
+   settle. The bar also ignores the field's height while the drag is in progress
+   (`fieldDragProgress.isDragging`): the drag's start queues the bar's geometry action and the
+   `onChange` that sets the settle token together, and SwiftUI runs deferred actions in an
+   unspecified order." The drag is a UIKit pan (`ChatFieldPan`, amended 2026-11-21), the
+   swipes' pan bridge (`ChatHorizontalPan`) turned vertical: it builds its pan as the swipes do
+   (`ChatFieldPan.makePan`, after `ChatHorizontalPan.makePan`) and takes its events through the same delivery
+   (`ChatHorizontalPan.deliver(_:moved:ended:)`: one two-axis `Sample` while it moves, then its last
+   sample and one outcome, finished or not), while its own rules (when it begins, what it waits
+   for) stay in its delegate and what it does with a sample stays in `ChatThreadView`. It starts only on a first movement more
+   up than sideways (`ChatFieldDrag.begins`), and once it starts it cancels the touch for the views
+   under it (`cancelsTouchesInView`), so a drag, short or long, never ends as a tap that focuses the
+   field; a tap never starts it and focuses the field as before. The field's text view keeps its
+   own gestures: the pan waits for its long presses (caret, loupe, selection), and its taps wait
+   for the pan. **Overflowing text (amended 2026-11-21, mock v15 H2):** while the focused field's
+   text (over its six lines) can still scroll, the text keeps the drag; once it reaches its end,
+   the rest of the SAME drag is the field's: its swell, its open distance and its flick, as for a
+   short draft. The pan runs beside the text's own scroll (`shouldRecognizeSimultaneouslyWith`),
+   notes the text under the drag's first touch, and hands on only the field's share of each sample
+   (`ChatFieldPan.Coordinator.share`, `ChatFieldDrag.fieldShare`): the finger's travel past the
+   point where the text reached its end; short of the end, no travel and no velocity, either way,
+   so a flick inside the text never opens the panel. Both axes of
+   the share count from the hand-off, where the text reached its end, found within the sample that
+   crosses it from the finger's travel (amended 2026-11-21, and 2026-11-22 for the crossing sample).
+   The hand-off is ONE point of the finger's travel, both axes (amended 2026-11-22): sideways taken
+   at the same point of the crossing sample, upward the previous sample's travel less the text's
+   remaining room, and a sample that reaches the end with no upward move hands off at its end; no
+   second origin (where the touch found the text) remains, so an axis cannot keep counting from an
+   earlier crossing after a reversal. Sideways
+   travel made while the text had the drag is not the field's, and a drag that reverses until the
+   text scrolls again drops the hand-off and takes a new one when the text is back at its end. Only
+   the finger takes the drag back (amended 2026-11-22): the hand-off drops when the text reads short of
+   its end once the finger has come down from its highest point since the hand-off by more than
+   `ChatViewLayout.fieldTextReversalSlack` (`ChatFieldPan.Coordinator.fingerCameBack`; 1 pt of text
+   the field keeps, one to three pixels by screen scale). The rule takes the text's own scroll to
+   follow the finger point for point while the finger drags it, so a finger that came down is taken to
+   have brought the text back whenever the text shows it. It is read from the finger's
+   distance, not from a sample's direction nor from how far short the text reads, and from the
+   farthest, not from where the finger is now, because the text's scroll and the pan run side by side
+   and UIKit does not say which hears a move first: the text can show a downward move one sample late,
+   when the finger is already going up again, or only at the let-go, and can show its end first in the
+   sample the finger turned down in, so that sample's move down counts too, from the sample before.
+   A text short of its end with the finger not come down moved without it, and an earned hand-off
+   survives that move, so the rest of the drag stays the field's; once the finger has come down, a text
+   short of its end drops the hand-off whatever moved it. Observed in a UI run, not documented by UIKit: on a layout
+   after the field was built again under a held drag past the end, UIKit scrolled the field's text to
+   its caret at its start, and the let-go read no share and the panel stayed shut; the
+   field's segment keeps the more-up-than-sideways rule, and whether the pan begins at all is
+   still decided on the drag's first movement. UIKit cannot
+   start a recognizer that failed earlier in the same touch, so waiting for the scroll could never
+   hand the rest of a drag to the field; sharing the touch keeps one delivery and one release path.
+   The collapsed reply editor's text never bounces vertically: the pan turns its vertical bounce off
+   (`bouncesVertically`) when a touch first lands in it, before the touch moves, and never turns it
+   back on, so past its end the text stays at its end while the field swells, as in H2; its own
+   scroll, caret and selection are unchanged (amended 2026-11-21; it replaces the known limit
+   "past its end the text's own bounce runs while the field swells"). Text that does not
+   scroll (a short draft) leaves the field the whole drag. *Superseded 2026-11-21 (overflowing
+   text could never drag the panel open):* "The field's text view goes first where it did: the pan
+   waits for its scroll (text overflowing the six lines) and its long presses (caret, loupe,
+   selection), and its taps wait for the pan." Its state (`ChatFieldDrag.Progress`) is
+   reset with the pill's spring however the drag ends (`fieldDragEnded`), so a cancelled drag (the
+   panel opening on an agent answer mid-drag, or a system interruption) springs back too. **The
+   panel opening cuts a held drag off itself (amended 2026-11-22):** UIKit cancels an active pan once
+   it is actually turned off, but the configuration update turning the pan off (`isEnabled`) did not
+   end a drag already held (a UI run showed it running on to its let-go with the swell held), so the chat's `onChange(of: chatExpanded)` calls `ChatFieldPan.Cut`, which sets
+   the held pan to cancelled (`Recognizer.cut`; a pan with no drag held is left as it is). The text
+   counts as at its end within `ChatViewLayout.fieldTextEndTolerance` (0.1 pt) of the end its sizes
+   give (`ChatFieldPan.Coordinator.isAtEnd`, amended 2026-11-22): UIKit holds the text on its own
+   value, which read a hair short of it, and the field then never got its share. **The release policy** (`ChatFieldDrag.opens(letGo:)`, amended 2026-11-21):
+   only a finished drag can open the panel. It opens when its swell (its upward travel, counted
+   only while it goes more up than sideways) reaches `fieldDragOpenDistance` (60 pt), or when its
+   predicted end does: the travel plus `ChatViewLayout.fieldFlickCarry` (0.25 s) of travel at the
+   let-go velocity (`ChatFieldDrag.predictedEnd`), which is SwiftUI's own projection
+   (`DragGesture.Value.predictedEndTranslation`), and only when that predicted end is more up than
+   sideways. The parity is for equivalent samples (amended 2026-11-21): a let-go with the same
+   travel and velocity SwiftUI's drag reported, on a drag that passes the begin rule, opens the
+   panel exactly when it did before the pan; it is not a promise for every physical flick, which
+   UIKit's pan and SwiftUI's drag measure in their own ways. A drag 30 pt up
+   let go at 90 pt/s predicts 52.5 pt and settles back; at 120 pt/s it predicts 60 pt and opens. The
+   pan stays on while the field has focus (mock v15 M2: "Type a question ... Drag up: your words ride
+   along"), so a short draft in the focused field opens the panel the same way and keeps its words,
+   and its keyboard (amended 2026-11-23, mock v15 H2: "Both open above the keyboard"): the reply
+   field and the panel's input are two text fields, each with its own focus value
+   (`DynamicIslandChat.InputFocus`), and the panel's opening (`onChange(of: isExpanded)`) moves the
+   focus a typed-in field holds to the panel's input. SwiftUI documents no order between that action
+   and the field's removal, so the swipe UI tests' drags from the typed-in field check on screen that
+   the panel's input has the keyboard. One shared value had let the field's focus go with it as it
+   left, and the panel opened with no keyboard (UI run 2026-11-23);
+   only the open panel and the tutorial turn it off. *Superseded 2026-11-21 (it carried a flick about
+   twice as far as SwiftUI's drag had, so slower flicks opened the panel):* "only a finished drag can
+   open the panel, from its swell or a flick's predicted swell (`ChatFieldDrag.predictedEnd`, a
+   scroll view's normal deceleration)." *Superseded
+   2026-11-21 (a short drag on the field ended as a tap and focused it):* "The drag's state is a
+   `@GestureState` (`ChatFieldDrag.Progress`) reset with the pill's spring, so a cancelled drag (the
+   panel opening on an agent answer mid-drag, a system interruption) springs back too; the let-go
+   only decides whether the panel opens." The drag holds the user-interaction freeze through `ChatSwipeHold` under
+   its own id (`ChatThreadView.fieldDragHoldId`) from its start until its swell has settled
+   (`ChatThreadView.fieldDragSettle`, the pill spring's own `settlingDuration`, so the two cannot
+   drift apart) plus the freeze rule's cooldown (`ChatViewLayout.freezeCooldown`, the part of
+   `swipeSettleHold` past the swipe spring) after it ends, finished or cancelled: one
+   `ChatSwipeHold.release(_:after:)` at the let-go, which a newer drag's `begin` cancels.
+   *Superseded 2026-11-21:* "One timer chain does both: at the settle the bar takes the field's
+   height, after the cooldown the freeze is released, so the hold always lasts at least the settle
+   plus the cooldown."
+   VoiceOver opens the panel with the named action "Show TabMail chat" on the element it focuses:
+   the text field, the sent words while the agent works, the waveform while dictating
+   (`showChatAction`), only while the panel is closed. Not in the tutorial, whose steps open the chat themselves. The panel stays dimmed
+   with the rest of the chat as built (the ghost dims with it). Tests: `ChatFieldDragTests`,
+   `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel`,
+   `testShortDragUpOnTheReplyFieldSettlesBack` and `testDraggedOpenPanelClosesOnCloseAndOnTheDim`
+   (taps), `ChatReplyFieldTests.fieldDragWiring`, the pan's rules in `ChatFieldDragTests`, and
+   `testDragUpInOverflowingTextScrollsIt` (the text keeps a drag short of its end: scrolled to its
+   top, a drag up within its scroll room moves another line to the top, read by tapping the
+   top-left corner and typing a mark, and the panel stays shut),
+   `testDragUpInOverflowingTextPastItsEndOpensThePanel` (signed in, the same drag carried past the
+   end opens the panel, whose editor holds the whole draft and keeps its focus, inside the panel
+   and above the keyboard when one shows), `testDragUpPastTheOpenDistanceInsideTheTextsRoomIsAllTheTexts` (a
+   sixteen-line draft: a drag past the open distance inside the text's room leaves the field's
+   glass still and the panel shut), `testDragUpPastTheTextsEndByLessThanTheOpenDistanceSettlesBack`
+   (past the open distance in all but past the end by less: the glass rises only by the rest, the
+   panel stays shut, and the debug marker's `over`, which the field's pan must have read, shows the
+   text reached its end and never went past it),
+   `testDoubleTapInOverflowingTextSelectsAWordToReplace` (the text view's own selection in an
+   overflowing draft: the typed word replaces the double-tapped one),
+   `ChatFieldDragTests.fieldShareOfATextDrag` and `panSharesWithTheTextUnderTheTouch` (the field's
+   share, from a touch-down offset that is not zero; `handOffClearsOnAReversal` and
+   `diagonalThenStraightUp` the hand-off's state, both axes; `handOffSurvivesATextScrollTheFingerDidNotMake`
+   the hand-off kept through a scroll of the text the finger did not make, a flick let go there, and
+   dropped by the finger coming back down, also after such a move; `handOffDropsWhenTheTextShowsTheFingersMoveLate` the
+   finger's reversal read when the text shows it a sample late, at a second crossing or at a rested
+   let-go; `handOffFoundOnAMoveDownCountsThatMove` a reversal in the very sample the text first shows
+   its end; `reversalHistoryEndsWithItsHandOff` each hand-off reading only its own reversal, after a
+   second crossing and in the next drag; `reversalSlack` the rule's own boundary and `reversalSlackThroughThePan` the same boundary through the
+   pan's share, speed included; `slowReversalAddsUp` a descent in half-point samples adding up past it; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
+   floating-point remainder; `handOffInsideACrossingSample` and
+   `handOffInsideACrossingSampleAfterAReversal` the hand-off inside a sample that crosses the end, where
+   the text reached it; `upwardShareCountsFromTheSecondHandOff` the upward share after a reversal,
+   `handOffWithNoUpwardMove` a crossing with no upward move, `noShareWhileTheTextHasTheDrag` no
+   travel and no speed in the text, up or down; `textUnderTheTouchDoesNotBounce` the
+   no-bounce rule; `textViewOrdering` pins the pan beside the text's scroll and not beside any other
+   pan in or on the text view, a selection handle's among them; the first was
+   `testDragUpInOverflowingTextScrollsItAndShortTextOpens`, whose short half ran signed out, where
+   the sign-in bar replaces the panel's editor), the text's long press
+   (`testLongPressInTheFocusedFieldMovesTheCaret`: a held press at the text's start puts the caret
+   there; `testLongPressThenDragUpInTheFocusedFieldStaysTheTexts`: a held press then a drag up
+   stays the text's; `ChatFieldDragTests.textViewOrdering`: the long press never waits for the
+   field's drag), `testDragUpOnAShortFocusedDraftOpensThePanelWithIt`
+   (signed in through the fixture's `--chat-swipe-signed-in`: the panel's editor holds the draft
+   and keeps its focus, above the keyboard where one shows, and Close gives the field back without
+   it; `testDragUpOnTheUnfocusedSignedInFieldOpensThePanelWithTheKeyboardDown`: with no keyboard
+   the panel opens with none; `ChatReplyFieldTests.fieldDragWiring` pins the two focus values and
+   the hand-over, in code, not comments),
+   `testDragCutOffByThePanelOpeningSettlesAndTheNextDragWorks` (the fixture's
+   `--chat-swipe-open-panel-under-drag` opens the panel the moment the debug marker sees the held
+   drag swollen past the open distance, which turns the pan off: the marker records the opening's
+   request and then the cut, in that order, so the drag ended with the finger still down (the
+   panel's own opening is read from its Close button); the freeze is
+   released, the field is back at rest, the next drag opens),
+   `testOpenActionsDragUpOnTheReplyFieldOnlyCloses` and the back swipes that start at the field
+   (`testNothingOpenRightDragOnTheReplyFieldGoesBack`, `testNothingOpenEdgeDragOnTheReplyFieldGoesBack`
+   from the margin beside it, and `testNothingOpenEdgeDragStartingOnTheReplyFieldGoesBack` from
+   the field's glass where it overlaps the back swipe's zone at the left edge).
+   `testDraggedOpenPanelClosesOnCloseAndOnTheDim` taps the dim halfway between the nav bar's bottom
+   and the open panel's top as the marker reads it, and checks the dim's own tap handler counted the
+   tap (`ChatFieldDragMarker.dimTapped`), so a tap that lands on the panel cannot pass. The swell and the settle are covered by
+   `ChatSwipeUITests.testShortDragOnTheReplyFieldKeepsTheChat`, which reads the debug marker
+   `ChatFieldDragMarker` (the newest row's largest move from the drag's start until well after the
+   settle, whether the freeze is still held halfway through the cooldown, and how far the glass's
+   top rose while the finger was down against where it rests after), by
+   `testDragThatOpensThePanelReleasesTheFreeze` (the same marker's freeze state) and by
+   `ChatReplyFieldTests.fieldDragSettleIsThePillSpring` (the settle is the pill spring's).
+   (`fieldDragSettleFences`, which pinned the deleted settle token, gate and timer chain, was
+   removed with them on 2026-11-21.) The VoiceOver action:
+   `ChatThreadLayoutTests.showChatActionOpensThePanel`.
+
+22. **The first-time drag tip (amendment 2026-11-20).** Once, above the collapsed reply field, a
+   tip in today's TipKit style (`ChatFieldDragTip`, behind the onboarding gate, shown at most once)
+   says "Drag up to see what you asked TabMail about this conversation." It is an inline `TipView`
+   with `arrowEdge: .bottom` in an overlay whose bottom sits on the field's top, not a popover: it
+   pushes no layout and takes no touch from the field, so the user's first tap focuses the field
+   and their first drag opens the panel (a popover tip would swallow that first touch). It goes
+   away for good when a drag starts, the field takes focus, the panel opens, or on its own close
+   button (TipKit invalidates it with `.tipClosed`; the drag, the focus and the panel opening call
+   `ChatFieldDragTip.close()`, `invalidate(reason: .actionPerformed)`), and is not shown over the open panel or in the
+   tutorial; there is no tutorial step for it. The overlay hangs on the whole stack in
+   `pill(on:)`, so it sits above "Replying only to" and the no-reply notice, never over them. It shows
+   only while the whole card fits between the header's bottom and the field stack's top
+   (`ChatThreadView.tipRoom`, amended 2026-11-21): at a large text size, in landscape (supported on
+   iPhone) or above a tall draft the card could run off the top of the screen, so it waits for room
+   instead, not shown and still eligible for its one showing. `ViewThatFits` measures the card
+   without showing it. VoiceOver can still reach the card while it waits (tabmail-ios#1255, a
+   VoiceOver-only issue for later; hiding the choice while the stand-in shows did not take and was
+   removed 2026-11-22). Tests:
+   `ChatReplyFieldTests.fieldDragTip`, `ChatFieldDragTests.firstDragWithTheTipOpens`,
+   `ChatSwipeUITests.testFieldDragTipShowsAndLeavesTheFieldItsTouches` (launched with
+   `--chat-field-drag-tip`, which resets the TipKit datastore and forces the tip on),
+   `testFieldDragTipCardIsWholeOrWaitsForRoom` (forced on, for the card's geometry: landscape at a
+   large text size, read once the card shows or waits, then upright; the whole card read from the
+   debug marker `ChatFieldDragMarker.TipCard`, the waiting from `ChatFieldDragMarker.TipWait` on the
+   empty stand-in). The tip's lifecycle is tested under the app's own TipKit rules, nothing forced,
+   on a datastore of the test's own that a relaunch keeps (`--chat-field-drag-tip-store`, emptied
+   first with `--chat-field-drag-tip-fresh`; amended 2026-11-21, since forcing the tip on bypasses
+   its eligibility and brings it back after it is ended). The app configures TipKit once with its
+   live pacing and the debug fixture changes only where the datastore is: one fixed folder of the
+   swipe fixture's (`TabMailApp.fieldDragTipTestStore`, honoured only with `--chat-swipe-ui-test`;
+   amended 2026-11-22); a debug launch on it stops when the folder cannot be prepared or TipKit
+   cannot open it, so the lifecycle tests never run without their store. Those launches mark the chat's AI summaries notice as already shown for
+   that launch only, since with the onboarding gate open it would otherwise open over the first
+   landing of a fresh install:
+   `testFieldDragTipWaitingForRoomKeepsItsOneShowing` (landscape at the largest text size the tip
+   waits and shows no card; relaunched upright on the same datastore it shows whole),
+   `testFieldDragTipStaysGoneAfterAShortDrag` and `testFieldDragTipStaysGoneAfterATap` (ended, it
+   stays gone in the chat opened again and after a relaunch on the same datastore), and
+   `testFieldDragTipShownOnceStaysGoneAfterLeavingTheChat` (shown at most once: after its whole card
+   has shown, leaving the chat without touching the field or the tip spends it).
+
+23. **A new email rises into the open chat (amendment 2026-11-20).** When the newest email changes
+   after the chat has landed (`ChatArrival.isArrival`), the new bubble rises from behind the reply
+   field (`.move(edge: .bottom)`) over `ChatViewLayout.arrivalRiseDuration` (0.42 s) and the rows
+   above move up with it: the stack's layout animates with the same rise, so the row's height grows
+   inside the animation. While the landing still holds the chat at the bottom, the arrival re-pins
+   it through the landing's own target in the same animation, so the new email ends fully above the
+   field. Under Reduce Motion the space opens at once (no layout animation, the chat jumps up) and
+   the bubble fades in over `arrivalFadeDuration` (0.2 s). The open's own load never animates, and
+   only the arriving row has the transition, so Reduce Motion does not fade in a load's rows. The
+   user's own newest email (their reply, filed from Sent) is not an arrival and does not rise.
+   Not decided here and left for later work: the AI Suggestion's working bubble and its growth into
+   the ghost. *Since built:* decision 16's working-bubble amendment (2026-11-20). Tests: `ChatArrivalTests`, `ChatThreadLayoutTests.arrivalEndsAboveTheField`,
+   `ChatReplyFieldTests.arrivalWiring`, and `ChatThreadLayoutTests.arrivalInALongChatMovesItUpWithTheRise`
+   (2026-11-21: the first chat is shorter than the screen and has nothing to scroll; in a chat
+   longer than the screen, held at its bottom, the scroll position as drawn passes through places
+   between where it was and where it ends, rather than jumping in one frame, and the new email
+   ends at the bar, on screen, as far above the field as the newest email was before it; it
+   measures the chat's motion, not the row's own transition).
 
 ## The longer index line (routed 2026-11-09)
 

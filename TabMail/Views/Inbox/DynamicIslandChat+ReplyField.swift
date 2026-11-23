@@ -54,28 +54,35 @@ extension DynamicIslandChat {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
+                    // The row pads only itself: the status line keeps the field's padding above it.
+                    .padding(.top, ChatViewLayout.fieldVerticalPadding)
                     .transition(.opacity)
             }
-            HStack(spacing: 10) {
+            ChatFieldBarRow {
                 micButton
+            } text: {
                 VStack(alignment: .leading, spacing: 2) {
                     if isWorking, let sent = fieldSentText {
                         Text(sent)
                             .lineLimit(1...6)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1)
+                            // The drag stays on while the agent works: so does its VoiceOver action.
+                            .showChatAction(field.showChat, isExpanded: isExpanded)
                     } else {
-                        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask")
+                        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask",
+                                   showChat: field.showChat, focus: .replyField)
                         if showsExample, let example = field.example {
                             exampleLine(example)
                         }
                     }
                 }
+            } send: {
                 trailingButton
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        // A drag up swells the field itself toward the panel, its top following the finger.
+        .modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))
     }
 
     /// The "e.g." line shows under the empty field, signed in, while nothing is being said.
@@ -100,4 +107,18 @@ extension DynamicIslandChat {
 
     /// The "e.g." line, as tests find it.
     static let exampleLineId = "chatExampleLine"
+}
+
+extension View {
+    /// The chat reply field's drag up as VoiceOver's "Show TabMail chat"
+    /// (`ChatViewConfig.showChatActionName`), on the element VoiceOver focuses: the text field, the
+    /// sent words while the agent works, the waveform while dictating. Only while the panel is
+    /// closed; nil offers nothing (any other pill, the panel open, the tutorial).
+    func showChatAction(_ showChat: (() -> Void)?, isExpanded: Bool) -> some View {
+        accessibilityActions {
+            if let showChat, !isExpanded {
+                Button(ChatViewConfig.showChatActionName) { showChat() }
+            }
+        }
+    }
 }

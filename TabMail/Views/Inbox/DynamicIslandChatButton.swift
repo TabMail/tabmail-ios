@@ -129,7 +129,16 @@ struct DynamicIslandChat: View {
     }
     @State private var agentToast: String?
     @State private var agentToastDismiss: Task<Void, Never>?
-    @FocusState private var isTextFieldFocused: Bool
+    /// Which text field has the keyboard: the chat's reply field, or the open panel's input. Each is
+    /// its own text field, and one value each lets the keyboard move from the field to the panel's
+    /// input as the panel opens (`InputFocus`).
+    @FocusState private var focusedInput: InputFocus?
+    /// Whether a text field has the keyboard; set false, neither has it. Set true, the panel's input
+    /// takes it: only the open panel sets it so (a forked chat's words, put in its input).
+    private var isTextFieldFocused: Bool {
+        get { focusedInput != nil }
+        nonmutating set { focusedInput = newValue ? .panel : nil }
+    }
     @AppStorage(ChatPillState.autoDictationKey) private var autoDictation = false
     @AppStorage(ChatPillState.dictationPromptShownKey) private var dictationPromptShown = false
     @State private var showDictationPrompt = false
@@ -492,7 +501,8 @@ struct DynamicIslandChat: View {
                 collapsedPill
             }
         }
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: isExpanded ? 24 : 100))
+        .glassEffect(.regular, in: RoundedRectangle(
+            cornerRadius: isExpanded ? 24 : (replyField != nil ? ChatViewLayout.fieldCornerRadius : 100)))
         .overlay {
             // Guided tutorial: the step's next move is opening this chat.
             if !isExpanded
@@ -559,6 +569,13 @@ struct DynamicIslandChat: View {
             autoStartTask?.cancel()
             autoStartTask = nil
             if expanded {
+                // The chat's field becomes the panel's input with its words (mock v15 M2); typed
+                // in, it keeps the keyboard, which moves to the panel's input, its own text field,
+                // so the panel opens above the keyboard (mock v15 H2). This reads the focus the
+                // field holds as the panel opens and gives it to the panel's input. SwiftUI does not
+                // document the order of this action and the field's removal, so the swipe UI tests'
+                // drags from the typed-in field check on screen that the panel's input has it.
+                if focusedInput == .replyField { focusedInput = .panel }
                 dismissAgentToast()
                 // Opportunistic cleanup of idle in-memory sessions (5 min TTL).
                 ChatPillState.shared.evictIdleSessions()
@@ -904,15 +921,13 @@ struct DynamicIslandChat: View {
     // MARK: - Expanded input bar
 
     private var expandedInputBar: some View {
-        HStack(spacing: 10) {
+        ChatFieldBarRow {
             micButton
-
+        } text: {
             inputField(placeholder: PillDictationMode.placeholder(isCompose: isComposeMode, offNote: dictationOffNote))
-
+        } send: {
             trailingButton
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
         .animation(nil, value: isTextFieldFocused)
         .animation(nil, value: isWorking)
     }
@@ -935,9 +950,10 @@ struct DynamicIslandChat: View {
         } label: {
             Image(systemName: micSymbol)
                 .contentTransition(.symbolEffect(.replace))
-                .font(.title3)
+                .font(.body)
                 .foregroundStyle(dictation.phase == .listening || speech.isRecording ? .red : Theme.accent)
-                .frame(width: 28, height: 28)
+                .frame(width: ChatViewLayout.fieldMicTapWidth, height: ChatViewLayout.fieldTapSize)
+                .contentShape(Rectangle())
         }
         // Dictation is transcribed on the AI backend (off without a connection), or on this iPhone
         // when opted out of AI (off if the language has no on-device model).
@@ -959,25 +975,40 @@ struct DynamicIslandChat: View {
         inputSelection = .init(insertionPoint: inputText.endIndex)
     }
 
-    /// The input field, with the dictation waveform over it while listening.
-    func inputField(placeholder: String) -> some View {
+    /// The two text fields that take the keyboard: the chat view's reply field, and the open
+    /// panel's input (also the only one of the inbox and compose pills, which have no reply field).
+    enum InputFocus: Hashable {
+        case replyField
+        case panel
+    }
+
+    /// The input field, with the dictation waveform over it while listening. `showChat`: the chat's
+    /// reply field's "Show TabMail chat" (`showChatAction`), on the field and, while dictation hides
+    /// the field from VoiceOver, on the waveform VoiceOver focuses instead. `focus`: which field
+    /// this is, for the keyboard (`InputFocus`).
+    func inputField(placeholder: String, showChat: (() -> Void)? = nil, focus: InputFocus = .panel) -> some View {
         // Dictating: the field's text dims behind the waveform. Tap it to stop listening; the
         // text is appended when it comes back.
         TextField(placeholder, text: typedText, selection: $inputSelection, axis: .vertical)
             .textFieldStyle(.plain)
             .lineLimit(1...6)
-            .focused($isTextFieldFocused)
+            .focused($focusedInput, equals: focus)
             .modifier(ReplyFieldFocusMarker(focused: isTextFieldFocused))
+            // Debug UI tests only: counts this field being built while a drag's finger is down
+            // and after its let-go.
+            .modifier(ChatFieldDragMarker.InputFieldBuilt())
             .frame(minHeight: dictation.isActive ? DictationConfig.meterMaxBarHeight : nil)
             .opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)
             .allowsHitTesting(!dictation.isActive)
             // VoiceOver reads the waveform instead of the dimmed field.
             .accessibilityHidden(dictation.isActive)
+            .showChatAction(showChat, isExpanded: isExpanded)
             .overlay {
                 if dictation.isActive {
                     DictationPillView(controller: dictation)
                         .contentShape(Rectangle())
                         .onTapGesture { dictation.finish() }
+                        .showChatAction(showChat, isExpanded: isExpanded)
                 }
             }
     }
@@ -1003,12 +1034,12 @@ struct DynamicIslandChat: View {
                 Image(systemName: "stop.circle.fill")
                     .font(.title2)
                     .foregroundStyle(.red.opacity(0.8))
-                    .frame(width: 44, height: 44)
+                    .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                     .contentShape(Rectangle())
             }
         } else if dictation.phase == .transcribing {
             DictationSpinner(isRetrying: dictation.isRetrying)
-                .frame(width: 44, height: 44)
+                .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                 .accessibilityLabel("Transcribing")
         } else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil) && isOnLiveSession
                     && (inputText.trimmingCharacters(in: .whitespaces).isEmpty || (pendingResume?.fieldWordsKey == wordsKey && fieldFill.holdsSentWords)) {
@@ -1030,7 +1061,7 @@ struct DynamicIslandChat: View {
                 Image(systemName: "arrow.clockwise.circle.fill")
                     .font(.title2)
                     .foregroundStyle(Theme.accent)
-                    .frame(width: 44, height: 44)
+                    .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                     .contentShape(Rectangle())
             }
             .accessibilityLabel("Retry")
@@ -1047,9 +1078,10 @@ struct DynamicIslandChat: View {
                 }
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
+                    .resizable()
+                    .frame(width: ChatViewLayout.fieldSendSize, height: ChatViewLayout.fieldSendSize)
                     .foregroundStyle(canTapSend ? Theme.accent : .secondary.opacity(0.3))
-                    .frame(width: 44, height: 44)
+                    .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                     .contentShape(Rectangle())
             }
             .disabled(!canTapSend)
@@ -3135,7 +3167,9 @@ private struct ExpandablePillPressStyle: ButtonStyle {
 /// reads a text field's own focus as lost once a swipe re-renders the chat, while editing goes on.
 /// Active only in debug builds launched with the swipe UI test's argument (`--chat-swipe-ui-test`)
 /// or the keyboard focus UI test's (`--keyboard-focus-ui-test`); it draws nothing (clear
-/// text in the background, so no layout change) and is set only when the field's focus changes.
+/// text in the background, so no layout change) and is set as the field appears and when its focus
+/// changes, so a field that appears with the keyboard (the panel's input, opened from the typed-in
+/// reply field) reads focused at once.
 private struct ReplyFieldFocusMarker: ViewModifier {
     let focused: Bool
 
@@ -3165,7 +3199,7 @@ private struct ReplyFieldFocusMarker: ViewModifier {
                         .foregroundStyle(.clear)
                         .allowsHitTesting(false)
                         .accessibilityIdentifier("chatReplyFieldFocus"))
-                .onChange(of: focused) { _, now in shown = now }
+                .onChange(of: focused, initial: true) { _, now in shown = now }
         }
     }
     #endif

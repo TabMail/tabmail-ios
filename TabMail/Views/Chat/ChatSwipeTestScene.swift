@@ -17,7 +17,9 @@ import SwiftUI
 /// chat (Priya's, from the real tutorial seed) in Part 2, so its coach card sits in the header under
 /// the subject. "Move the tutorial on" moves the run to Part 3 at once, which takes the card away
 /// while the chat stays open: it sits in a strip under the whole navigation stack, outside the
-/// chat's region, so it is on screen with the chat and no earlier gesture can reach it.
+/// chat's region, so it is on screen with the chat and no earlier gesture can reach it. With
+/// `--chat-swipe-signed-in` the scene has a TabMail session; with `--chat-swipe-open-panel-under-drag`
+/// a strip arms the chat's panel to open under the next drag held on the field.
 struct ChatSwipeTestScene: View {
     @State private var ready = false
     @State private var status = "Preparing fixture"
@@ -51,8 +53,8 @@ struct ChatSwipeTestScene: View {
     /// The email "Remove a bubble" takes out of the chat.
     static let removedIndex = 1
     /// How long after "Remove a bubble" the email leaves: long enough for a test to open the chat
-    /// and that bubble's actions first.
-    private static let removalDelay: Duration = .seconds(8)
+    /// and that bubble's actions first, on a simulator loaded by other runs (8 s ran out there).
+    private static let removalDelay: Duration = .seconds(15)
     /// `--chat-swipe-late-suggestion`: a strip under the whole navigation stack holds "Release the
     /// AI Suggestion", which writes the newest email's AI Suggestion when the test taps it, so the
     /// test decides that it lands only after its drag or jump has come to rest.
@@ -69,6 +71,14 @@ struct ChatSwipeTestScene: View {
     nonisolated static let fullReply = "Hello,\n\n\(lateSuggestion)\n\nThanks."
     /// What "Rewrite the AI Suggestion" puts in the newest row's reply, unannounced.
     nonisolated static let rewrittenReply = "Hello,\n\nA rewritten reply.\n\nRegards."
+    /// `--chat-swipe-signed-in`: the scene runs with a TabMail session, so the open panel shows its
+    /// editor (signed out it shows the sign-in bar instead) and the field its signed-in hint.
+    private let signedIn = ProcessInfo.processInfo.arguments.contains("--chat-swipe-signed-in")
+    /// `--chat-swipe-open-panel-under-drag`: a strip under the whole navigation stack holds "Open
+    /// the panel under the next drag", which arms the panel's expansion to run the moment the next
+    /// drag held on the field has swollen it past the open distance (`openPanelUnderTheNextDrag`),
+    /// so that drag, still held, is cut off by it.
+    private let openPanelUnderDrag = ProcessInfo.processInfo.arguments.contains("--chat-swipe-open-panel-under-drag")
 
     var body: some View {
         Group {
@@ -110,6 +120,13 @@ struct ChatSwipeTestScene: View {
                         Button("Release the AI Suggestion") { Task { await Self.writeSuggestion() } }
                             .padding()
                     }
+                } else if openPanelUnderDrag {
+                    // Below the whole stack, like the other strips, so the reply bar ends above it.
+                    VStack(spacing: 0) {
+                        NavigationStack { list }
+                        Button("Open the panel under the next drag") { Self.openPanelUnderTheNextDrag() }
+                            .padding()
+                    }
                 } else if Self.savedDraft {
                     // Below the whole stack, like the other strips. Rewrites the newest row's reply
                     // with no `.messageDataDidChange`, so the ghost keeps the reply the user taps.
@@ -125,6 +142,7 @@ struct ChatSwipeTestScene: View {
                 Text(status)
             }
         }
+        .environment(\.hasTabMailSession, signedIn)
         .task { await seed() }
         .onReceive(NotificationCenter.default.publisher(for: .chatJumpTappedForTesting)) { _ in
             guard Self.suggestionOnJump else { return }
@@ -201,6 +219,19 @@ struct ChatSwipeTestScene: View {
         NotificationCenter.default.post(name: .messageDataDidChange, object: id)
     }
 
+    /// Simulates the panel's expansion that interrupts a held drag: once the next drag held on the
+    /// field has swollen it past the open distance (seen by the drag marker's probe, not after a
+    /// set time), it posts `.openMessageWithChat`, the notification a tap on the inbox's agent toast
+    /// posts, so the chat expands its panel through that path. It is not an agent's answer, which
+    /// opens the panel directly (`ChatThreadView.agentAnswered`); either way the panel opening turns
+    /// the field's pan off.
+    private static func openPanelUnderTheNextDrag() {
+        let id = headerId(count - 1)
+        ChatFieldDragMarker.Probe.shared.openUnderTheNextDrag {
+            NotificationCenter.default.post(name: .openMessageWithChat, object: nil, userInfo: ["messageId": id])
+        }
+    }
+
     /// Rewrites the newest row's reply with no `.messageDataDidChange`: the open chat is not told,
     /// so its ghost still holds the reply it showed, and a tap must open the card with that one.
     private static func rewriteSuggestionQuietly() async {
@@ -258,8 +289,10 @@ struct ChatSwipeTestScene: View {
             let accountID = Self.accountID
             let now = Date()
             try await AppDatabase.dbPool.write { db in
-                // Each launch owns only this synthetic account's fixture rows.
+                // Each launch owns only this synthetic account's fixture rows, its kept words
+                // included, so every run starts with an empty field.
                 try MessageHeader.filter(Column("accountId") == accountID).deleteAll(db)
+                try ChatFieldWords.deleteAccount(accountID, db: db)
                 if Self.savedDraft { try Draft.filter(Column("accountId") == accountID).deleteAll(db) }
                 var account = Account(emailAddress: "me@example.com", displayName: "Chat swipe fixture", provider: .imap)
                 account.id = accountID

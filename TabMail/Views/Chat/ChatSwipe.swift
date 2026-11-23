@@ -4,6 +4,8 @@
 
 import SwiftUI
 import UIKit
+// The touch callbacks the field's pan (`ChatFieldPan.Recognizer`) overrides.
+import UIKit.UIGestureRecognizerSubclass
 
 /// What the chat's swipes act on (ADR-IOS-114 decision 12).
 enum ChatSwipe {
@@ -385,7 +387,7 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
 
     /// The swipe's pan, asking `delegate` before it starts so a vertical drag stays the scroll
     /// view's (`Coordinator.gestureRecognizerShouldBegin`).
-    static func makePan(delegate: Coordinator) -> UIPanGestureRecognizer {
+    static func makePan(delegate: any UIGestureRecognizerDelegate) -> UIPanGestureRecognizer {
         let pan = UIPanGestureRecognizer()
         pan.delegate = delegate
         return pan
@@ -409,14 +411,37 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
         if finished(recognizer.state) != nil { ChatSwipeHold.shared.release(id, after: ChatViewLayout.swipeSettleHold) }
     }
 
-    /// Hands a pan's event on: its horizontal travel while it moves; its velocity, and whether the
-    /// user finished it, once it ends.
+    /// The swipe's reading of a pan's event (`deliver(_:moved:ended:)`): its horizontal travel
+    /// while it moves; its horizontal velocity, and whether the user finished it, once it ends.
     static func deliver(_ recognizer: UIPanGestureRecognizer, changed: (CGFloat) -> Void,
                         ended: (CGFloat, Bool) -> Void) {
+        deliver(recognizer, moved: { changed($0.travel.width) }, ended: { ended($0.velocity.width, $1) })
+    }
+
+    /// One reading of a pan, both axes, in its own view: its travel since it began and its velocity
+    /// (points per second).
+    struct Sample: Equatable {
+        var travel: CGSize
+        var velocity: CGSize
+    }
+
+    /// The pan's reading now.
+    static func sample(_ recognizer: UIPanGestureRecognizer) -> Sample {
+        let travel = recognizer.translation(in: recognizer.view)
+        let velocity = recognizer.velocity(in: recognizer.view)
+        return Sample(travel: CGSize(width: travel.x, height: travel.y),
+                      velocity: CGSize(width: velocity.x, height: velocity.y))
+    }
+
+    /// Hands a pan's event on, for every pan the chat builds here (the swipes, the reply field's
+    /// drag up, `ChatFieldPan`): its sample while it moves; once it ends, its last sample and one
+    /// outcome, whether the user finished it (`finished`). What a pan does with them is its caller's.
+    static func deliver(_ recognizer: UIPanGestureRecognizer, moved: (Sample) -> Void,
+                        ended: (Sample, Bool) -> Void) {
         if let finished = finished(recognizer.state) {
-            ended(recognizer.velocity(in: recognizer.view).x, finished)
+            ended(sample(recognizer), finished)
         } else if recognizer.state == .began || recognizer.state == .changed {
-            changed(recognizer.translation(in: recognizer.view).x)
+            moved(sample(recognizer))
         }
     }
 
@@ -474,6 +499,331 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
                         || other === nav.interactivePopGestureRecognizer
                 }
                 responder = current.next
+            }
+            return false
+        }
+    }
+}
+
+/// The drag up on the chat's collapsed reply field (`ChatFieldDrag`): the swipes' pan bridge
+/// (`ChatHorizontalPan`), vertical. It starts only on a first movement more up than sideways
+/// (`ChatFieldDrag.begins`), so a sideways drag stays a swipe or the back swipe. Once it starts it
+/// cancels the touch for the views under it (`cancelsTouchesInView`), so the field's text view
+/// never takes the let-go as a tap and takes focus; a tap does not move, never starts it, and
+/// focuses the field as before. In the focused field's overflowing text it runs alongside the
+/// text's scroll and hands on only the field's share of the drag (`Coordinator.share`): none until
+/// the text first reaches its end, the rest of the same drag from there (mock v15 H2), and none
+/// again once the finger takes the drag back into the text. That text never bounces vertically (`Coordinator.touchDown`), so past its end it stays
+/// at its end while the field swells.
+struct ChatFieldPan: UIGestureRecognizerRepresentable {
+    /// Off over the open panel and in the tutorial, so no new drag starts there. UIKit cancels an
+    /// active pan once it is actually turned off, but in a UI run the update turning it off did not
+    /// end a drag already held, so the panel opening cuts that drag with `cut`.
+    let isEnabled: Bool
+    /// Cuts the drag held on the field off (`Cut`): the chat calls it when the panel opens.
+    let cut: Cut
+    /// The drag's travel since it began (`ChatHorizontalPan.Sample`).
+    let moved: (ChatHorizontalPan.Sample) -> Void
+    /// The drag's travel and its velocity at the let-go, and whether the user finished it (false
+    /// when the system cancelled or failed it, or the chat cut it off).
+    let ended: (ChatHorizontalPan.Sample, Bool) -> Void
+
+    func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIGestureRecognizer(context: Context) -> Recognizer {
+        Self.makePan(delegate: context.coordinator, isEnabled: isEnabled, cut: cut)
+    }
+
+    /// The field's pan (`Recognizer`) asking `delegate`, as the swipes' pan does
+    /// (`ChatHorizontalPan.makePan`), cancelling the touch for the views under it once it starts
+    /// (UIKit's default, stated because the field's focus depends on it). `cut` cuts its drags off.
+    static func makePan(delegate: Coordinator, isEnabled: Bool, cut: Cut) -> Recognizer {
+        let pan = Recognizer()
+        pan.delegate = delegate
+        pan.cancelsTouchesInView = true
+        pan.isEnabled = isEnabled
+        cut.recognizer = pan
+        return pan
+    }
+
+    /// Cuts the drag held on the field off, as the system cancelling it (`Recognizer.cut`): it
+    /// ends as an interrupted drag, springs back and opens nothing. The panel opening under a held
+    /// drag (an agent's answer, the inbox's agent toast) turns the pan off, yet the drag ran on to
+    /// its let-go with the swell held (UI run 2026-11-22: the opening was requested, then the drag
+    /// ended, never cut), so the chat cuts it itself when the panel opens. One per chat; it holds the
+    /// pan weakly.
+    @MainActor
+    final class Cut {
+        fileprivate(set) weak var recognizer: Recognizer?
+
+        func callAsFunction() {
+            recognizer?.cut()
+        }
+    }
+
+    func updateUIGestureRecognizer(_ recognizer: Recognizer, context: Context) {
+        // Debug UI tests only: the pan turned on or off, and its state then (`ChatFieldDragMarker`).
+        ChatFieldDragMarker.panEnabling(recognizer, to: isEnabled)
+        recognizer.isEnabled = isEnabled
+    }
+
+    /// The swipes' delivery (`ChatHorizontalPan.deliver`), both axes, each sample the field's
+    /// share of the drag (`Coordinator.share`); the let-go at rest when the finger held still
+    /// before it lifted (`ChatFieldDrag.letGo`).
+    func handleUIGestureRecognizerAction(_ recognizer: Recognizer, context: Context) {
+        let coordinator = context.coordinator
+        ChatHorizontalPan.deliver(recognizer, moved: { moved(coordinator.share($0)) },
+                                  ended: {
+            coordinator.letGo()
+            ended(coordinator.share(ChatFieldDrag.letGo($0, rested: recognizer.restedBeforeLift), atLetGo: true), $1)
+        })
+    }
+
+    /// UIKit's pan, noting when its finger last moved and when it lifted, on the touches' own
+    /// clock: UIKit reports at the let-go the speed of the finger's last move however long it then
+    /// held still, so the let-go reads how long it rested (`restedBeforeLift`).
+    final class Recognizer: UIPanGestureRecognizer {
+        private var lastMove: TimeInterval?
+        private var lift: TimeInterval?
+
+        /// How long the finger held still before it lifted; zero until it has lifted.
+        var restedBeforeLift: TimeInterval {
+            guard let lastMove, let lift else { return 0 }
+            return max(0, lift - lastMove)
+        }
+
+        /// The finger moved at `time`. A touch coming down is not a move: a pan only begins once
+        /// the finger moved, and a second finger landing during a hold leaves the hold a hold.
+        func moved(at time: TimeInterval) {
+            lastMove = time
+        }
+
+        /// The finger lifted at `time`.
+        func lifted(at time: TimeInterval) {
+            lift = time
+        }
+
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+            moved(at: event.timestamp)
+            super.touchesMoved(touches, with: event)
+        }
+
+        // Before UIKit ends the pan, so its let-go reads the lift.
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+            lifted(at: event.timestamp)
+            super.touchesEnded(touches, with: event)
+        }
+
+        override func reset() {
+            super.reset()
+            lastMove = nil
+            lift = nil
+        }
+
+        /// Cuts the drag in progress off while the finger is still down, as the system cancelling
+        /// it; a pan with no drag in progress is left as it is.
+        func cut() {
+            guard state == .began || state == .changed else { return }
+            state = .cancelled
+        }
+
+        #if DEBUG
+        // Debug UI tests only: the pan was cancelled (`ChatFieldDragMarker`; reads the new state
+        // only in a debug build the swipe UI tests launch).
+        override var state: UIGestureRecognizer.State {
+            didSet { ChatFieldDragMarker.panState(from: oldValue, to: state) }
+        }
+        #endif
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        /// Only a first movement more up than sideways starts the drag.
+        func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+            guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
+            return ChatFieldDrag.begins(translation: ChatHorizontalPan.sample(pan).travel)
+        }
+
+        /// The drag runs alone, as a swipe does, except beside the field's own text scroll (only
+        /// while its text overflows the field's six lines): both follow the finger, and the drag
+        /// hands on only the field's share (`share`), so the text keeps the drag until its end.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            Self.isTextViews(other) && ChatSwipeCloser.Coordinator.isScroll(other)
+        }
+
+        /// The field's text view's long presses go first (caret placement, the loupe, selection):
+        /// the drag starts only once they have declined, so a press held before moving stays the
+        /// text's.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldRequireFailureOf other: UIGestureRecognizer) -> Bool {
+            Self.isTextViews(other) && other is UILongPressGestureRecognizer
+        }
+
+        /// The text the drag's first touch landed in, and the drag's travel, both axes, where the
+        /// text last reached its end (nil until it does, and again once the text reads short of its
+        /// end after the finger came back down, `share`): the field's share counts from that one
+        /// point. The drag's highest travel
+        /// since then, and the farthest the finger has come back down from it. The previous
+        /// sample's travel and the text's place then, to find where in the next sample the text
+        /// reached its end.
+        private weak var text: UIScrollView?
+        private var handOff: CGSize?
+        private var highest: CGFloat = 0
+        private var farthestDown: CGFloat = 0
+        private var lastTravel = CGSize.zero
+        private var lastOffset: CGFloat = 0
+
+        /// Notes the text under a new drag's first touch.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            if recognizer.numberOfTouches == 0 { touchDown(on: touch.view) }
+            return true
+        }
+
+        /// A new drag's first touch landed on `view`: the text around it, if any, and its scroll
+        /// position now. That text stops bouncing vertically here, before the touch has moved, and
+        /// never bounces again: past its end the rest of the drag is the field's, and the text holds
+        /// still at its end while the field swells (mock v15 H2). Its own scroll, caret and
+        /// selection are unchanged.
+        func touchDown(on view: UIView?) {
+            text = Self.scrollingText(around: view)
+            text?.bouncesVertically = false
+            lastTravel = .zero
+            highest = 0
+            farthestDown = 0
+            lastOffset = text?.contentOffset.y ?? 0
+            // A drag that starts with the text at its end is the field's from its start.
+            let end = text.map { Self.end(of: $0) }
+            if let text, let end, Self.isAtEnd(text.contentOffset.y, end: end) {
+                handOff = .zero
+            } else {
+                handOff = nil
+            }
+            // Debug UI tests only: the hand-off record starts (`ChatFieldDragMarker`).
+            ChatFieldDragMarker.textTouchDown(end: end, handedOff: handOff != nil)
+        }
+
+        /// The field's share of `drag` (`ChatFieldDrag.fieldShare`): the drag's travel, both axes,
+        /// from the point where the text under it reached its end; none while the text still has
+        /// the drag (before it first reaches its end, and after the finger brings it back). The
+        /// hand-off is found in the first sample with the text at its end, at the point of that
+        /// sample where the text reached it (`crossing`), and dropped when the text reads short of
+        /// its end once the finger has come back down (`fingerCameBack`), so a drag that reverses
+        /// into the text and reaches the end again hands off afresh. That is read from how far the
+        /// finger came down since the hand-off, not from the sample's direction nor from how far
+        /// short the text reads: the text's own scroll and this pan run side by side, and UIKit
+        /// does not say which hears a move first, so the text can show a downward move one sample
+        /// late, with the finger already going up again, or only at the let-go, and can show its
+        /// end in the sample the finger turned down in. A text short of its end with the finger not
+        /// come down moved without it, and keeps the hand-off with the rest of the drag the field's:
+        /// seen in a UI run (2026-11-22), UIKit scrolled the field's text to its caret on a layout
+        /// after the field was built again while the finger was down. Once the finger has come
+        /// down, a text short of its end drops the hand-off whatever moved it. Off the text, all of
+        /// it. `atLetGo`: the let-go's sample (for the debug marker).
+        func share(_ drag: ChatHorizontalPan.Sample, atLetGo: Bool = false) -> ChatHorizontalPan.Sample {
+            guard let text else { return drag }
+            let end = Self.end(of: text)
+            let offset = text.contentOffset.y
+            let wasHandedOff = handOff != nil
+            if handOff != nil {
+                highest = min(highest, drag.travel.height)
+                farthestDown = max(farthestDown, drag.travel.height - highest)
+            }
+            if !Self.isAtEnd(offset, end: end) {
+                if handOff != nil, Self.fingerCameBack(down: farthestDown) {
+                    handOff = nil
+                }
+            } else if handOff == nil {
+                handOff = Self.crossing(from: lastTravel, textAt: lastOffset, to: drag.travel, end: end)
+                // A text read a sample late shows its end in the sample the finger turned down in:
+                // that move down counts, from the sample before.
+                highest = min(lastTravel.height, drag.travel.height)
+                farthestDown = drag.travel.height - highest
+            }
+            lastTravel = drag.travel
+            lastOffset = min(offset, end)
+            let shared = ChatFieldDrag.fieldShare(of: drag, handOff: handOff)
+            // Debug UI tests only: how far the text went past its end, and the hand-off as the pan
+            // read it (`ChatFieldDragMarker`).
+            ChatFieldDragMarker.textPastEnd(offset - end)
+            ChatFieldDragMarker.textShared(end: end, offset: offset, handOff: wasHandedOff ? nil : handOff?.height,
+                                           share: shared.travel.height, atLetGo: atLetGo)
+            return shared
+        }
+
+        /// The drag let go or was cut off, before the view hears of it: the drag marker watches the
+        /// text under it from here (debug UI tests only; nothing in release).
+        func letGo() {
+            ChatFieldDragMarker.textLetGo(text, lastMoved: lastOffset)
+        }
+
+        /// The drag's travel, both axes, where the text reached its end, within the sample that went
+        /// from `last` (the text then at `textAt`) to `travel`: the finger's upward move in that
+        /// sample took the text's remaining room first, so the hand-off is that room further up
+        /// than `last`, and the sideways travel is taken at the same point of the move. Neither
+        /// axis of the field's share then counts travel the text had. The text's place cannot tell
+        /// where in the sample the finger was, since the text holds still at its end; the finger's
+        /// travel can. A sample with no upward move hands off at its end.
+        static func crossing(from last: CGSize, textAt: CGFloat, to travel: CGSize, end: CGFloat) -> CGSize {
+            let up = last.height - travel.height
+            guard up > 0 else { return travel }
+            let room = min(up, max(0, end - textAt))
+            return CGSize(width: last.width + (travel.width - last.width) * (room / up),
+                          height: last.height - room)
+        }
+
+        /// Whether the finger came back down from a handed-off text's end: `down`, the farthest it
+        /// came down from its highest point since the hand-off (the sample before it too, when the
+        /// text first read its end on a move down), is more than
+        /// `ChatViewLayout.fieldTextReversalSlack`. The rule takes the text's own scroll to follow
+        /// the finger point for point while the finger drags it: a finger that came down is taken
+        /// to have brought the text back with it, whenever the text shows it, and a text that reads
+        /// short with the finger not come down is taken to have moved on its own (a caret scroll),
+        /// which keeps the hand-off. The farthest, not where the
+        /// finger is now: a text read a sample late shows where the finger was, which may be lower
+        /// than now.
+        static func fingerCameBack(down: CGFloat) -> Bool {
+            down > ChatViewLayout.fieldTextReversalSlack
+        }
+
+        /// Whether the text at scroll position `offset` is at its `end`: within
+        /// `ChatViewLayout.fieldTextEndTolerance` of it, since a text UIKit holds at its end can
+        /// read a hair short of the end its sizes give.
+        static func isAtEnd(_ offset: CGFloat, end: CGFloat) -> Bool {
+            offset >= end - ChatViewLayout.fieldTextEndTolerance
+        }
+
+        /// The scroll position at which `text` shows its end (its top when it does not scroll).
+        static func end(of text: UIScrollView) -> CGFloat {
+            max(text.contentSize.height + text.adjustedContentInset.bottom - text.bounds.height,
+                -text.adjustedContentInset.top)
+        }
+
+        /// The scrolling text view (`UITextInput`) that `view` is or sits in.
+        static func scrollingText(around view: UIView?) -> UIScrollView? {
+            var view = view
+            while let current = view {
+                if let scroll = current as? UIScrollView, current is UITextInput { return scroll }
+                view = current.superview
+            }
+            return nil
+        }
+
+        /// The text view's taps wait for the drag's decision, so a drag never ends as a tap that
+        /// focuses the field; a tap never starts the drag, so it focuses the field at once.
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+            Self.isTextViews(other) && other is UITapGestureRecognizer
+        }
+
+        /// Whether `other` belongs to a text view (`UITextInput`): installed on it or on a view
+        /// inside it.
+        static func isTextViews(_ other: UIGestureRecognizer) -> Bool {
+            var view = other.view
+            while let current = view {
+                if current is UITextInput { return true }
+                view = current.superview
             }
             return false
         }
@@ -557,6 +907,9 @@ struct ChatSwipeCloser: UIViewRepresentable {
             host = view
             self.edgePop = edgePop
             edgePop?.isEnabled = open.id == nil
+            // Debug UI tests only: the back swipe's states and transition while this closer holds
+            // it (`ChatFieldDragMarker`).
+            ChatFieldDragMarker.watchPop(edgePop, owner: self)
         }
 
         func setEdgePop(enabled: Bool) {
@@ -565,6 +918,8 @@ struct ChatSwipeCloser: UIViewRepresentable {
 
         /// Torn down, even mid-drag: the closer holds nothing more.
         func uninstall() {
+            // Debug UI tests only: the back swipe's watch ends with this closer's hold on it.
+            ChatFieldDragMarker.unwatchPop(owner: self)
             host?.removeGestureRecognizer(pan)
             host?.removeGestureRecognizer(tap)
             host = nil

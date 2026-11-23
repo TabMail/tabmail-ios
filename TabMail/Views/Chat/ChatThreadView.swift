@@ -4,6 +4,7 @@
 
 import GRDB
 import SwiftUI
+import TipKit
 
 #if DEBUG
 extension Notification.Name {
@@ -73,10 +74,22 @@ struct ChatThreadView: View {
 
     // The reply field: today's Chat pill on the newest email.
     @State private var chatExpanded = false
-    /// The collapsed pill's height, notices and chips included: the room the thread keeps under its
-    /// last bubble and the jump button. The field grows to six lines, so it is measured;
-    /// the open sheet keeps the last collapsed height, so the thread does not move under it.
+    /// The collapsed field's height, notices and chips included: the height of the bottom bar,
+    /// whose inset keeps the last bubble and the jump button above the field. The field grows to six
+    /// lines, so it is measured; the open panel keeps the last resting height, and a drag's swell
+    /// never reaches it (`pill(on:)` takes the swell back out of the layout, and a floating-point
+    /// remainder of that is the same height, `pillHeightMoved`), so the chat does not move under
+    /// either.
     @State private var pillHeight = ChatViewLayout.pillStartHeight
+    /// The chat's own height: the opened pill grows upward out of the bottom bar into it.
+    @State private var chatAreaHeight: CGFloat = 0
+    /// A drag up on the collapsed field (`ChatFieldDrag`, `ChatFieldPan`): reset however the drag
+    /// ends, a cancelled one included, with the pill's spring, so the swell always springs back
+    /// (`fieldDragEnded`). Its progress is read only in modifiers (`ChatFieldDrag.Model`), never
+    /// in this body.
+    @State private var fieldDrag = ChatFieldDrag.Model()
+    /// Cuts off a drag on the field the panel opened under (`ChatFieldPan.Cut`).
+    @State private var fieldPanCut = ChatFieldPan.Cut()
     @State private var chatInputFocused = false
     @State private var chatWorking = false
     /// The ready AI Suggestion's compose card: the email it answers, and how it opens.
@@ -117,7 +130,16 @@ struct ChatThreadView: View {
     private static let bottomId = "chat-bottom"
     private static let unreadLineId = "chat-unread-line"
     private static let chatSwipeId = "chat-swipe"
-    private static let pillSpring = Animation.spring(response: 0.45, dampingFraction: 0.82)
+    /// What a drag on the reply field holds the interaction freeze under (`ChatSwipeHold`).
+    static let fieldDragHoldId = "chat-field-drag"
+    /// The pill's spring, as a model so its settling duration can be read.
+    static let pillSpringModel = Spring(
+        response: ChatViewLayout.pillSpringResponse, dampingRatio: ChatViewLayout.pillSpringDamping)
+    private static let pillSpring = Animation.spring(pillSpringModel)
+    /// After a drag on the field lets go, how long its swell takes to spring back: the pill's
+    /// spring's own settling duration (about 0.6 s for response 0.45 and damping 0.82). The drag's
+    /// freeze holds through it plus the freeze rule's cooldown.
+    static let fieldDragSettle: Duration = .seconds(pillSpringModel.settlingDuration)
 
     init(
         messageId: String, expectedRfc822MessageId: String? = nil, expectedObservedUidValidity: Int? = nil,
@@ -272,6 +294,7 @@ struct ChatThreadView: View {
             viewModel.isViewVisible = false
             isOnScreen = false
             chatExpanded = false
+            ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)
             ICSCalendarImporter.dismiss()
         }
         .onChange(of: isAnyPresentation) { _, active in viewModel.hasActivePresentation = active }
@@ -326,7 +349,7 @@ struct ChatThreadView: View {
         let offersArchive = viewModel.chatHasInboxCopy
         let shown = thread.newest.flatMap { shownSuggestion(on: $0, thread: thread) }
         let suggestion = thread.newest.flatMap { suggestionPhase(on: $0, shown: shown, thread: thread) }
-        ZStack(alignment: .bottom) {
+        Group {
             ScrollViewReader { proxy in
                 ScrollView {
                     // A plain stack: every row has its real height, so one scroll lands where it
@@ -335,7 +358,15 @@ struct ChatThreadView: View {
                     // what the chat asks for, not by what it builds.
                     VStack(spacing: ChatViewLayout.bubbleSpacing) {
                         ForEach(thread.items) { item in
+                            // Only the arriving newest email rises (or fades in); no other row,
+                            // and nothing of the open's own load.
                             row(item, thread: thread, offersArchive: offersArchive)
+                                .transition(ChatArrival.transition(
+                                    ChatArrival.style(reduceMotion: reduceMotion),
+                                    isArrivalRow: item.id == thread.items.last?.id
+                                        && ChatArrival.animates(landed: didInitialScroll, newestIsOwn: item.isOwn)))
+                                // Debug UI tests only: where the newest row sits during a field drag.
+                                .modifier(ChatFieldDragMarker.Row(isNewest: item.id == thread.items.last?.id))
                         }
                         // Replies still in the outbox.
                         ForEach(unsentReplies) { reply in
@@ -360,9 +391,16 @@ struct ChatThreadView: View {
                                     .transition(.opacity)
                             }
                         }
-                        Color.clear.frame(height: pillHeight + ChatViewLayout.pillGap).id(Self.bottomId)
+                        // The bottom bar's inset keeps the field's room; only the gap is added here.
+                        Color.clear.frame(height: ChatViewLayout.pillGap).id(Self.bottomId)
                     }
                     .padding(.top, 8)
+                    // A new email rises from behind the field and the rows above move up with it,
+                    // its height growing inside the same animation. Not the open's own landing, and
+                    // not the user's own sent reply.
+                    .animation(ChatArrival.animates(landed: didInitialScroll, newestIsOwn: thread.items.last?.isOwn ?? false)
+                               ? ChatArrival.animation(ChatArrival.style(reduceMotion: reduceMotion)) : nil,
+                               value: thread.items.last?.id)
                 }
                 // Only the user's hand ends the landing. A programmatic scroll that animates (a
                 // late height arriving inside an animated transaction) or its settling is not the
@@ -388,6 +426,17 @@ struct ChatThreadView: View {
                 } action: { _, isAbove in
                     withAnimation(.easeInOut(duration: 0.2)) { showsJumpButton = isAbove }
                 }
+                // While the landing still holds the chat at the bottom, an arrival re-pins it in the
+                // same animation as the rise (the landing's re-pin path below), so the new email
+                // ends fully above the field and the chat never jumps.
+                .onChange(of: thread.items.last?.id) { old, new in
+                    guard ChatArrival.isArrival(landed: didInitialScroll, oldNewest: old, newNewest: new,
+                                                newestIsOwn: thread.items.last?.isOwn ?? false),
+                          let target = scrollTarget else { return }
+                    withAnimation(ChatArrival.animation(ChatArrival.style(reduceMotion: reduceMotion))) {
+                        proxy.scrollTo(target.id, anchor: target.anchor)
+                    }
+                }
                 .onChange(of: suggestion, initial: true) { old, new in
                     showSuggestion(new, from: old, proxy: proxy)
                 }
@@ -405,7 +454,8 @@ struct ChatThreadView: View {
                 // the thread lands, and on that inset change the platform keeps the offset plus the
                 // top inset, which moves a bottom landing past the bottom by the fill (memory 036).
                 // So the landing is issued again on every size or inset change until the user's
-                // scroll (`endLanding`) or a jump-button tap ends it.
+                // scroll (`endLanding`) or a jump-button tap ends it. The field's height and the
+                // keyboard arrive as the bottom bar's inset, so the bottom inset counts too.
                 .onScrollGeometryChange(for: [CGFloat].self) { geo in
                     [geo.containerSize.height, geo.contentSize.height, geo.contentInsets.top, geo.contentInsets.bottom]
                 } action: { old, new in
@@ -461,23 +511,37 @@ struct ChatThreadView: View {
                     Color.black.opacity(0.3)
                         .ignoresSafeArea()
                         .contentShape(Rectangle())
-                        .onTapGesture { withAnimation(Self.pillSpring) { chatExpanded = false } }
+                        .onTapGesture {
+                            ChatFieldDragMarker.dimTapped()
+                            withAnimation(Self.pillSpring) { chatExpanded = false }
+                        }
                         .transition(.opacity)
                 }
             }
-
-            if let newest = thread.newest {
-                pill(on: newest)
-                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                        if !chatExpanded { pillHeight = height }
-                    }
-                    // ...and above the reply field.
-                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
-                        pillTop = $0
-                        swipeOpen.reach(top: headerBottom, bottom: $0)
-                    }
+            // The reply field is the chat's bottom bar, as in Messages: the chat scrolls under it
+            // and the system blurs the strip below it. One field, always here. The bar is a slot
+            // of the collapsed field's height; the opened pill grows upward out of it (an overlay,
+            // not clipped), so the inset, and the chat under the panel, do not move.
+            .safeAreaBar(edge: .bottom, spacing: 0) {
+                if let newest = thread.newest {
+                    Color.clear
+                        .frame(height: pillHeight)
+                        .overlay(alignment: .bottom) {
+                            pill(on: newest)
+                                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                                    if !chatExpanded, Self.pillHeightMoved(from: pillHeight, to: height) { pillHeight = height }
+                                }
+                                // ...and above the reply field.
+                                .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
+                                    pillTop = $0
+                                    swipeOpen.reach(top: headerBottom, bottom: $0)
+                                }
+                                .frame(height: max(chatAreaHeight, pillHeight), alignment: .bottom)
+                        }
+                }
             }
         }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { chatAreaHeight = $0 }
         // While a swipe is open, a drag or tap anywhere else on the screen only closes it. The
         // closer's anchor fills the space every swipe frame is measured in.
         .background(ChatSwipeCloser(open: swipeOpen))
@@ -535,7 +599,8 @@ struct ChatThreadView: View {
         }
         .buttonStyle(.plain)
         .padding(.trailing)
-        .padding(.bottom, pillHeight + ChatViewLayout.pillGap)
+        // Above the bottom bar, whose inset the overlay already keeps clear.
+        .padding(.bottom, ChatViewLayout.pillGap)
         .transition(.opacity)
         .accessibilityLabel("Jump to the newest email")
     }
@@ -794,8 +859,10 @@ struct ChatThreadView: View {
         NSLog("[cvwb] working bubble fills, re-pin=%d reduceMotion=%d", scrollTarget != nil ? 1 : 0, reduceMotion ? 1 : 0)
         #endif
         ghostFadesIn = reduceMotion
-        // At rebase onto the reply field's arrival change (its own re-pin inside `withAnimation`
-        // for an arriving email), fold both re-pins into one helper and re-check this fill.
+        // An arriving email in a landed chat is not a fill: the ghost's swap back to the working
+        // bubble cross-fades inside the arrival's rise (at once under Reduce Motion), and this function only sets its flags
+        // (`suggestionGrowPending`, `ghostFadesIn`) in the guard above. The two re-pins fire on different triggers (the newest email's id
+        // for the arrival, Writing to ready here), so they stay separate.
         withAnimation(reduceMotion ? nil : .easeInOut(duration: ChatSuggestionConfig.fillDuration)) {
             suggestionGrowPending = false
             if let target = scrollTarget { proxy.scrollTo(target.id, anchor: target.anchor) }
@@ -894,18 +961,122 @@ struct ChatThreadView: View {
                     isNoReply: isNoReply,
                     onlyTo: replyTarget.only,
                     tutorialMove: tutorialMove(thread),
+                    drag: fieldDrag,
+                    // The drag's VoiceOver equivalent (decision 12: every chat swipe has a named
+                    // action), on the text field VoiceOver focuses; not over the panel or the tutorial.
+                    showChat: chatExpanded || TutorialCoordinator.shared.isRunning
+                        ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } },
                     suggestion: shown),
                 onFieldSend: { _ in fieldComposeOpened = false },
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: viewModel.message?.accountId,
                 composeHostCovered: isAnyPresentation)
+            // Debug UI tests only: the glass's top, swell included (`ChatFieldDragMarker`).
+            .modifier(ChatFieldDragMarker.Glass())
+            // The swell is not the field's room: its glass grows upward, and the same swell is taken
+            // back out of the layout here, springing back in the same transaction, so the field's
+            // measured height, the bar, its inset and the chat never move under a drag.
+            .modifier(ChatFieldDrag.Swell(model: fieldDrag, sign: -1))
+            // Drag the field up: it swells under the finger and opens the TabMail chat panel. A
+            // UIKit pan, so once it starts the field's text view loses the touch and a drag never
+            // focuses the field (`ChatFieldPan`). Not in the tutorial, whose steps open the chat
+            // themselves.
+            .gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning,
+                                  cut: fieldPanCut, moved: fieldDragMoved, ended: fieldDragEnded))
+            .modifier(ChatFieldDrag.Watch(model: fieldDrag) { fieldDragChanged($0) })
+            // Debug UI tests only: what the drag did to the chat (`ChatFieldDragMarker`).
+            .modifier(ChatFieldDragMarker.Field(model: fieldDrag))
+            // A tap on the field (it takes focus) or the panel opening ends the tip. The panel
+            // opening under a held drag (an agent answer, a notification) also cuts that drag off.
+            .onChange(of: chatInputFocused) { _, focused in if focused { ChatFieldDragTip.close() } }
+            .onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close(); fieldPanCut() } }
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.replyPillId)
         }
+        // Once, above the field and its notices: what the drag up shows. An inline tip in an overlay
+        // on the whole stack, outside the field's frame and its accessibility container: it pushes
+        // no layout and takes no touch from the field, "Replying only to" or the no-reply notice, so
+        // the first tap focuses the field and the first drag opens the panel. Not over the tutorial
+        // or the panel.
+        // The tip hangs by its bottom from a zero-height anchor on the stack's top edge, so it
+        // grows upward from there whatever its height. A custom top alignment guide on the TipView
+        // itself did not take: the tip was drawn from the stack's top down, over the field.
+        // It shows only while the whole card fits between the header and the stack
+        // (`tipRoom`): at the largest text size, in landscape, or over a tall draft it would run
+        // off the screen. `ViewThatFits` measures the card without showing it, so a card that
+        // does not fit is not shown and keeps its one showing for when it does.
+        .overlay(alignment: .top) {
+            if !chatExpanded && !TutorialCoordinator.shared.isRunning {
+                Color.clear
+                    .frame(height: 0)
+                    .overlay(alignment: .bottom) {
+                        ViewThatFits(in: .vertical) {
+                            TipView(ChatFieldDragTip(), arrowEdge: .bottom)
+                                .fixedSize(horizontal: false, vertical: true)
+                                // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`).
+                                .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop))
+                            Color.clear.frame(height: 0)
+                                // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`).
+                                .modifier(ChatFieldDragMarker.TipWait())
+                        }
+                        // VoiceOver can still reach a card waiting for room (tabmail-ios#1255).
+                        .frame(height: tipRoom, alignment: .bottom)
+                    }
+            }
+        }
         .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)
         .padding(.bottom, ChatViewLayout.fieldBottomGap)
         .animation(Self.pillSpring, value: chatExpanded)
+    }
+
+    /// Whether the collapsed field's measured height moved from `old` to `new`: by at least
+    /// `ChatViewLayout.fieldHeightTolerance`. A drag's swell is added inside the field's glass and
+    /// taken back out here, which floating point does not always cancel exactly; that remainder
+    /// once set the bar's height under a held drag, ran the chat's body and built the reply field
+    /// again, and UIKit then scrolled the field's text to its caret (UI run 2026-11-22). The swell
+    /// never moves the field's height (`pill(on:)`), so a remainder that small is the same height.
+    static func pillHeightMoved(from old: CGFloat, to new: CGFloat) -> Bool {
+        abs(new - old) >= ChatViewLayout.fieldHeightTolerance
+    }
+
+    /// The room above the field stack for its tip: from the header's bottom to the stack's top,
+    /// both measured in the chat's space; none until both are measured.
+    private var tipRoom: CGFloat {
+        let room = pillTop - headerBottom
+        return room.isFinite ? max(0, room) : 0
+    }
+
+    /// The drag up on the collapsed field moved (`ChatFieldPan`): the field swells under the finger.
+    private func fieldDragMoved(_ drag: ChatHorizontalPan.Sample) {
+        fieldDrag.progress = ChatFieldDrag.progress(translation: drag.travel)
+    }
+
+    /// The drag up on the collapsed field let go, or was cancelled (`ChatFieldPan`): the swell
+    /// springs back with the pill's spring however it ended, and a finished drag whose swell, or a
+    /// flick's predicted swell, reaches the open distance opens the panel in the same transaction.
+    private func fieldDragEnded(_ drag: ChatHorizontalPan.Sample, finished: Bool) {
+        // Debug UI tests only: a let-go or a cut-off (`ChatFieldDragMarker`).
+        ChatFieldDragMarker.dragEnded(finished: finished)
+        let opens = finished && ChatFieldDrag.opens(letGo: drag)
+        withAnimation(Self.pillSpring) {
+            fieldDrag.progress = ChatFieldDrag.Progress()
+            if opens { chatExpanded = true }
+        }
+    }
+
+    /// A drag on the field began or ended (finished or cancelled). It holds the interaction freeze
+    /// under its own id from its start and ends the tip once; after its let-go the freeze holds
+    /// while the swell settles (`fieldDragSettle`) and then the freeze rule's cooldown
+    /// (`freezeCooldown`). A newer drag's `begin` cancels an older settle; the chat going away
+    /// releases it (`onDisappear`).
+    private func fieldDragChanged(_ dragging: Bool) {
+        if dragging {
+            ChatSwipeHold.shared.begin(Self.fieldDragHoldId)
+            ChatFieldDragTip.close()
+            return
+        }
+        ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: Self.fieldDragSettle + ChatViewLayout.freezeCooldown)
     }
 
     /// The gray line above the field when the reply is not a Reply All; tap for everyone.

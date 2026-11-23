@@ -37,31 +37,37 @@ struct TutorialChatInputBar: View {
         }
     }
 
-    private var inputRow: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "mic")
-                .font(.title3)
-                .foregroundStyle(prompt == nil ? AnyShapeStyle(.secondary.opacity(0.3)) : AnyShapeStyle(Theme.accent))
-                .frame(width: 28, height: 28)
-                .accessibilityHidden(true)
+    /// The tutorial tooltip's inset from the bar's edges.
+    static let tooltipInset: CGFloat = 8
+    /// The tooltip arrow's centre from the tooltip's leading edge: over the mic glyph's centre.
+    static let tooltipArrowCenterX = ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2 - tooltipInset
 
+    /// The same row as the real bar (`ChatFieldBarRow`).
+    private var inputRow: some View {
+        ChatFieldBarRow {
+            Image(systemName: "mic")
+                .font(.body)
+                .foregroundStyle(prompt == nil ? AnyShapeStyle(.secondary.opacity(0.3)) : AnyShapeStyle(Theme.accent))
+                .frame(width: ChatViewLayout.fieldMicTapWidth, height: ChatViewLayout.fieldTapSize)
+                .accessibilityHidden(true)
+        } text: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(prompt ?? "Chat follows the tutorial steps")
                     .foregroundStyle(prompt == nil ? Theme.textSecondary : Theme.textPrimary)
                     .lineLimit(1...6)
                     .accessibilityIdentifier("tutorial-chat-input")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
+        } send: {
             Button {
                 guard prompt != nil else { return }
                 tooltipClosedFor = prompt
                 send()
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
+                    .resizable()
+                    .frame(width: ChatViewLayout.fieldSendSize, height: ChatViewLayout.fieldSendSize)
                     .foregroundStyle(prompt == nil || isWorking ? AnyShapeStyle(.secondary.opacity(0.3)) : AnyShapeStyle(Theme.accent))
-                    .frame(width: 44, height: 44)
+                    .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                     .contentShape(Rectangle())
             }
             .disabled(prompt == nil || isWorking)
@@ -73,8 +79,6 @@ struct TutorialChatInputBar: View {
             .accessibilityLabel("Send")
             .accessibilityIdentifier("tutorial-chat-send")
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
     }
 }
 
@@ -82,9 +86,9 @@ struct TutorialChatInputBar: View {
 private struct TutorialInputTooltip: View {
     let close: () -> Void
 
-    /// The arrow's center sits over the microphone: the bar's leading padding
-    /// plus half the microphone's frame, less the bubble's own inset.
-    private let arrowCenterX: CGFloat = 14 + 14 - 8
+    /// The arrow's center sits over the microphone glyph: the row's inset to the glyph plus half
+    /// the glyph, less the bubble's own inset (`TutorialChatInputBar.tooltipArrowCenterX`).
+    private let arrowCenterX = TutorialChatInputBar.tooltipArrowCenterX
     private let arrowSize = CGSize(width: 16, height: 8)
 
     var body: some View {
@@ -106,7 +110,7 @@ private struct TutorialInputTooltip: View {
         }
         .compositingGroup()
         .shadow(color: .black.opacity(0.2), radius: 8, y: 2)
-        .padding(.horizontal, 8)
+        .padding(.horizontal, TutorialChatInputBar.tooltipInset)
         .contentShape(Rectangle())
         .onTapGesture(perform: close)
         .accessibilityIdentifier("tutorial-input-tooltip")

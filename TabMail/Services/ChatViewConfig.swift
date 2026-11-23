@@ -44,6 +44,10 @@ enum ChatViewConfig {
     /// summaries of its newest this many emails, and the background walk takes each thread's newest
     /// this many. An older email asks for its own when it comes on screen.
     static let summaryWindow = 10
+
+    /// The reply field's VoiceOver action that opens the TabMail chat panel, the drag up's
+    /// equivalent (`showChatAction`).
+    static let showChatActionName = "Show TabMail chat"
 }
 
 /// Sizes and timings of the chat screen.
@@ -66,8 +70,8 @@ enum ChatViewLayout {
     static let bubbleCornerRadius: CGFloat = 18
     static let bubbleMaxWidthFraction: CGFloat = 0.78
     static let bubbleSpacing: CGFloat = 6
-    /// The one-line pill's height, used until the pill is measured: the thread keeps the measured
-    /// collapsed height under its last bubble, so it sits above the pill, never under it.
+    /// The bottom bar's height until the reply field is measured: the bar is a slot of the
+    /// collapsed field's measured height, and its inset keeps the last bubble above the field.
     static let pillStartHeight: CGFloat = 98
     /// Room between the last bubble and the pill's top, beyond the bubble spacing.
     static let pillGap: CGFloat = 6
@@ -105,12 +109,84 @@ enum ChatViewLayout {
     static let swipeSettleHold: Duration = .milliseconds(550)
     /// The response of the spring a let-go swipe settles with, in seconds.
     static let swipeSpringResponse: Double = 0.35
+    /// The interaction freeze's cooldown after an animation has settled (user-interaction-freeze
+    /// rule): the part of `swipeSettleHold` past the swipe's spring.
+    static var freezeCooldown: Duration { swipeSettleHold - .seconds(swipeSpringResponse) }
     /// The back swipe's zone at the screen's left edge, in points: with nothing open, a rightward
     /// drag that starts here goes back rather than opening a bubble's actions.
     static let backSwipeEdgeWidth: CGFloat = 24
     /// The AI Suggestion's dashed outline: its line width and its dash and gap lengths.
     static let suggestionStrokeWidth: CGFloat = 1.5
     static let suggestionDash: [CGFloat] = [6, 4]
+
+    // Every open field bar's row (`ChatFieldBarRow`): the chat's reply field, the opened pill's
+    // input bar (inbox, edit mode over a draft, the per-message pill) and the tutorial's copy.
+    // Measured from the visible glyphs. The collapsed Chat pill keeps its own size.
+    /// The field's edge to the mic glyph.
+    static let fieldMicInset: CGFloat = 12
+    /// The mic glyph's width at the body size.
+    static let fieldMicGlyphWidth: CGFloat = 13
+    /// The mic's tap width; it may reach past the field's edge into the side margin.
+    static let fieldMicTapWidth: CGFloat = 38
+    /// Between a button's glyph and the text.
+    static let fieldTextGap: CGFloat = 10
+    /// The Send circle's diameter, and its distance from the field's edge.
+    static let fieldSendSize: CGFloat = 28
+    static let fieldSendInset: CGFloat = 6
+    /// Every field button's tap height and the Send button's tap width.
+    static let fieldTapSize: CGFloat = 44
+    /// Above and below the text.
+    static let fieldVerticalPadding: CGFloat = 10
+    /// One line of body text at the default size: the buttons sit centred on the last line.
+    static let fieldLineHeight: CGFloat = 22
+    /// The collapsed reply field's corner: a capsule at one line (42 / 2), then fixed as it grows.
+    static let fieldCornerRadius: CGFloat = 21
+    /// Dragging the reply field up (`ChatFieldDrag`): how far the field may swell under the
+    /// finger, and the swell (or a flick's predicted swell) that opens the panel on let-go. The
+    /// movement before it counts as a drag is UIKit's own pan's (`ChatFieldPan`).
+    static let fieldDragMaxSwell: CGFloat = 220
+    static let fieldDragOpenDistance: CGFloat = 60
+    /// How far a flick's let-go speed carries the drag when predicting where it would rest
+    /// (`ChatFieldDrag.predictedEnd`), in seconds of travel at that speed: SwiftUI's own
+    /// projection (`DragGesture.Value.predictedEndTranslation`, a quarter second; its `velocity` is
+    /// four times the predicted end minus the travel), which the drag used before it became a
+    /// UIKit pan. The parity this gives is for equivalent samples: a let-go with the same travel and
+    /// velocity SwiftUI's drag reported, on a drag that passes the pan's begin rule
+    /// (`ChatFieldDrag.begins`), opens the panel exactly when it did. It is not a promise that every
+    /// physical flick does, since UIKit's pan and SwiftUI's drag measure a finger in their own ways.
+    static let fieldFlickCarry: CGFloat = 0.25
+    /// How long the finger may hold still before it lifts and still flick (`ChatFieldDrag.letGo`),
+    /// in seconds: UIKit's pan keeps the speed of the finger's last move at its let-go, so a drag
+    /// held still this long lets go at rest. Six frames at 60 Hz; a flick lifts within a frame or
+    /// two of its last move.
+    static let fieldFlickRest: TimeInterval = 0.1
+    /// How close to its end the focused field's overflowing text counts as at its end, where the
+    /// rest of a drag becomes the field's (`ChatFieldPan.Coordinator.isAtEnd`), in points: the
+    /// end is computed from the text's sizes while UIKit stops its scroll on its own value, so a
+    /// text held at its end read a hair short of it (UI run 2026-11-22: `over=-0.0`, under 0.05)
+    /// and the field never got its share. Well under a pixel at any scale.
+    static let fieldTextEndTolerance: CGFloat = 0.1
+    /// How far the finger may come back down from its highest point after the text handed the
+    /// drag on and still be going up (`ChatFieldPan.Coordinator.fingerCameBack`), in points: a
+    /// move down this small takes back at most a point of text (one pixel at 1x, two at 2x,
+    /// three at 3x), so the field keeping its share then shows next to nothing. Past it the
+    /// finger has taken the drag back, and a text read short of its end then ends the hand-off.
+    static let fieldTextReversalSlack: CGFloat = 1
+    /// How far the collapsed field's measured height must move to be a new height
+    /// (`ChatThreadView.pillHeightMoved`), in points: a drag's swell is added inside the field's
+    /// glass and taken back out around it, which floating point does not always cancel exactly
+    /// (UI run 2026-11-22: 158.287109375 read as 158.28710937500003 under a 125 pt swell). Well
+    /// under a pixel at any scale.
+    static let fieldHeightTolerance: CGFloat = 0.1
+    /// The pill's spring (the panel opening and closing, the field's swell springing back): its
+    /// response in seconds and its damping ratio. A drag's settle lasts this spring's own settling
+    /// duration (`ChatThreadView.fieldDragSettle`).
+    static let pillSpringResponse: Double = 0.45
+    static let pillSpringDamping: Double = 0.82
+    /// A new email's arrival in the open chat (`ChatArrival`): it rises from behind the field over
+    /// this long; under Reduce Motion the space opens at once and it fades in over the second.
+    static let arrivalRiseDuration: Double = 0.42
+    static let arrivalFadeDuration: Double = 0.2
 }
 
 /// The AI Suggestion in the chat: the ghost of the user's next message, and the field's hint.

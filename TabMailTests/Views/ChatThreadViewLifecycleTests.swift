@@ -866,6 +866,14 @@ struct ChatThreadViewLifecycleTests {
         var landed: Bool { top(of: ChatThreadViewLifecycleTests.length - 1) != nil && (scroll?.contentSize.height ?? 0) > (scroll?.bounds.height ?? .infinity) }
         /// The screen top of email `index`'s bubble.
         func top(of index: Int) -> CGFloat? { ChatThreadViewLifecycleTests.bubbleFrame(index, in: controller.view)?.minY }
+        /// How far the newest email's bubble ends above the reply pill's top, the whole field bar
+        /// rather than its text (negative if under it).
+        var newestAboveField: CGFloat? {
+            guard let pill = HostedAccessibility.elements(under: controller.view)
+                    .first(where: { HostedAccessibility.identifier(of: $0) == ChatThreadView.replyPillId })?.accessibilityFrame,
+                  let newest = ChatThreadViewLifecycleTests.bubbleFrame(ChatThreadViewLifecycleTests.length - 1, in: controller.view) else { return nil }
+            return pill.minY - newest.maxY
+        }
         /// Whether any part of email `index`'s bubble is in the scroll view's visible area.
         func shows(_ index: Int) -> Bool {
             guard let scroll, let frame = ChatThreadViewLifecycleTests.bubbleFrame(index, in: controller.view) else { return false }
@@ -899,6 +907,27 @@ struct ChatThreadViewLifecycleTests {
         func screenShrinks(by points: CGFloat) {
             window.frame.size.height -= points
         }
+
+        /// Only the bottom inset changes, as the keyboard's arrival changes it: the bottom safe area
+        /// grows, the bar with the field rises with it, and the scroll view keeps its size.
+        func bottomInsetGrows(by points: CGFloat) {
+            controller.additionalSafeAreaInsets.bottom += points
+        }
+    }
+
+    /// How far the bottom inset grows in the inset-only tests: about a keyboard's height.
+    private static let keyboardLikeInset: CGFloat = 300
+    /// How long a held condition is watched once it holds: half a second of frames, past the
+    /// platform's own adjustments after an inset change.
+    private static let holdFrames = 30
+
+    /// Whether `condition` holds on every frame for `holdFrames` frames.
+    private static func stays(_ condition: @MainActor () -> Bool) async throws -> Bool {
+        for _ in 0..<Self.holdFrames {
+            if !condition() { return false }
+            try await Task.sleep(for: .milliseconds(16))
+        }
+        return condition()
     }
 
     /// Installs a new field-words store on the test's database, as a new app run starts, and returns
@@ -1000,6 +1029,61 @@ struct ChatThreadViewLifecycleTests {
             try chat.fieldGrows()
             #expect(try await Self.until { (chat.fieldTop ?? fieldTop) < fieldTop - 40 && abs((chat.top(of: firstUnread) ?? 0) - landed) < 2 },
                     "the field grows and the Unread line stays: \(String(describing: chat.top(of: firstUnread))) vs \(landed)")
+        }
+    }
+
+    // A change of the bottom inset alone (the keyboard's arrival) changes neither the scroll view's
+    // size nor its content's. The landing re-issues on the bottom inset, though the platform may
+    // also hold the landing by itself, so these tests pin the outcome, not which of the two did it.
+    // A wrong outcome is either the scroll offset kept (the newest bubble would end under the risen
+    // field) or the bottom kept (the Unread line would move up with it); one of the two tests below
+    // sees each.
+
+    @Test("Opened at the bottom, the chat ends at the bottom when only the bottom inset grows, as the keyboard's does")
+    func bottomLandingFollowsABottomInset() async throws {
+        try await withPinned(unreadFrom: nil) { chat in
+            let opened = try await Self.until { chat.field != nil && chat.landed && abs(chat.belowScreen) < 2 }
+            #expect(opened, "control: the open lands at the bottom")
+            chat.phases(.animating, .decelerating, .idle)
+            let height = try #require(chat.scroll?.bounds.height)
+            let fieldTop = try #require(chat.fieldTop)
+            // Where the newest bubble ends above the field at the landing: the place it keeps.
+            let gap = try #require(chat.newestAboveField)
+            #expect(gap > 0, "control: at the landing the newest bubble ends above the field: \(gap)")
+            chat.bottomInsetGrows(by: Self.keyboardLikeInset)
+            let rose = try await Self.until { (chat.fieldTop ?? fieldTop) < fieldTop - Self.keyboardLikeInset / 2 }
+            #expect(rose, "control: the bottom inset grew, and the field rose with it")
+            let sameSize = abs((chat.scroll?.bounds.height ?? 0) - height) < 1
+            #expect(sameSize, "control: only the inset changed, not the scroll view's size")
+            // At the bottom, neither short of it nor pulled past it, with the newest bubble the same
+            // distance above the risen field as it was above the field at the landing.
+            let atTheBar: @MainActor () -> Bool = { abs(chat.belowScreen) < 2 && abs((chat.newestAboveField ?? -.infinity) - gap) < 2 }
+            let atTheBottom = try await Self.until(atTheBar)
+            #expect(atTheBottom, "the chat ends at the bottom, the newest bubble just above the risen field: below \(chat.belowScreen), above the field \(String(describing: chat.newestAboveField)) vs \(gap)")
+            let stays = try await Self.stays(atTheBar)
+            #expect(stays, "and stays there: below \(chat.belowScreen), above the field \(String(describing: chat.newestAboveField)) vs \(gap)")
+        }
+    }
+
+    @Test("Opened at the Unread line, the line stays where it landed when only the bottom inset grows, as the keyboard's does")
+    func unreadLandingKeepsItsAnchorThroughABottomInset() async throws {
+        let firstUnread = 20
+        try await withPinned(unreadFrom: firstUnread) { chat in
+            let opened = try await Self.until { chat.field != nil && chat.shows(firstUnread) && !chat.shows(firstUnread - 1) && chat.belowScreen > 2 }
+            #expect(opened, "control: the open lands at the Unread line")
+            let landed = try #require(chat.top(of: firstUnread))
+            chat.phases(.animating, .decelerating, .idle)
+            let height = try #require(chat.scroll?.bounds.height)
+            let fieldTop = try #require(chat.fieldTop)
+            chat.bottomInsetGrows(by: Self.keyboardLikeInset)
+            let rose = try await Self.until { (chat.fieldTop ?? fieldTop) < fieldTop - Self.keyboardLikeInset / 2 }
+            #expect(rose, "control: the bottom inset grew, and the field rose with it")
+            let sameSize = abs((chat.scroll?.bounds.height ?? 0) - height) < 1
+            #expect(sameSize, "control: only the inset changed, not the scroll view's size")
+            let atTheLine = try await Self.until { abs((chat.top(of: firstUnread) ?? 0) - landed) < 2 }
+            #expect(atTheLine, "the Unread line is where it landed: \(String(describing: chat.top(of: firstUnread))) vs \(landed)")
+            let stays = try await Self.stays { abs((chat.top(of: firstUnread) ?? 0) - landed) < 2 }
+            #expect(stays, "and stays there: \(String(describing: chat.top(of: firstUnread))) vs \(landed)")
         }
     }
 

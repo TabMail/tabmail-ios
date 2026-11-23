@@ -11,7 +11,7 @@ import GRDB
 /// Everything the user says or types goes to the agent on the newest email, as today's Chat pill
 /// on that email. Under the empty field an "e.g." line shows a change the user could ask for
 /// (`example`); a tap puts it in the field and never sends it.
-struct ChatReplyField: Equatable {
+struct ChatReplyField {
     /// The change the "e.g." line offers; nil shows no line.
     let example: String?
     /// The newest email is from a no-reply address.
@@ -20,6 +20,13 @@ struct ChatReplyField: Equatable {
     var onlyTo: [ChatThread.Person]? = nil
     /// In the tutorial, what the read-only field holds and sends (part 2); nil holds nothing.
     var tutorialMove: TutorialCoordinator.FieldMove? = nil
+    /// A drag up in flight, whose swell grows the field toward the panel (`ChatFieldDrag.Swell`);
+    /// nil swells nothing.
+    var drag: ChatFieldDrag.Model? = nil
+    /// VoiceOver's "Show TabMail chat" (`ChatViewConfig.showChatActionName`), the drag up's
+    /// equivalent, offered on the element VoiceOver focuses (`showChatAction`); nil offers nothing
+    /// (the panel open, the tutorial).
+    var showChat: (() -> Void)? = nil
     /// The full email of the AI Suggestion the chat shows now (`cachedReply`); nil when no ghost
     /// shows. A request sent while it shows is a compose edit of it (`ChatFieldReply.suggestion`).
     var suggestion: ReplyResult? = nil

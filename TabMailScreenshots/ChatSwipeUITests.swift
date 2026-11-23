@@ -116,6 +116,877 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "it only closed the actions")
     }
 
+    func testDragUpOnTheReplyFieldOpensTheChatPanel() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        XCTAssertTrue(field.isHittable, "control: the reply field is on screen")
+        XCTAssertFalse(app.buttons["chatClose"].exists, "control: the panel is closed")
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -200)))
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag opened the TabMail chat panel")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    /// Memory 129: a control at the bottom safe-area bar can exist yet swallow nothing, or take
+    /// nothing, so the opened panel is tapped, not only found: Close closes it, and so does the dim
+    /// above it.
+    func testDraggedOpenPanelClosesOnCloseAndOnTheDim() throws {
+        let app = launchIntoChat()
+        dragFieldOpen(in: app)
+        app.buttons["chatClose"].tap()
+        XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "Close closed the panel")
+        XCTAssertTrue(replyField(in: app).isHittable, "the collapsed field is back")
+
+        dragFieldOpen(in: app)
+        let close = app.buttons["chatClose"]
+        // The dim between the navigation bar's bottom and the panel's top, both on screen: the bar
+        // from its own frame, the panel's top from the app's marker (the panel's own frame), so no
+        // group inside the panel stands in for its edge. A tap higher up lands on the navigation
+        // bar, which takes it; lower, on the panel.
+        let barBottom = app.navigationBars.firstMatch.frame.maxY
+        let open = try XCTUnwrap(settledDragMarker(in: app), "control: the marker shows")
+        let panelTop = try XCTUnwrap(open.fieldTop, "control: the marker shows the open panel's top")
+        XCTAssertLessThan(barBottom + 2 * Self.dimTapMargin, panelTop,
+                          "control: there is dim between the navigation bar \(barBottom) and the panel \(panelTop) to tap")
+        tap(atY: (barBottom + panelTop) / 2, dx: 0.5, in: app)
+        XCTAssertTrue(close.waitForNonExistence(timeout: 3), "a tap on the dim closed the panel")
+        XCTAssertEqual(readDragMarker(in: app)?.dims, open.dims + 1, "the dim's own tap handler took the tap")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    /// How far from the navigation bar and the panel a dim tap must land to be the dim's. The open
+    /// panel leaves about 17 points of dim below the bar on an iPhone, so the midpoint tap has
+    /// about 8 on each side.
+    private static let dimTapMargin: CGFloat = 5
+
+    /// The swell is not the field's room: across a short drag and its settle the chat does not move.
+    /// XCUITest reads frames only once the app is idle, after the spring, so the app's marker
+    /// records the newest row's largest move from the drag's start until well after its settle.
+    func testShortDragOnTheReplyFieldKeepsTheChat() throws {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        let newest = bubble(3, in: app)
+        let before = restingMinY(of: newest)
+        // The marker reports the newest ROW's top, its sender line included, not the bubble's: read
+        // it at rest too, so the control compares a row's top with a row's top.
+        let rest = try XCTUnwrap(readDragMarker(in: app), "control: the marker shows at rest")
+        let restingGlass = try XCTUnwrap(rest.fieldTop, "control: the marker shows the field's glass at rest")
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -Self.shortDragTravel)),
+                    withVelocity: .slow, thenHoldForDuration: 0.3)
+        let marker = dragMarker(afterDrags: 1, in: app)
+        XCTAssertNotNil(marker, "control: the marker recorded one finished drag")
+        guard let marker else { return }
+        XCTAssertTrue(marker.hasBaseline, "control: the drag's start had the newest row's place")
+        // A drag is never a tap: the field does not take focus, so no keyboard moves the chat.
+        XCTAssertTrue(markerReads(focused: false, in: app), "the short drag left the field unfocused")
+        XCTAssertEqual(marker.newestMinY, rest.newestMinY, accuracy: 1, "control: the marker's newest row is the row read at rest")
+        // The glass rose under the held finger (read by the app while the finger was down)...
+        XCTAssertGreaterThan(marker.rise, Self.shortDragTravel / 2, "the field's glass swelled under the finger: \(marker.rise)")
+        XCTAssertLessThanOrEqual(marker.rise, Self.shortDragTravel + 1, "no further than the finger went")
+        // ...and is back at its resting top once settled.
+        XCTAssertEqual(marker.fieldTop ?? -1, restingGlass, accuracy: 1, "the swell settled back")
+        XCTAssertLessThan(marker.move, 1, "the chat stayed through the swell and the settle: moved \(marker.move)")
+        XCTAssertTrue(marker.heldAtSettle, "the freeze is still held through the cooldown after the settle")
+        XCTAssertFalse(marker.frozen, "the freeze is released once the drag has settled")
+        XCTAssertEqual(newest.frame.minY, before, accuracy: 1, "the chat is where it was once settled")
+        XCTAssertFalse(app.buttons["chatClose"].exists, "control: the short drag did not open the panel")
+    }
+
+    /// The short drag's travel: under the open distance.
+    private static let shortDragTravel: CGFloat = 40
+
+    /// A drag that opens the panel lets go of the user-interaction freeze too.
+    func testDragThatOpensThePanelReleasesTheFreeze() {
+        let app = launchIntoChat()
+        dragFieldOpen(in: app)
+        let marker = dragMarker(afterDrags: 1, in: app)
+        XCTAssertNotNil(marker, "control: the marker recorded one finished drag")
+        guard let marker else { return }
+        XCTAssertTrue(marker.heldAtSettle, "the freeze is still held through the cooldown after the settle")
+        XCTAssertFalse(marker.frozen, "the freeze is released after a drag that opened the panel")
+        XCTAssertTrue(app.buttons["chatClose"].exists, "control: the panel is still open")
+    }
+
+    /// A drag held past the open distance when the panel opens under it, as an agent's answer opens
+    /// it: opening turns the field's pan off, which cuts the drag off while the finger is still
+    /// down. The fixture opens the panel the moment the app sees the held drag swollen past the open
+    /// distance, and the app records what happened to the drag in order: the opening's request, then
+    /// the cut (a drag that ran on to the let-go would record `end` instead, and the swell would hold
+    /// until the finger lifts). The panel's actual opening is read from its Close button. The freeze the drag held is released, and once the panel closes the field
+    /// is back at rest, no swell left, and the next drag opens the panel. (A cut-off drag cannot
+    /// itself open the panel, as `fieldDragWiring` pins by reading; here the panel is open either
+    /// way.)
+    func testDragCutOffByThePanelOpeningSettlesAndTheNextDragWorks() throws {
+        let app = launchIntoChat(openPanelUnderDrag: true)
+        let field = replyField(in: app)
+        let restingGlass = try XCTUnwrap(settledDragMarker(in: app)?.fieldTop, "control: the marker shows the field at rest")
+        app.buttons["Open the panel under the next drag"].tap()
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        // Up past the open distance, then held well after the panel has opened under it.
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -Self.heldDragTravel)),
+                    withVelocity: .default, thenHoldForDuration: Self.holdAfterThePanelOpens)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "control: the panel opened under the held drag")
+        let marker = try XCTUnwrap(dragMarker(afterDrags: 1, in: app), "control: the marker recorded the one drag")
+        XCTAssertEqual(marker.events, ["open", "cut"],
+                       "the opening was requested under the held drag, and the drag was then cut off before the finger lifted: \(dragMarkerLabel(afterDrags: 1, in: app))")
+        XCTAssertFalse(marker.frozen, "the cut-off drag released the freeze")
+        // The open panel turns the field's pan off, and closing it turns the pan back on: the
+        // marker's pan record says which way each went.
+        let panOpen = try XCTUnwrap(marker.pan, "control: the marker reports the field's pan")
+        XCTAssertTrue(panOpen.contains { $0.hasPrefix("off:") }, "the opening turned the field's pan off: \(panOpen)")
+        app.buttons["chatClose"].tap()
+        XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "control: Close closed the panel")
+        let closedMarker = try XCTUnwrap(settledDragMarker(in: app), "control: the marker shows again")
+        XCTAssertEqual(closedMarker.pan?.last?.hasPrefix("on:"), true,
+                       "closing the panel turned the field's pan back on: \(String(describing: closedMarker.pan))")
+        let closed = try XCTUnwrap(closedMarker.fieldTop, "control: the marker shows the field again")
+        XCTAssertEqual(closed, restingGlass, accuracy: 1, "the field is back at rest, no swell left")
+        dragFieldOpen(in: app)
+    }
+
+    /// The held drag's travel, past the open distance, and how long it is held once there: the
+    /// panel opens the moment the swell passes the open distance, so this only keeps the finger
+    /// down well past that.
+    private static let heldDragTravel: CGFloat = 150
+    private static let holdAfterThePanelOpens: TimeInterval = 1.5
+
+    /// With the actions of a bubble open, a drag up from the reply field far enough to open the
+    /// panel only closes them: the closer takes it, as it takes every drag while something is open.
+    func testOpenActionsDragUpOnTheReplyFieldOnlyCloses() {
+        let app = launchIntoChat()
+        openBubble(2, in: app)
+        let field = replyField(in: app)
+        XCTAssertTrue(field.isHittable, "control: the reply field is on screen")
+        dragUp(atY: field.frame.midY, in: app)
+        XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "it closed the actions")
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "and did not open the panel")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    /// With nothing open, a back swipe that starts on the reply field goes back: the field's drag
+    /// takes only drags more up than sideways. The drag runs most of the screen's width: the back
+    /// swipe takes it once the field's drag has declined, a few dozen points in, and a back swipe
+    /// that stops short of half the width before the finger lifts settles back, as iOS's does.
+    func testNothingOpenRightDragOnTheReplyFieldGoesBack() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        let y = field.frame.midY / app.frame.height
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: Self.longBackSwipeStart, dy: y))
+        XCTAssertGreaterThan(start.screenPoint.x, field.frame.minX, "control: the drag starts on the field's text")
+        XCTAssertGreaterThan(start.screenPoint.x, Self.backSwipeEdge, "control: outside the screen edge's own back swipe")
+        start.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: Self.longBackSwipeEnd, dy: y)))
+        XCTAssertTrue(wentBack(app), "a right drag from the field goes back")
+    }
+
+    /// A right drag across most of the screen, and the screen edge's own back-swipe zone
+    /// (`ChatViewLayout.backSwipeEdgeWidth`), which a content back swipe starts outside of.
+    private static let longBackSwipeStart: CGFloat = 0.15
+    private static let longBackSwipeEnd: CGFloat = 0.95
+    private static let backSwipeEdge: CGFloat = 24
+
+    /// Starts in the screen's margin beside the field, outside the field's glass.
+    func testNothingOpenEdgeDragOnTheReplyFieldGoesBack() {
+        let app = launchIntoChat()
+        dragFromEdge(atY: replyField(in: app).frame.midY, in: app)
+        XCTAssertTrue(wentBack(app), "an edge drag at the field goes back")
+    }
+
+    /// Starts on the field's glass itself, where it overlaps the back swipe's zone at the screen's
+    /// left edge (the field's side inset is narrower than that zone): the field's own drag and its
+    /// text leave the back swipe the touch, so it goes back.
+    func testNothingOpenEdgeDragStartingOnTheReplyFieldGoesBack() {
+        let app = launchIntoChat()
+        let pill = app.descendants(matching: .any)["chatReplyPill"].firstMatch
+        XCTAssertTrue(pill.waitForExistence(timeout: 5), "control: the field's glass")
+        XCTAssertTrue(pill.isHittable, "control: the field is hittable")
+        let y = replyField(in: app).frame.midY
+        let x = pill.frame.minX + Self.insideTheFieldsEdge
+        let onTheGlass = pill.frame.contains(CGPoint(x: x, y: y))
+        XCTAssertTrue(onTheGlass, "control: the start (\(x), \(y)) is on the field's glass \(pill.frame)")
+        XCTAssertLessThan(x, Self.backSwipeEdgeWidth, "control: and inside the back swipe's zone")
+        let start = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: x, dy: y))
+        start.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: y / app.frame.height)))
+        XCTAssertTrue(wentBack(app), "an edge drag that starts on the field goes back")
+    }
+
+    /// `ChatViewLayout.backSwipeEdgeWidth`, the back swipe's zone at the left edge, and how far into
+    /// the field's glass from its leading edge the overlap drag starts (the field's side inset,
+    /// `ChatViewLayout.fieldSideInset`, is 16 points, so this lands at 20).
+    private static let backSwipeEdgeWidth: CGFloat = 24
+    private static let insideTheFieldsEdge: CGFloat = 4
+
+    /// Signed in, the focused field with a short draft: the drag up opens the panel, whose editor
+    /// (not the sign-in bar a signed-out panel shows) holds the same draft and keeps its focus
+    /// (mock v15 H2: the panel opens above the keyboard). Close then gives the field back without
+    /// the keyboard.
+    func testDragUpOnAShortFocusedDraftOpensThePanelWithIt() {
+        let app = launchIntoChat(signedIn: true)
+        let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
+        field.tap()
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.shortQuestion)
+        let typed = typedField(containing: Self.shortQuestion, in: app)
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
+        waitForTheKeyboardBack(under: typed, in: app)
+        dragUp(atY: typed.frame.midY, in: app)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag opened the panel while the field had focus")
+        XCTAssertFalse(app.staticTexts[Self.signInBarText].exists, "control: signed in, the panel has its editor, not the sign-in bar")
+        let open = settledDragMarker(in: app)
+        let editor = typedField(containing: Self.shortQuestion, in: app)
+        XCTAssertTrue(editor.waitForExistence(timeout: 3), "the panel's editor holds the draft")
+        XCTAssertEqual(editor.value as? String, Self.shortQuestion, "the draft, whole and unchanged")
+        if let panelTop = open?.fieldTop {
+            XCTAssertGreaterThanOrEqual(editor.frame.minY, panelTop, "inside the open panel")
+        } else {
+            XCTFail("control: the marker shows the open panel")
+        }
+        // Read from the element, as the overflowing draft's test reads it, and from the app's marker.
+        XCTAssertTrue(waitForFocus(editor, true, timeout: 3), "the panel's editor keeps the draft's focus")
+        XCTAssertTrue(markerReads(focused: true, in: app), "the app's marker reads the panel's editor focused")
+        // Where a software keyboard showed for the field, it is on screen and the editor above it.
+        waitForTheKeyboardBack(under: editor, in: app, failure: "the panel's editor holds still above the keyboard")
+        // Closing the panel clears the focus, and nothing gives it back to the field afterwards.
+        app.buttons["chatClose"].tap()
+        XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "Close closed the panel")
+        let restored = typedField(containing: Self.shortQuestion, in: app)
+        XCTAssertTrue(restored.waitForExistence(timeout: 3), "control: the field holds the draft again")
+        XCTAssertTrue(markerReads(focused: false, in: app), "the field came back without the keyboard")
+        XCTAssertFalse(markerReads(focused: true, in: app), "and does not take it back")
+        // Read from the field itself and from the screen too, so a focus that bypasses the pill's own
+        // focus value (and its marker) is caught: a software keyboard that showed for the field is
+        // down, after the marker's waits have let it go.
+        XCTAssertFalse(waitForFocus(restored, true, timeout: 1), "the field does not read focused itself")
+        XCTAssertTrue(keyboardStaysDown(in: app), "the keyboard stays down after Close")
+    }
+
+    /// Signed in, the field without the keyboard: the drag up opens the panel with its editor and
+    /// leaves the keyboard down. Only a typed-in field's keyboard moves to the panel's input.
+    func testDragUpOnTheUnfocusedSignedInFieldOpensThePanelWithTheKeyboardDown() {
+        let app = launchIntoChat(signedIn: true)
+        let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
+        XCTAssertTrue(markerReads(focused: false, in: app), "control: the field has no keyboard")
+        dragUp(atY: field.frame.midY, in: app)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag opened the panel")
+        XCTAssertFalse(app.staticTexts[Self.signInBarText].exists, "control: signed in, the panel has its editor, not the sign-in bar")
+        XCTAssertNotNil(settledDragMarker(in: app)?.fieldTop, "control: the marker shows the open panel")
+        let editor = replyField(in: app, placeholder: Self.panelPlaceholder)
+        XCTAssertTrue(markerReads(focused: false, in: app), "control: the app's marker reads the panel's editor")
+        XCTAssertFalse(markerReads(focused: true, in: app), "the panel's editor did not take the keyboard")
+        XCTAssertFalse(waitForFocus(editor, true, timeout: 1), "nor does it read focused itself")
+        XCTAssertTrue(keyboardStaysDown(in: app), "the keyboard stays down")
+    }
+
+    /// Whether no keyboard of a software keyboard's size is on screen at any read for
+    /// `keyboardDownWindow` (a keyboard parked below the screen counts as down).
+    private func keyboardStaysDown(in app: XCUIApplication) -> Bool {
+        let keyboard = app.keyboards.firstMatch
+        let deadline = Date().addingTimeInterval(Self.keyboardDownWindow)
+        repeat {
+            if keyboard.exists, app.frame.intersection(keyboard.frame).height > app.frame.height * Self.keyboardMinShare {
+                return false
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.keyboardBackPollStep))
+        } while Date() < deadline
+        return true
+    }
+
+    /// How long a keyboard must stay off screen to count as down.
+    private static let keyboardDownWindow: TimeInterval = 2
+
+    /// The signed-in field's hint (`ChatReplyField.placeholder`), the open panel's input's hint
+    /// (`PillDictationMode.placeholder`), and the open panel's sign-in bar.
+    private static let signedInPlaceholder = "Reply or ask anything"
+    private static let panelPlaceholder = "Type or speak..."
+    private static let signInBarText = "Sign in to TabMail for AI features and push notifications"
+
+    /// With the first-time tip showing, as a new user sees it: the tip is on screen, and it takes
+    /// no touch from the field. The first drag opens the panel; in a fresh launch, the first tap
+    /// focuses the field.
+    func testFieldDragTipShowsAndLeavesTheFieldItsTouches() {
+        let app = launchIntoChat(fieldDragTip: true)
+        let tip = app.staticTexts[Self.fieldDragTipText].firstMatch
+        XCTAssertTrue(tip.waitForExistence(timeout: 5), "the tip shows above the field")
+        XCTAssertLessThanOrEqual(tip.frame.maxY, replyField(in: app).frame.minY + 1, "control: the tip is above the field")
+        assertTipCardFits(shownTipCard(in: app), "the whole card, not only its words, is between the header and the field")
+        dragFieldOpen(in: app)
+        app.terminate()
+
+        let fresh = launchIntoChat(fieldDragTip: true)
+        XCTAssertTrue(fresh.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: 5),
+                      "control: the tip shows again in the fresh launch")
+        replyField(in: fresh).tap()
+        XCTAssertTrue(markerReads(focused: true, in: fresh), "the first tap focused the field")
+    }
+
+    /// The card's geometry, with the tip forced on: landscape at a large text size, where the card
+    /// may not fit above the field, it is either wholly between the header and the field or waiting
+    /// for room (the marker's `wait`), never cut off above the screen; the read waits until one of
+    /// the two holds. Turned upright, the whole card shows. (Whether waiting keeps the tip's one
+    /// showing is the app's own TipKit rules' to say, so
+    /// `testFieldDragTipWaitingForRoomKeepsItsOneShowing` checks it without the forcing.)
+    func testFieldDragTipCardIsWholeOrWaitsForRoom() throws {
+        XCUIDevice.shared.orientation = .landscapeLeft
+        addTeardownBlock { XCUIDevice.shared.orientation = .portrait }
+        let app = launchIntoChat(fieldDragTip: true, textSize: Self.largeTextSize)
+        let landscape = try XCTUnwrap(decidedTipMarker(in: app), "control: the card either shows or waits for room")
+        if let card = landscape.tip {
+            assertTipCardFits((card: card, room: landscape.room), "in landscape the card that shows is whole")
+        } else {
+            XCTAssertEqual(landscape.tipWaiting, true, "in landscape a card that does not show is waiting for room")
+        }
+        XCTContext.runActivity(named: landscape.tip == nil ? "landscape: the tip waited for room" : "landscape: the tip fit") { _ in }
+        XCUIDevice.shared.orientation = .portrait
+        XCTAssertTrue(app.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: 5),
+                      "with room the tip shows")
+        assertTipCardFits(shownTipCard(in: app), "upright, the whole card is between the header and the field")
+    }
+
+    /// The app's own tip rules, nothing forced, on a fresh datastore of the test's own: landscape at
+    /// the largest text size the whole card has no room, so the tip waits (the marker's `wait`) and
+    /// shows no card. Relaunched upright at the default size on the same datastore, it shows,
+    /// whole: waiting for room did not spend its one showing.
+    func testFieldDragTipWaitingForRoomKeepsItsOneShowing() throws {
+        XCUIDevice.shared.orientation = .landscapeLeft
+        addTeardownBlock { XCUIDevice.shared.orientation = .portrait }
+        let app = launchIntoChat(textSize: Self.largestTextSize, tipStore: .fresh)
+        let landscape = try XCTUnwrap(decidedTipMarker(in: app), "control: the tip's place is decided")
+        XCTAssertEqual(landscape.tipWaiting, true, "control: the tip is eligible and its whole card has no room, so it waits")
+        XCTAssertNil(landscape.tip, "no card shows without room")
+        let words = app.staticTexts[Self.fieldDragTipText].firstMatch
+        if words.exists {
+            // What the accessibility tree holds while nothing is drawn: where the words are, and
+            // whether a touch could reach them.
+            let found = XCTAttachment(string: "frame=\(words.frame) hittable=\(words.isHittable)\n\n\(app.debugDescription)")
+            found.name = "waiting tip words"
+            found.lifetime = .keepAlways
+            add(found)
+        }
+        // VoiceOver can still reach the waiting card's words (tabmail-ios#1255, a VoiceOver-only
+        // issue fixed later): expected to fail until then. The launch helper stops at the first
+        // failure and an expected one counts, so it is let through here and the upright half below
+        // still runs.
+        let voiceOverIssue = XCTExpectedFailure.Options()
+        voiceOverIssue.isStrict = false
+        continueAfterFailure = true
+        XCTExpectFailure("tabmail-ios#1255: a tip card waiting for room stays in the accessibility tree", options: voiceOverIssue) {
+            XCTAssertFalse(words.exists, "and none of its words")
+        }
+        continueAfterFailure = false
+        app.terminate()
+
+        XCUIDevice.shared.orientation = .portrait
+        let upright = launchIntoChat(tipStore: .kept)
+        XCTAssertTrue(upright.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: 5),
+                      "with room, on the same datastore, the tip shows: waiting kept its one showing")
+        assertTipCardFits(shownTipCard(in: upright), "the whole card is between the header and the field")
+    }
+
+    /// The app's own tip rules on a fresh datastore of the test's own: a short drag that opens
+    /// nothing ends the tip, and it stays gone when the chat is opened again and after a relaunch on
+    /// the same datastore.
+    func testFieldDragTipStaysGoneAfterAShortDrag() {
+        let app = launchIntoChat(tipStore: .fresh)
+        let tip = app.staticTexts[Self.fieldDragTipText].firstMatch
+        XCTAssertTrue(tip.waitForExistence(timeout: 5), "control: on a fresh datastore the tip shows")
+        let field = replyField(in: app)
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -25)),
+                    withVelocity: .slow, thenHoldForDuration: 0.3)
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "control: the short drag opened nothing")
+        XCTAssertTrue(tip.waitForNonExistence(timeout: 3), "the drag ended the tip")
+        XCTAssertFalse(tip.waitForExistence(timeout: Self.tipStaysGoneWait), "and it stays gone")
+        assertTipStaysGoneOnTheNextPresentations(of: app)
+    }
+
+    /// The app's own tip rules on a fresh datastore of the test's own: a tap that focuses the field
+    /// ends the tip, and it stays gone when the chat is opened again and after a relaunch on the
+    /// same datastore.
+    func testFieldDragTipStaysGoneAfterATap() {
+        let app = launchIntoChat(tipStore: .fresh)
+        let tip = app.staticTexts[Self.fieldDragTipText].firstMatch
+        XCTAssertTrue(tip.waitForExistence(timeout: 5), "control: on a fresh datastore the tip shows")
+        replyField(in: app).tap()
+        XCTAssertTrue(markerReads(focused: true, in: app), "control: the tap focused the field")
+        XCTAssertTrue(tip.waitForNonExistence(timeout: 3), "the tap ended the tip")
+        XCTAssertFalse(tip.waitForExistence(timeout: Self.tipStaysGoneWait), "and the tip stays gone")
+        assertTipStaysGoneOnTheNextPresentations(of: app)
+    }
+
+    /// The app's own tip rules on a fresh datastore of the test's own: the tip shows at most once.
+    /// Once its whole card has shown, it is spent even when the user leaves the chat without
+    /// touching the field or closing the tip: it does not come back when the chat is opened again
+    /// with room for it, nor after a relaunch on the same datastore.
+    func testFieldDragTipShownOnceStaysGoneAfterLeavingTheChat() {
+        let app = launchIntoChat(tipStore: .fresh)
+        let tip = app.staticTexts[Self.fieldDragTipText].firstMatch
+        XCTAssertTrue(tip.waitForExistence(timeout: 5), "control: on a fresh datastore the tip shows")
+        assertTipCardFits(shownTipCard(in: app), "control: its whole card showed between the header and the field")
+        assertTipStaysGoneOnTheNextPresentations(of: app)
+    }
+
+    /// The ended tip stays gone when the chat is opened again in the same launch, and in a relaunch
+    /// on the same datastore.
+    private func assertTipStaysGoneOnTheNextPresentations(of app: XCUIApplication,
+                                                          file: StaticString = #filePath, line: UInt = #line) {
+        dragFromEdge(atY: bubble(3, in: app).frame.midY, in: app)
+        XCTAssertTrue(wentBack(app), "control: back at the list", file: file, line: line)
+        app.buttons["Open chat"].tap()
+        XCTAssertTrue(bubble(3, in: app).waitForExistence(timeout: 10), "control: the chat is open again", file: file, line: line)
+        XCTAssertFalse(app.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: Self.tipStaysGoneWait),
+                       "the ended tip stays gone in the chat opened again", file: file, line: line)
+        app.terminate()
+
+        let relaunched = launchIntoChat(tipStore: .kept)
+        XCTAssertFalse(relaunched.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: Self.tipStaysGoneWait),
+                       "and after a relaunch on the same datastore", file: file, line: line)
+    }
+
+    /// An accessibility text size: the card grows tall enough that it may not fit in landscape,
+    /// yet it fits upright.
+    private static let largeTextSize = "UICTContentSizeCategoryAccessibilityXL"
+    /// The largest accessibility text size: in landscape the card has no room above the field.
+    private static let largestTextSize = "UICTContentSizeCategoryAccessibilityXXXL"
+    /// How long a gone tip is watched for coming back.
+    private static let tipStaysGoneWait: TimeInterval = 2
+
+    /// The marker once the tip's place is decided and holds across two reads a moment apart: its
+    /// whole card shows, or it waits for room. A tip TipKit has not yet made available lays out
+    /// empty, so neither holds until TipKit has decided. Nil if neither holds within the poll limit.
+    private func decidedTipMarker(in app: XCUIApplication) -> DragMarker? {
+        let deadline = Date().addingTimeInterval(Self.dragMarkerPollLimit)
+        var last: DragMarker?
+        repeat {
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.restReadInterval))
+            let now = readDragMarker(in: app)
+            if let now, now.tip != nil || now.tipWaiting == true,
+               let last, Self.sameSpan(now.tip, last.tip), now.tipWaiting == last.tipWaiting {
+                return now
+            }
+            last = now
+        } while Date() < deadline
+        return nil
+    }
+
+    /// The marker's tip card once it shows, with its room.
+    private func shownTipCard(in app: XCUIApplication) -> (card: (CGFloat, CGFloat)?, room: (CGFloat, CGFloat)?) {
+        let deadline = Date().addingTimeInterval(Self.dragMarkerPollLimit)
+        repeat {
+            if let marker = readDragMarker(in: app), let tip = marker.tip { return (tip, marker.room) }
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.focusMarkerPollStep))
+        } while Date() < deadline
+        return (nil, nil)
+    }
+
+    /// The marker after the screen has settled (read twice, a moment apart, the same).
+    private func settledDragMarker(in app: XCUIApplication) -> DragMarker? {
+        let deadline = Date().addingTimeInterval(Self.dragMarkerPollLimit)
+        var last: DragMarker?
+        repeat {
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.restReadInterval))
+            let now = readDragMarker(in: app)
+            if let now, let last, Self.sameSpan(now.tip, last.tip), now.fieldTop == last.fieldTop { return now }
+            last = now
+        } while Date() < deadline
+        return last
+    }
+
+    private static func sameSpan(_ one: (CGFloat, CGFloat)?, _ other: (CGFloat, CGFloat)?) -> Bool {
+        switch (one, other) {
+        case (nil, nil): true
+        case let (one?, other?): one == other
+        default: false
+        }
+    }
+
+    /// The whole card lies between the header's bottom and the field stack's top, measured by the
+    /// app in one space.
+    private func assertTipCardFits(_ shown: (card: (CGFloat, CGFloat)?, room: (CGFloat, CGFloat)?), _ message: String,
+                                   file: StaticString = #filePath, line: UInt = #line) {
+        guard let card = shown.card, let room = shown.room else {
+            XCTFail("control: the marker reports the card and its room", file: file, line: line)
+            return
+        }
+        XCTAssertLessThan(card.0, card.1, "control: the card has a height", file: file, line: line)
+        XCTAssertGreaterThanOrEqual(card.0, room.0 - 1, "\(message): its top \(card.0) is below the header \(room.0)", file: file, line: line)
+        XCTAssertLessThanOrEqual(card.1, room.1 + 1, "\(message): its bottom \(card.1) is above the field \(room.1)", file: file, line: line)
+    }
+
+    func testShortDragUpOnTheReplyFieldSettlesBack() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        XCTAssertTrue(field.isHittable, "control: the reply field is on screen")
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        // Slow and short: under the open distance, with no flick.
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -25)),
+                    withVelocity: .slow, thenHoldForDuration: 0.3)
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "a short drag does not open the panel")
+        XCTAssertTrue(replyField(in: app).isHittable, "the field settled back")
+        XCTAssertTrue(markerReads(focused: false, in: app), "and did not take focus, as a tap would")
+    }
+
+    /// The same short travel let go fast: the flick's predicted swell opens the panel through the
+    /// installed pan, though the finger stopped short of the open distance.
+    func testShortFlickUpOnTheReplyFieldOpensThePanel() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        XCTAssertTrue(field.isHittable, "control: the reply field is on screen")
+        XCTAssertLessThan(Self.shortFlick, ChatSwipeUITests.openDistance, "control: the finger stops short of the open distance")
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -Self.shortFlick)),
+                    withVelocity: .fast, thenHoldForDuration: 0)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the flick opened the panel")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    /// `ChatViewLayout.fieldDragOpenDistance`, and a flick's travel well short of it.
+    private static let openDistance: CGFloat = 60
+    private static let shortFlick: CGFloat = 40
+
+    /// The focused field: a drag up in text that overflows the field's lines, stopping short of the
+    /// text's end, only scrolls that text, so the panel stays shut and the field keeps its focus. The
+    /// text is first scrolled to its top, so the drag has room; which line is at the top is read by tapping the text's top-left corner and
+    /// typing a mark there. A short draft's drag opens the panel
+    /// (`testDragUpOnAShortFocusedDraftOpensThePanelWithIt`).
+    func testDragUpInOverflowingTextScrollsIt() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        field.tap()
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.overflowingText)
+        let long = typedField(containing: Self.overflowingLastLine, in: app)
+        XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
+        waitForTheKeyboardBack(under: long, in: app)
+        // Down to the text's top: the field's drag takes only drags up, so this is the text's scroll.
+        textScroll(long, by: Self.toTheTextsTop, in: app)
+        XCTAssertEqual(topLine(of: long, in: app), "Line 1", "control: the text is at its top, with room to scroll")
+        textScroll(long, by: -Self.withinTheScrollRoom, in: app)
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the drag scrolled the overflowing text; the panel stays shut")
+        XCTAssertTrue(markerReads(focused: true, in: app), "and the field kept its focus")
+        let watched = dragMarkerLabel(afterDrags: 1, in: app)
+        // Where the drag left it: the control read above left the caret at the draft's start, and a
+        // scroll toward it after the let-go can stop with another line on top, so the top line alone
+        // cannot show the text stayed put.
+        XCTAssertEqual(dragMarker(afterDrags: 1, in: app)?.textMove, "none",
+                       "after the let-go the text stayed where the drag left it (marker: \(watched))")
+        let after = topLine(of: long, in: app)
+        XCTAssertNotNil(after, "control: a line is at the text's top")
+        XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag (marker: \(watched))")
+        XCTAssertEqual(long.value as? String, Self.overflowingText, "control: the text is unchanged")
+    }
+
+    /// Signed in, the same draft and the same start, but the drag carries on past the text's end:
+    /// the rest of the same drag is the field's (mock v15 H2), so it opens the panel, whose editor
+    /// holds the whole draft, inside the panel and above the keyboard when one shows.
+    func testDragUpInOverflowingTextPastItsEndOpensThePanel() throws {
+        let app = launchIntoChat(signedIn: true)
+        let long = signedInDraftAtItsTop(Self.overflowingText, lastLine: Self.overflowingLastLine, in: app)
+        XCTAssertFalse(app.buttons["chatClose"].exists, "control: the panel is shut")
+        textScroll(long, by: -Self.pastTheTextsEnd, in: app)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag past the text's end opened the panel")
+        let opened = try XCTUnwrap(dragMarker(afterDrags: 1, in: app), "control: the field's pan saw the drag")
+        let watched = dragMarkerLabel(afterDrags: 1, in: app)
+        let downBuilds = try XCTUnwrap(opened.downBuilds, "control: the marker counted the field's builds while the finger was down (marker: \(watched))")
+        XCTAssertLessThanOrEqual(downBuilds, Self.dragStartBuildAllowance,
+                                 "the swell growing under the finger did not rebuild the field's editor: \(downBuilds) builds while it was down (marker: \(watched))")
+        XCTAssertFalse(app.staticTexts[Self.signInBarText].exists, "control: signed in, the panel has its editor, not the sign-in bar")
+        let panelTop = try XCTUnwrap(settledDragMarker(in: app)?.fieldTop, "control: the marker shows the open panel")
+        let editor = typedField(containing: Self.overflowingLastLine, in: app)
+        XCTAssertTrue(editor.waitForExistence(timeout: 3), "the panel's editor holds the draft")
+        XCTAssertEqual(editor.value as? String, Self.overflowingText, "the whole draft, unchanged")
+        XCTAssertGreaterThanOrEqual(editor.frame.minY, panelTop - 1, "inside the open panel")
+        // The draft keeps the keyboard's focus in the panel's editor (read from the element, so it
+        // holds whether or not the simulator shows its software keyboard), and where a software
+        // keyboard showed for the field, it is on screen and the editor above it.
+        XCTAssertTrue(waitForFocus(editor, true, timeout: 3), "the panel's editor keeps the draft's focus")
+        waitForTheKeyboardBack(under: editor, in: app, failure: "the panel's editor holds still above the keyboard")
+    }
+
+    /// Signed in, a draft whose scroll room is larger than the open distance, at its top: a drag up
+    /// further than the open distance that stays inside that room is all the text's. The field's
+    /// glass does not rise under it, the panel stays shut, the field keeps its focus, and the text
+    /// moved on.
+    func testDragUpPastTheOpenDistanceInsideTheTextsRoomIsAllTheTexts() throws {
+        let app = launchIntoChat(signedIn: true)
+        let long = signedInDraftAtItsTop(Self.longDraft, lastLine: Self.longDraftLastLine, in: app)
+        XCTAssertGreaterThan(Self.insideTheLongDraftsRoom, Self.openDistance, "control: the drag goes past the open distance")
+        textScroll(long, by: -Self.insideTheLongDraftsRoom, in: app)
+        let marker = try XCTUnwrap(dragMarker(afterDrags: 1, in: app), "control: the field's pan saw the drag")
+        XCTAssertLessThan(marker.rise, 1, "the text kept the whole drag; the field's glass did not rise: \(marker.rise)")
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the panel stays shut")
+        XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
+        let watched = dragMarkerLabel(afterDrags: 1, in: app)
+        XCTAssertEqual(marker.textMove, "none", "after the let-go the text stayed where the drag left it (marker: \(watched))")
+        let after = topLine(of: long, in: app)
+        XCTAssertNotNil(after, "control: a line is at the text's top")
+        XCTAssertNotEqual(after, "Line 1", "the text moved on under the drag (marker: \(watched))")
+        XCTAssertEqual(long.value as? String, Self.longDraft, "control: the draft is unchanged")
+    }
+
+    /// Signed in, the nine-line draft at its top, and a drag up further than the open distance in
+    /// all but past the text's end by less than it: the text scrolls to its end and stops there,
+    /// with no bounce past it, and only the rest of the drag is the field's. The glass rises under
+    /// that rest, but not far enough to open the panel, so it settles back.
+    func testDragUpPastTheTextsEndByLessThanTheOpenDistanceSettlesBack() throws {
+        let app = launchIntoChat(signedIn: true)
+        let long = signedInDraftAtItsTop(Self.overflowingText, lastLine: Self.overflowingLastLine, in: app)
+        XCTAssertGreaterThan(Self.acrossTheTextsEnd, Self.openDistance, "control: the whole drag goes past the open distance")
+        textScroll(long, by: -Self.acrossTheTextsEnd, in: app)
+        let marker = try XCTUnwrap(dragMarker(afterDrags: 1, in: app), "control: the field's pan saw the drag")
+        let watched = dragMarkerLabel(afterDrags: 1, in: app)
+        XCTAssertGreaterThan(marker.rise, 1, "past the text's end the rest of the drag swelled the field: \(marker.rise) (marker: \(watched))")
+        XCTAssertLessThan(marker.rise, Self.openDistance, "only the rest past the text's end: \(marker.rise) (marker: \(watched))")
+        let pastEnd = try XCTUnwrap(marker.textPastEnd, "control: the field's pan read the text's place while the drag moved (marker: \(watched))")
+        XCTAssertGreaterThan(pastEnd, -1, "control: the text reached its end under the drag: \(pastEnd) (marker: \(watched))")
+        XCTAssertLessThan(pastEnd, 1, "the text stopped at its end and did not bounce past it while the field swelled: \(pastEnd) (marker: \(watched))")
+        let downBuilds = try XCTUnwrap(marker.downBuilds, "control: the marker counted the field's builds while the finger was down (marker: \(watched))")
+        XCTAssertLessThanOrEqual(downBuilds, Self.dragStartBuildAllowance,
+                                 "the moving finger and the changing swell did not rebuild the field's editor: \(downBuilds) builds while it was down (marker: \(watched))")
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2), "the panel stays shut")
+        XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
+        XCTAssertEqual(long.value as? String, Self.overflowingText, "control: the draft is unchanged")
+    }
+
+    /// The text's scroll room (three lines, about 60 points) plus well past the open distance.
+    private static let pastTheTextsEnd: CGFloat = 220
+    /// Slack for editor builds while a drag's finger is down that do not come from its movement:
+    /// the chat's body may run as the drag starts (its freeze and tip state), building the reply
+    /// field again. A build per movement (the drag's state read where the editor is built) gives one
+    /// for each of the drag's moves past the text's end, far more than this on the long drag that
+    /// opens the panel.
+    private static let dragStartBuildAllowance = 2
+    /// Past the open distance in all, yet past the nine-line draft's end (its scroll room, more
+    /// than `withinTheScrollRoom`) by less than the open distance.
+    private static let acrossTheTextsEnd: CGFloat = 90
+    /// A draft with ten lines past the field's six (about 220 points of scroll room), and a drag up
+    /// past the open distance well inside that room.
+    private static let longDraftLineCount = 16
+    private static let longDraft = (1...longDraftLineCount).map { "Line \($0)" }.joined(separator: "\n")
+    private static let longDraftLastLine = "Line \(longDraftLineCount)"
+    private static let insideTheLongDraftsRoom: CGFloat = 120
+
+    /// Signed in, the focused field with `text` typed into it and scrolled back to its top, so a
+    /// drag up has the text's whole scroll room; returns the field, found by `lastLine`.
+    private func signedInDraftAtItsTop(_ text: String, lastLine: String, in app: XCUIApplication) -> XCUIElement {
+        let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
+        field.tap()
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(text)
+        let long = typedField(containing: lastLine, in: app)
+        XCTAssertTrue(long.waitForExistence(timeout: 5), "control: the typed lines are in the field")
+        waitForTheKeyboardBack(under: long, in: app)
+        // Down to the text's top: the field's drag takes only drags up, so this is the text's scroll.
+        textScroll(long, by: Self.toTheTextsTop, in: app)
+        XCTAssertEqual(topLine(of: long, in: app), "Line 1", "control: the text is at its top, with room to scroll")
+        return long
+    }
+
+    /// A slow vertical drag in the text from its middle, held at the end so it does not coast.
+    /// Both ends come from one read of the text's frame, in screen points: an element's coordinate
+    /// is resolved again for each end, so a field that moves with the keyboard in between would
+    /// give a press where it was and a lift where it is.
+    private func textScroll(_ text: XCUIElement, by travel: CGFloat, in app: XCUIApplication) {
+        let frame = text.frame
+        let start = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: frame.midX, dy: frame.midY))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: travel)),
+                    withVelocity: .slow, thenHoldForDuration: Self.scrollSettleHold)
+    }
+
+    /// The line at the top of the text: a tap at its top-left corner puts the caret at that line's
+    /// start, a typed mark shows where, and the mark is deleted again. The typing drops the software
+    /// keyboard for a moment, so it waits for it to come back before the next gesture.
+    private func topLine(of text: XCUIElement, in app: XCUIApplication) -> String? {
+        text.coordinate(withNormalizedOffset: .zero).withOffset(Self.insideTheTextsCorner).tap()
+        text.typeText(Self.lineMark)
+        let value = text.value as? String ?? ""
+        text.typeText(XCUIKeyboardKey.delete.rawValue)
+        waitForTheKeyboardBack(under: text, in: app)
+        return value.components(separatedBy: "\n").first { $0.hasPrefix(Self.lineMark) }.map { String($0.dropFirst(Self.lineMark.count)) }
+    }
+
+    /// Past the text's whole height, so a drag down reaches its top; a drag up of less than its
+    /// scroll room (three lines past the field's six, about 20 points each); the hold after either;
+    /// where in the text's top-left corner the tap lands; the mark typed there.
+    private static let toTheTextsTop: CGFloat = 300
+    private static let withinTheScrollRoom: CGFloat = 40
+    private static let scrollSettleHold: TimeInterval = 0.5
+    private static let insideTheTextsCorner = CGVector(dx: 6, dy: 6)
+    private static let lineMark = "#"
+
+    /// The focused field with words: a long press at the start of its text puts the caret there, so
+    /// the next typed character lands first. The text's long press runs while the field's drag waits;
+    /// were the long press made to wait for the drag, it could not begin until the finger lifts, and
+    /// the caret would stay at the end.
+    func testLongPressInTheFocusedFieldMovesTheCaret() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        field.tap()
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.caretPhrase)
+        let typed = typedField(containing: Self.caretPhrase, in: app)
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the phrase is in the field")
+        waitForTheKeyboardBack(under: typed, in: app)
+        typed.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: Self.caretPressInset, dy: 0))
+            .press(forDuration: Self.textLongPressHold)
+        typed.typeText(Self.lineMark)
+        // Found again by its last word, which the mark cannot split wherever it lands.
+        let marked = typedField(containing: Self.caretPhraseLastWord, in: app)
+        XCTAssertTrue(marked.waitForExistence(timeout: 5), "control: the field still holds the phrase")
+        XCTAssertEqual(marked.value as? String, Self.lineMark + Self.caretPhrase,
+                       "the long press put the caret at the text's start")
+        XCTAssertFalse(app.buttons["chatClose"].exists, "control: the press opened nothing")
+    }
+
+    /// Puts the caret at the start of the one-line `original` with the long press of
+    /// `testLongPressInTheFocusedFieldMovesTheCaret`, and checks it: a mark typed next lands first,
+    /// its Delete gives back exactly `original` with the field still focused, and no edit menu is
+    /// left for the next gesture (`editMenu`). It waits for the keyboard back as `topLine` does. A tap would not
+    /// do: on a one-line text whose caret is already at its end, the tap at its start shows the edit
+    /// menu and leaves the caret at the end (UI run 2026-11-23).
+    private func caretToTheStart(of text: XCUIElement, holding original: String, in app: XCUIApplication,
+                                 file: StaticString = #filePath, line: UInt = #line) {
+        text.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: Self.caretPressInset, dy: 0))
+            .press(forDuration: Self.textLongPressHold)
+        text.typeText(Self.lineMark)
+        let marked = text.value as? String
+        text.typeText(XCUIKeyboardKey.delete.rawValue)
+        waitForTheKeyboardBack(under: text, in: app, file: file, line: line)
+        XCTAssertEqual(marked, Self.lineMark + original, "control: the long press put the caret at the text's start", file: file, line: line)
+        XCTAssertEqual(text.value as? String, original, "control: the mark's Delete gave the text back as it was", file: file, line: line)
+        XCTAssertTrue(markerReads(focused: true, in: app), "control: the field kept its focus", file: file, line: line)
+        XCTAssertFalse(editMenu(in: app).exists, "control: no edit menu is left for the held press", file: file, line: line)
+    }
+
+    /// The text's edit menu, if one shows: XCUITest gives its commands as menu items or as buttons
+    /// (`KeyboardFocusRaceUITests.editMenuItem`), so any menu item, or a button named for one of the
+    /// menu's commands. `testEditMenuCheckSeesTheMenuADoubleTapShows` proves it finds a shown menu.
+    private func editMenu(in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any).matching(NSPredicate(
+            format: "elementType == %d OR (elementType == %d AND label IN %@)",
+            XCUIElement.ElementType.menuItem.rawValue, XCUIElement.ElementType.button.rawValue,
+            Self.editMenuCommands)).firstMatch
+    }
+
+    /// The text edit menu's commands: at a caret (Select, Select All, AutoFill, Paste) and on a
+    /// selection (Cut, Copy, Look Up, Translate).
+    private static let editMenuCommands = ["Select", "Select All", "AutoFill", "Paste", "Cut", "Copy", "Look Up", "Translate"]
+
+    /// The edit menu check of `caretToTheStart` sees a shown menu, on the same chat: a double tap on
+    /// the focused field's first word selects it and shows the menu (Copy, ...), the gesture of
+    /// `testDoubleTapInOverflowingTextSelectsAWordToReplace`. Before it, the check finds nothing.
+    func testEditMenuCheckSeesTheMenuADoubleTapShows() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        field.tap()
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.caretPhrase)
+        let typed = typedField(containing: Self.caretPhrase, in: app)
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the phrase is in the field")
+        waitForTheKeyboardBack(under: typed, in: app)
+        XCTAssertFalse(editMenu(in: app).exists, "control: the check finds no edit menu before the double tap")
+        typed.coordinate(withNormalizedOffset: .zero).withOffset(Self.insideTheTextsCorner).doubleTap()
+        XCTAssertTrue(editMenu(in: app).waitForExistence(timeout: 3), "the check sees the edit menu the double tap shows")
+    }
+
+    /// One short line, typed so the caret ends after it, and its last word.
+    private static let caretPhrase = "Lunch works"
+    private static let caretPhraseLastWord = "works"
+    /// Where the long press lands, from the text's leading edge: the text's long press puts the
+    /// caret at the nearest character boundary, so a press past the middle of the first letter
+    /// (about 4 points at the body size) would put it after that letter.
+    private static let caretPressInset: CGFloat = 1
+
+    /// Signed in, an overflowing draft at its top: a double tap on its first word makes the text
+    /// view's own selection of that word, and the typed word replaces exactly that selection. The
+    /// field's drag beside the text leaves its selection alone; the panel stays shut.
+    func testDoubleTapInOverflowingTextSelectsAWordToReplace() {
+        let app = launchIntoChat(signedIn: true)
+        let long = signedInDraftAtItsTop(Self.overflowingText, lastLine: Self.overflowingLastLine, in: app)
+        long.coordinate(withNormalizedOffset: .zero).withOffset(Self.insideTheTextsCorner).doubleTap()
+        long.typeText(Self.replacementWord)
+        let replaced = Self.replacementWord + String(Self.overflowingText.dropFirst(Self.firstWord.count))
+        XCTAssertEqual(long.value as? String, replaced, "the double tap selected the first word, and the typed word replaced it")
+        XCTAssertFalse(app.buttons["chatClose"].exists, "control: the panel stays shut")
+        XCTAssertTrue(markerReads(focused: true, in: app), "control: the field kept its focus")
+    }
+
+    /// The overflowing draft's first word, and the word typed over its selection.
+    private static let firstWord = "Line"
+    private static let replacementWord = "Row"
+
+    /// The focused field with words: a press held until the text view's own long press takes it,
+    /// then moved up past the open distance, stays the text's. The field's drag waits for the text
+    /// view's long presses, so the panel stays shut and the field keeps its focus and its words.
+    /// Without that wait the drag would take the moving finger and open the panel. The text's long
+    /// press shows its edit menu and leaves the caret where it was: it moves the caret only for a
+    /// finger moved along the line (UI run 2026-11-23: held with no move, or moved 10 or 200
+    /// points up, the caret stayed and the menu showed; moved 30 points sideways, the caret moved).
+    func testLongPressThenDragUpInTheFocusedFieldStaysTheTexts() {
+        let app = launchIntoChat()
+        let field = replyField(in: app)
+        field.tap()
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.shortQuestion)
+        let typed = typedField(containing: Self.shortQuestion, in: app)
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
+        waitForTheKeyboardBack(under: typed, in: app)
+        // From the caret at the text's start, with no edit menu showing (`caretToTheStart` checks
+        // both), so a menu after the held press is the press's own.
+        caretToTheStart(of: typed, holding: Self.shortQuestion, in: app)
+        // Both ends from one read of the field's frame (`textScroll`).
+        let frame = typed.frame
+        let onTheWords = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: frame.minX + frame.width * Self.onTheWordsDx, dy: frame.midY))
+        onTheWords.press(forDuration: Self.textLongPressHold,
+                         thenDragTo: onTheWords.withOffset(CGVector(dx: 0, dy: -Self.pastTheOpenDistance)))
+        XCTAssertFalse(app.buttons["chatClose"].waitForExistence(timeout: 2),
+                       "the held press stayed the text's; the panel stays shut")
+        // The press reached the text: the text view's own long press showed its edit menu
+        // (`editMenu`, which `testEditMenuCheckSeesTheMenuADoubleTapShows` proves sees a shown menu).
+        XCTAssertTrue(editMenu(in: app).waitForExistence(timeout: Self.editMenuAppearLimit),
+                      "the text's long press took the held press: its edit menu shows: \(dragMarkerLabel(afterDrags: 0, in: app))")
+        XCTAssertTrue(markerReads(focused: true, in: app), "the field kept its focus")
+        XCTAssertTrue(typedField(containing: Self.shortQuestion, in: app).exists, "and its words")
+        // The words are whole: a typed mark goes in once, beside the question.
+        typedField(containing: Self.shortQuestion, in: app).typeText(Self.lineMark)
+        let marked = typedField(containing: Self.lineMark, in: app)
+        XCTAssertTrue(marked.waitForExistence(timeout: 5), "control: the mark went into the field")
+        let value = marked.value as? String ?? ""
+        XCTAssertEqual(value.components(separatedBy: Self.lineMark).count - 1, 1, "control: the field holds one mark: \(value)")
+        XCTAssertEqual(value.replacingOccurrences(of: Self.lineMark, with: ""), Self.shortQuestion,
+                       "control: the field holds the question and the mark")
+    }
+
+    /// Longer than UIKit's long press (half a second), so the text view's own long press has begun
+    /// before the finger moves.
+    private static let textLongPressHold: TimeInterval = 1.0
+    /// How long the text's edit menu may take to show once the held press lets go.
+    private static let editMenuAppearLimit: TimeInterval = 3
+    /// Into the field from its leading edge, on the short question's words.
+    private static let onTheWordsDx: CGFloat = 0.1
+    /// Well past the app's open distance (`ChatViewLayout.fieldDragOpenDistance`, 60 pt), as the
+    /// drags that open the panel go.
+    private static let pastTheOpenDistance: CGFloat = 200
+
+    /// More lines than the field's six, so its text scrolls; the caret ends on the last line, at the
+    /// left, away from where the drag starts.
+    private static let overflowingLineCount = 9
+    private static let overflowingText = (1...overflowingLineCount).map { "Line \($0)" }.joined(separator: "\n")
+    private static let overflowingLastLine = "Line \(overflowingLineCount)"
+    /// Short, so the caret after it sits left of the field's middle, where the drag starts.
+    private static let shortQuestion = "Free?"
+
+    /// The reply field once it has words in it (it has no placeholder then), found by its text.
+    private func typedField(containing words: String, in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any).matching(NSPredicate(format: "value CONTAINS %@", words)).firstMatch
+    }
+
+    /// A drag up from the middle of the screen's width at `y`, far enough to open the panel.
+    private func dragUp(atY y: CGFloat, in app: XCUIApplication) {
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: y / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -200)))
+    }
+
     func testOpenActionsDragOnTheHeaderOnlyCloses() {
         let app = launchIntoChat()
         openBubble(2, in: app)
@@ -688,10 +1559,21 @@ final class ChatSwipeUITests: XCTestCase {
     /// the coach card.
     private enum Host { case stack, sheet, split, tutorialCard }
 
+    /// The TipKit datastore of the tip tests' own, under the app's own tip rules (nothing forced):
+    /// emptied at this launch, or kept from the launch before.
+    private enum TipStore { case fresh, kept }
+    /// With the tip rules live the onboarding gate is open, so the chat's own first-open notice (the
+    /// AI summaries popover, which keeps its own flag outside TipKit) would open over the first
+    /// landing of a fresh install and take the test's first touch. This launch argument marks it as
+    /// already shown for that launch only (the argument domain), and stores nothing.
+    private static let noticeAlreadyShown = ["-chatView.aiSummariesNotice.shownOnFirstOpen", "YES"]
+
     private func launchIntoChat(armRemoval: Bool = false, host: Host = .stack, tall: Bool = false,
                                 lateSuggestion: Bool = false, unread: Bool = false,
                                 suggestionOnJump: Bool = false, writing: Bool = false,
-                                readyAtOpen: Bool = false) -> XCUIApplication {
+                                readyAtOpen: Bool = false, fieldDragTip: Bool = false,
+                                textSize: String? = nil, signedIn: Bool = false,
+                                openPanelUnderDrag: Bool = false, tipStore: TipStore? = nil) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
@@ -704,6 +1586,14 @@ final class ChatSwipeUITests: XCTestCase {
             + (writing ? ["--chat-swipe-writing"] : [])
             + (readyAtOpen ? ["--chat-swipe-ready"] : [])
             + (host == .tutorialCard ? ["--chat-swipe-tutorial-card"] : [])
+            + (fieldDragTip ? ["--chat-field-drag-tip"] : [])
+            + (textSize.map { ["-UIPreferredContentSizeCategoryName", $0] } ?? [])
+            + (signedIn ? ["--chat-swipe-signed-in"] : [])
+            + (openPanelUnderDrag ? ["--chat-swipe-open-panel-under-drag"] : [])
+        if let tipStore {
+            app.launchArguments += ["--chat-field-drag-tip-store"] + Self.noticeAlreadyShown
+            if tipStore == .fresh { app.launchArguments.append("--chat-field-drag-tip-fresh") }
+        }
         app.launch()
         switch host {
         case .stack, .tutorialCard:
@@ -732,6 +1622,84 @@ final class ChatSwipeUITests: XCTestCase {
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 
+    /// Whether `field` takes the keyboard's focus within `timeout`, for a caller that types next and
+    /// then waits for the keyboard (`waitForTheKeyboardBack`): focus gained, it notes whether a
+    /// software keyboard came up for it (`noteTheKeyboard`) before the first key.
+    private func waitForTypingFocus(_ field: XCUIElement, timeout: TimeInterval) -> Bool {
+        let focused = waitForFocus(field, true, timeout: timeout)
+        if focused { noteTheKeyboard(in: XCUIApplication()) }
+        return focused
+    }
+
+    /// Notes whether a keyboard of a software keyboard's size comes up for the field just focused,
+    /// waiting up to `keyboardAppearLimit`. Typing drops a software keyboard at the first key, so
+    /// only a keyboard seen here, before any key, or by `waitForTheKeyboardBack` keeps a field that
+    /// holds still with the keyboard away from counting as a run with no software keyboard.
+    private func noteTheKeyboard(in app: XCUIApplication) {
+        let keyboard = app.keyboards.firstMatch
+        let deadline = Date().addingTimeInterval(Self.keyboardAppearLimit)
+        repeat {
+            if keyboard.exists, keyboard.frame.height > app.frame.height * Self.keyboardMinShare {
+                sawSoftwareKeyboard = true
+                return
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.keyboardBackPollStep))
+        } while Date() < deadline
+    }
+
+    /// XCUITest types like a hardware keyboard: a simulator that shows its software keyboard drops
+    /// it at the first typed key and brings it back about one and a half seconds after the last,
+    /// and the focused field rides down and up with it. A gesture aimed at the field in between
+    /// lands where the field was. Returns once `element` holds still above the software keyboard
+    /// back on screen. Only while no keyboard of a software keyboard's size has been seen in this
+    /// test, on screen or parked below it (a simulator that shows none), does a field holding still
+    /// for longer than the keyboard takes to come back count. A software keyboard that stays parked
+    /// or covers the field fails at the deadline, with `failure`.
+    private func waitForTheKeyboardBack(under element: XCUIElement, in app: XCUIApplication,
+                                        failure: String = "control: the field holds still above the keyboard after the typing",
+                                        file: StaticString = #filePath, line: UInt = #line) {
+        let keyboard = app.keyboards.firstMatch
+        var last: CGRect?
+        var keys: CGRect?
+        var stillSince = Date()
+        let deadline = Date().addingTimeInterval(Self.keyboardBackLimit)
+        repeat {
+            // One read of the field, the screen and the keyboard per poll.
+            let frame = element.frame
+            let screen = app.frame
+            keys = keyboard.exists ? keyboard.frame : nil
+            if let keys, keys.height > screen.height * Self.keyboardMinShare { sawSoftwareKeyboard = true }
+            if frame != last {
+                last = frame
+                stillSince = Date()
+            } else if let keys, screen.intersection(keys).height > screen.height * Self.keyboardMinShare {
+                // On screen only: while it is away the keyboard still exists, parked below the
+                // screen, and a field resting at the bottom is above that too. On screen, the field
+                // must rest above it.
+                if frame.maxY <= keys.minY + 1 { return }
+            } else if !sawSoftwareKeyboard, Date().timeIntervalSince(stillSince) > Self.keyboardReturnWindow {
+                return
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.keyboardBackPollStep))
+        } while Date() < deadline
+        XCTFail("\(failure) (field \(String(describing: last)), "
+                + "keyboard \(String(describing: keys)), software keyboard seen \(sawSoftwareKeyboard))", file: file, line: line)
+    }
+
+    /// Whether a keyboard of a software keyboard's size was seen in this test, once a field took
+    /// focus (`noteTheKeyboard`) or after typing (`waitForTheKeyboardBack`).
+    private var sawSoftwareKeyboard = false
+
+    /// How long the field may keep moving after typing; how often it and the keyboard are read; the
+    /// least share of the screen's height a software keyboard covers (the hardware keyboard's small
+    /// bar covers less); how long a field with no software keyboard must hold still, past the
+    /// keyboard's return; how long a software keyboard may take to come up once a field has focus.
+    private static let keyboardBackLimit: TimeInterval = 8
+    private static let keyboardBackPollStep: TimeInterval = 0.25
+    private static let keyboardMinShare: CGFloat = 0.25
+    private static let keyboardReturnWindow: TimeInterval = 2.5
+    private static let keyboardAppearLimit: TimeInterval = 2
+
     /// How long a focus read through the app's marker may take to settle.
     private static let focusMarkerPollLimit: TimeInterval = 3
     private static let focusMarkerPollStep: TimeInterval = 0.1
@@ -750,13 +1718,119 @@ final class ChatSwipeUITests: XCTestCase {
         return false
     }
 
-    private func replyField(in app: XCUIApplication) -> XCUIElement {
+    private func replyField(in app: XCUIApplication, placeholder: String = ChatSwipeUITests.replyPlaceholder) -> XCUIElement {
         let field = app.descendants(matching: .any).matching(NSPredicate(
             format: "(elementType == %d OR elementType == %d) AND placeholderValue == %@",
             XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue,
-            Self.replyPlaceholder)).firstMatch
+            placeholder)).firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5), "control: the reply field, found by its placeholder")
         return field
+    }
+
+    /// `ChatFieldDragTip.text`, the tip's words.
+    private static let fieldDragTipText = "Drag up to see what you asked TabMail about this conversation."
+    /// How long the app's drag marker may take to finish watching a drag (its watch outlasts the
+    /// settle by design).
+    private static let dragMarkerPollLimit: TimeInterval = 5
+
+    /// What the app's `chatFieldDragMarker` recorded: the newest row's largest move during and
+    /// after the last field drag, and whether the interaction freeze is held.
+    private struct DragMarker {
+        let drags: Int
+        let watching: Bool
+        /// Whether the drag's start had the newest row's place, and the row's last reported top.
+        let hasBaseline: Bool
+        let newestMinY: CGFloat
+        /// Whether the freeze was still held halfway through the cooldown after the settle.
+        let heldAtSettle: Bool
+        let move: CGFloat
+        let frozen: Bool
+        /// The drag tip's whole card, top and bottom, while it shows, and its room (the header's
+        /// bottom and the field stack's top), in the app's chat space.
+        let tip: (CGFloat, CGFloat)?
+        let room: (CGFloat, CGFloat)?
+        /// The top of the field's glass on screen, swell included (the open panel's top while it is
+        /// open); how far it rose above its place at the last drag's start while the finger moved;
+        /// and how many taps the open panel's dim took.
+        let fieldTop: CGFloat?
+        let rise: CGFloat
+        let dims: Int
+        /// How far the text under the last drag went past its end while the drag moved (nil when
+        /// the marker does not say).
+        let textPastEnd: CGFloat?
+        /// What happened to the last drag, in order (`open`, then `end` or `cut`); nil when the
+        /// marker does not say.
+        let events: [String]?
+        /// Whether the drag tip is waiting for room (eligible, its whole card has none); nil when
+        /// the marker does not say.
+        let tipWaiting: Bool?
+        /// The field's pan turned on or off (`on:<state>`, `off:<state>`) or cancelled during the
+        /// last drag and since, in order; nil when the marker does not say.
+        let pan: [String]?
+        /// How often the reply field's editor was built while the last drag's finger was down; nil
+        /// while that drag has not let go or when the marker does not say.
+        let downBuilds: Int?
+        /// The text under the last drag's first move of a point or more after its let-go, while the
+        /// marker watched (`none`: it stayed where the drag left it); nil when the marker does not say.
+        let textMove: String?
+    }
+
+    /// `<top>:<bottom>`, or nil for "none".
+    private static func span(_ text: String?) -> (CGFloat, CGFloat)? {
+        guard let parts = text?.split(separator: ":").compactMap({ Double($0) }), parts.count == 2 else { return nil }
+        return (CGFloat(parts[0]), CGFloat(parts[1]))
+    }
+
+    private func readDragMarker(in app: XCUIApplication) -> DragMarker? {
+        let marker = app.descendants(matching: .any)["chatFieldDragMarker"].firstMatch
+        guard marker.exists else { return nil }
+        var fields: [String: String] = [:]
+        for part in marker.label.split(separator: " ") {
+            let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
+            if pair.count == 2 { fields[pair[0]] = pair[1] }
+        }
+        guard let drags = fields["drags"].flatMap(Int.init), let watching = fields["watching"],
+              let base = fields["base"], let at = fields["at"].flatMap(Double.init), let held = fields["held"],
+              let move = fields["move"].flatMap(Double.init), let frozen = fields["frozen"] else { return nil }
+        return DragMarker(drags: drags, watching: watching == "1", hasBaseline: base == "1", newestMinY: CGFloat(at),
+                          heldAtSettle: held == "1", move: CGFloat(move), frozen: frozen == "1",
+                          tip: Self.span(fields["tip"]), room: Self.span(fields["room"]),
+                          fieldTop: fields["field"].flatMap(Double.init).flatMap { $0 < 0 ? nil : CGFloat($0) },
+                          rise: CGFloat(fields["rise"].flatMap(Double.init) ?? 0),
+                          dims: fields["dims"].flatMap(Int.init) ?? 0,
+                          textPastEnd: fields["over"].flatMap(Double.init).map { CGFloat($0) },
+                          events: fields["events"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) },
+                          tipWaiting: fields["wait"].map { $0 == "1" },
+                          pan: fields["pan"].map { $0 == "none" ? [] : $0.split(separator: ",").map(String.init) },
+                          downBuilds: fields["builds"]?.split(separator: ":").first.flatMap { Int($0) },
+                          textMove: fields["textMove"])
+    }
+
+    /// The marker once it has seen `drags` drags and stopped watching the last one.
+    private func dragMarker(afterDrags drags: Int, in app: XCUIApplication) -> DragMarker? {
+        let deadline = Date().addingTimeInterval(Self.dragMarkerPollLimit)
+        repeat {
+            if let marker = readDragMarker(in: app), marker.drags >= drags, !marker.watching { return marker }
+            RunLoop.current.run(until: Date().addingTimeInterval(Self.focusMarkerPollStep))
+        } while Date() < deadline
+        return nil
+    }
+
+    /// The marker's raw label once it has seen `drags` drags and stopped watching the last one
+    /// (prefixed when it never stopped), for a failure message: its `textAt`, `textEnd` and
+    /// `textMove` say what moved the text under the drag after its let-go.
+    private func dragMarkerLabel(afterDrags drags: Int, in app: XCUIApplication) -> String {
+        let settled = dragMarker(afterDrags: drags, in: app) != nil
+        let marker = app.descendants(matching: .any)["chatFieldDragMarker"].firstMatch
+        return (settled ? "" : "unsettled: ") + (marker.exists ? marker.label : "none")
+    }
+
+    /// Drags the collapsed reply field up past the open distance and waits for the panel.
+    private func dragFieldOpen(in app: XCUIApplication) {
+        let field = replyField(in: app)
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -200)))
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "control: the drag opened the panel")
     }
 
     private func navigationBarY(in app: XCUIApplication) -> CGFloat {
