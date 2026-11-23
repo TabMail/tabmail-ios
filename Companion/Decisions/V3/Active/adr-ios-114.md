@@ -457,6 +457,57 @@ same AI result, kept as long as the email itself is shown.
    ids, which restarts the summary observation (decision 9), and its first value asks for the
    newest emails, the joining one first. The summary at Send (`SentEmailSummary`) and the
    Message-ID at the queue write are unchanged.
+   **Undo on the Sending bubble (tabmail-ios #986, 2026-11-21):** a reply sent from a compose the
+   chat opened offers its Undo on its Sending bubble ("Sending · Undo", the seconds left under it)
+   instead of the undo-send toast, which is not shown for it. Who offers a send's Undo
+   (`PendingSendService.UndoOwner`) is decided once, at Send, from what was read as the operation
+   started, never from what is on screen later: the chat view setting read at the Send tap; the
+   screen the compose was opened on (`ComposeView.openedOn`, given by that screen as the compose
+   opens: `ComposeScreen.chat` for the chat view's AI Suggestion, the agent's compose cards it opens
+   and its Forward); and whether the send has an In-Reply-To, by which the chat finds its bubble
+   (`PendingSendService.sendHasBubbleUndo`). Every other send keeps the toast: a new email, and a
+   reply from a compose opened anywhere else (the Drafts list, the inbox, an email screen, the
+   compose an Undo reopens), whose screen shows no bubble; such a reply still shows in its chat as a
+   Sending bubble, without Undo. Both presenters count down to one deadline,
+   `OutboxCancellationPolicy.undoDeadline` (the row's durable `holdUntil` less the claim buffer), with
+   no timer or time of their own, and both Undos take one path (`PendingSendService.undoAndReopen`,
+   then RootView's `UndoReopenPresenter`), so a confirmed Undo returns the message to Drafts and
+   reopens its compose the same way from either. A toast that stops showing a send still in its
+   window hands its Undo to the bubble (`releaseToast`); a send not made in this run of the app (a
+   relaunch) has its Undo on the bubble only. A chat in the Search sheet closes the sheet once an
+   Undo's outcome is known, so RootView alone presents the reopen or the "Couldn't undo" notice.
+   *Amended 2026-11-21:* the first rule read only the setting and the In-Reply-To, so a reply opened
+   from the Drafts list, or sent again from the compose an Undo reopened, put its Undo on a bubble
+   that no screen showed; the screen the compose was opened on now decides as well.
+   *Amended 2026-11-22:* an agent's card can name an email of another thread, whose send shows only
+   in that thread's chat; recorded as `.chat`, it had no visible Undo from the chat that opened it.
+   A chat now records itself only for a compose whose target is one of its own emails, by the same
+   rule that finds a bubble's chat (`ChatUnsentReply.answers`, through
+   `ChatThreadView.composeScreen`), decided as the compose opens; any other keeps the toast.
+   It is judged on the In-Reply-To the send's outbox row will carry (`ThreadUtils.outgoingInReplyTo`,
+   the value `outgoingThreadHeaders` gives the send), not on the target's stored Message-ID: a
+   Message-ID written with spaces inside its brackets matched the chat at open but not the row the
+   chat looks for after Send, which lost the Undo. Every way of sending (Send, Send with the shown
+   suggestion, the Empty Body alert's Send Anyway) reads the setting in one place
+   (`ComposeView.startSend`). RootView's toast is its own presenter (`PendingSendToastPresenter`),
+   so a test draws it over the real chat and counts the Undos on screen.
+   *Amended 2026-11-22 (later):* the origin is the compose's state, set once as it opens
+   (`ComposeView.openedOn`): a chat builds its cover's compose again whenever it redraws, and with
+   a plain input a merge of threads while the compose was open could change the origin it had
+   opened with. The bubble's redraw schedule (`ChatUndoSendSchedule`) makes its instants one at a
+   time, once a second until the fill's window and every frame inside it: a queued row's hold can lie
+   far ahead of a clock set back, and a schedule laid out in memory at 30 frames a second up to it
+   could exhaust the app's memory. The sequence closes with `Date.distantFuture` after the deadline:
+   the mounted bubble's TimelineView was seen not to redraw at its schedule's last date, so ending on
+   the deadline left it offering Undo past it. The agent's cards open through their one presenter on every
+   host (`AgentToolRouter.ComposeRequest.composeView(account:openedOn:onOutcome:)`): the chat gives
+   it its `composeScreen(answering:)` for the card's email, the inbox and the email's screen give
+   none, and a new email records none. Tests:
+   `ChatUndoSendTests`, `ChatUndoSendRoutingTests` (the real Send of each kind of compose; the
+   agent's cards, the AI Suggestion and the toolbar Forward from the mounted chat with the toast
+   over it, one Undo on screen, checked on the hold Send gave the email; a compose built again with
+   another origin), `UndoSendReturnsToDraftsTests` (the return to Drafts from the toast and from
+   the bubble).
    **Superseded by the rebuild (2026-11-09), kept for history:**
    **The Sending bubble follows its queued email (decided 2026-11-07):** a reply sent from
    the chat (the ready AI Reply, or an agent compose) reports its queued email's outbox row

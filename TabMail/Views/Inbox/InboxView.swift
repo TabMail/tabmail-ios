@@ -908,7 +908,8 @@ struct InboxView: View {
                 showAgentToast(response, sessionKey: sessionKey)
             }
         }
-        .sheet(isPresented: $showSearch) {
+        // Search can open a chat, and so a bubble's Undo: its outcome is presented at the top level.
+        .chatModalSheet(isPresented: $showSearch) {
             SearchView(folders: folders, scopeTitle: title)
         }
         .sheet(item: $labelMenuMessage) { message in

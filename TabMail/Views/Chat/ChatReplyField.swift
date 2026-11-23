@@ -406,12 +406,13 @@ struct ChatReplyCompose: Equatable {
             && leftovers(recipients.bcc) == leftovers(bcc)
     }
 
-    /// The compose card, opened in this kind, as main's Reply All entries open it.
-    /// `draftId`: the draft it saves to; nil, the reply's usual one.
+    /// The compose card, opened in this kind, as main's Reply All entries open it. `draftId`: the
+    /// draft it saves to; nil, the reply's usual one. `openedOn`: the screen the chat records for it
+    /// (`ChatThreadView.composeScreen`).
     @MainActor
     func composeView(
         replyTo message: MessageHeader?, suggestedBody: String? = nil, suggestion: ReplyResult? = nil,
-        draftId: String? = nil, onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
+        draftId: String? = nil, openedOn: ComposeScreen?, onAgentOutcome: @escaping @MainActor (ComposeOutcome) -> Void
     ) -> ComposeView {
         // The fields exactly as given, an empty one included: a reply whose To is empty (an edit
         // removed everyone, or the only Reply-To is the user's own) opens with To empty, never
@@ -419,18 +420,21 @@ struct ChatReplyCompose: Equatable {
         ComposeView(
             replyTo: message, suggestedBody: suggestedBody, suggestion: suggestion, isReplyAll: isReplyAll,
             prefillTo: to, prefillCc: cc, prefillBcc: bcc, prefillSubject: subject,
-            prefillDraftId: draftId, onAgentOutcome: onAgentOutcome)
+            prefillDraftId: draftId, openedOn: openedOn, onAgentOutcome: onAgentOutcome)
     }
 }
 
 /// THE presenter of the agent's compose card, for every host (the chat, the inbox, the email's
-/// screen): the request carries the card exactly, so where it opens decides nothing.
+/// screen): the request carries the card exactly, so where it opens decides nothing in it. The host
+/// gives only the screen it records for a reply's or a forward's Undo (`openedOn`).
 extension AgentToolRouter.ComposeRequest {
-    /// `account`: the sender a new email opens with.
+    /// `account`: the sender a new email opens with. `openedOn`: the screen the compose was opened on
+    /// (`ComposeView.openedOn`): the chat's `composeScreen(answering:)`; nil on any other screen.
     @MainActor
-    func composeView(account: Account?, onOutcome: @escaping @MainActor (ComposeOutcome) -> Void) -> ComposeView {
+    func composeView(account: Account?, openedOn: ComposeScreen? = nil, onOutcome: @escaping @MainActor (ComposeOutcome) -> Void) -> ComposeView {
         switch mode {
         case .compose:
+            // A new email: no chat shows it, so it records no screen and keeps the toast.
             ComposeView(
                 suggestedBody: body, account: account, prefillTo: to, prefillCc: cc, prefillBcc: bcc,
                 prefillSubject: subject, onAgentOutcome: onOutcome)
@@ -442,11 +446,11 @@ extension AgentToolRouter.ComposeRequest {
                 replyTo: replyTo, suggestedBody: body, suggestion: suggestion, isReplyAll: isReplyAll,
                 onlyToChosen: fieldReply?.onlyTo != nil,
                 prefillTo: to, prefillCc: cc, prefillBcc: bcc, prefillSubject: subject,
-                prefillDraftId: draftId, onAgentOutcome: onOutcome)
+                prefillDraftId: draftId, openedOn: openedOn, onAgentOutcome: onOutcome)
         case .forward:
             ComposeView(
                 replyTo: replyTo, suggestedBody: body, isForward: true, prefillTo: to, prefillCc: cc, prefillBcc: bcc,
-                onAgentOutcome: onOutcome)
+                openedOn: openedOn, onAgentOutcome: onOutcome)
         }
     }
 }
@@ -485,7 +489,14 @@ struct ChatReadyReply: Identifiable {
 /// nor the copy on screen). Undo, a discard or the send's own cleanup deletes the row, and the bubble goes.
 struct ChatUnsentReply: Identifiable, Equatable, Sendable {
     let outboxId: String
-    let failed: Bool
+    /// The row's state, as the Outbox's own Cancel Send reads it (`OutboxCancellationPolicy`).
+    let status: OutboxStatus
+    let sentAt: Date?
+    let holdUntil: Date?
+    /// The send's draft generation, for Undo's reopen (`ChatUndoSendStatus`).
+    let draftId: String?
+    let instanceEpoch: String?
+    var failed: Bool { status == .failed }
     /// The provider took the email and its Sent copy is in the database, not yet in the chat.
     let filed: Bool
     /// The email's summary as a text message, once made.
@@ -505,8 +516,7 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
             .order(Column("createdAt"), Column("id"))
             .fetchAll(db)
         return try rows.compactMap { row in
-            guard let parent = row.inReplyTo.map(EmailFilter.normalizeMessageId),
-                  messageIds.contains(parent) else { return nil }
+            guard answers(row.inReplyTo, in: messageIds) else { return nil }
             var filed = false
             if row.sentAt != nil {
                 guard let sentId = row.sentMessageId.map(EmailFilter.normalizeMessageId),
@@ -515,9 +525,18 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
                     .filter(Column("accountId") == row.accountId && Column("rfc822MessageId") == sentId)
                     .fetchCount(db) > 0
             }
-            return ChatUnsentReply(outboxId: row.id, failed: row.outboxStatus == .failed, filed: filed,
+            return ChatUnsentReply(outboxId: row.id, status: row.outboxStatus, sentAt: row.sentAt, holdUntil: row.holdUntil,
+                                   draftId: row.draftId, instanceEpoch: row.instanceEpoch, filed: filed,
                                    textMessage: try summary(of: row, db: db))
         }
+    }
+
+    /// Whether a send with this In-Reply-To shows in the chat whose emails have `messageIds`
+    /// (normalized Message-IDs): it answers one of them. The one rule for which chat shows an outbox
+    /// row (`fetch`), and so for which chat a compose records as its screen (`ChatThreadView.composeScreen`).
+    nonisolated static func answers(_ inReplyTo: String?, in messageIds: Set<String>) -> Bool {
+        guard let parent = inReplyTo.map(EmailFilter.normalizeMessageId) else { return false }
+        return messageIds.contains(parent)
     }
 
     /// The unsent replies answering `messageIds`, now and after every change, from one observation.

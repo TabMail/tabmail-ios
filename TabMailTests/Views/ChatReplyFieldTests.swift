@@ -710,8 +710,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("composeEnded(.", in: text) == 0 && Self.count("{ _ in composeEnded", in: text) == 0)
         // The AI Suggestion's card is not a send from the field: its outcome leaves the field's
         // words alone (a completion with no field send would empty them).
-        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId, onAgentOutcome: { _ in })", in: text) == 1,
-                "the card holds the suggestion the ghost showed and never completes the field")
+        #expect(Self.count("ready.compose.composeView( replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: composeScreen(answering: ready.message), onAgentOutcome: { _ in })", in: text) == 1,
+                "the card holds the suggestion the ghost showed, records the chat's screen and never completes the field")
         #expect(Self.count("@State private var example = ChatSuggestionConfig.randomExample()", in: text) == 1,
                 "one example per chat open, kept across redraws")
         #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
@@ -745,7 +745,7 @@ struct ChatReplyFieldTests {
         // A reply filed or gone reloads the chat's emails, so a sent reply's copy takes its place.
         #expect(Self.count("unsentReplies = found if left || found.contains(where: \\.filed) { viewModel.reloadThread() }", in: text) == 1)
         #expect(Self.count("unsentReplies = ", in: text) == 1, "nothing else writes them")
-        #expect(Self.count("ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })", in: text) == 1,
+        #expect(Self.count("ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo() })", in: text) == 1,
                 "a failed send's Retry and Delete act on its own row")
     }
 
@@ -831,12 +831,13 @@ struct ChatReplyFieldTests {
     /// The compose card the chat opens for the AI Suggestion, as the chat's cover builds it.
     private static func card(_ message: MessageHeader, accounts: [Account] = [me]) -> ComposeView {
         let ready = ChatReadyReply(message: message, suggestion: message.suggestion ?? .filtered, accounts: accounts)
-        return ready.compose.composeView(replyTo: message, suggestion: ready.suggestion, draftId: ready.draftId, onAgentOutcome: { _ in })
+        return ready.compose.composeView(
+            replyTo: message, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: .chat, onAgentOutcome: { _ in })
     }
 
     /// The compose card the chat opens for the agent's reply, as the chat's cover builds it.
     private static func card(agent request: AgentToolRouter.ComposeRequest, accounts: [Account]) -> ComposeView {
-        request.composeView(account: accounts.first, onOutcome: { _ in })
+        request.composeView(account: accounts.first, openedOn: .chat, onOutcome: { _ in })
     }
 
     @Test("The one presenter opens the agent's new email from the account the host gives it, the bound From account")
@@ -866,6 +867,19 @@ struct ChatReplyFieldTests {
         #expect(compose.prefillTo == ["alex@example.com", "david@example.com"] && compose.prefillCc == ["sam@example.com"])
         #expect(compose.prefillBcc == [] && compose.replyTo?.id == email.id && !compose.isForward)
         #expect(compose.prefillSubject == ThreadUtils.replySubject(for: email.subject))
+    }
+
+    @Test("The AI Suggestion's card carries the whole suggestion the chat shows: its email, its text version and its change command")
+    func readyCardCarriesTheWholeSuggestion() {
+        let email = Self.groupEmail()
+        let shown = ReplyResult(body: "Hi Alex,\n\nTuesday works.", textMessage: "Tuesday works", changeCommand: "make it shorter")
+        let ready = ChatReadyReply(message: email, suggestion: shown, accounts: [Self.me])
+        #expect(ready.suggestion == shown, "control: the ready reply holds the suggestion as shown")
+        let compose = ready.compose.composeView(
+            replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: .chat, onAgentOutcome: { _ in })
+        // An edit in the card starts from this value and is stored only over it, so a part missing
+        // (its change command) would make the card's edit differ from what is stored.
+        #expect(compose.suggestion == shown, "the card opens on the suggestion as shown: \(String(describing: compose.suggestion))")
     }
 
     /// The reply request the AI reply tool opens for `arguments`, on an email from
@@ -1191,13 +1205,16 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ChatReplyCompose.", in: chat) == 0, "the chat builds no envelope of its own")
         #expect(Self.count("isReplyAll", in: chat) == 0,
                 "no card decides the kind or the Reply All recipients itself")
+        #expect(Self.count("openedOn: composeScreen(answering: req.replyTo)", in: chat) == 1,
+                "the agent's reply and forward cards record the chat's screen as they open")
         // A card from a field request: the agent's closing words open nothing; a field send starts afresh.
         #expect(Self.count("fieldComposeOpened = req.isFieldsOwnReply", in: chat) == 1,
                 "the chat reads the reply tool's one decision of the field's own reply (FieldReplyCardWordsTests)")
         #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false }, onAgentCompose: openAgentCompose, composeFromAccountId: viewModel.message?.accountId, composeHostCovered: isAnyPresentation)", in: chat) == 1,
                 "the chat's pill binds the email's account as a new message's From and takes nothing while the chat is covered")
-        // A new message's card opens from the account bound when the turn started.
-        #expect(Self.count("req.composeView(account: navigationStore.accounts.first { $0.id == req.fromAccountId }) { outcome in", in: chat) == 1)
+        // A new message's card opens from the account bound when the turn started, and records the
+        // chat's screen, in the one presenter call.
+        #expect(Self.count("req.composeView(account: navigationStore.accounts.first { $0.id == req.fromAccountId }, openedOn: composeScreen(answering: req.replyTo)) { outcome in", in: chat) == 1)
         // The card and fieldComposeOpened are set only for a request this chat's own pill took
         // (ADR-IOS-053 Phase 2; ChatComposeRoutingTests runs it with the inbox and the email screen mounted).
         #expect(Self.count("private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {", in: chat) == 1)
@@ -1209,7 +1226,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ownAddresses: context.ownAddresses) { replyTarget = $0 }", in: chat) == 1, "Done sets it")
         #expect(Self.count("ChatHeaderView(thread: thread) { guard TutorialCoordinator.shared.admits(.other) else { return } showsReplyTo = true }", in: chat) == 1)
         #expect(Self.count("Button { guard TutorialCoordinator.shared.admits(.other) else { return } forwardMessage = thread.newest }", in: chat) == 1)
-        #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }", in: chat) == 1)
+        #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }", in: chat) == 1)
         #expect(Self.count(".onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }", in: chat) == 1,
                 "a new newest email resets the choice, even one whose UID matches the last")
 

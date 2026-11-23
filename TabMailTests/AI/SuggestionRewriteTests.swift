@@ -625,7 +625,7 @@ struct SuggestionRewriteRouteTests {
         let accounts = try await fixture.db.read { try Account.fetchAll($0) }
         let ready = ChatReadyReply(message: email, suggestion: Self.shownReply, accounts: accounts)
         let card = ready.compose.composeView(
-            replyTo: email, suggestion: ready.suggestion, draftId: ready.draftId, onAgentOutcome: { _ in })
+            replyTo: email, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: .chat, onAgentOutcome: { _ in })
         // `nil` would let compose fill To from the reply's Reply-To, the user's own address.
         #expect(card.prefillTo == [], "To stays empty")
         #expect(card.prefillCc == ["pat@example.com"], "the outside Cc stays in Cc")

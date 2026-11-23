@@ -60,11 +60,11 @@ struct RootView: View {
     @State private var suppressNextSignedOutAlert = false
 
     // MARK: - Undo-send toast state
-    /// Exact authority for the retained Draft generation behind a confirmed
-    /// cancellation. PendingSendService.undo() discards only the Outbox row;
-    /// RootView hands this authority to UndoReopenCompose so it can bind to that
-    /// retained Draft without accepting a replacement owner or generation.
-    @State private var reopenSnapshot: PendingSendService.ReopenSnapshot?
+    // Exact authority for the retained Draft generation behind a confirmed
+    // cancellation lives in `PendingSendService.reopenSnapshot`, set by the one
+    // undo-and-reopen path the toast and a chat bubble share. RootView hands it to
+    // UndoReopenCompose so it binds to that retained Draft without accepting a
+    // replacement owner or generation.
     private var pendingSendService: PendingSendService { PendingSendService.shared }
 
     /// Sync status values — observed once here and published to descendants via
@@ -368,25 +368,8 @@ struct RootView: View {
             OnboardingTipGate.onboardingComplete = allOnboardingGatesPassed && !demoStore.isActive
         }
         // Undo-send toast (Gmail-style) — mounted at RootView so it persists
-        // across compose dismiss + navigation. Positioning matches the inbox
-        // undo chip (InboxView.swift:283-284): ignore the bottom safe area
-        // and use negative padding to sit where other app toasts sit.
-        .overlay(alignment: .bottom) {
-            if let pending = pendingSendService.current {
-                PendingSendToast(
-                    pending: pending,
-                    onUndo: {
-                        if let snapshot = pendingSendService.undo() {
-                            reopenSnapshot = snapshot
-                        }
-                    },
-                    onDismiss: { pendingSendService.dismiss() }
-                )
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-                .ignoresSafeArea(.container, edges: .bottom)
-                .padding(.bottom, -12)
-            }
-        }
+        // across compose dismiss + navigation.
+        .modifier(PendingSendToastPresenter())
         // Demo Mode banner — bottom overlay; persists across all in-app
         // navigation. Compose's `fullScreenCover` covers it during edit;
         // banner re-appears on dismiss. Suppressed for debug-menu entry
@@ -407,7 +390,7 @@ struct RootView: View {
                 .ignoresSafeArea(.container, edges: .bottom)
                 .padding(.bottom, -12)
         }
-        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: pendingSendService.current?.id)
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: pendingSendService.visibleToast?.id)
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: demoStore.isActive)
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: tutorial.lockedNotice)
         .alert("Could not start demo", isPresented: Binding(
@@ -418,7 +401,7 @@ struct RootView: View {
         } message: {
             Text(demoStartError ?? tutorial.startError ?? "")
         }
-        // Undo-send was not confirmed. `PendingSendService.undo()` made no
+        // Undo-send was not confirmed. `PendingSendService.undoAndReopen()` made no
         // cancellation change and left the toast in place. The durable Send may
         // still be queued or may already be sending, so this alert says only that
         // the Undo attempt did not take; it never promises the message was stopped.
@@ -448,12 +431,10 @@ struct RootView: View {
         // Undo-Send reopen: the Outbox cancellation was confirmed and the Draft
         // row remains durable. UndoReopenCompose resolves the snapshot's exact
         // owner/generation authority and binds the fresh ComposeView to that row;
-        // `PendingSendService.undo()` already returned that row to Drafts in the
+        // `PendingSendService.undoAndReopen()` already returned that row to Drafts in the
         // cancellation's own write, or reports that it did not (the compose then
         // opens as unsaved).
-        .fullScreenCover(item: $reopenSnapshot) { snapshot in
-            UndoReopenCompose(snapshot: snapshot)
-        }
+        .modifier(UndoReopenPresenter())
         // loadInitialData() is called eagerly in TabMailApp.init() (after DB creation)
         // so isInitialLoadComplete is already true before the first render.
         .task {

@@ -329,6 +329,16 @@ enum ThreadUtils {
         )
     }
 
+    /// The In-Reply-To a reply or forward of an email with this Message-ID carries, as
+    /// `outgoingThreadHeaders` builds it and the outbox row keeps it: the parent's own
+    /// Message-ID (bare/normalized). Many IMAP messages lack a Message-ID, in which case
+    /// there is nothing to thread on (nil).
+    static func outgoingInReplyTo(parentRfc822MessageId: String?) -> String? {
+        parentRfc822MessageId
+            .map { EmailFilter.normalizeMessageId($0) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+    }
+
     /// Pure scalar core — unit-testable without constructing a `MessageHeader`.
     static func outgoingThreadHeaders(
         parentRfc822MessageId: String?,
@@ -340,11 +350,7 @@ enum ThreadUtils {
         sendSubject: String,
         providerKind: AccountProvider
     ) -> OutgoingThreadHeaders {
-        // In-Reply-To = the parent's own Message-ID (bare/normalized). Many IMAP
-        // messages lack a Message-ID, in which case there is nothing to thread on.
-        let parentMsgId: String? = parentRfc822MessageId
-            .map { EmailFilter.normalizeMessageId($0) }
-            .flatMap { $0.isEmpty ? nil : $0 }
+        let parentMsgId = outgoingInReplyTo(parentRfc822MessageId: parentRfc822MessageId)
 
         // References chain = parent.references ++ parent's Message-ID, normalized,
         // order-preserving, de-duplicated (RFC 5322 §3.6.4).

@@ -949,6 +949,20 @@ struct ChatComposeRoutingTests {
                     try await Self.waitUntil { Self.namesButton(in: screens.view) == nil }
                     #expect(Self.namesButton(in: screens.view) == nil, "control: the chat is closed")
                     try await Self.openPill(in: screens)
+                    // The pill shows the field's unchanged sent words: Retry (a resume) only for a
+                    // cut-off; a plain failure keeps Send until the field is empty (ADR-IOS-117).
+                    let cutOff = failure == .connectionLost
+                    try await Self.waitUntil {
+                        let ids = HostedAccessibility.identifiers(in: screens.view)
+                        return ids.contains("chatRetry") == cutOff && ids.contains("chatSend") == !cutOff
+                    }
+                    let held = HostedAccessibility.identifiers(in: screens.view)
+                    #expect(held.contains("chatRetry") == cutOff && held.contains("chatSend") == !cutOff,
+                            "control: the pill holds the unchanged sent words after \(failure): \(held)")
+                    if !cutOff {
+                        try await Self.waitUntil { Self.type("", in: screens.view) }
+                        #expect(Self.type("", in: screens.view), "control: the pill's field is emptied")
+                    }
                     try await Self.waitUntil { HostedAccessibility.identifiers(in: screens.view).contains("chatRetry") }
                     #expect(HostedAccessibility.activate("chatRetry", in: screens.view),
                             "control: the email screen's pill offers Retry: \(HostedAccessibility.identifiers(in: screens.view))")
