@@ -216,15 +216,12 @@ struct ChatReplyAttachTests {
         text.components(separatedBy: needle).count - 1
     }
 
-    /// The operands of the chat's `isAnyPresentation`, read from its source with each line's `//`
-    /// comment removed first, so a term commented out is not one.
-    private static func presentationOperands() throws -> [String] {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let text = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Chat/ChatThreadView.swift"), encoding: .utf8)
-        let code = text.split(separator: "\n", omittingEmptySubsequences: false)
-            .map { line in line.range(of: "//").map { String(line[..<$0.lowerBound]) } ?? String(line) }
-            .joined(separator: "\n")
+    /// The operands of the chat's `isAnyPresentation` (`ChatThreadView`), read from its code with
+    /// comments blanked first (`FixedDateFormatFenceTests.codeOnly`), so a term commented out, by
+    /// `//` or `/* */`, is not one. Shared by every suite that pins what counts as presented.
+    static func presentationOperands() throws -> [String] {
+        let url = FixedDateFormatFenceTests.repositoryRoot().appendingPathComponent("TabMail/Views/Chat/ChatThreadView.swift")
+        let code = String(FixedDateFormatFenceTests.codeOnly(try String(contentsOf: url, encoding: .utf8), keepStrings: true))
         guard let start = code.range(of: "private var isAnyPresentation: Bool {"),
               let end = code[start.upperBound...].firstIndex(of: "}") else { return [] }
         return code[start.upperBound..<end].components(separatedBy: "||")
