@@ -342,6 +342,9 @@ struct SyncRunBannerEntryPointTests {
             #expect(bannerAfterPolls == InboxErrorBanner.genericMessage, "a background poll with a busy account cleared the banner")
 
             _ = await AccountManager.shared.followUpRun(world.accountA, mayStart: { true })
+            // The follow-up's pass started A's backfill worker; the last poll
+            // below needs A free.
+            await stopBackfillWorker(engine, accountId)
             waitEnd = Date().addingTimeInterval(10)
             while AccountManagerState.shared.lastSyncCompletedAt == nil, Date() < waitEnd {
                 try await Task.sleep(for: .milliseconds(10))
@@ -427,6 +430,9 @@ struct SyncRunBannerEntryPointTests {
             release.continuation.yield()
             if let pass = held.withLock({ $0 }) { await pass.value }
             _ = await AccountManager.shared.followUpRun(world.accountA, mayStart: { true })
+            // The follow-up's pass started A's backfill worker; the last refresh
+            // below needs A free.
+            await stopBackfillWorker(engine, accountId)
             let settle = Date().addingTimeInterval(10)
             while await engine.syncPassRunning.contains(accountId), Date() < settle {
                 try await Task.sleep(for: .milliseconds(10))
@@ -589,6 +595,17 @@ struct SyncRunBannerEntryPointTests {
         try await Task.sleep(for: .milliseconds(200))
         let asks = stages.triggers.filter { $0 == ask }.count
         #expect(asks == count, "the app's scheduler was asked \(asks) times for the follow-up, not \(count)")
+    }
+
+    /// Stops the account's backfill worker and waits until it has ended. A
+    /// foreground pass, a follow-up's included, starts the worker, and its first
+    /// cycle's catch-up slice takes the account's turn about 200 ms later, even
+    /// with nothing to catch up: a run after that which needs the account free
+    /// can find it busy.
+    private func stopBackfillWorker(_ engine: SyncEngine, _ accountId: String) async {
+        let worker = await engine.headerBackfillTasks[accountId]
+        await engine.resetBackfill(accountId: accountId)
+        await worker?.value
     }
 
     /// Bounded wait on the main actor.
