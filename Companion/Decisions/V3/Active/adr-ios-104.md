@@ -219,8 +219,9 @@ account gets one follow-up stage 2.** The design, its reasons and its history ar
 7. **No time limit counts a wait for another pass's turn.** A trigger never waits for one: its caller's
    time limit (`SyncConfig.perAccountSyncTimeoutSeconds` for the poll's stage 2 and pull to refresh's
    change read, `SyncConfig.backgroundPerAccountTimeoutSeconds` for stage 1) and the deadline its change
-   read is measured against (the 2026-11-12 amendment) start before only its own connection check
-   (`AccountManager.ensureConnected`, unchanged). The follow-up waits, so it takes its change read's
+   read is measured against (the 2026-11-12 amendment) start before at most its own connection check
+   (`AccountManager.ensureConnected`, unchanged). Inside the turn, a wait for a provider connection slot
+   does count against them (#1333). The follow-up waits, so it takes its change read's
    deadline (`perAccountSyncTimeoutSeconds` from its turn) when it gets the turn. It has no outer timeout,
    like `sync(account:)` from Settings: a waiter cancelled by a timeout would still take the turn and clear
    the flag without reading. Its deadline bounds its change read and the deadline-bounded steps of a due

@@ -49,8 +49,10 @@ extension AccountManager {
         // with the inner emission in backgroundDeltaSync.
         let accountId = account.id
         await MainActor.run { AccountManagerState.shared.setSyncPhase(.checking, forAccount: accountId) }
-        // A skipped pass leaves the phase to the pass that holds the turn, which
-        // clears it when it ends.
+        // A skipped pass does not clear the phase: a sync pass that holds the
+        // turn clears it when it ends, and the follow-up the flag asks for clears
+        // it after its own read. Until then this pass's "Checking" shows over the
+        // running work's phase (#1330).
         var skipped = false
         defer {
             if !skipped {
@@ -139,8 +141,10 @@ extension AccountManager {
         // emission in SyncEngine.sync().
         let accountId = account.id
         await MainActor.run { AccountManagerState.shared.setSyncPhase(.checking, forAccount: accountId) }
-        // A pass skipped for a busy account leaves the phase to the pass that
-        // holds the turn, which clears it when it ends.
+        // A pass skipped for a busy account does not clear the phase: a sync pass
+        // that holds the turn clears it when it ends, and the follow-up the flag
+        // asks for clears it after its own read. Until then this pass's
+        // "Checking" shows over the running work's phase (#1330).
         var leavesPhase = false
         defer {
             if !leavesPhase {

@@ -83,8 +83,9 @@ import Synchronization
 //   in the foreground only.
 //
 // No time limit counts a wait for another pass's turn. A trigger never waits for
-// one; only its own connection check (`AccountManager.ensureConnected`) runs
-// inside its limit before it takes or flags the turn, as before. The follow-up
+// one; at most its own connection check (`AccountManager.ensureConnected`) runs
+// inside its limit before it takes or flags the turn, as before. Inside the turn,
+// a wait for a provider connection slot does count (#1333). The follow-up
 // waits, so its quick sync's deadline (`SyncConfig.perAccountSyncTimeoutSeconds`)
 // starts when it gets the turn. It has no outer time limit, like stage 2 from
 // Settings: a timeout around a pass that waits would clear the flag unread. Its
