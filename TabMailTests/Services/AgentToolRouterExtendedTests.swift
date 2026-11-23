@@ -299,7 +299,7 @@ struct ComposeRequestEdgeCaseTests {
     func allNilOptionals() {
         let request = AgentToolRouter.ComposeRequest(
             mode: .compose, replyTo: nil, to: [], cc: [], bcc: [],
-            subject: nil, body: nil
+            subject: nil, body: nil, origin: ComposeTestOrigin.inbox
         )
         #expect(request.subject == nil)
         #expect(request.body == nil)
@@ -312,7 +312,7 @@ struct ComposeRequestEdgeCaseTests {
         let recipients = (0..<100).map { "user\($0)@test.com" }
         let request = AgentToolRouter.ComposeRequest(
             mode: .compose, replyTo: nil, to: recipients, cc: [], bcc: [],
-            subject: "Bulk", body: nil
+            subject: "Bulk", body: nil, origin: ComposeTestOrigin.inbox
         )
         #expect(request.to.count == 100)
     }
@@ -321,7 +321,7 @@ struct ComposeRequestEdgeCaseTests {
     func unicodeContent() {
         let request = AgentToolRouter.ComposeRequest(
             mode: .compose, replyTo: nil, to: ["a@b.com"], cc: [], bcc: [],
-            subject: "Re: Meeting Notes 会議", body: "<p>Hello 你好</p>"
+            subject: "Re: Meeting Notes 会議", body: "<p>Hello 你好</p>", origin: ComposeTestOrigin.inbox
         )
         #expect(request.subject?.contains("会議") == true)
         #expect(request.body?.contains("你好") == true)

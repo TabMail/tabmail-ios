@@ -102,6 +102,7 @@ struct ChatThreadLayoutTests {
         let window = UIWindow(windowScene: scene)
         let controller = UIHostingController(rootView: AnyView(
             NavigationStack { ChatThreadView(messageId: parent.id) }
+                .environment(NavigationStore())
                 .environment(\.dynamicTypeSize, textSize)
                 .environment(\.hasTabMailSession, signedIn)))
         window.rootViewController = controller

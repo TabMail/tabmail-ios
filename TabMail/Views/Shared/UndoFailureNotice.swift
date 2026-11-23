@@ -20,7 +20,8 @@ struct UndoFailureNotice: Identifiable, Equatable {
     /// otherwise none.
     @MainActor
     static var current: UndoFailureNotice? {
-        if let message = PendingSendService.shared.undoFailureMessage {
+        // Held while a chat modal is open: it closes itself first (`PendingSendService.openChatModals`).
+        if let message = PendingSendService.shared.topLevelUndoFailureMessage {
             return UndoFailureNotice(id: .send, message: message)
         }
         if let message = UndoService.shared.undoFailureMessage {
@@ -32,7 +33,7 @@ struct UndoFailureNotice: Identifiable, Equatable {
     /// Ends the notice from `source`, and only that one. A move refusal that
     /// arrived while the Send notice was up stays set, and becomes `current`
     /// next. (A Send notice cannot arrive while the move notice is up: its only
-    /// producer is the Send toast's Undo, which the alert covers.)
+    /// producers are the Send toast's Undo and a chat bubble's, which the alert covers.)
     @MainActor
     static func dismiss(_ source: Source) {
         switch source {

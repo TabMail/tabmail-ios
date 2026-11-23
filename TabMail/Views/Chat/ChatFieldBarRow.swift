@@ -71,6 +71,36 @@ enum ChatFieldDrag {
         var swell: CGFloat = 0
     }
 
+    /// The drag's progress as the chat holds it. Read only inside `Swell`, `Watch` and the debug
+    /// marker, so a moving finger redraws those modifiers alone and never rebuilds the chat's body
+    /// or the reply field under the drag (UI run 2026-11-22: after the let-go the field's text
+    /// scrolled to its caret, on the first layout after builds made while the finger moved).
+    @MainActor @Observable
+    final class Model {
+        var progress = Progress()
+    }
+
+    /// The swell: on the field's glass (`sign` 1), and taken back out of the layout around it
+    /// (`sign` -1), so the field's measured height never moves under a drag.
+    struct Swell: ViewModifier {
+        let model: Model?
+        let sign: CGFloat
+
+        func body(content: Content) -> some View {
+            content.padding(.top, sign * (model?.progress.swell ?? 0))
+        }
+    }
+
+    /// Tells `changed` when a drag begins and when it ends, finished or cancelled.
+    struct Watch: ViewModifier {
+        let model: Model
+        let changed: (Bool) -> Void
+
+        func body(content: Content) -> some View {
+            content.onChange(of: model.progress.isDragging) { _, dragging in changed(dragging) }
+        }
+    }
+
     /// The drag's progress for a drag of `translation`.
     static func progress(translation: CGSize) -> Progress {
         Progress(isDragging: true, swell: swell(translation: translation))
@@ -105,14 +135,16 @@ enum ChatFieldDrag {
         return swell(translation: translation) >= ChatViewLayout.fieldDragOpenDistance || flickedUp
     }
 
-    /// The field's share of a drag that started in the focused field's text (mock v15 H2): while
-    /// the text can still scroll it keeps the drag; once it has reached its end, the rest of the
-    /// same drag is the field's, its swell, its open distance and its flick, as for a short draft.
-    /// Both axes count from that one hand-off point: `handOff` is the drag's travel, both axes, at
-    /// the point where the text reached its end (zero for a drag that started there), nil while the
-    /// text can still scroll. Travel made while the text had the drag, either way, is not the
-    /// field's, so it never adds to the field's upward pull nor turns it sideways. Short of the end
-    /// the field gets no travel and no velocity, so a flick inside the text never opens the panel.
+    /// The field's share of a drag that started in the focused field's text (mock v15 H2): until
+    /// the text first reaches its end it keeps the drag; from there, the rest of the same drag is
+    /// the field's, its swell, its open distance and its flick, as for a short draft, until the
+    /// finger takes the drag back into the text (`ChatFieldPan.Coordinator.share`; a scroll of the
+    /// text the finger did not make keeps the hand-off). Both axes count from that one hand-off
+    /// point: `handOff` is the drag's travel, both axes, at the point where the text reached its
+    /// end (zero for a drag that started there), nil while the text has the drag. Travel made while
+    /// the text had the drag, either way, is not the field's, so it never adds to the field's upward
+    /// pull nor turns it sideways. With no hand-off the field gets no travel and no velocity, so a
+    /// flick while the text has the drag never opens the panel.
     static func fieldShare(of drag: ChatHorizontalPan.Sample, handOff: CGSize?) -> ChatHorizontalPan.Sample {
         guard let handOff else { return ChatHorizontalPan.Sample(travel: .zero, velocity: .zero) }
         return ChatHorizontalPan.Sample(travel: CGSize(width: drag.travel.width - handOff.width,

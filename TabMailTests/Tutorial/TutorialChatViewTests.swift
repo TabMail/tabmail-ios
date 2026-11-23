@@ -683,7 +683,8 @@ struct TutorialChatViewRunTests {
                 try await HostedAccessibility.withAutomation {
                     let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
                     let window = UIWindow(windowScene: scene)
-                    let controller = UIHostingController(rootView: NavigationStack { MessageOpenView(messageId: priya.id) })
+                    let controller = UIHostingController(rootView: NavigationStack { MessageOpenView(messageId: priya.id) }
+                        .environment(NavigationStore()))
                     window.rootViewController = controller
                     window.makeKeyAndVisible()
                     defer {
@@ -898,7 +899,8 @@ struct TutorialChatViewRunTests {
                 try await HostedAccessibility.withAutomation {
                     let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
                     let window = UIWindow(windowScene: scene)
-                    let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) })
+                    let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) }
+                        .environment(NavigationStore()))
                     window.rootViewController = controller
                     window.makeKeyAndVisible()
                     defer {
@@ -1084,7 +1086,7 @@ struct TutorialChatViewWiringTests {
     @Test("The tutorial's field holds the request and nothing else: never the AI Suggestion")
     func fieldText() {
         let field = { (move: TutorialCoordinator.FieldMove?) in
-            ChatReplyField(example: nil, isNoReply: false, clearCount: 0, tutorialMove: move)
+            ChatReplyField(example: nil, isNoReply: false, tutorialMove: move)
         }
         #expect(DynamicIslandChat.tutorialFieldText(field(.tapSuggestion)) == nil, "the move is a tap on the ghost")
         #expect(DynamicIslandChat.tutorialFieldText(field(.ask(.saveReplyAsTemplate)))

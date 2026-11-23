@@ -116,7 +116,7 @@ struct ChatBubbleActionTests {
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
         let controller = UIHostingController(rootView: AnyView(NavigationStack {
             ChatThreadView(messageId: headers[headers.count - 1].id)
-        }))
+        }.environment(NavigationStore())))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         let chat = Chat(controller: controller)

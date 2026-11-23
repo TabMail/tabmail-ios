@@ -272,6 +272,9 @@ actor MockEmailProvider: EmailProvider {
     /// reconcile-versus-drain hazard lives, and it cannot be observed from
     /// before/after states.
     var sendHook: (@Sendable () async -> Void)?
+    /// Awaited from INSIDE `disconnect()`, after the call is logged: lets a test hold an account's
+    /// teardown on the wire and observe what has already happened while it is parked.
+    var disconnectHook: (@Sendable () async -> Void)?
 
     // MARK: - Parameter Tracking
 
@@ -291,6 +294,7 @@ actor MockEmailProvider: EmailProvider {
 
     func disconnect() async throws {
         callLog.append("disconnect")
+        if let disconnectHook { await disconnectHook() }
         if let error = disconnectThrows { throw error }
     }
 
@@ -541,6 +545,10 @@ actor MockEmailProvider: EmailProvider {
         sendHook = hook
     }
 
+    func setDisconnectHook(_ hook: (@Sendable () async -> Void)?) {
+        disconnectHook = hook
+    }
+
     /// Reset all recorded state.
     func reset() {
         callLog.removeAll()
@@ -554,5 +562,6 @@ actor MockEmailProvider: EmailProvider {
         saveDraftHook = nil
         moveHook = nil
         sendHook = nil
+        disconnectHook = nil
     }
 }

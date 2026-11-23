@@ -44,6 +44,32 @@ enum HostedAccessibility {
         return try await body()
     }
 
+    /// The system Reduce Motion switch (libAccessibility's `_AXSReduceMotionEnabled`; test code only).
+    private static let reduceMotionSwitch: (get: Get, set: Set)? = {
+        guard let get = function("_AXSReduceMotionEnabled", as: Get.self),
+              let set = function("_AXSSetReduceMotionEnabled", as: Set.self) else { return nil }
+        return (get, set)
+    }()
+
+    /// Whether the test can turn Reduce Motion on; a test using `withReduceMotion` checks it first.
+    static var canSetReduceMotion: Bool { reduceMotionSwitch != nil }
+
+    /// Runs `body` with the system's Reduce Motion set to `on` (as `UIAccessibility` reports it,
+    /// and so SwiftUI's `accessibilityReduceMotion`), then restores it, because the simulator keeps it.
+    static func withReduceMotion<T>(_ on: Bool, _ body: () async throws -> T) async rethrows -> T {
+        guard let reduceMotionSwitch else { return try await body() }
+        let before = reduceMotionSwitch.get()
+        reduceMotionSwitch.set(on ? 1 : 0)
+        defer { reduceMotionSwitch.set(before) }
+        return try await body()
+    }
+
+    /// The label and value of every element `identifier` under `view`.
+    static func labelsAndValues(of identifier: String, in view: UIView) -> [(label: String?, value: String?)] {
+        elements(under: view).filter { Self.identifier(of: $0) == identifier }
+            .map { ($0.accessibilityLabel, $0.accessibilityValue) }
+    }
+
     /// Every accessibility element and view under `root`, depth first.
     static func elements(under root: NSObject) -> [NSObject] {
         var found: [NSObject] = []

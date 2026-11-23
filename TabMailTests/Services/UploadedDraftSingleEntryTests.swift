@@ -252,7 +252,7 @@ struct UploadedDraftSingleEntryTests {
         PendingSendService.shared.present(
             outboxId: held.id, draftId: uploaded.draftId, instanceEpoch: uploaded.cursor.newEpoch,
             toSummary: "To: recipient@example.com", holdUntil: held.holdUntil)
-        let snapshot = try #require(PendingSendService.shared.undo(), "the Undo was not confirmed")
+        let snapshot = try #require(PendingSendService.shared.tapToastUndo(), "the Undo was not confirmed")
         #expect(snapshot.returnedToDrafts)
 
         try await expectOneEntryAndUpload(

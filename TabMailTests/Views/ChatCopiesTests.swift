@@ -166,7 +166,7 @@ struct ChatCopiesTests {
             window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
             let controller = UIHostingController(rootView: NavigationStack {
                 ChatThreadView(messageId: opened.id)
-            })
+            }.environment(NavigationStore()))
             window.rootViewController = controller
             window.makeKeyAndVisible()
             defer {

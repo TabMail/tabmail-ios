@@ -68,6 +68,8 @@ struct MessageDetailView: View {
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) var optOutAllAI = false
     @Environment(\.dismiss) var dismiss
     @Environment(\.hasTabMailSession) var hasTabMailSession
+    /// The app's accounts: a new email's card opens from its bound account, looked up here.
+    @Environment(NavigationStore.self) var navigationStore
 
     var anyAISourceEnabled: Bool {
         (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
@@ -322,14 +324,9 @@ struct MessageDetailView: View {
         .fullScreenCover(item: $forwardMessage) { msg in
             ComposeView(replyTo: msg, isForward: true)
         }
+        // The email screen chat's own compose cards, taken by its pill (ADR-IOS-053 Phase 2).
         .fullScreenCover(item: $agentCompose) { req in
-            req.composeView(account: currentAccount, onOutcome: req.onOutcome)
-        }
-        .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
-            if newId != nil {
-                agentCompose = AgentToolRouter.shared.pendingCompose
-                AgentToolRouter.shared.pendingCompose = nil
-            }
+            req.composeView(account: fromAccount(of: req), onOutcome: req.onOutcome)
         }
         .sheet(item: $moveMessage) { msg in
             MoveFolderPicker(accountId: msg.accountId, currentFolderPath: msg.folderPath) { destinationPath in
@@ -600,7 +597,8 @@ struct MessageDetailView: View {
 
                 DynamicIslandChat(message: chatContextMessage ?? message, isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
                     showAgentToast(text)
-                })
+                }, onAgentCompose: openAgentCompose,
+                composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)
 
                 Menu {
                     RestrictedMailActionButton(

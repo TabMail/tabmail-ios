@@ -20,7 +20,7 @@ struct TutorialCoachView: View {
             step: step, lesson: lesson, host: host,
             flightsAsked: tutorial.flightsAsked,
             replyEdited: tutorial.replyEdited,
-            isSending: PendingSendService.shared.current != nil,
+            isSending: PendingSendService.shared.isSending,
             teachesChat: tutorial.teachesChat) {
             TutorialCoachCard(
                 content: content,

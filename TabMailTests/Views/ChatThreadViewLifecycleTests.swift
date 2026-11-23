@@ -186,7 +186,7 @@ struct ChatThreadViewLifecycleTests {
         window.frame = CGRect(x: 0, y: 0, width: 393, height: height)
         let controller = UIHostingController(rootView: NavigationStack {
             ChatThreadView(messageId: headers[openedIndex].id, highlightsOpenedMessage: highlights)
-        })
+        }.environment(NavigationStore()))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -333,7 +333,7 @@ struct ChatThreadViewLifecycleTests {
         gate.arm()
         let controller = UIHostingController(rootView: NavigationStack {
             ChatThreadView(messageId: headers[Self.length - 1].id)
-        })
+        }.environment(NavigationStore()))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -466,7 +466,7 @@ struct ChatThreadViewLifecycleTests {
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        let controller = UIHostingController(rootView: NavigationStack { open })
+        let controller = UIHostingController(rootView: NavigationStack { open }.environment(NavigationStore()))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -765,6 +765,8 @@ struct ChatThreadViewLifecycleTests {
         }
         saved.setChatView(on: true)
         ChatPillState.shared.removeAllSessions()
+        let words = Self.freshFieldWords(pool)
+        defer { ChatFieldWords.shared = words }
         let headers = try Self.insertThread(unreadFrom: nil, newestReady: ready, pool: pool)
         let newest = try #require(headers.last)
 
@@ -773,7 +775,7 @@ struct ChatThreadViewLifecycleTests {
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
         let controller = UIHostingController(rootView: NavigationStack {
             ChatThreadView(messageId: newest.id)
-        }.environment(\.hasTabMailSession, true))
+        }.environment(NavigationStore()).environment(\.hasTabMailSession, true))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -928,6 +930,16 @@ struct ChatThreadViewLifecycleTests {
         return condition()
     }
 
+    /// Installs a new field-words store on the test's database, as a new app run starts, and returns
+    /// the one it replaces for the caller to put back. The store keeps every chat's words in memory
+    /// for the run, so without it a draft one test typed is already in the field when the next test
+    /// opens a chat with the same key, and that field cannot grow.
+    private static func freshFieldWords(_ pool: DatabasePool) -> ChatFieldWords {
+        let previous = ChatFieldWords.shared
+        ChatFieldWords.shared = ChatFieldWords(database: { PrioritizedDatabase(pool: pool) })
+        return previous
+    }
+
     /// The pin tests' bound on a layout wait: three seconds of frames.
     private static let layoutWaitFrames = 180
 
@@ -955,6 +967,8 @@ struct ChatThreadViewLifecycleTests {
             }
             saved.setChatView(on: true)
             ChatPillState.shared.removeAllSessions()
+            let words = Self.freshFieldWords(pool)
+            defer { ChatFieldWords.shared = words }
             let headers = try Self.insertThread(unreadFrom: unreadFrom, pool: pool)
             let newest = try #require(headers.last)
             let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
@@ -962,7 +976,7 @@ struct ChatThreadViewLifecycleTests {
             window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
             let controller = UIHostingController(rootView: NavigationStack {
                 ChatThreadView(messageId: newest.id)
-            }.environment(\.hasTabMailSession, true))
+            }.environment(NavigationStore()).environment(\.hasTabMailSession, true))
             window.rootViewController = controller
             window.makeKeyAndVisible()
             defer {
@@ -1167,7 +1181,8 @@ struct ChatThreadViewLifecycleTests {
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
         hold.arm()
-        let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: seeded.id) })
+        let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: seeded.id) }
+            .environment(NavigationStore()))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {
@@ -1260,7 +1275,7 @@ struct ChatThreadViewLifecycleTests {
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
         let controller = UIHostingController(rootView: NavigationStack {
             ChatThreadView(messageId: parent.id)
-        }.environment(\.hasTabMailSession, true))
+        }.environment(NavigationStore()).environment(\.hasTabMailSession, true))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         defer {

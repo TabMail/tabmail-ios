@@ -406,7 +406,7 @@ struct ExchangeLastVerbMarkTests {
     }
 
     /// The agent's compose card opens through one presenter for every host
-    /// (`AgentToolRouter.ComposeRequest.composeView(account:onOutcome:)`), which
+    /// (`AgentToolRouter.ComposeRequest.composeView(account:openedOn:onOutcome:)`), which
     /// carries the request's reply-all flag into ComposeView for `.reply`, so an
     /// AI reply-all records 103 (#915).
     @Test("The agent compose presenter passes the request's reply-all flag")
@@ -415,7 +415,7 @@ struct ExchangeLastVerbMarkTests {
         let bodies = files.flatMap { file -> [String] in
             // Comments masked: a commented-out argument must not satisfy the fence.
             DiagnosticPrintGateTests.codeOnly(file.source)
-                .components(separatedBy: "func composeView(account: Account?, onOutcome: @escaping @MainActor (ComposeOutcome) -> Void) -> ComposeView").dropFirst()
+                .components(separatedBy: "func composeView(account: Account?, openedOn: ComposeScreen? = nil, onOutcome: @escaping @MainActor (ComposeOutcome) -> Void) -> ComposeView").dropFirst()
                 .map { String($0) }
         }
         #expect(bodies.count == 1, "expected the one agent compose presenter, found \(bodies.count)")
