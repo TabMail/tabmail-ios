@@ -917,8 +917,7 @@ struct ChatReplyFieldTests {
         let shown = ReplyResult(body: "Hi Alex,\n\nTuesday works.", textMessage: "Tuesday works", changeCommand: "make it shorter")
         let ready = ChatReadyReply(message: email, suggestion: shown, accounts: [Self.me])
         #expect(ready.suggestion == shown, "control: the ready reply holds the suggestion as shown")
-        let compose = ready.compose.composeView(
-            replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId, openedOn: .chat, onAgentOutcome: { _ in })
+        let compose = ready.composeView(openedOn: .chat, onOutcome: { _ in })
         // An edit in the card starts from this value and is stored only over it, so a part missing
         // (its change command) would make the card's edit differ from what is stored.
         #expect(compose.suggestion == shown, "the card opens on the suggestion as shown: \(String(describing: compose.suggestion))")

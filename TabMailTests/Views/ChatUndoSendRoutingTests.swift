@@ -234,10 +234,9 @@ struct ChatUndoSendRoutingTests {
     /// (`ChatReadyReply.draftId`).
     private static func readyAIReply(_ fixture: Fixture) -> some View {
         let ready = ChatReadyReply(message: fixture.parent, suggestion: Self.readySuggestion, accounts: [fixture.account])
-        return ready.compose.composeView(
-            replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
+        return ready.composeView(
             openedOn: ChatThreadView.composeScreen(answering: ready.message, chatMessageIds: fixture.chatMessageIds),
-            onAgentOutcome: { _ in })
+            onOutcome: { _ in })
     }
 
     private static func newEmail(_ fixture: Fixture) -> some View {
@@ -669,9 +668,7 @@ struct ChatUndoSendRoutingTests {
         var body: some View {
             let screen = origin.screen
             let _ = origin.built.append(screen)
-            ready.compose.composeView(
-                replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
-                openedOn: screen, onAgentOutcome: { _ in })
+            ready.composeView(openedOn: screen, onOutcome: { _ in })
         }
     }
 

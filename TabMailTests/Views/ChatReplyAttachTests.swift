@@ -124,6 +124,13 @@ struct ChatReplyAttachTests {
         default: Issue.record("the card carries the pick as picked: \(kind), \(String(describing: compose.attachmentPick))")
         }
 
+        // Only some people chosen: the card is a plain reply to them.
+        let narrowed = ChatReadyReply(attaching: pick, to: email, onlyTo: [Self.david], shown: Self.suggestion, accounts: [Self.me])
+            .composeView(openedOn: .chat, onOutcome: { _ in })
+        let narrowedReplyAll = narrowed.isReplyAll
+        #expect(!narrowedReplyAll, "a plain reply, so the send records a reply on the original")
+        #expect(narrowed.prefillTo == ["david@example.com"] && narrowed.prefillCc == [] && narrowed.prefillBcc == [])
+
         // The ghost's card: the same builder, nothing picked, nothing stored read either.
         let ghost = ChatReadyReply(message: email, suggestion: Self.suggestion, accounts: [Self.me]).composeView(openedOn: .chat, onOutcome: { _ in })
         #expect(ghost.attachmentPick == nil && !ghost.offersStoredSuggestion && ghost.suggestion == Self.suggestion)
@@ -131,17 +138,34 @@ struct ChatReplyAttachTests {
         #expect(ComposeView(replyTo: email).offersStoredSuggestion)
     }
 
+    @Test("The card the chat presents hands its outcome to the chat, so a sent reply can clear Replying only to")
+    func presentedCardHandsOnItsOutcome() {
+        let email = Self.groupEmail()
+        let url = URL(fileURLWithPath: "/tmp/attach/plan.pdf")
+        let card = ChatReadyReply(attaching: .files([url]), to: email, onlyTo: [Self.david], shown: Self.suggestion, accounts: [Self.me])
+        var sent = 0
+        var other = 0
+        let compose = card.composeView(openedOn: .chat, onOutcome: { outcome in
+            if case .sent = outcome { sent += 1 } else { other += 1 }
+        })
+        let handler = compose.onAgentOutcome
+        #expect(handler != nil, "the card reports how it ended")
+        handler?(.sent)
+        handler?(.cancelled)
+        #expect(sent == 1 && other == 1, "each outcome reaches the chat once: sent \(sent), other \(other)")
+    }
+
     @Test("The paperclip shows for a new email's field and a thread's, and its choice reaches the one given")
     func fieldPaperclip() {
         var threadChoices: [ChatNewEmailField.AttachSource] = []
-        let thread = ChatReplyField(example: nil, isNoReply: false, clearCount: 0, attach: { threadChoices.append($0) })
+        let thread = ChatReplyField(example: nil, isNoReply: false, attach: { threadChoices.append($0) })
         thread.paperclip?(.files)
         #expect(threadChoices == [.files], "a thread's paperclip reaches the chat")
-        #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).paperclip == nil, "nothing given: no paperclip")
+        #expect(ChatReplyField(example: nil, isNoReply: false).paperclip == nil, "nothing given: no paperclip")
 
         var newEmailChoices: [ChatNewEmailField.AttachSource] = []
         let newEmail = ChatReplyField(
-            example: nil, isNoReply: false, clearCount: 0,
+            example: nil, isNoReply: false,
             newEmail: ChatNewEmailField(startWords: "", sessionKey: "attach-session", wordsChanged: { _ in },
                                         send: { _ in }, attach: { newEmailChoices.append($0) }))
         newEmail.paperclip?(.camera)
