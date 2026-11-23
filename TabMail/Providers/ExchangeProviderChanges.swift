@@ -138,7 +138,10 @@ extension ExchangeProvider {
     /// The folders this read covers, in order: those already tracking before
     /// those in their baseline, the Inbox first in each, else in the request's
     /// order. Scope `.all` reads every folder the full sync syncs; `.inboxOnly`
-    /// reads the Inbox only; `.otherFolders` reads the run's folders (#1110).
+    /// reads the Inbox only; `.otherFolders` reads the run's folders (#1110) in
+    /// the request's order, which the engine sets (those read longest ago first),
+    /// so a folder still in its baseline is never kept behind tracked ones run
+    /// after run.
     nonisolated static func foldersToRead(_ request: ChangeRequest) -> [ChangeFolder] {
         let eligible = request.folders.filter { folder in
             switch request.scope {
@@ -146,6 +149,7 @@ extension ExchangeProvider {
             case .inboxOnly: return folder.role == .inbox
             }
         }
+        if request.scope == .otherFolders { return eligible }
         return eligible.enumerated().sorted { lhs, rhs in
             let l = (Self.isBaselinePhase(lhs.element) ? 1 : 0, lhs.element.role == .inbox ? 0 : 1, lhs.offset)
             let r = (Self.isBaselinePhase(rhs.element) ? 1 : 0, rhs.element.role == .inbox ? 0 : 1, rhs.offset)

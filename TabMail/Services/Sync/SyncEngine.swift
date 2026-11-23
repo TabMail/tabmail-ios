@@ -64,6 +64,10 @@ actor SyncEngine {
     /// Test-only seam (`setOtherFolderRunClockForTesting`): the clock other-folder
     /// runs are measured on. Nil outside tests: the real clock.
     var otherFolderRunClockForTesting: (@Sendable () -> Date)?
+    /// Test-only seam (`setOtherFolderRunForegroundForTesting`): whether the app
+    /// is in the foreground, for other-folder runs. Nil outside tests: the app's
+    /// lifecycle flag (`DatabaseSuspension.isAppActive`).
+    var otherFolderRunForegroundForTesting: (@Sendable () -> Bool)?
     #endif
 
     /// Generation counter per account — prevents stale task defer from clearing

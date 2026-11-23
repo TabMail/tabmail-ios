@@ -88,6 +88,23 @@ struct OtherFolderRuleTests {
         #expect(read == [named.id])
     }
 
+    @Test("Outlook: a run reads its folders in the order the engine gave, a folder still in its baseline before a tracked one; a pass still reads tracked folders first")
+    func outlookRunKeepsTheEnginesOrder() {
+        let tracking = OutlookFolderCursor(phase: .tracking, select: .state, next: "https://graph.example.com/delta-link").encoded
+        let baselining = ChangeFolder(id: "acc1:fld-new", path: "fld-new", role: .custom, isSynced: true)
+        let tracked = ChangeFolder(id: "acc1:fld-old", path: "fld-old", role: .custom, cursor: tracking, isSynced: true)
+        func request(_ scope: ChangeScope) -> ChangeRequest {
+            ChangeRequest(
+                folders: [baselining, tracked], scope: scope, recheck: [:],
+                context: ChangeContext(deadline: Date().addingTimeInterval(60), clock: { Date() }, onProgress: { _ in }),
+                localRows: IMAPChangeReaderTests.LocalRows())
+        }
+        let run = ExchangeProvider.foldersToRead(request(.otherFolders)).map(\.id)
+        let pass = ExchangeProvider.foldersToRead(request(.all)).map(\.id)
+        #expect(run == [baselining.id, tracked.id], "the run keeps the engine's order")
+        #expect(pass == [tracked.id, baselining.id], "a pass reads the tracked folder first, as before")
+    }
+
     @Test("Gmail: a run's read sends nothing and reads nothing, since every pass's history read already reports every label")
     func gmailRunReadsNothing() async throws {
         try await GmailDeltaApplyInvariantTests.withWorld(seeds: []) { w in
@@ -224,6 +241,8 @@ struct OtherFolderIMAPTests {
         let accountId: String
         let recorder = FollowedFolderIMAPTests.SliceRecorder()
         let offset = FollowedFolderIMAPTests.ClockOffset()
+        /// Whether the app is in the foreground, for the engine's other-folder runs.
+        let foreground = OtherFolderShared<Bool>(true)
 
         func id(_ path: String) -> String { "\(accountId):\(path)" }
         func path(ofId folderId: String) -> String { String(folderId.dropFirst(accountId.count + 1)) }
@@ -249,12 +268,14 @@ struct OtherFolderIMAPTests {
 
         func account() throws -> Account {
             let accountId = accountId
-            return try #require(try pool.read { db in try Account.fetchOne(db, key: accountId) })
+            let account = try pool.read { db in try Account.fetchOne(db, key: accountId) }
+            return try #require(account)
         }
 
         func folder(_ path: String) throws -> Folder {
             let folderId = id(path)
-            return try #require(try pool.read { db in try Folder.fetchOne(db, key: folderId) })
+            let folder = try pool.read { db in try Folder.fetchOne(db, key: folderId) }
+            return try #require(folder)
         }
 
         func uids(in path: String) throws -> Set<Int> {
@@ -381,19 +402,27 @@ struct OtherFolderIMAPTests {
         await engine.register(
             accountId: accountId, provider: provider,
             workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
-        // The body queue is process-wide: start from an empty one, and hold this
-        // world's downloads, so the only requests are the sync's own.
+        // The body queues are process-wide: start from empty ones, and hold this
+        // world's downloads, so the only requests are the sync's own. A listing
+        // queues its new rows on the active queue: emptied again at the end, so
+        // nothing of this world's account is left there for the next test.
         await BackfillBodyQueue.shared.emptyForTesting()
         await BackfillBodyQueue.shared.setDispatchSuppressedForTesting(true)
+        await ActiveBodyQueue.shared.emptyForTesting()
         let world = World(server: server, provider: provider, engine: engine, pool: pool, accountId: accountId)
         await world.watchSlices()
         let offset = world.offset
         await engine.setOtherFolderRunClockForTesting { offset.now() }
+        // The app is in the foreground unless a test says otherwise, whatever
+        // state the test host's own lifecycle is in.
+        let foreground = world.foreground
+        await engine.setOtherFolderRunForegroundForTesting { foreground.get }
         func teardown() async {
             await engine.remove(accountId: accountId)
             await engine.setCatchUpSliceStartHookForTesting(nil)
             await BackfillBodyQueue.shared.emptyForTesting()
             await BackfillBodyQueue.shared.setDispatchSuppressedForTesting(false)
+            await ActiveBodyQueue.shared.emptyForTesting()
             try? await provider.disconnect()
         }
         do {
@@ -580,6 +609,83 @@ struct OtherFolderIMAPTests {
         }
     }
 
+    @Test("A folder whose read fails is left out of the rest of the run, and the run still reads the other folders")
+    func aFailedFolderIsLeftOut() async throws {
+        try await Self.withWorld("failed", .plain) { w in
+            let uid = w.nextUid(in: Self.beta)
+            w.deliver(uid, to: Self.beta)
+            // Alpha's counters cannot be read this time (the form sent fails).
+            for fragment in Self.statusFragments(Self.alpha) { w.server.failNextCommand(containing: fragment) }
+            try await w.runOnce()
+            let alphaReads = w.statusCount(Self.alpha)
+            let arrived = try w.holds(uid, in: Self.beta)
+            #expect(alphaReads == 1, "Alpha's failed read was not asked again in the run")
+            #expect(arrived, "Beta was still read, and its new message arrived")
+        }
+    }
+
+    // MARK: Foreground only
+
+    @Test("A run starts, and takes each slice, only while the app is in the foreground: a pass that ends after the app has left starts none, a slice whose slot comes after the app left reads nothing, and a run whose app leaves during a slice takes no further slice")
+    func aRunReadsInTheForegroundOnly() async throws {
+        try await Self.withWorld("foreground", .plain) { w in
+            let account = try w.account()
+            let accountId = w.accountId
+            func otherStatuses() -> Int { Self.others.map { w.statusCount($0) }.reduce(0, +) }
+
+            // 1. Out of the foreground: no run is started.
+            w.foreground.set(false)
+            await w.engine.startOtherFolderRun(account: account)
+            let started = await w.engine.otherFolderRunTasks[accountId] != nil
+            await w.settle()
+            let readOutside = otherStatuses()
+            #expect(!started, "no run started out of the foreground")
+            #expect(w.runSlices.isEmpty && readOutside == 0, "nothing was read")
+
+            // 2. The app leaves after a slice's turn, before its slot: that
+            // slice reads nothing, and the run ends.
+            w.foreground.set(true)
+            let foreground = w.foreground
+            await w.watchSlices { _ in foreground.set(false) }
+            await w.engine.startOtherFolderRun(account: account)
+            await w.settle()
+            let readAtSlot = otherStatuses()
+            #expect(w.runSlices.count == 1, "the run took its first slice's turn, then ended")
+            #expect(readAtSlot == 0, "and that slice read nothing")
+
+            // 3. The app leaves during a slice: the slice ends as it would, and
+            // the run takes no further slice.
+            w.recorder.reset()
+            w.foreground.set(true)
+            let first = OtherFolderShared<String?>(nil)
+            await w.watchSlices { folderIds in
+                guard first.get == nil, let firstId = folderIds.first else { return }
+                let path = w.path(ofId: firstId)
+                first.set(path)
+                w.holdStatus(of: path)
+            }
+            await w.engine.startOtherFolderRun(account: account)
+            guard await OneSyncAtATimeTests.eventually({ w.isHoldingStatus(of: first.get) }) else {
+                Issue.record("precondition: the run's first slice is held at its first folder's read")
+                w.releaseStatus(of: first.get)
+                await w.settle()
+                return
+            }
+            // The slice's time runs out while its read is held, so it reads
+            // this folder only; the app leaves meanwhile.
+            w.offset.add(SyncConfig.catchUpSliceSeconds + 1)
+            w.foreground.set(false)
+            w.releaseStatus(of: first.get)
+            await w.settle()
+            let slices = w.runSlices.map(\.folderIds)
+            #expect(slices.count == 1, "no slice after the app left: \(slices)")
+            for path in Self.others where path != first.get {
+                let reads = w.statusCount(path)
+                #expect(reads == 0, "\(path): not read once the app had left")
+            }
+        }
+    }
+
     // MARK: Timing (sync timing promises 1, 2, 3 and 8)
 
     @Test("A new-mail trigger that finds a run's slice holding the turn asks for its stage 2 without waiting, and that stage 2 reads when the slice ends, before the run's next slice")
@@ -622,7 +728,14 @@ struct OtherFolderIMAPTests {
             w.offset.add(SyncConfig.catchUpSliceSeconds + 1)
             w.deliver(newUid, to: "INBOX")
 
-            let trigger = try await engine.syncOrFollowUp(account: account, deadline: nil)
+            let trigger: Bool?
+            do {
+                trigger = try await engine.syncOrFollowUp(account: account, deadline: nil)
+            } catch {
+                w.releaseStatus(of: first.get)
+                await w.settle()
+                throw error
+            }
             let wanted = await engine.syncFollowUpWanted.contains(accountId)
             #expect(trigger == nil, "the trigger found the account busy and did not wait")
             #expect(wanted, "it asked for its stage 2")
@@ -655,6 +768,9 @@ struct OtherFolderIMAPTests {
             let accountId = w.accountId
             let uids = Self.others.map { w.nextUid(in: $0) }
             for (path, uid) in zip(Self.others, uids) { w.deliver(uid, to: path) }
+            // Read before the pass holds the turn, so nothing below can throw
+            // while it is held.
+            let account = try w.account()
             let log = OneSyncAtATimeTests.PassLog()
             let release = AsyncStream<Void>.makeStream()
             let holder = OneSyncAtATimeTests.heldPass(
@@ -668,7 +784,6 @@ struct OtherFolderIMAPTests {
             guard await OneSyncAtATimeTests.eventually({ log.snapshot == ["start held"] }) else {
                 return await stop("precondition: the pass holds the turn")
             }
-            let account = try w.account()
             await engine.startOtherFolderRun(account: account)
             guard await OneSyncAtATimeTests.eventually({ await engine.syncPassWaiters[accountId]?.count == 1 }) else {
                 return await stop("precondition: the run waits for the turn behind the pass")
@@ -715,7 +830,8 @@ struct OtherFolderIMAPTests {
             w.offset.add(SyncConfig.otherFolderRunSeconds)
             w.releaseStatus(of: first.get)
             await w.settle()
-            let missed = try #require(second.get)
+            let missedPath = second.get
+            let missed = try #require(missedPath)
             let newUid = w.nextUid(in: missed) - 1
             let early = try w.holds(newUid, in: missed)
             #expect(!early, "precondition: the run ended before it reached \(missed)")
@@ -755,14 +871,25 @@ struct OtherFolderIMAPTests {
                 await w.settle()
                 return
             }
-            let firstPath = try #require(first.get)
+            guard let firstPath = first.get else {
+                Issue.record("precondition: the first slice named its first folder")
+                await w.settle()
+                return
+            }
+            let otherId = w.otherIds.first { $0 != w.id(firstPath) }
+            let secondPath = otherId.map { w.path(ofId: $0) } ?? ""
+            // Both folders' counters were read before the first listing, so the
+            // second folder is changed and not listed by its slice's guard, not
+            // left unread by its read.
+            let secondReadBefore = w.statusCount(secondPath)
+            #expect(secondReadBefore == 1, "precondition: the slice read \(secondPath)'s counters before its first listing")
             // The slice's time runs out while that listing is held.
             w.offset.add(SyncConfig.catchUpSliceSeconds + 1)
             server.releaseFetchAfterSnapshot(in: firstPath)
             await w.settle()
 
             let asked = w.runSlices.map(\.folderIds)
-            let secondId = try #require(w.otherIds.first { $0 != w.id(firstPath) })
+            let secondId = try #require(otherId)
             let firstAskedAll = asked.first.map { Set($0) == Set(w.otherIds) } ?? false
             #expect(asked.count == 2 && firstAskedAll, "two slices, the first asking both folders: \(asked)")
             #expect(asked.last == [secondId], "the second slice asks only the folder not listed yet: \(asked)")

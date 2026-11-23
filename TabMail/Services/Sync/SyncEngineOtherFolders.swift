@@ -28,28 +28,34 @@ import GRDB
 // End rule of a run, whichever comes first: every other folder has been read
 // once in it (a folder whose first read is still going, an Outlook baseline cut
 // by the slice's end, stays pending), a slice reads nothing new, its working time
-// (`SyncConfig.otherFolderRunSeconds`, slice time only) is spent, or the account
-// is removed. A folder the run did not finish is read in the next run.
+// (`SyncConfig.otherFolderRunSeconds`, slice time only) is spent, the app has
+// left the foreground (checked at each slice's turn and slot; a pass that ends
+// after the app has left starts no run), or the account is removed. A folder the run
+// did not finish is read in the next run.
 
 extension SyncEngine {
 
     /// Starts the account's other-folder run, unless one is running: at most
     /// one per account, so a clock-due pass that ends while a run goes on
     /// starts none. Called by a foreground pass whose full sync was due by the
-    /// clock (`foregroundPass`), when it ends.
+    /// clock (`foregroundPass`), when it ends; one that ends after the app has
+    /// left starts none.
     func startOtherFolderRun(account: Account) {
         let accountId = account.id
-        guard workQueues[accountId] != nil, otherFolderRunTasks[accountId] == nil else { return }
+        guard otherFolderRunForeground(), workQueues[accountId] != nil, otherFolderRunTasks[accountId] == nil else { return }
         otherFolderRunTasks[accountId] = Task { await self.runOtherFolders(account: account) }
     }
 
     /// One run. Its settings are taken first and the run reads only this
-    /// snapshot. An account with no other folder takes no turn. The task's
-    /// entry is cleared when the run ends.
+    /// snapshot. An account with no other folder takes no turn. The run takes
+    /// a slice only while the app is in the foreground (`CatchUpRun.inForeground`,
+    /// asked at each slice's turn and slot): once the app has left, it ends
+    /// there and reads nothing more. The task's entry is cleared when the run ends.
     private func runOtherFolders(account: Account) async {
         var run = CatchUpRun.snapshot(deadline: nil, clock: otherFolderRunClock)
         run.workSeconds = SyncConfig.otherFolderRunSeconds
         run.readsOtherFolders = true
+        run.inForeground = otherFolderRunForeground
         let hasOtherFolders: Bool
         do {
             let order = try await otherFolderReadOrder(accountId: account.id)
@@ -201,6 +207,16 @@ extension SyncEngine {
         return { Date() }
     }
 
+    /// Whether the app is in the foreground (the lifecycle flag,
+    /// `DatabaseSuspension.isAppActive`), or in a test the answer it installed
+    /// (`setOtherFolderRunForegroundForTesting`).
+    private var otherFolderRunForeground: @Sendable () -> Bool {
+        #if DEBUG
+        if let inForeground = otherFolderRunForegroundForTesting { return inForeground }
+        #endif
+        return { DatabaseSuspension.isAppActive }
+    }
+
     #if DEBUG
     /// Test seam: waits until the account's other-folder run is done.
     func awaitOtherFolderRunForTesting(accountId: String) async {
@@ -211,6 +227,13 @@ extension SyncEngine {
     /// the real one).
     func setOtherFolderRunClockForTesting(_ clock: (@Sendable () -> Date)?) {
         otherFolderRunClockForTesting = clock
+    }
+
+    /// Test seam: whether the app is in the foreground, for the next
+    /// other-folder runs and for each slice of a run under way (nil: the
+    /// lifecycle flag).
+    func setOtherFolderRunForegroundForTesting(_ inForeground: (@Sendable () -> Bool)?) {
+        otherFolderRunForegroundForTesting = inForeground
     }
     #endif
 }
