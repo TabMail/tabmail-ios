@@ -287,3 +287,96 @@ busy does not clear; with the account free it does); `GmailCatchUpTests.sliceHan
 next slice boundary, within one slice). `OneSyncAtATimeTests`'
 waiting cases (`secondPassWaitsForTheFirst`, `waitingPassKeepsTheFreshCursor`, `throwingPassHandsTheTurnOn`,
 `removedWhileWaitingDoesNothing`) now queue `sync(account:)`, the form that still waits.
+
+**Amended 2026-11-23 (tabmail-ios #1331, #1327): the screen starts foreground polling in one place.** A
+return to the app reaches `SyncScheduler.startForegroundPolling` (a return's stage 1 for every account, the
+300 s poll timer and IMAP IDLE) through `ForegroundPollStart`, a view modifier RootView applies. It reads one
+condition, the scene is active and an account exists and the app is not in screenshot mode, when RootView
+mounts and whenever any part of it changes, and starts foreground polling on every change to true. A change
+to false does nothing there; RootView's scene-phase handler still stops polling in the background.
+
+Why: RootView's scene-phase handler started foreground polling on a change to active only. RootView mounts
+only once the inbox is ready to paint (since v1.6.7), a cold launch in the foreground is already active by
+then, and `onChange` does not run for the value a view mounts with, so the poll, stage 1 and IDLE waited for
+the next background-and-return (#1331). Adding the first account while the app is open changes no phase
+either (#1327). One condition read at mount and on every change covers both, with no new timer, path or
+layer; Settings' database reset stays the only other caller.
+
+IDLE follows the provider. `startImapIdle` starts IDLE only for the IMAP providers registered when it looks,
+and at a cold launch RootView's connect loop usually registers them after that (the first account's provider
+connects after the account list refreshes, too). So every place that makes a connected mail provider the
+account's live one hands the account to `SyncScheduler.accountConnected` through
+`AccountManager.liveProviderConnected` (a main-actor task it does not wait for): `connectAccount` after a
+successful connect, `addIMAPAccount` and `addICloudAccount` once the provider they connected is installed,
+and `updatePassword` once the accepted probe is live. The adds and the password update install their own
+connected provider without `connectAccount`, so a hand-off in `connectAccount` alone missed a second IMAP
+account and a re-sign-in by password. The scheduler starts the provider's IDLE when foreground polling is on,
+read from the existing poll timer (set by `startForegroundPolling`, cleared by `stopPolling`). This covers
+the cold launch, the first account, an account added after the last was removed (the timer survives the
+removal, and `startForegroundPolling`'s `guard timer == nil` timer dedup, kept as it is, returns before
+`startImapIdle`), a second account added in the open app, a re-sign-in by password, and the OAuth
+reconnects (which go through `connectAccount`; their providers have no IDLE). `connectAccount` installs its
+provider before it connects and keeps it when the connect fails, and `ensureConnected` later reconnects that
+provider without a hand-off; so `connectAccount` hands off after a failed connect too, unless the sign-in was
+refused (`authFailedAccounts`, which holds both the typed refusal and an IMAP password refusal, recorded by
+the provider's sign-in reporter before it throws) or the account was removed. A cold launch with no network,
+a timeout or a temporary refusal then gets IDLE at once, and IDLE's own launch retry (every 10 s) brings it up
+when the server answers, as it already did for a provider `startImapIdle` found installed but not connected.
+A refused password hands nothing off, so IDLE never retries it; the password update hands off the accepted
+provider. Accepted: a server that wrongly refuses the sign-in at a cold launch and accepts the same password
+later gets IDLE at the next return. A provider that goes live in the background (no timer) starts nothing. A background transition that lands between the timer check and
+the provider's IDLE start can leave that IDLE on until the app is suspended, the same window
+`startImapIdle` has; it is harmless extra work and the next return and background transition put it right. A provider started twice keeps one IDLE connection: `launchIdleConnection` returns
+when its IDLE connection is live, and a second start during a launch replaces that launch, whose
+connection is then logged out as surplus.
+
+Screenshot mode never starts it: its seeded data is the whole content, as RootView's account task and
+`InboxViewModel.performSync` already say. Before, a return inside a screenshot run started it (test-only).
+Demo mode needs no term: `syncStartup` and the poll skip sync while the demo is on. RootView passes the
+unit-test host as screenshot mode too (`ForegroundPollStart.isUnitTestHost`, the `XCTestConfigurationFilePath`
+check, DEBUG only): the tests install their own databases and post account changes that reach the host's
+account list, and the host app must not start real sync, push resubscription or IDLE over them. Every test
+that starts the shared scheduler's polling stops it in its teardown, so a connect's IDLE start cannot reach a
+later test.
+
+Cold-launch cost (no network or database work is added before the first paint): RootView mounts only once the
+inbox is ready to paint, and the start's synchronous part runs on the main actor at that mount (the poll
+timer, the two background-task submits of `ensureBackgroundTasksScheduled`, and the spawn of the start's
+tasks; not measured, the BootProfiler mark "startForegroundPolling CALLED" shows it in a device log). The
+herd's first foreground pass waits for the first paint, so after it a foreground cold launch now runs what
+every return runs, as every cold launch did before v1.6.7: the staged-push merge, stage 1 with its resume
+recovery (in-flight queue work cancelled and re-read from the database, providers marked dirty so an IMAP
+pool reconnects at its next checkout and IDLE relaunches), the poll's first stage 2, the poll timer and
+IDLE. These and the inbox's own read of the folders on screen (`InboxView.onAppear` -> `startSync`, one
+second later) share each account's turn, as on a return. The inbox's folder listing is not a trigger and
+waits in line behind stage 1 (and, when the poll's flag came first, behind the follow-up stage 2 with a
+due full sync); its account change read is a trigger, which flags a busy account, and the flags fold into
+one follow-up stage 2. A pull to refresh in that window waits for the listing, as a pull right after any
+return waits behind the return's work (promise 7: the reads it wants start after it).
+Before the fix the launch ran only the inbox's read (the folders on screen, then each of their accounts'
+change read, `AccountManager.syncFolders` -> `backgroundDeltaSync`); the full sync when due, the older-mail
+catch-up, the poll and IDLE waited for a return. The hand-off adds, per provider that goes live (and per
+connect that failed for now), one main-actor task the install does not wait for, and while the poll timer
+is set two actor hops (the provider lookup and the provider's IDLE start).
+
+Tests: `ForegroundPollStartTests` (a view that mounts in an active scene with an account starts once; the
+first account added in an active scene starts once; a view mounted before the scene is active starts when it
+becomes active; every return starts again; an account added after the last was removed starts again;
+screenshot mode never starts; the unit-test host never starts; the condition's table; RootView starts it only
+through the modifier, and the app's only other caller is Settings). `ForegroundStartEffectTests`, through the
+app's scheduler and the app's own entry points against a fake IMAP server, with no phase change: a cold
+launch (`connectAccount`) starts stage 1, then the poll's pass, installs the timer and starts IDLE for a
+provider connected before the start and for one connected after it; the first account, an account added
+after the last was removed and a second account, each through `addIMAPAccount`; a password update through
+`updatePassword`; no IDLE from a connect while polling is off (before any start, after the app left); a cold
+launch whose first connect and first IDLE launch are refused for now gets IDLE live through IDLE's retry
+with no return, and one whose password is refused
+gets no IDLE start; a provider started twice, while launching and once live, sends IDLE once on one
+connection; IDLE's events on a real IDLE session (EXISTS reads the new message now; VANISHED deletes the row
+it names while another pass holds the account, and its read asks for the follow-up); and a source fence:
+every place in `TabMail/Services/Account` that makes a connected mail provider live calls
+`liveProviderConnected` (the iCloud add, whose server is fixed, is covered by the fence alone). The
+scheduler's `foregroundWorkHook` (DEBUG) records the start's work instead of running it; stage 1 and the
+poll are offered at the entry of `syncStartup` and `poll`, so a record means the start reached them.
+`addIMAPAccount`'s provider takes the factory's TLS test override (nil in production) so the add can reach
+the plain-TCP fake server.
