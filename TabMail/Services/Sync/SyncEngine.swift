@@ -723,13 +723,18 @@ actor SyncEngine {
             return false
         }
 
-        // No recent-sync skip: the two persisted clocks gate the pass. It always
-        // reads changes, and runs the full sync when `lastFullSyncAt` says it is
-        // due or the read needs a listing (step 2). Passes of an account take
-        // turns (`oneSyncAtATime`), so one that follows another only repeats a
-        // change read that finds nothing, and never a full sync the other
-        // recorded. A skip on `lastSyncedAt`, which every change read stamps,
-        // swallowed due full syncs (#1275).
+        // No recent-sync skip, of any length (design settled 2026-11-23, #1278): the
+        // two persisted clocks gate the pass. It always reads changes, and runs
+        // the full sync when `lastFullSyncAt` says it is due or the read needs a
+        // listing (step 2). Passes of an account take turns (`oneSyncAtATime`),
+        // so one that follows another only repeats a change read that finds
+        // nothing, and never a full sync the other recorded. On a return to the
+        // app this pass follows stage 1's quick sync of every folder: that second
+        // read is an accepted cost of one cheap request per account. A skip on
+        // `lastSyncedAt`, which every change read stamps, swallowed due full syncs
+        // (#1275); a guard would risk that again to save almost nothing. Do not
+        // add one. The whole design, and why: the sync design block at the top of
+        // SyncEngineOneSyncAtATime.swift.
 
         defer {
             Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }

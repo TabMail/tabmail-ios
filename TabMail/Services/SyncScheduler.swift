@@ -685,6 +685,17 @@ final class SyncScheduler {
                     fgStep("first-paint gate cleared")
                     BootProfiler.mark("startForegroundPolling: first paint reached — herd starting")
                 }
+                // Stage 1 then stage 2, on purpose (design settled 2026-11-23, #1278).
+                // `syncStartup` starts stage 1, the lean quick sync of every folder of
+                // every account, and returns without waiting for it. `poll()` below
+                // runs stage 2, which repeats the quick sync and runs the full sync
+                // when it is due. The two take each account's turn one after the
+                // other, so the second quick sync usually finds nothing; that one
+                // cheap request per account is accepted. Never add a recent-sync
+                // guard or skip to save it: the 15-second skip swallowed due full
+                // syncs (#1275). Nothing here may wait for stage 1, and stage 2's
+                // time limit starts only when it runs (#1289). Full design and
+                // history: the sync design block in SyncEngineOneSyncAtATime.swift.
                 await syncStartup(inboxOnly: false, drain: .none)
                 fgStep("syncStartup returned")
                 BootProfiler.mark("startForegroundPolling: syncStartup returned (herd spawned)")

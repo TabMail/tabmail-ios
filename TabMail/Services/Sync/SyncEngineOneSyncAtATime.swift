@@ -5,6 +5,73 @@
 import Foundation
 import Synchronization
 
+// MARK: - How an account's syncs start and take turns (design settled 2026-11-23)
+//
+// Read this before you change a sync trigger, the account turn, a sync time limit
+// or the return-to-app path. v1.11.4 changed these together and regressed: due
+// full syncs were swallowed (#1275) and a pass that waited for its turn read
+// nothing (#1289). Keep this design simple. Add no timer, skip, guard, queue or
+// second path. Before v1.11.3 the flow was mostly fine; prefer it to anything new.
+//
+// Two stages:
+// - Stage 1 is the quick sync (`SyncEngine.backgroundDeltaSync`, reached through
+//   `SyncScheduler.syncStartup` / `backgroundPoll`). It reads changes only and
+//   never runs a full sync (10 s limit from `syncStartup`; pull to refresh gives
+//   it stage 2's limit). Push and background refresh read the
+//   inbox only (on IMAP); a return to the app, IMAP IDLE, pull to refresh and
+//   background processing read every folder. It is the lean path the startup,
+//   push and background budgets depend on (iOS memory 042).
+// - Stage 2 is `SyncEngine.sync(account:)`, run for each account by
+//   `SyncScheduler.poll()`: a quick sync, then the full sync when `lastFullSyncAt`
+//   says it is due or the read needs a listing. Only the foreground starts it:
+//   opening the app, the 5-minute poll timer (stopped when the app leaves the
+//   foreground), adding an account and the account screen in Settings. The one
+//   exception is the one-time v1.7.1 epoch rebuild, which runs once per install
+//   on whatever launch comes first. A stage 2 already running when the app leaves
+//   the foreground may finish in the short background grace period.
+//
+// One sync at a time per account (`oneSyncAtATime`, ADR-IOS-104): two passes of
+// one account wrote its sync state, such as the delta cursor, at the same time.
+//
+// The per-account follow-up flag (#1289, #1313, #1314):
+// - A trigger (push, IDLE, pull to refresh, the poll, a return to the app) that
+//   finds the account busy sets the account's flag and returns. It never waits
+//   in line and is never dropped. However many arrive, the account runs ONE
+//   stage 2 when the running work ends, which runs the full sync if it is due.
+//   The flag is cleared when that sync starts.
+// - Only an account that is free takes the quick-sync-only route.
+// - In the background a set flag waits for the next opening of the app: stage 2
+//   never starts in the background. A silent push already schedules background
+//   work, and the next push, poll or opening covers anything else.
+// - The poll does not wait for a busy account either. It sets the flag and goes
+//   straight on to the queued work (actions, outbox, calendar), which never
+//   depended on stage 2: each gesture and a network restore already start that
+//   work on their own, while syncs run.
+//
+// Every time limit counts from when the sync starts running, never from when it
+// was asked for. Stage 2's limit (`SyncConfig.perAccountSyncTimeoutSeconds`)
+// starts when stage 2 takes the account's turn. In v1.11.4 it counted the wait
+// for the turn, so a stage 2 queued behind stage 1 had no time left (#1289).
+//
+// No recent-sync guard, of any length. A return to the app runs stage 1's quick
+// sync and then stage 2's own quick sync. They take turns, so they never collide,
+// and the second usually finds nothing: one cheap request per account. That cost
+// is accepted. The 15-second skip that saved it (added 2026-02) swallowed due
+// full syncs (#1275, deleted in #1308). A guard optimizes a tiny cost at the risk
+// of that failure again (#1278).
+//
+// History (pre-public archive and this repository):
+// - 2026-02-27: the 60 s limit was added while the poll still synced the accounts
+//   one after another; since 2026-03-12 they sync in parallel.
+// - 2026-04-08: one shared stage 1 for a return, push and background work, run
+//   alongside the poll on purpose ("sync never blocks queues"). The return has
+//   read twice since then.
+// - 2026-06-26: on a cold launch, stage 1, the push resubscribe and the poll wait
+//   for the first paint; the staged notification-extension mail merges first. The
+//   cause was measured: the on-device embedding model load starved the merge.
+// - 2026-11-10 (v1.11.4): one sync at a time per account (#575), which made the
+//   wait for a turn count against the caller's limit (#1289).
+
 /// One pass waiting for an account's sync turn.
 struct SyncTurnWaiter {
     let id: UInt64
