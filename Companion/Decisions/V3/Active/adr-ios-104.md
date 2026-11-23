@@ -383,7 +383,7 @@ gets no IDLE start; a password refused at IDLE's sign-in while the app is open g
 retry past 10 s, a return starts IDLE for a working account and skips the refused one, and the password update
 brings its IDLE back, and a teardown (`markDirty`) relaunches nothing for it; IDLE's sign-in refused for now
 twice keeps retrying, 10 s apart, until it is live, and so does a refusal for now of the sign-in repeated inside the
-INBOX select (#1349); a provider started twice, while launching and once live, sends IDLE once on one
+INBOX select, while a refusal of the password there stops IDLE with no retry (#1349); a provider started twice, while launching and once live, sends IDLE once on one
 connection; IDLE's events on a real IDLE session (EXISTS reads the new message now; VANISHED deletes the row
 it names while another pass holds the account, and its read asks for the follow-up); and a source fence:
 every place in `TabMail/Services/Account` that makes a connected mail provider live calls

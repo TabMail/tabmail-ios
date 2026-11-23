@@ -21,8 +21,8 @@ import UIKit
 /// - a password refused while the app is open gets one IDLE sign-in and no retry, a
 ///   return skips that account while a working one keeps IDLE, and the password update
 ///   brings its IDLE back; a refusal for now keeps IDLE's 10 s retry, also when it
-///   refuses the sign-in SwiftMail repeats inside a command on a dropped connection
-///   (#1349);
+///   refuses the sign-in SwiftMail repeats inside a command on a dropped connection,
+///   and a refusal of the password there stops IDLE too (#1349);
 /// - a provider started twice keeps one IDLE connection;
 /// - an IDLE event reads now: EXISTS reads the new message, VANISHED deletes the one it
 ///   names (the event handler `startIdle(for:)` installs);
@@ -492,6 +492,61 @@ struct ForegroundStartEffectTests {
             #expect(!marked, "a refusal for now is not a refused sign-in")
             let starts = world.idleStarts(account)
             #expect(starts == 1, "the retry is IDLE's own, not a new start")
+            await provider.setIdleLaunchPlantRaceTestHookForTesting(nil)
+        }
+    }
+
+    /// The same repeated sign-in, refused for the password: it arrives after IDLE's
+    /// launch claimed its connection, and stops IDLE as a refusal at the first sign-in
+    /// does.
+    @Test("IDLE whose connection drops before its INBOX select, and whose repeated sign-in is refused for the password, stops with no retry")
+    func reconnectRefusedPasswordStopsIdle() async throws {
+        try await withWorld(realIdle: true) { world in
+            let server = world.server
+            func logins() -> Int { server.recordedCommands().filter { $0.hasPrefix("LOGIN") }.count }
+            func idleCommands() -> Int { server.recordedCommands().filter { $0.hasPrefix("IDLE") }.count }
+            let account = try await world.addAccount(connect: true)
+            let installed = await AccountManager.shared.provider(for: account) as? IMAPProvider
+            let provider = try #require(installed, "precondition: the account's provider is installed")
+            // IDLE's first launch: once its sign-in is accepted, the server refuses the
+            // next sign-in for the password and drops the connection before the INBOX
+            // select, so the select reopens it and signs in again.
+            let launches = Mutex(0)
+            await provider.setIdleLaunchPlantRaceTestHookForTesting {
+                let first = launches.withLock { (n: inout Int) -> Bool in n += 1; return n == 1 }
+                guard first else { return }
+                server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials")
+                server.dropLastLoggedInSession()
+                // Long enough for the client to see the connection closed.
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+            let state = ScreenState(accounts: 1)
+            let window = try Self.host(state, start: { world.scheduler.startForegroundPolling() })
+            defer { Self.close(window) }
+            let refused = await eventually(seconds: 5) { server.consumedInjectedFailureCount() == 1 }
+            try #require(refused, "precondition: the repeated sign-in inside the select was refused")
+            await settle()
+            await settle()
+            let slotCleared = await provider.currentIdleServerForTesting() == nil
+            #expect(slotCleared, "the claimed IDLE connection stayed in its slot after the refusal")
+            let loginsAfterRefusal = logins()
+
+            // Past IDLE's 10 s retry: no further sign-in, and IDLE never goes live.
+            try? await Task.sleep(for: .seconds(12))
+            let retried = logins() - loginsAfterRefusal
+            #expect(retried == 0, "IDLE signed in \(retried) more time(s) after the password was refused")
+            let live = idleCommands()
+            #expect(live == 0, "IDLE went live after its repeated sign-in was refused")
+
+            // IDLE is no longer wanted: a teardown (`markDirty`) starts nothing.
+            await provider.markDirty()
+            try? await Task.sleep(for: .seconds(1))
+            let loginsAfterTeardown = logins() - loginsAfterRefusal
+            #expect(loginsAfterTeardown == 0, "a teardown relaunched IDLE after the password was refused")
+            let liveAfterTeardown = idleCommands()
+            #expect(liveAfterTeardown == 0, "a teardown brought IDLE back after the password was refused")
+            let starts = world.idleStarts(account)
+            #expect(starts == 1)
             await provider.setIdleLaunchPlantRaceTestHookForTesting(nil)
         }
     }
