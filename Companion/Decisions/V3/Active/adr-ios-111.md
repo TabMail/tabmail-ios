@@ -755,8 +755,9 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
 4. **Epoch.** A UIDVALIDITY other than the bookmark's (STATUS or SELECT) is
    `.refused(.addressEpochChanged(served))`: the apply clears the bookmark and the re-read list and,
    only against a KNOWN stored epoch that differs, arms `uidValidityResetPendingAt`; the turnover
-   reaction runs after the folder transaction and is re-driven at the next pass start
-   (`redriveArmedTurnovers`). Every read carries `FolderChanges.addressEpoch`; the apply's binding
+   reaction runs after the folder transaction and is re-driven after the next pass's read, within that
+   read's budget (`redriveArmedTurnovers`, amendment 2026-11-22 (#1287) below; *superseded in place:* "is
+   re-driven at the next pass start"). Every read carries `FolderChanges.addressEpoch`; the apply's binding
    check writes nothing (not even the bookmark) when the folder stores another epoch.
 5. **Untracked folders** report a STATUS observation; the engine compares it with the folder row and
    re-lists a changed folder through the shared listing path (`refreshUntrackedFolder`, the former
@@ -1014,6 +1015,8 @@ its own SELECT.
    list (`SyncEngine.uidWalkProgress`). Before the first folder list nothing is published. The wake lock
    reads the folders' walk state and fails closed: an account not polled, or with no folder rows, is not
    done.
+   *Superseded (2026-11-22, #1273):* "Before the first folder list nothing is published." See the amendment
+   of that date below: until the provider's total is known, progress is the database's own.
 
 **Consequences.** A folder whose listing proves nothing keeps its earlier counters and rows and is listed
 again next pass. The engine stays provider-blind. No column, no migration (`listingDue` lives in
@@ -1216,6 +1219,107 @@ before); a progress-only bookmark write fails a concurrent crawl range or load-o
 Keywords: IMAPChangeMode, CHANGEDSINCE, flagsChangedSince, messageCount, provenFrom, pendingCheck,
 IMAPRemovalCheckProgress, imapChangeRemovalCheckWindow, numericIdsBelow, IMAPChangeCountMismatch, mustList,
 heldRowsProof, arrivalRowsProof, fromServerInsertAllowed, ChangeInsertPremise, stagedRowProvenGone, heldSyncTurn, #755.
+
+### Amendment 2026-11-22 (#1273): backfill progress before the provider's total is known
+
+**Context.** Item 9 of the #755 amendment published no backfill progress while `progressTotal` answered
+`.notKnownYet`. IMAP knows its total only after `fetchFolders` ran in this process, Outlook only after a full
+sync's `fetchFullSyncFolders`; the routine passes are change reads, which never adopt a folder-list total. So after a launch
+an IMAP (iCloud included) or Outlook account's Fast Sync card read "Waiting..." for a long time, also when its
+walk was complete. 1.11.4 always published progress from the database.
+
+**Decision.** `SyncEngine.updateBackfillProgressForAccount` publishes while the total is not known yet. A
+`.notKnownYet` answer adds no UID scope (`uidTotal` 0) and no server total, so the published progress is the
+database's own: messages stored (`totalEmails`), settled (`ftsIndexed`), still owed a body
+(`pendingBodyCount`) and the walk's state (`headersDone`), hence the completed state ("N messages indexed")
+once every folder's walk is done and no body is owed. Once the provider's total is known it sharpens the
+denominator exactly as before (IMAP's UID scope from the folder list, Outlook's folder-list sum while
+crawling). A provider not registered yet still publishes nothing.
+
+**What stays.** Progress never reads the stored folder counters (`totalCount`, `lastKnownUidNext`), which
+only a proven listing writes; an unproven count is never shown as a denominator. Completion still gates on
+`pendingBodyCount` (PROJECT_MEMORY "Backfill / Fast Sync Completion").
+
+**Consequences.** Before a folder list the card's bar is "settled of stored", which can read near 100% while
+the walk still runs; it shows no check mark until the walk is done. For an account still crawling, the bar
+can drop once the provider's total arrives (IMAP switches to UIDs walked; Outlook's denominator becomes the
+folder-list sum). No column, no migration.
+
+Keywords: progressTotal, notKnownYet, updateBackfillProgressForAccount, Fast Sync Waiting, FastSyncAccountCard,
+BackfillProgress, #1273.
+
+### Amendment 2026-11-22 (#1287): the turnover re-drive runs after the read, inside the read's budget
+
+**Context.** Since #974 every change pass re-drove every armed folder of the account
+(`uidValidityResetPendingAt` set) before it read, one reaction after another, inside the account's sync turn and
+with no time limit of its own. A reaction is not short: the write barrier, the purges, a disconnect, a fresh
+login for the epoch observation, and the folder's resync listing (step 6, re-entrant in the same turn). When a
+reaction could not finish (its barrier gave up while an action drain ran, or the caller's timeout cancelled it),
+its flag stayed set and the next pass paid the same cost again. Until every armed folder's reaction completed,
+the account's change reads either timed out (10 s per-account pass, 60 s foreground pass) or started with no
+budget left and read nothing. On a 1.11.5 test build, an IMAP account read changes in 3 of 16 per-account passes
+for the first five minutes after the update (folders armed long before, #1277) and in 30 of 31 after the last
+re-drive. Gmail and Outlook accounts were unaffected.
+
+**Decision.** `SyncEngine.performChangePass` builds its request first (`makeChangeRequest`, the snapshot taken
+at the start of the turn). The request samples the end of the pass's read budget once, after its folder snapshot
+and before the first request (`changeReadEnd(turnStart:callerDeadline:)` on `changeReadClock`, in the request's
+`ChangeContext`). The pass reads and applies with that request (`readAndApplyChanges(account:provider:request:
+deadline:pass:)`), then calls `redriveArmedTurnovers(accountId:until:)` with the same end. The end belongs to
+the attempt: a pass that retries its read after a connection error (the foreground and per-account passes) builds
+a new request for the retry, and its first attempt, which threw, re-drove nothing. The end is a start
+cutoff: a reaction starts only before it; the armed folders not reached stay armed for a later pass. A pass that
+throws before the re-drive skips it: a failed request snapshot, a cancelled pass, a database failure, or a read in
+which every folder the pass read failed (the apply then throws; the IMAP reader itself records a lost or refused
+connection per folder and does not throw). A reaction already running at the end runs on until it completes or
+its pass is cancelled by the caller's timeout. A reaction that stops before it stamps the new epoch (step 5)
+leaves the flag set, and a later re-drive retries it (unchanged). One that stops after the stamp, during its resync
+listing (step 6), leaves the folder unarmed under its new epoch with its old rows purged (and none of the new ones
+yet, unless the listing committed some before it stopped); a later listing fills it
+(the change pass's listing of an untracked folder it reads and finds changed, the full sync for a syncable folder,
+opening the folder, or the catch-up crawl, since the purge reset `backfillComplete`). A pass cancelled before the
+end may still start the next folder's reaction; that reaction's first database read fails (a cancelled task's
+read throws), so it starts no purge. The full sync's re-drive (after its listing) and the apply's reaction for a
+folder its own read found renumbered are unchanged. The second runs inside the read: after the apply's folder
+transactions and before the untracked folders' listings, so in a pass that also has a changed untracked folder
+that listing waits for the reaction, as before. A folder that reaction left armed is retried by the same pass's
+re-drive while the budget lasts.
+
+**Why this placement and not a reaction outside the turn.** The apply already tolerates a reaction running
+outside the turn (its in-transaction armed check and binding epoch check), and the trigger handler spawns one
+that way. But every reaction disconnects the provider's sessions (step 5's connection hygiene), and a re-drive
+running beside the change read would cut that read's session once per armed folder. Inside the turn, after the
+read, a re-drive never cuts a change read of its own account. This covers the re-drive's own loop. A re-check that
+a reaction spawns when it ends (`releaseUidValidityReaction`) and the trigger handler's reaction run in tasks of
+their own: they can do their work before the listing beside a change read, as before, and their listing waits for
+the turn. A pass waiting for the turn behind a re-drive waits
+for the rest of the holder's turn: its read budget, the one reaction running at the budget's end, and whatever
+the holder does after its change pass (a foreground pass's full sync and catch-up start). That reaction is
+bounded by its caller's timeout (10 s per-account pass, 60 s foreground pass) and then by how long its cancelled
+work takes to unwind; a caller that sets no timeout does not bound it. The waiting pass follows a pass that has
+just read the account's changes. Whether a signal that arrives during the holder's turn is read when the turn
+frees is #1289's (a waiting pass's deadline, and a follow-up pass), not this amendment's.
+
+**Liveness (count the predicates, Memory 114).** An armed folder is re-driven by: this re-drive (every armed folder
+of the account, of any role, with a path, on every pass that reaches it, inbox-only passes included, while the
+budget lasts); the full sync after its listing (armed folders of the primary or secondary roles or favourites,
+with a path, excluding `skippablePaths` and the folders the pass tracks); the apply's reaction (a folder the pass's
+own read found renumbered); `syncFolderMessages` for the folder it is asked to list (opening any folder); and the
+trigger handler (a folder a read or listing finds renumbered). None is unconditional. Before this amendment the
+re-drive also ran on passes whose read then threw or used its whole budget. A folder now waits through such
+passes, and a later armed folder also waits while an earlier one's reaction uses the rest of each pass's budget.
+A custom folder that is not a favourite, which no scheduled listing selects, then waits until the user opens it,
+the on-demand path such folders always had. Accepted: the read comes first.
+
+**Consequences.** A pass's change read is never delayed by its own re-drive; a pass waiting for the turn can be,
+by the one reaction running at the holder's budget end (above). Re-driving N armed folders spreads over as many
+passes as their reactions need; each completed reaction is permanent. The turnover's new numbering is listed after
+the read instead of before it, so its arrivals show one step later in the same pass when that listing completes.
+No new setting, column or migration; nothing is added before the change read (the armed-folder query that ran
+before it now runs after it).
+
+Keywords: redriveArmedTurnovers, changeReadEnd, runUidValidityResetReaction, uidValidityResetPendingAt, write
+barrier exhausted, turnover re-drive, change read starved, #1287, #974, #1277.
 
 ### Amendment 2026-11-22 (#1109): a folder a user action lands in is followed
 

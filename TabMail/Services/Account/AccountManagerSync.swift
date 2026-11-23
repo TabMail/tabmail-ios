@@ -49,17 +49,33 @@ extension AccountManager {
         // with the inner emission in backgroundDeltaSync.
         let accountId = account.id
         await MainActor.run { AccountManagerState.shared.setSyncPhase(.checking, forAccount: accountId) }
+        // A skipped pass does not clear the phase: a sync pass that holds the
+        // turn clears it when it ends, and the follow-up the flag asks for clears
+        // it after its own read. Until then this pass's "Checking" shows over the
+        // running work's phase (#1330).
+        var skipped = false
         defer {
-            Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
+            if !skipped {
+                Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
+            }
         }
         do {
             // The pass is told the timeout's own deadline, so it reads only what it
             // can apply before the timeout gives up on it (ADR-IOS-104).
             let deadline = Date().addingTimeInterval(SyncConfig.backgroundPerAccountTimeoutSeconds)
-            let (changed, reason) = try await withTimeout(seconds: SyncConfig.backgroundPerAccountTimeoutSeconds) {
+            let read = try await withTimeout(seconds: SyncConfig.backgroundPerAccountTimeoutSeconds) {
                 try await self.ensureConnected(account)
                 return try await self.syncEngine.backgroundDeltaSync(account: account, inboxOnly: inboxOnly, deadline: deadline)
             }
+            // Another pass of the account runs: the account's follow-up flag is
+            // set, and one stage 2 follows when that pass ends (the sync design
+            // block in SyncEngineOneSyncAtATime.swift; #1289).
+            guard let read else {
+                skipped = true
+                BackgroundSyncLogger.logDebug("bgSync: BUSY \(account.emailAddress): another pass runs, follow-up wanted")
+                return SyncResult(hadChanges: false, failed: false, skipped: true)
+            }
+            let (changed, reason) = read
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             BackgroundSyncLogger.log("bgSync: END \(account.emailAddress): \(elapsed)ms, changes=\(changed), reason=\(reason)")
             return SyncResult(hadChanges: changed, failed: false)
@@ -89,11 +105,17 @@ extension AccountManager {
         /// for a non-temporary reason (`InboxErrorBanner.countsAsFailure`). A run
         /// that could not load its accounts counts too: it proved nothing.
         let countedFailure: Bool
+        /// For one account: another pass of it was running, so this one read
+        /// nothing and set its follow-up flag. For a run: some account was skipped,
+        /// so the run is not a success for every account (it never clears the
+        /// inbox banner).
+        let skipped: Bool
 
-        init(hadChanges: Bool, failed: Bool, countedFailure: Bool = false) {
+        init(hadChanges: Bool, failed: Bool, countedFailure: Bool = false, skipped: Bool = false) {
             self.hadChanges = hadChanges
             self.failed = failed
             self.countedFailure = countedFailure
+            self.skipped = skipped
         }
 
         /// A failed account's result, counted for the banner by the one rule.
@@ -107,24 +129,58 @@ extension AccountManager {
     /// Foreground sync for one account: ensure connection → full sync (delta + periodic full).
     /// Self-contained — safe to launch in parallel for multiple accounts.
     /// Sync phases are published automatically by ensureConnected() and SyncEngine.
-    func foregroundSyncOne(_ account: Account) async -> SyncResult {
+    /// `followUp`: set for the account's follow-up stage 2 (`followUpRun`),
+    /// which waits for its turn instead of setting the flag; it is the
+    /// scheduler's stage 2 gate, checked again at the turn
+    /// (`SyncEngine.followUpPass`).
+    func foregroundSyncOne(
+        _ account: Account, followUp mayStart: (@MainActor @Sendable () -> Bool)? = nil
+    ) async -> SyncResult {
         // Emit .checking BEFORE ensureConnected so the subtitle flips immediately
         // rather than waiting on IMAP TLS/login. Idempotent with the inner
         // emission in SyncEngine.sync().
         let accountId = account.id
         await MainActor.run { AccountManagerState.shared.setSyncPhase(.checking, forAccount: accountId) }
+        // A pass skipped for a busy account does not clear the phase: a sync pass
+        // that holds the turn clears it when it ends, and the follow-up the flag
+        // asks for clears it after its own read. Until then this pass's
+        // "Checking" shows over the running work's phase (#1330).
+        var leavesPhase = false
         defer {
-            Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
+            if !leavesPhase {
+                Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
+            }
         }
         do {
             try await ensureConnected(account)
             // Foreground inbox catch-up. Its writes run at `.normal` via
             // `SyncEngine.dbPool` = `AppDatabase.syncPool` — beats deep backfill in the
             // write scheduler but yields to the merge / a live user action.
-            // The pass is told the timeout's own deadline (ADR-IOS-104).
-            let deadline = Date().addingTimeInterval(SyncConfig.perAccountSyncTimeoutSeconds)
-            let changed = try await withTimeout(seconds: SyncConfig.perAccountSyncTimeoutSeconds) {
-                try await self.syncEngine.sync(account: account, deadline: deadline)
+            let ran: Bool?
+            if let mayStart {
+                // Waits for its turn and takes its change read's deadline there;
+                // nil when an earlier stage 2 served the flag, or when a stage 2
+                // may not start any more (`SyncEngine.followUpPass`).
+                ran = try await syncEngine.followUpPass(accountId: accountId, mayStart: mayStart)
+            } else {
+                // The pass is told the timeout's own deadline (ADR-IOS-104). It never
+                // waits for another pass's turn (`syncOrFollowUp`).
+                let deadline = Date().addingTimeInterval(SyncConfig.perAccountSyncTimeoutSeconds)
+                ran = try await withTimeout(seconds: SyncConfig.perAccountSyncTimeoutSeconds) {
+                    try await self.syncEngine.syncOrFollowUp(account: account, deadline: deadline)
+                }
+            }
+            guard let changed = ran else {
+                if mayStart != nil {
+                    BackgroundSyncLogger.logDebug("[SyncFollowUp] \(account.emailAddress): no stage 2 (served, or not now)")
+                } else {
+                    // Another pass of the account runs: its follow-up flag is set, and
+                    // one stage 2 follows when that pass ends (the sync design block in
+                    // SyncEngineOneSyncAtATime.swift; #1289).
+                    leavesPhase = true
+                    BackgroundSyncLogger.logDebug("[SyncScheduler] Busy \(account.emailAddress): another pass runs, follow-up wanted")
+                }
+                return SyncResult(hadChanges: false, failed: false, skipped: true)
             }
             return SyncResult(hadChanges: changed, failed: false)
         } catch let error as TimeoutError {
@@ -189,7 +245,8 @@ extension AccountManager {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             let summary = results.map { "\($0.0)=\($0.1)" }.joined(separator: ", ")
             BackgroundSyncLogger.log("\(label) END in \(elapsed)ms: [\(summary)]")
-            return SyncResult(hadChanges: hadChanges, failed: false, countedFailure: countedFailure)
+            return SyncResult(hadChanges: hadChanges, failed: false, countedFailure: countedFailure,
+                              skipped: accountResults.contains { $0.skipped })
         }
     }
 
@@ -238,7 +295,8 @@ extension AccountManager {
                 if !result.failed { allFailed = false }
             }
             return SyncResult(hadChanges: hadChanges, failed: allFailed,
-                              countedFailure: accountResults.contains { $0.countedFailure })
+                              countedFailure: accountResults.contains { $0.countedFailure },
+                              skipped: accountResults.contains { $0.skipped })
         }
     }
 
@@ -250,20 +308,27 @@ extension AccountManager {
     // runs never raise the inbox banner; only a full run with no counted failure
     // clears it (the rule is stated once, on `finishSyncRun`).
 
-    /// The foreground poll's header sync: every active account (a full run).
+    /// The foreground poll's header sync: every active account (a full run, or a
+    /// partial one when an account was busy and skipped: its follow-up reports
+    /// for it). A run with a skipped account does not advance "Updated": that
+    /// account read nothing yet, and its follow-up advances it when its read
+    /// completes.
     func foregroundPollRun() async -> SyncResult {
         let result = await foregroundSyncAll()
         await MainActor.run {
             let state = AccountManagerState.shared
             state.lastSyncFailed = result.failed
-            state.finishSyncRun(coverage: .full, countedFailure: result.countedFailure,
-                                completed: !result.failed)
+            state.finishSyncRun(coverage: result.skipped ? .partial : .full,
+                                countedFailure: result.countedFailure,
+                                completed: !result.failed && !result.skipped)
         }
         return result
     }
 
     /// The background poll's delta sync: every active account (a full run), or the
-    /// one account a push named (a partial run).
+    /// one account a push named (a partial run). A run with a busy account that
+    /// was skipped is partial too, and does not advance "Updated" (as
+    /// `foregroundPollRun`).
     func backgroundPollRun(accountEmail: String?, inboxOnly: Bool) async -> SyncResult {
         let result: SyncResult
         if let accountEmail {
@@ -274,8 +339,26 @@ extension AccountManager {
         await MainActor.run {
             let state = AccountManagerState.shared
             state.lastSyncFailed = false
-            state.finishSyncRun(coverage: accountEmail == nil ? .full : .partial,
-                                countedFailure: result.countedFailure, completed: true)
+            state.finishSyncRun(coverage: accountEmail == nil && !result.skipped ? .full : .partial,
+                                countedFailure: result.countedFailure, completed: !result.skipped)
+        }
+        return result
+    }
+
+    /// The follow-up stage 2 of one account (`SyncScheduler.runSyncFollowUp`;
+    /// `SyncEngine.followUpPass`): it waits for the account's turn and reports
+    /// its own result, as a partial run. Nil when an earlier stage 2 already
+    /// served the flag, or when `mayStart` (the scheduler's stage 2 gate,
+    /// checked again at the turn) no longer allows it: nothing ran, so nothing
+    /// is reported, and a second ask for one flag does no work before its wait
+    /// either.
+    func followUpRun(_ account: Account, mayStart: @escaping @MainActor @Sendable () -> Bool) async -> SyncResult? {
+        guard await syncEngine.followUpWanted(accountId: account.id) else { return nil }
+        let result = await foregroundSyncOne(account, followUp: mayStart)
+        guard !result.skipped else { return nil }
+        await MainActor.run {
+            AccountManagerState.shared.finishSyncRun(
+                coverage: .partial, countedFailure: result.countedFailure, completed: !result.failed)
         }
         return result
     }
@@ -286,7 +369,7 @@ extension AccountManager {
     /// Prefer `backgroundSyncOne` or `backgroundSyncAll` for new code.
     @discardableResult
     func backgroundDeltaSyncAccount(_ account: Account) async throws -> Bool {
-        return try await syncEngine.backgroundDeltaSync(account: account).changed
+        return try await syncEngine.backgroundDeltaSync(account: account)?.changed ?? false
     }
 
     @discardableResult

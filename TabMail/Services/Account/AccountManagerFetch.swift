@@ -427,7 +427,11 @@ extension AccountManager {
     /// `SyncEngine.followFolders`), and after its account's listings and change
     /// read a catch-up run reconciles the whole of those folders
     /// (`SyncEngine.startAccessCatchUp`), which this call does not wait for.
-    func syncFolders(_ folders: [Folder], connecting accounts: [Account]) async throws {
+    /// Returns whether a change read found its account busy (its follow-up flag
+    /// set instead): the pull did not read that account, so its run is not a
+    /// success for every account (it never clears the inbox banner).
+    @discardableResult
+    func syncFolders(_ folders: [Folder], connecting accounts: [Account]) async throws -> Bool {
         let grouped = Dictionary(grouping: folders) { $0.accountId }
         let affectedAccountIds = Array(grouped.keys)
         let accountsById = Dictionary(accounts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -439,7 +443,7 @@ extension AccountManager {
                 }
             }
         }
-        try await withThrowingTaskGroup(of: Void.self) { group in
+        return try await withThrowingTaskGroup(of: Bool.self) { group in
             for (accountId, accountFolders) in grouped {
                 let connected = providers[accountId]
                 let account = accountsById[accountId]
@@ -464,7 +468,7 @@ extension AccountManager {
                         provider = await self.provider(accountId: accountId)
                     }
                     // Removed while connecting (or connected with no mail provider): nothing to sync.
-                    guard let provider else { return }
+                    guard let provider else { return false }
                     // Pool creates connections on demand via checkout — no explicit connect needed.
                     for folder in accountFolders where !folder.path.isEmpty {
                         // Every listing goes through the one classifier (#755): an
@@ -491,29 +495,49 @@ extension AccountManager {
                     // the background sync runs, so a change made elsewhere to older mail
                     // or to a folder not on screen shows with this pull. Its deadline is
                     // taken here, once, and bounds it as a timeout too, as for the
-                    // background and foreground passes (a wait behind a running pass of
-                    // the same account counts). The pass reports a failed read in its
+                    // background and foreground passes. The read never waits for its
+                    // turn: when another pass of the account runs, it sets the
+                    // account's follow-up flag and reads nothing, and one stage 2
+                    // follows when that pass ends (the sync design block in
+                    // SyncEngineOneSyncAtATime.swift; #1289). So it never counts a
+                    // wait for another pass's turn. The pass reports a failed read in its
                     // result (the refresh still succeeds, as in the background); a
                     // timeout or what it rethrows (a database error, a failed retry
                     // after a connection error) fails the refresh.
-                    if let account {
-                        let timeout = SyncConfig.perAccountSyncTimeoutSeconds
-                        let deadline = Date().addingTimeInterval(timeout)
-                        let (changed, reason) = try await withTimeout(seconds: timeout) {
-                            try await syncEngine.backgroundDeltaSync(account: account, deadline: deadline)
-                        }
-                        if DebugModeManager.isLoggingEnabled() {
-                            BackgroundSyncLogger.logDebug("[SyncFolders] change read for account \(accountId.prefix(6)): changed=\(changed) reason=\(reason)")
-                        }
+                    guard let account else { return false }
+                    let timeout = SyncConfig.perAccountSyncTimeoutSeconds
+                    let deadline = Date().addingTimeInterval(timeout)
+                    let read = try await withTimeout(seconds: timeout) {
+                        try await syncEngine.backgroundDeltaSync(account: account, deadline: deadline)
                     }
                     // Then the whole of each folder is reconciled (#1109): a catch-up
                     // run for these folders, started after the change read so a
                     // folder the reader has just baselined is one the catch-up may
-                    // list. The refresh does not wait for it.
+                    // list. The refresh does not wait for it. When the read found
+                    // the account busy, the run starts all the same: it waits in
+                    // line like the follow-up, lists an untracked folder by its
+                    // access rule, and a tracked one's changes come through the
+                    // follow-up's read.
                     await syncEngine.startAccessCatchUp(accountId: accountId, folderIds: accessed)
+                    if DebugModeManager.isLoggingEnabled() {
+                        let outcome = read.map { "changed=\($0.changed) reason=\($0.reason)" } ?? "busy, follow-up wanted"
+                        BackgroundSyncLogger.logDebug("[SyncFolders] change read for account \(accountId.prefix(6)): \(outcome)")
+                    }
+                    return read == nil
                 }
             }
-            try await group.waitForAll()
+            // Every account runs to the end; the first error is rethrown after
+            // all of them (#689), as `waitForAll` does.
+            var busy = false
+            var firstError: (any Error)?
+            while let result = await group.nextResult() {
+                switch result {
+                case .success(let skipped): busy = busy || skipped
+                case .failure(let error): if firstError == nil { firstError = error }
+                }
+            }
+            if let firstError { throw firstError }
+            return busy
         }
     }
 }

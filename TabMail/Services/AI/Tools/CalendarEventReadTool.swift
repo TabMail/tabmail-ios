@@ -107,7 +107,10 @@ struct CalendarEventReadTool: AgentTool, Sendable {
         }
 
         if matches.isEmpty {
-            return "No entries matched."
+            if result.unread.isEmpty { return "No entries matched." }
+            return CalendarToolHelpers.withUnreadNote(
+                "No entries matched in the calendars that could be read.", unread: result.unread
+            )
         }
 
         Task { await CalendarToolHelpers.cacheEventDetailsForPills(matches, calendarNames: result.calendarNames, translator: ctx.translator) }
@@ -123,7 +126,7 @@ struct CalendarEventReadTool: AgentTool, Sendable {
             )
         }
         BackgroundSyncLogger.logDebug("[CalendarEventReadTool] \(matches.count) matches for start_iso=\(startIso)")
-        return results.joined(separator: "\n-----\n")
+        return CalendarToolHelpers.withUnreadNote(results.joined(separator: "\n-----\n"), unread: result.unread)
     }
 
     /// Direct lookup: resolve account + calendar from compound ID or cache, then getEvent.
@@ -195,8 +198,10 @@ struct CalendarEventReadTool: AgentTool, Sendable {
             }
         }
 
-        // Fallback: scan all accounts/calendars
+        // Fallback: scan all accounts/calendars. An account whose calendars could not be
+        // listed is named in the reply, never taken as one without the event (#1293).
         let backends = await CalendarProviderDispatch.resolveAll()
+        var unread: [String] = []
         for backend in backends {
             let accId = backend.account.id
             if accId == accountId { continue } // Already tried above
@@ -235,9 +240,15 @@ struct CalendarEventReadTool: AgentTool, Sendable {
                 }
             } catch {
                 BackgroundSyncLogger.logDebug("[CalendarEventReadTool] listCalendars failed for account \(accId): \(error)")
+                unread.append(CalendarToolHelpers.unreadAccountLabel(backend.account.emailAddress))
             }
         }
 
-        return #"{"error": "Event not found in any calendar."}"#
+        if unread.isEmpty {
+            return #"{"error": "Event not found in any calendar."}"#
+        }
+        return ToolJSON.string(from: [
+            "error": CalendarToolHelpers.withUnreadNote("Event not found in the calendars that could be read.", unread: unread.sorted())
+        ])
     }
 }

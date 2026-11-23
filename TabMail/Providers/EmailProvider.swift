@@ -361,7 +361,9 @@ enum ProgressTotal: Sendable, Equatable {
     /// profile read fails; providers without one).
     case none
     /// The provider has a total, but not before this launch's first folder list:
-    /// progress publishes nothing (the bar stays hidden) until it has.
+    /// until it has, progress is the database's own (stored and settled
+    /// messages, the walk's completed state), with no UID scope and no server
+    /// total (#1273).
     case notKnownYet
     /// The account's message total (Gmail: the profile's; Exchange: the sum of
     /// `totalItemCount` over its last complete folder list).

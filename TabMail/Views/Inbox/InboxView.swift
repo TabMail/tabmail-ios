@@ -1846,7 +1846,7 @@ struct InboxView: View {
     private var moveSheetContent: some View {
         if let group = moveThreadGroup, let rep = viewModel.lookupMessage(group.representative.id) {
             MoveFolderPicker(accountId: rep.accountId, currentFolderPath: rep.folderPath) { destinationPath in
-                performThreadMove(group, to: destinationPath)
+                performThreadMove(group, to: destinationPath, accountId: rep.accountId)
             }
         } else if let id = moveMessageId, let message = viewModel.lookupMessage(id) {
             MoveFolderPicker(accountId: message.accountId, currentFolderPath: message.folderPath) { destinationPath in
@@ -1881,14 +1881,16 @@ struct InboxView: View {
         viewModel.endInteraction()
     }
 
-    /// Move every member of a collapsed thread to `destinationPath` as one grouped
-    /// action (single undo entry). Dismisses all member rows together.
-    private func performThreadMove(_ group: ThreadGroup, to destinationPath: String) {
+    /// Move every member of a collapsed thread to `destinationPath` of `accountId`
+    /// (the account whose folders the picker listed) as one grouped action (single
+    /// undo entry). Dismisses all member rows together; `moveThread` reports a
+    /// member of another account as skipped, and it reappears.
+    private func performThreadMove(_ group: ThreadGroup, to destinationPath: String, accountId: String) {
         let allIds = group.members.map(\.id)
         viewModel.beginInteraction()
         // Same guard as `performSingleMove`. Asked once for the representative because
-        // `moveThread` itself derives ONE `destFolderId` from the first resolved
-        // member's account — the members of a thread move share a destination folder.
+        // `moveThread` derives ONE `destFolderId` from the picker's account — the
+        // members of a thread move share a destination folder.
         if !viewModel.moveDestinationIsDisplayed(
             group.representative.id, toFolderPath: destinationPath) {
             withAnimation(.easeIn(duration: 0.25)) {
@@ -1898,7 +1900,7 @@ struct InboxView: View {
         // moveThread reports back any ids it did NOT act on — un-hide exactly
         // those; they were never queued, so they'd otherwise vanish forever
         // with no undo entry.
-        let skipped = viewModel.moveThread(allIds, toFolderPath: destinationPath)
+        let skipped = viewModel.moveThread(allIds, toFolderPath: destinationPath, accountId: accountId)
         if !skipped.isEmpty {
             withAnimation(.easeOut(duration: 0.35)) {
                 dismissedMessages.subtract(skipped)

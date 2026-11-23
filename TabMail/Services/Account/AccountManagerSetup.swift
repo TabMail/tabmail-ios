@@ -188,8 +188,10 @@ extension AccountManager {
         try await connectAccount(account)
 
         // Kick off initial sync in background so the UI dismisses immediately.
-        // If RootView.foregroundSyncAll fires meanwhile, its pass waits its turn
-        // (`SyncEngine.oneSyncAtATime`); the two never run at once.
+        // The two never run at once (`SyncEngine.oneSyncAtATime`). This initial
+        // sync waits for its turn; a poll that finds the account busy sets its
+        // follow-up flag instead (the sync design block in
+        // SyncEngineOneSyncAtATime.swift).
         let engine = syncEngine
         Task {
             do {

@@ -8,6 +8,21 @@ import Synchronization
 import SwiftMail
 @testable import TabMail
 
+/// Where `markDirty()` lands for
+/// `IMAPProviderPoolInvariantTests.markDirtyKeepsWantedIdleMonitoringLive`.
+/// At file scope: a `@Test` argument list cannot name a member of the suite it
+/// is attached to.
+enum MarkDirtyIdleWindow: String, CaseIterable, Sendable {
+    /// IDLE is on the wire on a tracked connection (a Wi-Fi / cellular switch
+    /// in the foreground).
+    case liveSession
+    /// `startIdle()`'s launch is still connecting, before its claim (the return
+    /// to the app: the resume marks every provider dirty while IDLE starts).
+    case launchConnecting
+    /// IDLE was stopped (the app left the screen) before `markDirty()`.
+    case stopped
+}
+
 /// T0.6(a) — the IMAP connection pool's INVARIANT CONTRACT, stage (a).
 ///
 /// Every case here drives the REAL `IMAPProvider` actor against a real
@@ -2371,6 +2386,117 @@ struct IMAPProviderPoolInvariantTests {
 
         provider.setLogoutAttemptTestHookForTesting(nil)
         await provider.stopIdle()
+    }
+
+    /// **The property.** `markDirty()` never turns IDLE monitoring off: while
+    /// IDLE is wanted, the teardown is followed by IDLE on a new, listened-to
+    /// connection with no further `startIdle()`, whether it ends a live
+    /// session or a launch still connecting; every connection it ends is
+    /// logged out exactly once. And it never starts IDLE that `stopIdle()`
+    /// turned off.
+    ///
+    /// **Red evidence.** On the code before #1288 (`tearDownIdleConnection`
+    /// with no relaunch) the `liveSession` and `launchConnecting` cases fail:
+    /// no successor connection is ever tracked and no second IDLE reaches the
+    /// wire, which is what the 1.11.5 device logs showed after most returns to
+    /// the app.
+    @Test("markDirty() keeps wanted IDLE monitoring live on a new connection and never starts stopped IDLE",
+          arguments: MarkDirtyIdleWindow.allCases)
+    func markDirtyKeepsWantedIdleMonitoringLive(window: MarkDirtyIdleWindow) async throws {
+        let server = FakeIMAPServer(
+            username: Self.uniqueUsername(),
+            mailboxes: ["INBOX": [Self.message(uid: 101, id: "idle-mark-dirty-\(window.rawValue)@example.com")]]
+        )
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(for: server)
+        defer { awaitDisconnect(provider) }
+
+        let logoutAttempts = Mutex<[ObjectIdentifier: Int]>([:])
+        provider.setLogoutAttemptTestHookForTesting { instance in
+            logoutAttempts.withLock { $0[ObjectIdentifier(instance), default: 0] += 1 }
+        }
+        let idleCommands = { server.recordedCommands().filter { $0.hasPrefix("IDLE") }.count }
+
+        var ended: IMAPServer?
+        switch window {
+        case .liveSession, .stopped:
+            await provider.startIdle { _, _ in }
+            let idling = await waitUntil { idleCommands() == 1 }
+            #expect(idling, "setup: the IDLE command never reached the wire")
+            guard idling, let live = await provider.currentIdleServerForTesting() else {
+                await provider.stopIdle()
+                return
+            }
+            ended = live
+            if window == .stopped { await provider.stopIdle() }
+            // THE EVENT.
+            await provider.markDirty()
+        case .launchConnecting:
+            // The first launch's connection (created before its pre-claim
+            // window), so the case can require a DIFFERENT connection after.
+            let firstLaunch = Mutex<IMAPServer?>(nil)
+            provider.setServerCreatedTestHookForTesting { created, site in
+                guard site == "idleLaunch" else { return }
+                firstLaunch.withLock { if $0 == nil { $0 = created } }
+            }
+            let entries = Mutex(0)
+            let markedInWindow = Mutex(false)
+            await provider.setIdleLaunchPlantRaceTestHookForTesting { [provider] in
+                let first = entries.withLock { (n: inout Int) -> Bool in n += 1; return n == 1 }
+                // THE EVENT, inside the first launch's pre-claim window; the
+                // successor's own launch passes straight through.
+                if first {
+                    await provider.markDirty()
+                    markedInWindow.withLock { $0 = true }
+                }
+            }
+            await provider.startIdle { _, _ in }
+            let reached = await waitUntil { markedInWindow.withLock { $0 } }
+            #expect(reached, "setup: markDirty() never ran inside the first launch's pre-claim window")
+            ended = firstLaunch.withLock { $0 }
+            let captured = ended != nil
+            #expect(captured, "setup: the first IDLE launch's connection was never created")
+            guard reached, captured else {
+                provider.setServerCreatedTestHookForTesting(nil)
+                await provider.setIdleLaunchPlantRaceTestHookForTesting(nil)
+                await provider.stopIdle()
+                return
+            }
+        }
+
+        if window == .stopped {
+            // Give a wrongly started launch time to reach the wire.
+            try? await Task.sleep(for: .seconds(1))
+            let tracked = await provider.currentIdleServerForTesting() != nil
+            #expect(!tracked, "markDirty() started IDLE that stopIdle() had turned off")
+            #expect(idleCommands() == 1, "markDirty() started IDLE that stopIdle() had turned off: \(idleCommands()) IDLE commands")
+        } else {
+            // THE INVARIANT: IDLE runs again on a new connection, with no
+            // further startIdle(). An IDLE command on the wire is sent by the
+            // listener of the connection that holds the slot.
+            let expectedIdle = window == .liveSession ? 2 : 1
+            let resumed = await waitUntilAsync(timeoutSeconds: 10) {
+                guard let current = await provider.currentIdleServerForTesting() else { return false }
+                return current !== ended && idleCommands() >= expectedIdle
+            }
+            let tracked = await provider.currentIdleServerForTesting() != nil
+            #expect(resumed, "IDLE stayed off after markDirty() while it was wanted (\(window.rawValue)): \(idleCommands()) IDLE command(s), tracked=\(tracked)")
+        }
+        await provider.setIdleLaunchPlantRaceTestHookForTesting(nil)
+        provider.setServerCreatedTestHookForTesting(nil)
+
+        // Every connection markDirty() ended (the live session, or the
+        // cancelled launch's surplus connection) is logged out exactly once.
+        await provider.stopIdle()
+        let allClosed = await waitUntil { server.liveSessionCount() == 0 }
+        #expect(allClosed, "a connection was never logged out: \(server.liveSessionCount()) session(s) still logged in")
+        let counts = logoutAttempts.withLock { $0 }
+        #expect(counts.values.allSatisfy { $0 == 1 }, "a connection was logged out more than once: \(counts.values.sorted())")
+        if let ended {
+            #expect(counts[ObjectIdentifier(ended)] == 1, "the IDLE connection markDirty() ended must be logged out exactly once")
+        }
+        provider.setLogoutAttemptTestHookForTesting(nil)
     }
 
     // ════════════════════════════════════════════════════════════════════════

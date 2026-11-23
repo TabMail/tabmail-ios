@@ -70,9 +70,6 @@ extension OutlookChangeReadingTests {
                 }.count
             }
             let before = windowListings()
-            try await w.pool.write { db in
-                _ = try Account.filter(Column("id") == w.accountId).updateAll(db, Column("lastSyncedAt").set(to: nil as Date?))
-            }
             let engine = SyncEngine()
             await engine.register(accountId: w.accountId, provider: w.provider,
                                   workQueue: ProviderWorkQueue(provider: w.provider, maxConcurrency: 1))

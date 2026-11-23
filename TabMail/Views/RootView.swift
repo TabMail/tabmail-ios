@@ -423,7 +423,8 @@ struct RootView: View {
         // still be queued or may already be sending, so this alert says only that
         // the Undo attempt did not take; it never promises the message was stopped.
         // A refused move Undo (`UndoService.undoFailureMessage`) shows the same
-        // notice: nothing was moved back. See `undoFailureAlertHosts`.
+        // kind of notice: nothing was moved back, or, when other parts of the
+        // Undo did come back, some messages were not. See `undoFailureAlertHosts`.
         .background(undoFailureAlertHosts)
         .onReceive(NotificationCenter.default.publisher(for: .demoModeDidExit)) { _ in
             demoSeedingComplete = false

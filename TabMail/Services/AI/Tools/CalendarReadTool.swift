@@ -27,12 +27,21 @@ struct CalendarReadTool: AgentTool, Sendable {
         )
 
         if result.events.isEmpty {
-            return "No calendar events found in the requested date range."
+            if result.unread.isEmpty {
+                return "No calendar events found in the requested date range."
+            }
+            return CalendarToolHelpers.withUnreadNote(
+                "No calendar events found in the requested date range in the calendars that could be read.",
+                unread: result.unread
+            )
         }
 
         let tz = CalendarToolHelpers.resolveTimeZone(arguments)
         Task { await CalendarToolHelpers.cacheEventDetailsForPills(result.events, calendarNames: result.calendarNames) }
-        let output = CalendarToolHelpers.formatGroupedSummary(result.events, calendarNames: result.calendarNames, timeZone: tz)
+        let output = CalendarToolHelpers.withUnreadNote(
+            CalendarToolHelpers.formatGroupedSummary(result.events, calendarNames: result.calendarNames, timeZone: tz),
+            unread: result.unread
+        )
         BackgroundSyncLogger.logDebug("[CalendarReadTool] Returning \(result.events.count) events tz=\(tz.identifier)")
         // Print the exact tool result the LLM will see, so we can tell whether
         // a "day appears empty" complaint is a tool bug (missing rows) or an
