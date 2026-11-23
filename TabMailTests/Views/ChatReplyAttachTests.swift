@@ -262,7 +262,8 @@ struct ChatReplyAttachTests {
         #expect(Self.count("paperclipPickerOpen = false", in: chat) == 2, "its start, and the picker's onDismiss")
         #expect(Self.count("readyReply = ", in: chat) == 2, "the ghost's tap and the paperclip's pick, through the one presenter")
         // The pickers, and a pick waiting for its picker to close, count as presentations over the chat.
-        #expect(Self.count("|| forwardMessage != nil || showsReplyTo || showsMove || showsPhotoPicker || showsFilePicker || showsCamera || pendingAttachCard != nil", in: chat) == 1)
+        #expect(Self.count("|| showsPhotoPicker || showsFilePicker || showsCamera || pendingAttachCard != nil }", in: chat) == 1)
+        #expect(Self.count("private var isAnyPresentation: Bool { cardMessage != nil", in: chat) == 1, "the chain above is the presentations' own")
         // The test seam takes the same two steps as a picker, and exists only in debug builds.
         let seamText = ".onReceive(NotificationCenter.default.publisher(for: .chatPaperclipPickForTesting)) { note in guard let pick = note.object as? ComposeAttachmentPick else { return } attachPicked(pick) openPendingAttachCard() }"
         #expect(Self.count(seamText, in: chat) == 1)

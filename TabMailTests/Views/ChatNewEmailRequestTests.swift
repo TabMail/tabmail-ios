@@ -340,7 +340,7 @@ struct ChatNewEmailRequestTests {
         // Its email card counts too: the card's email screen takes the request, never the chat
         // under it (the card opens from a touch on the email's bubble, which hosted tests cannot
         // make, so this is checked here).
-        #expect(Self.count("private var isAnyPresentation: Bool { cardMessage != nil || readyReply != nil || agentCompose != nil || forwardMessage != nil || showsReplyTo || showsMove || newEmailCover != nil }", in: chat) == 1,
+        #expect(Self.count("private var isAnyPresentation: Bool { cardMessage != nil || readyReply != nil || agentCompose != nil || forwardMessage != nil || showsReplyTo || showsMove || newEmailCover != nil", in: chat) == 1,
                 "its own cover and its email card count as presented")
         #expect(Self.count("newEmailCover = .make( request: request, opensInChat: ChatViewConfig.opensInChat, signedIn: hasTabMailSession, chatAccount: Account.primary(), composeAccount: Account.primary())", in: chat) == 1)
         #expect(Self.count(cover, in: chat) == 1)
