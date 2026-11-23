@@ -287,3 +287,37 @@ busy does not clear; with the account free it does); `GmailCatchUpTests.sliceHan
 next slice boundary, within one slice). `OneSyncAtATimeTests`'
 waiting cases (`secondPassWaitsForTheFirst`, `waitingPassKeepsTheFreshCursor`, `throwingPassHandsTheTurnOn`,
 `removedWhileWaitingDoesNothing`) now queue `sync(account:)`, the form that still waits.
+
+**Amended 2026-11-23 (tabmail-ios #1331, #1327): the screen starts foreground polling in one place.** A
+return to the app reaches `SyncScheduler.startForegroundPolling` (a return's stage 1 for every account, the
+300 s poll timer and IMAP IDLE) through `ForegroundPollStart`, a view modifier RootView applies. It reads one
+condition, the scene is active and an account exists and the app is not in screenshot mode, when RootView
+mounts and whenever any part of it changes, and starts foreground polling on every change to true. A change
+to false does nothing there; RootView's scene-phase handler still stops polling in the background.
+
+Why: RootView's scene-phase handler started foreground polling on a change to active only. RootView mounts
+only once the inbox is ready to paint (since v1.6.7), a cold launch in the foreground is already active by
+then, and `onChange` does not run for the value a view mounts with, so the poll, stage 1 and IDLE waited for
+the next background-and-return (#1331). Adding the first account while the app is open changes no phase
+either (#1327). One condition read at mount and on every change covers both, with no new timer, path or
+layer; Settings' database reset stays the only other caller.
+
+Screenshot mode never starts it: its seeded data is the whole content, as RootView's account task and
+`InboxViewModel.performSync` already say. Before, a return inside a screenshot run started it (test-only).
+Demo mode needs no term: `syncStartup` and the poll skip sync while the demo is on.
+
+Cold-launch cost (nothing is added before the first paint): the herd's first foreground pass waits for the
+first paint, so after it a foreground cold launch now runs what every return runs, as every cold launch did
+before v1.6.7: the staged-push merge, stage 1 with its resume recovery (in-flight queue work cancelled and
+re-read from the database, providers marked dirty so an IMAP pool reconnects at its next checkout and IDLE
+relaunches), the poll's first stage 2, the poll timer and IDLE. These and the inbox's own read of the
+folders on screen (`InboxView.onAppear` -> `startSync`, one second later) share each account's turn, as on
+a return: a trigger that finds the account busy flags it, and the flags fold into one follow-up stage 2.
+Before the fix the launch ran the on-screen read only, and the other folders, the full sync when due, the
+poll and IDLE waited for a return.
+
+Tests: `ForegroundPollStartTests` (a view that mounts in an active scene with an account starts once; the
+first account added in an active scene starts once; a view mounted before the scene is active starts when it
+becomes active; every return starts again; an account added after the last was removed starts again;
+screenshot mode never starts; the condition's table; RootView starts it only through the modifier, and the
+app's only other caller is Settings).

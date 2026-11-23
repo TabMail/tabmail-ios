@@ -554,7 +554,8 @@ struct RootView: View {
                 // the user sees current state, then sync finds any remaining changes.
                 NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
                 BootProfiler.mark("RootView: posted inboxDataDidChange (UI reload from GRDB)")
-                // Sync is handled by startForegroundPolling() (triggered by scenePhase → .active).
+                // Sync is handled by startForegroundPolling(), which `ForegroundPollStart`
+                // calls once the scene is active with an account (at mount, and on a change).
                 // Do NOT call foregroundSyncAll() here — it races with the poll's sync,
                 // causing every full sync to run twice (doubled API calls, IMAP connections, DB writes).
             }
@@ -819,6 +820,14 @@ struct RootView: View {
             // otherwise have nothing registered until the next foreground pass.
             Task { await TabMailAuthService.restorePushRegistrationAfterSignIn() }
         }
+        // The one place the screen starts foreground polling: the scene active,
+        // an account, not screenshot mode; read at mount and on every change
+        // (#1331 cold launch, #1327 first account).
+        .modifier(ForegroundPollStart(
+            hasAccounts: !navigationStore.accounts.isEmpty,
+            screenshotMode: ScreenshotMode.isActive,
+            start: { syncScheduler.startForegroundPolling() }
+        ))
         .onChange(of: scenePhase) { _, phase in
             let phaseName = phase == .active ? "active" : (phase == .background ? "background" : "inactive")
             BootProfiler.mark("◐ scenePhase → \(phaseName) (accounts=\(navigationStore.accounts.count))")
@@ -827,9 +836,9 @@ struct RootView: View {
                 Task {
                     await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
                 }
-                if !navigationStore.accounts.isEmpty {
-                    syncScheduler.startForegroundPolling()
-                }
+                // Foreground polling starts in `ForegroundPollStart` below, not
+                // here: this handler does not run for the phase RootView mounts
+                // with, which a foreground cold launch already has (#1331).
                 // IOS-OUTBOX-001: the launch `.task` above is reconciliation's
                 // only other trigger, so a send stranded `.sending`/`sentAt ==
                 // nil` stayed stranded for the whole session — the drain selects
