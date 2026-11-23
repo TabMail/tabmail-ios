@@ -85,7 +85,8 @@ import Synchronization
 // No time limit counts a wait for another pass's turn. A trigger never waits for
 // one; at most its own connection check (`AccountManager.ensureConnected`) runs
 // inside its limit before it takes or flags the turn, as before. Inside the turn,
-// a wait for a provider connection slot does count (#1333). The follow-up
+// a wait for a provider connection slot does count (#1333); a catch-up slice's
+// clock starts at its slot of the provider work queue (#1109). The follow-up
 // waits, so its quick sync's deadline (`SyncConfig.perAccountSyncTimeoutSeconds`)
 // starts when it gets the turn. It has no outer time limit, like stage 2 from
 // Settings: a timeout around a pass that waits would clear the flag unread. Its
@@ -117,6 +118,8 @@ import Synchronization
 /// One pass waiting for an account's sync turn.
 struct SyncTurnWaiter {
     let id: UInt64
+    /// Where the waiting pass was started (`caller:line`), for the debug log.
+    let caller: String
     let continuation: CheckedContinuation<Void, Never>
 }
 
@@ -148,10 +151,18 @@ extension SyncEngine {
         let task = Self.currentTaskIdentity()
         if let task, Self.heldSyncTurn[accountId] == task { return try await pass() }
         if !syncPassRunning.insert(accountId).inserted {
+            let behind = syncTurnHolders[accountId] ?? "unknown"
+            let waitStart = ContinuousClock.now
             let ownsTurn = await waitForSyncTurn(accountId: accountId, caller: "\(caller):\(line)")
+            let waited = waitStart.duration(to: .now)
+            // Debug-gated (#1109): how long a pass that waits for the turn (a
+            // listing, the follow-up stage 2, `sync(account:)`, a catch-up
+            // slice) waited, and what held the turn when it got in line.
+            BackgroundSyncLogger.logDebug("[SyncTurnWait] \(accountId.prefix(8)): \(caller):\(line) waitedMs=\(MigrationTimingLedger.wholeMilliseconds(waited)) behind=\(behind)")
             // Only after a test-harness overrun: that test has already failed.
             if !ownsTurn { return try await pass() }
         }
+        syncTurnHolders[accountId] = "\(caller):\(line)"
         defer { handOverSyncPass(accountId: accountId) }
         var held = Self.heldSyncTurn
         held[accountId] = task
@@ -203,7 +214,7 @@ extension SyncEngine {
         defer { watcher?.cancel() }
         #endif
         await withCheckedContinuation {
-            syncPassWaiters[accountId, default: []].append(SyncTurnWaiter(id: id, continuation: $0))
+            syncPassWaiters[accountId, default: []].append(SyncTurnWaiter(id: id, caller: caller, continuation: $0))
         }
         return overrunSyncTurnWaiters.remove(id) == nil
     }
@@ -291,11 +302,13 @@ extension SyncEngine {
     private func handOverSyncPass(accountId: String) {
         guard var waiting = syncPassWaiters[accountId], !waiting.isEmpty else {
             syncPassRunning.remove(accountId)
+            syncTurnHolders[accountId] = nil
             if syncFollowUpWanted.contains(accountId) { syncFollowUp(accountId) }
             return
         }
         let next = waiting.removeFirst()
         syncPassWaiters[accountId] = waiting.isEmpty ? nil : waiting
+        syncTurnHolders[accountId] = next.caller
         next.continuation.resume()
     }
 }

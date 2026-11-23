@@ -1373,12 +1373,20 @@ on the re-drive.
    `CatchUpRun.accessedFolderIds`: it asks only those folders (the syncable ones among them, so a folder
    whose mark did not land is not asked), under the account's turn and slice pacing like every slice,
    until they make no progress or their slices have spent `SyncConfig.accessCatchUpRunSeconds` (120 s)
-   inside the account's turn (`CatchUpRun.workSeconds`): the wait for the turn and the pacing wait
-   between slices are not counted, because waiting is not working time. What a large folder still needs
+   of working time (`CatchUpRun.workSeconds`), each slice's counted from when its provider work starts,
+   once the account's provider work queue gives it a slot: the wait for the turn, the wait for the slot
+   and the pacing wait between slices are not counted, because waiting is not working time. The run ends
+   with the slice that spends its time. What a large folder still needs
    then is the backfill worker's, whose catch-up checks every followed folder. *(Amended in review
    2026-11-23: the run first had a deadline 120 s from when it took its folders, so a run whose first
    slice waited behind a long pass, as after a pull that found its account busy, could spend it all
-   waiting and ask nothing.)*
+   waiting and ask nothing.)* *(Amended in review 2026-11-23, second time. Superseded: "spent ... (120 s)
+   inside the account's turn (`CatchUpRun.workSeconds`): the wait for the turn and the pacing wait
+   between slices are not counted". A slice's clock then started at its turn, so its wait for a slot of
+   the provider work queue, inside the turn, counted as working time, and a slice that waited its whole
+   slice reached the provider with no time left; and a run whose last slice spent its time took another
+   turn, and could wait for another pacing window, before it found its time spent. Every catch-up slice,
+   the backfill's included, now starts its clock at its slot: ADR-IOS-107, amendment 2026-11-23 (#1109).)*
    `CatchUpContext.accessedFolderIds` tells the provider which folders an action reached (provider-neutral).
    `SyncEngine.remove(accountId:)` cancels the run.
 4. **IMAP access check** (`IMAPProvider.catchUpPlan`, `counters:`, `accessed:`). An untracked folder with no

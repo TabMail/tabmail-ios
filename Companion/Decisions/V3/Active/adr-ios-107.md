@@ -151,7 +151,9 @@ The owner's rulings of 2026-11-09:
        hands the catch-up a network state from before the walk.
      - **Slices under the lock.** Each slice takes the account's `oneSyncAtATime` turn (ADR-IOS-104),
        runs inside `queue.execute(.headerFetch)`, and releases the turn when it ends. The slice's clock
-       starts when its turn starts, not while it waits. A push or silent-push delta (or a foreground
+       starts when its turn starts, not while it waits. *(Superseded 2026-11-23, #1109, amendment at the
+       end of this ADR: the slice's clock starts when its provider work starts, at its slot of the
+       provider work queue, not at its turn.)* A push or silent-push delta (or a foreground
        pass) that arrives during the catch-up therefore waits at most one slice, and the turn is FIFO,
        so it runs before the run's next slice. A slice never throws.
      - **How many slices.** A foreground cycle (no deadline) runs ONE slice. The background job runs
@@ -1498,3 +1500,40 @@ widthCapThrough, timed-out width, cap growth, cap dropped at the maximum span, c
 window floor named UIDs, unmaterialised UID, known epoch, prune cutoff, pruneCutoff, scroll page after a prune,
 pool capacity wait, healthy folder asked in several slices, floor rule, epoch-tagged floor, CatchUpEpochValue,
 legacy prune seed, seedCatchUpPruneCutoffs, scan floor below the cutoff, actually deleted rows)
+
+### Amendment (2026-11-23, #1109): a slice's clock starts at its slot of the provider work queue
+
+**Current.** Every catch-up slice, the backfill worker's and a followed folder's access run's
+(ADR-IOS-111, amendment 2026-11-22, decision 3) alike, makes its context (`CatchUpRun.sliceStartingNow`),
+and so starts its clock, inside `queue.execute(.headerFetch)`, when the account's provider work queue
+gives it a slot: the slice's time (`catchUpSliceSeconds`), the background job's deadline and an access
+run's working time all count from there. The wait for the slot, like the wait for the turn, is not
+counted (sync timing promise 2: a time limit never counts a wait for a turn, a lock, a connection slot or
+a queue). A background job whose deadline passed while the slice waited for its slot ends there
+(`CatchUpSliceOutcome.runOver`), sending nothing. An access run ends with the slice that spends its
+working time; it takes no other turn to find it spent.
+
+**Cost, accepted.** When every slot of the account's queue is busy (body downloads, a listing), a slice
+now holds the account's turn for its queue wait plus its full slice, where before the wait came out of
+the slice: at most one slice's time (`catchUpSliceSeconds`, 2 s) longer than before. A pass that waits for
+the turn behind it (the pull's folder listings, the follow-up stage 2, `sync(account:)`) can wait that
+much longer; a sync trigger (push, IDLE, the poll, the pull's change read) never waits, it sets the
+follow-up flag (ADR-IOS-104). Other accounts, body downloads and the interface do not wait on it.
+
+**Measured, debug-gated** (`BackgroundSyncLogger.logDebug`): each slice logs `[CatchUpSlice]` with the
+account, its kind (`access`, `backfill-background`, `backfill-foreground`), its outcome, `queueWaitMs`,
+`workMs` and `turnHoldMs`; a pass that waited for the turn logs `[SyncTurnWait]` with where it was started,
+`waitedMs`, and where the pass that held the turn when it got in line was started (`behind=`,
+`SyncTurnWaiter.caller`, `SyncEngine.syncTurnHolders`).
+
+**Gap closed.** The backfill slices had clocked from their turn, before the slot wait, since the catch-up
+moved into the backfill worker (#766): a slice that waited for its slot reached the provider with less
+of its slice, or none. Still open: the wait for a connection inside a provider's catch-up call still
+counts (an IMAP slice's time and each request's timeout include the wait for a pooled connection),
+#1344 (P4).
+
+*Superseded:* "The slice's clock starts when its turn starts, not while it waits" (decision 2, "Slices
+under the lock").
+
+(slice clock, queue admission, provider work queue slot, sync timing promise 2, access run working time,
+spent run ends, turn hold, CatchUpSlice log, SyncTurnWait log, queueWaitMs, turnHoldMs, #766 gap, #1109)

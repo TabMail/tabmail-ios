@@ -83,6 +83,10 @@ actor SyncEngine {
     /// their turn, oldest first (`oneSyncAtATime`).
     var syncPassRunning: Set<String> = []
     var syncPassWaiters: [String: [SyncTurnWaiter]] = [:]
+    /// For each account whose turn is held, where the pass holding it was
+    /// started (`caller:line`), so a pass that waited names in the debug log
+    /// what it waited behind (`[SyncTurnWait]`). Read by nothing else.
+    var syncTurnHolders: [String: String] = [:]
     var syncTurnWaiterSerial: UInt64 = 0
     /// Waiters the test harness released after an overrun (`syncTurnWaitWatch`).
     var overrunSyncTurnWaiters: Set<UInt64> = []

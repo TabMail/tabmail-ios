@@ -3946,6 +3946,64 @@ struct GmailCatchUpTests {
         }
     }
 
+    /// A backfill slice's time also starts when its provider work starts (sync
+    /// timing promise 2, every catch-up slice since #1109): a foreground cycle's
+    /// one slice of three requests waits for the queue's only slot, held by
+    /// other provider work, while its clock moves on 100 s; it still sends its
+    /// three requests. RED with the slice's clock started at its turn: the
+    /// slice reached the provider with no time left and sent nothing.
+    @Test("A backfill slice's wait for a slot of the provider work queue is not part of its time")
+    func backfillSliceQueueWaitIsNotItsTime() async throws {
+        let clock = Clock()
+        let (seeds, local) = Self.rangesWorld(clock, count: 8)
+        try await Self.withWorld("gcu-backfill-queue", seeds: seeds, local: local, folders: Self.inboxOnly) { world async throws in
+            let account = try await Self.account(world)
+            let engine = world.engine
+            let registered = await engine.workQueues[world.accountId]
+            let queue = try #require(registered, "the world's account has a work queue")
+            let added = AddedTime()
+            let gate = AsyncStream<Void>.makeStream()
+            let gateStream = gate.stream
+            let slotHeld = Mutex(false)
+            let other = Task {
+                await queue.execute(priority: .userAction) {
+                    slotHeld.withLock { $0 = true }
+                    for await _ in gateStream { break }
+                    added.add(100)
+                }
+            }
+            let held = await OneSyncAtATimeTests.eventually { slotHeld.withLock { $0 } }
+            guard held else {
+                Issue.record("precondition: other provider work holds the queue's slot")
+                gate.continuation.finish()
+                await other.value
+                return
+            }
+            let starts = Mutex(0)
+            await engine.setCatchUpSliceStartHookForTesting { _ in starts.withLock { $0 += 1 } }
+            // A foreground cycle's run: no deadline, no working time, one slice.
+            let server = world.server
+            let before = server.http.recordedCalls().count
+            let base = Date()
+            let run = SyncEngine.CatchUpRun(
+                storageLimitInForce: false, deadline: nil, sliceSeconds: 3, intervalSeconds: 0.05,
+                clock: { base.addingTimeInterval(TimeInterval(server.http.recordedCalls().count - before) + added.total) })
+            let catchUp = Task { await engine.runCatchUpRun(account: account, run: run) }
+            let sliceStarted = await OneSyncAtATimeTests.eventually { starts.withLock { $0 } == 1 }
+            gate.continuation.finish()
+            await other.value
+            let progressed = await catchUp.value
+            await engine.setCatchUpSliceStartHookForTesting(nil)
+
+            let slices = starts.withLock { $0 }
+            let sent = server.http.recordedCalls().count - before
+            #expect(sliceStarted, "precondition: the cycle's slice started while the slot was held")
+            #expect(progressed, "the slice made progress")
+            #expect(slices == 1, "a foreground cycle takes one slice: \(slices)")
+            #expect(sent == 3, "the slice sent its three requests, its wait for the slot not counted: \(sent)")
+        }
+    }
+
     /// One foreground backfill cycle (`runBackfill`, no deadline: the production
     /// snapshot and slice) moves the listing forward by one slice, newest range
     /// first, and the worker's next cycles complete it.
