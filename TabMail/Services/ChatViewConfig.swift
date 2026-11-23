@@ -45,6 +45,11 @@ enum ChatViewConfig {
     /// this many. An older email asks for its own when it comes on screen.
     static let summaryWindow = 10
 
+    /// A new email's "Add recipient" sheet lists at most this many recent people
+    /// (`ChatRecentPeople`), found in the newest `recentPeopleScanCount` emails of the Sent folders.
+    static let recentPeopleCount = 8
+    static let recentPeopleScanCount = 100
+
     /// The reply field's VoiceOver action that opens the TabMail chat panel, the drag up's
     /// equivalent (`showChatAction`).
     static let showChatActionName = "Show TabMail chat"
