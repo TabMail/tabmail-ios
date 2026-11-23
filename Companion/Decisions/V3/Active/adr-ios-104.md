@@ -339,17 +339,25 @@ account list, and the host app must not start real sync, push resubscription or 
 that starts the shared scheduler's polling stops it in its teardown, so a connect's IDLE start cannot reach a
 later test.
 
-Cold-launch cost (nothing is added before the first paint): the herd's first foreground pass waits for the
-first paint, so after it a foreground cold launch now runs what every return runs, as every cold launch did
-before v1.6.7: the staged-push merge, stage 1 with its resume recovery (in-flight queue work cancelled and
-re-read from the database, providers marked dirty so an IMAP pool reconnects at its next checkout and IDLE
-relaunches), the poll's first stage 2, the poll timer and IDLE. These and the inbox's own read of the
-folders on screen (`InboxView.onAppear` -> `startSync`, one second later) share each account's turn, as on
-a return: a trigger that finds the account busy flags it, and the flags fold into one follow-up stage 2.
+Cold-launch cost (no network or database work is added before the first paint): RootView mounts only once the
+inbox is ready to paint, and the start's synchronous part runs on the main actor at that mount (the poll
+timer, the two background-task submits of `ensureBackgroundTasksScheduled`, and the spawn of the start's
+tasks; not measured, the BootProfiler mark "startForegroundPolling CALLED" shows it in a device log). The
+herd's first foreground pass waits for the first paint, so after it a foreground cold launch now runs what
+every return runs, as every cold launch did before v1.6.7: the staged-push merge, stage 1 with its resume
+recovery (in-flight queue work cancelled and re-read from the database, providers marked dirty so an IMAP
+pool reconnects at its next checkout and IDLE relaunches), the poll's first stage 2, the poll timer and
+IDLE. These and the inbox's own read of the folders on screen (`InboxView.onAppear` -> `startSync`, one
+second later) share each account's turn, as on a return. The inbox's folder listing is not a trigger and
+waits in line behind stage 1 (and, when the poll's flag came first, behind the follow-up stage 2 with a
+due full sync); its account change read is a trigger, which flags a busy account, and the flags fold into
+one follow-up stage 2. A pull to refresh in that window waits for the listing, as a pull right after any
+return waits behind the return's work (promise 7: the reads it wants start after it).
 Before the fix the launch ran only the inbox's read (the folders on screen, then each of their accounts'
 change read, `AccountManager.syncFolders` -> `backgroundDeltaSync`); the full sync when due, the older-mail
-catch-up, the poll and IDLE waited for a return. The hand-off adds one main-actor task per provider that
-goes live, which the install does not wait for.
+catch-up, the poll and IDLE waited for a return. The hand-off adds, per provider that goes live (and per
+connect that failed for now), one main-actor task the install does not wait for, and while the poll timer
+is set two actor hops (the provider lookup and the provider's IDLE start).
 
 Tests: `ForegroundPollStartTests` (a view that mounts in an active scene with an account starts once; the
 first account added in an active scene starts once; a view mounted before the scene is active starts when it

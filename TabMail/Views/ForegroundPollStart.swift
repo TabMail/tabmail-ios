@@ -41,8 +41,10 @@ struct ForegroundPollStart: ViewModifier {
         phase == .active && hasAccounts && !screenshotMode
     }
 
-    /// The app runs as the host of a unit-test run (the check NetworkMonitor,
-    /// EmbeddingService, PushNotificationService and ReminderBuilder make).
+    /// The app runs as the host of a unit-test run: the first key of the check
+    /// NetworkMonitor, EmbeddingService, PushNotificationService and
+    /// ReminderBuilder make (they also accept `XCTestBundlePath`), which every
+    /// hosted Xcode unit-test run sets.
     static let isUnitTestHost: Bool = {
         #if DEBUG
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
