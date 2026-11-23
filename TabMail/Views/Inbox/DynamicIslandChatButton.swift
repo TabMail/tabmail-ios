@@ -497,8 +497,10 @@ struct DynamicIslandChat: View {
             if expanded {
                 // The chat's field becomes the panel's input with its words (mock v15 M2); typed
                 // in, it keeps the keyboard, which moves to the panel's input, its own text field,
-                // so the panel opens above the keyboard (mock v15 H2). This runs in the update
-                // that opens the panel, while the field is still on screen with the keyboard.
+                // so the panel opens above the keyboard (mock v15 H2). This reads the focus the
+                // field holds as the panel opens and gives it to the panel's input. SwiftUI does not
+                // document the order of this action and the field's removal, so the swipe UI tests'
+                // drags from the typed-in field check on screen that the panel's input has it.
                 if focusedInput == .replyField { focusedInput = .panel }
                 dismissAgentToast()
                 // Opportunistic cleanup of idle in-memory sessions (5 min TTL).
@@ -3048,7 +3050,9 @@ private struct ExpandablePillPressStyle: ButtonStyle {
 /// reads a text field's own focus as lost once a swipe re-renders the chat, while editing goes on.
 /// Active only in debug builds launched with the swipe UI test's argument (`--chat-swipe-ui-test`)
 /// or the keyboard focus UI test's (`--keyboard-focus-ui-test`); it draws nothing (clear
-/// text in the background, so no layout change) and is set only when the field's focus changes.
+/// text in the background, so no layout change) and is set as the field appears and when its focus
+/// changes, so a field that appears with the keyboard (the panel's input, opened from the typed-in
+/// reply field) reads focused at once.
 private struct ReplyFieldFocusMarker: ViewModifier {
     let focused: Bool
 
@@ -3078,7 +3082,7 @@ private struct ReplyFieldFocusMarker: ViewModifier {
                         .foregroundStyle(.clear)
                         .allowsHitTesting(false)
                         .accessibilityIdentifier("chatReplyFieldFocus"))
-                .onChange(of: focused) { _, now in shown = now }
+                .onChange(of: focused, initial: true) { _, now in shown = now }
         }
     }
     #endif

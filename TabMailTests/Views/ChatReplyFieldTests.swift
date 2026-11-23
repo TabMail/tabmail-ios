@@ -543,12 +543,22 @@ struct ChatReplyFieldTests {
     // MARK: - 9. Wiring
 
     private static func source(_ path: String) throws -> String {
+        try text(path).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    /// `source` with its comments blanked first (`FixedDateFormatFenceTests.codeOnly`, string
+    /// literals kept), so a fence on it counts code only: a commented-out line is not there.
+    private static func code(_ path: String) throws -> String {
+        String(FixedDateFormatFenceTests.codeOnly(try text(path), keepStrings: true))
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    private static func text(_ path: String) throws -> String {
         let projectRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let text = try String(contentsOf: projectRoot.appendingPathComponent(path), encoding: .utf8)
-        return text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return try String(contentsOf: projectRoot.appendingPathComponent(path), encoding: .utf8)
     }
 
     private static func count(_ needle: String, in text: String) -> Int {
@@ -1277,27 +1287,19 @@ struct ChatReplyFieldTests {
         #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).showChat == nil)
         #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0, showChat: {}).showChat != nil)
         // The reply field and the panel's input are two text fields, each with its own focus value,
-        // and the panel opening moves a typed-in field's keyboard to the panel's input, in the
-        // update that opens it (mock v15 H2; on screen: `ChatSwipeUITests`, the drags that open
-        // the panel from the focused field).
-        #expect(Self.count("@FocusState private var focusedInput: InputFocus?", in: pill) == 1)
-        #expect(Self.count(".focused($focusedInput, equals: focus)", in: pill) == 1)
-        #expect(Self.count(".focused(", in: pill) == 1, "the input field is the pill's one focusable view")
-        #expect(Self.count("focus: .replyField", in: bar) == 1, "the reply field is the only field focused as the reply field")
-        let openingText = ".onChange(of: isExpanded) { _, expanded in autoStartTask?.cancel() autoStartTask = nil if expanded {"
-        let handOverText = "if focusedInput == .replyField { focusedInput = .panel } dismissAgentToast()"
-        #expect(Self.count(openingText, in: pill) == 1)
-        #expect(Self.count(handOverText, in: pill) == 1)
-        #expect(Self.count("focusedInput = .panel", in: pill) == 1, "the opening is the only hand-over")
-        let opening = try #require(pill.range(of: openingText))
-        let handOver = try #require(pill.range(of: handOverText))
-        guard opening.upperBound <= handOver.lowerBound else {
-            Issue.record("the hand-over comes after the opening")
-            return
-        }
-        // Directly inside the opening branch: only its comment between, no block opened or closed.
-        let between = String(pill[opening.upperBound..<handOver.lowerBound])
-        #expect(!between.contains("{") && !between.contains("}"), "the hand-over is in the branch that opens the panel: \(between)")
+        // and the panel opening moves a typed-in field's keyboard to the panel's input (mock v15
+        // H2; on screen: `ChatSwipeUITests`, the drags that open the panel from the focused field).
+        // Read in code only, so a commented-out line does not count.
+        let pillCode = try Self.code("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        let barCode = try Self.code("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
+        #expect(Self.count("@FocusState private var focusedInput: InputFocus?", in: pillCode) == 1)
+        #expect(Self.count(".focused($focusedInput, equals: focus)", in: pillCode) == 1)
+        #expect(Self.count(".focused(", in: pillCode) == 1, "the input field is the pill's one focusable view")
+        #expect(Self.count("focus: .replyField", in: barCode) == 1, "the reply field is the only field focused as the reply field")
+        // The first statement of the branch that opens the panel.
+        #expect(Self.count(".onChange(of: isExpanded) { _, expanded in autoStartTask?.cancel() autoStartTask = nil if expanded { if focusedInput == .replyField { focusedInput = .panel } dismissAgentToast()", in: pillCode) == 1,
+                "the hand-over opens the branch that opens the panel")
+        #expect(Self.count("focusedInput = .panel", in: pillCode) == 1, "the opening is the only hand-over")
     }
 
     @Test("The settle lasts the pill spring's own settling duration, which drives the panel and the swell too")

@@ -1363,9 +1363,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    along"), so a short draft in the focused field opens the panel the same way and keeps its words,
    and its keyboard (amended 2026-11-23, mock v15 H2: "Both open above the keyboard"): the reply
    field and the panel's input are two text fields, each with its own focus value
-   (`DynamicIslandChat.InputFocus`), and the update that opens the panel moves a typed-in field's
-   focus to the panel's input while the field is still on screen. One shared value had let the
-   field's focus go with it as it left, and the panel opened with no keyboard (UI run 2026-11-23);
+   (`DynamicIslandChat.InputFocus`), and the panel's opening (`onChange(of: isExpanded)`) moves the
+   focus a typed-in field holds to the panel's input. SwiftUI documents no order between that action
+   and the field's removal, so the swipe UI tests' drags from the typed-in field check on screen that
+   the panel's input has the keyboard. One shared value had let the field's focus go with it as it
+   left, and the panel opened with no keyboard (UI run 2026-11-23);
    only the open panel and the tutorial turn it off. *Superseded 2026-11-21 (it carried a flick about
    twice as far as SwiftUI's drag had, so slower flicks opened the panel):* "only a finished drag can
    open the panel, from its swell or a flick's predicted swell (`ChatFieldDrag.predictedEnd`, a
@@ -1426,8 +1428,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    stays the text's; `ChatFieldDragTests.textViewOrdering`: the long press never waits for the
    field's drag), `testDragUpOnAShortFocusedDraftOpensThePanelWithIt`
    (signed in through the fixture's `--chat-swipe-signed-in`: the panel's editor holds the draft
-   and keeps its focus; `ChatReplyFieldTests.fieldDragWiring` pins the two focus values and the
-   hand-over),
+   and keeps its focus, above the keyboard where one shows, and Close gives the field back without
+   it; `testDragUpOnTheUnfocusedSignedInFieldOpensThePanelWithTheKeyboardDown`: with no keyboard
+   the panel opens with none; `ChatReplyFieldTests.fieldDragWiring` pins the two focus values and
+   the hand-over, in code, not comments),
    `testDragCutOffByThePanelOpeningSettlesAndTheNextDragWorks` (the fixture's
    `--chat-swipe-open-panel-under-drag` opens the panel the moment the debug marker sees the held
    drag swollen past the open distance, which turns the pan off: the marker records the opening's

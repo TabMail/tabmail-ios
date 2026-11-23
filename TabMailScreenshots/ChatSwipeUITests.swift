@@ -318,7 +318,8 @@ final class ChatSwipeUITests: XCTestCase {
 
     /// Signed in, the focused field with a short draft: the drag up opens the panel, whose editor
     /// (not the sign-in bar a signed-out panel shows) holds the same draft and keeps its focus
-    /// (mock v15 H2: the panel opens above the keyboard).
+    /// (mock v15 H2: the panel opens above the keyboard). Close then gives the field back without
+    /// the keyboard.
     func testDragUpOnAShortFocusedDraftOpensThePanelWithIt() {
         let app = launchIntoChat(signedIn: true)
         let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
@@ -340,12 +341,42 @@ final class ChatSwipeUITests: XCTestCase {
         } else {
             XCTFail("control: the marker shows the open panel")
         }
-        // Read from the element, as the overflowing draft's test reads it.
+        // Read from the element, as the overflowing draft's test reads it, and from the app's marker.
         XCTAssertTrue(waitForFocus(editor, true, timeout: 3), "the panel's editor keeps the draft's focus")
+        XCTAssertTrue(markerReads(focused: true, in: app), "the app's marker reads the panel's editor focused")
+        // Where a software keyboard showed for the field, it is on screen and the editor above it.
+        waitForTheKeyboardBack(under: editor, in: app, failure: "the panel's editor holds still above the keyboard")
+        // Closing the panel clears the focus, and nothing gives it back to the field afterwards.
+        app.buttons["chatClose"].tap()
+        XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "Close closed the panel")
+        XCTAssertTrue(markerReads(focused: false, in: app), "the field came back without the keyboard")
+        XCTAssertFalse(markerReads(focused: true, in: app), "and does not take it back")
     }
 
-    /// The signed-in field's hint (`ChatReplyField.placeholder`), and the open panel's sign-in bar.
+    /// Signed in, the field without the keyboard: the drag up opens the panel with its editor and
+    /// leaves the keyboard down. Only a typed-in field's keyboard moves to the panel's input.
+    func testDragUpOnTheUnfocusedSignedInFieldOpensThePanelWithTheKeyboardDown() {
+        let app = launchIntoChat(signedIn: true)
+        let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
+        XCTAssertTrue(markerReads(focused: false, in: app), "control: the field has no keyboard")
+        dragUp(atY: field.frame.midY, in: app)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the drag opened the panel")
+        XCTAssertFalse(app.staticTexts[Self.signInBarText].exists, "control: signed in, the panel has its editor, not the sign-in bar")
+        XCTAssertNotNil(settledDragMarker(in: app)?.fieldTop, "control: the marker shows the open panel")
+        let editor = replyField(in: app, placeholder: Self.panelPlaceholder)
+        XCTAssertTrue(markerReads(focused: false, in: app), "control: the app's marker reads the panel's editor")
+        XCTAssertFalse(markerReads(focused: true, in: app), "the panel's editor did not take the keyboard")
+        XCTAssertFalse(waitForFocus(editor, true, timeout: 1), "nor does it read focused itself")
+        let keyboard = app.keyboards.firstMatch
+        let keyboardOnScreen = keyboard.exists
+            && app.frame.intersection(keyboard.frame).height > app.frame.height * Self.keyboardMinShare
+        XCTAssertFalse(keyboardOnScreen, "the keyboard stays down")
+    }
+
+    /// The signed-in field's hint (`ChatReplyField.placeholder`), the open panel's input's hint
+    /// (`PillDictationMode.placeholder`), and the open panel's sign-in bar.
     private static let signedInPlaceholder = "Reply or ask anything"
+    private static let panelPlaceholder = "Type or speak..."
     private static let signInBarText = "Sign in to TabMail for AI features and push notifications"
 
     /// With the first-time tip showing, as a new user sees it: the tip is on screen, and it takes
@@ -645,12 +676,9 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertGreaterThanOrEqual(editor.frame.minY, panelTop - 1, "inside the open panel")
         // The draft keeps the keyboard's focus in the panel's editor (read from the element, so it
         // holds whether or not the simulator shows its software keyboard), and where a software
-        // keyboard shows, the editor sits above it.
+        // keyboard showed for the field, it is on screen and the editor above it.
         XCTAssertTrue(waitForFocus(editor, true, timeout: 3), "the panel's editor keeps the draft's focus")
-        let keyboard = app.keyboards.firstMatch
-        if keyboard.exists {
-            XCTAssertLessThanOrEqual(editor.frame.maxY, keyboard.frame.minY + 1, "above the keyboard")
-        }
+        waitForTheKeyboardBack(under: editor, in: app, failure: "the panel's editor holds still above the keyboard")
     }
 
     /// Signed in, a draft whose scroll room is larger than the open distance, at its top: a drag up
@@ -788,20 +816,29 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertFalse(app.buttons["chatClose"].exists, "control: the press opened nothing")
     }
 
-    /// Puts the caret at the start of a one-line text with the long press of
-    /// `testLongPressInTheFocusedFieldMovesTheCaret`, and whether a mark typed next lands first; the
-    /// mark is deleted again, and it waits for the keyboard back as `topLine` does. A tap would not
+    /// Puts the caret at the start of the one-line `original` with the long press of
+    /// `testLongPressInTheFocusedFieldMovesTheCaret`, and checks it: a mark typed next lands first,
+    /// its Delete gives back exactly `original` with the field still focused, and no edit menu is
+    /// left for the next gesture. It waits for the keyboard back as `topLine` does. A tap would not
     /// do: on a one-line text whose caret is already at its end, the tap at its start shows the edit
     /// menu and leaves the caret at the end (UI run 2026-11-23).
-    private func caretToTheStart(of text: XCUIElement, in app: XCUIApplication) -> Bool {
+    private func caretToTheStart(of text: XCUIElement, holding original: String, in app: XCUIApplication,
+                                 file: StaticString = #filePath, line: UInt = #line) {
         text.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: Self.caretPressInset, dy: 0))
             .press(forDuration: Self.textLongPressHold)
         text.typeText(Self.lineMark)
-        let value = text.value as? String ?? ""
+        let marked = text.value as? String
         text.typeText(XCUIKeyboardKey.delete.rawValue)
-        waitForTheKeyboardBack(under: text, in: app)
-        return value.hasPrefix(Self.lineMark)
+        waitForTheKeyboardBack(under: text, in: app, file: file, line: line)
+        XCTAssertEqual(marked, Self.lineMark + original, "control: the long press put the caret at the text's start", file: file, line: line)
+        XCTAssertEqual(text.value as? String, original, "control: the mark's Delete gave the text back as it was", file: file, line: line)
+        XCTAssertTrue(markerReads(focused: true, in: app), "control: the field kept its focus", file: file, line: line)
+        XCTAssertFalse(app.descendants(matching: .any)[Self.editMenuItem].exists,
+                       "control: no edit menu is left for the held press", file: file, line: line)
     }
+
+    /// An item of the text's edit menu (Select, Select All, AutoFill), found by its label.
+    private static let editMenuItem = "Select All"
 
     /// One short line, typed so the caret ends after it, and its last word.
     private static let caretPhrase = "Lunch works"
@@ -846,7 +883,7 @@ final class ChatSwipeUITests: XCTestCase {
         // The caret starts at the text's start (`caretToTheStart`), away from both places the
         // text's long press can leave it: on the words under the finger, or at the text's end,
         // where it follows a finger moved above the one-line text.
-        XCTAssertTrue(caretToTheStart(of: typed, in: app), "control: the caret is at the text's start before the press")
+        caretToTheStart(of: typed, holding: Self.shortQuestion, in: app)
         // Both ends from one read of the field's frame (`textScroll`).
         let frame = typed.frame
         let onTheWords = app.coordinate(withNormalizedOffset: .zero)
@@ -863,6 +900,7 @@ final class ChatSwipeUITests: XCTestCase {
         let marked = typedField(containing: Self.lineMark, in: app)
         XCTAssertTrue(marked.waitForExistence(timeout: 5), "control: the mark went into the field")
         let value = marked.value as? String ?? ""
+        XCTAssertEqual(value.components(separatedBy: Self.lineMark).count - 1, 1, "control: the field holds one mark: \(value)")
         XCTAssertEqual(value.replacingOccurrences(of: Self.lineMark, with: ""), Self.shortQuestion,
                        "control: the field holds the question and the mark")
         XCTAssertNotEqual(value, Self.lineMark + Self.shortQuestion,
@@ -1564,8 +1602,10 @@ final class ChatSwipeUITests: XCTestCase {
     /// back on screen. Only while no keyboard of a software keyboard's size has been seen in this
     /// test, on screen or parked below it (a simulator that shows none), does a field holding still
     /// for longer than the keyboard takes to come back count. A software keyboard that stays parked
-    /// or covers the field fails at the deadline.
-    private func waitForTheKeyboardBack(under element: XCUIElement, in app: XCUIApplication) {
+    /// or covers the field fails at the deadline, with `failure`.
+    private func waitForTheKeyboardBack(under element: XCUIElement, in app: XCUIApplication,
+                                        failure: String = "control: the field holds still above the keyboard after the typing",
+                                        file: StaticString = #filePath, line: UInt = #line) {
         let keyboard = app.keyboards.firstMatch
         var last: CGRect?
         var keys: CGRect?
@@ -1590,8 +1630,8 @@ final class ChatSwipeUITests: XCTestCase {
             }
             RunLoop.current.run(until: Date().addingTimeInterval(Self.keyboardBackPollStep))
         } while Date() < deadline
-        XCTFail("control: the field holds still above the keyboard after the typing (field \(String(describing: last)), "
-                + "keyboard \(String(describing: keys)), software keyboard seen \(sawSoftwareKeyboard))")
+        XCTFail("\(failure) (field \(String(describing: last)), "
+                + "keyboard \(String(describing: keys)), software keyboard seen \(sawSoftwareKeyboard))", file: file, line: line)
     }
 
     /// Whether a keyboard of a software keyboard's size was seen in this test, once a field took
