@@ -77,15 +77,19 @@ struct ChatThreadView: View {
     /// The collapsed field's height, notices and chips included: the height of the bottom bar,
     /// whose inset keeps the last bubble and the jump button above the field. The field grows to six
     /// lines, so it is measured; the open panel keeps the last resting height, and a drag's swell
-    /// never reaches it (`pill(on:)` takes the swell back out of the layout), so the chat does not
-    /// move under either.
+    /// never reaches it (`pill(on:)` takes the swell back out of the layout, and a floating-point
+    /// remainder of that is the same height, `pillHeightMoved`), so the chat does not move under
+    /// either.
     @State private var pillHeight = ChatViewLayout.pillStartHeight
     /// The chat's own height: the opened pill grows upward out of the bottom bar into it.
     @State private var chatAreaHeight: CGFloat = 0
     /// A drag up on the collapsed field (`ChatFieldDrag`, `ChatFieldPan`): reset however the drag
     /// ends, a cancelled one included, with the pill's spring, so the swell always springs back
-    /// (`fieldDragEnded`).
-    @State private var fieldDragProgress = ChatFieldDrag.Progress()
+    /// (`fieldDragEnded`). Its progress is read only in modifiers (`ChatFieldDrag.Model`), never
+    /// in this body.
+    @State private var fieldDrag = ChatFieldDrag.Model()
+    /// Cuts off a drag on the field the panel opened under (`ChatFieldPan.Cut`).
+    @State private var fieldPanCut = ChatFieldPan.Cut()
     @State private var chatInputFocused = false
     @State private var chatWorking = false
     /// The ready AI Suggestion's compose card: the email it answers, and how it opens.
@@ -96,8 +100,6 @@ struct ChatThreadView: View {
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet.
     @State private var fieldComposeOpened = false
-    /// Bumps to empty the field.
-    @State private var fieldClearCount = 0
     /// The chat's replies still in the outbox (`ChatUnsentReply`), read from the database.
     @State private var unsentReplies: [ChatUnsentReply] = []
     /// Who the next reply goes to; Reply All until changed in Reply to.
@@ -111,9 +113,9 @@ struct ChatThreadView: View {
     @State private var headerBottom = -CGFloat.infinity
     @State private var pillTop = CGFloat.infinity
     @State private var showsMove = false
-    /// Whether the field's drag tip waits for room: `ViewThatFits` picked its empty stand-in.
-    @State private var tipWaitsForRoom = false
     @Environment(\.dismiss) private var dismiss
+    /// The app's accounts: a new email's card opens from its bound account, looked up here.
+    @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Held only while a grow is pending: set when the AI Suggestion's row becomes Writing, cleared
     /// inside the fill's `withAnimation` (`showSuggestion`), so the working bubble filling in is one
@@ -271,6 +273,7 @@ struct ChatThreadView: View {
                 }
                 .disabled(thread.newest == nil)
                 .accessibilityLabel("Forward")
+                .accessibilityIdentifier(Self.forwardId)
             }
         }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
@@ -308,14 +311,6 @@ struct ChatThreadView: View {
             guard didInitialScroll, isOnScreen else { return }
             askForSummaries()
         }
-        .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
-            guard newId != nil, let req = AgentToolRouter.shared.pendingCompose else { return }
-            // Asked for in a reply field: the agent's closing words open nothing. Who the card goes
-            // to travels with the request (`fieldReply`); this chat's own state decides nothing.
-            fieldComposeOpened = req.fieldReply != nil
-            agentCompose = req
-            AgentToolRouter.shared.pendingCompose = nil
-        }
         .sheet(item: $cardMessage) { msg in
             // Today's detail of that email, from the bottom; swipe down to return.
             NavigationStack {
@@ -331,10 +326,10 @@ struct ChatThreadView: View {
             // suggestion through the outbox.
             ready.compose.composeView(
                 replyTo: ready.message, suggestion: ready.suggestion, draftId: ready.draftId,
-                onAgentOutcome: { _ in })
+                openedOn: composeScreen(answering: ready.message), onAgentOutcome: { _ in })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
-        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
+        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }
         .sheet(isPresented: $showsReplyTo) {
             ChatReplyToSheet(
                 replyPeople: thread.replyPeople, target: replyTarget,
@@ -375,7 +370,7 @@ struct ChatThreadView: View {
                         }
                         // Replies still in the outbox.
                         ForEach(unsentReplies) { reply in
-                            ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })
+                            ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo() })
                         }
                         // The AI Suggestion, where the reply lands once sent: the working bubble
                         // while it is written, then the ghost.
@@ -534,7 +529,7 @@ struct ChatThreadView: View {
                         .overlay(alignment: .bottom) {
                             pill(on: newest)
                                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                                    if !chatExpanded { pillHeight = height }
+                                    if !chatExpanded, Self.pillHeightMoved(from: pillHeight, to: height) { pillHeight = height }
                                 }
                                 // ...and above the reply field.
                                 .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
@@ -846,6 +841,9 @@ struct ChatThreadView: View {
     /// The reply field's container, as tests find it.
     static let replyPillId = "chatReplyPill"
 
+    /// The toolbar's Forward, as tests find it.
+    static let forwardId = "chatForward"
+
     /// The AI Suggestion's row, from `suggestionPhase`. The working bubble filling in grows the row
     /// into the ghost over `ChatSuggestionConfig.fillDuration`, and while the landing holds its
     /// target the re-pin scroll runs in the same transaction, so the growing row stays above the
@@ -961,34 +959,37 @@ struct ChatThreadView: View {
                 replyField: ChatReplyField(
                     example: ChatReplyField.example(shown: shown, configured: example),
                     isNoReply: isNoReply,
-                    clearCount: fieldClearCount,
                     onlyTo: replyTarget.only,
                     tutorialMove: tutorialMove(thread),
-                    swell: fieldDragProgress.swell,
+                    drag: fieldDrag,
                     // The drag's VoiceOver equivalent (decision 12: every chat swipe has a named
                     // action), on the text field VoiceOver focuses; not over the panel or the tutorial.
                     showChat: chatExpanded || TutorialCoordinator.shared.isRunning
                         ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } },
                     suggestion: shown),
-                onFieldSend: { _ in fieldComposeOpened = false })
+                onFieldSend: { _ in fieldComposeOpened = false },
+                onAgentCompose: openAgentCompose,
+                composeFromAccountId: viewModel.message?.accountId,
+                composeHostCovered: isAnyPresentation)
             // Debug UI tests only: the glass's top, swell included (`ChatFieldDragMarker`).
             .modifier(ChatFieldDragMarker.Glass())
             // The swell is not the field's room: its glass grows upward, and the same swell is taken
             // back out of the layout here, springing back in the same transaction, so the field's
             // measured height, the bar, its inset and the chat never move under a drag.
-            .padding(.top, -fieldDragProgress.swell)
+            .modifier(ChatFieldDrag.Swell(model: fieldDrag, sign: -1))
             // Drag the field up: it swells under the finger and opens the TabMail chat panel. A
             // UIKit pan, so once it starts the field's text view loses the touch and a drag never
             // focuses the field (`ChatFieldPan`). Not in the tutorial, whose steps open the chat
             // themselves.
             .gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning,
-                                  moved: fieldDragMoved, ended: fieldDragEnded))
-            .onChange(of: fieldDragProgress.isDragging) { _, dragging in fieldDragChanged(dragging) }
+                                  cut: fieldPanCut, moved: fieldDragMoved, ended: fieldDragEnded))
+            .modifier(ChatFieldDrag.Watch(model: fieldDrag) { fieldDragChanged($0) })
             // Debug UI tests only: what the drag did to the chat (`ChatFieldDragMarker`).
-            .modifier(ChatFieldDragMarker.Field(dragging: fieldDragProgress.isDragging))
-            // A tap on the field (it takes focus) or the panel opening ends the tip.
+            .modifier(ChatFieldDragMarker.Field(model: fieldDrag))
+            // A tap on the field (it takes focus) or the panel opening ends the tip. The panel
+            // opening under a held drag (an agent answer, a notification) also cuts that drag off.
             .onChange(of: chatInputFocused) { _, focused in if focused { ChatFieldDragTip.close() } }
-            .onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close() } }
+            .onChange(of: chatExpanded) { _, expanded in if expanded { ChatFieldDragTip.close(); fieldPanCut() } }
             // One container, so its frame is the field's own (ChatThreadLayoutTests).
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.replyPillId)
@@ -1013,18 +1014,13 @@ struct ChatThreadView: View {
                         ViewThatFits(in: .vertical) {
                             TipView(ChatFieldDragTip(), arrowEdge: .bottom)
                                 .fixedSize(horizontal: false, vertical: true)
-                                // `ViewThatFits` keeps the candidate it did not pick in the
-                                // accessibility tree: VoiceOver must not read a card that is not
-                                // on screen while the stand-in shows.
-                                .accessibilityHidden(tipWaitsForRoom)
                                 // Debug UI tests only: where the whole card is (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipCard(roomTop: headerBottom, roomBottom: pillTop))
                             Color.clear.frame(height: 0)
-                                .onAppear { tipWaitsForRoom = true }
-                                .onDisappear { tipWaitsForRoom = false }
                                 // Debug UI tests only: the tip waits for room (`ChatFieldDragMarker`).
                                 .modifier(ChatFieldDragMarker.TipWait())
                         }
+                        // VoiceOver can still reach a card waiting for room (tabmail-ios#1255).
                         .frame(height: tipRoom, alignment: .bottom)
                     }
             }
@@ -1032,6 +1028,16 @@ struct ChatThreadView: View {
         .padding(.horizontal, chatExpanded ? 0 : ChatViewLayout.fieldSideInset)
         .padding(.bottom, ChatViewLayout.fieldBottomGap)
         .animation(Self.pillSpring, value: chatExpanded)
+    }
+
+    /// Whether the collapsed field's measured height moved from `old` to `new`: by at least
+    /// `ChatViewLayout.fieldHeightTolerance`. A drag's swell is added inside the field's glass and
+    /// taken back out here, which floating point does not always cancel exactly; that remainder
+    /// once set the bar's height under a held drag, ran the chat's body and built the reply field
+    /// again, and UIKit then scrolled the field's text to its caret (UI run 2026-11-22). The swell
+    /// never moves the field's height (`pill(on:)`), so a remainder that small is the same height.
+    static func pillHeightMoved(from old: CGFloat, to new: CGFloat) -> Bool {
+        abs(new - old) >= ChatViewLayout.fieldHeightTolerance
     }
 
     /// The room above the field stack for its tip: from the header's bottom to the stack's top,
@@ -1043,7 +1049,7 @@ struct ChatThreadView: View {
 
     /// The drag up on the collapsed field moved (`ChatFieldPan`): the field swells under the finger.
     private func fieldDragMoved(_ drag: ChatHorizontalPan.Sample) {
-        fieldDragProgress = ChatFieldDrag.progress(translation: drag.travel)
+        fieldDrag.progress = ChatFieldDrag.progress(translation: drag.travel)
     }
 
     /// The drag up on the collapsed field let go, or was cancelled (`ChatFieldPan`): the swell
@@ -1054,7 +1060,7 @@ struct ChatThreadView: View {
         ChatFieldDragMarker.dragEnded(finished: finished)
         let opens = finished && ChatFieldDrag.opens(letGo: drag)
         withAnimation(Self.pillSpring) {
-            fieldDragProgress = ChatFieldDrag.Progress()
+            fieldDrag.progress = ChatFieldDrag.Progress()
             if opens { chatExpanded = true }
         }
     }
@@ -1107,29 +1113,64 @@ struct ChatThreadView: View {
             .overlay(Capsule().stroke(Palette.separator, lineWidth: 0.5))
     }
 
+    /// A compose card this chat's agent asked for, taken by this chat's pill (ADR-IOS-053 Phase 2),
+    /// never one another screen asked for. The reply the reply field asked for
+    /// (`ComposeRequest.isFieldsOwnReply`, any copy of its email, in any account): the agent's
+    /// closing words open nothing. Who the card goes to travels with the request (`fieldReply`);
+    /// this chat's own state decides nothing.
+    private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
+        // A new email opens from the account bound when its turn started, looked up in the app's
+        // accounts as the card is taken; when it is not there the request ends and nothing opens.
+        guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return }
+        fieldComposeOpened = req.isFieldsOwnReply
+        agentCompose = req
+    }
+
     /// The agent finished a request from the field with something to say: the sheet rises with
-    /// the request and the answer, and the field empties. After a compose card the reply
-    /// was the point, so nothing opens.
+    /// the request and the answer. After a compose card the reply was the point, so nothing opens.
+    /// The field's words are the request's to complete, on its own chat key (`ChatFieldWords`,
+    /// `.answered`), not this view's.
     private func agentAnswered() {
         guard !fieldComposeOpened else { return }
-        fieldClearCount += 1
         withAnimation(Self.pillSpring) { chatExpanded = true }
     }
 
-    /// A compose card from the chat closed. Sent: the field empties; a reply shows as its queued
-    /// email's bubble, read from the outbox.
+    /// A compose card from the chat closed. Sent: a reply shows as its queued email's bubble, read
+    /// from the outbox. The field's words are emptied by the request that opened the card, on its
+    /// own chat key (`AgentToolRouter.enqueueComposeAndAwaitOutcome`).
     private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {
         guard case .sent = outcome else { return }
         // A reply sent clears "Replying only to"; the next one is a Reply All again.
         if replyTo != nil { replyTarget = .replyAll }
-        fieldClearCount += 1
     }
 
+    /// A new email opens from the account bound when its turn started (`ComposeRequest.fromAccountId`),
+    /// read from the same accounts `openAgentCompose` checked, never whichever email this chat shows.
     private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
-        req.composeView(account: context.accounts.first { $0.id == viewModel.message?.accountId }) { outcome in
+        req.composeView(account: navigationStore.accounts.first { $0.id == req.fromAccountId },
+                        openedOn: composeScreen(answering: req.replyTo)) { outcome in
             req.onOutcome(outcome)
             composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)
         }
+    }
+
+    /// The screen this chat records for a compose it opens (`ComposeView.openedOn`).
+    private func composeScreen(answering target: MessageHeader?) -> ComposeScreen? {
+        Self.composeScreen(answering: target, chatMessageIds: messageIds)
+    }
+
+    /// The screen a chat records for a compose it opens, as the compose opens: the chat
+    /// (`ComposeScreen.chat`) only when it shows that compose's send as its bubble, a reply to or a
+    /// forward of one of its own emails. It is decided on the In-Reply-To the send's outbox row will
+    /// carry (`ThreadUtils.outgoingInReplyTo`), by the rule the chat finds its bubbles with
+    /// (`ChatUnsentReply.answers`), so an email whose Message-ID the send cannot carry as the chat
+    /// matches it (blank, or written with spaces inside its brackets) keeps the toast.
+    /// Any other records none, and its send keeps the toast: a new email, and an agent's card for an
+    /// email of another thread (its tools can name any email), whose send shows only in that
+    /// thread's chat. `chatMessageIds`: the normalized Message-IDs of the chat's emails.
+    nonisolated static func composeScreen(answering target: MessageHeader?, chatMessageIds: Set<String>) -> ComposeScreen? {
+        let inReplyTo = ThreadUtils.outgoingInReplyTo(parentRfc822MessageId: target?.rfc822MessageId)
+        return ChatUnsentReply.answers(inReplyTo, in: chatMessageIds) ? .chat : nil
     }
 }
 

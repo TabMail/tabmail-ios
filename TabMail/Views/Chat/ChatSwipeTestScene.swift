@@ -53,8 +53,8 @@ struct ChatSwipeTestScene: View {
     /// The email "Remove a bubble" takes out of the chat.
     static let removedIndex = 1
     /// How long after "Remove a bubble" the email leaves: long enough for a test to open the chat
-    /// and that bubble's actions first.
-    private static let removalDelay: Duration = .seconds(8)
+    /// and that bubble's actions first, on a simulator loaded by other runs (8 s ran out there).
+    private static let removalDelay: Duration = .seconds(15)
     /// `--chat-swipe-late-suggestion`: a strip under the whole navigation stack holds "Release the
     /// AI Suggestion", which writes the newest email's AI Suggestion when the test taps it, so the
     /// test decides that it lands only after its drag or jump has come to rest.
@@ -289,8 +289,10 @@ struct ChatSwipeTestScene: View {
             let accountID = Self.accountID
             let now = Date()
             try await AppDatabase.dbPool.write { db in
-                // Each launch owns only this synthetic account's fixture rows.
+                // Each launch owns only this synthetic account's fixture rows, its kept words
+                // included, so every run starts with an empty field.
                 try MessageHeader.filter(Column("accountId") == accountID).deleteAll(db)
+                try ChatFieldWords.deleteAccount(accountID, db: db)
                 if Self.savedDraft { try Draft.filter(Column("accountId") == accountID).deleteAll(db) }
                 var account = Account(emailAddress: "me@example.com", displayName: "Chat swipe fixture", provider: .imap)
                 account.id = accountID

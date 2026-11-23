@@ -241,6 +241,8 @@ final class DemoModeService {
         await AccountManager.shared.unregisterDemoProviders(accountId: DemoSeed.demoAccountId)
 
         await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
+        // The demo's unsent chat words: the next demo's chats have the same keys (ADR-IOS-117).
+        ChatFieldWords.shared.forgetDemo()
         if let db = AppDatabase.shared.withLock({ $0 }) {
             do {
                 try await db.dbPool.write { conn in try DemoSeed.wipe(conn) }

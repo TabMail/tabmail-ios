@@ -445,6 +445,7 @@ actor SyncEngine {
         let t2 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
             runPurgeOrphanedAICache(dbPool: dbPool)
+            runPurgeOrphanedChatFieldWords(dbPool: dbPool)
         }
         let t3 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {

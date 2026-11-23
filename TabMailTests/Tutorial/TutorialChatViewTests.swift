@@ -1084,7 +1084,7 @@ struct TutorialChatViewWiringTests {
     @Test("The tutorial's field holds the request and nothing else: never the AI Suggestion")
     func fieldText() {
         let field = { (move: TutorialCoordinator.FieldMove?) in
-            ChatReplyField(example: nil, isNoReply: false, clearCount: 0, tutorialMove: move)
+            ChatReplyField(example: nil, isNoReply: false, tutorialMove: move)
         }
         #expect(DynamicIslandChat.tutorialFieldText(field(.tapSuggestion)) == nil, "the move is a tap on the ghost")
         #expect(DynamicIslandChat.tutorialFieldText(field(.ask(.saveReplyAsTemplate)))

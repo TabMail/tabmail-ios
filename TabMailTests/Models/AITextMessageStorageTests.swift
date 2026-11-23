@@ -35,6 +35,47 @@ struct AITextMessageStorageTests {
         #expect(applied.filter { order.contains($0) } == order)
     }
 
+    @Test("v109 (the chat field's words) registers right after v108: an install at v108 with a stored change command upgrades to the words table and keeps the command")
+    func chatFieldWordsFollowsReplyChangeCommand() throws {
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        // Registration order, which is the order an upgrade runs them (the ledger's own listing is
+        // not: it can come back sorted by name).
+        let identifiers = migrator.migrations
+        let v108 = try #require(identifiers.firstIndex(of: "v108_addReplyChangeCommand"))
+        let v109 = try #require(identifiers.firstIndex(of: "v109_addChatFieldWords"))
+        #expect(v109 == v108 + 1, "v109 registers right after v108: \(identifiers.suffix(4))")
+
+        // A device on the release with v108: a reply's change command is stored.
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        try migrator.migrate(db, upTo: "v108_addReplyChangeCommand")
+        let wordsAtV108 = try db.read { try $0.tableExists("chatFieldWords") }
+        #expect(!wordsAtV108, "control: the words table is not there before v109")
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "1", rfc822MessageId: "cmd@example.com")
+        try db.write {
+            try $0.execute(sql: "UPDATE messageHeader SET replyChangeCommand = ? WHERE id = ?",
+                           arguments: ["ask for the agenda", header.id])
+        }
+
+        // The upgrade.
+        try migrator.migrate(db)
+        let wordsAfter = try db.read { try $0.tableExists("chatFieldWords") }
+        #expect(wordsAfter, "the upgrade adds the words table")
+        let command = try db.read {
+            try String.fetchOne($0, sql: "SELECT replyChangeCommand FROM messageHeader WHERE id = ?", arguments: [header.id])
+        }
+        #expect(command == "ask for the agenda", "the stored change command is kept")
+        try db.write {
+            try ChatFieldWordsRecord(sessionId: "thread:acc1:t1", words: "Unsent words", updatedAt: Date()).insert($0)
+        }
+        let words = try db.read { try ChatFieldWordsRecord.fetchOne($0, key: "thread:acc1:t1")?.words }
+        #expect(words == "Unsent words", "the new table takes a chat's words")
+    }
+
     @Test("The header round-trips both text messages")
     func headerRoundTrip() throws {
         let db = try TestDatabase.make()

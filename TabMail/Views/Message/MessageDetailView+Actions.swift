@@ -66,9 +66,19 @@ extension MessageDetailView {
 
     // MARK: - Agent Tool Compose
 
-    var currentAccount: Account? {
-        guard let accountId = viewModel.message?.accountId else { return nil }
-        return try? AppDatabase.dbPool.read { db in try Account.fetchOne(db, key: accountId) }
+    /// Takes a compose card this screen's pill took: a new email opens from the account bound
+    /// when its turn started, looked up in the app's accounts as the card is taken; when it is not
+    /// there the request ends and nothing opens (`AgentToolRouter.canOpen`).
+    func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
+        guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return }
+        agentCompose = req
+    }
+
+    /// The account a new email the agent asked for is sent from: the one bound when its turn
+    /// started (`ComposeRequest.fromAccountId`), never whichever email this screen shows now,
+    /// read from the same accounts `openAgentCompose` checked.
+    func fromAccount(of req: AgentToolRouter.ComposeRequest) -> Account? {
+        navigationStore.accounts.first { $0.id == req.fromAccountId }
     }
 
     func replyAllComposeView(for msg: MessageHeader) -> some View {

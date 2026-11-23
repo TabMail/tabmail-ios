@@ -343,6 +343,20 @@ extension SyncEngine {
         }
     }
 
+    /// Purge the unsent words of chats whose thread has no email left on the device (ADR-IOS-117):
+    /// the thread's AI data rule (`runPurgeOrphanedAICache`), with the same grace, in the same pass.
+    /// Nonisolated — runs entirely off the main thread.
+    nonisolated static func runPurgeOrphanedChatFieldWords(dbPool: PrioritizedDatabase, now: Date = Date()) {
+        do {
+            let purged = try dbPool.write { db in try ChatFieldWords.purgeOrphans(db: db, now: now) }
+            if purged > 0 {
+                BackgroundSyncLogger.logDebug("[ChatFieldWords] Purged \(purged) chats whose thread is gone")
+            }
+        } catch {
+            BackgroundSyncLogger.logDebug("[ChatFieldWords] Purge failed: \(type(of: error))")
+        }
+    }
+
     /// Whether the email an AI cache entry belongs to is still on the device: a header of the
     /// entry's own account, in any folder, carries the entry's `rfc822MessageId` (ADR-IOS-114).
     /// The account is the key's first part (`MessageIdentity.aiCacheKey`: account, folder,

@@ -29,6 +29,7 @@ struct DemoIsolationTests {
             try db.execute(sql: "CREATE TABLE messageAICache (key TEXT)")
             try db.execute(sql: "CREATE TABLE chatTurn (sessionId TEXT)")
             try db.execute(sql: "CREATE TABLE chatHistory (sessionId TEXT)")
+            try db.execute(sql: "CREATE TABLE chatFieldWords (sessionId TEXT)")
             try db.execute(sql: "CREATE TABLE outboxMessage (accountId TEXT)")
             try db.execute(sql: "CREATE TABLE draft (accountId TEXT)")
             try db.execute(sql: "CREATE TABLE pendingOperation (accountId TEXT)")
@@ -47,6 +48,7 @@ struct DemoIsolationTests {
             // Every real session shape must survive: inbox UUID, msg-detail, compose.
             try db.execute(sql: "INSERT INTO chatTurn (sessionId) VALUES ('real-session'), ('msg:real-1:stable'), ('compose:d1')")
             try db.execute(sql: "INSERT INTO chatHistory (sessionId) VALUES ('real-session')")
+            try db.execute(sql: "INSERT INTO chatFieldWords (sessionId) VALUES ('thread:real-1:t1')")
             try db.execute(sql: "INSERT INTO outboxMessage (accountId) VALUES ('real-1')")
             try db.execute(sql: "INSERT INTO draft (accountId) VALUES ('real-1')")
             try db.execute(sql: "INSERT INTO pendingOperation (accountId) VALUES ('real-1')")
@@ -62,6 +64,7 @@ struct DemoIsolationTests {
             // Every demo session shape (scopedSessionId output): inbox, msg-detail, compose.
             try db.execute(sql: "INSERT INTO chatTurn (sessionId) VALUES ('demo:s1'), ('demo:msg:demo-account:stable'), ('demo:compose:d2')")
             try db.execute(sql: "INSERT INTO chatHistory (sessionId) VALUES ('demo:s1')")
+            try db.execute(sql: "INSERT INTO chatFieldWords (sessionId) VALUES ('demo:thread:demo-account:t1')")
             try db.execute(sql: "INSERT INTO outboxMessage (accountId) VALUES (?)", arguments: [demo])
             try db.execute(sql: "INSERT INTO draft (accountId) VALUES (?)", arguments: [demo])
             try db.execute(sql: "INSERT INTO pendingOperation (accountId) VALUES (?)", arguments: [demo])
@@ -94,6 +97,7 @@ struct DemoIsolationTests {
                 "demoCache": try count(db, "messageAICache", "key LIKE '\(demo):%'"),
                 "demoChats": try count(db, "chatTurn", "sessionId LIKE 'demo:%'"),
                 "demoHistory": try count(db, "chatHistory", "sessionId LIKE 'demo:%'"),
+                "demoFieldWords": try count(db, "chatFieldWords", "sessionId LIKE 'demo:%'"),
                 "demoCalOps": try count(db, "pendingCalendarOperation", "accountId = '\(demo)'"),
                 "demoIdMap": try count(db, "chatIdMapping", "realId LIKE '\(demo):%'"),
                 "demoDrafts": try count(db, "draft", "accountId = '\(demo)'"),
@@ -107,6 +111,7 @@ struct DemoIsolationTests {
                 "realCache": try count(db, "messageAICache", "key = 'real-1:k'"),
                 "realChats": try count(db, "chatTurn", "sessionId IN ('real-session', 'msg:real-1:stable', 'compose:d1')"),
                 "realHistory": try count(db, "chatHistory", "sessionId = 'real-session'"),
+                "realFieldWords": try count(db, "chatFieldWords", "sessionId = 'thread:real-1:t1'"),
                 "realCalOps": try count(db, "pendingCalendarOperation", "accountId = 'real-1'"),
                 "realIdMap": try count(db, "chatIdMapping", "realId = 'real-1:INBOX:100'"),
                 "realDrafts": try count(db, "draft", "accountId = 'real-1'"),
@@ -123,6 +128,7 @@ struct DemoIsolationTests {
         #expect(c["demoCache"] == 0)
         #expect(c["demoChats"] == 0)
         #expect(c["demoHistory"] == 0)
+        #expect(c["demoFieldWords"] == 0)
         #expect(c["demoCalOps"] == 0)
         #expect(c["demoIdMap"] == 0)
         #expect(c["demoDrafts"] == 0)
@@ -137,6 +143,7 @@ struct DemoIsolationTests {
         #expect(c["realCache"] == 1)
         #expect(c["realChats"] == 3)
         #expect(c["realHistory"] == 1)
+        #expect(c["realFieldWords"] == 1)
         #expect(c["realCalOps"] == 1)
         #expect(c["realIdMap"] == 1)
         #expect(c["realDrafts"] == 1)

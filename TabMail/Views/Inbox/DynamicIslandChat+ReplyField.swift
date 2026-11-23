@@ -90,12 +90,12 @@ extension DynamicIslandChat {
             }
         }
         // A drag up swells the field itself toward the panel, its top following the finger.
-        .padding(.top, field.swell)
+        .modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))
     }
 
     private func replyInput(_ field: ChatReplyField) -> some View {
         inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask",
-                   showChat: field.showChat)
+                   showChat: field.showChat, focus: .replyField)
     }
 
     /// The "e.g." line shows under the empty field, signed in, while nothing is being said.

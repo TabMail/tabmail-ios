@@ -85,12 +85,14 @@ enum ComposeDraftGuards {
     /// the reply the user tapped, or an agent's text) always wins; only without one
     /// does a reply read the email row's current suggestion, which protects against
     /// caller-side staleness when background AI, P2P sync, or a prior in-place edit
-    /// updated the row after the caller's snapshot.
+    /// updated the row after the caller's snapshot. `onlyToChosen`: a reply only to the people
+    /// chosen in the chat's Reply to never reads it: the stored suggestion was written for the
+    /// email's whole Reply All audience (ADR-IOS-114 decision 11).
     static func suggestionToShow(
-        given: ReplyResult?, isReply: Bool, freshSuggestion: () -> ReplyResult?
+        given: ReplyResult?, isReply: Bool, onlyToChosen: Bool, freshSuggestion: () -> ReplyResult?
     ) -> ReplyResult? {
         if let given { return given }
-        return isReply ? freshSuggestion() : nil
+        return isReply && !onlyToChosen ? freshSuggestion() : nil
     }
 
     /// The row explicit Save persists: the existing row with the authored fields
@@ -1070,6 +1072,7 @@ enum ComposeDraftGuards {
 }
 
 struct ComposeView: View {
+    static let sendButtonId = "composeSend"
     /// Immutable authored values captured in one MainActor turn immediately
     /// before the agent-vs-Send claim. No live compose field is read afterward.
     private struct AuthoredSendSnapshot {
@@ -1107,6 +1110,10 @@ struct ComposeView: View {
         let isReplyAll: Bool
         /// The guided tutorial's practice reply: sent with no undo hold.
         let isTutorialPracticeReply: Bool
+        /// Undo shows on the chat's "Sending" bubble, not the toast
+        /// (`PendingSendService.sendHasBubbleUndo`), from the setting read at the Send tap and the
+        /// screen this compose was opened on (`openedOn`).
+        let sendHasBubbleUndo: Bool
         let outbound: DraftMessage
     }
     @State private var recipients = ComposeDraftGuards.Recipients()
@@ -1252,6 +1259,11 @@ struct ComposeView: View {
     /// Opened as Reply All (#915). Persisted on the draft row and the outbox row
     /// so the original is marked reply-all on the providers that record it.
     var isReplyAll: Bool = false
+    /// A reply only to the people chosen in the chat's Reply to (the agent's reply carries the
+    /// field's choice, `ComposeRequest.fieldReply`). Its words are written for them: the card never
+    /// offers the email's stored AI Suggestion, written for the whole Reply All audience, and
+    /// Recompute writes for the card's people and stores nothing (ADR-IOS-114 decision 11).
+    var onlyToChosen: Bool = false
     var prefillTo: [String]?
     var prefillCc: [String]?
     var prefillBcc: [String]?
@@ -1281,6 +1293,12 @@ struct ComposeView: View {
     /// PORT — process-local Undo reopens only the retained exact Draft
     /// owner/generation reconstructed before confirmed Outbox cancellation.
     var retainedDraftAuthority: PendingSendService.RetainedDraftAuthority?
+    /// The screen this compose was opened on, given as it opens and kept for its whole presentation
+    /// (nil: a screen that names none, or a chat that does not show this compose's send). State, so
+    /// a screen that builds the compose again while it is open (a chat whose emails changed, a merge
+    /// bringing in or taking out the email it answers) never changes it: the first value stays. Read
+    /// at Send to decide who offers the send's Undo (`PendingSendService.sendHasBubbleUndo`).
+    @State private var openedOn: ComposeScreen?
     /// Fires when the user either sends, fails to persist, or dismisses —
     /// exactly once per compose session, via `ComposeOutcomeState.tryResolve`
     /// upstream. Non-agent compose entry points leave this `nil` and the
@@ -1300,6 +1318,7 @@ struct ComposeView: View {
         account: Account? = nil,
         isForward: Bool = false,
         isReplyAll: Bool = false,
+        onlyToChosen: Bool = false,
         prefillTo: [String]? = nil,
         prefillCc: [String]? = nil,
         prefillBcc: [String]? = nil,
@@ -1311,6 +1330,7 @@ struct ComposeView: View {
         openAuthority: LocallyAuthoredDraftOpenAuthority? = nil,
         preparedDraft: Draft? = nil,
         retainedDraftAuthority: PendingSendService.RetainedDraftAuthority? = nil,
+        openedOn: ComposeScreen? = nil,
         onAgentOutcome: (@MainActor (ComposeOutcome) -> Void)? = nil
     ) {
         self.replyTo = replyTo
@@ -1319,6 +1339,7 @@ struct ComposeView: View {
         self.account = account
         self.isForward = isForward
         self.isReplyAll = isReplyAll
+        self.onlyToChosen = onlyToChosen
         self.prefillTo = prefillTo
         self.prefillCc = prefillCc
         self.prefillBcc = prefillBcc
@@ -1330,6 +1351,7 @@ struct ComposeView: View {
         self.openAuthority = openAuthority
         self.preparedDraft = preparedDraft
         self.retainedDraftAuthority = retainedDraftAuthority
+        _openedOn = State(initialValue: openedOn)
         self.onAgentOutcome = onAgentOutcome
         if let preparedDraft {
             var recipients = ComposeDraftGuards.Recipients()
@@ -1695,6 +1717,7 @@ struct ComposeView: View {
                         ProgressView()
                     } else {
                         Button("Send") { trySend() }
+                            .accessibilityIdentifier(Self.sendButtonId)
                             .font(.subheadline)
                             .fontWeight(.semibold)
                             // B1: block Send while attachments failed to load —
@@ -1933,7 +1956,7 @@ struct ComposeView: View {
                 onDiscard: { dismiss() }))
             .overlay { if isCheckingServerCopy { ServerCopyCheckCover() } }
             .alert("Empty Body", isPresented: $showEmptyBodyPrompt) {
-                Button("Send Anyway") { Task { await send() } }
+                Button("Send Anyway") { startSend() }
                 Button("Cancel", role: .cancel) { }
             } message: {
                 Text("The message body is empty. Send anyway?")
@@ -2272,6 +2295,8 @@ struct ComposeView: View {
 
     /// Admitted through the compose agent fence, as an inline edit is: one of the two runs at a
     /// time, so the last gesture admitted lands last and neither replaces the other's newer value.
+    /// In a reply only to the people chosen (`onlyToChosen`) the new reply is written for the
+    /// card's people and stored nowhere (`recomputedReplyForChosen`).
     private func recomputeReply() {
         guard let reply = replyTo, let account = resolvedAccount, agentSendFence.beginAgent() else { return }
         isRecomputing = true
@@ -2279,12 +2304,24 @@ struct ComposeView: View {
         let fence = agentSendFence
         recomputeTask = Task {
             defer { fence.finishAgent() }
-            if let result = await Self.recomputedReply(
-                for: reply, account: account,
-                kbText: PromptStore.shared.kbText(),
-                compositionPrompt: PromptStore.shared.compositionMarkdown(),
-                aiService: ChatPillState.shared.aiService, dbPool: dbPool
-            ) {
+            let recomputed: ReplyResult?
+            if onlyToChosen {
+                // The card's people and From account as the recompute starts, with the email's body
+                // through the one identity-checked read; nil (another email at its address) asks nothing.
+                if let context = await composeEditContextForRequest() {
+                    recomputed = await Self.recomputedReplyForChosen(
+                        context: context, composeEdit: EmailReplyTool.chatComposeEdit)
+                } else {
+                    recomputed = nil
+                }
+            } else {
+                recomputed = await Self.recomputedReply(
+                    for: reply, account: account,
+                    kbText: PromptStore.shared.kbText(),
+                    compositionPrompt: PromptStore.shared.compositionMarkdown(),
+                    aiService: ChatPillState.shared.aiService, dbPool: dbPool)
+            }
+            if let result = recomputed {
                 // The card closed meanwhile.
                 guard !Task.isCancelled else { return }
                 shownSuggestion = result
@@ -2384,7 +2421,7 @@ struct ComposeView: View {
         let previous = shownSuggestion
         let edit = Self.suggestionEdit(
             body: newBody, textMessage: textMessage, changeCommand: changeCommand,
-            showingSuggestion: showingSuggestion, isForward: isForward, replyTo: replyTo,
+            showingSuggestion: showingSuggestion, isForward: isForward, onlyToChosen: onlyToChosen, replyTo: replyTo,
             recipients: recipients.pendingCommitted, subject: newSubject ?? subject,
             accountId: selectedAccount?.id, accounts: navigationStore.accounts)
         if let s = newSubject {
@@ -2423,13 +2460,18 @@ struct ComposeView: View {
         let target: MessageHeader?
     }
 
+    /// `onlyToChosen`: the card replies only to the people chosen in the chat's reply field. Its
+    /// words were written for them, never as the email's Reply All suggestion, so no edit of them
+    /// is stored as that suggestion for the card's whole life, even after its recipients are put
+    /// back to everyone and its shown value equals the stored one (ADR-IOS-114 decision 11).
     static func suggestionEdit(
         body newBody: String?, textMessage: String?, changeCommand: String?,
-        showingSuggestion: Bool, isForward: Bool, replyTo: MessageHeader?,
+        showingSuggestion: Bool, isForward: Bool, onlyToChosen: Bool, replyTo: MessageHeader?,
         recipients: ComposeDraftGuards.Recipients, subject: String, accountId: String?, accounts: [Account]
     ) -> SuggestionEdit {
         let edited = newBody.map { ReplyResult(body: $0, textMessage: textMessage, changeCommand: changeCommand) }
         guard edited != nil else { return SuggestionEdit(edited: nil, target: nil) }
+        guard !onlyToChosen else { return SuggestionEdit(edited: edited, target: nil) }
         let target = suggestionEditTarget(
             showingSuggestion: showingSuggestion, isForward: isForward, replyTo: replyTo,
             recipients: recipients, subject: subject, accountId: accountId, accounts: accounts)
@@ -2569,6 +2611,27 @@ struct ComposeView: View {
             BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")
         } catch {
             BackgroundSyncLogger.logDebug("[Compose] Recompute reply failed: \(error)")
+        }
+        return nil
+    }
+
+    /// What `recomputeReply` does in a reply only to the people chosen in the chat's Reply to
+    /// (`onlyToChosen`): a new reply written as the agent's reply tool writes one asked for with
+    /// no request (`EmailReplyTool`): the compose edit with an empty draft and an empty request, in
+    /// `context`, the card's (its people, its From account, the email's body). It is never stored:
+    /// the email's AI Suggestion is the one written for its whole Reply All audience. Nil when
+    /// none was written. Internal for testability.
+    nonisolated static func recomputedReplyForChosen(
+        context: ComposeEditContext, composeEdit: EmailReplyTool.ComposeEdit
+    ) async -> ReplyResult? {
+        do {
+            let result = try await composeEdit(context, "", "", "")
+            if let body = result.body, !body.isEmpty {
+                return ReplyResult(body: body, textMessage: result.textMessage, changeCommand: result.changeCommand)
+            }
+            BackgroundSyncLogger.logDebug("[Compose] Recompute for the people chosen returned no body")
+        } catch {
+            BackgroundSyncLogger.logDebug("[Compose] Recompute for the people chosen failed: \(error)")
         }
         return nil
     }
@@ -3289,6 +3352,7 @@ struct ComposeView: View {
         // caller's snapshot was captured.
         let suggestionToShow = ComposeDraftGuards.suggestionToShow(
             given: Self.givenSuggestion(suggestion, suggestedBody: suggestedBody), isReply: replyTo != nil && !isForward,
+            onlyToChosen: onlyToChosen,
             freshSuggestion: {
                 guard let reply = replyTo else { return nil }
                 // Only while the row is still the email replied to: another email seated at its
@@ -3517,13 +3581,24 @@ struct ComposeView: View {
             guard TutorialCoordinator.shared.admits(
                 .useSuggestion, accountId: replyTo?.accountId, messageId: replyTo?.messageId) else { return }
             acceptVisibleSuggestionIfOffered()
-            Task { await send() }
+            startSend()
         case .sendAsTyped:
-            Task { await send() }
+            startSend()
         }
     }
 
-    private func send() async {
+    /// Starts this compose's send, for every way the user sends it: Send, Send with the shown
+    /// suggestion, and the Empty Body alert's Send Anyway. The chat view setting is read here, at
+    /// the tap, before anything suspends (snapshot settings at operation start).
+    private func startSend() {
+        let chatViewActive = ChatViewConfig.isActive
+        Task { await send(chatViewActive: chatViewActive) }
+    }
+
+    /// `chatViewActive` is the chat view setting read at the Send tap, before anything suspends
+    /// (snapshot settings at operation start); with `openedOn`, given as this compose opened, it
+    /// decides who offers this send's Undo.
+    private func send(chatViewActive: Bool) async {
         // An explicit Save may be suspended while settling forwarded attachments.
         // Sending concurrently would race two durable dispositions of one compose.
         guard !isSavingDraft else { return }
@@ -3646,6 +3721,8 @@ struct ComposeView: View {
             isForward: isForward,
             isReplyAll: isReplyAll,
             isTutorialPracticeReply: isPracticeReply,
+            sendHasBubbleUndo: PendingSendService.sendHasBubbleUndo(
+                chatViewActive: chatViewActive, openedOn: openedOn, inReplyTo: outbound.inReplyTo),
             outbound: outbound)
 
         // Capture existing draft (server-side metadata preserved through save-before-send).
@@ -3845,7 +3922,8 @@ struct ComposeView: View {
             draftId: snapshot.draftId,
             instanceEpoch: snapshot.instanceEpoch,
             toSummary: toSummary,
-            holdUntil: queued.holdUntil
+            holdUntil: queued.holdUntil,
+            owner: snapshot.sendHasBubbleUndo ? .bubble : .toast
         )
         sendWasAdmitted = true
 

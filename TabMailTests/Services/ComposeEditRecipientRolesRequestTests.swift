@@ -93,9 +93,8 @@ struct ComposeEditRecipientRolesRequestTests {
             #expect(vars["mode"] as? String == "edit_new")
 
             let recipientsJSON = try #require(vars["recipients_json"] as? String)
-            let recipients = try #require(
-                try JSONSerialization.jsonObject(with: Data(recipientsJSON.utf8)) as? [[String: Any]]
-            )
+            let decoded = try JSONSerialization.jsonObject(with: Data(recipientsJSON.utf8))
+            let recipients = try #require(decoded as? [[String: Any]])
             #expect(recipients.compactMap { $0["email"] as? String } == [Self.primary])
             #expect(recipients.count == 1)
 
@@ -124,9 +123,8 @@ struct ComposeEditRecipientRolesRequestTests {
             guard messages.count == 1 else { return }
             let vars = messages[0]
             let recipientsJSON = try #require(vars["recipients_json"] as? String)
-            let recipients = try #require(
-                try JSONSerialization.jsonObject(with: Data(recipientsJSON.utf8)) as? [[String: Any]]
-            )
+            let decoded = try JSONSerialization.jsonObject(with: Data(recipientsJSON.utf8))
+            let recipients = try #require(decoded as? [[String: Any]])
             #expect(recipients.compactMap { $0["email"] as? String } == [Self.primary])
             #expect(recipients.count == 1)
             #expect(vars["original_to"] as? String == "Sam Lee <\(Self.primary)>")
@@ -194,20 +192,24 @@ struct ComposeEditRecipientRolesRequestTests {
             case .compose:
                 return try await EmailComposeTool(context: ctx).execute(arguments: [
                     "to": .array([.string(Self.copied)]), "request": request,
-                ])
+                ], invocation: ComposeTestOrigin.invocation)
             case .forward:
                 return try await EmailForwardTool(context: ctx).execute(arguments: [
                     "unique_id": .int(21), "to": .array([.string(Self.copied)]), "request": request,
-                ])
+                ], invocation: ComposeTestOrigin.invocation)
             case .reply:
                 return try await EmailReplyTool(context: ctx).execute(arguments: [
                     "unique_id": .int(21), "request": request,
-                ])
+                ], invocation: ComposeTestOrigin.invocation)
             }
         }
         let deadline = Date().addingTimeInterval(5)
-        while router.pendingCompose == nil, Date() < deadline { await Task.yield() }
-        guard let req = router.pendingCompose else {
+        var taken = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+        while taken == nil, Date() < deadline {
+            await Task.yield()
+            taken = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+        }
+        guard let req = taken else {
             Issue.record("Tool did not open a compose card")
             task.cancel()
             _ = try? await task.value
@@ -236,11 +238,15 @@ struct ComposeEditRecipientRolesRequestTests {
                 "recipients": .array([.dictionary(["name": .string("Sam Lee"), "email": .string(Self.primary)])]),
                 "cc": .array([.dictionary(["name": .string("Pat Kim"), "email": .string(Self.copied)])]),
                 "request": .string("Ask about moving the offsite to Friday"),
-            ])
+            ], invocation: ComposeTestOrigin.invocation)
         }
         let deadline = Date().addingTimeInterval(5)
-        while router.pendingCompose == nil, Date() < deadline { await Task.yield() }
-        guard let req = router.pendingCompose else {
+        var taken = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+        while taken == nil, Date() < deadline {
+            await Task.yield()
+            taken = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+        }
+        guard let req = taken else {
             Issue.record("Tool did not open a compose card")
             task.cancel()
             _ = try? await task.value
