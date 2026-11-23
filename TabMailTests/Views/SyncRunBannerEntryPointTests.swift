@@ -99,6 +99,10 @@ struct SyncRunBannerEntryPointTests {
         await AccountManager.shared.clearAuthFailed(world.accountA.id)
         await AccountManager.shared.clearAuthFailed(world.accountB.id)
         let state = AccountManagerState.shared
+        // A phase a run left for its holder to clear (a test's synthetic holder
+        // never does).
+        state.setSyncPhase(nil, forAccount: world.accountA.id)
+        state.setSyncPhase(nil, forAccount: world.accountB.id)
         state.syncErrorBanner = saved.0
         state.lastSyncCompletedAt = saved.1
         state.lastSyncFailed = saved.2
@@ -360,10 +364,12 @@ struct SyncRunBannerEntryPointTests {
 
     /// A unified-inbox refresh whose change read finds an account busy (its
     /// follow-up flag set instead) did not read that account: it is a partial
-    /// run and never clears the banner. RED while a busy change read counted as
-    /// read. A pass that queued behind A's listing takes A's turn when the
-    /// listing ends, so A's change read, which follows its listing, finds it
-    /// held. With A free, the same refresh clears.
+    /// run and never clears the banner, and it still advances "Updated" (it
+    /// listed the folders on screen). RED while a busy change read counted as
+    /// read, and with a busy refresh left out of the completion stamp. A pass
+    /// that queued behind A's listing takes A's turn when the listing ends, so
+    /// A's change read, which follows its listing, finds it held. With A free,
+    /// the same refresh clears.
     @Test("a unified-inbox refresh whose change read finds an account busy never clears")
     func busyChangeReadRefreshNeverClears() async throws {
         try await withWorld { world in try await withAppSchedulerRecording { stages in
@@ -402,14 +408,19 @@ struct SyncRunBannerEntryPointTests {
                     try? await Task.sleep(for: .milliseconds(5))
                 }
             }
+            let state = AccountManagerState.shared
+            let stampBefore = Date(timeIntervalSinceNow: -3600)
+            state.lastSyncCompletedAt = stampBefore
             await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
             await world.providerA.setFetchMessagesHook(nil)
             let heldAfterListing = log.snapshot == ["start held"]
             let readsWhileHeld = await world.providerA.changeRequests.count
             let wanted = await engine.followUpWanted(accountId: accountId)
+            let stamped = (state.lastSyncCompletedAt ?? .distantPast) > stampBefore
             #expect(heldAfterListing, "precondition: a pass took A's turn when its listing ended")
             #expect(readsWhileHeld == 0 && wanted, "precondition: A's change read found the account busy")
             #expect(banner == InboxErrorBanner.genericMessage, "a refresh that did not read a busy account cleared the banner")
+            #expect(stamped, "a refresh that found an account busy did not advance \"Updated\"")
 
             // The flag's follow-up (the app's scheduler only records its asks),
             // then the same refresh with A free.
@@ -568,10 +579,14 @@ struct SyncRunBannerEntryPointTests {
     }
 
     /// Waits until the app's scheduler recorded `count` asks for the account's
-    /// follow-up, and expects exactly that many.
+    /// follow-up, then until no pass of the account runs and an ask already on
+    /// its way to the main actor has landed, and expects exactly that many.
     private func waitForAsks(_ count: Int, of accountId: String, _ stages: SyncFollowUpTests.Stages) async throws {
         let ask = "follow-up \(accountId)"
         try await waitUntil { stages.triggers.filter { $0 == ask }.count >= count }
+        let engine = await AccountManager.shared.syncEngine
+        try await waitUntil { await !engine.syncPassRunning.contains(accountId) }
+        try await Task.sleep(for: .milliseconds(200))
         let asks = stages.triggers.filter { $0 == ask }.count
         #expect(asks == count, "the app's scheduler was asked \(asks) times for the follow-up, not \(count)")
     }
@@ -799,6 +814,8 @@ struct SyncRunBannerEntryPointTests {
             // the other pass, which then ends.
             painted.continuation.yield(true)
             try await waitUntil { await engine.syncPassWaiters[accountId]?.count == 1 }
+            let inLine = await engine.syncPassWaiters[accountId]?.count == 1
+            #expect(inLine, "precondition: after the paint the follow-up waits in line behind the other pass")
             other.continuation.yield()
             await otherPass.value
             await followUp.value
@@ -810,8 +827,8 @@ struct SyncRunBannerEntryPointTests {
 
     /// Fast Sync in the foreground: catch-up slices hold the account's turn back
     /// to back. A push that finds the account busy flags it, and its follow-up
-    /// reads between two slices (it waits for the running slice, as the push's
-    /// own read did), not at the next poll after Fast Sync. RED with Fast Sync
+    /// waits for the running slice and reads before the next one (Fast Sync never
+    /// held back the push's own read), not at the next poll after Fast Sync. RED with Fast Sync
     /// in the follow-up's gate: it started nothing, and the read waited.
     @Test("during Fast Sync a push's follow-up reads between two catch-up slices")
     func followUpReadsBetweenFastSyncSlices() async throws {
@@ -852,6 +869,8 @@ struct SyncRunBannerEntryPointTests {
             let second = OneSyncAtATimeTests.heldPass(
                 engine: engine, accountId: accountId, name: "slice 2", log: log, release: slice2.stream)
             try await waitUntil { await engine.syncPassWaiters[accountId]?.count == 2 }
+            let bothInLine = await engine.syncPassWaiters[accountId]?.count == 2
+            #expect(bothInLine, "precondition: the next slice waits in line behind the follow-up")
             slice1.continuation.yield()
             await first.value
             try await waitUntil { log.snapshot.contains("start slice 2") }
@@ -864,17 +883,31 @@ struct SyncRunBannerEntryPointTests {
         } }
     }
 
+    /// What changes while the scheduler's follow-up waits for its turn.
+    enum GateFlip: String, CaseIterable, Sendable {
+        /// The app leaves the foreground.
+        case background
+        /// Demo mode starts.
+        case demo
+    }
+
     /// The scheduler's own follow-up across a change of the app's state: admitted
-    /// in the foreground, it waits in line; the app leaves before its turn. At
-    /// its turn the scheduler's gate (`followUpMayStart`, the `mayStart` it
-    /// hands the engine) refuses: nothing reads and the flag stays set. The
-    /// next foreground follow-up reads. RED with the scheduler's `mayStart`
-    /// always true: the follow-up read in the background and cleared the flag.
-    @Test("the scheduler's follow-up whose app leaves before its turn reads nothing and keeps the flag")
-    func schedulerFollowUpAcrossAGateFlip() async throws {
+    /// in the foreground, it waits in line; the app leaves, or demo mode starts,
+    /// before its turn. At its turn the scheduler's gate (`followUpMayStart`, the
+    /// `mayStart` it hands the engine) refuses: nothing reads and the flag stays
+    /// set. The next foreground follow-up reads. RED with the scheduler's
+    /// `mayStart` always true: the follow-up read in the background and cleared
+    /// the flag; and with it checking the foreground alone: it read the real
+    /// account under demo mode.
+    @Test("the scheduler's follow-up whose app leaves, or enters demo mode, before its turn reads nothing and keeps the flag",
+          arguments: GateFlip.allCases)
+    func schedulerFollowUpAcrossAGateFlip(flip: GateFlip) async throws {
         try await withWorld { world in try await withAppSchedulerRecording { stages in
             let engine = try await registerA(world)
             let accountId = world.accountA.id
+            let demo = DemoModeStore.shared
+            let savedDemo = demo.isActive
+            defer { demo.isActive = savedDemo }
             let log = OneSyncAtATimeTests.PassLog()
             let release = AsyncStream<Void>.makeStream()
             defer { release.continuation.finish() }
@@ -891,16 +924,27 @@ struct SyncRunBannerEntryPointTests {
             let inLine = await engine.syncPassWaiters[accountId]?.count == 1
             #expect(inLine, "precondition: the follow-up waits in line")
 
-            scheduler.applicationStateForTesting = .background
+            switch flip {
+            case .background: scheduler.applicationStateForTesting = .background
+            case .demo: demo.isActive = true
+            }
             release.continuation.yield()
             await holder.value
             await followUp.value
             let readsAway = await world.providerA.changeRequests.count
             let wantedAway = await engine.followUpWanted(accountId: accountId)
-            #expect(readsAway == 0, "the follow-up read after the app had left")
-            #expect(wantedAway, "the follow-up cleared the flag with nothing read")
-            // The flag, and the release of the still-flagged account.
-            try await waitForAsks(2, of: accountId, stages)
+            #expect(readsAway == 0, "the follow-up read after the gate closed (\(flip.rawValue))")
+            #expect(wantedAway, "the follow-up cleared the flag with nothing read (\(flip.rawValue))")
+            // The flag, and the release of the still-flagged account. Under demo
+            // mode the app's scheduler refuses that release's ask at its own
+            // gate, before it records it: the ask lands while demo mode is on.
+            switch flip {
+            case .background:
+                try await waitForAsks(2, of: accountId, stages)
+            case .demo:
+                try await waitForAsks(1, of: accountId, stages)
+                demo.isActive = savedDemo
+            }
 
             scheduler.applicationStateForTesting = .active
             await scheduler.runSyncFollowUp(accountId: accountId)

@@ -192,9 +192,10 @@ account gets one follow-up stage 2.** The design, its reasons and its history ar
    app is not in the background, read from `UIApplication.applicationState`, so inactive, a sheet or
    Control Center over the app, counts as foreground; the silent-push path's own check is narrower,
    `.active` only; sync is not disabled, no demo mode). Fast Sync does not hold it back: it stands in for
-   the trigger's own read, which never waited for Fast Sync to end (in v1.11.2 it waited for the running
-   catch-up slice, then read), so during Fast Sync it reads between two slices; the processing job's fast
-   sync runs in the background, where it does not start anyway. Item 5's stage 2 for every account keeps
+   the trigger's own read, which Fast Sync never held back (v1.11.2; that tag had no account turn and no
+   catch-up slices, so only this eligibility comes from it). During Fast Sync the follow-up waits for the
+   running catch-up slice and reads before the next one; the processing job's fast sync runs in the
+   background, where it does not start anyway. Item 5's stage 2 for every account keeps
    the poll's gate (`SyncScheduler.pollStageTwoMayStart`: also not during Fast Sync, when the poll skips
    its own reads). In the background
    the flag waits: the next opening's stage 1 frees the account and asks again. The follow-up checks the

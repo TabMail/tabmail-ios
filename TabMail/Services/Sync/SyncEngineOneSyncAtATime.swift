@@ -61,9 +61,9 @@ import Synchronization
 // - On a launch the follow-up waits for the first paint, as the poll does. It
 //   stands in for the trigger's own read, so after a read that found changes it
 //   also mirrors the delta cursors for the notification extension, and it
-//   reloads the inbox once it read. Fast Sync does not hold it back: the
-//   trigger's own read never waited for Fast Sync to end, so during Fast Sync
-//   the follow-up reads between two catch-up slices. The poll and its stage 2
+//   reloads the inbox once it read. Fast Sync does not hold it back, as it never
+//   held back the trigger's own read (v1.11.2), so during Fast Sync the
+//   follow-up reads between two catch-up slices. The poll and its stage 2
 //   for every account (#1313, #1314) still skip their reads during Fast Sync.
 // - The poll does not wait for a busy account either. It sets the flag and goes
 //   straight on to the queued work (actions, outbox, calendar), which never

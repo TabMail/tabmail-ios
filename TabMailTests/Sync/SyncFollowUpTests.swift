@@ -890,25 +890,29 @@ struct SyncFollowUpTests {
         #expect(stages.triggers == expected, "app state \(state.rawValue)")
     }
 
-    /// The app's mode for the stage 2 gates.
+    /// The app's state for the stage 2 gates.
     enum GateMode: String, CaseIterable, Sendable {
         case normal
         case fastSync
         case demo
+        /// The app is not in the foreground.
+        case background
     }
 
-    /// Fast Sync and demo mode against the two stage 2 gates. The follow-up
-    /// stands in for a trigger's own read, which Fast Sync never held back (it
-    /// waited for the running catch-up slice, then read), so only demo mode
-    /// stops it. The stage 2 for every account (a poll tick during a poll,
-    /// #1313) keeps the poll's gate, which Fast Sync stops too: the poll skips
-    /// its own reads then. RED with the Fast Sync term in the follow-up's gate (a
-    /// push during Fast Sync read nothing until the next poll after it), with it
-    /// dropped from the poll's, or with demo mode left out of the follow-up's.
-    @Test("Fast Sync holds back the poll's stage 2 but not the follow-up; demo mode holds back both",
+    /// The app's state against the stage 2 gates. The follow-up stands in for a
+    /// trigger's own read, which Fast Sync never held back (v1.11.2), so only
+    /// demo mode and the background stop it. The stage 2 for every account (a
+    /// poll tick during a poll, #1313; a return during a running return, #1314)
+    /// keeps the poll's gate, which Fast Sync stops too: the poll skips its own
+    /// reads then. RED with the Fast Sync term in the follow-up's gate (a push
+    /// during Fast Sync read nothing until the next poll after it), with it
+    /// dropped from the poll's gate or from the return's path alone, with demo
+    /// mode left out of the follow-up's gate, or with the foreground left out of
+    /// the poll's.
+    @Test("Fast Sync holds back the poll's and the return's stage 2 but not the follow-up; demo mode and the background hold back all three",
           arguments: GateMode.allCases)
     @MainActor
-    func stageTwoGatesForFastSyncAndDemo(mode: GateMode) async {
+    func stageTwoGatesForFastSyncAndDemo(mode: GateMode) async throws {
         let stages = Stages()
         let state = AccountManagerState.shared
         let demo = DemoModeStore.shared
@@ -919,12 +923,27 @@ struct SyncFollowUpTests {
             state.fastSyncModeActive = saved.0
             demo.isActive = saved.1
         }
-        let scheduler = SyncScheduler(foreground: true, pollActive: true, stageTwo: { stages.triggers.append($0) })
+        let scheduler = SyncScheduler(
+            foreground: mode != .background, pollActive: true,
+            foregroundReady: {
+                stages.gateReached = true
+                return true
+            },
+            stageTwo: { stages.triggers.append($0) })
         await scheduler.runSyncFollowUp(accountId: "follow-up-account")
         await scheduler.poll()
-        let followUp = mode == .demo ? [] : ["follow-up follow-up-account"]
-        let tick = mode == .normal ? ["poll tick during a poll"] : []
-        #expect(stages.triggers == followUp + tick, "mode \(mode.rawValue)")
+        stages.gateReached = false
+        scheduler.stageTwoForReturnDuringReturn()
+        let deadline = Date().addingTimeInterval(5)
+        while !stages.gateReached, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(stages.gateReached, "precondition: the return's stage 2 reached the first-paint gate")
+        // The rest of the return's stage 2 runs on the main actor after the gate.
+        try await Task.sleep(for: .milliseconds(100))
+        let followUp = mode == .normal || mode == .fastSync ? ["follow-up follow-up-account"] : []
+        let others = mode == .normal ? ["poll tick during a poll", "return during a running return"] : []
+        #expect(stages.triggers == followUp + others, "mode \(mode.rawValue)")
     }
 
     /// RED without the first-paint gate: the follow-up's stage 2 could start

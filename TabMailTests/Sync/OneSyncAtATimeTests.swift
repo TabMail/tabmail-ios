@@ -366,6 +366,15 @@ struct OneSyncAtATimeTests {
         }
     }
 
+    /// The full-sync interval the sync timing promises state (promise 5: a full
+    /// sync at least every 900 s in the foreground; promise 4: a return runs one
+    /// when the last is older). The engine's own constant is not read here, so a
+    /// changed interval fails the boundary cases below.
+    static let promisedFullSyncInterval: TimeInterval = 900
+    /// How far either side of the interval the boundary cases sit: more than a
+    /// test's run time, so the pass sees the same side.
+    static let boundaryMargin: TimeInterval = 60
+
     /// When the account's last full sync ran, as the foreground pass finds it.
     enum LastFullSync: String, CaseIterable, Sendable {
         /// Cleared: a release boundary, the epoch rebuild or Settings' resync.
@@ -374,12 +383,28 @@ struct OneSyncAtATimeTests {
         case anHourAgo
         /// Within the interval: no full sync is due.
         case aMinuteAgo
+        /// Just longer ago than the promised interval: due.
+        case justPastTheInterval
+        /// Just within the promised interval: not due.
+        case justInsideTheInterval
 
         var date: Date? {
+            let interval = OneSyncAtATimeTests.promisedFullSyncInterval
+            let margin = OneSyncAtATimeTests.boundaryMargin
             switch self {
-            case .never: nil
-            case .anHourAgo: Date().addingTimeInterval(-3600)
-            case .aMinuteAgo: Date().addingTimeInterval(-60)
+            case .never: return nil
+            case .anHourAgo: return Date().addingTimeInterval(-3600)
+            case .aMinuteAgo: return Date().addingTimeInterval(-60)
+            case .justPastTheInterval: return Date().addingTimeInterval(-(interval + margin))
+            case .justInsideTheInterval: return Date().addingTimeInterval(-(interval - margin))
+            }
+        }
+
+        /// The pass runs a full sync.
+        var isDue: Bool {
+            switch self {
+            case .never, .anHourAgo, .justPastTheInterval: true
+            case .aMinuteAgo, .justInsideTheInterval: false
             }
         }
     }
@@ -436,12 +461,11 @@ struct OneSyncAtATimeTests {
                     "the pass must read changes from the cursor the change read left")
             #expect(catchUpsAfter > catchUpsBefore,
                     "the pass did not start the older-mail catch-up, whether or not a full sync was due")
-            switch lastFullSync {
-            case .never, .anHourAgo:
+            if lastFullSync.isDue {
                 let recorded = afterPass?.lastFullSyncAt.map { Date().timeIntervalSince($0) < 15 } == true
                 #expect(wire.snapshot.listingRequests == 1, "the due full sync did not run after the change read")
                 #expect(recorded, "the due full sync was not recorded as run")
-            case .aMinuteAgo:
+            } else {
                 let unmoved = afterPass?.lastFullSyncAt == afterRead?.lastFullSyncAt
                 // No full sync: only the pass's own change read can stamp it.
                 let readRecorded = afterPass?.lastSyncedAt.map { $0 > readStamp } == true
@@ -489,13 +513,12 @@ struct OneSyncAtATimeTests {
 
             let afterPass = try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) }
             #expect(wire.snapshot.historyStarts == ["1500", "2001"], "precondition: the pass's own change read ran, and failed")
-            switch lastFullSync {
-            case .never, .anHourAgo:
+            if lastFullSync.isDue {
                 let recorded = afterPass?.lastFullSyncAt.map { Date().timeIntervalSince($0) < 15 } == true
                 #expect(wire.snapshot.listingRequests == 1, "the due full sync did not run after the failed read")
                 #expect(recorded, "the due full sync was not recorded as run")
                 #expect(!failed, "a pass whose due full sync ran reports no error")
-            case .aMinuteAgo:
+            } else {
                 let unmoved = afterPass?.lastFullSyncAt == afterRead?.lastFullSyncAt
                 #expect(wire.snapshot.listingRequests == 0, "a full sync ran that was not due")
                 #expect(unmoved, "the last full sync time moved")

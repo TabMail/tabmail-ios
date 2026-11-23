@@ -1081,10 +1081,10 @@ final class SyncScheduler {
 
     /// Whether the follow-up stage 2 may start now: only in the foreground, and
     /// never in demo mode. Fast Sync does not hold it back: it stands in for a
-    /// trigger's own read, which never waited for Fast Sync to end (it waited
-    /// for the running catch-up slice, then read), so during Fast Sync it reads
-    /// between two slices. In the background, where the processing job's fast
-    /// sync runs, it does not start anyway.
+    /// trigger's own read, which Fast Sync never held back (v1.11.2), so during
+    /// Fast Sync it waits for the running catch-up slice and reads before the
+    /// next one. In the background, where the processing job's fast sync runs,
+    /// it does not start anyway.
     private var followUpMayStart: Bool {
         isForeground && !Self.syncDisabled && !DemoModeStore.shared.isActive
     }
@@ -1104,8 +1104,9 @@ final class SyncScheduler {
     /// set, and the next opening's stage 1 asks again when it ends. The same
     /// gate (`followUpMayStart`) is checked again when it gets the turn
     /// (`SyncEngine.followUpPass`): the app may have left while it waited. It
-    /// stands in for the trigger's own read, so it keeps that read's gate and
-    /// side steps: it waits for the first paint, as the opening's reads do (the
+    /// stands in for the trigger's own read (in the foreground only, and for
+    /// every folder, the stage 2), so it keeps that read's Fast Sync eligibility
+    /// and side steps: it waits for the first paint, as the opening's reads do (the
     /// startup budget); when it read, the inbox reloads, as after a push's own
     /// read (`backgroundPoll`: the trigger's reload came before this read), and
     /// when it found changes the notification extension's cursors are mirrored
