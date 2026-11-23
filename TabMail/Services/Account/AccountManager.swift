@@ -1460,16 +1460,17 @@ actor AccountManager {
     }
 
     #if DEBUG
-    /// Test seam: `IMAPProvider`'s TLS override for providers this factory builds,
-    /// so the factory and `updatePassword` can be driven against the plain-TCP
-    /// `FakeIMAPServer`. `nil` (production) lets SwiftMail choose.
+    /// Test seam: `IMAPProvider`'s TLS override for providers this factory and
+    /// `addIMAPAccount` build, so the factory, `updatePassword` and the IMAP add
+    /// can be driven against the plain-TCP `FakeIMAPServer`. `nil` (production)
+    /// lets SwiftMail choose.
     private nonisolated let imapUseTLSOverrideBox = Mutex<Bool?>(nil)
     nonisolated func setIMAPUseTLSOverrideForTesting(_ useTLS: Bool?) {
         imapUseTLSOverrideBox.withLock { $0 = useTLS }
     }
-    private nonisolated var imapUseTLSOverride: Bool? { imapUseTLSOverrideBox.withLock { $0 } }
+    nonisolated var imapUseTLSOverride: Bool? { imapUseTLSOverrideBox.withLock { $0 } }
     #else
-    private nonisolated var imapUseTLSOverride: Bool? { nil }
+    nonisolated var imapUseTLSOverride: Bool? { nil }
     #endif
 
     #if DEBUG
@@ -1528,6 +1529,16 @@ actor AccountManager {
     /// The registered provider for `accountId`, if connected.
     func provider(accountId: String) -> (any EmailProvider)? {
         providers[accountId]
+    }
+
+    /// IDLE follows the provider (#1331): every place that makes a connected mail
+    /// provider the account's live one calls this (`connectAccount`, the IMAP and
+    /// iCloud adds, a password update). While foreground polling is on, the
+    /// scheduler starts that provider's IDLE now, so a provider that goes live
+    /// after the foreground start does not wait for the next return. Not
+    /// awaited: installing a provider never waits for the main actor.
+    func liveProviderConnected(_ account: Account) {
+        Task { @MainActor in await SyncScheduler.shared.accountConnected(account) }
     }
 
     func connectAccount(_ account: Account) async throws {
@@ -1649,11 +1660,7 @@ actor AccountManager {
             }
             authFailedAccounts.remove(account.id)
             BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() DONE in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms")
-            // IDLE follows the provider (#1331): while foreground polling is on,
-            // the scheduler starts this provider's IDLE now, so a provider that
-            // connects after the foreground start does not wait for the next
-            // return. Not awaited: a connect never waits for the main actor.
-            Task { @MainActor in await SyncScheduler.shared.accountConnected(account) }
+            liveProviderConnected(account)
         } catch {
             BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() FAILED in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms (auth=\(isAuthError(error)))")
             if isAuthError(error) {

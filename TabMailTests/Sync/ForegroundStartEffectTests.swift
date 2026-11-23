@@ -7,22 +7,28 @@ import UIKit
 
 /// Sync timing promises 4, 5 and 6 through the app's real scheduler (#1331, #1327).
 /// The production `ForegroundPollStart` calls `SyncScheduler.shared.startForegroundPolling`,
-/// and real IMAP accounts connect through `AccountManager.connectAccount` against a fake
-/// IMAP server, with no scene-phase change at any point:
+/// and real IMAP accounts go live through the app's own entry points against a fake IMAP
+/// server (`connectAccount` as RootView's connect loop calls it, `addIMAPAccount` as the
+/// add screen calls it, `updatePassword` as the re-sign-in prompt calls it), with no
+/// scene-phase change at any point:
 /// - a foreground start begins stage 1, then the poll's pass, and installs the poll timer;
-/// - every IMAP provider gets IDLE while foreground polling is on, whether it connected
+/// - every IMAP provider gets IDLE while foreground polling is on, whether it went live
 ///   before the start or after it (IDLE follows the provider);
 /// - a connect while foreground polling is off starts no IDLE;
-/// - a provider started twice keeps one IDLE connection.
+/// - a provider started twice keeps one IDLE connection;
+/// - every place that makes a connected mail provider live hands it to the scheduler.
 ///
 /// Isolation: the scheduler's `foregroundWorkHook` records each piece of work a start
 /// begins and takes it instead of running it, so stage 1 and the poll never sync, cancel
 /// the shared queues or resubscribe push (their reads are pinned by `SyncFollowUpTests`
-/// and `OneSyncAtATimeTests`). The hook also takes the IDLE start of any account that is
-/// not this test's, so another suite's connect never starts a real IDLE here. Every test
+/// and `OneSyncAtATimeTests`). "stage 1" and "poll" are offered at the entry of
+/// `syncStartup` and `poll`, so a record means the start reached them. The hook also takes
+/// the IDLE start of any account that is not this test's, so another suite's connect never
+/// starts a real IDLE here. `.processGlobalState`: the suite installs its own app
+/// database and sets the shared scheduler's hooks and the IMAP TLS override. Every test
 /// stops the shared scheduler's polling in its teardown.
 @MainActor
-@Suite("A foreground start begins stage 1, the poll timer and IDLE, and IDLE follows every provider that connects", .serialized)
+@Suite("A foreground start begins stage 1, the poll timer and IDLE, and IDLE follows every provider that goes live", .serialized, .processGlobalState)
 struct ForegroundStartEffectTests {
 
     @MainActor final class World {
@@ -68,6 +74,19 @@ struct ForegroundStartEffectTests {
             try KeychainHelper.save(server.password, for: KeychainHelper.passwordKey(accountId: account.id))
             accounts.append(account)
             if connect { try await AccountManager.shared.connectAccount(account) }
+            return account
+        }
+
+        /// An IMAP account on the fake server added the way the add screen adds one:
+        /// `addIMAPAccount` connects it, stores it and makes its provider live.
+        func addThroughSetup() async throws -> Account {
+            let account = try await AccountManager.shared.addIMAPAccount(
+                displayName: "Poll start fixture",
+                email: "poll-start-\(UUID().uuidString.prefix(8))@example.com",
+                username: server.username, password: server.password,
+                imapHost: "127.0.0.1", imapPort: server.port,
+                smtpHost: "127.0.0.1", smtpPort: server.port)
+            accounts.append(account)
             return account
         }
 
@@ -132,7 +151,7 @@ struct ForegroundStartEffectTests {
         }
     }
 
-    @Test("The first account added in an active scene starts stage 1, the poll and its timer, and IDLE once its provider connects")
+    @Test("The first account added in an active scene starts stage 1, the poll and its timer, and IDLE for its provider")
     func firstAccount() async throws {
         try await withWorld { world in
             let state = ScreenState(accounts: 0)
@@ -142,18 +161,17 @@ struct ForegroundStartEffectTests {
             let nothingYet = world.count("stage 1") == 0 && !world.scheduler.foregroundPollingIsOn
             #expect(nothingYet, "no account, no start: \(world.works)")
 
-            // Adding an account refreshes the account list before it connects.
-            let account = try await world.addAccount(connect: false)
+            // The add screen's add makes the provider live, then the account list
+            // refreshes (`.backgroundDataDidChange`) and the screen sees an account.
+            let account = try await world.addThroughSetup()
             state.accounts = 1
             let herdDone = await eventually { world.count("poll") == 1 }
             #expect(herdDone, "the first account started stage 1 and the poll's pass (#1327)")
             let stageOnes = world.count("stage 1")
             #expect(stageOnes == 1)
             #expect(world.scheduler.foregroundPollingIsOn, "the first account installed the poll timer")
-
-            try await AccountManager.shared.connectAccount(account)
             let idle = await eventually { world.idleStarts(account) == 1 }
-            #expect(idle, "the first account's provider got IDLE when it connected")
+            #expect(idle, "the first account's provider got IDLE")
         }
     }
 
@@ -174,19 +192,20 @@ struct ForegroundStartEffectTests {
             await settle()
             #expect(world.scheduler.foregroundPollingIsOn, "removing the last account leaves the poll timer on")
 
-            let next = try await world.addAccount(connect: false)
+            // The timer is already on, so the start returns before its own IDLE
+            // start: the add's hand-off is what gives the new provider IDLE.
+            let next = try await world.addThroughSetup()
             state.accounts = 1
             let restarted = await eventually { world.count("poll") == 2 }
             #expect(restarted, "the re-added account started stage 1 and the poll's pass again")
             let stageOnes = world.count("stage 1")
             #expect(stageOnes == 2)
-            try await AccountManager.shared.connectAccount(next)
             let idle = await eventually { world.idleStarts(next) == 1 }
             #expect(idle, "the re-added account's provider got IDLE although the timer was already on")
         }
     }
 
-    @Test("A second account added in the open app gets IDLE when it connects, and starts no second stage 1")
+    @Test("A second account added in the open app gets IDLE, and starts no second stage 1")
     func secondAccount() async throws {
         try await withWorld { world in
             let first = try await world.addAccount(connect: true)
@@ -196,18 +215,17 @@ struct ForegroundStartEffectTests {
             let started = await eventually { world.count("poll") == 1 && world.idleStarts(first) == 1 }
             try #require(started)
 
-            let second = try await world.addAccount(connect: false)
+            let second = try await world.addThroughSetup()
             state.accounts = 2
-            try await AccountManager.shared.connectAccount(second)
             let idle = await eventually { world.idleStarts(second) == 1 }
-            #expect(idle, "the second account's provider got IDLE when it connected")
+            #expect(idle, "the second account's provider got IDLE when the add made it live")
             let stageOnes = world.count("stage 1")
             #expect(stageOnes == 1, "a second account is not a start: \(world.works)")
         }
     }
 
-    @Test("A reconnect (a re-sign-in or a settings change) gives the new provider IDLE")
-    func reconnect() async throws {
+    @Test("A password update (the re-sign-in prompt) gives the provider it makes live IDLE")
+    func passwordUpdate() async throws {
         try await withWorld { world in
             let account = try await world.addAccount(connect: true)
             let state = ScreenState(accounts: 1)
@@ -216,11 +234,11 @@ struct ForegroundStartEffectTests {
             let started = await eventually { world.idleStarts(account) == 1 }
             try #require(started)
 
-            // The re-sign-in and settings paths in AccountManagerSetup: disconnect, then connect.
-            await AccountManager.shared.disconnectAccount(account)
-            try await AccountManager.shared.connectAccount(account)
+            let replaced = await AccountManager.shared.provider(for: account)
+            try await AccountManager.shared.updatePassword(world.server.password, for: account)
             let idle = await eventually { world.idleStarts(account) == 2 }
-            #expect(idle, "the reconnected provider got IDLE")
+            #expect(idle, "the provider the password update made live got IDLE")
+            try? await replaced?.disconnect()
         }
     }
 
@@ -281,6 +299,55 @@ struct ForegroundStartEffectTests {
         }
     }
 
+    // MARK: - Every live install hands off
+
+    /// IDLE follows the provider: every place that makes a connected mail provider
+    /// the account's live one (writes `providers[...]`, or installs an accepted
+    /// password probe) calls `liveProviderConnected`. A new install site that skips
+    /// it fails here. Exempt: the demo providers (no IMAP) and the test seams.
+    @Test("Every place that makes a connected mail provider live hands it to the scheduler")
+    func everyLiveInstallHandsOff() throws {
+        let exempt: Set<String> = [
+            "registerDemoProviders", "registerProviderForTesting", "connectProviderForTesting",
+            // Its callers are checked instead (it installs; they hand off).
+            "installAcceptedPasswordProbeAsLive",
+        ]
+        let install = try Regex(#"providers\[[^\]]+\]\s*=[^=]|installAcceptedPasswordProbeAsLive\("#)
+        let memberFunc = try Regex(#"^    (?:[A-Za-z@][A-Za-z()]* )*func ([A-Za-z0-9_]+)"#)
+        var installers: [String: Bool] = [:]
+        let dir = Self.projectRoot.appendingPathComponent("TabMail/Services/Account")
+        for name in try FileManager.default.contentsOfDirectory(atPath: dir.path) where name.hasSuffix(".swift") {
+            let lines = try String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8)
+                .components(separatedBy: "\n")
+            var current: (name: String, body: [String])?
+            func recordCurrent() {
+                guard let current else { return }
+                let body = current.body.joined(separator: "\n")
+                guard !exempt.contains(current.name), body.contains(install) else { return }
+                installers[current.name] = body.contains("liveProviderConnected(")
+            }
+            for line in lines {
+                if let match = line.firstMatch(of: memberFunc), let funcName = match.output[1].substring {
+                    recordCurrent()
+                    current = (String(funcName), [])
+                } else {
+                    current?.body.append(line)
+                }
+            }
+            recordCurrent()
+        }
+        let known: Set<String> = ["connectAccount", "addIMAPAccount", "addICloudAccount", "updatePassword"]
+        let found = Set(installers.keys)
+        #expect(known.isSubset(of: found), "the scan found the install sites: \(installers)")
+        let skipping = installers.filter { !$0.value }.map(\.key).sorted()
+        #expect(skipping.isEmpty, "these make a provider live without handing it to the scheduler: \(skipping)")
+    }
+
+    private static let projectRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+
     // MARK: - Harness
 
     private func withWorld(realIdle: Bool = false, _ body: (World) async throws -> Void) async throws {
@@ -303,6 +370,9 @@ struct ForegroundStartEffectTests {
             // IDLE a connect starts cannot reach a later test.
             scheduler.stopPolling()
             for account in world.accounts {
+                // `addIMAPAccount` starts the account's initial sync; taking the
+                // account's turn waits for it to end before the account goes.
+                await manager.syncEngine.oneSyncAtATime(accountId: account.id) {}
                 if let provider = await manager.provider(for: account) as? IMAPProvider {
                     await provider.stopIdle()
                     try? await provider.disconnect()

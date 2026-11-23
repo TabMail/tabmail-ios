@@ -257,7 +257,9 @@ final class SyncScheduler {
     /// "IDLE <account id>", "stop IDLE"). Returning true takes it: it is recorded
     /// and not run. So a test sees what a start begins without syncing,
     /// subscribing or touching the extension's mirrors. The poll timer is still
-    /// installed: read it with `foregroundPollingIsOn`.
+    /// installed: read it with `foregroundPollingIsOn`. "stage 1" and "poll" are
+    /// offered at the entry of `syncStartup` and `poll`, and each IDLE start
+    /// after its provider is found, so a record means that work was reached.
     var foregroundWorkHook: (@MainActor @Sendable (_ work: String) -> Bool)?
     var foregroundPollingIsOn: Bool { timer != nil }
 
@@ -400,6 +402,7 @@ final class SyncScheduler {
     ///   the foreground since the last recovery. Default `false` = always recover, so every
     ///   genuine resume path (foreground return, BGAppRefresh, BGProcessing) is unchanged.
     func syncStartup(inboxOnly: Bool, drain: DrainMode = .none, foregroundFastPath: Bool = false) async {
+        if testTakes("stage 1") { return }
         let t0 = CFAbsoluteTimeGetCurrent()
         func stepLog(_ label: String) {
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
@@ -765,7 +768,7 @@ final class SyncScheduler {
                 // syncs (#1275). Nothing here may wait for stage 1, and stage 2's
                 // time limit starts only when it runs (#1289). Full design and
                 // history: the sync design block in SyncEngineOneSyncAtATime.swift.
-                if !testTakes("stage 1") { await syncStartup(inboxOnly: false, drain: .none) }
+                await syncStartup(inboxOnly: false, drain: .none)
                 fgStep("syncStartup returned")
                 BootProfiler.mark("startForegroundPolling: syncStartup returned (herd spawned)")
                 // Re-subscribe push on foreground return.
@@ -787,7 +790,7 @@ final class SyncScheduler {
                         await PushNotificationService.shared.checkPushConsentStatusForForeground()
                     }
                 }
-                if !testTakes("poll") { await poll() }
+                await poll()
                 BootProfiler.mark("startForegroundPolling: poll() done (foreground sync pass complete)")
             }
         } else {
@@ -857,8 +860,10 @@ final class SyncScheduler {
         }
     }
 
-    /// IDLE follows the provider (#1331). `AccountManager.connectAccount` calls
-    /// this after every successful connect. While foreground polling is on (the
+    /// IDLE follows the provider (#1331). `AccountManager.liveProviderConnected`
+    /// calls this wherever a connected mail provider becomes the account's live
+    /// one (`connectAccount`, the IMAP and iCloud adds, a password update).
+    /// While foreground polling is on (the
     /// poll timer is set, from `startForegroundPolling` until `stopPolling`), an
     /// IMAP account's provider starts IDLE now. So a provider that connects after
     /// `startImapIdle` looked (a cold launch, the first or a second account, an
@@ -1197,6 +1202,7 @@ final class SyncScheduler {
     /// The foreground poll (the timer's tick and a return's herd). Internal, not
     /// private, so a test drives a tick that lands during a poll (#1313).
     func poll() async {
+        if testTakes("poll") { return }
         if Self.syncDisabled { return }
         // Pause all sync while demo mode is active — the user's real accounts must
         // not sync or churn the DB/UI underneath the demo (incl. demo entered from

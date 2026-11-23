@@ -254,7 +254,8 @@ extension AccountManager {
             password: password,
             senderEmail: email,
             smtpHost: smtpHost,
-            smtpPort: smtpPort
+            smtpPort: smtpPort,
+            useTLS: imapUseTLSOverride
         )
         try await testProvider.connect()
 
@@ -310,6 +311,7 @@ extension AccountManager {
         let queue = ProviderWorkQueue(provider: testProvider, maxConcurrency: concurrency)
         workQueues[account.id] = queue
         await syncEngine.register(accountId: account.id, provider: testProvider, workQueue: queue)
+        liveProviderConnected(account)
 
         // Kick off initial sync in background so the UI dismisses immediately.
         let engine = syncEngine
@@ -394,6 +396,7 @@ extension AccountManager {
         let queue = ProviderWorkQueue(provider: testProvider, maxConcurrency: concurrency)
         workQueues[account.id] = queue
         await syncEngine.register(accountId: account.id, provider: testProvider, workQueue: queue)
+        liveProviderConnected(account)
 
         // Set up CalDAV if requested. Best-effort: the email account is the
         // primary entity and its IMAP connection was already validated above,
@@ -933,6 +936,7 @@ extension AccountManager {
             }
         }
         authFailedAccounts.remove(account.id)
+        if mailProbe != nil { liveProviderConnected(account) }
     }
 
     /// Re-authenticate an account that signs in with OAuth and reconnect it.
