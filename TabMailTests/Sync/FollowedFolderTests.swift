@@ -870,7 +870,8 @@ struct FollowedFolderOutlookTests {
     static func readUntilTracking(_ w: R.World, _ engine: SyncEngine, _ path: String) async throws {
         for _ in 0..<passes {
             let account = try w.account()
-            _ = try await engine.readAndApplyChanges(account: account, provider: w.provider, scope: .all)
+            let request = try await engine.makeChangeRequest(accountId: account.id, scope: .all, deadline: nil)
+            _ = try await engine.readAndApplyChanges(account: account, provider: w.provider, request: request)
             if try w.cursor(path)?.phase == .tracking { return }
         }
     }
