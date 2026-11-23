@@ -182,13 +182,22 @@ struct ForegroundPollStartTests {
         }
     }
 
+    @Test("The unit-test host counts as screenshot mode, so it never starts the app's own sync")
+    func unitTestHostNeverStarts() {
+        #expect(ForegroundPollStart.isUnitTestHost, "this run's host app is a unit-test host")
+        let wanted = ForegroundPollStart.wanted(
+            phase: .active, hasAccounts: true, screenshotMode: ScreenshotMode.isActive || ForegroundPollStart.isUnitTestHost)
+        #expect(!wanted, "the host app would start foreground polling over the tests' databases")
+    }
+
     @Test("RootView starts foreground polling only through ForegroundPollStart, with the app's own inputs")
     func rootViewStartsThePollInOnePlace() throws {
         let root = try Self.source("TabMail/Views/RootView.swift")
         #expect(root.contains(
             ".modifier(ForegroundPollStart( hasAccounts: !navigationStore.accounts.isEmpty, "
-            + "screenshotMode: ScreenshotMode.isActive, start: { syncScheduler.startForegroundPolling() } ))"),
-            "RootView applies the modifier with its account list, screenshot mode and the scheduler's start")
+            + "screenshotMode: ScreenshotMode.isActive || ForegroundPollStart.isUnitTestHost, "
+            + "start: { syncScheduler.startForegroundPolling() } ))"),
+            "RootView applies the modifier with its account list, screenshot mode or the unit-test host, and the scheduler's start")
         #expect(root.components(separatedBy: ".startForegroundPolling()").count - 1 == 1,
                 "RootView calls startForegroundPolling in one place")
 

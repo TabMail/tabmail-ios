@@ -1649,6 +1649,11 @@ actor AccountManager {
             }
             authFailedAccounts.remove(account.id)
             BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() DONE in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms")
+            // IDLE follows the provider (#1331): while foreground polling is on,
+            // the scheduler starts this provider's IDLE now, so a provider that
+            // connects after the foreground start does not wait for the next
+            // return. Not awaited: a connect never waits for the main actor.
+            Task { @MainActor in await SyncScheduler.shared.accountConnected(account) }
         } catch {
             BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() FAILED in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms (auth=\(isAuthError(error)))")
             if isAuthError(error) {

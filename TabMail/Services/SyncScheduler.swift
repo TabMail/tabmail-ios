@@ -251,6 +251,15 @@ final class SyncScheduler {
     var applicationStateForTesting: UIApplication.State?
     var foregroundReadinessHook: (@MainActor @Sendable () async -> Bool)?
     var stageTwoHook: (@MainActor @Sendable (_ trigger: String) async -> Void)?
+    /// When set, a foreground start (`startForegroundPolling`) and the IDLE
+    /// start and stop offer each piece of work to the test first ("staged merge",
+    /// "mirrors", "stage 1", "push", "poll", "background tasks",
+    /// "IDLE <account id>", "stop IDLE"). Returning true takes it: it is recorded
+    /// and not run. So a test sees what a start begins without syncing,
+    /// subscribing or touching the extension's mirrors. The poll timer is still
+    /// installed: read it with `foregroundPollingIsOn`.
+    var foregroundWorkHook: (@MainActor @Sendable (_ work: String) -> Bool)?
+    var foregroundPollingIsOn: Bool { timer != nil }
 
     /// Test harness for the follow-up stage 2 (the sync design block in
     /// SyncEngineOneSyncAtATime.swift): `foreground` stands for the app's
@@ -292,6 +301,14 @@ final class SyncScheduler {
         if let foregroundReadinessHook { return await foregroundReadinessHook() }
         #endif
         return await AppStartup.shared.awaitLaunchReady(background: false)
+    }
+
+    /// True when a test's `foregroundWorkHook` takes `work` (it is then not run).
+    private func testTakes(_ work: String) -> Bool {
+        #if DEBUG
+        if let foregroundWorkHook { return foregroundWorkHook(work) }
+        #endif
+        return false
     }
 
     private func backgroundDatabaseReady() async -> Bool {
@@ -669,10 +686,10 @@ final class SyncScheduler {
         // is the PRIVILEGED single-flight (NSEMergeCoordinator serializes it), so
         // running it concurrently with an in-flight poll is safe. This realizes the
         // rule: the update signal goes right after the merge, independent of the herd.
-        Task {
+        if !testTakes("staged merge") { Task {
             // Instant once the inbox has painted (warm foreground); on a cold-launch
             // first foreground this waits for first paint, same as the herd gate.
-            guard await AppStartup.shared.awaitLaunchReady(background: false) else { return }
+            guard await foregroundLaunchReady() else { return }
             // Emits its OWN immediate `.inboxDataDidChange` (debounce-bypass flag)
             // when it stages new mail.
             await NSEDataBridge.mergeNSEStagingData()
@@ -680,7 +697,7 @@ final class SyncScheduler {
             // background-cycle merge that wrote while we were off-screen). Coalesces
             // with the merge's immediate post via the inbox single-flight reload.
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-        }
+        } }
 
         // ── ALWAYS, UNGATED: converge the shared identity mirrors ──
         // The extension cannot read this database; the shared mirrors are the
@@ -711,9 +728,9 @@ final class SyncScheduler {
         // either cannot resolve the address or cannot open a connection, and in
         // both cases takes no action on the account) and the next launch's
         // `mirrorAllState()` re-derives the same values.
-        Task.detached(priority: .medium) {
+        if !testTakes("mirrors") { Task.detached(priority: .medium) {
             NSEDataBridge.mirrorAccountIdentity()
-        }
+        } }
 
         // ── GATED: the heavy herd (sync / push resub / poll) — one cycle at a time ──
         if !isStartupInFlight {
@@ -732,7 +749,7 @@ final class SyncScheduler {
                 // — not a fixed timer. The quick merge above already ran ungated; this
                 // gate only holds back the heavy network work. Warm returns skip it.
                 if !didFirstForegroundSettle {
-                    guard await AppStartup.shared.awaitLaunchReady(background: false) else { return }
+                    guard await foregroundLaunchReady() else { return }
                     didFirstForegroundSettle = true
                     fgStep("first-paint gate cleared")
                     BootProfiler.mark("startForegroundPolling: first paint reached — herd starting")
@@ -748,7 +765,7 @@ final class SyncScheduler {
                 // syncs (#1275). Nothing here may wait for stage 1, and stage 2's
                 // time limit starts only when it runs (#1289). Full design and
                 // history: the sync design block in SyncEngineOneSyncAtATime.swift.
-                await syncStartup(inboxOnly: false, drain: .none)
+                if !testTakes("stage 1") { await syncStartup(inboxOnly: false, drain: .none) }
                 fgStep("syncStartup returned")
                 BootProfiler.mark("startForegroundPolling: syncStartup returned (herd spawned)")
                 // Re-subscribe push on foreground return.
@@ -760,15 +777,17 @@ final class SyncScheduler {
                 // live, and settings can only change while the app is backgrounded,
                 // so this foreground resub always re-registers with the current
                 // capability (worker upserts idempotently). See the notification-service enhancement
-                await PushNotificationService.shared.subscribeAllAccounts()
-                // Non-interactive check: does the push worker have a pending
-                // classification error for any of our Gmail/Outlook accounts?
-                // Posts `.pushConsentErrorsDetected` if so; UI surfaces
-                // banner.
-                Task {
-                    await PushNotificationService.shared.checkPushConsentStatusForForeground()
+                if !testTakes("push") {
+                    await PushNotificationService.shared.subscribeAllAccounts()
+                    // Non-interactive check: does the push worker have a pending
+                    // classification error for any of our Gmail/Outlook accounts?
+                    // Posts `.pushConsentErrorsDetected` if so; UI surfaces
+                    // banner.
+                    Task {
+                        await PushNotificationService.shared.checkPushConsentStatusForForeground()
+                    }
                 }
-                await poll()
+                if !testTakes("poll") { await poll() }
                 BootProfiler.mark("startForegroundPolling: poll() done (foreground sync pass complete)")
             }
         } else {
@@ -788,7 +807,7 @@ final class SyncScheduler {
         }
 
         // Re-schedule BGTasks on every foreground launch in case iOS purged them
-        ensureBackgroundTasksScheduled()
+        if !testTakes("background tasks") { ensureBackgroundTasksScheduled() }
         // IMAP IDLE is managed by IMAPProvider on the primary connection.
         // Tell all IMAP providers to start IDLE on foreground.
         startImapIdle()
@@ -830,35 +849,7 @@ final class SyncScheduler {
                 return
             }
             for account in accounts {
-                guard let provider = await manager.provider(for: account) as? IMAPProvider else { continue }
-                // Sync trigger: an IDLE event's read gives an account another pass
-                // holds a follow-up flag, never a wait. Siblings: silent push, the
-                // open-app push, pull to refresh, the poll, a return (the sync
-                // design block in SyncEngineOneSyncAtATime.swift; ADR-IOS-104).
-                await provider.startIdle { [weak self] event, email in
-                    guard let self else { return }
-                    switch event {
-                    case .vanished(let uidSet):
-                        // RFC 7162: the server NAMES the deleted UIDs — consume
-                        // them for targeted deletes (ADR-IOS-051 Phase 1), then
-                        // still poll so counts/flags refresh through the normal
-                        // sync path.
-                        let uids = uidSet.toArray().map { UInt32($0.value) }
-                        if DebugModeManager.isLoggingEnabled() {
-                            BackgroundSyncLogger.logDebug("[SyncScheduler:IDLE] \(email) event: vanished (\(uids.count) UIDs) — targeted delete + syncing")
-                        }
-                        await self.manager.syncEngine.handleVanishedUIDs(accountEmail: email, uids: uids)
-                        await self.backgroundPoll(accountEmail: email)
-                    case .exists, .expunge:
-                        // .expunge carries a SEQUENCE number, not a UID — it
-                        // cannot be mapped to a local row safely; keep it as a
-                        // generic poll trigger (ADR-IOS-051).
-                        BackgroundSyncLogger.logDebug("[SyncScheduler:IDLE] \(email) event: \(event) — syncing")
-                        await self.backgroundPoll(accountEmail: email)
-                    default:
-                        break
-                    }
-                }
+                await startIdle(for: account)
             }
             if !accounts.isEmpty {
                 BackgroundSyncLogger.logDebug("[SyncScheduler:IDLE] Started IDLE for \(accounts.count) IMAP account(s)")
@@ -866,8 +857,58 @@ final class SyncScheduler {
         }
     }
 
+    /// IDLE follows the provider (#1331). `AccountManager.connectAccount` calls
+    /// this after every successful connect. While foreground polling is on (the
+    /// poll timer is set, from `startForegroundPolling` until `stopPolling`), an
+    /// IMAP account's provider starts IDLE now. So a provider that connects after
+    /// `startImapIdle` looked (a cold launch, the first or a second account, an
+    /// account added after the last was removed, a reconnect after a re-sign-in
+    /// or a settings change) does not wait for the next return to the app for
+    /// its IDLE (sync timing promise 6). A connect in the background (no timer)
+    /// starts nothing. A provider whose IDLE already runs keeps its one IDLE
+    /// connection (`IMAPProvider.launchIdleConnection`).
+    func accountConnected(_ account: Account) async {
+        guard timer != nil else { return }
+        await startIdle(for: account)
+    }
+
+    /// Starts IDLE on the account's provider when it is an IMAP one.
+    private func startIdle(for account: Account) async {
+        guard let provider = await manager.provider(for: account) as? IMAPProvider else { return }
+        guard !testTakes("IDLE \(account.id)") else { return }
+        // Sync trigger: an IDLE event's read gives an account another pass
+        // holds a follow-up flag, never a wait. Siblings: silent push, the
+        // open-app push, pull to refresh, the poll, a return (the sync
+        // design block in SyncEngineOneSyncAtATime.swift; ADR-IOS-104).
+        await provider.startIdle { [weak self] event, email in
+            guard let self else { return }
+            switch event {
+            case .vanished(let uidSet):
+                // RFC 7162: the server NAMES the deleted UIDs — consume
+                // them for targeted deletes (ADR-IOS-051 Phase 1), then
+                // still poll so counts/flags refresh through the normal
+                // sync path.
+                let uids = uidSet.toArray().map { UInt32($0.value) }
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[SyncScheduler:IDLE] \(email) event: vanished (\(uids.count) UIDs) — targeted delete + syncing")
+                }
+                await self.manager.syncEngine.handleVanishedUIDs(accountEmail: email, uids: uids)
+                await self.backgroundPoll(accountEmail: email)
+            case .exists, .expunge:
+                // .expunge carries a SEQUENCE number, not a UID — it
+                // cannot be mapped to a local row safely; keep it as a
+                // generic poll trigger (ADR-IOS-051).
+                BackgroundSyncLogger.logDebug("[SyncScheduler:IDLE] \(email) event: \(event) — syncing")
+                await self.backgroundPoll(accountEmail: email)
+            default:
+                break
+            }
+        }
+    }
+
     /// Stop IMAP IDLE on all IMAP/iCloud providers.
     func stopImapIdle() {
+        guard !testTakes("stop IDLE") else { return }
         Task {
             let accounts: [Account]
             do {

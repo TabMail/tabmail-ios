@@ -20,7 +20,11 @@ import SwiftUI
 ///
 /// Screenshot mode never syncs: its seeded data is the whole content, as
 /// RootView's account task and `InboxViewModel.performSync` already say. Demo mode
-/// needs no term: the poll path skips sync itself while the demo is on.
+/// needs no term: the poll path skips sync itself while the demo is on. RootView
+/// passes the unit-test host as screenshot mode too (`isUnitTestHost`): tests
+/// install their own databases and post account changes, which reach the host's
+/// account list, and the host must not start the app's real sync over them.
+/// Release builds are never a unit-test host.
 ///
 /// Sync trigger site (a return to the app). Siblings: IMAP IDLE, silent push, the
 /// open-app push, the poll's tick, pull-to-refresh. The trigger map and the
@@ -36,6 +40,16 @@ struct ForegroundPollStart: ViewModifier {
     static func wanted(phase: ScenePhase, hasAccounts: Bool, screenshotMode: Bool) -> Bool {
         phase == .active && hasAccounts && !screenshotMode
     }
+
+    /// The app runs as the host of a unit-test run (the check NetworkMonitor,
+    /// EmbeddingService, PushNotificationService and ReminderBuilder make).
+    static let isUnitTestHost: Bool = {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        #else
+        false
+        #endif
+    }()
 
     func body(content: Content) -> some View {
         content.onChange(

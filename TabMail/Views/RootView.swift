@@ -822,10 +822,11 @@ struct RootView: View {
         }
         // The one place the screen starts foreground polling: the scene active,
         // an account, not screenshot mode; read at mount and on every change
-        // (#1331 cold launch, #1327 first account).
+        // (#1331 cold launch, #1327 first account). The unit-test host counts as
+        // screenshot mode: it never syncs (`ForegroundPollStart.isUnitTestHost`).
         .modifier(ForegroundPollStart(
             hasAccounts: !navigationStore.accounts.isEmpty,
-            screenshotMode: ScreenshotMode.isActive,
+            screenshotMode: ScreenshotMode.isActive || ForegroundPollStart.isUnitTestHost,
             start: { syncScheduler.startForegroundPolling() }
         ))
         .onChange(of: scenePhase) { _, phase in
@@ -836,7 +837,7 @@ struct RootView: View {
                 Task {
                     await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
                 }
-                // Foreground polling starts in `ForegroundPollStart` below, not
+                // Foreground polling starts in `ForegroundPollStart` above, not
                 // here: this handler does not run for the phase RootView mounts
                 // with, which a foreground cold launch already has (#1331).
                 // IOS-OUTBOX-001: the launch `.task` above is reconciliation's

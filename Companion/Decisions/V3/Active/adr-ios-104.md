@@ -302,9 +302,27 @@ the next background-and-return (#1331). Adding the first account while the app i
 either (#1327). One condition read at mount and on every change covers both, with no new timer, path or
 layer; Settings' database reset stays the only other caller.
 
+IDLE follows the provider. `startImapIdle` starts IDLE only for the IMAP providers registered when it looks,
+and at a cold launch RootView's connect loop usually registers them after that (the first account's provider
+connects after the account list refreshes, too). So `AccountManager.connectAccount`, after every successful
+connect, hands the account to `SyncScheduler.accountConnected` (a main-actor task it does not wait for),
+which starts the provider's IDLE when foreground polling is on, read from the existing poll timer (set by
+`startForegroundPolling`, cleared by `stopPolling`). This covers the cold launch, the first account, an
+account added after the last was removed (the timer survives the removal, and `startForegroundPolling`'s
+`guard timer == nil` timer dedup, kept as it is, returns before `startImapIdle`), a second account added in
+the open app, and the reconnects after a re-sign-in or a settings change. A connect in the background (no
+timer) starts nothing. A provider started twice keeps one IDLE connection: `launchIdleConnection` returns
+when its IDLE connection is live, and a second start during a launch replaces that launch, whose
+connection is then logged out as surplus.
+
 Screenshot mode never starts it: its seeded data is the whole content, as RootView's account task and
 `InboxViewModel.performSync` already say. Before, a return inside a screenshot run started it (test-only).
-Demo mode needs no term: `syncStartup` and the poll skip sync while the demo is on.
+Demo mode needs no term: `syncStartup` and the poll skip sync while the demo is on. RootView passes the
+unit-test host as screenshot mode too (`ForegroundPollStart.isUnitTestHost`, the `XCTestConfigurationFilePath`
+check, DEBUG only): the tests install their own databases and post account changes that reach the host's
+account list, and the host app must not start real sync, push resubscription or IDLE over them. Every test
+that starts the shared scheduler's polling stops it in its teardown, so a connect's IDLE start cannot reach a
+later test.
 
 Cold-launch cost (nothing is added before the first paint): the herd's first foreground pass waits for the
 first paint, so after it a foreground cold launch now runs what every return runs, as every cold launch did
@@ -313,11 +331,19 @@ re-read from the database, providers marked dirty so an IMAP pool reconnects at 
 relaunches), the poll's first stage 2, the poll timer and IDLE. These and the inbox's own read of the
 folders on screen (`InboxView.onAppear` -> `startSync`, one second later) share each account's turn, as on
 a return: a trigger that finds the account busy flags it, and the flags fold into one follow-up stage 2.
-Before the fix the launch ran the on-screen read only, and the other folders, the full sync when due, the
-poll and IDLE waited for a return.
+Before the fix the launch ran only the inbox's read (the folders on screen, then each of their accounts'
+change read, `AccountManager.syncFolders` -> `backgroundDeltaSync`); the full sync when due, the older-mail
+catch-up, the poll and IDLE waited for a return. On the connect path the hand-off adds one main-actor task
+per successful connect, which `connectAccount` does not wait for.
 
 Tests: `ForegroundPollStartTests` (a view that mounts in an active scene with an account starts once; the
 first account added in an active scene starts once; a view mounted before the scene is active starts when it
 becomes active; every return starts again; an account added after the last was removed starts again;
-screenshot mode never starts; the condition's table; RootView starts it only through the modifier, and the
-app's only other caller is Settings).
+screenshot mode never starts; the unit-test host never starts; the condition's table; RootView starts it only
+through the modifier, and the app's only other caller is Settings). `ForegroundStartEffectTests`, through the
+app's scheduler and real IMAP connects to a fake server, with no phase change: a cold launch starts stage 1,
+then the poll's pass, installs the timer and starts IDLE for a provider connected before the start and for
+one connected after it; the first account; an account added after the last was removed; a second account; a
+reconnect; no IDLE from a connect while polling is off (before any start, after the app left); a provider
+started twice, while launching and once live, sends IDLE once on one connection. The scheduler's
+`foregroundWorkHook` (DEBUG) records stage 1, the push resubscribe and the poll instead of running them.
