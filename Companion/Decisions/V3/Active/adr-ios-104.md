@@ -361,7 +361,8 @@ launch (`connectAccount`) starts stage 1, then the poll's pass, installs the tim
 provider connected before the start and for one connected after it; the first account, an account added
 after the last was removed and a second account, each through `addIMAPAccount`; a password update through
 `updatePassword`; no IDLE from a connect while polling is off (before any start, after the app left); a cold
-launch whose first connect is refused for now gets IDLE live with no return, and one whose password is refused
+launch whose first connect and first IDLE launch are refused for now gets IDLE live through IDLE's retry
+with no return, and one whose password is refused
 gets no IDLE start; a provider started twice, while launching and once live, sends IDLE once on one
 connection; IDLE's events on a real IDLE session (EXISTS reads the new message now; VANISHED deletes the row
 it names while another pass holds the account, and its read asks for the follow-up); and a source fence:

@@ -300,17 +300,24 @@ struct ForegroundStartEffectTests {
             let sweptNone = world.idleStarts(forNow) == 0 && world.idleStarts(refused) == 0
             #expect(sweptNone, "precondition: the start's IDLE found no provider")
 
-            // Refused for now: the provider stays installed and IDLE comes up by itself.
+            // Refused for now, twice: the account's connect, then IDLE's first launch.
+            // The provider stays installed, and IDLE's own launch retry brings it up
+            // once the server answers.
+            server.failNextCommand(containing: "LOGIN", message: "[UNAVAILABLE] Try again later")
             server.failNextCommand(containing: "LOGIN", message: "[UNAVAILABLE] Try again later")
             var failedForNow = false
             do { try await manager.connectAccount(forNow) } catch { failedForNow = true }
             #expect(failedForNow, "precondition: the first connect was refused for now")
             let forNowMarked = await manager.authFailedAccounts.contains(forNow.id)
             #expect(!forNowMarked, "precondition: a refusal for now is not a refused sign-in")
-            let live = await eventually(seconds: 15) {
+            let launchRefused = await eventually(seconds: 5) { server.consumedInjectedFailureCount() == 2 }
+            #expect(launchRefused, "precondition: IDLE's first launch was refused as well")
+            let notLiveYet = !server.recordedCommands().contains { $0.hasPrefix("IDLE") }
+            #expect(notLiveYet, "precondition: IDLE was not live after its first launch failed")
+            let live = await eventually(seconds: 20) {
                 server.recordedCommands().contains { $0.hasPrefix("IDLE") }
             }
-            #expect(live, "IDLE went live after a failed first connect, with no return to the app")
+            #expect(live, "IDLE's own retry brought it up once the server answered, with no return to the app")
             let forNowIdle = world.idleStarts(forNow)
             #expect(forNowIdle == 1)
 
