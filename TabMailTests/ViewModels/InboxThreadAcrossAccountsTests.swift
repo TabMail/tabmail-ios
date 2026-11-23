@@ -7,6 +7,7 @@ import GRDB
 import Observation
 import Synchronization
 import Testing
+import UIKit
 @testable import TabMail
 
 /// A conversation that reached two of the user's accounts is one thread in the
@@ -169,6 +170,42 @@ struct InboxThreadAcrossAccountsTests {
         UserDefaults.standard.removeObject(forKey: AccountManager.markReadOnArchiveDeleteKey)
         NetworkMonitor.setConnectedForTesting(fixture.wasConnected)
         InstalledTestDatabaseLifetime.finish(previous: fixture.previous, pool: fixture.pool, directory: fixture.dir)
+    }
+
+    /// Ends a refused Undo's notice the way the user does. The test host's
+    /// RootView shows the notice as a "Couldn't undo" alert; clearing the notice
+    /// in code while that alert is still appearing can leave the alert up in the
+    /// host's window, where a later suite's alert checks find it. So this waits
+    /// for the alert to finish appearing and dismisses it through UIKit, as its
+    /// OK does, which ends the notice; then it waits for both to be gone. With
+    /// no alert up (no active scene), it ends the notice in code.
+    private func dismissUndoFailureAlert() async {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let window = scene?.windows.first { $0.isKeyWindow } ?? scene?.windows.first
+        func presentedAlert() -> UIAlertController? {
+            var controller = window?.rootViewController?.presentedViewController
+            while let current = controller {
+                if let alert = current as? UIAlertController, alert.title == "Couldn't undo" { return alert }
+                controller = current.presentedViewController
+            }
+            return nil
+        }
+        func eventually(_ condition: () -> Bool) async -> Bool {
+            let end = Date().addingTimeInterval(5)
+            while !condition() {
+                if Date() >= end { return false }
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+            return true
+        }
+        let up = await eventually { presentedAlert().map { !$0.isBeingPresented } ?? false }
+        if up, let alert = presentedAlert() {
+            alert.dismiss(animated: false)
+        } else {
+            UndoService.shared.dismissUndoFailure()
+        }
+        let gone = await eventually { UndoService.shared.undoFailureMessage == nil && presentedAlert() == nil }
+        #expect(gone, "control: the notice and its alert are gone before the next step")
     }
 
     /// Holds the FIFO write queue until the returned continuation finishes, so
@@ -667,6 +704,7 @@ struct InboxThreadAcrossAccountsTests {
         case .both:
             #expect(UndoService.shared.undoFailureMessage == "Nothing was moved back.")
         }
+        await dismissUndoFailureAlert()
     }
 
     @Test("each Undo's notice is decided by that entry alone: a partly refused Undo says some messages were not moved back, the next one, which brings everything back, says nothing, and the one after, which brings nothing back, says nothing was moved back")
@@ -703,7 +741,7 @@ struct InboxThreadAcrossAccountsTests {
         let partlyBack = try await folderId(of: partly[1].id, in: fixture.pool)
         #expect(partlyBack == fixture.outlookInbox.id, "setup: the partly refused entry's Outlook member is back")
         #expect(UndoService.shared.undoFailureMessage == "Some messages were not moved back.")
-        UndoService.shared.dismissUndoFailure()
+        await dismissUndoFailureAlert()
 
         await UndoService.shared.undo()
         await AccountManager.shared.awaitWriteQueueDrain()
@@ -719,6 +757,7 @@ struct InboxThreadAcrossAccountsTests {
         #expect(UndoService.shared.undoFailureMessage == "Nothing was moved back.",
                 "an Undo that brought nothing back says so, whatever the ones before it brought back")
         #expect(UndoService.shared.undoStack.isEmpty)
+        await dismissUndoFailureAlert()
     }
 
     // MARK: - Address changes and pruning across the parts of one entry
