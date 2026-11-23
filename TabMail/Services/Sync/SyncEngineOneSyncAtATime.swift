@@ -21,9 +21,11 @@ import Synchronization
 //   inbox only (on IMAP); a return to the app, IMAP IDLE, pull to refresh and
 //   background processing read every folder. It is the lean path the startup,
 //   push and background budgets depend on (iOS memory 042).
-// - Stage 2 is `SyncEngine.sync(account:)`, run for each account by
-//   `SyncScheduler.poll()`: a quick sync, then the full sync when `lastFullSyncAt`
-//   says it is due or the read needs a listing. Only the foreground starts it:
+// - Stage 2 is `SyncEngine.foregroundPass`, run for each account by
+//   `SyncScheduler.poll()` (`syncOrFollowUp`) or by Settings, a new account and
+//   the epoch rebuild (`sync(account:)`): a quick sync, then the full sync when
+//   `lastFullSyncAt` says it is due or the read needs a listing. Only the
+//   foreground starts it:
 //   opening the app, the 5-minute poll timer (stopped when the app leaves the
 //   foreground), adding an account and the account screen in Settings. The one
 //   exception is the one-time v1.7.1 epoch rebuild, which runs once per install
@@ -46,7 +48,16 @@ import Synchronization
 // - The poll does not wait for a busy account either. It sets the flag and goes
 //   straight on to the queued work (actions, outbox, calendar), which never
 //   depended on stage 2: each gesture and a network restore already start that
-//   work on their own, while syncs run.
+//   work on their own, while syncs run. An account it skipped never counts as a
+//   success when the poll clears the inbox error banner.
+// - Work that is not a trigger still waits for its turn: a single-folder
+//   listing (pull to refresh's folders on screen, message detail), a catch-up
+//   slice, a Settings reset, and stage 2 from Settings, a new account or the
+//   epoch rebuild (`sync(account:)`).
+// - Code: `oneSyncAtATimeOrFollowUp` sets the flag; `handOverSyncPass` asks for
+//   the stage 2 each time the account becomes free while the flag is set;
+//   `foregroundPass` clears it when it starts; `SyncScheduler.runSyncFollowUp`
+//   runs it, in the foreground only.
 //
 // Every time limit counts from when the sync starts running, never from when it
 // was asked for. Stage 2's limit (`SyncConfig.perAccountSyncTimeoutSeconds`)
@@ -82,7 +93,10 @@ extension SyncEngine {
     /// Runs `pass` as the account's only sync pass, so a delta and a full sync
     /// of one account never run at the same time. A pass that arrives while
     /// another runs waits its turn, in arrival order, and then runs; nothing is
-    /// joined, and a caller's timeout includes the wait. The pass's first step
+    /// joined. Only work that is not a sync trigger waits here (a listing, a
+    /// catch-up slice, a Settings reset, stage 2 from Settings or a new account);
+    /// none of them has a time limit that counts the wait. A trigger never waits:
+    /// it uses `oneSyncAtATimeOrFollowUp`. The pass's first step
     /// inside its turn is `accountAtTurnStart`. The turn is released on every
     /// exit, a throw included, and handed straight to the oldest waiter.
     /// A waiter whose task was cancelled still takes its turn, and its pass
@@ -111,6 +125,26 @@ extension SyncEngine {
         var held = Self.heldSyncTurn
         held[accountId] = task
         return try await Self.$heldSyncTurn.withValue(held) { try await pass() }
+    }
+
+    /// The trigger form of `oneSyncAtATime` (the follow-up flag in the sync
+    /// design block above; #1289): runs `pass` only when the account's turn is
+    /// free. When another pass holds it, it sets the account's follow-up flag
+    /// and returns nil at once: the trigger never waits in line, and it is not
+    /// dropped, because one stage 2 runs when the running work ends
+    /// (`handOverSyncPass`). Its caller's time limit therefore counts from
+    /// when its pass takes the turn. Re-entrant like `oneSyncAtATime`.
+    func oneSyncAtATimeOrFollowUp<T>(
+        accountId: String, caller: String = #fileID, line: Int = #line, _ pass: () async throws -> T
+    ) async rethrows -> T? {
+        let task = Self.currentTaskIdentity()
+        let heldByThisTask = task != nil && Self.heldSyncTurn[accountId] == task
+        if !heldByThisTask && syncPassRunning.contains(accountId) {
+            syncFollowUpWanted.insert(accountId)
+            BackgroundSyncLogger.logDebug("[SyncTurn] \(accountId.prefix(8)): busy, follow-up wanted (\(caller):\(line))")
+            return nil
+        }
+        return try await oneSyncAtATime(accountId: accountId, caller: caller, line: line, pass)
     }
 
     /// Waits for the account's turn; false only when the test harness released
@@ -209,9 +243,14 @@ extension SyncEngine {
     #endif
 
     /// Ends a pass: the oldest waiter takes the turn, or the account is free.
+    /// Once it is free, a trigger that found it busy gets its one stage 2: the
+    /// flag asks for it here, and the stage 2 clears the flag when it takes the
+    /// turn (`foregroundPass`). Until then every release asks again, so a
+    /// flag set in the background is asked for by the next opening's stage 1.
     private func handOverSyncPass(accountId: String) {
         guard var waiting = syncPassWaiters[accountId], !waiting.isEmpty else {
             syncPassRunning.remove(accountId)
+            if syncFollowUpWanted.contains(accountId) { syncFollowUp(accountId) }
             return
         }
         let next = waiting.removeFirst()

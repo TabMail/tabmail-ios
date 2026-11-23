@@ -481,19 +481,24 @@ extension AccountManager {
                     // the background sync runs, so a change made elsewhere to older mail
                     // or to a folder not on screen shows with this pull. Its deadline is
                     // taken here, once, and bounds it as a timeout too, as for the
-                    // background and foreground passes (a wait behind a running pass of
-                    // the same account counts). The pass reports a failed read in its
+                    // background and foreground passes. The read never waits for its
+                    // turn: when another pass of the account runs, it sets the
+                    // account's follow-up flag and reads nothing, and one stage 2
+                    // follows when that pass ends (the sync design block in
+                    // SyncEngineOneSyncAtATime.swift; #1289). So its time limit counts
+                    // from when it runs. The pass reports a failed read in its
                     // result (the refresh still succeeds, as in the background); a
                     // timeout or what it rethrows (a database error, a failed retry
                     // after a connection error) fails the refresh.
                     if let account {
                         let timeout = SyncConfig.perAccountSyncTimeoutSeconds
                         let deadline = Date().addingTimeInterval(timeout)
-                        let (changed, reason) = try await withTimeout(seconds: timeout) {
+                        let read = try await withTimeout(seconds: timeout) {
                             try await syncEngine.backgroundDeltaSync(account: account, deadline: deadline)
                         }
                         if DebugModeManager.isLoggingEnabled() {
-                            BackgroundSyncLogger.logDebug("[SyncFolders] change read for account \(accountId.prefix(6)): changed=\(changed) reason=\(reason)")
+                            let outcome = read.map { "changed=\($0.changed) reason=\($0.reason)" } ?? "busy, follow-up wanted"
+                            BackgroundSyncLogger.logDebug("[SyncFolders] change read for account \(accountId.prefix(6)): \(outcome)")
                         }
                     }
                 }

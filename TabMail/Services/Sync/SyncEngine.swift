@@ -76,6 +76,11 @@ actor SyncEngine {
     var syncTurnWaiterSerial: UInt64 = 0
     /// Waiters the test harness released after an overrun (`syncTurnWaitWatch`).
     var overrunSyncTurnWaiters: Set<UInt64> = []
+    /// The accounts a sync trigger found busy: each gets one follow-up stage 2
+    /// when its running work ends (`oneSyncAtATimeOrFollowUp`; the sync design
+    /// block at the top of SyncEngineOneSyncAtATime.swift). In memory only: a
+    /// launch runs every account's stage 1 and stage 2 anyway.
+    var syncFollowUpWanted: Set<String> = []
 
     /// Header walks (`runBackfillWalk`) executing now, foreground or job. A walk
     /// admitted before a download gate closed keeps running on its own snapshot,
@@ -96,8 +101,18 @@ actor SyncEngine {
     /// read that runs past its budget needs no real waiting.
     nonisolated let changeReadClock: @Sendable () -> Date
 
-    init(changeReadClock: @escaping @Sendable () -> Date = { Date() }) {
+    /// Asks for an account's follow-up stage 2 when its turn is released with its
+    /// follow-up flag set (`handOverSyncPass`). The app's engine asks
+    /// `SyncScheduler.runSyncFollowUp`, which runs it only in the foreground; an
+    /// engine built without one, as most tests build it, asks nothing.
+    nonisolated let syncFollowUp: @Sendable (_ accountId: String) -> Void
+
+    init(
+        changeReadClock: @escaping @Sendable () -> Date = { Date() },
+        syncFollowUp: @escaping @Sendable (_ accountId: String) -> Void = { _ in }
+    ) {
         self.changeReadClock = changeReadClock
+        self.syncFollowUp = syncFollowUp
     }
 
     /// GRDB DatabasePool for foreground SYNC — full / delta / pull-down / on-demand /
@@ -589,12 +604,15 @@ actor SyncEngine {
     /// Only fetches new headers and enqueues to body/AI/embedding queues.
     /// Does NOT start backfill, bulk index, embedding rebuild, or full sync fallback.
     /// Designed to complete well within iOS's ~30s background budget.
-    /// Returns (changed, reason) where reason describes what happened for diagnostics.
+    /// Returns (changed, reason) where reason describes what happened for diagnostics,
+    /// or nil when another pass of the account was running: the account's
+    /// follow-up flag is set and nothing was read (`oneSyncAtATimeOrFollowUp`).
     /// - Parameter deadline: the caller's own deadline for this call (its timeout),
-    ///   or nil when it sets none. The pass reads only what it can apply before it,
-    ///   whatever its wait for its turn (ADR-IOS-104 decision 2, amended).
+    ///   or nil when it sets none. The pass reads only what it can apply before it
+    ///   (ADR-IOS-104 decision 2, amended). It never waits for its turn, so the
+    ///   caller's time limit counts from when the pass takes the turn.
     @discardableResult
-    func backgroundDeltaSync(account: Account, inboxOnly: Bool = false, deadline: Date? = nil) async throws -> (changed: Bool, reason: String) {
+    func backgroundDeltaSync(account: Account, inboxOnly: Bool = false, deadline: Date? = nil) async throws -> (changed: Bool, reason: String)? {
         guard let queue = workQueues[account.id] else {
             BackgroundSyncLogger.logDebug("[Sync:bg] No provider for \(account.emailAddress) — skipping")
             BackgroundSyncLogger.log("bgDelta: \(account.emailAddress) noProvider")
@@ -602,10 +620,11 @@ actor SyncEngine {
         }
         let provider = queue.provider
 
-        // A foreground pass of the same account running now finishes first
-        // (`oneSyncAtATime`); then this delta runs, on the account's row as it is
-        // when its turn starts.
-        return try await oneSyncAtATime(accountId: account.id) {
+        // Stage 1 is a sync trigger: when another pass of the account runs, it
+        // sets the account's follow-up flag and returns nil instead of waiting
+        // (the sync design block in SyncEngineOneSyncAtATime.swift; #1289).
+        // Otherwise it runs on the account's row as it is when its turn starts.
+        return try await oneSyncAtATimeOrFollowUp(accountId: account.id) {
             try await self.backgroundDeltaPass(
                 accountId: account.id, queue: queue, provider: provider, inboxOnly: inboxOnly, deadline: deadline)
         }
@@ -710,7 +729,25 @@ actor SyncEngine {
 
         // The work queue has several slots and does not serialize passes: a pass
         // of the same account running now finishes first (`oneSyncAtATime`).
+        // Settings, a new account and the epoch rebuild wait here; the poll and
+        // the follow-up use `syncOrFollowUp`, which never waits.
         return try await oneSyncAtATime(accountId: account.id) {
+            try await self.foregroundPass(accountId: account.id, queue: queue, provider: provider, deadline: deadline)
+        }
+    }
+
+    /// Stage 2 as a sync trigger, for the poll and the follow-up stage 2: it runs
+    /// only when the account's turn is free, and returns nil, with the account's
+    /// follow-up flag set, when another pass holds it (`oneSyncAtATimeOrFollowUp`;
+    /// the sync design block in SyncEngineOneSyncAtATime.swift). It never waits
+    /// for its turn, so its caller's time limit counts from when it runs (#1289).
+    func syncOrFollowUp(account: Account, deadline: Date?) async throws -> Bool? {
+        guard let queue = workQueues[account.id] else {
+            BackgroundSyncLogger.logDebug("[Sync] No provider registered for \(account.emailAddress) — skipping")
+            return false
+        }
+        let provider = queue.provider
+        return try await oneSyncAtATimeOrFollowUp(accountId: account.id) {
             try await self.foregroundPass(accountId: account.id, queue: queue, provider: provider, deadline: deadline)
         }
     }
@@ -718,6 +755,9 @@ actor SyncEngine {
     private func foregroundPass(
         accountId: String, queue: ProviderWorkQueue, provider: any EmailProvider, deadline: Date?
     ) async throws -> Bool {
+        // Stage 2 has taken the turn: it is the one stage 2 a trigger that found
+        // the account busy asked for (the follow-up flag in the sync design block).
+        syncFollowUpWanted.remove(accountId)
         guard let account = try await accountAtTurnStart(accountId) else {
             BackgroundSyncLogger.logDebug("[Sync] Account \(accountId.prefix(8)) was removed before its turn — skipping")
             return false

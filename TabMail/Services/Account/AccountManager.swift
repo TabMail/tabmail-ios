@@ -196,7 +196,12 @@ actor AccountManager {
     /// once by the drain at every terminal branch (success/notFound/scope/
     /// auth/badRequest) and on transient retry-back-to-queued.
     var calendarOpAwaiters: [String: CheckedContinuation<CalendarOpOutcome, Never>] = [:]
-    let syncEngine = SyncEngine()
+    /// A sync trigger that finds an account busy asks the scheduler for the
+    /// account's one follow-up stage 2 (the sync design block in
+    /// SyncEngineOneSyncAtATime.swift).
+    let syncEngine = SyncEngine(syncFollowUp: { accountId in
+        Task { @MainActor in await SyncScheduler.shared.runSyncFollowUp(accountId: accountId) }
+    })
     private var _oauthService: OAuthService?
     /// OAuthService is @MainActor (uses ASWebAuthenticationSession).
     /// Created lazily on first use from MainActor context. All callers

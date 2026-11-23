@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -16,6 +17,9 @@ import Testing
 /// | `AccountManager.foregroundPollRun`            | full                | never  | when no account failed |
 /// | `AccountManager.backgroundPollRun(nil)`       | full                | never  | when no account failed |
 /// | `AccountManager.backgroundPollRun(email)`     | partial             | never  | never               |
+/// | `AccountManager.followUpRun`                  | partial             | never  | never               |
+///
+/// A poll run that skipped a busy account (`SyncResult.skipped`) is partial.
 ///
 /// "Failed" above means counted (`InboxErrorBanner.countsAsFailure`): for a poll,
 /// an account marked sign-in-needed never counts. A refresh judges the one error
@@ -241,6 +245,68 @@ struct SyncRunBannerEntryPointTests {
             #expect(AccountManagerState.shared.lastSyncCompletedAt == completedBefore,
                     "an all-failed poll advanced lastSyncCompletedAt")
             #expect(AccountManagerState.shared.lastSyncFailed)
+        }
+    }
+
+    // MARK: - A busy account is skipped, never waited for
+
+    /// A poll that finds an account's turn held by another pass returns without
+    /// waiting for it (the account gets its follow-up flag). It did not sync
+    /// every account, so it never clears the banner, foreground or background.
+    /// The follow-up stage 2 reports as a partial run, so it never clears either;
+    /// the next run that syncs every account does. RED while a poll waited for a
+    /// busy account, and while a skipped account counted as a success.
+    @Test("a poll with a busy account returns at once and never clears; nor does the account's follow-up")
+    func busyAccountPollNeverClears() async throws {
+        try await withWorld { world in
+            await raiseThroughRefresh(world)
+            #expect(banner == InboxErrorBanner.genericMessage)
+            await world.setFailing(false)
+            let engine = await AccountManager.shared.syncEngine
+            let accountId = world.accountA.id
+            let log = OneSyncAtATimeTests.PassLog()
+            let release = AsyncStream<Void>.makeStream()
+            let holder = OneSyncAtATimeTests.heldPass(
+                engine: engine, accountId: accountId, name: "held", log: log, release: release.stream)
+            var waitEnd = Date().addingTimeInterval(10)
+            while log.snapshot.isEmpty, Date() < waitEnd { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(log.snapshot == ["start held"], "precondition: account A's turn is held")
+
+            let runs = Mutex<[AccountManager.SyncResult]>([])
+            let polls = Task {
+                let foreground = await AccountManager.shared.foregroundPollRun()
+                let foregroundBanner = AccountManagerState.shared.syncErrorBanner
+                runs.withLock { $0.append(foreground) }
+                let background = await AccountManager.shared.backgroundPollRun(accountEmail: nil, inboxOnly: false)
+                runs.withLock { $0.append(background) }
+                return foregroundBanner
+            }
+            waitEnd = Date().addingTimeInterval(10)
+            while runs.withLock({ $0.count }) < 2, Date() < waitEnd { try await Task.sleep(for: .milliseconds(10)) }
+            let returnedWhileHeld = runs.withLock { $0.count } == 2
+            #expect(returnedWhileHeld, "a poll waited for the busy account's turn")
+            release.continuation.yield()
+            await holder.value
+            let bannerAfterForeground = await polls.value
+            let results = runs.withLock { $0 }
+            let everyRunSkipped = results.count == 2 && results.allSatisfy(\.skipped)
+            #expect(everyRunSkipped, "a run with a busy account did not report it skipped")
+            #expect(bannerAfterForeground == InboxErrorBanner.genericMessage, "a foreground poll with a busy account cleared the banner")
+            #expect(banner == InboxErrorBanner.genericMessage, "a background poll with a busy account cleared the banner")
+
+            // The account's follow-up stage 2, now that it is free.
+            var followUp: AccountManager.SyncResult?
+            waitEnd = Date().addingTimeInterval(10)
+            while followUp == nil, Date() < waitEnd {
+                followUp = await AccountManager.shared.followUpRun(world.accountA)
+                if followUp == nil { try await Task.sleep(for: .milliseconds(20)) }
+            }
+            let followUpRan = followUp != nil
+            #expect(followUpRan, "the follow-up stage 2 never ran")
+            #expect(banner == InboxErrorBanner.genericMessage, "the follow-up, a partial run, cleared the banner")
+
+            _ = await AccountManager.shared.foregroundPollRun()
+            #expect(banner == nil, "non-vacuity: a run that syncs every account clears")
         }
     }
 

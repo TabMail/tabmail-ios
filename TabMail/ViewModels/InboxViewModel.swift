@@ -1812,6 +1812,11 @@ final class InboxViewModel {
             // Each account connects (if it has no provider yet) and syncs in its own
             // task, so an account that cannot connect or sync never stops the others
             // (#689). The run's outcome is the one error that reaches this catch.
+            // Sync trigger: the pull's change read gives an account another pass
+            // holds a follow-up flag, never a wait; the folders on screen still
+            // wait for their turn. Siblings: IDLE, silent push, the open-app push,
+            // the poll, a return (the sync design block in
+            // SyncEngineOneSyncAtATime.swift; ADR-IOS-104).
             try await manager.syncFolders(folders, connecting: uniqueAccounts)
 
             AccountManagerState.shared.lastSyncFailed = false
