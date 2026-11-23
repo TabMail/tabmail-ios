@@ -1360,7 +1360,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    UIKit's pan and SwiftUI's drag measure in their own ways. A drag 30 pt up
    let go at 90 pt/s predicts 52.5 pt and settles back; at 120 pt/s it predicts 60 pt and opens. The
    pan stays on while the field has focus (mock v15 M2: "Type a question ... Drag up: your words ride
-   along"), so a short draft in the focused field opens the panel the same way and keeps its words;
+   along"), so a short draft in the focused field opens the panel the same way and keeps its words,
+   and its keyboard (amended 2026-11-23, mock v15 H2: "Both open above the keyboard"): the reply
+   field and the panel's input are two text fields, each with its own focus value
+   (`DynamicIslandChat.InputFocus`), and the update that opens the panel moves a typed-in field's
+   focus to the panel's input while the field is still on screen. One shared value had let the
+   field's focus go with it as it left, and the panel opened with no keyboard (UI run 2026-11-23);
    only the open panel and the tutorial turn it off. *Superseded 2026-11-21 (it carried a flick about
    twice as far as SwiftUI's drag had, so slower flicks opened the panel):* "only a finished drag can
    open the panel, from its swell or a flick's predicted swell (`ChatFieldDrag.predictedEnd`, a
@@ -1420,7 +1425,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    there; `testLongPressThenDragUpInTheFocusedFieldStaysTheTexts`: a held press then a drag up
    stays the text's; `ChatFieldDragTests.textViewOrdering`: the long press never waits for the
    field's drag), `testDragUpOnAShortFocusedDraftOpensThePanelWithIt`
-   (signed in through the fixture's `--chat-swipe-signed-in`: the panel's editor holds the draft),
+   (signed in through the fixture's `--chat-swipe-signed-in`: the panel's editor holds the draft
+   and keeps its focus; `ChatReplyFieldTests.fieldDragWiring` pins the two focus values and the
+   hand-over),
    `testDragCutOffByThePanelOpeningSettlesAndTheNextDragWorks` (the fixture's
    `--chat-swipe-open-panel-under-drag` opens the panel the moment the debug marker sees the held
    drag swollen past the open distance, which turns the pan off: the marker records the opening's

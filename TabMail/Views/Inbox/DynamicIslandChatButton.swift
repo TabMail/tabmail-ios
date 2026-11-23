@@ -102,7 +102,16 @@ struct DynamicIslandChat: View {
     }
     @State private var agentToast: String?
     @State private var agentToastDismiss: Task<Void, Never>?
-    @FocusState private var isTextFieldFocused: Bool
+    /// Which text field has the keyboard: the chat's reply field, or the open panel's input. Each is
+    /// its own text field, and one value each lets the keyboard move from the field to the panel's
+    /// input as the panel opens (`InputFocus`).
+    @FocusState private var focusedInput: InputFocus?
+    /// Whether a text field has the keyboard; set false, neither has it. Set true, the panel's input
+    /// takes it: only the open panel sets it so (a forked chat's words, put in its input).
+    private var isTextFieldFocused: Bool {
+        get { focusedInput != nil }
+        nonmutating set { focusedInput = newValue ? .panel : nil }
+    }
     @AppStorage(ChatPillState.autoDictationKey) private var autoDictation = false
     @AppStorage(ChatPillState.dictationPromptShownKey) private var dictationPromptShown = false
     @State private var showDictationPrompt = false
@@ -486,6 +495,11 @@ struct DynamicIslandChat: View {
             autoStartTask?.cancel()
             autoStartTask = nil
             if expanded {
+                // The chat's field becomes the panel's input with its words (mock v15 M2); typed
+                // in, it keeps the keyboard, which moves to the panel's input, its own text field,
+                // so the panel opens above the keyboard (mock v15 H2). This runs in the update
+                // that opens the panel, while the field is still on screen with the keyboard.
+                if focusedInput == .replyField { focusedInput = .panel }
                 dismissAgentToast()
                 // Opportunistic cleanup of idle in-memory sessions (5 min TTL).
                 ChatPillState.shared.evictIdleSessions()
@@ -875,16 +889,24 @@ struct DynamicIslandChat: View {
         inputSelection = .init(insertionPoint: inputText.endIndex)
     }
 
+    /// The two text fields that take the keyboard: the chat view's reply field, and the open
+    /// panel's input (also the only one of the inbox and compose pills, which have no reply field).
+    enum InputFocus: Hashable {
+        case replyField
+        case panel
+    }
+
     /// The input field, with the dictation waveform over it while listening. `showChat`: the chat's
     /// reply field's "Show TabMail chat" (`showChatAction`), on the field and, while dictation hides
-    /// the field from VoiceOver, on the waveform VoiceOver focuses instead.
-    func inputField(placeholder: String, showChat: (() -> Void)? = nil) -> some View {
+    /// the field from VoiceOver, on the waveform VoiceOver focuses instead. `focus`: which field
+    /// this is, for the keyboard (`InputFocus`).
+    func inputField(placeholder: String, showChat: (() -> Void)? = nil, focus: InputFocus = .panel) -> some View {
         // Dictating: the field's text dims behind the waveform. Tap it to stop listening; the
         // text is appended when it comes back.
         TextField(placeholder, text: typedText, selection: $inputSelection, axis: .vertical)
             .textFieldStyle(.plain)
             .lineLimit(1...6)
-            .focused($isTextFieldFocused)
+            .focused($focusedInput, equals: focus)
             .modifier(ReplyFieldFocusMarker(focused: isTextFieldFocused))
             // Debug UI tests only: counts this field being built while a drag's finger is down
             // and after its let-go.

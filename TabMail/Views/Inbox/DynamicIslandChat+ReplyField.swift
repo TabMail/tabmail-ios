@@ -71,7 +71,7 @@ extension DynamicIslandChat {
                             .showChatAction(field.showChat, isExpanded: isExpanded)
                     } else {
                         inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask",
-                                   showChat: field.showChat)
+                                   showChat: field.showChat, focus: .replyField)
                         if showsExample, let example = field.example {
                             exampleLine(example)
                         }

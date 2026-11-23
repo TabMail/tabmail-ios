@@ -317,7 +317,8 @@ final class ChatSwipeUITests: XCTestCase {
     private static let insideTheFieldsEdge: CGFloat = 4
 
     /// Signed in, the focused field with a short draft: the drag up opens the panel, whose editor
-    /// (not the sign-in bar a signed-out panel shows) holds the same draft.
+    /// (not the sign-in bar a signed-out panel shows) holds the same draft and keeps its focus
+    /// (mock v15 H2: the panel opens above the keyboard).
     func testDragUpOnAShortFocusedDraftOpensThePanelWithIt() {
         let app = launchIntoChat(signedIn: true)
         let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
@@ -339,6 +340,8 @@ final class ChatSwipeUITests: XCTestCase {
         } else {
             XCTFail("control: the marker shows the open panel")
         }
+        // Read from the element, as the overflowing draft's test reads it.
+        XCTAssertTrue(waitForFocus(editor, true, timeout: 3), "the panel's editor keeps the draft's focus")
     }
 
     /// The signed-in field's hint (`ChatReplyField.placeholder`), and the open panel's sign-in bar.

@@ -1267,7 +1267,7 @@ struct ChatReplyFieldTests {
         // One helper, only while the panel is closed.
         #expect(Self.count("func showChatAction(_ showChat: (() -> Void)?, isExpanded: Bool) -> some View { accessibilityActions { if let showChat, !isExpanded { Button(ChatViewConfig.showChatActionName) { showChat() } } } }", in: bar) == 1)
         // On the text field, and on the sent words while the agent works (the drag stays on then).
-        #expect(Self.count("inputField(placeholder: hasTabMailSession ? field.placeholder : \"Sign in to reply or ask\", showChat: field.showChat)", in: bar) == 1)
+        #expect(Self.count("inputField(placeholder: hasTabMailSession ? field.placeholder : \"Sign in to reply or ask\", showChat: field.showChat, focus: .replyField)", in: bar) == 1)
         #expect(Self.count(".opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1) // The drag stays on while the agent works: so does its VoiceOver action. .showChatAction(field.showChat, isExpanded: isExpanded)", in: bar) == 1)
         // While dictating, VoiceOver cannot reach the hidden text field: the waveform carries it.
         let pill = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
@@ -1276,6 +1276,28 @@ struct ChatReplyFieldTests {
         // A field built without the action offers none (the panel open, the tutorial).
         #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).showChat == nil)
         #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0, showChat: {}).showChat != nil)
+        // The reply field and the panel's input are two text fields, each with its own focus value,
+        // and the panel opening moves a typed-in field's keyboard to the panel's input, in the
+        // update that opens it (mock v15 H2; on screen: `ChatSwipeUITests`, the drags that open
+        // the panel from the focused field).
+        #expect(Self.count("@FocusState private var focusedInput: InputFocus?", in: pill) == 1)
+        #expect(Self.count(".focused($focusedInput, equals: focus)", in: pill) == 1)
+        #expect(Self.count(".focused(", in: pill) == 1, "the input field is the pill's one focusable view")
+        #expect(Self.count("focus: .replyField", in: bar) == 1, "the reply field is the only field focused as the reply field")
+        let openingText = ".onChange(of: isExpanded) { _, expanded in autoStartTask?.cancel() autoStartTask = nil if expanded {"
+        let handOverText = "if focusedInput == .replyField { focusedInput = .panel } dismissAgentToast()"
+        #expect(Self.count(openingText, in: pill) == 1)
+        #expect(Self.count(handOverText, in: pill) == 1)
+        #expect(Self.count("focusedInput = .panel", in: pill) == 1, "the opening is the only hand-over")
+        let opening = try #require(pill.range(of: openingText))
+        let handOver = try #require(pill.range(of: handOverText))
+        guard opening.upperBound <= handOver.lowerBound else {
+            Issue.record("the hand-over comes after the opening")
+            return
+        }
+        // Directly inside the opening branch: only its comment between, no block opened or closed.
+        let between = String(pill[opening.upperBound..<handOver.lowerBound])
+        #expect(!between.contains("{") && !between.contains("}"), "the hand-over is in the branch that opens the panel: \(between)")
     }
 
     @Test("The settle lasts the pill spring's own settling duration, which drives the panel and the swell too")
