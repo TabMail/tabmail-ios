@@ -22,7 +22,9 @@ saw only page one, and a mailbox with more calendars than one page lost the rest
   Only the assistant's tools and Settings list calendars and events, never the durable calendar
   queue, so the error cannot hold a queued write. The cap is reachable: 40 pages of 250 is 10,000
   rows, which a search with explicit dates years apart on a very busy calendar can pass. That
-  calendar is then skipped (`CalendarToolHelpers` logs and moves on) and a narrower window lists it.
+  calendar is then reported in the tool's result as not read, and a narrower window lists it
+  (#1293, 2026-11-23; until then it was skipped: `CalendarToolHelpers` logged and moved on, and
+  the assistant read the missing calendar as one with no events).
 - `listEvents` asks for `ExchangeCalendarConfig.listPageSize` (250) events a page, the `$top` the
   search tool's `maxResults` already sent, so Graph is known to take it. It filters each page as
   it is read (cancelled, empty, then the `query`), so `maxResults` counts the events returned,
