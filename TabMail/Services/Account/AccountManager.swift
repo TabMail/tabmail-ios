@@ -1533,7 +1533,9 @@ actor AccountManager {
 
     /// IDLE follows the provider (#1331): every place that makes a connected mail
     /// provider the account's live one calls this (`connectAccount`, the IMAP and
-    /// iCloud adds, a password update). While foreground polling is on, the
+    /// iCloud adds, a password update), and `connectAccount` also after a connect
+    /// that failed for a reason other than a refused sign-in, as its provider stays
+    /// installed. While foreground polling is on, the
     /// scheduler starts that provider's IDLE now, so a provider that goes live
     /// after the foreground start does not wait for the next return. Not
     /// awaited: installing a provider never waits for the main actor.
@@ -1668,6 +1670,19 @@ actor AccountManager {
                 authFailedAccounts.insert(account.id)
             } else {
                 BackgroundSyncLogger.logDebug("[AccountManager] Connect failed for \(account.emailAddress) (non-auth): \(error)")
+            }
+            // The provider stays installed (stored above), so IDLE follows it here
+            // too: a connect that failed for now (no network at a cold launch, a
+            // timeout, a temporary refusal) gets IDLE, whose own launch retry brings
+            // it up once the server answers. This is the provider's only hand-off:
+            // `ensureConnected` later reconnects it without one. A refused sign-in
+            // hands nothing off:
+            // `authFailedAccounts` holds both the typed refusal above and an IMAP
+            // password refusal, which the provider's sign-in reporter records before
+            // it throws. A server that wrongly refuses the sign-in at a cold launch
+            // gets IDLE at the next return.
+            if !authFailedAccounts.contains(account.id), !isRuntimeRemoved(account.id) {
+                liveProviderConnected(account)
             }
             throw error
         }

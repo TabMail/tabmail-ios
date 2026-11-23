@@ -315,8 +315,16 @@ read from the existing poll timer (set by `startForegroundPolling`, cleared by `
 the cold launch, the first account, an account added after the last was removed (the timer survives the
 removal, and `startForegroundPolling`'s `guard timer == nil` timer dedup, kept as it is, returns before
 `startImapIdle`), a second account added in the open app, a re-sign-in by password, and the OAuth
-reconnects (which go through `connectAccount`; their providers have no IDLE). A provider that goes live in
-the background (no timer) starts nothing. A background transition that lands between the timer check and
+reconnects (which go through `connectAccount`; their providers have no IDLE). `connectAccount` installs its
+provider before it connects and keeps it when the connect fails, and `ensureConnected` later reconnects that
+provider without a hand-off; so `connectAccount` hands off after a failed connect too, unless the sign-in was
+refused (`authFailedAccounts`, which holds both the typed refusal and an IMAP password refusal, recorded by
+the provider's sign-in reporter before it throws) or the account was removed. A cold launch with no network,
+a timeout or a temporary refusal then gets IDLE at once, and IDLE's own launch retry (every 10 s) brings it up
+when the server answers, as it already did for a provider `startImapIdle` found installed but not connected.
+A refused password hands nothing off, so IDLE never retries it; the password update hands off the accepted
+provider. Accepted: a server that wrongly refuses the sign-in at a cold launch and accepts the same password
+later gets IDLE at the next return. A provider that goes live in the background (no timer) starts nothing. A background transition that lands between the timer check and
 the provider's IDLE start can leave that IDLE on until the app is suspended, the same window
 `startImapIdle` has; it is harmless extra work and the next return and background transition put it right. A provider started twice keeps one IDLE connection: `launchIdleConnection` returns
 when its IDLE connection is live, and a second start during a launch replaces that launch, whose
@@ -352,8 +360,11 @@ app's scheduler and the app's own entry points against a fake IMAP server, with 
 launch (`connectAccount`) starts stage 1, then the poll's pass, installs the timer and starts IDLE for a
 provider connected before the start and for one connected after it; the first account, an account added
 after the last was removed and a second account, each through `addIMAPAccount`; a password update through
-`updatePassword`; no IDLE from a connect while polling is off (before any start, after the app left); a
-provider started twice, while launching and once live, sends IDLE once on one connection; and a source fence:
+`updatePassword`; no IDLE from a connect while polling is off (before any start, after the app left); a cold
+launch whose first connect is refused for now gets IDLE live with no return, and one whose password is refused
+gets no IDLE start; a provider started twice, while launching and once live, sends IDLE once on one
+connection; IDLE's events on a real IDLE session (EXISTS reads the new message now; VANISHED deletes the row
+it names while another pass holds the account, and its read asks for the follow-up); and a source fence:
 every place in `TabMail/Services/Account` that makes a connected mail provider live calls
 `liveProviderConnected` (the iCloud add, whose server is fixed, is covered by the fence alone). The
 scheduler's `foregroundWorkHook` (DEBUG) records the start's work instead of running it; stage 1 and the

@@ -1234,6 +1234,19 @@ final class FakeIMAPServer: @unchecked Sendable {
         }
     }
 
+    /// Sends one untagged response (`* 2 EXISTS`, `* VANISHED 1`) to every
+    /// session in IDLE, as a server reports a change to the selected mailbox
+    /// during IDLE (RFC 2177). The mailbox itself is changed separately
+    /// (`setMessages`). Returns how many sessions it reached.
+    @discardableResult
+    func notifyIdleSessions(_ untagged: String) -> Int {
+        let fds = withState { $0.idlingFds }
+        for fd in fds {
+            sendLine(fd: fd, "\(untagged)\r\n")
+        }
+        return fds.count
+    }
+
     func killConnectionOnNextCommand(containing fragment: String) {
         withState { state in
             state.injectedFailureCountdowns[fragment.uppercased(), default: []]

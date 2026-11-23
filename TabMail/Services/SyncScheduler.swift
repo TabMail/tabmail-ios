@@ -862,7 +862,9 @@ final class SyncScheduler {
 
     /// IDLE follows the provider (#1331). `AccountManager.liveProviderConnected`
     /// calls this wherever a connected mail provider becomes the account's live
-    /// one (`connectAccount`, the IMAP and iCloud adds, a password update).
+    /// one (`connectAccount`, the IMAP and iCloud adds, a password update), and
+    /// after a `connectAccount` that failed for now (IDLE's launch retry then
+    /// brings it up).
     /// While foreground polling is on (the
     /// poll timer is set, from `startForegroundPolling` until `stopPolling`), an
     /// IMAP account's provider starts IDLE now. So a provider that connects after

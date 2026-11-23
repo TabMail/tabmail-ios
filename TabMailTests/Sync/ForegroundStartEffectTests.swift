@@ -15,7 +15,11 @@ import UIKit
 /// - every IMAP provider gets IDLE while foreground polling is on, whether it went live
 ///   before the start or after it (IDLE follows the provider);
 /// - a connect while foreground polling is off starts no IDLE;
+/// - a cold launch's first connect that fails for now still gets IDLE, which comes up
+///   once the server answers; a refused password gets none;
 /// - a provider started twice keeps one IDLE connection;
+/// - an IDLE event reads now: EXISTS reads the new message, VANISHED deletes the one it
+///   names (the event handler `startIdle(for:)` installs);
 /// - every place that makes a connected mail provider live hands it to the scheduler.
 ///
 /// Isolation: the scheduler's `foregroundWorkHook` records each piece of work a start
@@ -94,6 +98,17 @@ struct ForegroundStartEffectTests {
             await AccountManager.shared.disconnectAccount(account)
             let accountId = account.id
             _ = try await pool.write { db in try Account.deleteOne(db, key: accountId) }
+        }
+
+        /// The UIDs of the account's stored inbox rows.
+        func inboxUIDs(_ account: Account) -> Set<String> {
+            let uids = try? pool.read { db -> [String] in
+                guard let inbox = try Folder
+                    .filter(Column("accountId") == account.id && Column("role") == FolderRole.inbox.rawValue)
+                    .fetchOne(db) else { return [] }
+                return try MessageHeader.filter(Column("folderId") == inbox.id).fetchAll(db).map(\.messageId)
+            }
+            return Set(uids ?? [])
         }
     }
 
@@ -267,6 +282,52 @@ struct ForegroundStartEffectTests {
         }
     }
 
+    @Test("A cold launch whose first connect fails for now still gets IDLE once the server answers; one whose password is refused gets none")
+    func failedFirstConnect() async throws {
+        try await withWorld(realIdle: true) { world in
+            let server = world.server
+            let manager = AccountManager.shared
+            // A cold launch whose start looked for providers before RootView's
+            // connect loop installed them.
+            let forNow = try await world.addAccount(connect: false)
+            let refused = try await world.addAccount(connect: false)
+            let state = ScreenState(accounts: 2)
+            let window = try Self.host(state, start: { world.scheduler.startForegroundPolling() })
+            defer { Self.close(window) }
+            let on = await eventually { world.scheduler.foregroundPollingIsOn }
+            try #require(on)
+            await settle()
+            let sweptNone = world.idleStarts(forNow) == 0 && world.idleStarts(refused) == 0
+            #expect(sweptNone, "precondition: the start's IDLE found no provider")
+
+            // Refused for now: the provider stays installed and IDLE comes up by itself.
+            server.failNextCommand(containing: "LOGIN", message: "[UNAVAILABLE] Try again later")
+            var failedForNow = false
+            do { try await manager.connectAccount(forNow) } catch { failedForNow = true }
+            #expect(failedForNow, "precondition: the first connect was refused for now")
+            let forNowMarked = await manager.authFailedAccounts.contains(forNow.id)
+            #expect(!forNowMarked, "precondition: a refusal for now is not a refused sign-in")
+            let live = await eventually(seconds: 15) {
+                server.recordedCommands().contains { $0.hasPrefix("IDLE") }
+            }
+            #expect(live, "IDLE went live after a failed first connect, with no return to the app")
+            let forNowIdle = world.idleStarts(forNow)
+            #expect(forNowIdle == 1)
+
+            // A refused password: nothing is handed off, so IDLE never retries it.
+            server.failNextCommand(containing: "LOGIN", message: "[AUTHENTICATIONFAILED] Invalid credentials")
+            var refusedSignIn = false
+            do { try await manager.connectAccount(refused) } catch { refusedSignIn = true }
+            #expect(refusedSignIn, "precondition: the sign-in was refused")
+            let refusedMarked = await manager.authFailedAccounts.contains(refused.id)
+            #expect(refusedMarked, "precondition: the refusal reached the sign-in record")
+            await settle()
+            await settle()
+            let refusedIdle = world.idleStarts(refused)
+            #expect(refusedIdle == 0, "a refused sign-in started IDLE, which would retry the refused password")
+        }
+    }
+
     // MARK: - One IDLE connection per provider
 
     @Test("A provider whose IDLE is started twice, while launching and once live, keeps one IDLE connection")
@@ -297,6 +358,88 @@ struct ForegroundStartEffectTests {
             #expect(idleCommands == 1, "IDLE was sent \(idleCommands) times")
             #expect(idleConnections == 1, "\(idleConnections) connections ran IDLE")
         }
+    }
+
+    // MARK: - An IDLE event reads now
+
+    /// The event handler the scheduler gives IDLE (`startIdle(for:)`), with a real
+    /// IDLE session on the fake server: a new message (EXISTS) is read at once, not at
+    /// the next poll; a VANISHED deletes the messages it names even while another pass
+    /// holds the account, and its read then asks for the follow-up (promises 1 and 6).
+    @Test("An IDLE event reads now: EXISTS reads the new message; VANISHED deletes the one it names and, with the account busy, asks for a follow-up")
+    func idleEventsRead() async throws {
+        try await withWorld(realIdle: true) { world in
+            let wasConnected = NetworkMonitor.checkConnected()
+            NetworkMonitor.setConnectedForTesting(true)
+            defer { NetworkMonitor.setConnectedForTesting(wasConnected) }
+            let server = world.server
+            server.setMessages([Self.message(uid: 1)], in: "INBOX")
+            let account = try await world.addThroughSetup()
+            let synced = await eventually(seconds: 15) { world.inboxUIDs(account) == ["1"] }
+            try #require(synced, "precondition: the add's initial sync read the inbox")
+            // The initial sync's turn ends before the events below, so the EXISTS
+            // read finds the account free.
+            await AccountManager.shared.syncEngine.oneSyncAtATime(accountId: account.id) {}
+
+            let state = ScreenState(accounts: 1)
+            let window = try Self.host(state, start: { world.scheduler.startForegroundPolling() })
+            defer { Self.close(window) }
+            let idling = await eventually(seconds: 10) {
+                server.recordedCommands().contains { $0.hasPrefix("IDLE") }
+            }
+            try #require(idling, "precondition: the start's IDLE is live on the fake server")
+
+            // A new message. The start's own poll pass was taken and the timer's
+            // next tick is 300 s away, so only the event's read brings it in.
+            server.setMessages(server.messages(in: "INBOX") + [Self.message(uid: 2)], in: "INBOX")
+            let toldExists = server.notifyIdleSessions("* 2 EXISTS")
+            #expect(toldExists == 1)
+            let read = await eventually(seconds: 15) { world.inboxUIDs(account).contains("2") }
+            #expect(read, "the EXISTS event read the new message now (#1331)")
+
+            // A deletion while another pass holds the account: the event's read can
+            // only ask for a follow-up, so a row gone now was deleted by the event.
+            let followUp = "stage 2: follow-up \(account.id)"
+            let followUpsBefore = world.count(followUp)
+            let (entered, enter) = AsyncStream<Void>.makeStream()
+            let (release, open) = AsyncStream<Void>.makeStream()
+            let holder = Task {
+                await AccountManager.shared.syncEngine.oneSyncAtATime(accountId: account.id) {
+                    enter.yield()
+                    for await _ in release { break }
+                }
+            }
+            for await _ in entered { break }
+            server.setMessages(server.messages(in: "INBOX").filter { $0.uid != 1 }, in: "INBOX")
+            let toldVanished = server.notifyIdleSessions("* VANISHED 1")
+            #expect(toldVanished == 1)
+            let deleted = await eventually(seconds: 10) { !world.inboxUIDs(account).contains("1") }
+            #expect(deleted, "the VANISHED event deleted the message it named while the account was busy")
+            let flagged = await eventually(seconds: 10) { world.count(followUp) == followUpsBefore + 1 }
+            #expect(flagged, "the VANISHED event's read found the account busy and asked for a follow-up")
+            open.yield()
+            open.finish()
+            await holder.value
+        }
+    }
+
+    /// A plain message for the fake server's inbox, dated relative to now.
+    private static func message(uid: Int) -> FakeIMAPServer.Message {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        let date = formatter.string(from: Date().addingTimeInterval(-Double(10 - uid) * 60))
+        return FakeIMAPServer.makeMessage(uid: uid, rfc822Text: """
+            From: Test Sender <sender@example.com>\r
+            To: Recipient <recipient@example.com>\r
+            Subject: idle event \(uid)\r
+            Date: \(date)\r
+            Message-ID: <idle-event-\(uid)@example.com>\r
+            Content-Type: text/plain; charset=utf-8\r
+            \r
+            idle event fixture body.\r
+
+            """)
     }
 
     // MARK: - Every live install hands off
