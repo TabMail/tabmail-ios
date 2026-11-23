@@ -788,6 +788,21 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertFalse(app.buttons["chatClose"].exists, "control: the press opened nothing")
     }
 
+    /// Puts the caret at the start of a one-line text with the long press of
+    /// `testLongPressInTheFocusedFieldMovesTheCaret`, and whether a mark typed next lands first; the
+    /// mark is deleted again, and it waits for the keyboard back as `topLine` does. A tap would not
+    /// do: on a one-line text whose caret is already at its end, the tap at its start shows the edit
+    /// menu and leaves the caret at the end (UI run 2026-11-23).
+    private func caretToTheStart(of text: XCUIElement, in app: XCUIApplication) -> Bool {
+        text.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: Self.caretPressInset, dy: 0))
+            .press(forDuration: Self.textLongPressHold)
+        text.typeText(Self.lineMark)
+        let value = text.value as? String ?? ""
+        text.typeText(XCUIKeyboardKey.delete.rawValue)
+        waitForTheKeyboardBack(under: text, in: app)
+        return value.hasPrefix(Self.lineMark)
+    }
+
     /// One short line, typed so the caret ends after it, and its last word.
     private static let caretPhrase = "Lunch works"
     private static let caretPhraseLastWord = "works"
@@ -828,10 +843,10 @@ final class ChatSwipeUITests: XCTestCase {
         let typed = typedField(containing: Self.shortQuestion, in: app)
         XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
         waitForTheKeyboardBack(under: typed, in: app)
-        // The caret starts at the text's start (`topLine` taps it there and shows where a mark
-        // lands), away from both places the text's long press can leave it: on the words under the
-        // finger, or at the text's end, where it follows a finger moved above the one-line text.
-        XCTAssertEqual(topLine(of: typed, in: app), Self.shortQuestion, "control: the caret is at the text's start before the press")
+        // The caret starts at the text's start (`caretToTheStart`), away from both places the
+        // text's long press can leave it: on the words under the finger, or at the text's end,
+        // where it follows a finger moved above the one-line text.
+        XCTAssertTrue(caretToTheStart(of: typed, in: app), "control: the caret is at the text's start before the press")
         // Both ends from one read of the field's frame (`textScroll`).
         let frame = typed.frame
         let onTheWords = app.coordinate(withNormalizedOffset: .zero)
