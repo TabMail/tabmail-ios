@@ -6,6 +6,7 @@ import Foundation
 import GRDB
 import Synchronization
 import Testing
+import UIKit
 @testable import TabMail
 
 /// THE PROPERTY: a sync trigger never waits for an account's turn and is never
@@ -39,9 +40,14 @@ struct SyncFollowUpTests {
             var runner: (@Sendable (_ accountId: String) -> Void)?
             /// Stage 2 runs started by the runner and not yet finished.
             var running = 0
-            /// Each runner follow-up's outcome: "ran", "served" (an earlier
-            /// stage 2 had cleared the flag) or "threw".
+            /// Each runner follow-up's outcome: "ran", "served" (nothing ran: an
+            /// earlier stage 2 had cleared the flag, or the app had left) or
+            /// "threw".
             var outcomes: [String] = []
+            /// The app's state for the runner, as the scheduler's stage 2 gate
+            /// (`SyncScheduler.stageTwoMayStart`): checked at the ask and again
+            /// at the turn.
+            var foreground = true
         }
         let state = Mutex(State())
         let log: OneSyncAtATimeTests.PassLog
@@ -63,18 +69,22 @@ struct SyncFollowUpTests {
         var asks: [String] { state.withLock { $0.asks } }
         var running: Int { state.withLock { $0.running } }
         var outcomes: [String] { state.withLock { $0.outcomes } }
+        var foreground: Bool { state.withLock { $0.foreground } }
+        func setForeground(_ foreground: Bool) { state.withLock { $0.foreground = foreground } }
 
         /// In the foreground the scheduler runs one follow-up per ask
         /// (`runSyncFollowUp` → `followUpRun` → `followUpPass`), which waits
-        /// for the turn and takes its time limit there.
+        /// for the turn, checks the gate again there and takes its change
+        /// read's deadline there. Weak: the engine's callback holds this object.
         func runStageTwo(engine: SyncEngine) {
             state.withLock { state in
-                state.runner = { [self] accountId in
+                state.runner = { [weak self, weak engine] accountId in
+                    guard let self, let engine, self.foreground else { return }
                     self.state.withLock { $0.running += 1 }
                     Task {
                         let outcome: String
                         do {
-                            let ran = try await engine.followUpPass(accountId: accountId)
+                            let ran = try await engine.followUpPass(accountId: accountId, mayStart: { self.foreground })
                             outcome = ran == nil ? "served" : "ran"
                         } catch {
                             outcome = "threw"
@@ -176,6 +186,8 @@ struct SyncFollowUpTests {
             let engine = await O.engine(provider: Self.provider(account, scenario), syncFollowUp: { followUps.ask($0) })
             followUps.runStageTwo(engine: engine)
             let release = AsyncStream<Void>.makeStream()
+            // A test that stops early still ends its held pass.
+            defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "held", log: followUps.log, release: release.stream)
             #expect(await O.eventually { followUps.log.snapshot == ["start held"] }, "precondition: the turn is held")
@@ -217,6 +229,8 @@ struct SyncFollowUpTests {
             let followUps = FollowUps()
             let engine = await O.engine(provider: Self.provider(account, scenario), syncFollowUp: { followUps.ask($0) })
             let release = AsyncStream<Void>.makeStream()
+            // A test that stops early still ends its held pass.
+            defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "held", log: followUps.log, release: release.stream)
             #expect(await O.eventually { followUps.log.snapshot == ["start held"] }, "precondition: the turn is held")
@@ -249,6 +263,64 @@ struct SyncFollowUpTests {
         }
     }
 
+    /// RED without the gate checked again at the turn: a follow-up admitted in
+    /// the foreground got the turn after the app had left and ran its stage 2 in
+    /// the background, clearing the flag. It returns with the flag set instead;
+    /// its release asks again, the scheduler starts nothing while the app is
+    /// away, and the next opening's stage 1 asks again when it ends: that
+    /// follow-up runs the stage 2.
+    @Test("A follow-up whose app leaves before its turn runs no stage 2 in the background; the next opening runs it")
+    func followUpAfterTheAppLeftWaitsForTheOpening() async throws {
+        try await O.withAppDB { pool in
+            let account = try O.makeAccount(pool: pool, lastFullSyncAt: Date())
+            try await Self.setCursor(pool, "1500")
+            let wire = O.CursorWire()
+            let scenario = O.cursorScenario(wire: wire, parkFirstListing: false)
+            defer { scenario.close() }
+            let followUps = FollowUps()
+            let engine = await O.engine(provider: Self.provider(account, scenario), syncFollowUp: { followUps.ask($0) })
+            followUps.runStageTwo(engine: engine)
+            let release = AsyncStream<Void>.makeStream()
+            defer { release.continuation.finish() }
+            let holder = O.heldPass(
+                engine: engine, accountId: Self.accountId, name: "held", log: followUps.log, release: release.stream)
+            #expect(await O.eventually { followUps.log.snapshot == ["start held"] }, "precondition: the turn is held")
+
+            // In the foreground a busy trigger's follow-up is admitted and waits in line.
+            let busy = try await engine.backgroundDeltaSync(account: account)
+            let busyReadNothing = busy == nil
+            #expect(busyReadNothing, "precondition: the trigger found the account busy")
+            let inLine = await Self.waitingInLine(engine, 1)
+            #expect(inLine, "precondition: the follow-up waits in line")
+
+            // The app leaves; then the running work ends and the follow-up gets the turn.
+            followUps.setForeground(false)
+            release.continuation.yield()
+            await holder.value
+            let finished = await O.eventually { followUps.running == 0 }
+            let wantedAway = await engine.syncFollowUpWanted
+            let turnAway = await engine.syncPassRunning
+            #expect(finished, "precondition: the admitted follow-up finished")
+            #expect(wire.snapshot.historyStarts.isEmpty, "the follow-up ran its stage 2 after the app had left")
+            #expect(wantedAway == [Self.accountId], "the follow-up cleared the flag with no stage 2")
+            #expect(turnAway.isEmpty, "the follow-up that did not run kept the turn")
+            #expect(followUps.asks.count == 2, "its release did not ask again for the flagged stage 2")
+
+            // The next opening: stage 1 reads, and when it ends the follow-up runs stage 2.
+            followUps.setForeground(true)
+            let read = try await engine.backgroundDeltaSync(account: account)
+            let stageOneRan = read != nil
+            #expect(stageOneRan, "precondition: the account was free at the opening")
+            let settled = await Self.settled(engine, followUps)
+            #expect(settled, "the opening's follow-up never finished")
+            let reads = wire.snapshot.historyStarts
+            #expect(reads.count == 2, "the opening did not run stage 1 and then the follow-up's stage 2: \(reads)")
+            #expect(followUps.asks.count == 3, "stage 1's release did not ask for the flagged stage 2")
+            #expect(followUps.outcomes == ["served", "ran"], "the follow-ups did not run as expected: \(followUps.outcomes)")
+            await engine.remove(accountId: Self.accountId)
+        }
+    }
+
     /// RED with a stage 2 whose time limit counts from before its wait for the
     /// turn (#1289; a follow-up that took its limit at the ask): the limit ran
     /// out while it waited behind a long stage 1, so it started with no read
@@ -268,6 +340,8 @@ struct SyncFollowUpTests {
                 syncFollowUp: { followUps.ask($0) })
             followUps.runStageTwo(engine: engine)
             let release = AsyncStream<Void>.makeStream()
+            // A test that stops early still ends its held pass.
+            defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "stage 1", log: followUps.log, release: release.stream)
             #expect(await O.eventually { followUps.log.snapshot == ["start stage 1"] }, "precondition: stage 1 holds the turn")
@@ -315,6 +389,8 @@ struct SyncFollowUpTests {
             let followUps = FollowUps()
             let engine = await O.engine(provider: Self.provider(account, scenario), syncFollowUp: { followUps.ask($0) })
             let release = AsyncStream<Void>.makeStream()
+            // A test that stops early still ends its held pass.
+            defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "held", log: followUps.log, release: release.stream)
             #expect(await O.eventually { followUps.log.snapshot == ["start held"] }, "precondition: the turn is held")
@@ -326,12 +402,12 @@ struct SyncFollowUpTests {
             // then the follow-up.
             let ahead = Task { () async throws -> Bool? in
                 switch servedBy {
-                case .anotherFollowUp: return try await engine.followUpPass(accountId: Self.accountId)
+                case .anotherFollowUp: return try await engine.followUpPass(accountId: Self.accountId, mayStart: { true })
                 case .stageTwoAhead: return try await engine.sync(account: account)
                 }
             }
             #expect(await Self.waitingInLine(engine, 1), "precondition: the first stage 2 waits in line")
-            let followUp = Task { try await engine.followUpPass(accountId: Self.accountId) }
+            let followUp = Task { try await engine.followUpPass(accountId: Self.accountId, mayStart: { true }) }
             #expect(await Self.waitingInLine(engine, 2), "precondition: the follow-up waits behind it")
 
             release.continuation.yield()
@@ -362,6 +438,8 @@ struct SyncFollowUpTests {
             let followUps = FollowUps()
             let engine = await O.engine(provider: Self.provider(account, scenario), syncFollowUp: { followUps.ask($0) })
             let release = AsyncStream<Void>.makeStream()
+            // A test that stops early still ends its held pass.
+            defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "held", log: followUps.log, release: release.stream)
             #expect(await O.eventually { followUps.log.snapshot == ["start held"] }, "precondition: the turn is held")
@@ -454,6 +532,8 @@ struct SyncFollowUpTests {
                 // scheduler declines.
                 gate.signal()
                 let release = AsyncStream<Void>.makeStream()
+                // A test that stops early still ends its held pass.
+                defer { release.continuation.finish() }
                 let holder = O.heldPass(
                     engine: engine, accountId: Self.accountId, name: "background", log: log, release: release.stream)
                 #expect(await O.eventually { log.snapshot.contains("start background") }, "precondition: a pass holds the turn")
@@ -595,6 +675,16 @@ struct SyncFollowUpTests {
         /// Work that holds the account's turn (a listing, a catch-up slice, a
         /// reset) for a while, and outlasts every time limit taken meanwhile.
         case held(milliseconds: Int)
+        /// A checkpoint: wait until the account goes quiet, then check that
+        /// every trigger so far already had its read.
+        case settle
+    }
+
+    /// How many triggers of each kind found the account busy, over every seed.
+    final class BusyKinds: Sendable {
+        let counts = Mutex<[String: Int]>([:])
+        func found(_ kind: String) { counts.withLock { $0[kind, default: 0] += 1 } }
+        var snapshot: [String: Int] { counts.withLock { $0 } }
     }
 
     /// The seeded schedule: a gap before each step, then the step.
@@ -609,8 +699,10 @@ struct SyncFollowUpTests {
                 step = .changeRead
             } else if roll < 60 {
                 step = .stageTwo
-            } else {
+            } else if roll < 92 {
                 step = .held(milliseconds: Int.random(in: 5...40, using: &rng))
+            } else {
+                step = .settle
             }
             schedule.append((gap, step))
         }
@@ -621,14 +713,18 @@ struct SyncFollowUpTests {
     /// seed, with seeded latency on every change read and a clock that jumps past
     /// every time limit while held work runs (a long pass), and the foreground
     /// follow-up runner on. Checked by invariants, not by a schedule's expected
-    /// values: every trigger gets a change read that starts after it, one account
-    /// never runs two passes at once, and the flag is empty once all is quiet.
+    /// values: every trigger gets a change read that starts after it before the
+    /// account goes quiet (checked at seeded checkpoints and at the end), one
+    /// account never runs two passes at once, and the flag is empty whenever all
+    /// is quiet. Over the seeds, both trigger kinds find the account busy.
     /// RED with a trigger that waits for its turn and counts its time limit from
     /// its arrival (#1289): one behind held work reaches its turn with no time
     /// left and reads nothing.
     @Test("Seeded fuzz: every trigger gets a later read, passes never overlap, the flag ends empty")
     func fuzzEveryTriggerGetsALaterRead() async throws {
         var asksSeen = 0
+        var checkpoints = 0
+        let busyKinds = BusyKinds()
         for seed in Self.fuzzSeeds {
             try await O.withAppDB { pool in
                 let account = try O.makeAccount(pool: pool, lastFullSyncAt: Date())
@@ -647,21 +743,27 @@ struct SyncFollowUpTests {
                 var work: [Task<Void, Never>] = []
                 for (gap, step) in Self.fuzzSchedule(seed: seed) {
                     try await Task.sleep(for: .milliseconds(gap))
-                    // A trigger arrives, and its caller takes its time limit, just
+                    // A trigger arrives, and its caller takes its time limit just
                     // before it calls the engine, as backgroundSyncOne and
-                    // foregroundSyncOne do.
+                    // foregroundSyncOne do (`fuzzTriggerArrives`).
                     switch step {
                     case .changeRead:
                         work.append(Task {
-                            wire.trigger()
-                            let deadline = clock.read().addingTimeInterval(SyncConfig.backgroundPerAccountTimeoutSeconds)
-                            _ = try? await engine.backgroundDeltaSync(account: account, deadline: deadline)
+                            do {
+                                let read = try await engine.fuzzTriggerArrives(
+                                    stageTwo: false, account: account, limit: SyncConfig.backgroundPerAccountTimeoutSeconds,
+                                    now: { clock.read() }, arrives: { wire.trigger() })
+                                if read == nil { busyKinds.found("change read") }
+                            } catch {}
                         })
                     case .stageTwo:
                         work.append(Task {
-                            wire.trigger()
-                            let deadline = clock.read().addingTimeInterval(stageTwoLimit)
-                            _ = try? await engine.syncOrFollowUp(account: account, deadline: deadline)
+                            do {
+                                let ran = try await engine.fuzzTriggerArrives(
+                                    stageTwo: true, account: account, limit: stageTwoLimit,
+                                    now: { clock.read() }, arrives: { wire.trigger() })
+                                if ran == nil { busyKinds.found("stage 2") }
+                            } catch {}
                         })
                     case .held(let milliseconds):
                         work.append(Task {
@@ -672,6 +774,15 @@ struct SyncFollowUpTests {
                                 wire.heldEnds()
                             }
                         })
+                    case .settle:
+                        for task in work { await task.value }
+                        work.removeAll()
+                        let quietNow = await Self.settled(engine, followUps)
+                        let now = wire.snapshot
+                        checkpoints += 1
+                        #expect(quietNow, "seed \(seed): at a checkpoint the account never went quiet, or its flag stayed set")
+                        #expect(now.triggers == 0 || now.lastRead > now.lastTrigger,
+                                "seed \(seed): at a checkpoint a trigger had no change read that started after it (\(now.triggers) triggers, \(now.reads) reads)")
                     }
                 }
                 for task in work { await task.value }
@@ -688,6 +799,10 @@ struct SyncFollowUpTests {
             }
         }
         #expect(asksSeen > 0, "precondition: no seed made a trigger find the account busy")
+        let busy = busyKinds.snapshot
+        #expect(busy["change read", default: 0] > 0 && busy["stage 2", default: 0] > 0,
+                "precondition: not every trigger kind found the account busy: \(busy)")
+        #expect(checkpoints > 0, "precondition: no seed reached a checkpoint")
     }
 
     // MARK: - The scheduler
@@ -695,6 +810,8 @@ struct SyncFollowUpTests {
     @MainActor
     final class Stages {
         var triggers: [String] = []
+        /// The first-paint gate was reached.
+        var gateReached = false
     }
 
     /// RED while a tick during a poll only returned (#1313): it read nothing.
@@ -745,13 +862,69 @@ struct SyncFollowUpTests {
     }
 
     /// The follow-up the engine asks for runs only where a stage 2 may start: in
-    /// the foreground. In the background the flag waits for the next opening.
-    @Test("The follow-up stage 2 runs in the foreground only", arguments: [true, false])
+    /// the foreground, inactive included (the app is on screen). In the
+    /// background the flag waits for the next opening. RED with the app's state
+    /// compared wrongly (`== .active`, or not at all).
+    @Test("The follow-up stage 2 runs in the foreground only",
+          arguments: [UIApplication.State.active, .inactive, .background])
     @MainActor
-    func followUpRunsInTheForegroundOnly(foreground: Bool) async {
+    func followUpRunsInTheForegroundOnly(state: UIApplication.State) async {
         let stages = Stages()
-        let scheduler = SyncScheduler(foreground: foreground, stageTwo: { stages.triggers.append($0) })
+        let scheduler = SyncScheduler(foreground: true, stageTwo: { stages.triggers.append($0) })
+        scheduler.applicationStateForTesting = state
         await scheduler.runSyncFollowUp(accountId: "follow-up-account")
-        #expect(stages.triggers == (foreground ? ["follow-up follow-up-account"] : []))
+        let expected = state == .background ? [] : ["follow-up follow-up-account"]
+        #expect(stages.triggers == expected, "app state \(state.rawValue)")
+    }
+
+    /// RED without the first-paint gate: the follow-up's stage 2 could start
+    /// before the inbox had painted (a background wake's work ending as the app
+    /// opens). It waits for the first paint, as the opening's own reads do.
+    @Test("The follow-up stage 2 waits for the inbox's first paint")
+    @MainActor
+    func followUpWaitsForTheFirstPaint() async throws {
+        let stages = Stages()
+        let painted = AsyncStream<Bool>.makeStream()
+        defer { painted.continuation.finish() }
+        let scheduler = SyncScheduler(
+            foreground: true,
+            foregroundReady: {
+                stages.gateReached = true
+                for await ready in painted.stream { return ready }
+                return false
+            },
+            stageTwo: { stages.triggers.append($0) })
+        let followUp = Task { await scheduler.runSyncFollowUp(accountId: "follow-up-account") }
+        let deadline = Date().addingTimeInterval(5)
+        while !stages.gateReached, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(stages.gateReached, "precondition: the follow-up reached the first-paint gate")
+        #expect(stages.triggers.isEmpty, "the stage 2 started before the inbox painted")
+        painted.continuation.yield(true)
+        await followUp.value
+        #expect(stages.triggers == ["follow-up follow-up-account"])
+    }
+}
+
+extension SyncEngine {
+    /// The fuzz's trigger (`SyncFollowUpTests.fuzzEveryTriggerGetsALaterRead`):
+    /// it arrives, its caller takes its time limit from the clock, and it calls
+    /// the engine, in one step on the engine, as a caller does with no time
+    /// between them. The fuzz's clock jumps inside held work, and held work
+    /// hands the turn on only on the engine, so none can end between the
+    /// arrival and the call: a jump after the limit was taken finds the account
+    /// still busy. Nil when the trigger found the account busy.
+    func fuzzTriggerArrives(
+        stageTwo: Bool, account: Account, limit: TimeInterval,
+        now: @Sendable () -> Date, arrives: @Sendable () -> Void
+    ) async throws -> Bool? {
+        arrives()
+        let deadline = now().addingTimeInterval(limit)
+        if stageTwo {
+            return try await syncOrFollowUp(account: account, deadline: deadline)
+        }
+        let read = try await backgroundDeltaSync(account: account, deadline: deadline)
+        return read?.changed
     }
 }

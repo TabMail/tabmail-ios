@@ -70,7 +70,7 @@ extension AccountManager {
             // block in SyncEngineOneSyncAtATime.swift; #1289).
             guard let read else {
                 skipped = true
-                BackgroundSyncLogger.log("bgSync: BUSY \(account.emailAddress): another pass runs, follow-up wanted")
+                BackgroundSyncLogger.logDebug("bgSync: BUSY \(account.emailAddress): another pass runs, follow-up wanted")
                 return SyncResult(hadChanges: false, failed: false, skipped: true)
             }
             let (changed, reason) = read
@@ -127,9 +127,13 @@ extension AccountManager {
     /// Foreground sync for one account: ensure connection → full sync (delta + periodic full).
     /// Self-contained — safe to launch in parallel for multiple accounts.
     /// Sync phases are published automatically by ensureConnected() and SyncEngine.
-    /// `followUp`: the account's follow-up stage 2 (`followUpRun`), which waits
-    /// for its turn instead of setting the flag.
-    func foregroundSyncOne(_ account: Account, followUp: Bool = false) async -> SyncResult {
+    /// `followUp`: set for the account's follow-up stage 2 (`followUpRun`),
+    /// which waits for its turn instead of setting the flag; it is the
+    /// scheduler's stage 2 gate, checked again at the turn
+    /// (`SyncEngine.followUpPass`).
+    func foregroundSyncOne(
+        _ account: Account, followUp mayStart: (@MainActor @Sendable () -> Bool)? = nil
+    ) async -> SyncResult {
         // Emit .checking BEFORE ensureConnected so the subtitle flips immediately
         // rather than waiting on IMAP TLS/login. Idempotent with the inner
         // emission in SyncEngine.sync().
@@ -149,10 +153,11 @@ extension AccountManager {
             // `SyncEngine.dbPool` = `AppDatabase.syncPool` — beats deep backfill in the
             // write scheduler but yields to the merge / a live user action.
             let ran: Bool?
-            if followUp {
-                // Waits for its turn and takes its time limit there; nil when an
-                // earlier stage 2 served the flag (`SyncEngine.followUpPass`).
-                ran = try await syncEngine.followUpPass(accountId: accountId)
+            if let mayStart {
+                // Waits for its turn and takes its change read's deadline there;
+                // nil when an earlier stage 2 served the flag, or when a stage 2
+                // may not start any more (`SyncEngine.followUpPass`).
+                ran = try await syncEngine.followUpPass(accountId: accountId, mayStart: mayStart)
             } else {
                 // The pass is told the timeout's own deadline (ADR-IOS-104). It never
                 // waits for another pass's turn (`syncOrFollowUp`).
@@ -162,8 +167,8 @@ extension AccountManager {
                 }
             }
             guard let changed = ran else {
-                if followUp {
-                    BackgroundSyncLogger.logDebug("[SyncFollowUp] \(account.emailAddress): already served")
+                if mayStart != nil {
+                    BackgroundSyncLogger.logDebug("[SyncFollowUp] \(account.emailAddress): no stage 2 (served, or not now)")
                 } else {
                     // Another pass of the account runs: its follow-up flag is set, and
                     // one stage 2 follows when that pass ends (the sync design block in
@@ -301,21 +306,25 @@ extension AccountManager {
 
     /// The foreground poll's header sync: every active account (a full run, or a
     /// partial one when an account was busy and skipped: its follow-up reports
-    /// for it).
+    /// for it). A run with a skipped account does not advance "Updated": that
+    /// account read nothing yet, and its follow-up advances it when its read
+    /// completes.
     func foregroundPollRun() async -> SyncResult {
         let result = await foregroundSyncAll()
         await MainActor.run {
             let state = AccountManagerState.shared
             state.lastSyncFailed = result.failed
             state.finishSyncRun(coverage: result.skipped ? .partial : .full,
-                                countedFailure: result.countedFailure, completed: !result.failed)
+                                countedFailure: result.countedFailure,
+                                completed: !result.failed && !result.skipped)
         }
         return result
     }
 
     /// The background poll's delta sync: every active account (a full run), or the
     /// one account a push named (a partial run). A run with a busy account that
-    /// was skipped is partial too.
+    /// was skipped is partial too, and does not advance "Updated" (as
+    /// `foregroundPollRun`).
     func backgroundPollRun(accountEmail: String?, inboxOnly: Bool) async -> SyncResult {
         let result: SyncResult
         if let accountEmail {
@@ -327,7 +336,7 @@ extension AccountManager {
             let state = AccountManagerState.shared
             state.lastSyncFailed = false
             state.finishSyncRun(coverage: accountEmail == nil && !result.skipped ? .full : .partial,
-                                countedFailure: result.countedFailure, completed: true)
+                                countedFailure: result.countedFailure, completed: !result.skipped)
         }
         return result
     }
@@ -335,11 +344,13 @@ extension AccountManager {
     /// The follow-up stage 2 of one account (`SyncScheduler.runSyncFollowUp`;
     /// `SyncEngine.followUpPass`): it waits for the account's turn and reports
     /// its own result, as a partial run. Nil when an earlier stage 2 already
-    /// served the flag: nothing ran, so nothing is reported, and a second ask
-    /// for one flag does no work before its wait either.
-    func followUpRun(_ account: Account) async -> SyncResult? {
+    /// served the flag, or when `mayStart` (the scheduler's stage 2 gate,
+    /// checked again at the turn) no longer allows it: nothing ran, so nothing
+    /// is reported, and a second ask for one flag does no work before its wait
+    /// either.
+    func followUpRun(_ account: Account, mayStart: @escaping @MainActor @Sendable () -> Bool) async -> SyncResult? {
         guard await syncEngine.followUpWanted(accountId: account.id) else { return nil }
-        let result = await foregroundSyncOne(account, followUp: true)
+        let result = await foregroundSyncOne(account, followUp: mayStart)
         guard !result.skipped else { return nil }
         await MainActor.run {
             AccountManagerState.shared.finishSyncRun(

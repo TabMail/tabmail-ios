@@ -762,16 +762,29 @@ actor SyncEngine {
     /// even when that work takes the turn again at once (a catch-up's next
     /// slice). It runs stage 2 only if the flag is still set when it gets the
     /// turn, and returns nil, doing nothing, when a stage 2 that ran in between
-    /// served it: two asks for one flag run one stage 2. Its time limit starts at
-    /// its turn (the change read's deadline is taken there). No outer timeout: a
+    /// served it: two asks for one flag run one stage 2. `mayStart` is the
+    /// scheduler's stage 2 gate (`SyncScheduler.stageTwoMayStart`: foreground
+    /// only), checked again at the turn, before the flag is cleared: a
+    /// follow-up admitted in the foreground can get the turn after the app has
+    /// left. Not allowed then, it returns nil with the flag still set; the
+    /// release asks again, and the scheduler starts nothing until a stage 2 may
+    /// start (the next opening). Its change read's deadline is taken at its
+    /// turn, 60 s on (`SyncConfig.perAccountSyncTimeoutSeconds`). No outer
+    /// timeout, as Settings' stage 2: a due full sync runs to its end, and a
     /// waiter it cancelled would still take the turn and clear the flag without
     /// reading.
-    func followUpPass(accountId: String) async throws -> Bool? {
+    func followUpPass(
+        accountId: String, mayStart: @escaping @MainActor @Sendable () -> Bool
+    ) async throws -> Bool? {
         guard let queue = workQueues[accountId] else { return nil }
         let provider = queue.provider
         return try await oneSyncAtATime(accountId: accountId) {
             guard self.syncFollowUpWanted.contains(accountId) else {
                 BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): served by an earlier stage 2")
+                return nil
+            }
+            guard await mayStart() else {
+                BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): no stage 2 now, the flag waits")
                 return nil
             }
             let deadline = self.changeReadClock().addingTimeInterval(SyncConfig.perAccountSyncTimeoutSeconds)

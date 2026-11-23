@@ -181,15 +181,22 @@ account gets one follow-up stage 2.** The design, its reasons and its history ar
    the flag is still set. Stage 2 clears the flag as its first step inside the turn (`foregroundPass`), so
    however many triggers arrived, one stage 2 serves them and its read starts after each of them; it runs
    the full sync when it is due (the #1275 amendment). A follow-up whose flag an earlier stage 2 served
-   does nothing and reports nothing; one that ran reloads the inbox (`.inboxDataDidChange`), as a push's
-   own read does. When the turn becomes free with the flag still set (`handOverSyncPass`, the branch with
+   does nothing and reports nothing. One that ran stands in for the trigger's own read, so it does that
+   read's side steps: it reloads the inbox after its read (`.inboxDataDidChange`), and after a read that
+   found changes it mirrors the delta cursors for the notification extension
+   (`NSEDataBridge.mirrorLastHistoryIds`, as `SyncScheduler.backgroundPoll` does). When the turn becomes free with the flag still set (`handOverSyncPass`, the branch with
    no waiter), the engine asks again: that serves a flag set in the background, whose first ask started
    nothing, at the next opening. Removing an account (`SyncEngine.remove`) drops its flag.
 4. **Foreground only.** Stage 2 starts only in the foreground (`SyncScheduler.stageTwoMayStart`: the app
-   is not in the background, read from `UIApplication.applicationState` as the silent-push path reads it,
-   sync is not disabled, no demo mode, no background processing fast sync). In the background
-   the flag waits: the next opening's stage 1 frees the account and asks again. The flag is not stored; a
-   launch runs every account's stage 1 and stage 2 anyway.
+   is not in the background, read from `UIApplication.applicationState`, so inactive, a sheet or Control
+   Center over the app, counts as foreground; the silent-push path's own check is narrower, `.active`
+   only; sync is not disabled, no demo mode, no background processing fast sync). In the background
+   the flag waits: the next opening's stage 1 frees the account and asks again. The follow-up checks the
+   same gate when it is asked for and again inside its turn, before it clears the flag
+   (`followUpPass`'s `mayStart`): if the app left while it waited, it starts nothing and the flag stays set;
+   the release asks again, that ask stops at the scheduler's gate, and the next opening serves the flag. On
+   a launch the follow-up also waits for the first paint (`foregroundLaunchReady`), as the poll does. The
+   flag is not stored; a launch runs every account's stage 1 and stage 2 anyway.
 5. **A trigger that finds its own work running.** A poll tick that lands during a poll (#1313) and a
    return to the app while the previous return's work still runs (#1314, after the first paint) run
    stage 2 for every account through the same trigger form: a free account runs it, a busy one is
@@ -198,7 +205,9 @@ account gets one follow-up stage 2.** The design, its reasons and its history ar
    (`AccountManager.SyncResult.skipped`) and goes on to the queued work (actions, outbox, calendar). A run
    with a skipped account is partial, so it never clears the inbox error banner. So is a pull to refresh
    whose change read found an account busy (`AccountManager.syncFolders` returns it). The follow-up
-   reports its own account as a partial run.
+   reports its own account as a partial run. A poll run with a skipped account also does not advance
+   "Updated" (`AccountManagerState.lastSyncCompletedAt`, display only): the follow-up does, once its read
+   completes.
 7. **No time limit counts a wait for another pass's turn.** A trigger never waits for one: its caller's
    time limit (`SyncConfig.perAccountSyncTimeoutSeconds` for the poll's stage 2 and pull to refresh's
    change read, `SyncConfig.backgroundPerAccountTimeoutSeconds` for stage 1) and the deadline its change
@@ -251,11 +260,18 @@ opening the due full sync runs once per account, and each account's last read st
 ends: the poll during stage 1, an account flagged before the opening, the poll first),
 `fuzzEveryTriggerGetsALaterRead` (seeded triggers, poll passes and held work with read latency and a clock
 that jumps past every limit: every trigger gets a change read that starts after it, passes never overlap,
-the flag ends empty), `pollTickDuringAPollRunsStageTwo` (#1313), `returnDuringAReturnRunsStageTwo` and
-`herdSkipBranchAsksForStageTwo` (#1314), `followUpRunsInTheForegroundOnly`;
-`SyncRunBannerEntryPointTests.busyAccountPollNeverClears` (a poll with a busy account returns at once, reads
-nothing and does not clear the banner, nor does the account's follow-up, which reads it once; a later full
-run does) and `busyChangeReadRefreshNeverClears` (a unified-inbox pull whose change read finds an account
+the flag ends empty, and at every point the account goes idle its last read started after its last trigger;
+both trigger kinds meet a busy account), `pollTickDuringAPollRunsStageTwo` (#1313), `returnDuringAReturnRunsStageTwo` and
+`herdSkipBranchAsksForStageTwo` (#1314), `followUpRunsInTheForegroundOnly` (active and inactive run it,
+background does not), `followUpAfterTheAppLeftWaitsForTheOpening` (a follow-up admitted in the foreground
+whose app leaves before its turn starts no stage 2, keeps the flag, and the next opening serves it),
+`followUpWaitsForTheFirstPaint`; `SyncRunBannerEntryPointTests.busyAccountPollNeverClears` (a poll with a
+busy account returns at once, reads nothing, does not clear the banner and does not advance "Updated", nor
+does the account's follow-up clear it, which reads it once; a later full run does),
+`busyTriggerAsksTheAppScheduler` (the app's engine asks the app's scheduler, at the flag and again at the
+release), `pollTickDuringAPollReadsAFreeAccount` (the real stage 2 of #1313's branch),
+`followUpWithChangesMirrorsTheCursors`, `followUpWithNothingOwedDoesNothing` (no phase, report or reload),
+`followUpReloadsTheInbox` (after its read) and `busyChangeReadRefreshNeverClears` (a unified-inbox pull whose change read finds an account
 busy does not clear; with the account free it does); `GmailCatchUpTests.sliceHandsTheTurnOn` and
 `jobHandsTheTurnOnBetweenSlices` (a trigger during a catch-up is flagged, and its follow-up reads at the
 next slice boundary, within one slice). `OneSyncAtATimeTests`'

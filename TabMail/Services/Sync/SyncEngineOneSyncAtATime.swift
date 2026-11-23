@@ -49,8 +49,16 @@ import Synchronization
 //   is still set when it gets the turn: a stage 2 that ran in between served it.
 // - Only an account that is free takes the quick-sync-only route.
 // - In the background a set flag waits for the next opening of the app: stage 2
-//   never starts in the background. A silent push already schedules background
-//   work, and the next push, poll or opening covers anything else.
+//   never starts in the background. The follow-up checks this when it is asked
+//   for and again when it gets the turn; if the app left in between, it starts
+//   nothing and the flag waits. The app counts as in the foreground while it is
+//   on screen, inactive included (a sheet or Control Center over it). A silent
+//   push already schedules background work, and the next push, poll or opening
+//   covers anything else.
+// - On a launch the follow-up waits for the first paint, as the poll does. It
+//   stands in for the trigger's own read, so after a read that found changes it
+//   also mirrors the delta cursors for the notification extension, and it
+//   reloads the inbox once it read.
 // - The poll does not wait for a busy account either. It sets the flag and goes
 //   straight on to the queued work (actions, outbox, calendar), which never
 //   depended on stage 2: each gesture and a network restore already start that
@@ -64,20 +72,24 @@ import Synchronization
 //   when it sets it; `handOverSyncPass` asks again each time the account becomes
 //   free while the flag is set (a flag set in the background, whose ask started
 //   nothing); `followUpPass` waits for the turn and runs stage 2 if the flag is
-//   still set; `foregroundPass` clears the flag when it starts;
-//   `SyncScheduler.runSyncFollowUp` runs the follow-up, in the foreground only.
+//   still set and the app is still in the foreground; `foregroundPass` clears
+//   the flag when it starts; `SyncScheduler.runSyncFollowUp` runs the follow-up,
+//   in the foreground only.
 //
 // No time limit counts a wait for another pass's turn. A trigger never waits for
 // one; only its own connection check (`AccountManager.ensureConnected`) runs
 // inside its limit before it takes or flags the turn, as before. The follow-up
-// waits, so it takes its limit (`SyncConfig.perAccountSyncTimeoutSeconds`) when
-// it gets the turn. In v1.11.4 a stage 2 queued behind stage 1 counted that wait
-// against its limit and had no time left (#1289).
+// waits, so its quick sync's deadline (`SyncConfig.perAccountSyncTimeoutSeconds`)
+// starts when it gets the turn. Like stage 2 from Settings it has no outer time
+// limit, so a full sync that is due runs to its end. In v1.11.4 a stage 2 queued
+// behind stage 1 counted that wait against its limit and had no time left
+// (#1289).
 //
 // No recent-sync guard, of any length. A return to the app runs stage 1's quick
 // sync and then stage 2's own quick sync. They take turns, so they never collide,
-// and the second usually finds nothing: one cheap request per account. That cost
-// is accepted. The 15-second skip that saved it (added 2026-02) swallowed due
+// and the second usually finds nothing: one cheap change read per account
+// (usually one request; Gmail's read of every folder can also list its labels).
+// That cost is accepted. The 15-second skip that saved it (added 2026-02) swallowed due
 // full syncs (#1275, deleted in #1308). A guard optimizes a tiny cost at the risk
 // of that failure again (#1278).
 //

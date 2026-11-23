@@ -3505,7 +3505,7 @@ struct GmailCatchUpTests {
 
         func ask(_ accountId: String) {
             guard let engine = engine.withLock({ $0 }) else { return }
-            let followUp = Task { try await engine.followUpPass(accountId: accountId) }
+            let followUp = Task { try await engine.followUpPass(accountId: accountId, mayStart: { true }) }
             started.withLock { $0.append(followUp) }
         }
 
@@ -3544,6 +3544,8 @@ struct GmailCatchUpTests {
             let engine = world.engine
             let server = world.server
             followUps.engine.withLock { $0 = engine }
+            // The engine's callback holds the runner, and the runner the engine.
+            defer { followUps.engine.withLock { $0 = nil } }
             let run = Self.requestRun(server, slice: slice, deadline: nil)
             let catchUp = Task { await engine.runCatchUpRun(account: account, run: run) }
 
@@ -3604,6 +3606,8 @@ struct GmailCatchUpTests {
             let engine = world.engine
             let server = world.server
             followUps.engine.withLock { $0 = engine }
+            // The engine's callback holds the runner, and the runner the engine.
+            defer { followUps.engine.withLock { $0 = nil } }
             let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
             let job = Task { await engine.performBackfill(account: account, deadline: deadline) }
 

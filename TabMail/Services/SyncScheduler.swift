@@ -245,10 +245,12 @@ final class SyncScheduler {
         isPollActive = pollActive
     }
 
-    /// nil outside the harness below: the app's own state decides.
-    private var foregroundForTesting: Bool?
-    private var foregroundReadinessHook: (@MainActor @Sendable () async -> Bool)?
-    private var stageTwoHook: (@MainActor @Sendable (_ trigger: String) async -> Void)?
+    /// nil outside the harness below: the app's own state decides. A test may
+    /// set these on its own instance, or on `shared` to see what the app's
+    /// engine asks for, and restores them.
+    var applicationStateForTesting: UIApplication.State?
+    var foregroundReadinessHook: (@MainActor @Sendable () async -> Bool)?
+    var stageTwoHook: (@MainActor @Sendable (_ trigger: String) async -> Void)?
 
     /// Test harness for the follow-up stage 2 (the sync design block in
     /// SyncEngineOneSyncAtATime.swift): `foreground` stands for the app's
@@ -260,23 +262,28 @@ final class SyncScheduler {
         foregroundReady: @escaping @MainActor @Sendable () async -> Bool = { true },
         stageTwo: (@MainActor @Sendable (_ trigger: String) async -> Void)? = nil
     ) {
-        foregroundForTesting = foreground
+        applicationStateForTesting = foreground ? .active : .background
         isPollActive = pollActive
         foregroundReadinessHook = foregroundReady
         stageTwoHook = stageTwo
     }
     #endif
 
-    /// The app is in the foreground now, read from the app's own state as the
-    /// silent-push path reads it, not from the poll timer (the timer can be
-    /// missing while the app is in front, and a tick already sent can still
-    /// run after `stopPolling`). Inactive (a sheet or Control Center over the
-    /// app) counts as foreground: the app is on screen.
+    /// The app is in the foreground now, read from the app's own state
+    /// (`UIApplication.applicationState`), not from the poll timer (the timer
+    /// can be missing while the app is in front, and a tick already sent can
+    /// still run after `stopPolling`). Inactive (a sheet or Control Center over
+    /// the app) counts as foreground: the app is on screen. (The silent-push
+    /// path's own check is narrower: `.active` only.)
     private var isForeground: Bool {
+        applicationState != .background
+    }
+
+    private var applicationState: UIApplication.State {
         #if DEBUG
-        if let foregroundForTesting { return foregroundForTesting }
+        if let applicationStateForTesting { return applicationStateForTesting }
         #endif
-        return UIApplication.shared.applicationState != .background
+        return UIApplication.shared.applicationState
     }
 
     /// The first-paint gate of a foreground return (`AppStartup.awaitLaunchReady`).
@@ -1085,21 +1092,28 @@ final class SyncScheduler {
     /// trigger sets the flag and again when the account becomes free with the
     /// flag set. It waits for the work holding the turn to end. When a stage 2
     /// may not start, as in the background, it starts nothing: the flag stays
-    /// set, and the next opening's stage 1 asks again when it ends. When the
-    /// follow-up read, the inbox reloads, as after a push's own read
-    /// (`backgroundPoll`): the trigger's reload came before this read.
+    /// set, and the next opening's stage 1 asks again when it ends. The same
+    /// gate is checked again when it gets the turn (`SyncEngine.followUpPass`):
+    /// the app may have left while it waited. It stands in for the trigger's
+    /// own read, so it keeps that read's gate and side steps: it waits for the
+    /// first paint, as the opening's reads do (the startup budget); when it
+    /// read, the inbox reloads, as after a push's own read (`backgroundPoll`:
+    /// the trigger's reload came before this read), and when it found changes
+    /// the notification extension's cursors are mirrored again.
     func runSyncFollowUp(accountId: String) async {
         guard stageTwoMayStart else {
             BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): no stage 2 now, the flag waits")
             return
         }
+        guard await foregroundLaunchReady() else { return }
         #if DEBUG
         if let stageTwoHook { await stageTwoHook("follow-up \(accountId)"); return }
         #endif
         guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: accountId) }),
               account.isActive else { return }
         BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): stage 2")
-        guard await manager.followUpRun(account) != nil else { return }
+        guard let result = await manager.followUpRun(account, mayStart: { self.stageTwoMayStart }) else { return }
+        if result.hadChanges { NSEDataBridge.mirrorLastHistoryIds() }
         NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
     }
 
@@ -1140,7 +1154,7 @@ final class SyncScheduler {
             return
         }
         guard !isPollActive else {
-            BackgroundSyncLogger.log("poll: SKIPPED — already polling; stage 2 for every account")
+            BackgroundSyncLogger.log("poll: SKIPPED — already polling")
             // The tick still gets its stage 2 (#1313); the running poll does the
             // queued work. The sync design block in SyncEngineOneSyncAtATime.swift.
             await stageTwoForEveryAccount(trigger: "poll tick during a poll")
