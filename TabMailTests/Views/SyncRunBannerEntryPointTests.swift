@@ -740,16 +740,17 @@ struct SyncRunBannerEntryPointTests {
     }
 
     /// A follow-up asked for when no stage 2 is owed (an earlier one served the
-    /// flag) does nothing: no phase, no connection check, no report, no reload.
-    /// RED without `followUpRun`'s first check: it published "Checking" over the
-    /// account's phase and then cleared it.
+    /// flag) does nothing: no connection check or other provider call, no report,
+    /// no reload. RED without `followUpRun`'s first check: its connection check
+    /// reached the provider (it also showed "Checking" and then cleared the
+    /// account's phase). The phase is not read here: the shown phase is one value
+    /// summed over every account on shared state, and other suites' sync engines
+    /// publish and clear their own accounts' phases on it while this test runs.
     @Test("a follow-up asked for with no stage 2 owed does nothing")
     func followUpWithNothingOwedDoesNothing() async throws {
         try await withWorld { world in
             let accountId = world.accountA.id
             let state = AccountManagerState.shared
-            state.setSyncPhase(.downloading(3), forAccount: accountId)
-            defer { state.setSyncPhase(nil, forAccount: accountId) }
             let completedBefore = Date(timeIntervalSinceNow: -60)
             state.lastSyncCompletedAt = completedBefore
             let events = Events()
@@ -757,10 +758,12 @@ struct SyncRunBannerEntryPointTests {
                 events.append("reload")
             }
             defer { NotificationCenter.default.removeObserver(observer) }
+            let callsBefore = await world.providerA.callLog.count
+            // The connection check, the report and the reload all finish before
+            // the runner returns.
             await SyncScheduler(foreground: true).runSyncFollowUp(accountId: accountId)
-            // A run's phase clear lands on the main actor after it returns.
-            try await Task.sleep(for: .milliseconds(200))
-            #expect(state.syncPhase == .downloading(3), "a follow-up with nothing owed changed the account's phase")
+            let calls = await Array(world.providerA.callLog.dropFirst(callsBefore))
+            #expect(calls.isEmpty, "a follow-up with nothing owed reached the provider: \(calls)")
             #expect(state.lastSyncCompletedAt == completedBefore, "a follow-up with nothing owed reported a run")
             #expect(events.snapshot.isEmpty, "a follow-up with nothing owed reloaded the inbox")
         }
