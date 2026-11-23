@@ -26,6 +26,15 @@ enum ChangeScope: Sendable, Equatable {
     /// A push or background pass: no folder list. A provider whose changes come
     /// in one account-wide read may still report every folder.
     case inboxOnly
+    /// A slice of an other-folder run (#1110, `SyncEngine.readOtherFolders`): the
+    /// request names only the run's folders, outside the syncable set, in the
+    /// order to read them. No folder list, no account part, no re-read list. A
+    /// reader that reads folder by folder reads them in that order and reports a
+    /// folder it sent nothing for (out of time, or its session ended before it)
+    /// as `.notRun`, so the run reads it in a later slice. A provider whose
+    /// changes come in one account-wide read reads nothing: every pass already
+    /// reads every folder.
+    case otherFolders
 }
 
 /// One local folder the read is asked about, as it stood at the start of the
@@ -39,10 +48,12 @@ struct ChangeFolder: Sendable, Equatable {
     /// none yet. The engine writes back what the reader returns in
     /// `FolderChanges.cursor`, in that folder's transaction.
     var cursor: String?
-    /// The folder is in the full sync's syncable set
-    /// (`SyncEngine.syncableFoldersInOrder`): a per-folder reader reads changes
-    /// only for these. A folder's re-read list (`ChangeRequest.recheck`) is read
-    /// whatever this says.
+    /// The folder's changes are read: on a pass, a folder of the full sync's
+    /// syncable set (`SyncEngine.syncableFoldersInOrder`); on an other-folder run
+    /// (`ChangeScope.otherFolders`, #1110), every folder of the request. A
+    /// per-folder reader reads changes only for these. A folder's re-read list
+    /// (`ChangeRequest.recheck`) is read whatever this says.
+    /// *Superseded (#1110):* "The folder is in the full sync's syncable set".
     var isSynced: Bool
     /// The start of the folder's held range (`Folder.oldestSyncedDate`). A hint
     /// only: the apply checks the range again inside the folder's transaction, so
@@ -116,7 +127,9 @@ struct ChangeContext: Sendable {
 
 /// Built ONCE at the start of a pass; nothing in it is re-read during the pass.
 struct ChangeRequest: Sendable {
-    /// Every local folder of the account.
+    /// Every local folder of the account; on an other-folder run
+    /// (`ChangeScope.otherFolders`, #1110), the run's folders only, in the order
+    /// to read them.
     let folders: [ChangeFolder]
     let scope: ChangeScope
     /// Folder id -> message ids a change was declined for under the user's own

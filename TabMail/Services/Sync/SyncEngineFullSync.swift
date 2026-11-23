@@ -587,9 +587,11 @@ extension SyncEngine {
 
     /// Whether a folder is in the syncable set (`syncableFoldersInOrder`): a main
     /// role, a favourite, or a folder a user action landed in (`Folder.isFollowed`,
-    /// #1109). These are also the only folders the catch-up checks
+    /// #1109). Every other folder's changes are read by an other-folder run
+    /// (#1110), and the catch-up checks it after the syncable ones.
+    /// *Superseded (#1110):* "These are also the only folders the catch-up checks
     /// (`runCatchUpRun` takes `syncableFolderIds`), so only for them does arming
-    /// the catch-up repair anything.
+    /// the catch-up repair anything."
     nonisolated static func isSyncable(_ folder: Folder) -> Bool {
         syncedPrimaryRoles.contains(folder.role) || syncedSecondaryRoles.contains(folder.role)
             || folder.isFavorite || folder.isFollowed

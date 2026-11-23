@@ -1511,3 +1511,93 @@ followFolders, startAccessCatchUp, access catch-up run, accessedFolderIds, acces
 catchUpAccessCheckAgeSeconds, completionCounters, firstCounters, Counters, syncable set, isSyncable,
 custom non-favourite folder, sync on demand, v112_addFolderIsFollowed, accessesFolder, body poll, #1109,
 #1263, #1264, #1268, #1269, #1276.
+
+### Amendment 2026-11-23 (#1110): the folders outside the syncable set have their changes read every 15 minutes
+
+**Context.** The passes read the changes of the syncable set only (`SyncEngine.isSyncable`: main roles,
+favourites and, since #1109, followed folders). Every other folder (an IMAP custom folder or an Outlook
+folder the user has not opened or acted in) was read only when opened: mail a server rule filed there, and
+changes made there elsewhere, did not reach the device until then. Gmail was already covered: every
+pass's history read reports every label.
+
+**Decision.**
+1. **The run.** A foreground pass whose full sync was due by its 15-minute clock (`lastFullSyncAt` against
+   `fullSyncInterval`; not a pass whose full sync ran only because its change read needed a listing), and
+   whose full sync completed, starts the account's other-folder run when it ends
+   (`SyncEngine.startOtherFolderRun`, `SyncEngineOtherFolders.swift`), beside the older-mail worker. At
+   most one run per account: a start while one runs starts none. The run has no timer, scheduler, queue,
+   gate or turn of its own (tabmail-ios rule `sync-work-rides-the-existing-pipe.md`): it is the catch-up
+   runner (`runCatchUpRun` with `CatchUpRun.readsOtherFolders`), so each slice takes the account's turn
+   (ADR-IOS-104), waits for the pacing window outside it, takes a `.headerFetch` slot of the provider work
+   queue and works at most one slice (`catchUpSliceSeconds`), then hands the turn on. A trigger that comes
+   during a slice sets the account's follow-up flag (#1289), and the stage 2 it asks for waits at most that
+   slice. The poll, IDLE, push, pull and return passes are unchanged, and nothing is added to
+   `syncStartup`: a clock-due pass does one in-memory check and starts one task when it ends.
+2. **What a slice reads.** The other folders (`isSyncable` false, a non-empty path) not yet done in the
+   run, those whose read finished or failed longest ago first, never-read ones first of all
+   (`otherFolderReadOrder`, an in-memory record per engine, `otherFolderAttemptedAt`). The slice reads them
+   through the provider's change reader with the new scope `ChangeScope.otherFolders` (every folder of the
+   request is read: `ChangeFolder.isSynced` true), for at most half the slice (`otherFolderReadShare`), and
+   applies the answer with the passes' one generic apply (`applyChangeSet`). Readers read the request's
+   folders in its order and report a folder they did not reach as `.notRun`, which stays pending.
+   - IMAP with QRESYNC or CONDSTORE: each folder's own bookmark (`Folder.changeCursor`). A first read stores
+     it (`.baselineReady`) and arms the folder's catch-up check (decision 5).
+   - IMAP with no change tracking: each folder's STATUS. A folder whose counters moved is listed
+     (`refreshUntrackedFolder`, `otherFolderSlice:`) only while the slice has time to start a listing
+     (`.listingNotStarted` otherwise: a later slice of the run lists it); the listing's deletion check is
+     bounded by the slice. A due mark (`FolderChangeState.listingDue`) alone lists nothing in a run: a check
+     cut by a slice's end leaves one, and honouring it would list the folder in every run.
+   - Outlook: the per-folder Graph delta of the run's folders, with no folder-list read; a first read
+     baselines, across slices if it must. It stops when the request allowance is spent (`.notRun`).
+   - Gmail: nothing is sent (every folder `.notRun`).
+3. **What a run never writes.** The folder list, the account's bookmark (the slice keeps it, `.keep`),
+   `lastSyncedAt` and `lastFullSyncAt`; and it never turns a folder's coverage (`FolderChangeState.tracking`)
+   on, since the full sync does not list these folders. A refused or dropped bookmark of an other folder
+   (`dropChangeBookmark(listedByFullSync: false)`, and the first bookmark's due listing) does not make the
+   account's full sync due; it arms the catch-up check as always.
+4. **The end rule.** A run ends at the first of: every other folder read once in it (a folder whose baseline
+   a slice's end cut stays pending); a slice that reads nothing new and leaves no new folder out; its
+   working time spent (`SyncConfig.otherFolderRunSeconds`, 120 s, slice time only: the waits for the turn,
+   the slot and the pacing window do not count, as for the access run of #1109); the account removed
+   (`remove(accountId:)` cancels and awaits it). A folder the run did not finish is read first by the next.
+5. **The catch-up checks every folder** (`catchUpFolderIds`): the syncable ones first, then the others
+   (`CatchUpContext.otherFolderIds`, `CatchUpSchedule.leastRecentlyAttemptedFirst(later:)`), so the other
+   folders' first checks never hold back a due check of the syncable set. An IMAP other folder with no
+   change tracking gets its whole-folder check weekly (`SyncConfig.catchUpOtherFolderFullCheckIntervalSeconds`)
+   instead of daily, because its run cannot fit a deletion check in a slice; a first check and a lapse are
+   not held back. First checks run on any network, as every scan does (#1063). This amends ADR-IOS-107
+   decision 1. *Superseded:* "the syncable folders, then every other folder owed a check after a move
+   retired without proof".
+6. **Unchanged:** the syncable set, the passes and their triggers, the sync timing promises (each is listed
+   in the change's pull request), the startup budget (tabmail-ios memory 042), sync by UID, the one removal
+   core, no mail content stored, nothing provider-specific above the boundary
+   (`ChangeSeamFenceTests.otherFolderRunIsProviderBlindAndUngated`).
+
+**Consequences.** A change made to an other folder elsewhere reaches the device within about 15 minutes
+while the app is open. Cost per run: IMAP with no change tracking, one STATUS per quiet folder; IMAP with
+tracking, one SELECT per folder; Outlook, one delta request per quiet folder; Gmail, nothing. An account's
+first runs also store each folder's first bookmark or baseline, spread over runs by the working time.
+Limits:
+- The run starts only after a clock-due foreground pass: while the app is closed the other folders wait for
+  the next opening.
+- The run passes no re-read list (`ChangeRequest.recheck` is empty), so a record a reader could not read in
+  an other folder is read again only with the message's next change or the folder's catch-up check.
+- On IMAP with no change tracking a flag change made elsewhere moves no counter: it arrives with the weekly
+  check, or at once when the user opens the folder (which then follows it, #1109).
+- A folder whose read keeps failing is left out for the rest of its run and goes behind the others in the
+  next.
+
+Tests: `OtherFolderRunTests` (`OtherFolderRuleTests`: the weekly and daily check, the order, Outlook's
+folders, Gmail's empty read, the dropped bookmark; `OtherFolderIMAPTests`, against `FakeIMAPServer` with and
+without QRESYNC: rule-filed mail arrives after a clock-due pass, the passes send nothing for the other
+folders, a listing-only full sync starts no run, the account's clocks and the folders' coverage stay as they
+were, a quiet folder costs one STATUS, a trigger during a slice gets its stage 2 before the run's next slice,
+waiting is not working time, a folder not reached is read first next run, a listing starts only within the
+slice; `OtherFolderOutlookTests`: baseline, then new, deleted and read changes), and
+`ChangeSeamFenceTests.otherFolderRunIsProviderBlindAndUngated`.
+
+Keywords: other folder, other-folder run, startOtherFolderRun, readOtherFolders, readsOtherFolders,
+otherFolderReadOrder, otherFolderAttemptedAt, otherFolderRunSeconds, otherFolderReadShare, ChangeScope
+otherFolders, catchUpOtherFolderFullCheckIntervalSeconds, otherFolderIds, catchUpFolderIds,
+listingNotStarted, listedByFullSync, rule-filed mail, folder outside the syncable set, 15-minute clock,
+clockDue, #1110.

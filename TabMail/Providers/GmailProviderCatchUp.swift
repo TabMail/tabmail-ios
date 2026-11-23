@@ -156,7 +156,7 @@ extension GmailProvider {
     func catchUp(
         folders: [Folder], localRows: any CatchUpLocalRowReader, context: CatchUpContext
     ) async -> [CatchUpFolderResult] {
-        let ordered = CatchUpSchedule.leastRecentlyAttemptedFirst(folders) {
+        let ordered = CatchUpSchedule.leastRecentlyAttemptedFirst(folders, later: context.otherFolderIds) {
             GmailCatchUpState.decode($0.catchUpState)?.lastAttemptAt
         }
         var results: [CatchUpFolderResult] = []

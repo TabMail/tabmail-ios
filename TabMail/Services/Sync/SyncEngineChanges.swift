@@ -221,7 +221,7 @@ extension SyncEngine {
             // Recorded for this pass by `listFolder` (`unprovenListingPasses`),
             // so an error in a later folder cannot lose it.
             case .unproven: break
-            case .notListed: break
+            case .notListed, .listingNotStarted: break
             }
         }
         outcome.outOfTime = outOfTime
@@ -277,15 +277,19 @@ extension SyncEngine {
                 }
             })
         return ChangeRequest(
-            folders: folders.map {
-                ChangeFolder(
-                    id: $0.id, path: $0.path, role: $0.role, cursor: $0.changeCursor,
-                    isSynced: synced.contains($0.id), heldSince: $0.oldestSyncedDate,
-                    addressEpoch: Self.knownUidValidity($0.lastKnownUidValidity),
-                    olderMailComplete: $0.backfillComplete, olderMailCursor: $0.backfillUidCursor)
-            },
+            folders: folders.map { Self.changeFolder($0, isSynced: synced.contains($0.id)) },
             scope: scope, recheck: recheck, context: context,
             localRows: SyncEngineCatchUpRowReader(pool: dbPool))
+    }
+
+    /// The reader's view of one stored folder, for a pass's request
+    /// (`makeChangeRequest`) and an other-folder run's (`readOtherFolders`, #1110).
+    nonisolated static func changeFolder(_ folder: Folder, isSynced: Bool) -> ChangeFolder {
+        ChangeFolder(
+            id: folder.id, path: folder.path, role: folder.role, cursor: folder.changeCursor,
+            isSynced: isSynced, heldSince: folder.oldestSyncedDate,
+            addressEpoch: knownUidValidity(folder.lastKnownUidValidity),
+            olderMailComplete: folder.backfillComplete, olderMailCursor: folder.backfillUidCursor)
     }
 
     /// The distinct ids one pass reads again: the folders' lists taken in turn,
@@ -322,7 +326,9 @@ extension SyncEngine {
         try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
     }
 
-    private func applyChangeSet(_ changeSet: ChangeSet, account: Account, request: ChangeRequest) async throws -> ChangePassOutcome {
+    /// The one generic apply of a read: a pass's (`readAndApplyChanges`) and an
+    /// other-folder run's slice (`readOtherFolders`, #1110).
+    func applyChangeSet(_ changeSet: ChangeSet, account: Account, request: ChangeRequest) async throws -> ChangePassOutcome {
         let accountId = account.id
         var outcome = ChangePassOutcome()
         outcome.fromReader = true

@@ -191,7 +191,7 @@ extension ExchangeProvider {
     func catchUp(
         folders: [Folder], localRows: any CatchUpLocalRowReader, context: CatchUpContext
     ) async -> [CatchUpFolderResult] {
-        let ordered = CatchUpSchedule.leastRecentlyAttemptedFirst(folders) {
+        let ordered = CatchUpSchedule.leastRecentlyAttemptedFirst(folders, later: context.otherFolderIds) {
             ExchangeCatchUpState.decode($0.catchUpState)?.lastAttemptAt
         }
         let allowance = GraphCatchUpAllowance(context: context)

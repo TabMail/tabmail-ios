@@ -75,9 +75,19 @@ extension SyncEngine {
     /// changed folder the window listing (which writes the folder's counters)
     /// and the deletion check on that listing's count. Returns what the refresh
     /// did (`UntrackedRefresh`).
+    /// - Parameter otherFolderSlice: the read budget of the other-folder run's
+    ///   slice this refresh belongs to (#1110), nil for a pass. A listing starts
+    ///   only while the slice has budget (`.listingNotStarted` otherwise: the run
+    ///   lists the folder in a later slice); the listing shows no download count
+    ///   (no pass is running to clear it); and a due mark alone
+    ///   (`FolderChangeState.listingDue`) does not list the folder, only counters
+    ///   that moved or a check the reader owes (`UntrackedObservation.mustList`).
+    ///   A deletion check cut by a slice's end leaves that mark, and honouring it
+    ///   would list the folder again in every run; the weekly full check of the
+    ///   catch-up removes what the check would have.
     func refreshUntrackedFolder(
         folderId: String, observation: UntrackedObservation, account: Account, provider: any EmailProvider,
-        deadline: Date? = nil, pass: UUID? = nil
+        deadline: Date? = nil, pass: UUID? = nil, otherFolderSlice: ChangeContext? = nil
     ) async throws -> UntrackedRefresh {
         guard let folder = try await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
               !folder.path.isEmpty, folder.uidValidityResetPendingAt == nil else { return .notListed }
@@ -92,10 +102,11 @@ extension SyncEngine {
             return .notListed
         }
 
+        let markedDue = otherFolderSlice == nil && FolderChangeState(raw: folder.changeState).listingDue
         guard Self.untrackedFolderChanged(
             observation: observation, lastKnownUidNext: folder.lastKnownUidNext,
             totalCount: folder.totalCount, lastKnownHighestModSeq: folder.lastKnownHighestModSeq,
-            listingDue: FolderChangeState(raw: folder.changeState).listingDue || observation.mustList) else {
+            listingDue: markedDue || observation.mustList) else {
             BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) unchanged (uidNext=\(observation.uidNext), count=\(observation.messageCount), modseq=\(observation.highestModSeq.map(String.init) ?? "-"))")
             // A quiet folder is the one that would otherwise never get an epoch.
             // Bootstrap only (never an overwrite); the binding predicates are
@@ -106,9 +117,13 @@ extension SyncEngine {
             return .notListed
         }
 
+        if let otherFolderSlice, !otherFolderSlice.hasBudget() {
+            BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) changed: no slice time left to start its listing — later slice")
+            return .listingNotStarted
+        }
         BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) changed (uidNext: \(folder.lastKnownUidNext ?? 0)→\(observation.uidNext), count: \(folder.totalCount)→\(observation.messageCount))")
         let newCount = max(0, observation.messageCount - folder.totalCount)
-        if newCount > 0 { publishDownloading(newCount, forAccount: account.id) }
+        if newCount > 0, otherFolderSlice == nil { publishDownloading(newCount, forAccount: account.id) }
         // The listing writes the folder's counters from its own selection, with
         // its rows (`runSyncMessages`); this observation only decided to list.
         // One classifier (`listFolder` → `runListing`): no error escapes it.
@@ -149,4 +164,7 @@ enum UntrackedRefresh: Sendable, Equatable {
     /// A listing started and failed to prove its window (a short FETCH, an
     /// EXISTS 0 not confirmed): the pass's full-sync stamp is withheld.
     case unproven
+    /// Changed, but the other-folder run's slice had no time left to start its
+    /// listing (#1110): the run lists it in a later slice. Never for a pass.
+    case listingNotStarted
 }

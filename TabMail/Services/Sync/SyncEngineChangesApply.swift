@@ -212,8 +212,9 @@ extension SyncEngine {
         case .refused(let reason):
             // This folder only: its bookmark is gone, so it is not covered, its
             // catch-up gets one whole-folder check, and the account's full sync
-            // lists it. Its next read starts a new baseline.
-            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, db: db)
+            // lists it when it syncs it (an other folder, read by its run, is not
+            // listed by the full sync, #1110). Its next read starts a new baseline.
+            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, listedByFullSync: Self.isSyncable(folder), db: db)
             cursor = nil
             state.tracking = false
             if case .addressEpochChanged(let served) = reason {
@@ -245,9 +246,14 @@ extension SyncEngine {
             state.tracking = false
         case .baselineReady:
             // Covered only after a window listing in a pass whose read covered it
-            // (`commitChangeBaseline`); make that listing due.
+            // (`commitChangeBaseline`); make that listing due. A folder the full
+            // sync does not list (an other folder, read by its run, #1110) leaves
+            // the account's clocks as they are: no listing would follow, and its
+            // new bookmark's one whole-folder check is the catch-up's.
             state.tracking = false
-            try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+            if Self.isSyncable(folder) {
+                try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+            }
         case .tracked, .failed, .notRun:
             break
         }
@@ -288,9 +294,15 @@ extension SyncEngine {
     /// after its next listing, which does not reach below the window either.
     /// *Superseded (#1062):* "with `selfHealDue` and no bookmark it writes only
     /// `selfHealOwed`" (the self-heal pass, deleted, ran without the lapse).
+    /// `listedByFullSync: false` (a folder outside the syncable set, whose
+    /// changes an other-folder run reads, #1110): the account's full sync, which
+    /// does not list the folder, is not made due; the catch-up check is armed as
+    /// always.
     /// Reads the folder's raw columns only (no model is decoded), so the release
     /// boundary can call it inside `AppDatabase.init` (#876).
-    nonisolated static func dropChangeBookmark(folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, db: Database) throws {
+    nonisolated static func dropChangeBookmark(
+        folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, listedByFullSync: Bool = true, db: Database
+    ) throws {
         guard let row = try Row.fetchOne(
             db, sql: "SELECT accountId, changeCursor, changeState FROM folder WHERE id = ?", arguments: [folderId])
         else { return }
@@ -316,6 +328,7 @@ extension SyncEngine {
         try db.execute(sql: "UPDATE folder SET changeCursor = NULL, changeState = ? WHERE id = ?",
                        arguments: [state.encoded, folderId])
         if !selfHealDue { try markCatchUpLapse(folderId: folderId, db: db) }
+        guard listedByFullSync else { return }
         try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
     }
 

@@ -53,6 +53,9 @@ import SwiftMail
 // session never opened (its pass-start NOOP included) keeps its failure time too; a
 // session that cannot be opened again mid-pass fails the folders not yet read
 // (`.failed`, bookmark kept, no failure time); a budget run out leaves them `.notRun`.
+// A slice of an other-folder run (`ChangeScope.otherFolders`, #1110) reads the
+// request's folders in its order, the same way, and reports a folder it did not
+// reach `.notRun` whatever stopped it.
 
 /// IMAP's opaque per-folder change bookmark, stored as JSON in
 /// `Folder.changeCursor`. Three server-assigned integers about the mailbox
@@ -221,8 +224,10 @@ extension IMAPProvider {
                     while next < work.count {
                         guard context.hasBudget() else { budgetSpent = true; return }
                         let folder = work[next]
-                        changeReadFirst.remove(folder.id)
-                        if changeReadLast == folder.id { changeReadLast = nil }
+                        if request.scope != .otherFolders {
+                            changeReadFirst.remove(folder.id)
+                            if changeReadLast == folder.id { changeReadLast = nil }
+                        }
                         do {
                             results[folder.id] = try await self.readChangeFolder(
                                 folder, server: server, mode: mode, request: request)
@@ -254,7 +259,8 @@ extension IMAPProvider {
                     BackgroundSyncLogger.logDebug("[IMAPChanges] session ended on \(error)")
                 }
                 if closedByServer, generation == generationAtStart { continue }
-                if let timedOut {
+                // A run's order is the engine's (`changeReadOrder`).
+                if let timedOut, request.scope != .otherFolders {
                     // The next pass reads the folders left unread first and the one
                     // that timed out last (the inbox stays first until its read has
                     // timed out on several passes in a row).
@@ -270,8 +276,11 @@ extension IMAPProvider {
                     // again, a read that timed out, a dropped one that did not end in
                     // time), or after a teardown that ended the pass at any point, the
                     // folders not yet read fail with no failure time and are read on
-                    // the next pass.
-                    results[folder.id] = sessionOpened || generation != generationAtStart
+                    // the next pass. A slice of an other-folder run reports them
+                    // `.notRun` instead: the run reads them in a later slice (#1110).
+                    let unreached = sessionOpened || generation != generationAtStart
+                    if unreached, request.scope == .otherFolders { continue }
+                    results[folder.id] = unreached
                         ? FolderChanges(folderId: folder.id, status: .failed(error))
                         : Self.failedFolder(folder, error: error, now: context.clock())
                 }
@@ -289,18 +298,24 @@ extension IMAPProvider {
     /// read that timed out, the folders it left unread come first and the folder
     /// that timed out comes last, except that the inbox stays first until its read
     /// has timed out on several passes in a row
-    /// (`readFirst(_:first:last:inboxTimeouts:)`).
+    /// (`readFirst(_:first:last:inboxTimeouts:)`). A slice of an other-folder run
+    /// (`.otherFolders`, #1110) reads its folders in the request's order, which
+    /// the engine sets, and leaves the passes' hints as they are.
     func changeReadOrder(_ request: ChangeRequest) -> [ChangeFolder] {
-        // Hints for folders the account no longer has are dropped.
-        changeReadFirst.formIntersection(request.folders.map(\.id))
-        if let last = changeReadLast, !request.folders.contains(where: { $0.id == last }) { changeReadLast = nil }
         let candidates = request.folders.filter { folder in
             guard !folder.path.isEmpty else { return false }
             switch request.scope {
             case .inboxOnly: return folder.role == .inbox
             case .all: return folder.isSynced || !(request.recheck[folder.id] ?? []).isEmpty
+            case .otherFolders: return folder.isSynced
             }
         }
+        // A run's request names only its own folders: the hints, and the
+        // rotation, are the passes' alone.
+        if request.scope == .otherFolders { return candidates }
+        // Hints for folders the account no longer has are dropped.
+        changeReadFirst.formIntersection(request.folders.map(\.id))
+        if let last = changeReadLast, !request.folders.contains(where: { $0.id == last }) { changeReadLast = nil }
         let inbox = candidates.filter { $0.role == .inbox }
         let rest = candidates.filter { $0.role != .inbox }
         guard !rest.isEmpty else { return inbox }

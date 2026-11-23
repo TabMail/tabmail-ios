@@ -52,6 +52,10 @@ import Foundation
 /// sends at most `SyncConfig.graphChangeReadRequestsPerSecond` times its read
 /// budget, a `$batch` charged its width before it is sent.
 ///
+/// **Other-folder runs** (scope `.otherFolders`, #1110): each slice reads the
+/// run's folders, every one a delta as above, with no folder list and no re-read
+/// list; a folder the slice can send nothing for is `.notRun`.
+///
 /// **Folder list** (scope `.all`): the mail-folder delta is a change signal. A
 /// record for a folder already stored updates its name and counts
 /// (`FolderListUpdate.updated`); a new folder, a removed one or no link yet runs
@@ -91,6 +95,10 @@ extension ExchangeProvider {
         var results: [String: FolderChanges] = [:]
         var verbIdsByFolder: [(folder: ChangeFolder, ids: [String])] = []
         for folder in Self.foldersToRead(request) {
+            // A slice of an other-folder run reports a folder it can send nothing
+            // for `.notRun`, so the run reads it in a later slice (#1110); a pass
+            // reports such a folder from its stored phase.
+            if request.scope == .otherFolders, !allowance.canSend(1) { break }
             let read = try await readFolder(folder, request: request, allowance: &allowance)
             results[folder.id] = read.changes
             if !read.verbIds.isEmpty { verbIdsByFolder.append((folder, read.verbIds)) }
@@ -128,12 +136,13 @@ extension ExchangeProvider {
     }
 
     /// The folders this read covers, in order: those already tracking before
-    /// those in their baseline, the Inbox first in each. Scope `.all` reads every
-    /// folder the full sync syncs; `.inboxOnly` reads the Inbox only.
+    /// those in their baseline, the Inbox first in each, else in the request's
+    /// order. Scope `.all` reads every folder the full sync syncs; `.inboxOnly`
+    /// reads the Inbox only; `.otherFolders` reads the run's folders (#1110).
     nonisolated static func foldersToRead(_ request: ChangeRequest) -> [ChangeFolder] {
         let eligible = request.folders.filter { folder in
             switch request.scope {
-            case .all: return folder.isSynced
+            case .all, .otherFolders: return folder.isSynced
             case .inboxOnly: return folder.role == .inbox
             }
         }

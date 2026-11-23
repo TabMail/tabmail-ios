@@ -872,6 +872,13 @@ enum SyncConfig {
     /// its cursor is valid, so a Gmail folder is listed only the first time and
     /// after a lapse of the cursor (`GmailProvider.catchUpPlan`).
     static let catchUpFullCheckIntervalSeconds: TimeInterval = 86_400
+    /// The same full listing for a folder outside the syncable set (#1110: no
+    /// main role, not a favourite, no user action landed in it), whose changes
+    /// an other-folder run reads (seconds: a week). It matters only where no
+    /// change bookmark covers the folder (an IMAP server without change
+    /// tracking): there it is what removes a message deleted deep in the folder,
+    /// and applies a read mark changed on old mail, without opening the folder.
+    static let catchUpOtherFolderFullCheckIntervalSeconds: TimeInterval = 604_800
     /// On a server with no mod-sequences, a folder a user action lands in is
     /// listed again at that access when its counters (EXISTS, UIDNEXT) differ
     /// from those its last completed listing started from, or when that listing
@@ -887,6 +894,23 @@ enum SyncConfig {
     /// What a large folder still needs then is the backfill worker's, which
     /// checks every followed folder.
     static let accessCatchUpRunSeconds: TimeInterval = 120
+    /// How long one other-folder run may work (seconds, #1110): the run a
+    /// clock-due foreground pass starts to read the changes of the folders
+    /// outside the syncable set. Its slices run, paced like every other catch-up
+    /// slice of the account, until every such folder has been read once, a slice
+    /// reads nothing new, or the slices' time inside the account's turn adds up
+    /// to this (`CatchUpRun.workSeconds`: waits do not count). A folder not
+    /// reached is read first by the next run.
+    static let otherFolderRunSeconds: TimeInterval = 120
+    /// The share of an other-folder slice's time its change read may use
+    /// (#1110); the rest is left for the listings of the changed folders no
+    /// bookmark covers (servers without change tracking), which start only
+    /// before the slice's end. Without it a read of many folders on a slow link
+    /// spends the whole slice on one STATUS per folder, no listing ever starts,
+    /// and the same folders are read again at every run. A reader whose read is
+    /// all its work (a bookmark, an Outlook delta) gets the same time per run in
+    /// more, shorter slices: a run's working time counts slice time only.
+    static let otherFolderReadShare: Double = 0.5
     /// About how many messages one IMAP listing range holds (`UID FETCH lo:hi
     /// (UID FLAGS)`, then one membership `UID SEARCH` of the same range). The
     /// first range's width in UIDs is sized from the folder's EXISTS and UIDNEXT
