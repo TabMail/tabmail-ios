@@ -386,7 +386,7 @@ struct ForegroundStartEffectTests {
             try #require(synced, "precondition: the add's initial sync read the inbox")
             // The initial sync's turn ends before the events below, so the EXISTS
             // read finds the account free.
-            await AccountManager.shared.syncEngine.oneSyncAtATime(accountId: account.id) {}
+            await AccountManager.shared.syncEngine.oneSyncAtATime(accountId: account.id) { @Sendable in }
 
             let state = ScreenState(accounts: 1)
             let window = try Self.host(state, start: { world.scheduler.startForegroundPolling() })
@@ -411,7 +411,7 @@ struct ForegroundStartEffectTests {
             let (entered, enter) = AsyncStream<Void>.makeStream()
             let (release, open) = AsyncStream<Void>.makeStream()
             let holder = Task {
-                await AccountManager.shared.syncEngine.oneSyncAtATime(accountId: account.id) {
+                await AccountManager.shared.syncEngine.oneSyncAtATime(accountId: account.id) { @Sendable in
                     enter.yield()
                     for await _ in release { break }
                 }
@@ -522,7 +522,7 @@ struct ForegroundStartEffectTests {
             for account in world.accounts {
                 // `addIMAPAccount` starts the account's initial sync; taking the
                 // account's turn waits for it to end before the account goes.
-                await manager.syncEngine.oneSyncAtATime(accountId: account.id) {}
+                await manager.syncEngine.oneSyncAtATime(accountId: account.id) { @Sendable in }
                 if let provider = await manager.provider(for: account) as? IMAPProvider {
                     await provider.stopIdle()
                     try? await provider.disconnect()
