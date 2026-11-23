@@ -318,6 +318,78 @@ struct InboxThreadAcrossAccountsTests {
         expectOverlayReleased([onGmail.id, onOutlook.id], after: "Undo")
     }
 
+    @Test("archiving or deleting a thread of unread, tagged members on two accounts shows each one in its own folder, untagged, and read only when that setting is on, before its write runs; an Undo after the moves shows every member back in its own inbox with its tag, in one notice naming them all, before its writes run, and brings the tags back", arguments: RoleAction.allCases, [true, false])
+    func eachMemberShowsAtOnceBothWays(action: RoleAction, markRead: Bool) async throws {
+        let fixture = try makeFixture()
+        defer { finish(fixture) }
+        clearSharedState()
+        UserDefaults.standard.set(markRead, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        var onGmail = makeHeader(folder: fixture.gmailInbox, messageId: "gmail-member", isRead: false)
+        onGmail.actionTag = .reply
+        var onOutlook = makeHeader(folder: fixture.outlookInbox, messageId: "outlook-member", isRead: false)
+        onOutlook.actionTag = .archive
+        let members = [onGmail, onOutlook]
+        try await insert(members, into: fixture.pool)
+        let memberIds = members.map(\.id)
+        let expectedRead: Bool? = markRead ? true : nil
+        let cleared: ActionTag?? = .some(nil)
+
+        let vm = InboxViewModel(folders: [fixture.gmailInbox, fixture.outlookInbox])
+        let forwardGate = await gateWriteQueue()
+        let skipped = await act(action, on: memberIds, with: vm)
+        #expect(skipped.isEmpty, "both members are acted on: \(skipped)")
+        let shown = AccountManager.shared.snapshotOverlay()
+        for member in members {
+            let destination = fixture.destination(action, account: member.accountId)
+            #expect(shown[member.id]?.folderId == destination.id, "\(member.messageId) shows in \(destination.path)")
+            #expect(shown[member.id]?.isRead == expectedRead,
+                    "\(member.messageId) shows read exactly when the setting is on")
+            #expect(shown[member.id]?.actionTag == cleared,
+                    "\(member.messageId) shows without its tag once it leaves the inbox")
+        }
+        forwardGate.finish()
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        for member in members {
+            let row = try await header(member.id, in: fixture.pool)
+            #expect(row?.folderId == fixture.destination(action, account: member.accountId).id)
+            #expect(row?.isRead == markRead, "\(member.messageId) is read in the database exactly when the setting is on")
+            #expect(row?.actionTag == nil, "\(member.messageId) loses its tag as it leaves the inbox")
+        }
+        expectOverlayReleased(memberIds, after: "the forward moves")
+
+        // Undo once the moves are done: what it shows comes before its writes.
+        let undone = UndoneTap()
+        defer { undone.stop() }
+        let undoGate = await gateWriteQueue()
+        await UndoService.shared.undo()
+        let notices = undone.snapshot
+        #expect(notices == [memberIds], "one notice to the list names the members of every part")
+        let back = AccountManager.shared.snapshotOverlay()
+        for member in members {
+            let restoredTag: ActionTag?? = .some(member.actionTag)
+            #expect(back[member.id]?.folderId == member.folderId, "\(member.messageId) shows back in its own inbox")
+            #expect(back[member.id]?.folderPath == member.folderPath)
+            #expect(back[member.id]?.isInInbox == true)
+            #expect(back[member.id]?.actionTag == restoredTag, "\(member.messageId) shows its tag again")
+            let stored = try await folderId(of: member.id, in: fixture.pool)
+            #expect(stored == fixture.destination(action, account: member.accountId).id,
+                    "setup: \(member.messageId)'s Undo write has not run yet")
+        }
+        undoGate.finish()
+        await AccountManager.shared.awaitWriteQueueDrain()
+
+        #expect(UndoService.shared.undoFailureMessage == nil, "Undo must not be refused")
+        for member in members {
+            let row = try await header(member.id, in: fixture.pool)
+            #expect(row?.folderId == member.folderId)
+            #expect(row?.actionTag == member.actionTag, "Undo brings back \(member.messageId)'s tag")
+            #expect(row?.isRead == markRead, "Undo leaves the read state as it is")
+        }
+        expectOverlayReleased(memberIds, after: "Undo")
+    }
+
     @Test("archiving or deleting a thread across two accounts records each account's read before that account's move, for the acted-on unread members only", arguments: RoleAction.allCases)
     func eachAccountReadsBeforeItsMove(action: RoleAction) async throws {
         let fixture = try makeFixture()
@@ -597,6 +669,58 @@ struct InboxThreadAcrossAccountsTests {
         }
     }
 
+    @Test("each Undo's notice is decided by that entry alone: a partly refused Undo says some messages were not moved back, the next one, which brings everything back, says nothing, and the one after, which brings nothing back, says nothing was moved back")
+    func undoNoticeIsDecidedPerEntry() async throws {
+        let fixture = try makeFixture()
+        defer { finish(fixture) }
+        clearSharedState()
+
+        // Three threads across both accounts, one entry each. Undo takes the
+        // newest first: the partly refused one, then the one that comes back
+        // whole, then the one that does not come back at all.
+        let threads = ["refused", "whole", "partly"].map { name in
+            [makeHeader(folder: fixture.gmailInbox, messageId: "\(name)-gmail"),
+             makeHeader(folder: fixture.outlookInbox, messageId: "\(name)-outlook")]
+        }
+        let (refused, whole, partly) = (threads[0], threads[1], threads[2])
+        try await insert(threads.flatMap { $0 }, into: fixture.pool)
+        let vm = InboxViewModel(folders: [fixture.gmailInbox, fixture.outlookInbox])
+        for thread in threads {
+            let skipped = vm.archiveThread(thread.map(\.id))
+            #expect(skipped.isEmpty, "setup: the whole thread is archived: \(skipped)")
+        }
+        await AccountManager.shared.awaitWriteQueueDrain()
+        #expect(UndoService.shared.undoStack.count == 3, "setup: one entry per thread")
+        // Sync removed the archived rows that cannot come back: the partly
+        // refused entry's Gmail member and both members of the last one.
+        let gone = [partly[0].id] + refused.map(\.id)
+        try await fixture.pool.writeWithoutTransaction { db in
+            for id in gone { _ = try MessageHeader.deleteOne(db, key: id) }
+        }
+
+        await UndoService.shared.undo()
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let partlyBack = try await folderId(of: partly[1].id, in: fixture.pool)
+        #expect(partlyBack == fixture.outlookInbox.id, "setup: the partly refused entry's Outlook member is back")
+        #expect(UndoService.shared.undoFailureMessage == "Some messages were not moved back.")
+        UndoService.shared.dismissUndoFailure()
+
+        await UndoService.shared.undo()
+        await AccountManager.shared.awaitWriteQueueDrain()
+        for member in whole {
+            let back = try await folderId(of: member.id, in: fixture.pool)
+            #expect(back == member.folderId, "setup: \(member.messageId) is back")
+        }
+        #expect(UndoService.shared.undoFailureMessage == nil,
+                "an Undo that brought everything back says nothing, whatever the one before it refused")
+
+        await UndoService.shared.undo()
+        await AccountManager.shared.awaitWriteQueueDrain()
+        #expect(UndoService.shared.undoFailureMessage == "Nothing was moved back.",
+                "an Undo that brought nothing back says so, whatever the ones before it brought back")
+        #expect(UndoService.shared.undoStack.isEmpty)
+    }
+
     // MARK: - Address changes and pruning across the parts of one entry
 
     @Test("a member of the entry's second account whose address changed when its move finished is followed, and Undo brings it back under its new address", arguments: RekeyMoment.allCases)
@@ -748,13 +872,16 @@ struct InboxThreadAcrossAccountsTests {
             #expect(await AccountManager.shared.deferredMoveSuccessorCountForTesting() == 1,
                     "setup: the IMAP part waits for the address its move is given")
             // The server finished the move and named the message's new UID.
+            // Built here: the suite's statics belong to the main actor, which
+            // the database writer's closure does not run on.
+            let proven = ProvenDestinationAddress(
+                sourceProviderId: Self.imapUid,
+                destinationProviderId: Self.imapUidInArchive,
+                destinationUidValidity: UInt32(Self.imapArchiveEpoch))
             let finished = try await fixture.pool.write { db in
                 let result = try MessageHeaderRekey.finishMove(
                     imapForward,
-                    destinations: [ProvenDestinationAddress(
-                        sourceProviderId: Self.imapUid,
-                        destinationProviderId: Self.imapUidInArchive,
-                        destinationUidValidity: UInt32(Self.imapArchiveEpoch))],
+                    destinations: [proven],
                     addressChangesOnMove: true,
                     accountScopedIds: false,
                     db: db)
@@ -859,6 +986,30 @@ struct InboxThreadAcrossAccountsTests {
         #expect(try await folderId(of: inProjects.id, in: fixture.pool) == fixture.outlookProjects.id)
         #expect(try await queuedMoves(in: fixture.pool).isEmpty,
                 "Undo cancels the queued move and queues no move for the member that never moved")
+    }
+}
+
+/// Records the ids each `.messagesUndone` notice names, in order: the list
+/// puts back every row a notice names (`InboxView`), so one Undo must name the
+/// members of all its parts.
+private final class UndoneTap: @unchecked Sendable {
+    private let received = Mutex<[[String]]>([])
+    private var observer: NSObjectProtocol?
+
+    init() {
+        observer = NotificationCenter.default.addObserver(
+            forName: .messagesUndone, object: nil, queue: nil
+        ) { [self] notification in
+            let ids = notification.object as? [String] ?? []
+            received.withLock { $0.append(ids) }
+        }
+    }
+
+    var snapshot: [[String]] { received.withLock { $0 } }
+
+    func stop() {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
     }
 }
 
