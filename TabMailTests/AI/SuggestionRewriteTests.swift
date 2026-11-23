@@ -910,7 +910,7 @@ struct SuggestionRewriteRouteTests {
         for (index, step) in edits.enumerated() {
             let edit = ComposeView.suggestionEdit(
                 body: step.body, textMessage: step.text, changeCommand: step.command,
-                showingSuggestion: true, isForward: false, replyTo: header,
+                showingSuggestion: true, isForward: false, onlyToChosen: false, replyTo: header,
                 recipients: envelope.recipients, subject: envelope.subject, accountId: nil, accounts: [])
             let expected = ReplyResult(body: step.body, textMessage: step.text, changeCommand: step.command)
             #expect(edit.edited == expected, "edit \(index): the card shows the whole edited value")
@@ -952,7 +952,7 @@ struct SuggestionRewriteRouteTests {
             let previous = shown
             let edit = ComposeView.suggestionEdit(
                 body: body, textMessage: text, changeCommand: command,
-                showingSuggestion: true, isForward: false, replyTo: header,
+                showingSuggestion: true, isForward: false, onlyToChosen: false, replyTo: header,
                 recipients: envelope.recipients.applying(to: to, cc: cc, bcc: bcc), subject: newSubject ?? subject,
                 accountId: nil, accounts: [])
             if let newSubject { subject = newSubject }

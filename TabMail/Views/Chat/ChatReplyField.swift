@@ -440,9 +440,11 @@ extension AgentToolRouter.ComposeRequest {
                 prefillSubject: subject, onAgentOutcome: onOutcome)
         case .reply:
             // The reply tool's envelope exactly (`EmailReplyTool`): its fields, an empty one
-            // included, its subject and its kind.
+            // included, its subject and its kind. A reply only to the people chosen in the field's
+            // Reply to keeps its words written for them (`ComposeView.onlyToChosen`).
             ComposeView(
                 replyTo: replyTo, suggestedBody: body, suggestion: suggestion, isReplyAll: isReplyAll,
+                onlyToChosen: fieldReply?.onlyTo != nil,
                 prefillTo: to, prefillCc: cc, prefillBcc: bcc, prefillSubject: subject,
                 prefillDraftId: draftId, openedOn: openedOn, onAgentOutcome: onOutcome)
         case .forward:

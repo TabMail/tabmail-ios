@@ -140,5 +140,36 @@ struct ComposeRecipientWiringTests {
         // Recompute and an inline edit are admitted through one fence: one runs at a time.
         #expect(Self.count("agentSendFence.beginAgent() else { return }", in: action) == 1)
         #expect(Self.count("defer { fence.finishAgent() }", in: action) == 1)
+        // A reply only to the people chosen in the chat's Reply to: the new reply is written for the
+        // card's people from the card's own context (identity-checked), and the stored path, which
+        // writes for everyone and stores, never runs for it.
+        let chosen = try #require(action.range(of: "if onlyToChosen {"))
+        let context = try #require(action.range(of: "if let context = await composeEditContextForRequest() {"))
+        let written = try #require(action.range(
+            of: "recomputed = await Self.recomputedReplyForChosen( context: context, composeEdit: EmailReplyTool.chatComposeEdit)"))
+        let stored = try #require(action.range(of: "} else { recomputed = await Self.recomputedReply("))
+        #expect(chosen.upperBound <= context.lowerBound && context.upperBound <= written.lowerBound
+                    && written.upperBound <= stored.lowerBound,
+                "the chosen people's branch reads the card's context and writes for it before the stored path's else")
+        #expect(Self.count("recomputedReplyForChosen(", in: action) == 1 && Self.count("Self.recomputedReply(", in: action) == 1,
+                "one call each: the chosen people's recompute and the stored one")
+        // The chosen people's recompute stores nothing: the action itself never writes a suggestion
+        // (the stored path's write lives inside `recomputedReply`).
+        for write in ["writeCachedReplyToDB", "storeSuggestion", "replaceSuggestion", "dbPool"] {
+            #expect(Self.count(write, in: String(action[chosen.lowerBound..<stored.lowerBound])) == 0,
+                    "the chosen people's branch writes nothing: \(write)")
+        }
+        #expect(Self.count("writeCachedReplyToDB", in: action) == 0, "the action never stores a suggestion itself")
+        // Its context is the card's own: its recipients now and its From account, with the body
+        // through the identity-checked read.
+        let builder = try #require(text.range(of: "private func buildComposeEditContext(relatedBodyText bodyText: String?) -> ComposeEditContext {"))
+        let builderBody = String(text[builder.upperBound...].prefix(600))
+        #expect(builderBody.contains("ComposeEditContext.make( recipients: recipients, account: resolvedAccount,"),
+                "the card's recipients and From account: \(builderBody)")
+        let reader = try #require(text.range(of: "private func composeEditContextForRequest() async -> ComposeEditContext? {"))
+        let readerBody = String(text[reader.upperBound...].prefix(700))
+        #expect(readerBody.contains("ComposeEditContext.relatedBodyText(of: reply, db: db)")
+                    && readerBody.contains("return buildComposeEditContext(relatedBodyText: bodyText)"),
+                "the body through the identity-checked read, into the card's context: \(readerBody)")
     }
 }

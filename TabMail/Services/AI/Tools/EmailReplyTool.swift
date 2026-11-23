@@ -56,7 +56,7 @@ struct EmailReplyTool: AgentTool, Sendable {
 
     /// `invocation.fieldReply`: the request was sent from the chat's reply field. A reply to the
     /// email that field showed, any copy of it in the same account, carries it, so its compose goes
-    /// to the people chosen then; a reply to another account's copy, or another email, keeps its
+    /// to the people chosen then, and its words are written for them; a reply to another account's copy, or another email, keeps its
     /// own recipients (ADR-IOS-114 decision 11). The field's AI Suggestion belongs to the row it
     /// showed alone, and only while that row is still the same email.
     /// `invocation.composeOrigin`: the chat that asked, where the reply's compose card opens
@@ -194,20 +194,35 @@ struct EmailReplyTool: AgentTool, Sendable {
                 })
         }
 
+        // A reply to only the people chosen in Reply to (the draft is `ChatReplyCompose.onlyTo`): its
+        // words are written for them. The email's stored AI Suggestion was written for its whole
+        // Reply All audience, so it never stands in for them (ADR-IOS-114 decision 11).
+        let onlyToChosen = fieldReply?.onlyTo != nil
+
         // When a compose instruction is present, run it through performInlineEdit
         // with mode "edit_reply" — matching TB's runComposeEdit() flow.
         // TB wraps the request: "Reply to email with subject '...' with request: ..."
+        // A reply only to the people chosen, with neither a request nor a body from the agent, is
+        // written as Thunderbird's email_reply writes a reply asked for with no request: the same
+        // compose edit for the draft's recipients, with an empty request.
+        let request: String?
+        if let composeRequest {
+            request = "Reply to email with subject \"\(header.subject)\" with request: \(composeRequest)"
+        } else if onlyToChosen, explicitBody == nil {
+            request = ""
+        } else {
+            request = nil
+        }
         var envelope = start
         var generatedBody: String? = explicitBody
-        if let composeRequest {
+        if let request {
             guard let bodyText = try await relatedBody(of: header, boundTo: fieldRow) else {
                 return ComposeOutcome.failed("the email changed since the request was sent; nothing was done").describeForLLM
             }
-            let wrappedRequest = "Reply to email with subject \"\(header.subject)\" with request: \(composeRequest)"
             let context = await Self.editContext(
                 recipients: start.recipients, account: account, related: header, relatedBodyText: bodyText)
             do {
-                let result = try await composeEdit(context, "", "", wrappedRequest)
+                let result = try await composeEdit(context, "", "", request)
                 // A subject the edit writes replaces the start's; with none the start's stays.
                 if let subject = result.subject { envelope = start.with(subject: subject) }
                 generatedBody = result.body ?? generatedBody
@@ -219,8 +234,10 @@ struct EmailReplyTool: AgentTool, Sendable {
 
         // With no request and no explicit body, the card opens on the stored AI Suggestion: the
         // whole value (body, text message, change command), so the card's own edit replaces
-        // exactly the value stored (`MessageHeader.replaceSuggestion(with:ifStill:)`).
-        let storedSuggestion = generatedBody == nil ? header.suggestion : nil
+        // exactly the value stored (`MessageHeader.replaceSuggestion(with:ifStill:)`). Never in a
+        // reply only to the people chosen: its card opens with the words written for them, or
+        // empty when writing them failed.
+        let storedSuggestion = generatedBody == nil && !onlyToChosen ? header.suggestion : nil
         // A reply to only the people chosen in Reply to saves to a draft of its own, as the AI
         // Suggestion's card does: a reply draft already saved for this email (a Reply All, say)
         // neither sets the card's recipients nor is saved over. Otherwise the reply's usual draft.
