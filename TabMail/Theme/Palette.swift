@@ -52,6 +52,10 @@ enum Palette {
 
     // MARK: - Link
     static let link = Color(light: Color(hex: 0x0060DF), dark: Color(hex: 0x0A84FF))
+    /// The chat's "Sending" bubble while Undo is offered: a pending tint of the bubble blue, and the
+    /// text on it (navy in light mode, 9.5:1; white in dark mode, 11:1). See `ChatUndoSendFill`.
+    static let chatUndoSendPendingTint = Color(light: Color(hex: 0xBFD7F7), dark: Color(hex: 0x0C3D70))
+    static let chatUndoSendPendingText = Color(light: Color(hex: 0x0A2A5C), dark: Color.white)
 
     // MARK: - Dictation (as TabMail Voice's `src/core/palette.ts`)
     /// The TabMail icon's gradient, blue → purple: the transcribing spinner's arc.

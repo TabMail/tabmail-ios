@@ -180,6 +180,24 @@ enum ChatViewLayout {
     /// held still this long lets go at rest. Six frames at 60 Hz; a flick lifts within a frame or
     /// two of its last move.
     static let fieldFlickRest: TimeInterval = 0.1
+    /// How close to its end the focused field's overflowing text counts as at its end, where the
+    /// rest of a drag becomes the field's (`ChatFieldPan.Coordinator.isAtEnd`), in points: the
+    /// end is computed from the text's sizes while UIKit stops its scroll on its own value, so a
+    /// text held at its end read a hair short of it (UI run 2026-11-22: `over=-0.0`, under 0.05)
+    /// and the field never got its share. Well under a pixel at any scale.
+    static let fieldTextEndTolerance: CGFloat = 0.1
+    /// How far the finger may come back down from its highest point after the text handed the
+    /// drag on and still be going up (`ChatFieldPan.Coordinator.fingerCameBack`), in points: a
+    /// move down this small takes back at most a point of text (one pixel at 1x, two at 2x,
+    /// three at 3x), so the field keeping its share then shows next to nothing. Past it the
+    /// finger has taken the drag back, and a text read short of its end then ends the hand-off.
+    static let fieldTextReversalSlack: CGFloat = 1
+    /// How far the collapsed field's measured height must move to be a new height
+    /// (`ChatThreadView.pillHeightMoved`), in points: a drag's swell is added inside the field's
+    /// glass and taken back out around it, which floating point does not always cancel exactly
+    /// (UI run 2026-11-22: 158.287109375 read as 158.28710937500003 under a 125 pt swell). Well
+    /// under a pixel at any scale.
+    static let fieldHeightTolerance: CGFloat = 0.1
     /// The pill's spring (the panel opening and closing, the field's swell springing back): its
     /// response in seconds and its damping ratio. A drag's settle lasts this spring's own settling
     /// duration (`ChatThreadView.fieldDragSettle`).

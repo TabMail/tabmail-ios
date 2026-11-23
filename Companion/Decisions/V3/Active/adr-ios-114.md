@@ -470,6 +470,57 @@ same AI result, kept as long as the email itself is shown.
    ids, which restarts the summary observation (decision 9), and its first value asks for the
    newest emails, the joining one first. The summary at Send (`SentEmailSummary`) and the
    Message-ID at the queue write are unchanged.
+   **Undo on the Sending bubble (tabmail-ios #986, 2026-11-21):** a reply sent from a compose the
+   chat opened offers its Undo on its Sending bubble ("Sending · Undo", the seconds left under it)
+   instead of the undo-send toast, which is not shown for it. Who offers a send's Undo
+   (`PendingSendService.UndoOwner`) is decided once, at Send, from what was read as the operation
+   started, never from what is on screen later: the chat view setting read at the Send tap; the
+   screen the compose was opened on (`ComposeView.openedOn`, given by that screen as the compose
+   opens: `ComposeScreen.chat` for the chat view's AI Suggestion, the agent's compose cards it opens
+   and its Forward); and whether the send has an In-Reply-To, by which the chat finds its bubble
+   (`PendingSendService.sendHasBubbleUndo`). Every other send keeps the toast: a new email, and a
+   reply from a compose opened anywhere else (the Drafts list, the inbox, an email screen, the
+   compose an Undo reopens), whose screen shows no bubble; such a reply still shows in its chat as a
+   Sending bubble, without Undo. Both presenters count down to one deadline,
+   `OutboxCancellationPolicy.undoDeadline` (the row's durable `holdUntil` less the claim buffer), with
+   no timer or time of their own, and both Undos take one path (`PendingSendService.undoAndReopen`,
+   then RootView's `UndoReopenPresenter`), so a confirmed Undo returns the message to Drafts and
+   reopens its compose the same way from either. A toast that stops showing a send still in its
+   window hands its Undo to the bubble (`releaseToast`); a send not made in this run of the app (a
+   relaunch) has its Undo on the bubble only. A chat in the Search sheet closes the sheet once an
+   Undo's outcome is known, so RootView alone presents the reopen or the "Couldn't undo" notice.
+   *Amended 2026-11-21:* the first rule read only the setting and the In-Reply-To, so a reply opened
+   from the Drafts list, or sent again from the compose an Undo reopened, put its Undo on a bubble
+   that no screen showed; the screen the compose was opened on now decides as well.
+   *Amended 2026-11-22:* an agent's card can name an email of another thread, whose send shows only
+   in that thread's chat; recorded as `.chat`, it had no visible Undo from the chat that opened it.
+   A chat now records itself only for a compose whose target is one of its own emails, by the same
+   rule that finds a bubble's chat (`ChatUnsentReply.answers`, through
+   `ChatThreadView.composeScreen`), decided as the compose opens; any other keeps the toast.
+   It is judged on the In-Reply-To the send's outbox row will carry (`ThreadUtils.outgoingInReplyTo`,
+   the value `outgoingThreadHeaders` gives the send), not on the target's stored Message-ID: a
+   Message-ID written with spaces inside its brackets matched the chat at open but not the row the
+   chat looks for after Send, which lost the Undo. Every way of sending (Send, Send with the shown
+   suggestion, the Empty Body alert's Send Anyway) reads the setting in one place
+   (`ComposeView.startSend`). RootView's toast is its own presenter (`PendingSendToastPresenter`),
+   so a test draws it over the real chat and counts the Undos on screen.
+   *Amended 2026-11-22 (later):* the origin is the compose's state, set once as it opens
+   (`ComposeView.openedOn`): a chat builds its cover's compose again whenever it redraws, and with
+   a plain input a merge of threads while the compose was open could change the origin it had
+   opened with. The bubble's redraw schedule (`ChatUndoSendSchedule`) makes its instants one at a
+   time, once a second until the fill's window and every frame inside it: a queued row's hold can lie
+   far ahead of a clock set back, and a schedule laid out in memory at 30 frames a second up to it
+   could exhaust the app's memory. The sequence closes with `Date.distantFuture` after the deadline:
+   the mounted bubble's TimelineView was seen not to redraw at its schedule's last date, so ending on
+   the deadline left it offering Undo past it. The agent's cards open through their one presenter on every
+   host (`AgentToolRouter.ComposeRequest.composeView(account:openedOn:onOutcome:)`): the chat gives
+   it its `composeScreen(answering:)` for the card's email, the inbox and the email's screen give
+   none, and a new email records none. Tests:
+   `ChatUndoSendTests`, `ChatUndoSendRoutingTests` (the real Send of each kind of compose; the
+   agent's cards, the AI Suggestion and the toolbar Forward from the mounted chat with the toast
+   over it, one Undo on screen, checked on the hold Send gave the email; a compose built again with
+   another origin), `UndoSendReturnsToDraftsTests` (the return to Drafts from the toast and from
+   the bubble).
    **Superseded by the rebuild (2026-11-09), kept for history:**
    **The Sending bubble follows its queued email (decided 2026-11-07):** a reply sent from
    the chat (the ready AI Reply, or an agent compose) reports its queued email's outbox row
@@ -605,6 +656,32 @@ same AI result, kept as long as the email itself is shown.
    instead of the people chosen, and Retry re-read the field (its current choice, or a sheet send when the sheet was open). Tests:
    `ChatReplyRecoveryTests` (connection lost then resumed, and a server failure then Retry, the
    choice changed in between).
+   **The words of a reply to the people chosen are written for them (2026-11-22, tabmail-ios#1175):**
+   the email's stored AI Suggestion (`MessageHeader.suggestion`) was written for its whole Reply
+   All audience, so a reply narrowed in the field never takes it. With a request, the reply tool
+   writes for the narrowed draft (`start`, ADR-IOS-053 amendment 3). With neither a request nor a
+   body from the agent, its words are written for the people chosen as Thunderbird's `email_reply`
+   writes every reply, for the draft's recipients: the same compose edit, with an empty request
+   (`EmailReplyTool`, `onlyToChosen`). If writing fails, with or without a request, the card opens
+   with the agent's own body when it gave one, else with no words; never the stored suggestion. The card never reads it either: the one presenter
+   (`ComposeRequest.composeView`) sets `ComposeView.onlyToChosen` from the request's field choice,
+   and `ComposeDraftGuards.suggestionToShow` then skips the row's suggestion. Recompute on that card
+   writes for the card's people and From account as the tool writes (`ComposeView.recomputedReplyForChosen`:
+   the compose edit with an empty draft and request, in the card's identity-checked context,
+   `composeEditContextForRequest`) and stores nothing. An edit of its suggestion is never stored as
+   the email's, for the card's whole life: the card's edit decision (`ComposeView.suggestionEdit`,
+   given the card's `onlyToChosen`) names no email to store over, also after the card's recipients
+   go back to everyone. Value equality cannot stand in for that: a Device Sync reply (a body, no
+   text message or change command) can hold the very words written for the people chosen, and the
+   one writer's compare (`MessageHeader.replaceSuggestion(with:ifStill:)`) would then pass. A reply
+   with nobody chosen, from the sheet or another screen, or about another email or another account's
+   copy is unchanged. The compose prompt's "primarily to the last sender"
+   is tabmail-backend#213. Before this, a narrowed reply with no request opened on the stored
+   suggestion ("Hi all", names of people left out), a failed writing fell back to it, and Recompute
+   wrote for everyone and stored the result. Tests: `EmailReplyWordsTests`,
+   `ComposeSuggestionPersistTests.cardShowsTheTappedSuggestionNotTheRowsLaterReply`,
+   `ComposeSuggestionPersistTests.cardEditUsesTheCardsOwnInputs`,
+   `ComposeRecipientWiringTests.recomputeControlRunsTheRecompute`.
 
 12. **Swipes in the chat (amendment 2026-11-05).** Swiping left
    anywhere between the header and the field slides the whole chat to reveal Trash, then Archive at
@@ -1258,15 +1335,25 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
 21. **Drag the field up to open the TabMail chat (amendment 2026-11-20).** Until now the panel
    opened only on an agent answer, a confirmation card or `.openMessageWithChat`. A drag up on the
    collapsed reply field now opens it too, and the field itself swells into the panel: while the
-   finger moves, the field's top follows it (`ChatReplyField.swell`, `ChatFieldDrag.swell`, at most
+   finger moves, the field's top follows it (`ChatReplyField.drag`, `ChatFieldDrag.swell`, at most
    `ChatViewLayout.fieldDragMaxSwell`); on let-go the panel opens with the pill's spring once the
    swell, or a flick's predicted swell, reaches `fieldDragOpenDistance`, and otherwise the field
    settles back. Only a drag more up than sideways counts, so the chat's sideways swipes are
    unchanged. The swell is not the field's room: `pill(on:)` takes it back out of the layout right
-   after the field (`.padding(.top, -fieldDragProgress.swell)`), so the field's glass grows upward
-   while its measured height, the bar, its inset and the chat stay put; the two paddings read the
-   same gesture state and spring back in the same reset transaction, so they cancel through the
-   settle too. While the field is dragged up, its swollen glass grows over the "Replying only to" line or
+   after the field (`ChatFieldDrag.Swell(model: fieldDrag, sign: -1)`; formerly
+   `.padding(.top, -fieldDragProgress.swell)`), so the field's glass grows upward while its
+   measured height, the bar, its inset and the chat stay put; the two paddings read the same drag
+   state and spring back in the same reset transaction, so they cancel through the settle too.
+   They cancel only up to floating point (amended 2026-11-22): at some swells the measured height
+   reads an ulp off (a UI run: 158.287109375 as 158.28710937500003 under a 125 pt swell), which set
+   the bar's height, ran the chat's body and built the reply field again under a held drag; the
+   bar takes a measured height only once it moved by `ChatViewLayout.fieldHeightTolerance` (0.1 pt,
+   `ChatThreadView.pillHeightMoved`). **The drag state is read only in modifiers (amended 2026-11-22):** it lives in an observable
+   model (`ChatFieldDrag.Model`, held by `ChatThreadView.fieldDrag`) that only the two `Swell`
+   paddings, the drag's start and end watch (`ChatFieldDrag.Watch`) and the debug marker read, so a
+   moving finger redraws those modifiers and never rebuilds the chat's body or the reply field
+   (a UI run showed the field's text scrolling to its caret after the let-go, on the first layout
+   after builds made while the finger moved). While the field is dragged up, its swollen glass grows over the "Replying only to" line or
    the no-reply notice above it, and the bar, the chat and its inset stay still, as designed. *Superseded 2026-11-21 (the compensation below needed three fixes and was deleted
    for the padding above):* "from the drag's start until its swell has settled
    (`ChatThreadView.fieldDragSettle`, the pill spring's own `settlingDuration`, so the two cannot
@@ -1275,8 +1362,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (`fieldDragProgress.isDragging`): the drag's start queues the bar's geometry action and the
    `onChange` that sets the settle token together, and SwiftUI runs deferred actions in an
    unspecified order." The drag is a UIKit pan (`ChatFieldPan`, amended 2026-11-21), the
-   swipes' pan bridge (`ChatHorizontalPan`) turned vertical: it builds its pan with
-   `ChatHorizontalPan.makePan` and takes its events through the same delivery
+   swipes' pan bridge (`ChatHorizontalPan`) turned vertical: it builds its pan as the swipes do
+   (`ChatFieldPan.makePan`, after `ChatHorizontalPan.makePan`) and takes its events through the same delivery
    (`ChatHorizontalPan.deliver(_:moved:ended:)`: one two-axis `Sample` while it moves, then its last
    sample and one outcome, finished or not), while its own rules (when it begins, what it waits
    for) stay in its delegate and what it does with a sample stays in `ChatThreadView`. It starts only on a first movement more
@@ -1300,7 +1387,23 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    second origin (where the touch found the text) remains, so an axis cannot keep counting from an
    earlier crossing after a reversal. Sideways
    travel made while the text had the drag is not the field's, and a drag that reverses until the
-   text scrolls again drops the hand-off and takes a new one when the text is back at its end; the
+   text scrolls again drops the hand-off and takes a new one when the text is back at its end. Only
+   the finger takes the drag back (amended 2026-11-22): the hand-off drops when the text reads short of
+   its end once the finger has come down from its highest point since the hand-off by more than
+   `ChatViewLayout.fieldTextReversalSlack` (`ChatFieldPan.Coordinator.fingerCameBack`; 1 pt of text
+   the field keeps, one to three pixels by screen scale). The rule takes the text's own scroll to
+   follow the finger point for point while the finger drags it, so a finger that came down is taken to
+   have brought the text back whenever the text shows it. It is read from the finger's
+   distance, not from a sample's direction nor from how far short the text reads, and from the
+   farthest, not from where the finger is now, because the text's scroll and the pan run side by side
+   and UIKit does not say which hears a move first: the text can show a downward move one sample late,
+   when the finger is already going up again, or only at the let-go, and can show its end first in the
+   sample the finger turned down in, so that sample's move down counts too, from the sample before.
+   A text short of its end with the finger not come down moved without it, and an earned hand-off
+   survives that move, so the rest of the drag stays the field's; once the finger has come down, a text
+   short of its end drops the hand-off whatever moved it. Observed in a UI run, not documented by UIKit: on a layout
+   after the field was built again under a held drag past the end, UIKit scrolled the field's text to
+   its caret at its start, and the let-go read no share and the panel stayed shut; the
    field's segment keeps the more-up-than-sideways rule, and whether the pan begins at all is
    still decided on the drag's first movement. UIKit cannot
    start a recognizer that failed earlier in the same touch, so waiting for the scroll could never
@@ -1315,8 +1418,14 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    waits for its scroll (text overflowing the six lines) and its long presses (caret, loupe,
    selection), and its taps wait for the pan." Its state (`ChatFieldDrag.Progress`) is
    reset with the pill's spring however the drag ends (`fieldDragEnded`), so a cancelled drag (the
-   panel opening on an agent answer mid-drag, which turns the pan off, or a system interruption)
-   springs back too. **The release policy** (`ChatFieldDrag.opens(letGo:)`, amended 2026-11-21):
+   panel opening on an agent answer mid-drag, or a system interruption) springs back too. **The
+   panel opening cuts a held drag off itself (amended 2026-11-22):** UIKit cancels an active pan once
+   it is actually turned off, but the configuration update turning the pan off (`isEnabled`) did not
+   end a drag already held (a UI run showed it running on to its let-go with the swell held), so the chat's `onChange(of: chatExpanded)` calls `ChatFieldPan.Cut`, which sets
+   the held pan to cancelled (`Recognizer.cut`; a pan with no drag held is left as it is). The text
+   counts as at its end within `ChatViewLayout.fieldTextEndTolerance` (0.1 pt) of the end its sizes
+   give (`ChatFieldPan.Coordinator.isAtEnd`, amended 2026-11-22): UIKit holds the text on its own
+   value, which read a hair short of it, and the field then never got its share. **The release policy** (`ChatFieldDrag.opens(letGo:)`, amended 2026-11-21):
    only a finished drag can open the panel. It opens when its swell (its upward travel, counted
    only while it goes more up than sideways) reaches `fieldDragOpenDistance` (60 pt), or when its
    predicted end does: the travel plus `ChatViewLayout.fieldFlickCarry` (0.25 s) of travel at the
@@ -1328,7 +1437,14 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    UIKit's pan and SwiftUI's drag measure in their own ways. A drag 30 pt up
    let go at 90 pt/s predicts 52.5 pt and settles back; at 120 pt/s it predicts 60 pt and opens. The
    pan stays on while the field has focus (mock v15 M2: "Type a question ... Drag up: your words ride
-   along"), so a short draft in the focused field opens the panel the same way and keeps its words;
+   along"), so a short draft in the focused field opens the panel the same way and keeps its words,
+   and its keyboard (amended 2026-11-23, mock v15 H2: "Both open above the keyboard"): the reply
+   field and the panel's input are two text fields, each with its own focus value
+   (`DynamicIslandChat.InputFocus`), and the panel's opening (`onChange(of: isExpanded)`) moves the
+   focus a typed-in field holds to the panel's input. SwiftUI documents no order between that action
+   and the field's removal, so the swipe UI tests' drags from the typed-in field check on screen that
+   the panel's input has the keyboard. One shared value had let the field's focus go with it as it
+   left, and the panel opened with no keyboard (UI run 2026-11-23);
    only the open panel and the tutorial turn it off. *Superseded 2026-11-21 (it carried a flick about
    twice as far as SwiftUI's drag had, so slower flicks opened the panel):* "only a finished drag can
    open the panel, from its swell or a flick's predicted swell (`ChatFieldDrag.predictedEnd`, a
@@ -1367,7 +1483,15 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    overflowing draft: the typed word replaces the double-tapped one),
    `ChatFieldDragTests.fieldShareOfATextDrag` and `panSharesWithTheTextUnderTheTouch` (the field's
    share, from a touch-down offset that is not zero; `handOffClearsOnAReversal` and
-   `diagonalThenStraightUp` the hand-off's state, both axes; `handOffInsideACrossingSample` and
+   `diagonalThenStraightUp` the hand-off's state, both axes; `handOffSurvivesATextScrollTheFingerDidNotMake`
+   the hand-off kept through a scroll of the text the finger did not make, a flick let go there, and
+   dropped by the finger coming back down, also after such a move; `handOffDropsWhenTheTextShowsTheFingersMoveLate` the
+   finger's reversal read when the text shows it a sample late, at a second crossing or at a rested
+   let-go; `handOffFoundOnAMoveDownCountsThatMove` a reversal in the very sample the text first shows
+   its end; `reversalHistoryEndsWithItsHandOff` each hand-off reading only its own reversal, after a
+   second crossing and in the next drag; `reversalSlack` the rule's own boundary and `reversalSlackThroughThePan` the same boundary through the
+   pan's share, speed included; `slowReversalAddsUp` a descent in half-point samples adding up past it; `pillHeightIgnoresTheSwellsRemainder` the bar's height through the swell's
+   floating-point remainder; `handOffInsideACrossingSample` and
    `handOffInsideACrossingSampleAfterAReversal` the hand-off inside a sample that crosses the end, where
    the text reached it; `upwardShareCountsFromTheSecondHandOff` the upward share after a reversal,
    `handOffWithNoUpwardMove` a crossing with no upward move, `noShareWhileTheTextHasTheDrag` no
@@ -1380,7 +1504,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    there; `testLongPressThenDragUpInTheFocusedFieldStaysTheTexts`: a held press then a drag up
    stays the text's; `ChatFieldDragTests.textViewOrdering`: the long press never waits for the
    field's drag), `testDragUpOnAShortFocusedDraftOpensThePanelWithIt`
-   (signed in through the fixture's `--chat-swipe-signed-in`: the panel's editor holds the draft),
+   (signed in through the fixture's `--chat-swipe-signed-in`: the panel's editor holds the draft
+   and keeps its focus, above the keyboard where one shows, and Close gives the field back without
+   it; `testDragUpOnTheUnfocusedSignedInFieldOpensThePanelWithTheKeyboardDown`: with no keyboard
+   the panel opens with none; `ChatReplyFieldTests.fieldDragWiring` pins the two focus values and
+   the hand-over, in code, not comments),
    `testDragCutOffByThePanelOpeningSettlesAndTheNextDragWorks` (the fixture's
    `--chat-swipe-open-panel-under-drag` opens the panel the moment the debug marker sees the held
    drag swollen past the open distance, which turns the pan off: the marker records the opening's
@@ -1419,7 +1547,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (`ChatThreadView.tipRoom`, amended 2026-11-21): at a large text size, in landscape (supported on
    iPhone) or above a tall draft the card could run off the top of the screen, so it waits for room
    instead, not shown and still eligible for its one showing. `ViewThatFits` measures the card
-   without showing it. Tests:
+   without showing it. VoiceOver can still reach the card while it waits (tabmail-ios#1255, a
+   VoiceOver-only issue for later; hiding the choice while the stand-in shows did not take and was
+   removed 2026-11-22). Tests:
    `ChatReplyFieldTests.fieldDragTip`, `ChatFieldDragTests.firstDragWithTheTipOpens`,
    `ChatSwipeUITests.testFieldDragTipShowsAndLeavesTheFieldItsTouches` (launched with
    `--chat-field-drag-tip`, which resets the TipKit datastore and forces the tip on),

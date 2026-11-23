@@ -19,8 +19,9 @@ import UIKit
 ///
 /// Each case opens the chat for real in a window, picks who gets the reply through the Reply to
 /// sheet as the user does, holds the agent's real reply request behind a compose already on screen,
-/// releases it, and reads the recipients of the compose card the chat opens. A request from the
-/// reply field runs the tool with the invocation the field's send builds (`ChatFieldReply`, its
+/// releases it, and reads the recipients of the compose card the chat opens. Every request is asked
+/// in this chat (`ComposeOrigin`, ADR-IOS-053 Phase 2), so this chat's pill takes it; a request from
+/// the reply field runs the tool with the invocation the field's send builds (`ChatFieldReply`, its
 /// building pinned in `ChatReplyFieldTests.recipientsWiring`).
 @Suite("Who gets the agent's reply in the chat", .serialized, .processGlobalState)
 @MainActor
@@ -65,6 +66,8 @@ struct ChatReplyComposeOriginTests {
         let email: MessageHeader
         let other: MessageHeader
         let translator: MockChatIdTranslator
+        /// This chat, as a turn sent in it names itself: where its compose cards open.
+        let asked: ComposeOrigin
 
         var view: UIView { controller.view }
 
@@ -83,10 +86,8 @@ struct ChatReplyComposeOriginTests {
         await queue.clearForTesting()
         let router = AgentToolRouter.shared
         router.resetComposeQueueForTesting()
-        router.pendingCompose = nil
         defer {
             router.resetComposeQueueForTesting()
-            router.pendingCompose = nil
             saved.restore()
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
@@ -106,6 +107,10 @@ struct ChatReplyComposeOriginTests {
         let translator = MockChatIdTranslator()
         await translator.seed(email.id, as: 1)
         await translator.seed(other.id, as: 2)
+        // The chat's pill is keyed by its email as stored (`ChatThreadKey`).
+        let storedEmail = try await pool.read { db in try MessageHeader.fetchOne(db, key: email.id) }
+        let stored = try #require(storedEmail, "control: the chat's email is stored")
+        let asked = ComposeOrigin(sessionKey: ChatThreadKey.key(for: stored), screen: .chat)
 
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
@@ -127,7 +132,7 @@ struct ChatReplyComposeOriginTests {
             await queue.clearForTesting()
             await queue.setDispatchSuppressedForTesting(false)
         }
-        let chat = Chat(pool: pool, controller: controller, email: email, other: other, translator: translator)
+        let chat = Chat(pool: pool, controller: controller, email: email, other: other, translator: translator, asked: asked)
         try await Self.waitUntil { Self.namesButton(in: chat.view) != nil }
         #expect(Self.namesButton(in: chat.view) != nil, "control: the chat shows its header: \(HostedAccessibility.labels(in: chat.view).prefix(12))")
         do {
@@ -220,9 +225,15 @@ struct ChatReplyComposeOriginTests {
         }
     }
 
-    /// The request as the reply field sends it about `email`: who was chosen in Reply to when sent.
-    private static func field(_ email: MessageHeader, onlyTo: [String]?) -> ToolInvocation {
-        ToolInvocation(fieldReply: ChatFieldReply(email: email, onlyTo: onlyTo))
+    /// The request as the reply field sends it about `email` in `chat`: who was chosen in Reply to
+    /// when sent.
+    private static func field(_ email: MessageHeader, onlyTo: [String]?, in chat: Chat) -> ToolInvocation {
+        ToolInvocation(fieldReply: ChatFieldReply(email: email, onlyTo: onlyTo), composeOrigin: chat.asked)
+    }
+
+    /// A request asked in `chat`'s open sheet: no field choice.
+    private static func sheet(in chat: Chat) -> ToolInvocation {
+        ToolInvocation(composeOrigin: chat.asked)
     }
 
     // MARK: - A request from elsewhere keeps its recipients
@@ -237,8 +248,9 @@ struct ChatReplyComposeOriginTests {
                 NotificationCenter.default.post(name: .openMessageWithChat, object: nil, userInfo: ["messageId": chat.email.id])
                 try await Task.sleep(for: .milliseconds(500))
                 let tool = chat.tool
+                let invocation = Self.sheet(in: chat)
                 let card = try await Self.heldReply(in: chat, run: {
-                    try await tool.execute(arguments: ["unique_id": .int(1), "body": .string("Friday works")])
+                    try await tool.execute(arguments: ["unique_id": .int(1), "body": .string("Friday works")], invocation: invocation)
                 }, whileHeld: {
                     NotificationCenter.default.post(name: .emailPillTapped, object: nil)
                     try await Task.sleep(for: .milliseconds(500))
@@ -250,15 +262,16 @@ struct ChatReplyComposeOriginTests {
         }
     }
 
-    @Test("A reply to another chat's email that arrives in this chat keeps its recipients")
+    @Test("A reply asked in this chat to another chat's email keeps that email's recipients")
     func requestFromAnotherChat() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
         try await HostedAccessibility.withAutomation {
             try await withChat { chat in
                 try await Self.replyOnly(untick: ["alex@example.com", "sam@example.com"], in: chat)
                 let tool = chat.tool
+                let invocation = Self.sheet(in: chat)
                 let card = try await Self.heldReply(in: chat, run: {
-                    try await tool.execute(arguments: ["unique_id": .int(2), "body": .string("Lunch works")])
+                    try await tool.execute(arguments: ["unique_id": .int(2), "body": .string("Lunch works")], invocation: invocation)
                 })
                 #expect(Self.addresses(card["to"]) == ["carol@example.com"],
                         "the other chat's reply goes to its own people, never this chat's choice: \(card)")
@@ -274,7 +287,7 @@ struct ChatReplyComposeOriginTests {
             try await withChat { chat in
                 try await Self.replyOnly(untick: ["alex@example.com", "sam@example.com"], in: chat)
                 let tool = chat.tool
-                let invocation = Self.field(chat.email, onlyTo: ["david@example.com"])
+                let invocation = Self.field(chat.email, onlyTo: ["david@example.com"], in: chat)
                 let card = try await Self.heldReply(in: chat, run: {
                     try await tool.execute(arguments: ["unique_id": .int(2), "body": .string("Lunch works")], invocation: invocation)
                 })
@@ -294,7 +307,7 @@ struct ChatReplyComposeOriginTests {
                 // Sent replying only to David; the chat is back at everyone when the card arrives.
                 #expect(Self.replyingOnlyTo(in: chat.view) == nil, "control: the chat replies to everyone")
                 let tool = chat.tool
-                let invocation = Self.field(chat.email, onlyTo: ["david@example.com"])
+                let invocation = Self.field(chat.email, onlyTo: ["david@example.com"], in: chat)
                 let card = try await Self.heldReply(in: chat, run: {
                     try await tool.execute(arguments: ["unique_id": .int(1), "body": .string("Friday works")], invocation: invocation)
                 })
@@ -310,7 +323,7 @@ struct ChatReplyComposeOriginTests {
         try await HostedAccessibility.withAutomation {
             try await withChat { chat in
                 let tool = chat.tool
-                let invocation = Self.field(chat.email, onlyTo: nil)
+                let invocation = Self.field(chat.email, onlyTo: nil, in: chat)
                 let card = try await Self.heldReply(in: chat, run: {
                     try await tool.execute(arguments: ["unique_id": .int(1), "body": .string("Friday works")], invocation: invocation)
                 }, whileHeld: {

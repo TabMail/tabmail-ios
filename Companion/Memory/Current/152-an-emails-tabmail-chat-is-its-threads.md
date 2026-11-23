@@ -31,6 +31,9 @@
   `chatHistory`; rows whose email was not on the device keep their `msg:` key; thread eviction counts
   and clears those leftovers as chats with no Inbox email, as before. Memory index rows keep their old `sessionId` text; their
   turn ids are unchanged.
+- The field's unsent words (2026-11-18, #979, ADR-IOS-117) are kept under the SAME key
+  (`ChatFieldWords.key(for:)`, table `chatFieldWords`), never a second scheme; they live while an
+  email of the thread is on the device (`runPurgeOrphanedChatFieldWords`) and go with the account.
 - Trap, fenced (2026-11-16): a chat is keyed by `computedThreadId`, so rewriting it on an existing
   row strands that thread's chat. The only such write is the fragment merge
   (`ThreadUtils.runFragmentMergeOnce`), run only by `v54`, before `v107` made thread keys, so nothing

@@ -219,6 +219,10 @@ struct InboxView: View {
     /// rationale + on-device evidence. Bound through from `MailNavigationView`
     /// via `MailContentColumn` → `InboxColumnResolver`.
     @Binding var pushedMessageId: String?
+    /// An email this inbox opens shows beside it, not over it: the split view is expanded (regular
+    /// width, such as a Plus or Pro Max iPhone in landscape). `MailNavigationView` sets it from
+    /// its own size class, read outside the split view's columns.
+    let emailsOpenBeside: Bool
     @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.hasTabMailSession) private var hasTabMailSession
     /// Hides the trial-ended row's Feedback button once an answer was sent.
@@ -253,13 +257,31 @@ struct InboxView: View {
             || labelMenuMessage != nil
             || showLabelFilterPicker
     }
+    /// The inbox is on screen as its navigation says: no email is pushed over it. Its pill takes
+    /// the inbox chat's compose cards only then (ADR-IOS-053 Phase 2). Read from the pushed-email
+    /// bindings, not the page's appearance callbacks, which fire a disappear right after the page
+    /// appears in the collapsed split view and none when an email is pushed (ADR-IOS-054). In the
+    /// expanded split view an opened email shows beside the inbox, so the inbox stays on screen.
+    private var composeHostShown: Bool {
+        emailsOpenBeside || (selectedMessageId == nil && pushedMessageId == nil)
+    }
+    /// One of the inbox's own sheets, covers or alerts is up: its pill takes no compose card until
+    /// it closes, so a card never opens under it.
+    private var isAnyPresentation: Bool {
+        showSearch || labelMenuMessage != nil || showLabelFilterPicker
+            || moveMessageId != nil || moveThreadGroup != nil
+            || replyMessage != nil || draftOpen != nil || agentCompose != nil
+            || newEmailCover != nil || viewModel.showCompose || showUndoAlert
+    }
 
-    init(title: String, folders: [Folder], selection: MailboxSelection, selectedMessageId: Binding<String?>, pushedMessageId: Binding<String?>) {
+    init(title: String, folders: [Folder], selection: MailboxSelection, selectedMessageId: Binding<String?>, pushedMessageId: Binding<String?>,
+         emailsOpenBeside: Bool = false) {
         self.title = title
         self.folders = folders
         self.selection = selection
         self._selectedMessageId = selectedMessageId
         self._pushedMessageId = pushedMessageId
+        self.emailsOpenBeside = emailsOpenBeside
         // StateObject(wrappedValue:) is @autoclosure @escaping — the holder
         // (and its inner InboxViewModel) is constructed EXACTLY ONCE per
         // InboxView lifetime, even if the parent re-renders many times.
@@ -658,7 +680,8 @@ struct InboxView: View {
                 if !DemoModeStore.shared.hidesAIContent {
                     DynamicIslandChat(isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
                         showAgentToast(text, sessionKey: "inbox")
-                    })
+                    }, onAgentCompose: { agentCompose = $0 },
+                    composeHostCovered: isAnyPresentation, composeHostShown: composeHostShown)
                 }
 
                 if !chatExpanded && sideButtonsReady {
@@ -895,14 +918,9 @@ struct InboxView: View {
         .fullScreenCover(item: $draftOpen) { open in
             DraftComposePresenter(source: open.source)
         }
+        // The inbox chat's own compose cards, taken by its pill (ADR-IOS-053 Phase 2).
         .fullScreenCover(item: $agentCompose) { req in
             req.composeView(account: viewModel.primaryAccount, onOutcome: req.onOutcome)
-        }
-        .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
-            if newId != nil {
-                agentCompose = AgentToolRouter.shared.pendingCompose
-                AgentToolRouter.shared.pendingCompose = nil
-            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .agentSessionDidFinish).receive(on: DispatchQueue.main)) { notification in
             guard let sessionKey = notification.userInfo?["sessionKey"] as? String else { return }
@@ -910,7 +928,8 @@ struct InboxView: View {
                 showAgentToast(response, sessionKey: sessionKey)
             }
         }
-        .sheet(isPresented: $showSearch) {
+        // Search can open a chat, and so a bubble's Undo: its outcome is presented at the top level.
+        .chatModalSheet(isPresented: $showSearch) {
             SearchView(folders: folders, scopeTitle: title)
         }
         .sheet(item: $labelMenuMessage) { message in

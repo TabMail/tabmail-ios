@@ -32,7 +32,7 @@ extension ComposeOutcome {
 /// Shared reference-type state attached to each `AgentToolRouter.ComposeRequest`.
 /// Gives the helper's outcome closure a stable identity to guard against
 /// double-resume (ComposeView's `send()` + `.onDisappear` both firing) and
-/// also lets `dispatchNextIfIdle()` skip requests whose Task was cancelled
+/// also lets `takeCompose(for:)` drop requests whose Task was cancelled
 /// before the window ever appeared.
 ///
 /// Thread-safe: `tryResolve(_:)` is invoked from MainActor ComposeView callbacks
@@ -119,17 +119,20 @@ final class RecentlyCompletedComposeCache {
 
 /// Router for FSM-style agent tools that trigger UI actions (compose/reply/forward).
 /// Matching TB's FSM pattern: tool fires → UI opens → tool returns status message.
-/// On iOS, the FSM is simpler: we set `pendingCompose` and the hosting view
-/// (InboxView / MessageDetailView) observes it and presents ComposeView.
+/// On iOS, a compose tool queues a `ComposeRequest` stamped with the chat that asked
+/// (`ComposeOrigin`); that chat's pill takes it (`takeCompose(for:)`) and its screen
+/// presents ComposeView (ADR-IOS-053 Phase 2).
 @MainActor @Observable
 final class AgentToolRouter {
     static let shared = AgentToolRouter()
 
-    /// Currently-active compose request awaiting capture by a hosting view
-    /// (`InboxView` / `MessageDetailView`). Written only by `dispatchNextIfIdle()`;
-    /// nilled by the consuming view after capture. External callers MUST NOT write
-    /// this directly — use `enqueueCompose(_:)` to respect FIFO ordering. See ADR-IOS-030.
-    var pendingCompose: ComposeRequest?
+    /// Bumped whenever a queued compose request may have become takeable: a request
+    /// was queued, the last compose window closed, or a taken card was refused because
+    /// its bound From account is missing (`canOpen`). The only observable compose
+    /// state: every host pill watches it and asks `takeCompose(for:)` for its own
+    /// requests, so no view ever takes another screen's request (ADR-IOS-053 Phase 2,
+    /// replacing the global `pendingCompose` slot that the first observer took).
+    private(set) var composeOffer = 0
 
     /// Short-TTL cache of recently-successful sends keyed by the replied/forwarded
     /// message. See `RecentlyCompletedComposeCache` for rationale.
@@ -138,11 +141,12 @@ final class AgentToolRouter {
 
     // MARK: - Compose FIFO Queue (ADR-IOS-030)
 
-    /// FIFO queue of agent compose requests waiting for the compose UI to be free.
-    /// In-memory only; lost on app kill (acceptable — agent compose tool calls are
-    /// transient session intent, not durable user actions). See ADR-IOS-030.
+    /// FIFO queue of agent compose requests waiting for the compose UI to be free
+    /// and for the screen that asked to take them. In-memory only; lost on app kill
+    /// (acceptable — agent compose tool calls are transient session intent, not
+    /// durable user actions). See ADR-IOS-030.
     /// Marked `@ObservationIgnored` because no view should observe queue contents —
-    /// only `pendingCompose` is the public observable handoff slot.
+    /// only `composeOffer` is observable.
     @ObservationIgnored private var composeQueue: [ComposeRequest] = []
 
     /// Number of currently-presented `ComposeView` instances, tracked via the
@@ -151,23 +155,118 @@ final class AgentToolRouter {
     /// increment the count, so a manual compose blocks queued agent compose requests.
     @ObservationIgnored private var presentationCount: Int = 0
 
-    /// True between the moment a request is dispatched (`pendingCompose` set) and the
+    /// True between the moment a host takes a request (`takeCompose(for:)`) and the
     /// moment its `ComposeView` actually appears on screen (`composePresentationDidBegin`).
-    /// Closes a race window: the view nils `pendingCompose` synchronously in its `onChange`
-    /// handler before the cover finishes presenting, leaving a brief gap where both
-    /// `pendingCompose == nil` and `presentationCount == 0` are true even though a request
-    /// is mid-dispatch. Without this flag, a second `enqueueCompose` arriving in that
-    /// window would overwrite the in-flight request and lose it.
+    /// Closes a race window: the host's cover is still presenting, so
+    /// `presentationCount == 0` even though a request is mid-dispatch. Without this
+    /// flag, another host could take a second request in that window and present a
+    /// second compose window over the first.
     @ObservationIgnored private var awaitingAppear: Bool = false
 
-    /// Enqueue a compose request from an agent tool. Fire-and-forget — the tool returns
-    /// immediately and the queue dispatches asynchronously as compose windows free up.
-    /// If no compose UI is currently presented and no prior request is mid-dispatch,
-    /// the request is dispatched immediately. Otherwise it waits its turn FIFO.
-    /// See ADR-IOS-030.
+    /// Whether an account's removal has committed: `AccountManager`'s runtime fence
+    /// (`isRuntimeRemoved`), set synchronously by `disconnectAccount` before it first suspends.
+    /// A request that depends on such an account ends instead of queueing or being taken.
+    @ObservationIgnored private let isAccountRemoved: @Sendable (String) -> Bool
+
+    /// What a compose tool tells the model when an account its request depends on was removed
+    /// while the request waited for its screen.
+    static let removedAccountReason = "the email account was removed before the compose window opened"
+
+    /// What a compose tool tells the model when the account its new email was bound to send from
+    /// is not among the app's accounts as its screen takes the card.
+    static let fromAccountMissingReason = "the email account to send from was not found when the compose window opened"
+
+    init(isAccountRemoved: @escaping @Sendable (String) -> Bool = { AccountManager.shared.isRuntimeRemoved($0) }) {
+        self.isAccountRemoved = isAccountRemoved
+    }
+
+    /// The screen a host pill stands for, asking for its compose requests: its screen
+    /// kind and the keys of the chat it shows (own key first, then the thread's).
+    struct ComposeHost: Equatable {
+        let screen: ComposeOrigin.Screen
+        let sessionKeys: [String]
+
+        /// Whether `origin` asked this host: the same kind of screen showing the chat that asked.
+        func asked(_ origin: ComposeOrigin) -> Bool {
+            origin.screen == screen && sessionKeys.contains(origin.sessionKey)
+        }
+    }
+
+    /// Enqueue a compose request from an agent tool. The request waits in FIFO order
+    /// until no compose UI is presented and the screen that asked takes it
+    /// (`takeCompose(for:)`); the offer tells every host pill to look. See ADR-IOS-030.
     func enqueueCompose(_ request: ComposeRequest) {
+        if dependsOnRemovedAccount(request) {
+            request.onOutcome(.failed(Self.removedAccountReason))
+            return
+        }
         composeQueue.append(request)
-        dispatchNextIfIdle()
+        composeOffer += 1
+    }
+
+    /// Ends every queued request that depends on an account whose removal has committed
+    /// (`ComposeRequest.accountIds`, read against the fence): its card would open with a gone
+    /// email or a From address it can no longer send from, or wait under a chat key the screens
+    /// no longer read. Each request's tool returns
+    /// `.failed(removedAccountReason)` and nothing opens. Scheduled by `disconnectAccount` right
+    /// after it sets the fence, which refuses every later request (`enqueueCompose`) and every
+    /// take (`takeCompose(for:)`) in between.
+    ///
+    /// Each request is read against the fence once: another removal can set the fence while this
+    /// runs (the fence is set on the AccountManager actor), and a request it catches is removed
+    /// only together with its outcome, here or in the next drain, never without one.
+    func endComposeRequestsOfRemovedAccounts() {
+        var ended: [ComposeRequest] = []
+        var kept: [ComposeRequest] = []
+        for request in composeQueue {
+            if dependsOnRemovedAccount(request) { ended.append(request) } else { kept.append(request) }
+        }
+        guard !ended.isEmpty else { return }
+        composeQueue = kept
+        for request in ended {
+            request.onOutcome(.failed(Self.removedAccountReason))
+        }
+    }
+
+    private func dependsOnRemovedAccount(_ request: ComposeRequest) -> Bool {
+        request.accountIds.contains(where: isAccountRemoved)
+    }
+
+    /// The oldest queued request `host` asked for, removed from the queue, or nil.
+    /// Nil while a compose UI is presented (`presentationCount > 0`) or a taken
+    /// request's window has not appeared yet (`awaitingAppear`): one compose window at
+    /// a time (ADR-IOS-030). Requests other screens asked for are left in place and
+    /// never block this one; a request whose screen is not showing waits until it is,
+    /// or until its tool is cancelled.
+    ///
+    /// First drops every queued request whose Task was cancelled before it was taken
+    /// (`outcomeState.resolved`, flipped by `enqueueComposeAndAwaitOutcome`'s
+    /// `onCancel` handler): presenting a compose window for a tool that already
+    /// returned would leave the user confused and the follow-on `onOutcome` calls
+    /// dangling. Then ends every request whose account was removed
+    /// (`endComposeRequestsOfRemovedAccounts`), so none is handed out between the fence and
+    /// its scheduled drain.
+    func takeCompose(for host: ComposeHost) -> ComposeRequest? {
+        guard !awaitingAppear, presentationCount == 0 else { return nil }
+        composeQueue.removeAll { $0.outcomeState.resolved }
+        endComposeRequestsOfRemovedAccounts()
+        guard let index = composeQueue.firstIndex(where: { host.asked($0.origin) }) else { return nil }
+        awaitingAppear = true
+        return composeQueue.remove(at: index)
+    }
+
+    /// Whether a request its screen just took can open: a new email bound to an account
+    /// (`ComposeRequest.fromAccountId`) opens only when that account is in `accounts`, the
+    /// app's accounts as the screen takes the card, so the card never opens from another account.
+    /// When it is not, the request ends with `.failed(fromAccountMissingReason)`, which the model
+    /// reports, the take's hold is released and the queue is offered again; nothing opens.
+    func canOpen(_ request: ComposeRequest, accounts: [Account]) -> Bool {
+        guard let accountId = request.fromAccountId,
+              !accounts.contains(where: { $0.id == accountId }) else { return true }
+        awaitingAppear = false
+        composeOffer += 1
+        request.onOutcome(.failed(Self.fromAccountMissingReason))
+        return false
     }
 
     /// Called by `ComposeView.onAppear`. Marks the compose UI as busy so the queue holds
@@ -178,35 +277,14 @@ final class AgentToolRouter {
         awaitingAppear = false
     }
 
-    /// Called by `ComposeView.onDisappear`. When all compose UI is gone, dispatches
-    /// the next queued request (if any) so it presents immediately after the previous
-    /// window's dismissal animation completes.
+    /// Called by `ComposeView.onDisappear`. When all compose UI is gone, offers the
+    /// queue again so the next request presents right after the previous window's
+    /// dismissal, on the screen that asked for it.
     func composePresentationDidEnd() {
         presentationCount = max(0, presentationCount - 1)
         if presentationCount == 0 {
-            dispatchNextIfIdle()
+            composeOffer += 1
         }
-    }
-
-    /// Pop the next queued compose request and publish it via `pendingCompose`,
-    /// triggering the existing onChange/fullScreenCover machinery in InboxView/MessageDetailView.
-    /// No-ops when a compose UI is currently presented (`presentationCount > 0`),
-    /// a previous dispatch is mid-flight (`awaitingAppear == true`), the slot is occupied
-    /// (`pendingCompose != nil`), or the queue is empty.
-    ///
-    /// Also skips any leading queue entries whose Task was cancelled before
-    /// dispatch (their `outcomeState.resolved` was flipped by
-    /// `enqueueComposeAndAwaitOutcome`'s `onCancel` handler). Presenting a
-    /// compose window for a tool that already returned would leave the user
-    /// confused and the follow-on `onOutcome` calls dangling.
-    private func dispatchNextIfIdle() {
-        guard !awaitingAppear, pendingCompose == nil, presentationCount == 0 else { return }
-        while composeQueue.first?.outcomeState.resolved == true {
-            composeQueue.removeFirst()
-        }
-        guard !composeQueue.isEmpty else { return }
-        awaitingAppear = true
-        pendingCompose = composeQueue.removeFirst()
     }
 
     /// Whether a compose UI is presented anywhere: a `ComposeView`, a `DraftComposePresenter`, or
@@ -219,12 +297,12 @@ final class AgentToolRouter {
     /// Test-only: current presentation count (number of `ComposeView`s on screen).
     var composePresentationCount: Int { presentationCount }
 
-    /// Test-only: whether a request is mid-dispatch (set, but cover not yet appeared).
+    /// Test-only: whether a request is mid-dispatch (taken, but cover not yet appeared).
     var composeAwaitingAppear: Bool { awaitingAppear }
 
     /// Test-only: is the head-of-queue request already resolved (cancelled before
-    /// dispatch)? Returns `nil` when the queue is empty. Exposes what tests need
-    /// to verify the stale-skip behavior in `dispatchNextIfIdle` without leaking
+    /// it was taken)? Returns `nil` when the queue is empty. Exposes what tests need
+    /// to verify the stale-drop behavior in `takeCompose(for:)` without leaking
     /// the full `ComposeRequest` type across the test boundary.
     var firstQueuedRequestResolvedForTesting: Bool? {
         composeQueue.first?.outcomeState.resolved
@@ -233,8 +311,7 @@ final class AgentToolRouter {
     /// Test-only: the request at the head of the queue, as the compose that takes it will read it.
     var firstQueuedRequestForTesting: ComposeRequest? { composeQueue.first }
 
-    /// Test-only: reset queue + counters between tests. Does NOT touch `pendingCompose`
-    /// so existing tests are unaffected.
+    /// Test-only: reset queue + counters between tests.
     func resetComposeQueueForTesting() {
         composeQueue.removeAll()
         presentationCount = 0
@@ -259,6 +336,10 @@ final class AgentToolRouter {
         let bcc: [String]
         let subject: String?
         let body: String?
+        /// The chat that asked (ADR-IOS-053 Phase 2): only a pill of that screen kind
+        /// showing that chat takes the request (`takeCompose(for:)`), so the card opens
+        /// on the screen that asked, built by that screen.
+        let origin: ComposeOrigin
         /// A `.reply` opened on the stored AI Suggestion: the whole stored value, so an edit in the
         /// card compares against exactly what is stored. Nil when the card opens on `body`.
         let suggestion: ReplyResult?
@@ -270,6 +351,11 @@ final class AgentToolRouter {
         /// user chose in Reply to when the request was sent (ADR-IOS-114 decision 11). Nil for
         /// every other request, whose compose keeps the recipients above.
         let fieldReply: ChatFieldReply?
+        /// The card is the reply the chat's reply field asked for (`ChatFieldReply.isOwnReply`): the
+        /// email the field showed, any copy, in any account, whoever it goes to. Decided once by the
+        /// reply tool; the field's words (`AgentToolRouter.enqueueComposeAndAwaitOutcome`) and the
+        /// chat that opens the card (its closing answer opens nothing) both read it.
+        let isFieldsOwnReply: Bool
         /// The draft the card saves to; nil, the reply's usual one. An edit of the AI Suggestion
         /// opens on the suggestion's own draft (`Draft.separateReplyKey`), as the ghost's card does.
         let draftId: String?
@@ -281,8 +367,8 @@ final class AgentToolRouter {
         let onOutcome: @MainActor (ComposeOutcome) -> Void
 
         /// Shared idempotence + staleness flag. Threaded into the request by
-        /// `enqueueComposeAndAwaitOutcome` so `dispatchNextIfIdle` can skip
-        /// requests whose Task was cancelled before dispatch.
+        /// `enqueueComposeAndAwaitOutcome` so `takeCompose(for:)` can drop
+        /// requests whose Task was cancelled before they were taken.
         let outcomeState: ComposeOutcomeState
 
         init(
@@ -293,9 +379,11 @@ final class AgentToolRouter {
             bcc: [String],
             subject: String?,
             body: String?,
+            origin: ComposeOrigin,
             suggestion: ReplyResult? = nil,
             isReplyAll: Bool = false,
             fieldReply: ChatFieldReply? = nil,
+            isFieldsOwnReply: Bool = false,
             draftId: String? = nil,
             onOutcome: @escaping @MainActor (ComposeOutcome) -> Void = { _ in },
             outcomeState: ComposeOutcomeState = ComposeOutcomeState()
@@ -307,9 +395,11 @@ final class AgentToolRouter {
             self.bcc = bcc
             self.subject = subject
             self.body = body
+            self.origin = origin
             self.suggestion = suggestion
             self.isReplyAll = isReplyAll
             self.fieldReply = fieldReply
+            self.isFieldsOwnReply = isFieldsOwnReply
             self.draftId = draftId
             self.onOutcome = onOutcome
             self.outcomeState = outcomeState
@@ -319,6 +409,23 @@ final class AgentToolRouter {
             case compose
             case reply
             case forward
+        }
+
+        /// The account a new email is sent from, bound when the turn started
+        /// (`ComposeOrigin.fromAccountId`). Nil for a reply or forward, sent from its email's
+        /// account, and for a new email asked in the inbox, whose card picks its account.
+        var fromAccountId: String? { mode == .compose ? origin.fromAccountId : nil }
+
+        /// The accounts the request depends on: the account of the email it replies to or
+        /// forwards, the account its new email is sent from, and the account whose thread key
+        /// the asking turn ran under (the chat view or the email screen; the inbox's key names
+        /// none). Removing one of them ends the request: its email or its From address is gone,
+        /// and the removed account's key is not among the keys a screen reads once that
+        /// account's emails are gone, even where the merged thread's chat still shows through a
+        /// surviving account's emails (ADR-IOS-114 decision 14). A new email asked in the inbox
+        /// depends on none.
+        var accountIds: [String] {
+            [replyTo?.accountId, fromAccountId, ChatThreadKey.parse(origin.sessionKey)?.accountId].compactMap { $0 }
         }
     }
 
@@ -589,16 +696,37 @@ extension AgentToolRouter {
     /// The `make` closure receives both a one-shot `onOutcome` callback and
     /// the shared `ComposeOutcomeState` instance; threading both into the
     /// returned `ComposeRequest` keeps the idempotence machinery intact and
-    /// lets `dispatchNextIfIdle()` skip requests whose Task was cancelled
-    /// before dispatch.
+    /// lets `takeCompose(for:)` drop requests whose Task was cancelled
+    /// before they were taken.
     ///
     /// Exactly-once resume is guaranteed by:
     ///   - `ComposeOutcomeState.tryResolve` — atomic first-wins flag
     ///   - `ComposeContinuationGuard.resume` — NSLock-serialized resume
+    ///
+    /// When the wait ends the request leaves the queue if it is still there: a request
+    /// stopped while it waits for a screen that does not come back would otherwise keep its
+    /// recipients and body in memory until some later take.
+    ///
+    /// `fieldWordsKey`: the request was sent from the chat's reply field under this chat key
+    /// (`ToolInvocation.fieldWordsKey`). The field's own reply card (`ComposeRequest.isFieldsOwnReply`,
+    /// `ChatFieldReply.isOwnReply`, decided apart from who it goes to) marks the field composing
+    /// there, and a sent card completes the field's send there, in `ChatFieldWords`, whether or not
+    /// a chat view still shows it (ADR-IOS-117).
     func enqueueComposeAndAwaitOutcome(
+        fieldWordsKey: String? = nil,
         make: (@escaping @MainActor (ComposeOutcome) -> Void, ComposeOutcomeState) -> ComposeRequest
     ) async -> ComposeOutcome {
         let state = ComposeOutcomeState()
+        let outcome = await awaitComposeOutcome(state: state, fieldWordsKey: fieldWordsKey, make: make)
+        composeQueue.removeAll { $0.outcomeState === state }
+        return outcome
+    }
+
+    private func awaitComposeOutcome(
+        state: ComposeOutcomeState,
+        fieldWordsKey: String?,
+        make: (@escaping @MainActor (ComposeOutcome) -> Void, ComposeOutcomeState) -> ComposeRequest
+    ) async -> ComposeOutcome {
         let guard_ = ComposeContinuationGuard()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<ComposeOutcome, Never>) in
@@ -624,16 +752,22 @@ extension AgentToolRouter {
                     // (MainActor). `tryResolve` is atomic so we don't depend
                     // on that isolation for correctness.
                     guard state.tryResolve(outcome) else { return }
+                    if case .sent = outcome, let fieldWordsKey {
+                        ChatFieldWords.shared.apply(.completed, to: fieldWordsKey)
+                    }
                     guard_.resume(returning: outcome)
                 }, state)
+                if let fieldWordsKey, request.isFieldsOwnReply {
+                    ChatFieldWords.shared.apply(.composeOpened, to: fieldWordsKey)
+                }
                 enqueueCompose(request)
             }
         } onCancel: {
             // Invoked on an arbitrary thread by the cooperative cancellation
             // machinery, potentially *before* the operation closure runs (see
             // cancellation-before-entry case above). `tryResolve` flips
-            // `resolved` atomically so the dispatcher's stale-skip in
-            // `dispatchNextIfIdle()` sees a consistent value, and
+            // `resolved` atomically so the stale-drop in
+            // `takeCompose(for:)` sees a consistent value, and
             // `ComposeContinuationGuard.resume` is idempotent — so we always
             // call resume rather than gating on tryResolve (which the
             // in-operation path may have already flipped).

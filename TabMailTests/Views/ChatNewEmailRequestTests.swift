@@ -315,7 +315,7 @@ struct ChatNewEmailRequestTests {
         #expect(Self.count("listPresentationWriter?.isUp =", in: inbox) == 1,
                 "and only as that changes: a screen pushed over the list hides the list, not its Search")
         let navigation = try Self.source("TabMail/Views/MailNavigationView.swift")
-        #expect(Self.count("pushedMessageId: $pushedMessageId) .environment(\\.listPresentationWriter, listPresentation)", in: navigation) == 1,
+        #expect(Self.count("emailsOpenBeside: sizeClass == .regular) .environment(\\.listPresentationWriter, listPresentation)", in: navigation) == 1,
                 "the list column writes the state")
         // Every screen that opens in the detail column reads it: the selected email and an email
         // pill's email. Nothing in the list column does, so an email opened in Search still takes one.
@@ -842,9 +842,12 @@ struct ChatNewEmailRequestHostedTests {
             let shown = try await Self.postedLinkShowsNewEmail(screen)
             let newEmail = screen.topPresented()
             #expect(router.isComposeUp, "the new email's chat counts as a compose up")
+            // Asked by this email screen's chat, as its pill stamps a turn's compose.
             let request = AgentToolRouter.ComposeRequest(
                 mode: .compose, replyTo: nil, to: ["next@example.com"], cc: [], bcc: [],
-                subject: "From the agent", body: nil)
+                subject: "From the agent", body: nil,
+                origin: ComposeOrigin(sessionKey: ChatThreadKey.key(for: screen.email), screen: .email,
+                                      fromAccountId: screen.email.accountId))
             router.enqueueCompose(request)
             let waited = try await Self.keeps {
                 router.composeQueueDepth == 1 && !router.composeAwaitingAppear && screen.topPresented() === newEmail
@@ -1225,7 +1228,6 @@ struct ChatNewEmailRequestHostedTests {
             await queue.clearForTesting()
             saved.setChatView(on: chatView)
             // Another suite's compose may still be counted: a count left up would hold every request.
-            router.pendingCompose = nil
             router.resetComposeQueueForTesting()
             let email = ThreadChatTests.header("601", from: "Ann Example", rfc: "request-1@example.com", thread: "request-thread", minutesAgo: 5)
             try ThreadChatTests.insert(email, pool: pool)

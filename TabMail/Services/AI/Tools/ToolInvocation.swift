@@ -25,16 +25,64 @@ struct ToolInvocation: Sendable {
     /// The agent's reply to that email carries it (`ComposeRequest.fieldReply`); nil for every
     /// other request.
     let fieldReply: ChatFieldReply?
+    /// The chat that sent the request, where a compose card the turn asks for opens (ADR-IOS-053
+    /// Phase 2): only a screen of that kind showing that chat takes the request. Nil when no screen
+    /// can open one; the compose tools then fail fast instead of waiting for a card.
+    let composeOrigin: ComposeOrigin?
+    /// Set when the request was sent from the chat's reply field: the chat key its words were sent
+    /// under (`ChatFieldWords.key(for:)`), captured as it was sent. The request's own transitions of
+    /// the field (a compose card opening, its reply going out) land on this key in
+    /// `ChatFieldWords`, never on whichever chat a pill shows by then (ADR-IOS-117).
+    let fieldWordsKey: String?
 
-    init(uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil, fieldReply: ChatFieldReply? = nil) {
+    init(
+        uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil, fieldReply: ChatFieldReply? = nil,
+        composeOrigin: ComposeOrigin? = nil, fieldWordsKey: String? = nil
+    ) {
         self.uiSink = uiSink
         self.sessionKey = sessionKey
         self.fieldReply = fieldReply
+        self.composeOrigin = composeOrigin
+        self.fieldWordsKey = fieldWordsKey
     }
 
     /// The no-UI invocation used by every non-interactive completion caller and
     /// as the `AgentTool` protocol/default fallback.
     static let noninteractive = ToolInvocation(uiSink: nil, sessionKey: nil)
+}
+
+/// Where an agent's compose card opens: the chat session that asked, and the kind of screen it was
+/// asked on (ADR-IOS-053 Phase 2). Captured as the send starts; the compose tools stamp it on their
+/// `AgentToolRouter.ComposeRequest`, and only a pill of that screen kind whose chat holds the session
+/// key takes the request (`AgentToolRouter.takeCompose(for:)`). So the card opens on the screen that
+/// asked, built by that screen, whichever other screens are mounted.
+struct ComposeOrigin: Hashable, Sendable {
+    enum Screen: Hashable, Sendable {
+        /// The inbox's own chat.
+        case inbox
+        /// The email screen (`MessageDetailView`).
+        case email
+        /// The chat view (`ChatThreadView`), whose reply field's choice the card applies.
+        case chat
+    }
+
+    let sessionKey: String
+    let screen: Screen
+    /// The account a new email the turn asks for is sent from, bound as the turn starts: the
+    /// account of the email the chat view or email screen was opened on. Nil in the inbox, whose
+    /// card picks its account when it opens. Replies and forwards are sent from their email's
+    /// account and never read it (`AgentToolRouter.ComposeRequest.fromAccountId`).
+    let fromAccountId: String?
+
+    init(sessionKey: String, screen: Screen, fromAccountId: String? = nil) {
+        self.sessionKey = sessionKey
+        self.screen = screen
+        self.fromAccountId = fromAccountId
+    }
+
+    /// Why a compose tool invoked with no origin fails fast: no screen could ever take its card,
+    /// so it never waits for one (as a confirmation tool with no sink, ADR-IOS-053).
+    static let noScreenReason = "no chat screen to open the compose window on"
 }
 
 /// MainActor delivery channel owned by exactly one chat session. Replaces the
@@ -54,8 +102,14 @@ protocol AgentUISink: Sendable {
 /// implicitly `Sendable`, so this value type is `Sendable`.
 struct SessionUISink: AgentUISink {
     let session: ChatPillState.Session
+    /// The request was sent from the reply field: the chat key its words were sent under
+    /// (`ToolInvocation.fieldWordsKey`). Its card's transition of the field lands there.
+    var fieldWordsKey: String? = nil
 
     @MainActor func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
+        // The request's own chat: a card empties the words it sent there (unless newer words were
+        // typed), whichever chat the pill shows when the card arrives.
+        if let fieldWordsKey { ChatFieldWords.shared.apply(.confirmationCard, to: fieldWordsKey) }
         // Appending is SwiftUI-mutation-safe (new rows don't invalidate existing
         // layout) and drives the pill's `ChatBubble` → `ActionConfirmationCard`
         // renderer declaratively. Content is empty; the card IS the row.

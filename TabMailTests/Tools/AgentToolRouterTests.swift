@@ -4,7 +4,64 @@
 
 import Testing
 import Foundation
+import Synchronization
 @testable import TabMail
+
+/// The chat a compose tool test asks from: the inbox's own chat, the host its pill stands for, and
+/// the invocation of a turn sent there (ADR-IOS-053 Phase 2).
+enum ComposeTestOrigin {
+    static let inbox = ComposeOrigin(sessionKey: "inbox", screen: .inbox)
+    static let inboxHost = AgentToolRouter.ComposeHost(screen: .inbox, sessionKeys: ["inbox"])
+    static let invocation = ToolInvocation(composeOrigin: inbox)
+
+    /// Runs `tool` with no compose origin for at most five seconds: a tool that waits for a card no
+    /// screen can take throws `BoundedWait.DeadlineExpired`, so a regression fails instead of
+    /// hanging the run.
+    static func runWithoutOrigin(_ tool: any AgentTool, arguments: [String: JSONValue]) async throws -> String {
+        let run = Task { try await tool.execute(arguments: arguments, invocation: .noninteractive) }
+        guard let result = await BoundedWait.result(of: run, within: .seconds(5)) else {
+            throw BoundedWait.DeadlineExpired()
+        }
+        return try result.get()
+    }
+}
+
+/// Awaits a task for a bounded time. The task is cancelled at the deadline and the wait returns
+/// nil even when the task ignores the cancellation, so a waiter left unresolved fails its test
+/// instead of hanging the whole run.
+enum BoundedWait {
+    struct DeadlineExpired: Error {}
+
+    static func result<T: Sendable, Failure: Error>(of task: Task<T, Failure>, within limit: Duration) async -> Result<T, Failure>? {
+        let once = ResumeOnce<Result<T, Failure>?>()
+        return await withCheckedContinuation { continuation in
+            once.store(continuation)
+            Task { once.resume(await task.result) }
+            Task {
+                try? await Task.sleep(for: limit)
+                task.cancel()
+                once.resume(nil)
+            }
+        }
+    }
+
+    private final class ResumeOnce<Value: Sendable>: @unchecked Sendable {
+        private var continuation: CheckedContinuation<Value, Never>?
+        private let lock = NSLock()
+
+        func store(_ continuation: CheckedContinuation<Value, Never>) {
+            lock.withLock { self.continuation = continuation }
+        }
+
+        func resume(_ value: Value) {
+            let continuation: CheckedContinuation<Value, Never>? = lock.withLock {
+                defer { self.continuation = nil }
+                return self.continuation
+            }
+            continuation?.resume(returning: value)
+        }
+    }
+}
 
 // MARK: - ComposeRequest Tests
 
@@ -15,11 +72,11 @@ struct ComposeRequestTests {
     func uniqueIds() {
         let r1 = AgentToolRouter.ComposeRequest(
             mode: .compose, replyTo: nil, to: [], cc: [], bcc: [],
-            subject: nil, body: nil
+            subject: nil, body: nil, origin: ComposeTestOrigin.inbox
         )
         let r2 = AgentToolRouter.ComposeRequest(
             mode: .compose, replyTo: nil, to: [], cc: [], bcc: [],
-            subject: nil, body: nil
+            subject: nil, body: nil, origin: ComposeTestOrigin.inbox
         )
         #expect(r1.id != r2.id)
     }
@@ -30,7 +87,7 @@ struct ComposeRequestTests {
             mode: .compose, replyTo: nil,
             to: ["alice@test.com", "bob@test.com"],
             cc: ["cc@test.com"], bcc: [],
-            subject: "Meeting Notes", body: "<p>Hello</p>"
+            subject: "Meeting Notes", body: "<p>Hello</p>", origin: ComposeTestOrigin.inbox
         )
         #expect(request.to == ["alice@test.com", "bob@test.com"])
         #expect(request.cc == ["cc@test.com"])
@@ -45,7 +102,7 @@ struct ComposeRequestTests {
         let request = AgentToolRouter.ComposeRequest(
             mode: .reply, replyTo: nil,
             to: ["sender@test.com"], cc: [], bcc: [],
-            subject: "Re: Original", body: nil
+            subject: "Re: Original", body: nil, origin: ComposeTestOrigin.inbox
         )
         // Mode is a value type — just verify it was set
         switch request.mode {
@@ -59,7 +116,7 @@ struct ComposeRequestTests {
         let request = AgentToolRouter.ComposeRequest(
             mode: .forward, replyTo: nil,
             to: ["fwd@test.com"], cc: [], bcc: ["secret@test.com"],
-            subject: "Fwd: Important", body: "See below"
+            subject: "Fwd: Important", body: "See below", origin: ComposeTestOrigin.inbox
         )
         switch request.mode {
         case .forward: break // expected
@@ -307,38 +364,48 @@ struct AgentToolRouterSendableTests {
     }
 }
 
-// MARK: - Compose FIFO Queue Tests (ADR-IOS-030)
+// MARK: - Compose FIFO Queue Tests (ADR-IOS-030, taken by the asking screen per ADR-IOS-053 Phase 2)
 
 /// Each test owns a fresh `AgentToolRouter` — no `.shared` access. This makes
 /// the suite safe to run in parallel with anything else that touches the
 /// singleton (compose tool tests, blocking-helper tests below, etc.). See
 /// `EmailReplyToolTests` suite header for the original cross-suite flake story.
+///
+/// THE SYSTEM PROPERTIES pinned here: one compose window at a time, in FIFO order per screen
+/// (ADR-IOS-030); and a request is only ever taken by the kind of screen that asked, showing the
+/// chat that asked, whichever screens look first; a request whose screen is not showing never
+/// holds another screen's request (ADR-IOS-053 Phase 2).
 @Suite("AgentToolRouter Compose Queue")
 @MainActor
 struct AgentToolRouterComposeQueueTests {
+    private static let chatKey = "thread:acc1:t-1"
+    private static let chat = ComposeOrigin(sessionKey: chatKey, screen: .chat)
+    private static let chatHost = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [chatKey])
+    private static let inboxHost = ComposeTestOrigin.inboxHost
 
-    /// Build a unique ComposeRequest for queue tests.
-    private func makeRequest(_ subject: String) -> AgentToolRouter.ComposeRequest {
+    /// Build a unique ComposeRequest for queue tests, asked from `origin`.
+    private func makeRequest(_ subject: String, origin: ComposeOrigin = ComposeTestOrigin.inbox) -> AgentToolRouter.ComposeRequest {
         AgentToolRouter.ComposeRequest(
             mode: .compose, replyTo: nil,
             to: ["test@example.com"], cc: [], bcc: [],
-            subject: subject, body: nil
+            subject: subject, body: nil, origin: origin
         )
     }
 
-    @Test("enqueueCompose dispatches immediately when idle")
-    func dispatchesImmediatelyWhenIdle() {
+    @Test("A request is taken at once by the screen that asked when no compose is on screen")
+    func takenImmediatelyWhenIdle() {
         let router = AgentToolRouter()
         let req = makeRequest("First")
 
         router.enqueueCompose(req)
+        let taken = router.takeCompose(for: Self.inboxHost)
 
-        // No compose UI presented, no prior pending → should dispatch immediately
-        #expect(router.pendingCompose?.id == req.id)
+        #expect(taken?.id == req.id)
         #expect(router.composeQueueDepth == 0)
+        #expect(router.composeAwaitingAppear, "its window has not appeared yet")
     }
 
-    @Test("enqueueCompose holds in queue when compose UI is presented")
+    @Test("A request waits in the queue while a compose is on screen")
     func holdsWhenPresented() {
         let router = AgentToolRouter()
         // Simulate that a ComposeView is currently on screen (manual or agent).
@@ -347,12 +414,12 @@ struct AgentToolRouterComposeQueueTests {
         let req = makeRequest("Held")
         router.enqueueCompose(req)
 
-        // Should NOT dispatch — pendingCompose stays nil, request stays in queue
-        #expect(router.pendingCompose == nil)
+        let taken = router.takeCompose(for: Self.inboxHost)
+        #expect(taken == nil, "nothing is taken while a compose is on screen")
         #expect(router.composeQueueDepth == 1)
     }
 
-    @Test("Queue drains in FIFO order when compose UI dismisses")
+    @Test("The queue is taken in FIFO order as each compose closes")
     func drainsFIFOOnDismiss() {
         let router = AgentToolRouter()
         router.composePresentationDidBegin()
@@ -360,102 +427,84 @@ struct AgentToolRouterComposeQueueTests {
         let r1 = makeRequest("First")
         let r2 = makeRequest("Second")
         let r3 = makeRequest("Third")
-
         router.enqueueCompose(r1)
         router.enqueueCompose(r2)
         router.enqueueCompose(r3)
-
         #expect(router.composeQueueDepth == 3)
-        #expect(router.pendingCompose == nil)
 
-        // Manual compose dismisses → queue dispatches first request
+        // The manual compose closes: the first request is taken, and its window appears.
         router.composePresentationDidEnd()
-        #expect(router.pendingCompose?.id == r1.id)
+        let first = router.takeCompose(for: Self.inboxHost)
+        #expect(first?.id == r1.id)
+        router.composePresentationDidBegin()
+        let whileFirstShows = router.takeCompose(for: Self.inboxHost)
+        #expect(whileFirstShows == nil, "r2 and r3 wait while r1 is on screen")
         #expect(router.composeQueueDepth == 2)
 
-        // Simulate view capturing the request and the new ComposeView appearing
-        router.pendingCompose = nil
-        router.composePresentationDidBegin()
-
-        // While r1 is presented, r2 and r3 still wait
-        #expect(router.composeQueueDepth == 2)
-        #expect(router.pendingCompose == nil)
-
-        // r1 dismisses → r2 dispatches
         router.composePresentationDidEnd()
-        #expect(router.pendingCompose?.id == r2.id)
-        #expect(router.composeQueueDepth == 1)
-
-        router.pendingCompose = nil
+        let second = router.takeCompose(for: Self.inboxHost)
+        #expect(second?.id == r2.id)
         router.composePresentationDidBegin()
-
-        // r2 dismisses → r3 dispatches
         router.composePresentationDidEnd()
-        #expect(router.pendingCompose?.id == r3.id)
+        let third = router.takeCompose(for: Self.inboxHost)
+        #expect(third?.id == r3.id)
         #expect(router.composeQueueDepth == 0)
 
-        // r3 dismisses → queue empty, nothing more to dispatch
-        router.pendingCompose = nil
         router.composePresentationDidBegin()
         router.composePresentationDidEnd()
-        #expect(router.pendingCompose == nil)
-        #expect(router.composeQueueDepth == 0)
+        let none = router.takeCompose(for: Self.inboxHost)
+        #expect(none == nil, "the queue is empty")
     }
 
-    @Test("Manual compose blocks queued agent requests until dismissed")
+    @Test("A manual compose holds queued agent requests until it closes")
     func manualComposeBlocksAgentQueue() {
         let router = AgentToolRouter()
         // User opens compose manually — ComposeView.onAppear fires
         router.composePresentationDidBegin()
 
-        // Agent fires three compose tools while user's compose is up
         let r1 = makeRequest("Agent 1")
         let r2 = makeRequest("Agent 2")
         router.enqueueCompose(r1)
         router.enqueueCompose(r2)
-
-        // All requests queued — none dispatched
-        #expect(router.pendingCompose == nil)
+        let held = router.takeCompose(for: Self.inboxHost)
+        #expect(held == nil)
         #expect(router.composeQueueDepth == 2)
 
-        // User closes their manual compose
+        // User closes their manual compose: the first agent request is taken.
         router.composePresentationDidEnd()
-
-        // First agent request appears immediately
-        #expect(router.pendingCompose?.id == r1.id)
+        let taken = router.takeCompose(for: Self.inboxHost)
+        #expect(taken?.id == r1.id)
         #expect(router.composeQueueDepth == 1)
     }
 
-    @Test("Back-to-back enqueue while idle: only first dispatches, second waits")
-    func backToBackEnqueueWhileIdle() {
+    @Test("A request queued between a take and its window appearing waits, and is taken after that window closes")
+    func raceBetweenTakeAndAppear() {
+        // The take ↔ onAppear window: r1 is taken, its cover is still presenting
+        // (presentationCount == 0), and r2 arrives. r2 must wait, not open a second window.
         let router = AgentToolRouter()
         let r1 = makeRequest("First")
         let r2 = makeRequest("Second")
 
         router.enqueueCompose(r1)
-        // r1 dispatched, view hasn't yet captured (pendingCompose still set)
-        #expect(router.pendingCompose?.id == r1.id)
+        let first = router.takeCompose(for: Self.inboxHost)
+        #expect(first?.id == r1.id)
+        #expect(router.composeAwaitingAppear == true)
 
         router.enqueueCompose(r2)
-        // r2 must wait — pendingCompose != nil so dispatch is gated
-        #expect(router.pendingCompose?.id == r1.id)
-        #expect(router.composeQueueDepth == 1)
+        let early = router.takeCompose(for: Self.inboxHost)
+        #expect(early == nil, "r2 must not open while r1's window is still presenting")
+        #expect(router.composeQueueDepth == 1, "r2 must be queued")
 
-        // View captures r1 and nils the slot. Cover hasn't yet finished presenting.
-        router.pendingCompose = nil
-
-        // r2 stays queued because awaitingAppear is still true (the dispatch flag
-        // is only cleared by composePresentationDidBegin). This is the race-window
-        // guard — see ADR-IOS-030.
-        #expect(router.composeAwaitingAppear == true)
-        #expect(router.composeQueueDepth == 1)
-
+        // r1's ComposeView appears, then closes.
         router.composePresentationDidBegin()
         #expect(router.composeAwaitingAppear == false)
+        #expect(router.composePresentationCount == 1)
         router.composePresentationDidEnd()
 
-        #expect(router.pendingCompose?.id == r2.id)
+        let second = router.takeCompose(for: Self.inboxHost)
+        #expect(second?.id == r2.id)
         #expect(router.composeQueueDepth == 0)
+        #expect(router.composeAwaitingAppear == true)
     }
 
     @Test("presentationCount never goes negative")
@@ -473,106 +522,512 @@ struct AgentToolRouterComposeQueueTests {
         #expect(router.composePresentationCount == 0)
     }
 
-    @Test("Race: enqueue between view-capture and onAppear queues, doesn't overwrite")
-    func raceBetweenCaptureAndAppear() {
-        // Reproduces the dispatch ↔ onAppear race window:
-        // 1. enqueue r1 → router dispatches → pendingCompose=r1
-        // 2. view's onChange fires → captures into local @State, nils router slot
-        // 3. (race window: pendingCompose==nil, presentationCount==0)
-        // 4. enqueue r2 arrives during the window → MUST queue, not overwrite r1
-        // 5. r1's ComposeView finally appears → composePresentationDidBegin
-        // 6. r1 dismisses → r2 dispatches
+    @Test("Only the kind of screen that asked, showing the chat that asked, takes a request, whichever screens look first")
+    func onlyTheAskingScreenTakes() {
         let router = AgentToolRouter()
+        let req = makeRequest("Reply", origin: Self.chat)
+        router.enqueueCompose(req)
 
-        let r1 = makeRequest("First")
-        let r2 = makeRequest("Second")
+        // Every other screen looks first: the inbox, the email screen of the same thread, another chat.
+        let inbox = router.takeCompose(for: Self.inboxHost)
+        #expect(inbox == nil, "the inbox never takes the chat's request")
+        let email = router.takeCompose(for: AgentToolRouter.ComposeHost(screen: .email, sessionKeys: [Self.chatKey]))
+        #expect(email == nil, "the email screen of the same thread never takes it")
+        let otherChat = router.takeCompose(for: AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: ["thread:acc1:other"]))
+        #expect(otherChat == nil, "another chat never takes it")
+        #expect(router.composeQueueDepth == 1, "the request is still waiting")
+        #expect(router.composeAwaitingAppear == false, "a take that found nothing holds nothing")
 
-        router.enqueueCompose(r1)
-        #expect(router.pendingCompose?.id == r1.id)
-        #expect(router.composeAwaitingAppear == true)
-
-        // Simulate the view's onChange handler: capture r1 into local @State,
-        // nil the router slot. The cover hasn't yet finished presenting.
-        router.pendingCompose = nil
-
-        // Race window. Without the awaitingAppear guard, the next dispatch would
-        // see pendingCompose==nil + count==0 + queue=[r2] and overwrite the
-        // in-flight r1. WITH the guard, r2 must queue.
-        router.enqueueCompose(r2)
-        #expect(router.pendingCompose == nil, "r2 must NOT have replaced in-flight r1")
-        #expect(router.composeQueueDepth == 1, "r2 must be queued")
-
-        // r1's ComposeView finally appears
-        router.composePresentationDidBegin()
-        #expect(router.composeAwaitingAppear == false)
-        #expect(router.composePresentationCount == 1)
-
-        // r1 dismisses → r2 dispatches
-        router.composePresentationDidEnd()
-        #expect(router.pendingCompose?.id == r2.id)
-        #expect(router.composeQueueDepth == 0)
-        #expect(router.composeAwaitingAppear == true)
+        // The chat that asked takes it, by any key of its thread.
+        let host = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: ["thread:acc1:newer", Self.chatKey])
+        let taken = router.takeCompose(for: host)
+        #expect(taken?.id == req.id)
     }
 
-    @Test("Loser in dual-observer race captures nil and presents nothing")
-    func dualObserverLoserCapturesNil() {
-        // Both InboxView and MessageDetailView observe pendingCompose?.id and race to
-        // capture. The first to run sets its local @State and nils the router slot.
-        // The second reads nil and captures nothing. This test verifies that the
-        // nil-after-capture pattern works with the new queue: even after the loser
-        // captures nil, the queue's awaitingAppear flag still gates further dispatches.
+    @Test("A request whose screen is not showing never holds another screen's request")
+    func otherScreensRequestIsNotBlocked() {
         let router = AgentToolRouter()
+        let forChat = makeRequest("For the chat", origin: Self.chat)
+        let forInbox = makeRequest("For the inbox")
+        router.enqueueCompose(forChat)
+        router.enqueueCompose(forInbox)
 
-        let r1 = makeRequest("First")
-        let r2 = makeRequest("Second")
+        // Only the inbox shows: it takes its own request, behind the chat's.
+        let inbox = router.takeCompose(for: Self.inboxHost)
+        #expect(inbox?.id == forInbox.id)
+        #expect(router.composeQueueDepth == 1, "the chat's request waits for its chat")
+        #expect(router.firstQueuedRequestForTesting?.id == forChat.id)
 
-        router.enqueueCompose(r1)
-        #expect(router.pendingCompose?.id == r1.id)
-
-        // Winner captures r1 and nils the slot
-        router.pendingCompose = nil
-
-        // Loser reads nil — captures nothing locally (we don't simulate, just verify
-        // the router state is unchanged by repeated reads)
-        _ = router.pendingCompose
-        #expect(router.composeAwaitingAppear == true)
-
-        // A second tool fires immediately. The queue must hold r2 because awaitingAppear
-        // is still true (winner's ComposeView hasn't fired onAppear yet).
-        router.enqueueCompose(r2)
-        #expect(router.composeQueueDepth == 1)
-        #expect(router.pendingCompose == nil)
-
-        // Winner's ComposeView appears
+        // The inbox's compose comes and goes; the chat shows again and takes its request.
         router.composePresentationDidBegin()
-        #expect(router.composeAwaitingAppear == false)
-
         router.composePresentationDidEnd()
-        #expect(router.pendingCompose?.id == r2.id)
+        let chat = router.takeCompose(for: Self.chatHost)
+        #expect(chat?.id == forChat.id)
     }
 
-    @Test("Two simultaneous compose presentations require two dismisses to drain queue")
+    @Test("A screen takes its own requests oldest first")
+    func oneScreenIsFIFO() {
+        let router = AgentToolRouter()
+        let r1 = makeRequest("First", origin: Self.chat)
+        let r2 = makeRequest("Second", origin: Self.chat)
+        router.enqueueCompose(r1)
+        router.enqueueCompose(r2)
+
+        let first = router.takeCompose(for: Self.chatHost)
+        #expect(first?.id == r1.id)
+        router.composePresentationDidBegin()
+        router.composePresentationDidEnd()
+        let second = router.takeCompose(for: Self.chatHost)
+        #expect(second?.id == r2.id)
+    }
+
+    @Test("The offer moves when a request is queued and when the last compose closes, so the screens look again")
+    func offerMovesWhenTakeable() {
+        let router = AgentToolRouter()
+        let start = router.composeOffer
+
+        router.enqueueCompose(makeRequest("First"))
+        #expect(router.composeOffer == start + 1, "a queued request is offered")
+
+        router.composePresentationDidBegin()
+        router.composePresentationDidBegin()
+        #expect(router.composeOffer == start + 1, "a compose appearing offers nothing")
+        router.composePresentationDidEnd()
+        #expect(router.composeOffer == start + 1, "one compose is still on screen")
+        router.composePresentationDidEnd()
+        #expect(router.composeOffer == start + 2, "the last compose closed: the queue is offered again")
+    }
+
+    @Test("Two compose windows on screen need two closes before a request is taken")
     func twoSimultaneousPresentations() {
-        // E.g. InboxView and MessageDetailView both have a ComposeView mounted briefly
-        // during a transition. Queue should only drain when count returns to 0.
+        // E.g. two screens briefly have a ComposeView mounted during a transition.
         let router = AgentToolRouter()
         router.composePresentationDidBegin()
         router.composePresentationDidBegin()
 
         let req = makeRequest("Pending")
         router.enqueueCompose(req)
-        #expect(router.composeQueueDepth == 1)
-        #expect(router.pendingCompose == nil)
 
-        // Only one dismissed — count is still 1
         router.composePresentationDidEnd()
-        #expect(router.pendingCompose == nil)
+        let early = router.takeCompose(for: Self.inboxHost)
+        #expect(early == nil, "one compose is still on screen")
         #expect(router.composeQueueDepth == 1)
 
-        // Second dismissed — count is 0, dispatch fires
         router.composePresentationDidEnd()
-        #expect(router.pendingCompose?.id == req.id)
+        let taken = router.takeCompose(for: Self.inboxHost)
+        #expect(taken?.id == req.id)
         #expect(router.composeQueueDepth == 0)
+    }
+}
+
+// MARK: - Removed Account Tests
+
+/// THE SYSTEM PROPERTY pinned here: a compose card waiting for its screen never opens for an
+/// account whose removal has committed, and its turn never hangs on it. A request depends on the
+/// account of the email it answers or forwards, the account a new email is sent from (bound when
+/// the turn started), and the account whose thread key the asking turn ran under. Once one of them
+/// is removed the request ends with a plain failure the model reads, and nothing opens; requests of
+/// other accounts, and new emails asked in the inbox, are untouched. The router reads the removal
+/// from the committed-removal fence (`AccountManager.isRuntimeRemoved`), here a set the test owns.
+@Suite("AgentToolRouter compose requests of a removed account")
+@MainActor
+struct AgentToolRouterRemovedAccountTests {
+    private static let gone = "acc-gone"
+    private static let kept = "acc-kept"
+    private static let goneThread = ChatThreadKey.key(accountId: gone, threadId: "t-1")
+    private static let keptThread = ChatThreadKey.key(accountId: kept, threadId: "t-2")
+
+    /// The fence a test router reads: the accounts whose removal has committed.
+    private final class Fence: Sendable {
+        private let removed = Mutex<Set<String>>([])
+        func remove(_ accountId: String) { _ = removed.withLock { $0.insert(accountId) } }
+        func isRemoved(_ accountId: String) -> Bool { removed.withLock { $0.contains(accountId) } }
+    }
+
+    private static func router(_ fence: Fence) -> AgentToolRouter {
+        AgentToolRouter(isAccountRemoved: { fence.isRemoved($0) })
+    }
+
+    /// The outcomes each request's tool received, by request subject.
+    @MainActor
+    private final class Outcomes {
+        var bySubject: [String: ComposeOutcome] = [:]
+    }
+
+    /// The outcome state of the request a tool queued.
+    @MainActor
+    private final class HeldState {
+        var state: ComposeOutcomeState?
+    }
+
+    private static func header(account: String) -> MessageHeader {
+        MessageHeader(
+            messageId: "1", subject: "Lunch", from: "Alex", fromAddress: "alex@example.com",
+            to: "me@example.com", date: Date(), snippet: "",
+            folderId: "\(account):INBOX", accountId: account, folderPath: "INBOX", isInInbox: true)
+    }
+
+    private static func request(
+        _ subject: String, mode: AgentToolRouter.ComposeRequest.Mode, replyTo: MessageHeader?,
+        origin: ComposeOrigin, outcomes: Outcomes
+    ) -> AgentToolRouter.ComposeRequest {
+        AgentToolRouter.ComposeRequest(
+            mode: mode, replyTo: replyTo, to: ["alex@example.com"], cc: [], bcc: [],
+            subject: subject, body: nil, origin: origin,
+            onOutcome: { outcomes.bySubject[subject] = $0 })
+    }
+
+    private static func isRemovedFailure(_ outcome: ComposeOutcome?) -> Bool {
+        if case .failed(let reason)? = outcome { return reason == AgentToolRouter.removedAccountReason }
+        return false
+    }
+
+    @Test("A request depends on its email's account, a new email's bound From account, and the asking key's account")
+    func requestAccounts() {
+        let fromGone = ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: Self.gone)
+        let newEmail = AgentToolRouter.ComposeRequest(
+            mode: .compose, replyTo: nil, to: [], cc: [], bcc: [], subject: nil, body: nil, origin: fromGone)
+        #expect(newEmail.fromAccountId == Self.gone, "a new email is sent from the account bound at turn start")
+        #expect(Set(newEmail.accountIds) == [Self.gone, Self.kept])
+
+        let reply = AgentToolRouter.ComposeRequest(
+            mode: .reply, replyTo: Self.header(account: Self.kept), to: [], cc: [], bcc: [],
+            subject: nil, body: nil, origin: fromGone)
+        #expect(reply.fromAccountId == nil, "a reply is sent from its email's account, never the bound one")
+        #expect(Set(reply.accountIds) == [Self.kept])
+        let forward = AgentToolRouter.ComposeRequest(
+            mode: .forward, replyTo: Self.header(account: Self.kept), to: [], cc: [], bcc: [],
+            subject: nil, body: nil, origin: fromGone)
+        #expect(forward.fromAccountId == nil && Set(forward.accountIds) == [Self.kept])
+
+        let inboxNew = AgentToolRouter.ComposeRequest(
+            mode: .compose, replyTo: nil, to: [], cc: [], bcc: [], subject: nil, body: nil, origin: ComposeTestOrigin.inbox)
+        #expect(inboxNew.accountIds.isEmpty, "a new email asked in the inbox depends on no account")
+    }
+
+    @Test("Removing an account ends its waiting requests, from any screen, and leaves the others waiting")
+    func endsTheRemovedAccountsRequests() {
+        let fence = Fence()
+        let router = Self.router(fence)
+        let outcomes = Outcomes()
+        let fromChat = ComposeOrigin(sessionKey: Self.goneThread, screen: .chat, fromAccountId: Self.gone)
+        let fromEmail = ComposeOrigin(sessionKey: Self.goneThread, screen: .email, fromAccountId: Self.gone)
+        // A merged chat shown through the kept account's email, opened on the removed account's.
+        let mergedFromGone = ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: Self.gone)
+        let mergedFromKept = ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: Self.kept)
+        router.enqueueCompose(Self.request("inbox reply to gone", mode: .reply, replyTo: Self.header(account: Self.gone),
+                                           origin: ComposeTestOrigin.inbox, outcomes: outcomes))
+        router.enqueueCompose(Self.request("chat email of gone", mode: .compose, replyTo: nil, origin: fromChat, outcomes: outcomes))
+        router.enqueueCompose(Self.request("email screen forward of gone", mode: .forward, replyTo: Self.header(account: Self.gone),
+                                           origin: fromEmail, outcomes: outcomes))
+        router.enqueueCompose(Self.request("merged chat email from gone", mode: .compose, replyTo: nil,
+                                           origin: mergedFromGone, outcomes: outcomes))
+        router.enqueueCompose(Self.request("merged chat email from kept", mode: .compose, replyTo: nil,
+                                           origin: mergedFromKept, outcomes: outcomes))
+        router.enqueueCompose(Self.request("merged chat reply to kept", mode: .reply, replyTo: Self.header(account: Self.kept),
+                                           origin: mergedFromGone, outcomes: outcomes))
+        router.enqueueCompose(Self.request("inbox reply to kept", mode: .reply, replyTo: Self.header(account: Self.kept),
+                                           origin: ComposeTestOrigin.inbox, outcomes: outcomes))
+        router.enqueueCompose(Self.request("inbox new email", mode: .compose, replyTo: nil,
+                                           origin: ComposeTestOrigin.inbox, outcomes: outcomes))
+        #expect(router.composeQueueDepth == 8)
+
+        fence.remove(Self.gone)
+        router.endComposeRequestsOfRemovedAccounts()
+
+        #expect(Self.isRemovedFailure(outcomes.bySubject["inbox reply to gone"]), "the email it answers is gone")
+        #expect(Self.isRemovedFailure(outcomes.bySubject["chat email of gone"]), "its key and its From are the removed account's")
+        #expect(Self.isRemovedFailure(outcomes.bySubject["email screen forward of gone"]))
+        #expect(Self.isRemovedFailure(outcomes.bySubject["merged chat email from gone"]),
+                "its From account is gone, though its chat still shows through the kept account's email")
+        #expect(outcomes.bySubject["merged chat email from kept"] == nil && outcomes.bySubject["merged chat reply to kept"] == nil,
+                "a request of the kept account's chat keeps waiting; a reply never reads the bound From")
+        #expect(outcomes.bySubject["inbox reply to kept"] == nil && outcomes.bySubject["inbox new email"] == nil,
+                "another account's requests, and a new email from the inbox, still wait")
+        #expect(router.composeQueueDepth == 4)
+
+        // The inbox shows again: it opens the kept account's reply, never the removed one's.
+        let first = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+        #expect(first?.subject == "inbox reply to kept")
+        router.composePresentationDidBegin()
+        router.composePresentationDidEnd()
+        let second = router.takeCompose(for: ComposeTestOrigin.inboxHost)
+        #expect(second?.subject == "inbox new email")
+        router.composePresentationDidBegin()
+        router.composePresentationDidEnd()
+        #expect(router.takeCompose(for: ComposeTestOrigin.inboxHost) == nil)
+        #expect(router.takeCompose(for: AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [Self.goneThread])) == nil)
+        // The merged chat shows again: the kept account's new email, then its reply.
+        let merged = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [Self.keptThread])
+        #expect(router.takeCompose(for: merged)?.subject == "merged chat email from kept")
+        router.composePresentationDidBegin()
+        router.composePresentationDidEnd()
+        #expect(router.takeCompose(for: merged)?.subject == "merged chat reply to kept")
+    }
+
+    @Test("A request of a removed account that arrives later ends at once, and no screen is asked to look")
+    func laterRequestEndsAtOnce() {
+        let fence = Fence()
+        let router = Self.router(fence)
+        let outcomes = Outcomes()
+        fence.remove(Self.gone)
+        let offer = router.composeOffer
+
+        router.enqueueCompose(Self.request("late reply to gone", mode: .reply, replyTo: Self.header(account: Self.gone),
+                                           origin: ComposeTestOrigin.inbox, outcomes: outcomes))
+        router.enqueueCompose(Self.request("late chat email of gone", mode: .compose, replyTo: nil,
+                                           origin: ComposeOrigin(sessionKey: Self.goneThread, screen: .chat), outcomes: outcomes))
+        router.enqueueCompose(Self.request("late merged chat email from gone", mode: .compose, replyTo: nil,
+                                           origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: Self.gone),
+                                           outcomes: outcomes))
+
+        #expect(Self.isRemovedFailure(outcomes.bySubject["late reply to gone"]))
+        #expect(Self.isRemovedFailure(outcomes.bySubject["late chat email of gone"]))
+        #expect(Self.isRemovedFailure(outcomes.bySubject["late merged chat email from gone"]))
+        #expect(router.composeQueueDepth == 0)
+        #expect(router.composeOffer == offer)
+        #expect(router.takeCompose(for: ComposeTestOrigin.inboxHost) == nil)
+
+        // Another account's request still queues as before.
+        router.enqueueCompose(Self.request("late reply to kept", mode: .reply, replyTo: Self.header(account: Self.kept),
+                                           origin: ComposeTestOrigin.inbox, outcomes: outcomes))
+        #expect(outcomes.bySubject["late reply to kept"] == nil)
+        #expect(router.takeCompose(for: ComposeTestOrigin.inboxHost)?.subject == "late reply to kept")
+    }
+
+    /// The fence is set before the drain `disconnectAccount` schedules has run: a screen that
+    /// looks in between never takes the removed account's request.
+    @Test("A screen that looks after the removal committed, before its waiting requests ended, never takes one of them")
+    func takeAfterTheFenceEndsTheRequest() {
+        let fence = Fence()
+        let router = Self.router(fence)
+        let outcomes = Outcomes()
+        router.enqueueCompose(Self.request("merged chat email from gone", mode: .compose, replyTo: nil,
+                                           origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: Self.gone),
+                                           outcomes: outcomes))
+        router.enqueueCompose(Self.request("merged chat email from kept", mode: .compose, replyTo: nil,
+                                           origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: Self.kept),
+                                           outcomes: outcomes))
+        fence.remove(Self.gone)
+
+        let taken = router.takeCompose(for: AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [Self.keptThread]))
+        #expect(taken?.subject == "merged chat email from kept", "the removed From account's card never opens")
+        #expect(Self.isRemovedFailure(outcomes.bySubject["merged chat email from gone"]), "its tool hears of the removal")
+        #expect(router.composeQueueDepth == 0)
+    }
+
+    @Test("The tool waiting on a removed account's card returns a plain failure: its turn ends")
+    func waitingToolReturnsFailure() async {
+        let fence = Fence()
+        let router = Self.router(fence)
+        let chat = ComposeOrigin(sessionKey: Self.goneThread, screen: .chat)
+        let held = HeldState()
+        let task = Task { @MainActor () -> ComposeOutcome in
+            await router.enqueueComposeAndAwaitOutcome { onOutcome, state in
+                held.state = state
+                return AgentToolRouter.ComposeRequest(
+                    mode: .reply, replyTo: Self.header(account: Self.gone),
+                    to: ["alex@example.com"], cc: [], bcc: [], subject: "Re: Lunch", body: nil,
+                    origin: chat, onOutcome: onOutcome, outcomeState: state)
+            }
+        }
+        // Never hang the run on a regression: every wait is bounded, and a request left
+        // unresolved is cancelled before the test returns.
+        let admitted = await Self.eventually { router.composeQueueDepth == 1 }
+        guard admitted else {
+            Issue.record("the tool's request was never queued")
+            task.cancel()
+            _ = await task.value
+            return
+        }
+
+        fence.remove(Self.gone)
+        router.endComposeRequestsOfRemovedAccounts()
+
+        guard held.state?.resolved == true else {
+            Issue.record("the removal left the tool waiting")
+            task.cancel()
+            _ = await task.value
+            return
+        }
+        let outcome = await task.value
+        #expect(outcome.describeForLLM == ComposeOutcome.failed(AgentToolRouter.removedAccountReason).describeForLLM)
+        #expect(router.composeQueueDepth == 0)
+    }
+
+    /// Polls `condition` for up to five seconds, giving way between checks; stops early when the
+    /// test is cancelled.
+    private static func eventually(_ condition: @MainActor () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, !Task.isCancelled {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
+    }
+
+    /// The production router reads AccountManager's fence, and the removal ends the waiting
+    /// requests from `disconnectAccount`, right after the fence is set and before its first
+    /// suspension; account removal itself schedules nothing of its own
+    /// (`DestructiveCleanupReliabilityTests` runs a committed and an aborted removal).
+    @Test("The router reads the committed-removal fence, and the fence's setter ends the waiting requests")
+    func removalEndsRequestsAtTheFence() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        func source(_ path: String) throws -> String {
+            let raw = try String(contentsOf: projectRoot.appendingPathComponent(path), encoding: .utf8)
+            return raw.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+        let router = try source("TabMail/Services/AI/AgentToolRouter.swift")
+        #expect(router.components(separatedBy: "init(isAccountRemoved: @escaping @Sendable (String) -> Bool = { AccountManager.shared.isRuntimeRemoved($0) })").count - 1 == 1,
+                "the shared router reads AccountManager's fence")
+        let manager = try source("TabMail/Services/Account/AccountManager.swift")
+        let drain = "Task { @MainActor in AgentToolRouter.shared.endComposeRequestsOfRemovedAccounts() }"
+        #expect(manager.components(separatedBy: drain).count - 1 == 1)
+        let body = try #require(manager.range(of: "func disconnectAccount("))
+        let fence = try #require(manager.range(of: "_ = removedAccountRuntimeFence.withLock { $0.insert(account.id) }", range: body.upperBound..<manager.endIndex))
+        let ends = try #require(manager.range(of: drain, range: body.upperBound..<manager.endIndex))
+        let firstAwait = try #require(manager.range(of: "await ", range: body.upperBound..<manager.endIndex))
+        #expect(fence.upperBound <= ends.lowerBound, "the drain runs once the fence refuses new requests and takes")
+        #expect(ends.upperBound <= firstAwait.lowerBound, "scheduled before disconnectAccount first suspends")
+        let between = manager[fence.upperBound..<ends.lowerBound]
+        #expect(!between.contains("}"), "inside the committed-removal branch that sets the fence")
+        let setup = try source("TabMail/Services/Account/AccountManagerSetup.swift")
+        #expect(!setup.contains("endComposeRequests"), "account removal schedules no drain of its own")
+    }
+
+    /// A fence that a second removal sets while a drain is reading it: once armed, the first read
+    /// of the armed account finds it not removed and then sets it, as a removal that commits on
+    /// the AccountManager actor in the middle of the drain does.
+    private final class FenceSetMidDrain: Sendable {
+        private struct State {
+            var removed: Set<String> = []
+            var armed: String?
+        }
+        private let state = Mutex(State())
+        func remove(_ accountId: String) { state.withLock { _ = $0.removed.insert(accountId) } }
+        func arm(_ accountId: String) { state.withLock { $0.armed = accountId } }
+        func isRemoved(_ accountId: String) -> Bool {
+            state.withLock { state in
+                if state.removed.contains(accountId) { return true }
+                if state.armed == accountId {
+                    state.removed.insert(accountId)
+                    state.armed = nil
+                }
+                return false
+            }
+        }
+    }
+
+    /// How many outcomes each request's tool received, by request subject.
+    @MainActor
+    private final class OutcomeCounts {
+        var bySubject: [String: [ComposeOutcome]] = [:]
+    }
+
+    /// INVARIANT: a request leaves the queue only together with its outcome. Two removals: the
+    /// second commits while the drain of the first runs. Every removed request's tool hears of its
+    /// removal exactly once, in that drain or the next; none is dropped and left waiting.
+    @Test("A removal that commits while another removal's drain runs drops no request without its outcome")
+    func removalDuringTheDrainLosesNoOutcome() {
+        let second = "acc-second"
+        let fence = FenceSetMidDrain()
+        let router = AgentToolRouter(isAccountRemoved: { fence.isRemoved($0) })
+        let counts = OutcomeCounts()
+        func request(_ subject: String, origin: ComposeOrigin) -> AgentToolRouter.ComposeRequest {
+            AgentToolRouter.ComposeRequest(
+                mode: .compose, replyTo: nil, to: ["alex@example.com"], cc: [], bcc: [],
+                subject: subject, body: nil, origin: origin,
+                onOutcome: { counts.bySubject[subject, default: []].append($0) })
+        }
+        router.enqueueCompose(request("from gone", origin: ComposeOrigin(sessionKey: Self.goneThread, screen: .chat, fromAccountId: Self.gone)))
+        // Asked in the kept account's chat, sent from the second account: only its From depends on it.
+        router.enqueueCompose(request("from second", origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: second)))
+        router.enqueueCompose(request("from kept", origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: Self.kept)))
+        let queued = router.composeQueueDepth
+        #expect(queued == 3, "control: all three wait")
+
+        fence.remove(Self.gone)
+        fence.arm(second)
+        router.endComposeRequestsOfRemovedAccounts()
+        // The second removal's own drain, scheduled when its fence was set.
+        router.endComposeRequestsOfRemovedAccounts()
+
+        let goneOutcomes = counts.bySubject["from gone"] ?? []
+        let secondOutcomes = counts.bySubject["from second"] ?? []
+        let keptOutcomes = counts.bySubject["from kept"] ?? []
+        #expect(goneOutcomes.count == 1 && Self.isRemovedFailure(goneOutcomes.first), "the first removal's request ends once: \(goneOutcomes)")
+        #expect(secondOutcomes.count == 1 && Self.isRemovedFailure(secondOutcomes.first),
+                "the second removal's request ends once, never dropped without an answer: \(secondOutcomes)")
+        #expect(keptOutcomes.isEmpty, "the kept account's request keeps waiting")
+        let left = router.composeQueueDepth
+        #expect(left == 1, "only the kept account's request is left")
+        let leftSubject = router.firstQueuedRequestForTesting?.subject
+        #expect(leftSubject == "from kept")
+    }
+
+    private static func account(_ id: String, _ address: String) -> Account {
+        var account = Account(emailAddress: address, displayName: "Account", provider: .imap)
+        account.id = id
+        return account
+    }
+
+    /// INVARIANT: a new email's card opens only from the account bound when its turn started.
+    /// When that account is not among the app's accounts as its screen takes the card, the
+    /// request ends with a plain failure the model reads, nothing opens, and the take's hold is
+    /// released so the next card can open.
+    @Test("A new email whose bound account is not among the app's accounts ends as its screen takes it, and frees the queue")
+    func missingBoundAccountEndsTheTakenRequest() throws {
+        let router = Self.router(Fence())
+        let outcomes = Outcomes()
+        let host = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [Self.keptThread])
+        router.enqueueCompose(Self.request("from a missing account", mode: .compose, replyTo: nil,
+                                           origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: "acc-missing"),
+                                           outcomes: outcomes))
+        router.enqueueCompose(Self.request("from kept", mode: .compose, replyTo: nil,
+                                           origin: ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: Self.kept),
+                                           outcomes: outcomes))
+        let accounts = [Self.account(Self.kept, "kept@example.com")]
+        let offerBefore = router.composeOffer
+
+        let first = router.takeCompose(for: host)
+        let taken = try #require(first, "control: the screen takes the first card")
+        let opens = router.canOpen(taken, accounts: accounts)
+        #expect(!opens, "a card bound to an account that is not there never opens")
+        let ended = outcomes.bySubject["from a missing account"]
+        var reason: String?
+        if case .failed(let text)? = ended { reason = text }
+        #expect(reason == AgentToolRouter.fromAccountMissingReason, "its tool hears why: \(String(describing: ended))")
+        let holding = router.composeAwaitingAppear
+        #expect(!holding, "the take's hold is released")
+        let offerAfter = router.composeOffer
+        #expect(offerAfter > offerBefore, "and the screens are asked to look again")
+
+        let next = router.takeCompose(for: host)
+        #expect(next?.subject == "from kept", "the next card can open")
+        if let next {
+            let nextOpens = router.canOpen(next, accounts: accounts)
+            #expect(nextOpens, "control: a card bound to an account that is there opens")
+        }
+        let keptOutcome = outcomes.bySubject["from kept"]
+        #expect(keptOutcome == nil)
+    }
+
+    @Test("A reply, a forward and an inbox new email bind no account, so the app's accounts never stop them")
+    func unboundRequestsAlwaysOpen() {
+        let router = Self.router(Fence())
+        let outcomes = Outcomes()
+        let fromMissing = ComposeOrigin(sessionKey: Self.keptThread, screen: .chat, fromAccountId: "acc-missing")
+        let reply = Self.request("reply", mode: .reply, replyTo: Self.header(account: Self.kept), origin: fromMissing, outcomes: outcomes)
+        let forward = Self.request("forward", mode: .forward, replyTo: Self.header(account: Self.kept), origin: fromMissing, outcomes: outcomes)
+        let inboxNew = Self.request("inbox new email", mode: .compose, replyTo: nil, origin: ComposeTestOrigin.inbox, outcomes: outcomes)
+        for request in [reply, forward, inboxNew] {
+            let opens = router.canOpen(request, accounts: [])
+            #expect(opens, "\(request.subject ?? ""): its card picks its account itself")
+        }
+        #expect(outcomes.bySubject.isEmpty)
     }
 }
 
@@ -588,11 +1043,9 @@ struct AgentToolRouterComposeQueueTests {
 @MainActor
 struct AgentToolRouterBlockingComposeTests {
 
-    /// Shared helper: wraps the cancellation-before-dispatch setup used by
-    /// `composeOutcomeOnTaskCancellation` and `staleCancelledRequestSkippedOnDispatch`.
-    /// Returns only after the cancellation has propagated and the task has
-    /// completed — leaves the router with a resolved request sitting at the
-    /// head of the queue and `presentationCount == 1`.
+    /// Shared helper: queues a request behind a compose window on screen
+    /// (`presentationCount == 1`), waits until it is in the queue, then cancels its task.
+    /// Returns the outcome after the cancellation has propagated and the task has completed.
     private func enqueueAndCancelTaskForTesting(router: AgentToolRouter) async -> ComposeOutcome {
         // Block the queue so the helper's request stays queued, not dispatched.
         router.composePresentationDidBegin()
@@ -603,14 +1056,19 @@ struct AgentToolRouterBlockingComposeTests {
                     mode: .compose, replyTo: nil,
                     to: ["t@example.com"], cc: [], bcc: [],
                     subject: "Queued", body: nil,
+                    origin: ComposeTestOrigin.inbox,
                     onOutcome: onOutcome, outcomeState: state
                 )
             }
         }
-        // Let the helper reach the withCheckedContinuation suspension and
-        // enqueue its request before we cancel.
-        await Task.yield()
-        await Task.yield()
+        // Wait, for a bounded time, until the helper has queued its request, so the cancel stops
+        // a request that really waits in the queue, never a task cancelled before it ran.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while router.composeQueueDepth == 0, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(router.composeQueueDepth == 1, "control: the request waits in the queue before it is stopped")
+        #expect(router.firstQueuedRequestForTesting?.subject == "Queued", "control: the waiting request is the helper's")
         task.cancel()
         return await task.value
     }
@@ -625,17 +1083,18 @@ struct AgentToolRouterBlockingComposeTests {
                     mode: .reply, replyTo: nil,
                     to: ["a@b.com"], cc: [], bcc: [],
                     subject: "Re: test", body: nil,
+                    origin: ComposeTestOrigin.inbox,
                     onOutcome: onOutcome, outcomeState: state
                 )
             }
         }
-        // Wait for the helper to enqueue + dispatch (queue is idle, so the
-        // request promotes straight to pendingCompose on the same run).
+        // Wait for the helper to enqueue (queue is idle, so the asking
+        // screen can take the request on the same run).
         await Task.yield()
         await Task.yield()
 
-        guard let req = router.pendingCompose else {
-            Issue.record("pendingCompose should be set after helper enqueues")
+        guard let req = router.takeCompose(for: ComposeTestOrigin.inboxHost) else {
+            Issue.record("the asking screen should take the request after the helper enqueues")
             task.cancel()
             _ = await task.value
             return
@@ -653,7 +1112,7 @@ struct AgentToolRouterBlockingComposeTests {
         }
     }
 
-    @Test("Task cancellation resumes with .cancelled and flips outcomeState")
+    @Test("A request stopped while it waits leaves the queue with its outcome, though no screen looks again")
     func composeOutcomeOnTaskCancellation() async {
         let router = AgentToolRouter()
 
@@ -663,27 +1122,36 @@ struct AgentToolRouterBlockingComposeTests {
         case .cancelled: break  // expected
         default: Issue.record("Expected .cancelled, got \(outcome)")
         }
-        // Request is still in the queue (presentation blocked dispatch), and
-        // the onCancel handler flipped its resolved flag via tryResolve.
-        #expect(router.composeQueueDepth == 1)
-        #expect(router.firstQueuedRequestResolvedForTesting == true)
+        // The window still holds the queue and nothing takes, yet the stopped request (its
+        // recipients and body) is gone: nothing keeps it until some later take.
+        #expect(router.composeQueueDepth == 0)
+        #expect(router.composePresentationCount == 1)
     }
 
-    @Test("Stale cancelled request at queue head is skipped by dispatcher")
+    @Test("A request cancelled before it was taken is dropped, never taken")
     func staleCancelledRequestSkippedOnDispatch() async {
         let router = AgentToolRouter()
 
-        // Same setup as the previous test — leaves a resolved request in queue.
-        _ = await enqueueAndCancelTaskForTesting(router: router)
+        // A request whose tool was cancelled but which is still queued: the cancellation has
+        // resolved it on another thread and its wait has not ended yet.
+        let state = ComposeOutcomeState()
+        _ = state.tryResolve(.cancelled)
+        router.enqueueCompose(AgentToolRouter.ComposeRequest(
+            mode: .compose, replyTo: nil,
+            to: ["t@example.com"], cc: [], bcc: [],
+            subject: "Queued", body: nil,
+            origin: ComposeTestOrigin.inbox,
+            onOutcome: { _ in }, outcomeState: state
+        ))
         #expect(router.composeQueueDepth == 1)
+        #expect(router.firstQueuedRequestResolvedForTesting == true)
 
-        // Now drop presentationCount to 0. The dispatcher's stale-skip
-        // while-loop should consume the resolved request without promoting
-        // it to pendingCompose.
-        router.composePresentationDidEnd()
+        // The asking screen looks: the resolved request is dropped, not taken.
+        let taken = router.takeCompose(for: ComposeTestOrigin.inboxHost)
 
-        #expect(router.pendingCompose == nil)
+        #expect(taken == nil)
         #expect(router.composeQueueDepth == 0)
+        #expect(router.composeAwaitingAppear == false, "nothing waits for a window that will not open")
     }
 
     @Test("Task already cancelled before helper entry resumes cleanly (no hang)")
@@ -702,6 +1170,7 @@ struct AgentToolRouterBlockingComposeTests {
                     mode: .reply, replyTo: nil,
                     to: ["a@b.com"], cc: [], bcc: [],
                     subject: "Pre-cancelled", body: nil,
+                    origin: ComposeTestOrigin.inbox,
                     onOutcome: onOutcome, outcomeState: state
                 )
             }
@@ -729,14 +1198,15 @@ struct AgentToolRouterBlockingComposeTests {
                     mode: .compose, replyTo: nil,
                     to: ["x@y.com"], cc: [], bcc: [],
                     subject: nil, body: nil,
+                    origin: ComposeTestOrigin.inbox,
                     onOutcome: onOutcome, outcomeState: state
                 )
             }
         }
         await Task.yield()
         await Task.yield()
-        guard let req = router.pendingCompose else {
-            Issue.record("pendingCompose should be set")
+        guard let req = router.takeCompose(for: ComposeTestOrigin.inboxHost) else {
+            Issue.record("the asking screen should take the request")
             task.cancel(); _ = await task.value; return
         }
 

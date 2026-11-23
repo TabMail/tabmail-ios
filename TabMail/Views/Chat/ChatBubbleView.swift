@@ -297,6 +297,8 @@ struct ChatUnsentReplyBubble: View {
     let reply: ChatUnsentReply
     let retry: () -> Void
     let delete: () -> Void
+    /// Undo send while the row's undo window lasts (`ChatUndoSendStatus`).
+    let undo: () -> Void
 
     private var notSent: Bool { reply.failed }
 
@@ -330,35 +332,33 @@ struct ChatUnsentReplyBubble: View {
     }
 
     private var bubble: some View {
-        VStack(alignment: .trailing, spacing: 4) {
-            Group {
-                // Each branch says what it shows, so VoiceOver reads what is on screen.
-                if let text = reply.textMessage {
-                    Text(text)
-                        .font(.body)
-                        .foregroundStyle(Color.white)
-                        .multilineTextAlignment(.leading)
-                        .accessibilityLabel("You said: \(text)")
-                } else {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.mini).tint(Color.white)
-                        Text("Summarizing")
-                            .font(.caption)
-                            .foregroundStyle(Color.white.opacity(0.8))
+        ChatUndoSendTimeline(reply: reply) { look, secondsLeft in
+            VStack(alignment: .trailing, spacing: 4) {
+                ChatUndoSendFill(look: look) { textColor in
+                    Group {
+                        // Each branch says what it shows, so VoiceOver reads what is on screen.
+                        if let text = reply.textMessage {
+                            Text(text)
+                                .font(.body)
+                                .foregroundStyle(textColor)
+                                .multilineTextAlignment(.leading)
+                                .accessibilityLabel("You said: \(text)")
+                        } else {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.mini).tint(textColor)
+                                Text("Summarizing")
+                                    .font(.caption)
+                                    .foregroundStyle(textColor.opacity(0.8))
+                            }
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("You said: summarizing")
+                        }
                     }
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("You said: summarizing")
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
                 }
+                ChatUndoSendStatus(reply: reply, secondsLeft: secondsLeft, undo: undo)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
-                    .fill(Theme.accent)
-            )
-            Text(reply.caption)
-                .font(.caption2)
-                .foregroundStyle(Theme.textSecondary)
         }
     }
 }
