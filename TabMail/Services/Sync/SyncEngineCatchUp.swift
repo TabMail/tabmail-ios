@@ -302,7 +302,10 @@ extension SyncEngine {
     /// out is one it added, and that distinction never decided anything.
     ///
     /// The request rate: a slice sends at most `run.sliceMaxRequests`, and opens a
-    /// window of `run.intervalSeconds` (real time) in `catchUpSliceWindowEnds`; no
+    /// window of `run.intervalSeconds` (real time) in `catchUpSliceWindowEnds`,
+    /// from its turn and, once it ran, again from when its provider work started
+    /// (#1109: a slice that waited for its slot still has its whole slice, so its
+    /// window must not have run out meanwhile); no
     /// slice of the account, from this run or another, starts before the window
     /// ends. The wait happens outside the turn, so a delta is never held by it,
     /// and never reaches past the run's deadline: a window that ends at or after
@@ -348,9 +351,10 @@ extension SyncEngine {
                 // The slice's clock starts when its provider work starts, once
                 // the account's provider work queue gives it a slot: the wait
                 // for the slot, like the wait for the turn, is not working time
-                // (sync timing promise 2). The slice's time, the run's deadline
-                // and an access run's working time all count from here; a
-                // background job whose deadline passed during the wait ends.
+                // (sync timing promise 2). The slice's time and an access run's
+                // working time count from here, and the background job's
+                // deadline, a fixed instant, is checked here: a job whose
+                // deadline passed during the wait ends.
                 // *Superseded (#1109):* the slice's context was made, and its
                 // clock started, at its turn, before the wait for the slot, so a
                 // slice that waited reached the provider with less time, or none.
@@ -362,15 +366,16 @@ extension SyncEngine {
                         guard let context = run.sliceStartingNow(worked: workedSoFar) else {
                             return CatchUpSliceWork(queueWait: asked.duration(to: admitted))
                         }
+                        let admittedAt = Date()
                         let start = run.clock()
                         let result = await self.runCatchUp(provider: provider, folderIds: folderIds, context: context)
                         return CatchUpSliceWork(
-                            result: result, spent: run.clock().timeIntervalSince(start),
+                            result: result, spent: run.clock().timeIntervalSince(start), admittedAt: admittedAt,
                             queueWait: asked.duration(to: admitted), work: admitted.duration(to: .now))
                     }
                 } catch {
                     Self.logCatchUpSlice(
-                        accountId: accountId, run: run, outcome: "notRun(\(error))",
+                        accountId: accountId, run: run, outcome: "notRun", error: error,
                         work: CatchUpSliceWork(queueWait: asked.duration(to: .now)), turnTaken: turnTaken)
                     return .ran(CatchUpSliceResult(), spent: 0)
                 }
@@ -378,6 +383,14 @@ extension SyncEngine {
                     accountId: accountId, run: run, outcome: sliceWork.result == nil ? "runOver" : "ran",
                     work: sliceWork, turnTaken: turnTaken)
                 guard let result = sliceWork.result else { return .runOver }
+                // A slice that ran opens its window from when its provider work
+                // started, so the next slice of the account starts at least one
+                // window after this one's requests began, however long this one
+                // waited for its slot. The window opened at the turn stays for a
+                // slice that found the run over at its slot.
+                if let admittedAt = sliceWork.admittedAt {
+                    self.catchUpSliceWindowEnds[accountId] = admittedAt.addingTimeInterval(run.intervalSeconds)
+                }
                 return .ran(result, spent: sliceWork.spent)
             }
             switch slice {
@@ -468,6 +481,9 @@ extension SyncEngine {
         var result: CatchUpSliceResult?
         /// The slice's working time on the run's clock (`CatchUpRun.workSeconds`).
         var spent: TimeInterval = 0
+        /// When the slice's provider work started (real time, the pacing
+        /// window's clock); nil when it did not run.
+        var admittedAt: Date?
         /// How long the slice waited for a slot of the provider work queue.
         var queueWait: Duration
         /// How long its provider work took, for the debug log.
@@ -480,13 +496,14 @@ extension SyncEngine {
     /// from its turn start: the folder read, the queue wait and the work). A pass
     /// that waited behind it logs `[SyncTurnWait]` when it starts.
     private static func logCatchUpSlice(
-        accountId: String, run: CatchUpRun, outcome: String, work: CatchUpSliceWork,
-        turnTaken: ContinuousClock.Instant
+        accountId: String, run: CatchUpRun, outcome: String, error: (any Error)? = nil,
+        work: CatchUpSliceWork, turnTaken: ContinuousClock.Instant
     ) {
         BackgroundSyncLogger.logDebug({
             let kind = run.workSeconds != nil ? "access" : (run.deadline != nil ? "backfill-background" : "backfill-foreground")
+            let shown = error.map { "\(outcome)(\($0))" } ?? outcome
             let turnHold = turnTaken.duration(to: .now)
-            return "[CatchUpSlice] \(accountId.prefix(8)): kind=\(kind) outcome=\(outcome)"
+            return "[CatchUpSlice] \(accountId.prefix(8)): kind=\(kind) outcome=\(shown)"
                 + " queueWaitMs=\(MigrationTimingLedger.wholeMilliseconds(work.queueWait))"
                 + " workMs=\(MigrationTimingLedger.wholeMilliseconds(work.work))"
                 + " turnHoldMs=\(MigrationTimingLedger.wholeMilliseconds(turnHold))"
