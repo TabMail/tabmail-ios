@@ -1258,47 +1258,54 @@ budget left and read nothing. On a 1.11.5 test build, an IMAP account read chang
 for the first five minutes after the update (folders armed long before, #1277) and in 30 of 31 after the last
 re-drive. Gmail and Outlook accounts were unaffected.
 
-**Decision.** `SyncEngine.performChangePass` samples the end of its read budget once, at the start of its turn
-(`changeReadEnd(turnStart:callerDeadline:)` on `changeReadClock`), and hands that one end to both the read
-(`readAndApplyChanges(account:provider:scope:readEnd:deadline:pass:)`, the request's `ChangeContext`) and the
-re-drive. It reads and applies first, then calls `redriveArmedTurnovers(accountId:until:)` with that end. A
-reaction starts only before the end; the armed folders not reached stay armed for a later pass. A read that throws
-skips the re-drive for that pass: a cancelled pass, or a database failure (the IMAP reader records a lost or
-refused connection per folder and does not throw). A reaction already running at the end runs on until it completes
-or its pass is cancelled by the caller's timeout. A reaction that stops before it stamps the new epoch (step 5)
+**Decision.** `SyncEngine.performChangePass` builds its request first (`makeChangeRequest`, the snapshot taken
+at the start of the turn). The request samples the end of the pass's read budget once, after its folder snapshot
+and before the first request (`changeReadEnd(turnStart:callerDeadline:)` on `changeReadClock`, in the request's
+`ChangeContext`). The pass reads and applies with that request (`readAndApplyChanges(account:provider:request:
+deadline:pass:)`), then calls `redriveArmedTurnovers(accountId:until:)` with the same end. The end is a start
+cutoff: a reaction starts only before it; the armed folders not reached stay armed for a later pass. A pass that
+throws before the re-drive skips it: a failed request snapshot, a cancelled pass, a database failure, or a read in
+which every folder the pass read failed (the apply then throws; the IMAP reader itself records a lost or refused
+connection per folder and does not throw). A reaction already running at the end runs on until it completes or
+its pass is cancelled by the caller's timeout. A reaction that stops before it stamps the new epoch (step 5)
 leaves the flag set, and a later re-drive retries it (unchanged). One that stops after the stamp, during its resync
-listing (step 6), leaves the folder unarmed under its new epoch with its old rows purged; the folder's next listing
-fills it (the change pass's listing of a changed folder it reads, the full sync for a syncable folder, opening the
-folder, or the catch-up crawl, since the purge reset `backfillComplete`). A pass cancelled before the end may still
-start the next folder's reaction; that reaction stops at its first database read (a cancelled task's read throws)
-and changes nothing. The full sync's re-drive (after its listing, syncable folders) and the apply's reaction for a
-folder its own read found renumbered (after the apply) were already after the read and are unchanged; a folder that
-reaction left armed is retried by the same pass's re-drive while the budget lasts.
+listing (step 6), leaves the folder unarmed under its new epoch with its old rows purged; a later listing fills it
+(the change pass's listing of an untracked folder it reads and finds changed, the full sync for a syncable folder,
+opening the folder, or the catch-up crawl, since the purge reset `backfillComplete`). A pass cancelled before the
+end may still start the next folder's reaction; that reaction's first database read fails (a cancelled task's
+read throws), so it starts no purge. The full sync's re-drive (after its listing) and the apply's reaction for a
+folder its own read found renumbered (after the apply) were already after the read and are unchanged; a folder
+that reaction left armed is retried by the same pass's re-drive while the budget lasts.
 
 **Why this placement and not a reaction outside the turn.** The apply already tolerates a reaction running
 outside the turn (its in-transaction armed check and binding epoch check), and the trigger handler spawns one
 that way. But every reaction disconnects the provider's sessions (step 5's connection hygiene), and a re-drive
 running beside the change read would cut that read's session once per armed folder. Inside the turn, after the
 read, a re-drive never cuts a change read of its own account. A pass waiting for the turn behind a re-drive waits
-for the holder's read budget plus the one reaction running at its end. That reaction is bounded by its caller's
-timeout (10 s per-account pass, 60 s foreground pass) and then by how long its cancelled work takes to unwind; a
-caller that sets no timeout does not bound it. The waiting pass follows a pass that has just read the account's
-changes.
+for the rest of the holder's turn: its read budget, the one reaction running at the budget's end, and whatever
+the holder does after its change pass (a foreground pass's full sync and catch-up start). That reaction is
+bounded by its caller's timeout (10 s per-account pass, 60 s foreground pass) and then by how long its cancelled
+work takes to unwind; a caller that sets no timeout does not bound it. The waiting pass follows a pass that has
+just read the account's changes. Whether a signal that arrives during the holder's turn is read when the turn
+frees is #1289's (a waiting pass's deadline, and a follow-up pass), not this amendment's.
 
 **Liveness (count the predicates, Memory 114).** An armed folder is re-driven by: this re-drive (every armed folder
-of the account, of any role, on every pass whose read did not throw, inbox-only passes included, while the budget
-lasts); the full sync after its listing (armed syncable folders); the apply's reaction (a folder the pass's own read
-found renumbered); `syncFolderMessages` for the folder it is asked to list (opening any folder); and the trigger
-handler (a folder a read or listing finds renumbered). Before this amendment the re-drive also ran on passes whose
-read then threw or used its whole budget. A folder now waits through such passes; a custom folder that is not a
-favourite, which no scheduled listing selects, then waits until the user opens it, the on-demand path such folders
-always had. Accepted: the read comes first.
+of the account, of any role, with a path, on every pass that reaches it, inbox-only passes included, while the
+budget lasts); the full sync after its listing (armed folders of the primary or secondary roles or favourites,
+with a path, excluding `skippablePaths` and the folders the pass tracks); the apply's reaction (a folder the pass's
+own read found renumbered); `syncFolderMessages` for the folder it is asked to list (opening any folder); and the
+trigger handler (a folder a read or listing finds renumbered). None is unconditional. Before this amendment the
+re-drive also ran on passes whose read then threw or used its whole budget. A folder now waits through such
+passes, and a later armed folder also waits while an earlier one's reaction uses the rest of each pass's budget.
+A custom folder that is not a favourite, which no scheduled listing selects, then waits until the user opens it,
+the on-demand path such folders always had. Accepted: the read comes first.
 
 **Consequences.** A pass's change read is never delayed by its own re-drive; a pass waiting for the turn can be,
 by the one reaction running at the holder's budget end (above). Re-driving N armed folders spreads over as many
 passes as their reactions need; each completed reaction is permanent. The turnover's new numbering is listed after
-the read instead of before it, so its arrivals show one step later in the same pass. No new setting, column or
-migration.
+the read instead of before it, so its arrivals show one step later in the same pass when that listing completes.
+No new setting, column or migration; nothing is added before the change read (the armed-folder query that ran
+before it now runs after it).
 
 Keywords: redriveArmedTurnovers, changeReadEnd, runUidValidityResetReaction, uidValidityResetPendingAt, write
 barrier exhausted, turnover re-drive, change read starved, #1287, #974, #1277.

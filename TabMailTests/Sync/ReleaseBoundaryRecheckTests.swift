@@ -930,9 +930,11 @@ struct ReleaseBoundaryRecheckTests {
                 try db.execute(sql: "UPDATE folder SET catchUpState = '{\"seen\":1}' WHERE id = ?", arguments: [custom.id])
             }
 
-            let readEnd = SyncEngine.changeReadEnd(turnStart: Date(), callerDeadline: nil)
-            let outcome = try #require(try await SyncEngine().readAndApplyChanges(
-                account: try w.account(), provider: w.provider, scope: .all, readEnd: readEnd))
+            let engine = SyncEngine()
+            let account = try w.account()
+            let request = try await engine.makeChangeRequest(accountId: account.id, scope: .all, deadline: nil)
+            let read = try await engine.readAndApplyChanges(account: account, provider: w.provider, request: request)
+            let outcome = try #require(read)
             #expect(try w.row("c-read", in: Self.customPath)?.isRead == false, "precondition: the re-read applied")
             #expect(!outcome.trackableFolderIds.contains(custom.id), "the read does not make the folder trackable")
             #expect(try Self.tracking(w.pool, folderId: custom.id) == false)
