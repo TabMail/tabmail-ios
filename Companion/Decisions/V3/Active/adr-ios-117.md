@@ -96,7 +96,9 @@ what TabMail's servers keep; this table holds only the user's own unsent words o
 chat history the same key already keeps, and goes with that thread's AI data and with the account.
 
 **Consequences:**
-- ios-978 (a new email started as a chat) reuses this store for its field's words.
+- ios-978 (a new email started as a chat) was expected to reuse this store for its field's words. It does
+  not (2026-11-23): a new email's pill is about no email, so it keeps its own fill (decision 1), and its
+  words go to its draft (ADR-IOS-114 decision 24).
 - A thread whose key changes (a `computedThreadId` rewrite, fenced by `ThreadIdWriteFenceTests`) strands
   its words as it strands its chat; the purge deletes them once the old key has no email.
 - Words typed in a field whose send is still in flight are not kept until the send completes; a send
