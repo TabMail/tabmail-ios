@@ -554,7 +554,7 @@ struct IMAPChangeEngineTests {
             let bothPasses = reacted.withLock { $0 }
             #expect(completed.uidValidityResetPendingAt == nil, "the next pass did not re-drive the folder left armed")
             #expect(completed.lastKnownUidValidity == Self.epoch + 1)
-            #expect(bothPasses.count == 2, "each folder's reaction ran once: \(bothPasses)")
+            #expect(bothPasses.count == 2, "the second folder's reaction did not run in the second pass: \(bothPasses)")
         }
     }
 

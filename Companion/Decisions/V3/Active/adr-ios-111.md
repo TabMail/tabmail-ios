@@ -1277,8 +1277,10 @@ yet, unless the listing committed some before it stopped); a later listing fills
 opening the folder, or the catch-up crawl, since the purge reset `backfillComplete`). A pass cancelled before the
 end may still start the next folder's reaction; that reaction's first database read fails (a cancelled task's
 read throws), so it starts no purge. The full sync's re-drive (after its listing) and the apply's reaction for a
-folder its own read found renumbered (after the apply) were already after the read and are unchanged; a folder
-that reaction left armed is retried by the same pass's re-drive while the budget lasts.
+folder its own read found renumbered are unchanged. The second runs inside the read: after the apply's folder
+transactions and before the untracked folders' listings, so in a pass that also has a changed untracked folder
+that listing waits for the reaction, as before. A folder that reaction left armed is retried by the same pass's
+re-drive while the budget lasts.
 
 **Why this placement and not a reaction outside the turn.** The apply already tolerates a reaction running
 outside the turn (its in-transaction armed check and binding epoch check), and the trigger handler spawns one
