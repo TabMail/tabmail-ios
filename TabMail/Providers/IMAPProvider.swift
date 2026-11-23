@@ -547,6 +547,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     //    (cancelling whatever it finds first). `stopIdle()`/`markDirty()`:
     //    cancel + nil. `onIdleStreamEnded(owner:)`: nil ONLY inside the
     //    identity-matched branch. `evictIdleConnection()`: cancel + nil.
+    //  - `idleEnabled` is the wish for IDLE (`startIdle()` sets it,
+    //    `stopIdle()` clears it). Every path that ends a listener or a launch
+    //    while the wish stands starts or schedules its successor:
+    //    `markDirty()` at once, in its own turn (`tearDownIdleConnection`,
+    //    #1288); `onIdleStreamEnded` after 5 s or 10 s;
+    //    `retryLaunchIdleConnection` after 10 s; `evictIdleConnection()` after
+    //    30 s. A cancelled listener and a refused launch never relaunch on
+    //    their own: their canceller does.
     //
     // CROSS-FIELD INVARIANTS (all three lanes)
     //  1. A resumed-but-not-yet-continued waiter holds ownership: the in-use
@@ -2981,7 +2989,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         for (_, cont) in folderCapacityWaiters { cont.resume(throwing: ProviderError.notConnected) }
         folderCapacityWaiters.removeAll()
 
-        // Stop IDLE listener (don't clear idleEnabled — it will resume after reconnect)
+        // End IDLE and, while it is still wanted (`idleEnabled` is kept), start
+        // it again on a fresh connection (`tearDownIdleConnection`, #1288).
         if tearDownIdleConnection() {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] markDirty: disconnecting IDLE connection") }
         }
@@ -3280,10 +3289,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// generation), at every teardown call site that could plausibly log out a
     /// connection some OTHER task still holds: `disconnect()` and `markDirty()`
     /// — the two EXTERNAL teardowns (cross-field invariant #1's void set).
-    /// It also fires for the IDLE connection's teardown in `stopIdle()` and
-    /// `evictIdleConnection()`, which share `markDirty()`'s IDLE path
-    /// (`tearDownIdleConnection`); the IDLE connection is never checked out,
-    /// so those calls can never look like a held connection being logged out.
+    /// It also fires for the IDLE connection's teardown in `stopIdle()`, which
+    /// shares `markDirty()`'s IDLE path (`tearDownIdleConnection`); the IDLE
+    /// connection is never checked out, so that call can never look like a
+    /// held connection being logged out. `evictIdleConnection()` logs its IDLE
+    /// connection out on its own path, without this hook.
     ///
     /// NOT wired into `releaseActionConnection(healthy:false)` /
     /// `releaseFolderConnection(healthy:false)`: those are the exclusive
@@ -3505,8 +3515,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         tearDownIdleConnection()
     }
 
-    /// The ONE way an IDLE session is ended from outside its listener
-    /// (`markDirty()`, `stopIdle()`, `evictIdleConnection()`): cancel the
+    /// The way `markDirty()` and `stopIdle()` end an IDLE session from outside
+    /// its listener (`evictIdleConnection()` has its own teardown and must not
+    /// use this one: the relaunch below would undo the 30 s back-off and take
+    /// back the slot the eviction freed): cancel the
     /// listener, clear the slot, then a detached DONE followed by LOGOUT on the
     /// tracked connection. SwiftMail's `executeCommandBody` calls
     /// `waitForIdleCompletionIfNeeded()` before EVERY command including LOGOUT,
@@ -3517,14 +3529,27 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// owns the connection's only logout, so nothing can put a LOGOUT on the
     /// wire ahead of the DONE. Synchronous — callers keep their one-actor-turn
     /// teardown. Returns whether an IDLE connection was torn down.
+    ///
+    /// A teardown that leaves IDLE wanted (`idleEnabled`, i.e. `markDirty()`)
+    /// starts its successor here, on a fresh connection, in the same turn
+    /// (#1288). Nothing else would: the listener it cancelled returns without
+    /// relaunching, a launch it cancelled is refused at its claim, and IDLE is a
+    /// standing connection, so there is no "next use" to recreate it. The
+    /// resume's `markDirty()` lands while `startIdle()`'s launch is connecting
+    /// on most returns to the app; without this, IDLE stayed off for the rest of
+    /// the session. `stopIdle()` clears `idleEnabled` first, so it starts nothing.
     @discardableResult
     private func tearDownIdleConnection() -> Bool {
         idleListenerTask?.cancel()
         idleListenerTask = nil
-        guard let server = idleServer else { return false }
-        idleServer = nil
-        detachedTeardownLogout(server, sendDoneFirst: true)
-        return true
+        var toreDown = false
+        if let server = idleServer {
+            idleServer = nil
+            detachedTeardownLogout(server, sendDoneFirst: true)
+            toreDown = true
+        }
+        if idleEnabled { launchIdleConnection() }
+        return toreDown
     }
 
     /// Minimum server connection limit to enable IDLE.
@@ -3536,7 +3561,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ///
     /// T3.7 PORT (D-20 / R7-F3) — this function is deliberately callable
     /// concurrently: its own callers (`startIdle`, `onIdleStreamEnded`'s retry
-    /// timer, `evictIdleConnection`'s post-eviction relaunch) are not mutually
+    /// timer, `retryLaunchIdleConnection`'s timer, `evictIdleConnection`'s
+    /// post-eviction relaunch, `tearDownIdleConnection`'s relaunch for
+    /// `markDirty()`) are not mutually
     /// exclusive, so two overlapping calls landing while `idleServer` is still
     /// nil (neither `createServer()` RTT has resolved) both reach the claim
     /// below. Pre-fix, the created connection was planted via an unconditional
