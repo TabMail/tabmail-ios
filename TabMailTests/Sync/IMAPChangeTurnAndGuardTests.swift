@@ -474,11 +474,21 @@ struct IMAPChangeTurnAndGuardTests {
                     }
                 }
                 try await Self.waitUntil { finished.count.withLock { $0 } == kinds.count }
-                #expect(finished.count.withLock { $0 } == kinds.count, "\(label): every task completed (\(kinds))")
+                let finishedCount = finished.count.withLock { $0 }
+                #expect(finishedCount == kinds.count, "\(label): every task completed (\(kinds))")
                 // One more change pass through the production entry, and no repair
                 // listing: a listing would re-list the folder and hide what the
-                // overlapping tasks left behind.
-                _ = try await w.engine.backgroundDeltaSync(account: w.account)
+                // overlapping tasks left behind. A change pass that finds the
+                // account busy (an older-mail slice a pass started) reads nothing,
+                // so it is tried again until it runs.
+                let passDeadline = Date().addingTimeInterval(10)
+                var read = try await w.engine.backgroundDeltaSync(account: w.account)
+                while read == nil, Date() < passDeadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                    read = try await w.engine.backgroundDeltaSync(account: w.account)
+                }
+                let changePassRan = read != nil
+                #expect(changePassRan, "\(label): the last change pass never found the account free")
                 let rows = try w.uids()
                 #expect(Set(["4", "5", "6"]).isSubset(of: rows), "\(label): no live message lost: \(rows.sorted())")
                 #expect(rows.isSubset(of: Set((1...6).map(String.init))), "\(label): no row the server does not hold: \(rows.sorted())")

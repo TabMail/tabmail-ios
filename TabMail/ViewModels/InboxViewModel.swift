@@ -1812,10 +1812,17 @@ final class InboxViewModel {
             // Each account connects (if it has no provider yet) and syncs in its own
             // task, so an account that cannot connect or sync never stops the others
             // (#689). The run's outcome is the one error that reaches this catch.
-            try await manager.syncFolders(folders, connecting: uniqueAccounts)
+            // Sync trigger: the pull's change read gives an account another pass
+            // holds a follow-up flag, never a wait; the folders on screen still
+            // wait for their turn. Siblings: IDLE, silent push, the open-app push,
+            // the poll, a return (the sync design block in
+            // SyncEngineOneSyncAtATime.swift; ADR-IOS-104).
+            // An account whose change read found it busy was not read by this pull,
+            // so the run is partial (its follow-up reports for it).
+            let busy = try await manager.syncFolders(folders, connecting: uniqueAccounts)
 
             AccountManagerState.shared.lastSyncFailed = false
-            AccountManagerState.shared.finishSyncRun(coverage: coverage, countedFailure: false, completed: true)
+            AccountManagerState.shared.finishSyncRun(coverage: busy ? .partial : coverage, countedFailure: false, completed: true)
         } catch is CancellationError {
             // Task cancelled (e.g., user navigated away) — not user-facing
         } catch let error where SyncEngine.isTransientError(error) {

@@ -244,7 +244,55 @@ final class SyncScheduler {
         refreshNetworkAvailableForTesting = refreshNetworkAvailable
         isPollActive = pollActive
     }
+
+    /// nil outside the harness below: the app's own state decides. A test may
+    /// set these on its own instance, or on `shared` to see what the app's
+    /// engine asks for, and restores them.
+    var applicationStateForTesting: UIApplication.State?
+    var foregroundReadinessHook: (@MainActor @Sendable () async -> Bool)?
+    var stageTwoHook: (@MainActor @Sendable (_ trigger: String) async -> Void)?
+
+    /// Test harness for the follow-up stage 2 (the sync design block in
+    /// SyncEngineOneSyncAtATime.swift): `foreground` stands for the app's
+    /// state, `foregroundReady` for the first-paint gate, and `stageTwo`,
+    /// when given, records each stage 2 the scheduler starts instead of
+    /// running it.
+    init(
+        foreground: Bool, pollActive: Bool = false,
+        foregroundReady: @escaping @MainActor @Sendable () async -> Bool = { true },
+        stageTwo: (@MainActor @Sendable (_ trigger: String) async -> Void)? = nil
+    ) {
+        applicationStateForTesting = foreground ? .active : .background
+        isPollActive = pollActive
+        foregroundReadinessHook = foregroundReady
+        stageTwoHook = stageTwo
+    }
     #endif
+
+    /// The app is in the foreground now, read from the app's own state
+    /// (`UIApplication.applicationState`), not from the poll timer (the timer
+    /// can be missing while the app is in front, and a tick already sent can
+    /// still run after `stopPolling`). Inactive (a sheet or Control Center over
+    /// the app) counts as foreground: the app is on screen. (The silent-push
+    /// path's own check is narrower: `.active` only.)
+    private var isForeground: Bool {
+        applicationState != .background
+    }
+
+    private var applicationState: UIApplication.State {
+        #if DEBUG
+        if let applicationStateForTesting { return applicationStateForTesting }
+        #endif
+        return UIApplication.shared.applicationState
+    }
+
+    /// The first-paint gate of a foreground return (`AppStartup.awaitLaunchReady`).
+    private func foregroundLaunchReady() async -> Bool {
+        #if DEBUG
+        if let foregroundReadinessHook { return await foregroundReadinessHook() }
+        #endif
+        return await AppStartup.shared.awaitLaunchReady(background: false)
+    }
 
     private func backgroundDatabaseReady() async -> Bool {
         #if DEBUG
@@ -322,6 +370,10 @@ final class SyncScheduler {
     }
 
     /// Unified startup sequence for all sync entry points.
+    /// Sync trigger: its stage 1 gives an account another pass holds a follow-up
+    /// flag, never a wait. Sibling triggers: IDLE, the open-app push, pull to
+    /// refresh, the poll (the sync design block in SyncEngineOneSyncAtATime.swift;
+    /// ADR-IOS-104).
     /// - inboxOnly: true for BGAppRefresh/push (limited budget), false for foreground/BGProcessing
     /// - drain: how long to wait for queue drain after repopulate
     /// - foregroundFastPath: pass `true` ONLY from in-foreground new-mail triggers
@@ -685,6 +737,17 @@ final class SyncScheduler {
                     fgStep("first-paint gate cleared")
                     BootProfiler.mark("startForegroundPolling: first paint reached — herd starting")
                 }
+                // Stage 1 then stage 2, on purpose (design settled 2026-11-23, #1278).
+                // `syncStartup` starts stage 1, the lean quick sync of every folder of
+                // every account, and returns without waiting for it. `poll()` below
+                // runs stage 2, which repeats the quick sync and runs the full sync
+                // when it is due. The two take each account's turn one after the
+                // other, so the second quick sync usually finds nothing; that one
+                // cheap request per account is accepted. Never add a recent-sync
+                // guard or skip to save it: the 15-second skip swallowed due full
+                // syncs (#1275). Nothing here may wait for stage 1, and stage 2's
+                // time limit starts only when it runs (#1289). Full design and
+                // history: the sync design block in SyncEngineOneSyncAtATime.swift.
                 await syncStartup(inboxOnly: false, drain: .none)
                 fgStep("syncStartup returned")
                 BootProfiler.mark("startForegroundPolling: syncStartup returned (herd spawned)")
@@ -713,6 +776,7 @@ final class SyncScheduler {
             // We DON'T start a second one — but the ungated merge above already ran,
             // so a foreground during a slow sync still surfaces freshly-staged mail.
             BootProfiler.mark("startForegroundPolling: herd SKIPPED (sync already in flight) — ungated merge still ran")
+            stageTwoForReturnDuringReturn()
         }
 
         guard timer == nil else { return }
@@ -767,6 +831,10 @@ final class SyncScheduler {
             }
             for account in accounts {
                 guard let provider = await manager.provider(for: account) as? IMAPProvider else { continue }
+                // Sync trigger: an IDLE event's read gives an account another pass
+                // holds a follow-up flag, never a wait. Siblings: silent push, the
+                // open-app push, pull to refresh, the poll, a return (the sync
+                // design block in SyncEngineOneSyncAtATime.swift; ADR-IOS-104).
                 await provider.startIdle { [weak self] event, email in
                     guard let self else { return }
                     switch event {
@@ -956,8 +1024,10 @@ final class SyncScheduler {
     @discardableResult
     func backgroundPoll(inboxOnly: Bool = false, scheduleProcessing: Bool = true, accountEmail: String? = nil) async -> Bool {
         // No overlap guard here: `SyncEngine.oneSyncAtATime` runs one sync pass
-        // per account at a time, so a delta arriving during another pass of the
-        // same account waits its turn.
+        // per account at a time. Stage 1 is a sync trigger (return, push, IDLE,
+        // background refresh): for an account another pass holds, it sets the
+        // account's follow-up flag and returns instead of waiting (the sync
+        // design block in SyncEngineOneSyncAtATime.swift; ADR-IOS-104).
         guard NetworkMonitor.checkConnected() else {
             BackgroundSyncLogger.log("backgroundPoll: SKIPPED reason=noNetwork (account=\(accountEmail ?? "all"))")
             return false
@@ -1007,7 +1077,85 @@ final class SyncScheduler {
     /// TEMP: Kill switch to verify sync polling is the source of swipe lag. Remove after testing.
     static let syncDisabled = false
 
-    private func poll() async {
+    // MARK: - Follow-up stage 2 (the sync design block in SyncEngineOneSyncAtATime.swift)
+
+    /// Whether the follow-up stage 2 may start now: only in the foreground, and
+    /// never in demo mode. Fast Sync does not hold it back: it stands in for a
+    /// trigger's own read, which Fast Sync never held back (v1.11.2), so during
+    /// Fast Sync it waits for the running catch-up slice and reads before the
+    /// next one. In the background, where the processing job's fast sync runs,
+    /// it does not start anyway.
+    private var followUpMayStart: Bool {
+        isForeground && !Self.syncDisabled && !DemoModeStore.shared.isActive
+    }
+
+    /// Whether the poll's stage 2 for every account may start now
+    /// (`stageTwoForEveryAccount`): the follow-up's gate, and not during Fast
+    /// Sync, when the poll skips its own reads.
+    private var pollStageTwoMayStart: Bool {
+        followUpMayStart && !AccountManagerState.shared.fastSyncModeActive
+    }
+
+    /// Runs the one stage 2 an account's follow-up flag asks for
+    /// (`AccountManager.followUpRun` -> `SyncEngine.followUpPass`), asked when a
+    /// trigger sets the flag and again when the account becomes free with the
+    /// flag set. It waits for the work holding the turn to end. When a stage 2
+    /// may not start, as in the background, it starts nothing: the flag stays
+    /// set, and the next opening's stage 1 asks again when it ends. The same
+    /// gate (`followUpMayStart`) is checked again when it gets the turn
+    /// (`SyncEngine.followUpPass`): the app may have left while it waited. It
+    /// stands in for the trigger's own read (in the foreground only, and for
+    /// every folder, the stage 2), so it keeps that read's Fast Sync eligibility
+    /// and side steps: it waits for the first paint, as the opening's reads do (the
+    /// startup budget); when it read, the inbox reloads, as after a push's own
+    /// read (`backgroundPoll`: the trigger's reload came before this read), and
+    /// when it found changes the notification extension's cursors are mirrored
+    /// again.
+    func runSyncFollowUp(accountId: String) async {
+        guard followUpMayStart else {
+            BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): no stage 2 now, the flag waits")
+            return
+        }
+        guard await foregroundLaunchReady() else { return }
+        #if DEBUG
+        if let stageTwoHook { await stageTwoHook("follow-up \(accountId)"); return }
+        #endif
+        guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: accountId) }),
+              account.isActive else { return }
+        BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): stage 2")
+        guard let result = await manager.followUpRun(account, mayStart: { self.followUpMayStart }) else { return }
+        if result.hadChanges { NSEDataBridge.mirrorLastHistoryIds() }
+        NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+    }
+
+    /// Stage 2 for every account, for a trigger that found the work it would
+    /// start already running: a poll tick during a poll (#1313), a return to the
+    /// app during the previous return's work (#1314). An account that is free
+    /// runs it now; one that is busy gets its follow-up flag. The running work
+    /// does the rest (the queued work, the push re-subscribe).
+    private func stageTwoForEveryAccount(trigger: String) async {
+        guard pollStageTwoMayStart else { return }
+        BackgroundSyncLogger.logDebug("[SyncFollowUp] \(trigger): stage 2 for every account")
+        #if DEBUG
+        if let stageTwoHook { await stageTwoHook(trigger); return }
+        #endif
+        _ = await manager.foregroundPollRun()
+    }
+
+    /// A return to the app while the previous return's work still runs (the
+    /// herd is skipped) still gets a read that starts after it (#1314): stage 2
+    /// for every account once the inbox has painted. An account the running work
+    /// holds gets its follow-up flag instead; nothing else of the herd runs again.
+    func stageTwoForReturnDuringReturn() {
+        Task {
+            guard await foregroundLaunchReady() else { return }
+            await stageTwoForEveryAccount(trigger: "return during a running return")
+        }
+    }
+
+    /// The foreground poll (the timer's tick and a return's herd). Internal, not
+    /// private, so a test drives a tick that lands during a poll (#1313).
+    func poll() async {
         if Self.syncDisabled { return }
         // Pause all sync while demo mode is active — the user's real accounts must
         // not sync or churn the DB/UI underneath the demo (incl. demo entered from
@@ -1018,6 +1166,9 @@ final class SyncScheduler {
         }
         guard !isPollActive else {
             BackgroundSyncLogger.log("poll: SKIPPED — already polling")
+            // The tick still gets its stage 2 (#1313); the running poll does the
+            // queued work. The sync design block in SyncEngineOneSyncAtATime.swift.
+            await stageTwoForEveryAccount(trigger: "poll tick during a poll")
             return
         }
         isPollActive = true

@@ -87,6 +87,7 @@ struct GmailCatchUpTests {
         folders: [(path: String, role: FolderRole)] = GmailCatchUpTests.catchUpFolders,
         userLabels: [String: String] = [labelPath: "Projects"],
         concurrency: Int = 1,
+        syncFollowUp: @escaping @Sendable (_ accountId: String) -> Void = { _ in },
         _ body: (World) async throws -> Void
     ) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -104,7 +105,7 @@ struct GmailCatchUpTests {
         try insert(local, accountId: name, pool: pool)
 
         let provider = server.provider()
-        let engine = SyncEngine()
+        let engine = SyncEngine(syncFollowUp: syncFollowUp)
         await engine.register(
             accountId: name, provider: provider, workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: concurrency))
         let world = World(server: server, provider: provider, engine: engine, pool: pool, accountId: name)
@@ -3495,18 +3496,46 @@ struct GmailCatchUpTests {
         return try condition()
     }
 
+    /// The follow-up stage 2 the scheduler runs in the foreground for each ask
+    /// (`SyncScheduler.runSyncFollowUp` → `SyncEngine.followUpPass`), for a test
+    /// whose engine is made inside its world.
+    final class FollowUpRunner: Sendable {
+        let engine = Mutex<SyncEngine?>(nil)
+        let started = Mutex<[Task<Bool?, Error>]>([])
+
+        func ask(_ accountId: String) {
+            guard let engine = engine.withLock({ $0 }) else { return }
+            let followUp = Task { try await engine.followUpPass(accountId: accountId, mayStart: { true }) }
+            started.withLock { $0.append(followUp) }
+        }
+
+        /// Waits for every follow-up started; how many ran a stage 2.
+        func ran() async throws -> Int {
+            var ran = 0
+            for followUp in started.withLock({ $0 }) {
+                let result = try await followUp.value
+                if result != nil { ran += 1 }
+            }
+            return ran
+        }
+    }
+
     /// The catch-up takes the account's one-sync-at-a-time turn one slice at a
-    /// time: a silent-push delta that arrives while a slice is running starts as
-    /// soon as that slice ends, and the run goes on after it.
-    @Test("A catch-up slice hands the turn on: a delta that arrives during the catch-up waits at most one slice")
+    /// time: a silent-push delta that arrives while a slice is running reads
+    /// nothing and sets the account's follow-up flag (it never waits); the
+    /// follow-up stage 2 it asks for waits in line and reads as soon as that
+    /// slice ends, and the run goes on after it.
+    @Test("A catch-up slice hands the turn on: a delta that arrives during the catch-up gets its follow-up read after at most one slice")
     func sliceHandsTheTurnOn() async throws {
         let clock = Clock()
         let count = 8
         let slice = 3
         let (seeds, local) = Self.rangesWorld(clock, count: count)
+        let followUps = FollowUpRunner()
         try await Self.withWorld(
             "gcu-slice-turn", seeds: seeds, local: local, folders: Self.inboxOnly,
-            concurrency: SyncConfig.imapMaxConnectionCeiling
+            concurrency: SyncConfig.imapMaxConnectionCeiling,
+            syncFollowUp: { followUps.ask($0) }
         ) { world async throws in
             world.server.serveProfile()
             try Self.setAccount(world, cursor: world.server.currentHistoryId(), lastFullSyncAt: Date())
@@ -3514,6 +3543,9 @@ struct GmailCatchUpTests {
             let account = try await Self.account(world)
             let engine = world.engine
             let server = world.server
+            followUps.engine.withLock { $0 = engine }
+            // The engine's callback holds the runner, and the runner the engine.
+            defer { followUps.engine.withLock { $0 = nil } }
             let run = Self.requestRun(server, slice: slice, deadline: nil)
             let catchUp = Task { await engine.runCatchUpRun(account: account, run: run) }
 
@@ -3521,39 +3553,50 @@ struct GmailCatchUpTests {
             let inThirdSlice = await Self.eventually(seconds: 30) { server.listRequests().count >= 2 * slice + 1 }
             #expect(inThirdSlice, "precondition: the catch-up reached its third slice")
             let arrival = server.http.recordedCalls().count
-            _ = try await engine.backgroundDeltaSync(account: account)
-
-            let calls = server.http.recordedCalls()
-            let history = try #require(
-                calls.indices.first { $0 >= arrival && calls[$0].url.contains("/history") }, "precondition: the delta ran")
-            let waited = calls[arrival..<history].filter { $0.url.contains("/messages") }.count
-            #expect(waited <= slice, "the delta waited for \(waited) catch-up requests; a slice is \(slice)")
-            // Every slice here is one range's three lists, so a delta that runs
-            // between slices finds a whole number of slices before it.
-            let before = calls[..<history].filter { $0.url.contains("/messages") }.count
-            #expect(before % slice == 0, "the delta ran inside a slice, after \(before) catch-up requests")
+            let read = try await engine.backgroundDeltaSync(account: account)
+            let readNothing = read == nil
+            #expect(readNothing, "a delta during a slice must set the follow-up flag, not wait for the slice")
 
             #expect(await catchUp.value, "the run made progress")
+            let ran = try await followUps.ran()
+            #expect(ran == 1, "the delta's flag got \(ran) follow-up stage 2s; it gets one")
+            let calls = server.http.recordedCalls()
+            let changeReads = calls.indices.filter { calls[$0].url.contains("/history") }
+            #expect(changeReads.count == 1, "\(changeReads.count) change reads: the busy delta reads nothing and its follow-up reads once")
+            guard let readAt = changeReads.first, readAt >= arrival else {
+                Issue.record("no change read started after the delta at request \(arrival): \(changeReads)")
+                return
+            }
+            let waited = calls[arrival..<readAt].filter { $0.url.contains("/messages") }.count
+            #expect(waited <= slice, "the follow-up read after \(waited) catch-up requests; a slice is \(slice)")
+            // Every slice here is one range's three lists, so a read at the end
+            // of a slice finds a whole number of slices before it.
+            let before = calls[..<readAt].filter { $0.url.contains("/messages") }.count
+            #expect(before % slice == 0, "the follow-up read inside a slice, after \(before) catch-up requests")
             #expect(try Self.state(world, inboxPath)?.lastCompletedAt != nil,
-                    "the run goes on after the delta and completes the listing")
-            #expect(server.listRequests().filter { $0.labelId == inboxPath }.count == count, "no range is listed twice")
+                    "the run goes on after the follow-up and completes the listing")
+            let inboxListings = server.listRequests().filter { $0.labelId == inboxPath }.count
+            #expect(inboxListings == count, "no range is listed twice")
         }
     }
 
     /// The same through the production entry: the background processing job
     /// (`performBackfill`, real clock and the job's deadline) releases the
     /// account's turn between its slices, so a delta that arrives while the job
-    /// runs waits at most one slice plus one request timeout, never the job.
-    @Test("The background job hands the turn on between slices: a delta that arrives during it waits at most one slice",
+    /// runs gets its follow-up read within one slice plus one request timeout,
+    /// never at the job's end.
+    @Test("The background job hands the turn on between slices: a delta that arrives during it gets its follow-up read within one slice",
           .enabled(if: !NetworkMonitor.checkExpensive()))
     func jobHandsTheTurnOnBetweenSlices() async throws {
         let clock = Clock()
         let count = 20
         let roundTrip = SyncConfig.catchUpSliceSeconds / 10
         let (seeds, local) = Self.rangesWorld(clock, count: count)
+        let followUps = FollowUpRunner()
         try await Self.withWorld(
             "gcu-job-turn", seeds: seeds, local: local, folders: Self.inboxOnly,
-            concurrency: SyncConfig.imapMaxConnectionCeiling
+            concurrency: SyncConfig.imapMaxConnectionCeiling,
+            syncFollowUp: { followUps.ask($0) }
         ) { world async throws in
             world.server.serveProfile()
             try Self.setAccount(world, cursor: world.server.currentHistoryId(), lastFullSyncAt: Date())
@@ -3563,21 +3606,33 @@ struct GmailCatchUpTests {
             let account = try await Self.account(world)
             let engine = world.engine
             let server = world.server
+            followUps.engine.withLock { $0 = engine }
+            // The engine's callback holds the runner, and the runner the engine.
+            defer { followUps.engine.withLock { $0 = nil } }
             let deadline = Date().addingTimeInterval(SyncConfig.backgroundBackfillDeadlineSeconds)
             let job = Task { await engine.performBackfill(account: account, deadline: deadline) }
 
             let started = await Self.eventually(seconds: 30) { server.listRequests().count >= 2 }
             #expect(started, "precondition: the job's catch-up is listing")
             let arrival = Date()
-            _ = try await engine.backgroundDeltaSync(account: account)
+            let read = try await engine.backgroundDeltaSync(account: account)
+            let readNothing = read == nil
+            #expect(readNothing, "a delta during the job must set the follow-up flag, not wait for a slice")
+            let bound = SyncConfig.catchUpSliceSeconds + SyncConfig.catchUpRequestTimeoutSeconds
+            let followUpRead = await Self.eventually(seconds: bound * 2) {
+                server.http.recordedCalls().contains { $0.url.contains("/history") }
+            }
             let waited = Date().timeIntervalSince(arrival)
             let listingOpen = try Self.state(world, inboxPath)?.listing != nil
 
-            #expect(listingOpen, "precondition: the delta ran while the job's listing was in progress")
-            #expect(waited <= SyncConfig.catchUpSliceSeconds + SyncConfig.catchUpRequestTimeoutSeconds,
-                    "the delta waited \(waited) s; one slice is at most \(SyncConfig.catchUpSliceSeconds) s plus one request timeout")
+            #expect(followUpRead, "the delta's follow-up never read")
+            #expect(listingOpen, "precondition: the follow-up read while the job's listing was in progress")
+            #expect(waited <= bound,
+                    "the follow-up read after \(waited) s; one slice is at most \(SyncConfig.catchUpSliceSeconds) s plus one request timeout")
             #expect(await job.value, "the job made progress")
-            #expect(try Self.state(world, inboxPath)?.lastCompletedAt != nil, "the job goes on after the delta and completes the listing")
+            let ran = try await followUps.ran()
+            #expect(ran == 1, "the delta's flag got \(ran) follow-up stage 2s; it gets one")
+            #expect(try Self.state(world, inboxPath)?.lastCompletedAt != nil, "the job goes on after the follow-up and completes the listing")
         }
     }
 

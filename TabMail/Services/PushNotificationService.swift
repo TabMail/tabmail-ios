@@ -1645,6 +1645,10 @@ actor PushNotificationService {
     /// Handle a silent push notification (content-available: 1).
     /// Only syncs the specific account that received the push (not all accounts).
     /// Coalesced pushes for OTHER accounts trigger a targeted follow-up.
+    /// Sync trigger: its read (`syncStartup`) gives an account another pass holds
+    /// a follow-up flag, never a wait. Siblings: IDLE, the open-app push, pull to
+    /// refresh, the poll, a return (the sync design block in
+    /// SyncEngineOneSyncAtATime.swift; ADR-IOS-104).
     func handleSilentPush(provider: String?, accountEmail: String?) async -> UIBackgroundFetchResult {
         BackgroundSyncLogger.logDebug("[Push] Silent push: provider=\(provider ?? "?"), email=\(accountEmail ?? "?")")
         BackgroundSyncLogger.logPush("Silent push RECEIVED (provider=\(provider ?? "?"), email=\(accountEmail ?? "?"))")

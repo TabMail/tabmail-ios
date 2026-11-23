@@ -573,6 +573,10 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     }
 
     /// Owns the Task used by willPresent; the returned handle lets tests join it.
+    /// Sync trigger: after the merge, its read (`syncStartup`) gives an account
+    /// another pass holds a follow-up flag, never a wait. Siblings: IDLE, silent
+    /// push, pull to refresh, the poll, a return (the sync design block in
+    /// SyncEngineOneSyncAtATime.swift; ADR-IOS-104).
     @discardableResult
     func startForegroundNotificationWork() -> Task<Void, Never> {
         #if DEBUG

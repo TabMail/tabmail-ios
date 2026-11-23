@@ -38,6 +38,13 @@ struct SyncConfigConstantsTests {
         #expect(SyncConfig.maxQueueRetries == 3)
     }
 
+    /// Sync timing promise 5: in the foreground a poll runs at least every 300 s
+    /// (the scheduler's poll timer reads this value).
+    @Test("foregroundPollIntervalSeconds is 300 (5 min)")
+    func foregroundPollIntervalValue() {
+        #expect(SyncConfig.foregroundPollIntervalSeconds == 300)
+    }
+
     @Test("maxConcurrentLLMCalls is 32 (matches TB maxAgentWorkers)")
     func maxConcurrentLLMCallsValue() {
         #expect(SyncConfig.maxConcurrentLLMCalls == 32)

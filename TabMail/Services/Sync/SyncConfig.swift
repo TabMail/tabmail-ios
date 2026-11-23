@@ -557,7 +557,18 @@ enum SyncConfig {
 
     /// Timeout for IMAP/provider connect() during reconnect. TCP handshake + login.
     static let connectTimeoutSeconds: TimeInterval = 15
-    /// Timeout for per-account sync during poll(). Prevents one stalled server from blocking others.
+    /// Time limit for one account's stage 2 in poll() (`SyncEngine.syncOrFollowUp`),
+    /// also used for pull to refresh's quick sync. Added when the poll synced the
+    /// accounts one after another (2026-02); they have synced in parallel since
+    /// 2026-03. Its job now: one stalled server must not hold the poll open, which
+    /// would skip the next polls and keep back the queued work the poll runs after
+    /// stage 2. It never counts a wait for another pass's turn: those callers
+    /// never wait for one (only their own connection check comes first), and the
+    /// follow-up stage 2 (`SyncEngine.followUpPass`), which waits, takes its change
+    /// read's deadline from this when it gets the turn and has no outer timeout.
+    /// v1.11.4 counted the wait for the turn, so a stage 2 queued behind stage 1
+    /// read nothing (#1289; design settled 2026-11-23). See the sync design block
+    /// in SyncEngineOneSyncAtATime.swift.
     static let perAccountSyncTimeoutSeconds: TimeInterval = 60
     /// Min seconds between WAL checkpoints. The checkpoint is invoked from many
     /// background/normal jobs (full/delta sync, backfill batches, maintenance) via

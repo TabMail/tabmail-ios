@@ -748,10 +748,12 @@ struct OutlookChangeReadingTests {
             await engine.register(
                 accountId: w.accountId, provider: w.provider,
                 workQueue: ProviderWorkQueue(provider: w.provider, maxConcurrency: 1))
-            let outcome = try await engine.backgroundDeltaSync(account: try w.account(), inboxOnly: true)
+            let read = try await engine.backgroundDeltaSync(account: try w.account(), inboxOnly: true)
             await engine.remove(accountId: w.accountId)
+            let outcome = try #require(read, "the account was free, so the read ran")
             #expect(outcome.reason != "noCursor", "an Outlook push pass is not taken for one with no bookmark")
-            #expect(try w.account().lastSyncedAt.map { $0 > before } == true, "the poll is recorded")
+            let pollRecorded = try w.account().lastSyncedAt.map { $0 > before } == true
+            #expect(pollRecorded, "the poll is recorded")
         }
     }
 
