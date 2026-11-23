@@ -387,6 +387,10 @@ struct ForegroundStartEffectTests {
             // The initial sync's turn ends before the events below, so the EXISTS
             // read finds the account free.
             await AccountManager.shared.syncEngine.oneSyncAtATime(accountId: account.id) { @Sendable in }
+            // That sync ended by starting the account's older-mail worker
+            // (`startBackfill`), whose catch-up also lists the inbox and would read
+            // the new message below on its own: stop it, so only the event can.
+            await AccountManager.shared.syncEngine.stopBackfillWorkerForTesting(accountId: account.id)
 
             let state = ScreenState(accounts: 1)
             let window = try Self.host(state, start: { world.scheduler.startForegroundPolling() })
@@ -396,8 +400,9 @@ struct ForegroundStartEffectTests {
             }
             try #require(idling, "precondition: the start's IDLE is live on the fake server")
 
-            // A new message. The start's own poll pass was taken and the timer's
-            // next tick is 300 s away, so only the event's read brings it in.
+            // A new message. The start's own poll pass was taken, the older-mail
+            // worker is stopped and the timer's next tick is 300 s away, so only the
+            // event's read brings it in.
             server.setMessages(server.messages(in: "INBOX") + [Self.message(uid: 2)], in: "INBOX")
             let toldExists = server.notifyIdleSessions("* 2 EXISTS")
             #expect(toldExists == 1)
