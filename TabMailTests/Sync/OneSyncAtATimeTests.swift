@@ -702,15 +702,20 @@ struct OneSyncAtATimeTests {
 
     /// The label of the pass holding the turn (`SyncEngine.syncTurnHolders`)
     /// feeds only the debug line `[SyncTurnWait]`, so it is debug-gated like
-    /// the line: with debug logging off, neither taking the turn nor a handover
-    /// records a holder; with it on, the holder is where the running pass was
-    /// started, a handover names the next one, and a free turn has none. RED
-    /// with the label stored whatever the logging setting.
+    /// the line. With debug logging off, a pass that takes the turn records no
+    /// label, and none is there once the next pass has it. With it on, the
+    /// label is where the running pass was started, then where the next one
+    /// was (recorded at the handover and again when that pass starts), and a
+    /// free turn has none. With logging switched off while a label is held, the
+    /// label is dropped by the time the next pass has the turn, so a later wait
+    /// never names a holder that has gone. RED with the label stored whatever
+    /// the logging setting, and with a held label kept once logging is off.
     @Test("The turn holder's label is recorded only with debug logging on; a handover names the next holder")
     func turnHolderLabelIsDebugGated() async throws {
         let previous = DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 }
         defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = previous } }
-        for logging in [false, true] {
+        // (logging while the first pass takes the turn, logging from the handover on)
+        for (logging, loggingAtHandover) in [(false, false), (true, true), (true, false)] {
             DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = logging }
             let engine = SyncEngine()
             let accountId = Self.accountId
@@ -736,6 +741,7 @@ struct OneSyncAtATimeTests {
                 }
             }
             let queued = await Self.eventually { await engine.syncPassWaiters[accountId]?.count == 1 }
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = loggingAtHandover }
             first.continuation.yield()
             let handedOver = await Self.eventually { log.snapshot == ["start a", "end a", "start b"] }
             let holderB = await engine.syncTurnHolders[accountId]
@@ -744,12 +750,13 @@ struct OneSyncAtATimeTests {
             if finished { await passA.value; await passB.value }
             let holderAfter = await engine.syncTurnHolders[accountId]
 
-            #expect(started && queued && handedOver && finished, "precondition: two passes held the turn one after the other (logging \(logging))")
+            let mode = "logging \(logging), then \(loggingAtHandover) from the handover"
+            #expect(started && queued && handedOver && finished, "precondition: two passes held the turn one after the other (\(mode))")
             let expectedA: String? = logging ? "pass-a:1" : nil
-            let expectedB: String? = logging ? "pass-b:2" : nil
-            #expect(holderA == expectedA, "the running pass's label with logging \(logging): \(String(describing: holderA))")
-            #expect(holderB == expectedB, "the label after the handover with logging \(logging): \(String(describing: holderB))")
-            #expect(holderAfter == nil, "a free turn has no holder (logging \(logging)): \(String(describing: holderAfter))")
+            let expectedB: String? = loggingAtHandover ? "pass-b:2" : nil
+            #expect(holderA == expectedA, "the running pass's label (\(mode)): \(String(describing: holderA))")
+            #expect(holderB == expectedB, "the label once the next pass has the turn (\(mode)): \(String(describing: holderB))")
+            #expect(holderAfter == nil, "a free turn has no holder (\(mode)): \(String(describing: holderAfter))")
         }
     }
 

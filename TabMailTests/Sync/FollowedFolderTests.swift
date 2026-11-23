@@ -791,7 +791,7 @@ struct FollowedFolderIMAPTests {
     @MainActor
     func followingAFollowedFolderNeverWaitsForTheWriter() async throws {
         try await Self.withWorld("follow-read-first", .plain) { w in
-            let engine = AccountManager.shared.syncEngine
+            let engine = await AccountManager.shared.syncEngine
             let folderId = w.folderId
             await engine.followFolders([folderId])
             try w.expectFollowed([folderId], "precondition: the first access follows the folder")

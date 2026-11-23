@@ -4914,7 +4914,8 @@ struct GmailCatchUpTests {
             let runLeft = await engine.accessCatchUpTasks[accountId] != nil
             let pendingLeft = await engine.accessCatchUpPending[accountId]
             let turnFree = !(await engine.syncPassRunning.contains(accountId))
-            let slotStillHeld = holder.isHeld
+            // The slot is let go only here, after the checks above: a removal
+            // seen ended before this line did not wait for the slot.
             await holder.release()
             await Self.ended(removal, "the removal")
 
@@ -4922,7 +4923,7 @@ struct GmailCatchUpTests {
             #expect(held, "precondition: the test holds the queue's only slot")
             #expect(queued, "precondition: the access run's slice waited in the queue for the held slot")
             #expect(pendingBefore == [inbox], "precondition: the second access waits for the next run: \(String(describing: pendingBefore))")
-            #expect(removedWhileHeld && slotStillHeld, "the removal ended the run without waiting for the slot")
+            #expect(removedWhileHeld, "the removal ended the run without waiting for the slot")
             #expect(!runLeft, "no access run is left for the removed account")
             #expect(pendingLeft == nil, "the folders waiting for the next run were dropped: \(String(describing: pendingLeft))")
             #expect(turnFree, "the run freed the account's turn")
