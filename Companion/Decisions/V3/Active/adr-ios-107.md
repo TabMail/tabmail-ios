@@ -1534,7 +1534,9 @@ slice as before.
 account, its kind (`access`, `backfill-background`, `backfill-foreground`), its outcome, `queueWaitMs`,
 `workMs` and `turnHoldMs`; a pass that waited for the turn logs `[SyncTurnWait]` with where it was started,
 `waitedMs`, and where the pass that held the turn when it got in line was started (`behind=`,
-`SyncTurnWaiter.caller`, `SyncEngine.syncTurnHolders`).
+`SyncTurnWaiter.caller`, `SyncEngine.syncTurnHolders`). The holder label and the wait's clock are recorded
+only with debug logging on (`recordSyncTurnHolder`); with it off, taking and handing over a turn stores
+nothing for them. *(Amended in review 2026-11-23: the label was first stored on every turn.)*
 
 **Gap closed.** The backfill slices had clocked from their turn, before the slot wait, since the catch-up
 moved into the backfill worker (#766): a slice that waited for its slot reached the provider with less
