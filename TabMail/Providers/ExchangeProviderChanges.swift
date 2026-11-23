@@ -54,7 +54,10 @@ import Foundation
 ///
 /// **Other-folder runs** (scope `.otherFolders`, #1110): each slice reads the
 /// run's folders, every one a delta as above, with no folder list and no re-read
-/// list; a folder the slice can send nothing for is `.notRun`.
+/// list; a folder the slice can send nothing for is `.notRun`, and a baseline
+/// read that passed no page (the slice's time, or a held page, ended it) is
+/// `.baselining` with `FolderChanges.readCut`, so the run does not read the same
+/// page again in every slice (#1358).
 ///
 /// **Folder list** (scope `.all`): the mail-folder delta is a change signal. A
 /// record for a folder already stored updates its name and counts
@@ -191,6 +194,7 @@ extension ExchangeProvider {
 
         var ending = FolderReadEnding.cut
         var restartedBaseline = false
+        var pagePassed = false
         pages: while true {
             guard allowance.canSend(1) else { ending = .cut; break }
             let link = state.next
@@ -310,6 +314,7 @@ extension ExchangeProvider {
             }
             state.next = next
             state.failingSince = nil
+            pagePassed = true
             if page.deltaLink != nil {
                 if state.phase == .baseline {
                     state.phase = .tracking
@@ -329,8 +334,15 @@ extension ExchangeProvider {
                              collected: &collected, changes: &changes)
         }
 
-        let finished = Self.finish(
+        var finished = Self.finish(
             changes, collected: collected, state: state, stored: stored, ending: ending, now: context.clock())
+        // A run's baseline read that passed no page did not move the folder,
+        // whatever held rows it applies: the run counts it as cut, not as a
+        // baseline under way, so a slow link cannot keep the run on this page
+        // in every slice (#1358).
+        if request.scope == .otherFolders, !pagePassed, case .baselining = finished.status {
+            finished.readCut = true
+        }
         // Only records that travel with the result need their verb.
         let carried = Set(finished.records.map(\.messageId))
         return (finished, verbOrder.filter { carried.contains($0) })

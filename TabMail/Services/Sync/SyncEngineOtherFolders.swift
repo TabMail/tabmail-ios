@@ -29,10 +29,10 @@ import GRDB
 // cast and no provider test (`ChangeSeamFenceTests`).
 //
 // End rule of a run, whichever comes first: every other folder has been read
-// once in it (a folder whose first read is still going, an Outlook baseline cut
-// by the slice's end, stays pending), a slice reads nothing new (a slice whose
-// only work was a folder its time cut counts that folder as tried and goes on,
-// #1358), its working time
+// once in it (a folder whose first read is still going, an Outlook baseline that
+// moved and is not done, stays pending), a slice reads nothing new (a slice whose
+// only work was a folder its time cut, an Outlook baseline page included, counts
+// that folder as tried and goes on, #1358), its working time
 // (`SyncConfig.otherFolderRunSeconds`, slice time only) is spent, or the account
 // is removed. A folder the run did not finish is read in the next run. A run
 // under way when the app leaves the screen goes on in the app's later wakes, as
@@ -101,7 +101,8 @@ extension SyncEngine {
     /// run). Progressed and still pending: a baseline that moved. Failed
     /// (`inFlightFolderIds`, left out of the rest of the run): a read or a
     /// listing that failed. Pending with nothing: not reached. Cut by the
-    /// slice's time (a read the reader started, `FolderChanges.readCut`; a
+    /// slice's time (a read the reader started and reports cut,
+    /// `FolderChanges.readCut`, among them a baseline that passed no page; a
     /// baseline that neither moved nor failed; changed with no time left to
     /// start its listing): pending while the slice moved or failed another
     /// folder, else tried (`inFlightFolderIds`), so the run goes on (#1358). A
@@ -175,8 +176,9 @@ extension SyncEngine {
             case .failed:
                 slice.inFlightFolderIds.insert(folderId)
             case .baselining:
-                // A baseline read that neither moved nor failed was cut.
-                if changes.cursor != nil || !changes.records.isEmpty {
+                // A baseline read the reader reports cut (no page passed), or
+                // one that neither moved nor failed, was cut.
+                if !changes.readCut, changes.cursor != nil || !changes.records.isEmpty {
                     slice.progressedFolderIds.insert(folderId)
                 } else {
                     cut.insert(folderId)

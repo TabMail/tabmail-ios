@@ -32,8 +32,8 @@ enum ChangeScope: Sendable, Equatable {
     /// reader that reads folder by folder reads them in that order and reports a
     /// folder it sent nothing for (out of time, or its session ended before it)
     /// as `.notRun`, so the run reads it in a later slice, and a folder whose
-    /// read it started and the slice's time cut as `.notRun` with
-    /// `FolderChanges.readCut` (#1358). A provider whose
+    /// read it started and that did not move with `FolderChanges.readCut`
+    /// (#1358). A provider whose
     /// changes come in one account-wide read reads nothing: every pass already
     /// reads every folder.
     case otherFolders
@@ -335,11 +335,13 @@ struct FolderChanges: Sendable {
     /// before tracking starts never leaves the bookmark without its check.
     var armCatchUpWithBookmark = false
     /// A slice of an other-folder run (`ChangeScope.otherFolders`, #1110): the
-    /// reader sent this folder a request, and the slice's read time ran out
-    /// before the folder's read could finish (`.notRun`, nothing of it to
-    /// apply). Kept apart from a folder the reader sent nothing for, so the run
-    /// can count the folder as tried and go on to the next one (#1358). Never
-    /// set on a pass.
+    /// reader sent this folder a request, and the read ended before it moved
+    /// the folder: the slice's read time ran out before the read could finish
+    /// (`.notRun`, nothing of it to apply), or a baseline passed no page
+    /// (`.baselining`: the held rows of the page it read apply, its place in
+    /// the baseline stays). Kept apart from a folder the reader sent nothing
+    /// for, and from a baseline that moved, so the run can count the folder as
+    /// tried and go on to the next one (#1358). Never set on a pass.
     var readCut = false
     /// The folder's rows with numeric ids in `lowerId...upperId` the read
     /// checked: exactly `checkedIds` (bounded by the check's window). The apply
