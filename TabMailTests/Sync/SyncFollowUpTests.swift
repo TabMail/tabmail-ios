@@ -395,7 +395,8 @@ struct SyncFollowUpTests {
             // A test that stops early still ends its held pass.
             defer { release.continuation.finish() }
             let holder = O.heldPass(engine: w.engine, accountId: accountId, name: "held", log: log, release: release.stream)
-            #expect(await O.eventually { log.snapshot == ["start held"] }, "precondition: the turn is held")
+            let heldNow = await O.eventually { log.snapshot == ["start held"] }
+            #expect(heldNow, "precondition: the turn is held")
             let busy = await w.engine.oneSyncAtATimeOrFollowUp(accountId: accountId) { true }
             let flagged = busy == nil
             #expect(flagged, "precondition: the trigger found the account busy and set the flag")
