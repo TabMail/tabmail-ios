@@ -1,6 +1,7 @@
 import Foundation
 import GRDB
 import SwiftUI
+import Synchronization
 import Testing
 import UIKit
 @testable import TabMail
@@ -19,7 +20,9 @@ import UIKit
 ///   once the server answers; a refused password gets none;
 /// - a password refused while the app is open gets one IDLE sign-in and no retry, a
 ///   return skips that account while a working one keeps IDLE, and the password update
-///   brings its IDLE back; a refusal for now keeps IDLE's 10 s retry (#1349);
+///   brings its IDLE back; a refusal for now keeps IDLE's 10 s retry, also when it
+///   refuses the sign-in SwiftMail repeats inside a command on a dropped connection
+///   (#1349);
 /// - a provider started twice keeps one IDLE connection;
 /// - an IDLE event reads now: EXISTS reads the new message, VANISHED deletes the one it
 ///   names (the event handler `startIdle(for:)` installs);
@@ -376,6 +379,17 @@ struct ForegroundStartEffectTests {
             let liveOnRefused = idleCommands()
             #expect(liveOnRefused == 0, "IDLE went live after its sign-in was refused")
 
+            // IDLE is no longer wanted: the teardown of a return to the app
+            // (`markDirty`), which relaunches a wanted IDLE, starts nothing.
+            let installed = await manager.provider(for: refused) as? IMAPProvider
+            let refusedProvider = try #require(installed, "precondition: the refused account's provider stayed installed")
+            await refusedProvider.markDirty()
+            try? await Task.sleep(for: .seconds(1))
+            let loginsAfterTeardown = logins() - loginsAfterRefusal
+            #expect(loginsAfterTeardown == 0, "a teardown relaunched IDLE with the refused password")
+            let liveAfterTeardown = idleCommands()
+            #expect(liveAfterTeardown == 0, "a teardown brought IDLE back for the refused account")
+
             // The working account goes live in the open app and gets IDLE.
             try await manager.connectAccount(working)
             let workingLive = await eventually(seconds: 5) { idleCommands() == 1 }
@@ -416,16 +430,69 @@ struct ForegroundStartEffectTests {
             defer { Self.close(window) }
             let first = await eventually(seconds: 5) { server.consumedInjectedFailureCount() == 1 }
             try #require(first, "precondition: IDLE's first sign-in was refused for now")
+            let firstAt = ContinuousClock.now
             let second = await eventually(seconds: 15) { server.consumedInjectedFailureCount() == 2 }
             #expect(second, "IDLE retried after its first refusal for now")
+            let secondAt = ContinuousClock.now
             let live = await eventually(seconds: 15) {
                 server.recordedCommands().contains { $0.hasPrefix("IDLE") }
             }
             #expect(live, "IDLE kept retrying until the server answered")
+            let liveAt = ContinuousClock.now
+            // Each retry waits its 10 s: none comes early.
+            let firstGap = secondAt - firstAt
+            #expect(firstGap >= .seconds(9), "IDLE retried \(firstGap) after the first refusal for now")
+            let secondGap = liveAt - secondAt
+            #expect(secondGap >= .seconds(9), "IDLE retried \(secondGap) after the second refusal for now")
             let marked = await AccountManager.shared.authFailedAccounts.contains(account.id)
             #expect(!marked, "a refusal for now is not a refused sign-in")
             let starts = world.idleStarts(account)
             #expect(starts == 1, "the retries are IDLE's own, not new starts")
+        }
+    }
+
+    /// The sign-in SwiftMail repeats inside a command, when it reopens a connection that
+    /// dropped, can be refused for now too. That refusal arrives as a raw `loginFailed`,
+    /// not as `createServer`'s `ProviderTemporaryRefusal`, and must keep IDLE's retry
+    /// like any other refusal for now.
+    @Test("IDLE whose connection drops before its INBOX select, and whose repeated sign-in is refused for now, retries and comes up")
+    func reconnectRefusedForNowKeepsRetrying() async throws {
+        try await withWorld(realIdle: true) { world in
+            let server = world.server
+            let account = try await world.addAccount(connect: true)
+            let installed = await AccountManager.shared.provider(for: account) as? IMAPProvider
+            let provider = try #require(installed, "precondition: the account's provider is installed")
+            // IDLE's first launch: once its sign-in is accepted, the server refuses the
+            // next sign-in for now and drops the connection before the INBOX select, so
+            // the select reopens it and signs in again.
+            let launches = Mutex(0)
+            await provider.setIdleLaunchPlantRaceTestHookForTesting {
+                let first = launches.withLock { (n: inout Int) -> Bool in n += 1; return n == 1 }
+                guard first else { return }
+                server.failNextCommand(containing: "LOGIN", message: "[UNAVAILABLE] Try again later")
+                server.dropLastLoggedInSession()
+                // Long enough for the client to see the connection closed.
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+            let state = ScreenState(accounts: 1)
+            let window = try Self.host(state, start: { world.scheduler.startForegroundPolling() })
+            defer { Self.close(window) }
+            let refused = await eventually(seconds: 5) { server.consumedInjectedFailureCount() == 1 }
+            try #require(refused, "precondition: the repeated sign-in inside the select was refused for now")
+            let refusedAt = ContinuousClock.now
+            let notLiveYet = !server.recordedCommands().contains { $0.hasPrefix("IDLE") }
+            #expect(notLiveYet, "precondition: IDLE was not live after its select failed")
+            let live = await eventually(seconds: 15) {
+                server.recordedCommands().contains { $0.hasPrefix("IDLE") }
+            }
+            #expect(live, "IDLE stopped after a refusal for now of its repeated sign-in")
+            let gap = ContinuousClock.now - refusedAt
+            #expect(gap >= .seconds(9), "IDLE came back \(gap) after the refusal, before its 10 s retry")
+            let marked = await AccountManager.shared.authFailedAccounts.contains(account.id)
+            #expect(!marked, "a refusal for now is not a refused sign-in")
+            let starts = world.idleStarts(account)
+            #expect(starts == 1, "the retry is IDLE's own, not a new start")
+            await provider.setIdleLaunchPlantRaceTestHookForTesting(nil)
         }
     }
 
