@@ -252,7 +252,8 @@ extension ChatThreadViewLifecycleTests {
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        window.rootViewController = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: headers[0].id) })
+        window.rootViewController = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: headers[0].id) }
+            .environment(NavigationStore()))
         window.makeKeyAndVisible()
         let close: @MainActor () -> Void = {
             window.isHidden = true

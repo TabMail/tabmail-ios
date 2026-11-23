@@ -43,12 +43,14 @@ extension ChatThreadViewLifecycleTests {
     private struct CoverHost: View {
         @Bindable var model: CoverModel
         let messageId: String
+        let navigationStore = NavigationStore()
 
         var body: some View {
             NavigationStack(path: $model.path) {
                 ChatThreadView(messageId: messageId)
                     .navigationDestination(for: Int.self) { _ in Text("Covering screen") }
             }
+            .environment(navigationStore)
         }
     }
 
