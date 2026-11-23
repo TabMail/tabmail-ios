@@ -325,8 +325,7 @@ final class AccountOperationExecutor {
         // The folders the drained actions landed in are followed, and a catch-up
         // run reconciles the whole of each (#1109), after the listings above so
         // the moved messages show first. The drain does not wait for the run.
-        for (accountId, folderIds) in context.foldersAccessed.sorted(by: { $0.key < $1.key })
-        where manager.workQueues[accountId] != nil {
+        for (accountId, folderIds) in context.foldersAccessed.sorted(by: { $0.key < $1.key }) {
             await manager.syncEngine.folderAccessed(accountId: accountId, folderIds: folderIds.sorted())
         }
     }

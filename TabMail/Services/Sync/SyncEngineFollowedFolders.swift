@@ -95,7 +95,7 @@ extension SyncEngine {
                 BackgroundSyncLogger.logDebug("[Follow] access catch-up for \(folderIds.sorted()): progressed=\(progressed)")
             }
         }
-        if !Task.isCancelled { accessCatchUpTasks[accountId] = nil }
+        accessCatchUpTasks[accountId] = nil
     }
 
     #if DEBUG
