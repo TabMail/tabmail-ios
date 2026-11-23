@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import GRDB
 import Synchronization
 import Testing
 @testable import TabMail
@@ -102,6 +103,50 @@ struct ProgressTotalSourceTests {
             account: account, provider: mock, plan: SyncEngine.FullSyncPlan())
         let listed = await mock.callLogSnapshot().contains("fetchFolders")
         #expect(listed, "the full sync's discovery is the provider's, every time")
+    }
+
+    // MARK: - Progress before the provider's total is known (#1273)
+
+    @Test("An IMAP or Outlook account whose walk is complete shows completed (N messages indexed) from the database alone, with no folder list run in this process",
+          arguments: [AccountProvider.imap, .outlook])
+    func walkedCompleteAccountShowsCompletedWithoutAFolderList(_ kind: AccountProvider) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let account = try FolderEpochTestFixture.makeAccount(id: "progress-walked-\(kind.rawValue)", provider: kind, pool: pool)
+        // Stored counters far from the rows: completion never reads them.
+        try FolderEpochTestFixture.insertFolder(
+            accountId: account.id, path: "INBOX", role: .inbox, pool: pool, totalCount: 500, lastKnownUidNext: 999)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: account.id, path: "Archive", role: .archive, pool: pool, totalCount: 500, lastKnownUidNext: 999)
+        try FolderEpochTestFixture.insertHeaders(accountId: account.id, path: "INBOX", uids: [1, 2], pool: pool)
+        try FolderEpochTestFixture.insertHeaders(accountId: account.id, path: "Archive", uids: [1], pool: pool)
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE folder SET backfillComplete = 1 WHERE accountId = ?", arguments: [account.id])
+            try db.execute(sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE accountId = ?", arguments: [account.id])
+        }
+        // Never connected: neither provider has listed its folders in this process.
+        let provider: any EmailProvider = kind == .imap
+            ? IMAPProvider(host: "127.0.0.1", port: 1, username: "walked@example.com", password: "unused",
+                           smtpHost: "127.0.0.1", smtpPort: 1, useTLS: false)
+            : ExchangeProvider(userEmail: "walked@example.com", accessToken: { _ in "fake-graph-token" }, session: http.session)
+        let engine = SyncEngine()
+        await engine.register(accountId: account.id, provider: provider,
+                              workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
+        await AccountManager.shared.clearBackfillProgress(accountId: account.id)
+
+        let source = await provider.progressTotal(crawling: false)
+        #expect(source == .notKnownYet, "precondition: the provider has no total yet")
+        await engine.updateBackfillProgressForAccount(account)
+        let progress = try #require(await AccountManager.shared._backfillBacking[account.id],
+                                    "a walked-complete account publishes progress before any folder list")
+        #expect(progress.headersDone)
+        #expect(progress.totalEmails == 3, "the messages stored, never a stored folder count")
+        #expect(progress.ftsIndexed == 3)
+        #expect(progress.pendingBodyCount == 0)
+        #expect(progress.isFullyComplete, "the card shows N messages indexed")
+        await AccountManager.shared.clearBackfillProgress(accountId: account.id)
     }
 
     // MARK: - Fast Sync completion across accounts

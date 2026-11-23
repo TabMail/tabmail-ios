@@ -244,16 +244,27 @@ struct ListingCountersTests {
         #expect(mixed.walked < mixed.total, "an incomplete walk never reads done")
     }
 
-    @Test("IMAP progress before this launch's first folder list publishes nothing (never 0, never the row count), then the folder list's UID scope")
-    func imapProgressWaitsForTheFolderList() async throws {
+    @Test("IMAP progress before this launch's first folder list is the database's own (stored and settled messages, no UID scope, never the stored folder counters), then the folder list's UID scope")
+    func imapProgressBeforeTheFolderListIsTheDatabases() async throws {
         try await E.withWorld("lc-progress-imap", capabilities: Self.condstoreNoReader, serverUIDs: Array(1...40), localUIDs: [1, 2]) { w in
             let folderId = w.folderId
+            // Stored counters far from both the rows and the server: progress must
+            // read neither as a denominator.
             try await w.pool.write { db in
-                try db.execute(sql: "UPDATE folder SET backfillComplete = 0, backfillUidCursor = 30 WHERE id = ?", arguments: [folderId])
+                try db.execute(sql: "UPDATE folder SET backfillComplete = 0, backfillUidCursor = 30, totalCount = 500, lastKnownUidNext = 999 WHERE id = ?", arguments: [folderId])
+                try db.execute(sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE folderId = ? AND messageId = '1'", arguments: [folderId])
             }
             await AccountManager.shared.clearBackfillProgress(accountId: w.account.id)
+            let source = await w.provider.progressTotal(crawling: true)
+            #expect(source == .notKnownYet, "precondition: no folder list has run in this process")
             await w.engine.updateBackfillProgressForAccount(w.account)
-            #expect(await AccountManager.shared._backfillBacking[w.account.id] == nil, "nothing is published before the folder list")
+            let before = try #require(await AccountManager.shared._backfillBacking[w.account.id],
+                                      "progress is published before the folder list")
+            #expect(before.uidTotal == 0 && before.uidWalked == 0, "no UID scope before the folder list, never the stored UIDNEXT")
+            #expect(before.totalEmails == 2, "the messages stored, never the stored folder count")
+            #expect(before.ftsIndexed == 1)
+            #expect(before.pendingBodyCount == 1)
+            #expect(!before.headersDone && !before.isFullyComplete)
 
             _ = try await w.provider.fetchFolders()
             await w.engine.updateBackfillProgressForAccount(w.account)

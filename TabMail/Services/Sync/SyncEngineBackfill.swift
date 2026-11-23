@@ -390,8 +390,10 @@ extension SyncEngine {
     ///
     /// The denominator has its own provider-side source (`progressTotal`), never
     /// the stored folder counters. While the provider's total is not known yet
-    /// (before this launch's first folder list) nothing is published: the bar
-    /// stays hidden rather than show 0 or the stored row count.
+    /// (IMAP before this launch's first folder list, Outlook before its first
+    /// full sync), the progress is what the database knows: the messages stored
+    /// and settled, and the completed state once every folder's walk is done
+    /// (#1273). The provider's total only sharpens the denominator once known.
     func updateBackfillProgressForAccount(_ account: Account) async {
         let accountId = account.id
         // Quick DB check: are all folders done?
@@ -402,11 +404,11 @@ extension SyncEngine {
 
         // The provider is the source (#755): Gmail keeps its profile total,
         // Exchange answers its latest folder list's sum, IMAP its folder lists'
-        // UIDNEXT. A provider not registered yet, or one with no folder list yet
-        // (`.notKnownYet`), publishes nothing: the bar waits for its source.
+        // UIDNEXT. A provider not registered yet publishes nothing. One with no
+        // folder list yet (`.notKnownYet`) adds no UID scope and no server total,
+        // so the database's counts below are published as they are.
         guard let provider = providers[accountId] else { return }
         let source = await provider.progressTotal(crawling: !headersDone)
-        if source == .notKnownYet { return }
         let uidNextByPath: [String: Int]
         if case .uidNext(let map) = source { uidNextByPath = map } else { uidNextByPath = [:] }
         let walk = Self.uidWalkProgress(folders: folders ?? [], uidNextByPath: uidNextByPath)
