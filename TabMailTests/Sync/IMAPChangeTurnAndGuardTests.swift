@@ -474,7 +474,8 @@ struct IMAPChangeTurnAndGuardTests {
                     }
                 }
                 try await Self.waitUntil { finished.count.withLock { $0 } == kinds.count }
-                #expect(finished.count.withLock { $0 } == kinds.count, "\(label): every task completed (\(kinds))")
+                let finishedCount = finished.count.withLock { $0 }
+                #expect(finishedCount == kinds.count, "\(label): every task completed (\(kinds))")
                 // One more change pass through the production entry, and no repair
                 // listing: a listing would re-list the folder and hide what the
                 // overlapping tasks left behind. A change pass that finds the

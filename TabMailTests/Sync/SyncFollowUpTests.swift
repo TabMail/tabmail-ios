@@ -196,7 +196,8 @@ struct SyncFollowUpTests {
             defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "held", log: followUps.log, release: release.stream)
-            #expect(await O.eventually { followUps.log.snapshot == ["start held"] }, "precondition: the turn is held")
+            let turnHeld = await O.eventually { followUps.log.snapshot == ["start held"] }
+            #expect(turnHeld, "precondition: the turn is held")
 
             let results = Self.fire(kind, burst: burst, engine: engine, account: account)
             let returned = await O.eventually(seconds: 5) { results.snapshot.count == burst }
@@ -239,7 +240,8 @@ struct SyncFollowUpTests {
             defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "held", log: followUps.log, release: release.stream)
-            #expect(await O.eventually { followUps.log.snapshot == ["start held"] }, "precondition: the turn is held")
+            let turnHeld = await O.eventually { followUps.log.snapshot == ["start held"] }
+            #expect(turnHeld, "precondition: the turn is held")
             // The scheduler declines every ask (background): no runner.
             let busy = try await engine.backgroundDeltaSync(account: account)
             let busyReadNothing = busy == nil
@@ -290,7 +292,8 @@ struct SyncFollowUpTests {
             defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "held", log: followUps.log, release: release.stream)
-            #expect(await O.eventually { followUps.log.snapshot == ["start held"] }, "precondition: the turn is held")
+            let turnHeld = await O.eventually { followUps.log.snapshot == ["start held"] }
+            #expect(turnHeld, "precondition: the turn is held")
 
             // In the foreground a busy trigger's follow-up is admitted and waits in line.
             let busy = try await engine.backgroundDeltaSync(account: account)
@@ -350,7 +353,8 @@ struct SyncFollowUpTests {
             defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "stage 1", log: followUps.log, release: release.stream)
-            #expect(await O.eventually { followUps.log.snapshot == ["start stage 1"] }, "precondition: stage 1 holds the turn")
+            let stageOneHolds = await O.eventually { followUps.log.snapshot == ["start stage 1"] }
+            #expect(stageOneHolds, "precondition: stage 1 holds the turn")
 
             // The poll's stage 2, with the time limit the poll gives it, finds
             // stage 1 running; its follow-up waits in line.
@@ -448,7 +452,8 @@ struct SyncFollowUpTests {
             defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "held", log: followUps.log, release: release.stream)
-            #expect(await O.eventually { followUps.log.snapshot == ["start held"] }, "precondition: the turn is held")
+            let turnHeld = await O.eventually { followUps.log.snapshot == ["start held"] }
+            #expect(turnHeld, "precondition: the turn is held")
             let busy = try await engine.backgroundDeltaSync(account: account)
             let busyReadNothing = busy == nil
             #expect(busyReadNothing, "precondition: the trigger found the account busy")
@@ -497,7 +502,8 @@ struct SyncFollowUpTests {
             defer { release.continuation.finish() }
             let holder = O.heldPass(
                 engine: engine, accountId: Self.accountId, name: "held", log: followUps.log, release: release.stream)
-            #expect(await O.eventually { followUps.log.snapshot == ["start held"] }, "precondition: the turn is held")
+            let turnHeld = await O.eventually { followUps.log.snapshot == ["start held"] }
+            #expect(turnHeld, "precondition: the turn is held")
             _ = try await engine.backgroundDeltaSync(account: account)
             release.continuation.yield()
             await holder.value
@@ -576,10 +582,11 @@ struct SyncFollowUpTests {
                 followUps.runStageTwo(engine: engine)
                 log.append("opening")
                 let stageOne = Task { try await engine.backgroundDeltaSync(account: account) }
-                #expect(await O.eventually { log.snapshot.contains("read 1500") }, "precondition: stage 1 is reading")
+                let stageOneReading = await O.eventually { log.snapshot.contains("read 1500") }
+                #expect(stageOneReading, "precondition: stage 1 is reading")
                 let poll = Self.fire(.stageTwo, burst: 1, engine: engine, account: account)
-                #expect(await O.eventually(seconds: 5) { poll.snapshot == ["nothing"] },
-                        "precondition: the poll's stage 2 found stage 1 running")
+                let pollFoundStageOne = await O.eventually(seconds: 5) { poll.snapshot == ["nothing"] }
+                #expect(pollFoundStageOne, "precondition: the poll's stage 2 found stage 1 running")
                 gate.signal()
                 _ = try await stageOne.value
             case .flaggedBefore:
@@ -591,7 +598,8 @@ struct SyncFollowUpTests {
                 defer { release.continuation.finish() }
                 let holder = O.heldPass(
                     engine: engine, accountId: Self.accountId, name: "background", log: log, release: release.stream)
-                #expect(await O.eventually { log.snapshot.contains("start background") }, "precondition: a pass holds the turn")
+                let backgroundHolds = await O.eventually { log.snapshot.contains("start background") }
+                #expect(backgroundHolds, "precondition: a pass holds the turn")
                 _ = try await engine.backgroundDeltaSync(account: account)
                 release.continuation.yield()
                 await holder.value
@@ -604,18 +612,21 @@ struct SyncFollowUpTests {
                 #expect(stageOneRan, "precondition: stage 1 ran")
                 #expect(followUps.asks.count == 3, "precondition: stage 1's release asked")
                 let poll = Self.fire(.stageTwo, burst: 1, engine: engine, account: account)
-                #expect(await O.eventually(seconds: 5) { poll.snapshot.count == 1 }, "the poll's stage 2 waited")
+                let pollWaited = await O.eventually(seconds: 5) { poll.snapshot.count == 1 }
+                #expect(pollWaited, "the poll's stage 2 waited")
             case .pollFirst:
                 followUps.runStageTwo(engine: engine)
                 log.append("opening")
                 let poll = Self.fire(.stageTwo, burst: 1, engine: engine, account: account)
-                #expect(await O.eventually { log.snapshot.contains("read 1500") }, "precondition: the poll's stage 2 is reading")
+                let pollReading = await O.eventually { log.snapshot.contains("read 1500") }
+                #expect(pollReading, "precondition: the poll's stage 2 is reading")
                 let read = try await engine.backgroundDeltaSync(account: account)
                 let stageOneReadNothing = read == nil
                 #expect(stageOneReadNothing, "precondition: stage 1 found the poll's stage 2 running")
                 log.append("stage 1 returned")
                 gate.signal()
-                #expect(await O.eventually(seconds: 5) { poll.snapshot.count == 1 }, "the poll's stage 2 never ended")
+                let pollEnded = await O.eventually(seconds: 5) { poll.snapshot.count == 1 }
+                #expect(pollEnded, "the poll's stage 2 never ended")
             }
             #expect(await Self.settled(engine, followUps), "the opening's passes never settled")
 
@@ -916,9 +927,11 @@ struct SyncFollowUpTests {
     @Test("The return that skips the herd asks for its stage 2")
     func herdSkipBranchAsksForStageTwo() throws {
         let files = try DiagnosticPrintGateTests.appTargetSources()
-        let scheduler = try #require(files.first { $0.relativePath == "TabMail/Services/SyncScheduler.swift" }).source
+        let schedulerFile = files.first { $0.relativePath == "TabMail/Services/SyncScheduler.swift" }
+        let scheduler = try #require(schedulerFile).source
         let lines = scheduler.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-        let skip = try #require(lines.firstIndex { $0.contains("herd SKIPPED") }, "the herd-skip branch is gone")
+        let skipIndex = lines.firstIndex { $0.contains("herd SKIPPED") }
+        let skip = try #require(skipIndex, "the herd-skip branch is gone")
         let next = lines[(skip + 1)...].first { !$0.isEmpty && !$0.hasPrefix("//") }
         #expect(next == "stageTwoForReturnDuringReturn()", "the herd-skip branch no longer asks for its stage 2")
     }

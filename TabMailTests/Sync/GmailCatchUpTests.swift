@@ -3575,7 +3575,8 @@ struct GmailCatchUpTests {
             #expect(before % slice == 0, "the follow-up read inside a slice, after \(before) catch-up requests")
             #expect(try Self.state(world, inboxPath)?.lastCompletedAt != nil,
                     "the run goes on after the follow-up and completes the listing")
-            #expect(server.listRequests().filter { $0.labelId == inboxPath }.count == count, "no range is listed twice")
+            let inboxListings = server.listRequests().filter { $0.labelId == inboxPath }.count
+            #expect(inboxListings == count, "no range is listed twice")
         }
     }
 

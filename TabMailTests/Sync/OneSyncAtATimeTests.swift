@@ -234,8 +234,8 @@ struct OneSyncAtATimeTests {
             #expect(try await Self.waitForHistoryRequests(1, wire: wire), "precondition: the first pass's delta started")
             // A pass that waits its turn (a sync trigger never waits: `SyncFollowUpTests`).
             let secondTask = Task { _ = try? await engine.sync(account: account) }
-            #expect(await Self.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 1 },
-                    "precondition: the second pass waits its turn behind the first")
+            let secondWaits = await Self.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 1 }
+            #expect(secondWaits, "precondition: the second pass waits its turn behind the first")
 
             await #expect(throws: (any Error).self, "precondition: the first pass throws (its delta failed, no full sync due)") {
                 _ = try await first.value
@@ -320,12 +320,12 @@ struct OneSyncAtATimeTests {
             let engine = await Self.engine(provider: provider)
 
             let first = Task { try await engine.sync(account: account) }
-            #expect(await Self.eventually { wire.snapshot.listingRequests == 1 },
-                    "precondition: the first pass reached its full sync")
+            let firstListed = await Self.eventually { wire.snapshot.listingRequests == 1 }
+            #expect(firstListed, "precondition: the first pass reached its full sync")
             // The caller's copy still names the expired cursor.
             let second = Task { _ = try await engine.sync(account: account) }
-            #expect(await Self.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 1 },
-                    "precondition: the pass waits its turn behind the full sync")
+            let secondWaits = await Self.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 1 }
+            #expect(secondWaits, "precondition: the pass waits its turn behind the full sync")
             wire.releaseFirstListing.signal()
 
             _ = try await first.value
@@ -560,12 +560,13 @@ struct OneSyncAtATimeTests {
             let log = PassLog()
             let held = AsyncStream<Void>.makeStream()
             let holder = Self.heldPass(engine: engine, accountId: Self.accountId, name: "held", log: log, release: held.stream)
-            #expect(await Self.eventually { log.snapshot == ["start held"] }, "precondition: the turn is held")
+            let turnHeld = await Self.eventually { log.snapshot == ["start held"] }
+            #expect(turnHeld, "precondition: the turn is held")
 
             // Every caller passes the copy it read before the wait.
             let foreground = Task { try await engine.sync(account: account) }
-            #expect(await Self.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 1 },
-                    "precondition: the foreground pass waits its turn")
+            let foregroundWaits = await Self.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 1 }
+            #expect(foregroundWaits, "precondition: the foreground pass waits its turn")
             let busyRead = try await engine.backgroundDeltaSync(account: account)
             let busyReadNothing = busyRead == nil
             #expect(busyReadNothing, "a delta during a held turn read instead of setting the follow-up flag")
@@ -583,8 +584,8 @@ struct OneSyncAtATimeTests {
                 #expect(deltaResult.changed == false && deltaResult.reason == "noAccount",
                         "a delta whose account is gone must report no change, for the removed account")
                 #expect(scenario.recordedCalls().isEmpty, "a pass whose account is gone made a request")
-                #expect(try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) } == nil,
-                        "a pass whose account is gone wrote its row back")
+                let rowGone = try await pool.read { db in try Account.fetchOne(db, key: Self.accountId) } == nil
+                #expect(rowGone, "a pass whose account is gone wrote its row back")
             } else {
                 #expect(!wire.snapshot.historyStarts.isEmpty, "non-vacuity: the same passes sync when the account is there")
             }

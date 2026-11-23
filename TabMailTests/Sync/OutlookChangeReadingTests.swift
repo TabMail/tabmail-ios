@@ -752,7 +752,8 @@ struct OutlookChangeReadingTests {
             await engine.remove(accountId: w.accountId)
             let outcome = try #require(read, "the account was free, so the read ran")
             #expect(outcome.reason != "noCursor", "an Outlook push pass is not taken for one with no bookmark")
-            #expect(try w.account().lastSyncedAt.map { $0 > before } == true, "the poll is recorded")
+            let pollRecorded = try w.account().lastSyncedAt.map { $0 > before } == true
+            #expect(pollRecorded, "the poll is recorded")
         }
     }
 
