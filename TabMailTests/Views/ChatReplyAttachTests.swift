@@ -216,6 +216,21 @@ struct ChatReplyAttachTests {
         text.components(separatedBy: needle).count - 1
     }
 
+    /// The operands of the chat's `isAnyPresentation`, read from its source with each line's `//`
+    /// comment removed first, so a term commented out is not one.
+    private static func presentationOperands() throws -> [String] {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let text = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Chat/ChatThreadView.swift"), encoding: .utf8)
+        let code = text.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line in line.range(of: "//").map { String(line[..<$0.lowerBound]) } ?? String(line) }
+            .joined(separator: "\n")
+        guard let start = code.range(of: "private var isAnyPresentation: Bool {"),
+              let end = code[start.upperBound...].firstIndex(of: "}") else { return [] }
+        return code[start.upperBound..<end].components(separatedBy: "||")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
     @Test("Compose adds the pick once its draft has loaded, after recording the starting state, through its own buttons' steps")
     func composeAddsThePickAfterLoading() throws {
         let compose = try Self.source("TabMail/Views/Compose/ComposeView.swift")
@@ -261,9 +276,13 @@ struct ChatReplyAttachTests {
         #expect(Self.count("paperclipPickerOpen = true", in: chat) == 1, "set only by the menu's choice")
         #expect(Self.count("paperclipPickerOpen = false", in: chat) == 2, "its start, and the picker's onDismiss")
         #expect(Self.count("readyReply = ", in: chat) == 2, "the ghost's tap and the paperclip's pick, through the one presenter")
-        // The pickers, and a pick waiting for its picker to close, count as presentations over the chat.
-        #expect(Self.count("|| showsPhotoPicker || showsFilePicker || showsCamera || pendingAttachCard != nil }", in: chat) == 1)
-        #expect(Self.count("private var isAnyPresentation: Bool { cardMessage != nil", in: chat) == 1, "the chain above is the presentations' own")
+        // The pickers, and a pick waiting for its picker to close, count as presentations over the
+        // chat: each is one of isAnyPresentation's operands, read with comments removed.
+        let operands = try Self.presentationOperands()
+        let paperclipTerms = ["showsPhotoPicker", "showsFilePicker", "showsCamera", "pendingAttachCard != nil"]
+        let missing = paperclipTerms.filter { !operands.contains($0) }
+        let others = operands.count - paperclipTerms.count
+        #expect(missing.isEmpty && others > 0, "isAnyPresentation's operands: \(operands)")
         // The test seam takes the same two steps as a picker, and exists only in debug builds.
         let seamText = ".onReceive(NotificationCenter.default.publisher(for: .chatPaperclipPickForTesting)) { note in guard let pick = note.object as? ComposeAttachmentPick else { return } attachPicked(pick) openPendingAttachCard() }"
         #expect(Self.count(seamText, in: chat) == 1)
