@@ -1749,8 +1749,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        while one is up is taken by the screen under it, and UIKit may refuse its cover; that
        screen then takes no other request until it is left. The same holds for an email an email
        pill pushes beneath a chat's email card, whose screen and the chat may then both take one
-       (ios#1259, P4). An agent's compose released as a cover closes
-       goes to whichever screen observes it first (ADR-IOS-030's one global slot, ios#1172).
+       (ios#1259, P4). An agent's compose released as a cover closes goes only to the screen
+       whose chat asked for it, once that screen is shown and uncovered (ADR-IOS-053 amendment 2;
+       before it, ADR-IOS-030's one global slot gave it to whichever screen observed it first,
+       ios#1172).
      - *The agent's compose waits for it.* The new email's chat cover keeps ADR-IOS-030's
        presentation count while it is up, as `DraftComposePresenter` does for a draft's chat, so an
        agent's compose finished meanwhile is queued and comes up once the cover closes, instead of

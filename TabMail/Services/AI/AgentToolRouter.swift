@@ -152,7 +152,9 @@ final class AgentToolRouter {
     /// Number of currently-presented `ComposeView` instances, tracked via the
     /// `composePresentationDidBegin/End` hooks called from `ComposeView.onAppear/onDisappear`.
     /// While > 0 the queue holds — both manually-opened and agent-opened compose windows
-    /// increment the count, so a manual compose blocks queued agent compose requests.
+    /// increment the count, so a manual compose blocks queued agent compose requests. A draft's
+    /// chat (`DraftComposePresenter`) and a new email's chat cover (`ChatNewEmailCoverView`)
+    /// count the same way.
     @ObservationIgnored private var presentationCount: Int = 0
 
     /// True between the moment a host takes a request (`takeCompose(for:)`) and the
