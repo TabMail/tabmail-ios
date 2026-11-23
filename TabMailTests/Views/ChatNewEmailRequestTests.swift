@@ -1006,9 +1006,8 @@ struct ChatNewEmailRequestHostedTests {
                 composeAccount: otherAccount ? seed.other : seed.account))
         } body: { screen in
             let accounts = try await screen.pool.read { db in try Account.fetchAll(db) }
-            let from = try #require(accounts.first { $0.id == fromId }?.emailAddress)
-            let notFrom = try #require(accounts.first { $0.id == notFromId }?.emailAddress)
-            #expect(from != notFrom, "control: the two accounts have their own addresses")
+            let given = try #require(accounts.first { $0.id == fromId })
+            #expect(accounts.contains { $0.id == notFromId }, "control: compose has another account to pick by itself")
             var fields: [String: String] = [:]
             try await ThreadChatTests.wait {
                 fields = Self.composeRecipients(screen.view)
@@ -1021,10 +1020,18 @@ struct ChatNewEmailRequestHostedTests {
             let hasBody = texts.contains { $0.contains("Are you free at noon?") }
             #expect(texts.contains("Lunch on Friday"), "the subject: \(texts)")
             #expect(hasBody, "the body: \(texts)")
-            try await ThreadChatTests.wait { HostedAccessibility.labels(in: screen.view).contains(from) }
-            let labels = HostedAccessibility.labels(in: screen.view)
-            #expect(labels.contains(from), "from the account it was given: \(labels.prefix(16))")
-            #expect(!labels.contains(notFrom), "not the other one")
+            // The From row is not read off the screen: compose's scroll view swaps its class a
+            // moment after it shows (`DisableAutoScrollToVisible`), and from then on the SwiftUI
+            // rows inside it (From, To:, Subject:) are missing from accessibility (tabmail-ios#1124),
+            // so a read finds the row or not depending on timing. Compose takes its From from the
+            // account it is given (`ComposeView.prepopulate`); what is checked here is that the
+            // cover gives it this one.
+            let built = ChatNewEmailCoverView(cover: .make(
+                request: full, opensInChat: false, signedIn: true, chatAccount: nil, composeAccount: given)).body
+            let compose = try #require(
+                Mirror(reflecting: built).descendant("storage", "trueContent") as? ComposeView,
+                "control: the cover shows compose: \(type(of: built))")
+            #expect(compose.account?.id == fromId, "from the account it was given, not the one compose would pick")
             #expect(!HostedAccessibility.identifiers(in: screen.view).contains(ChatNewThreadView.backId), "not the chat")
         }
         let router = AgentToolRouter.shared

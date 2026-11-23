@@ -1173,6 +1173,41 @@ struct ChatNewDraftSaveTests {
         #expect(recorder.calls.isEmpty)
     }
 
+    @Test("A save that a newer save of the draft already beat on disk is refused, writes nothing, and leaves the chat comparing with what it opened")
+    func supersededSaveKeepsWhatWasOpened() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let draft = try await savedDraft(fixture, attachments: [])
+        let recorder = QueueRecorder()
+        let model = ChatNewThreadModel(reopening: draft, account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
+        let id = draft.id
+        // A newer save of the same draft, in this session: the row on disk is later than any
+        // snapshot the chat takes now, so the store keeps it and does not apply the chat's.
+        let later = Date().addingTimeInterval(3600).timeIntervalSince1970
+        try await fixture.pool.write { db in
+            try db.execute(sql: "UPDATE draft SET updatedAt = ?, body = ? WHERE id = ?",
+                           arguments: [later, "Saved later", id])
+        }
+        model.words = "Written in the chat"
+        let outcome = await model.saveIfNeeded()
+        let afterRow = try await row(fixture, draft.id)
+        let after = try #require(afterRow)
+        let refused: Bool
+        if case .refused = outcome { refused = true } else { refused = false }
+        #expect(refused, "the chat's save was not applied: \(outcome)")
+        #expect(after.body == "Saved later")
+        #expect(recorder.calls.isEmpty)
+
+        // Nothing of the chat's was written, so going back to the draft's own words saves nothing.
+        model.words = "Lunch on Friday?"
+        let again = await model.saveIfNeeded()
+        let finalRow = try await row(fixture, draft.id)
+        let final = try #require(finalRow)
+        #expect(again == .saved, "back to what was opened: nothing to save")
+        #expect(final.body == "Saved later")
+        #expect(recorder.calls.isEmpty)
+    }
+
     @Test("A draft deleted after the chat opened is not brought back from the chat")
     func deletedDraftStaysDeleted() async throws {
         let fixture = try fixture()
