@@ -1409,8 +1409,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count(".accessibilityHidden(dictation.isActive) .showChatAction(showChat, isExpanded: isExpanded)", in: pill) == 1)
         #expect(Self.count(".onTapGesture { dictation.finish() } .showChatAction(showChat, isExpanded: isExpanded)", in: pill) == 1)
         // A field built without the action offers none (the panel open, the tutorial).
-        #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0).showChat == nil)
-        #expect(ChatReplyField(example: nil, isNoReply: false, clearCount: 0, showChat: {}).showChat != nil)
+        #expect(ChatReplyField(example: nil, isNoReply: false).showChat == nil)
+        #expect(ChatReplyField(example: nil, isNoReply: false, showChat: {}).showChat != nil)
         // The reply field and the panel's input are two text fields, each with its own focus value,
         // and the panel opening moves a typed-in field's keyboard to the panel's input (mock v15
         // H2; on screen: `ChatSwipeUITests`, the drags that open the panel from the focused field).
