@@ -18,17 +18,21 @@ import GRDB
 //
 // The turnover re-drive: a folder whose UIDVALIDITY reset reaction is armed
 // (`Folder.uidValidityResetPendingAt`) and was interrupted is re-driven by every
-// change pass after its read, every armed folder of the account (count the
-// predicate, not the call sites: Memory 114), while the read's budget lasts
-// (#1287). A folder the pass does not reach stays armed for the next pass.
+// change pass whose read did not throw, after that read, every armed folder of
+// the account (count the predicate, not the call sites: Memory 114), while the
+// read's budget lasts (#1287). A folder the pass does not reach stays armed for
+// a later pass.
 
 extension SyncEngine {
 
     /// Re-drive the account's armed folders, one after another, after the pass
-    /// has read. A reaction starts only before `end` (the pass's read budget,
-    /// `changeReadEnd`, which ends before the caller's own deadline); one already
-    /// running at `end` finishes or is cancelled with its pass, and its flag stays
-    /// set until a reaction completes.
+    /// has read. A reaction starts only before `end`, the end of the read budget
+    /// the pass sampled for its read (`changeReadEnd`, before the caller's own
+    /// deadline). A reaction already running at `end` runs on until it completes
+    /// or its pass is cancelled (the caller's timeout). One stopped before it
+    /// stamps the new epoch leaves the folder armed for a later re-drive; one
+    /// stopped after the stamp leaves it unarmed and empty under the new epoch
+    /// until its next listing fills it.
     func redriveArmedTurnovers(accountId: String, until end: Date) async {
         let armed = ((try? await dbPool.read { db in
             try Folder

@@ -177,13 +177,17 @@ extension SyncEngine {
 
     /// Read and apply the provider's changes. Nil = the provider has no change
     /// reader; the caller keeps that provider's remaining change path.
+    /// - Parameter readEnd: the end of the pass's read budget
+    ///   (`changeReadEnd`), sampled once by the pass at the start of its turn;
+    ///   the pass's turnover re-drive is bounded by the same end.
     /// - Parameter deadline: the caller's own deadline for the whole pass (its
     ///   timeout), or nil when the caller sets none. It is not account sync state.
     func readAndApplyChanges(
-        account: Account, provider: any EmailProvider, scope: ChangeScope, deadline: Date? = nil, pass: UUID? = nil
+        account: Account, provider: any EmailProvider, scope: ChangeScope, readEnd: Date, deadline: Date? = nil,
+        pass: UUID? = nil
     ) async throws -> ChangePassOutcome? {
         let accountId = account.id
-        let request = try await makeChangeRequest(accountId: accountId, scope: scope, deadline: deadline)
+        let request = try await makeChangeRequest(accountId: accountId, scope: scope, readEnd: readEnd)
         let outOfTime = !request.context.hasBudget()
         guard let firstRead = try await provider.fetchChanges(
             since: ChangeCursor(account: account.lastHistoryId), request: request) else { return nil }
@@ -245,12 +249,11 @@ extension SyncEngine {
     }
 
     /// Built ONCE when the pass's turn starts (snapshot rule).
-    private func makeChangeRequest(accountId: String, scope: ChangeScope, deadline: Date?) async throws -> ChangeRequest {
+    private func makeChangeRequest(accountId: String, scope: ChangeScope, readEnd: Date) async throws -> ChangeRequest {
         let folders = try await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId).fetchAll(db)
         }
         let clock = changeReadClock
-        let readEnd = Self.changeReadEnd(turnStart: clock(), callerDeadline: deadline)
         let synced = Set(syncableFoldersInOrder(folders).map(\.id))
         // At most `SyncConfig.changeRereadBudgetPerPass` distinct ids are read
         // again in one pass, so full re-read lists never push a pass past the
@@ -378,8 +381,10 @@ extension SyncEngine {
         }
 
         // A renumbered folder's turnover reaction, armed durably in its folder
-        // transaction above, runs now (single-flight; a crash re-drives it from
-        // the armed flag after the next pass's read).
+        // transaction above, runs now (single-flight). One stopped before it
+        // stamps the new epoch, or lost to a crash, leaves the flag set: a later
+        // pass's re-drive retries it after that pass's read, while its read
+        // budget lasts.
         for path in armedTurnovers {
             BackgroundSyncLogger.logDebug("[Sync] Change apply: folder \(path) renumbered — turnover reaction")
             await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: path)

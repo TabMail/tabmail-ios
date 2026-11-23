@@ -35,12 +35,15 @@ extension SyncEngine {
         account: Account, provider: any EmailProvider, inboxOnly: Bool = false, deadline: Date? = nil, pass: UUID? = nil
     ) async throws -> ChangePassOutcome {
         // The pass reads first. The armed turnovers are re-driven after the read,
-        // and only while the read's own budget from the start of the turn lasts,
-        // so a reaction that cannot finish never keeps the account's changes
-        // unread, and no reaction starts once that budget is spent (#1287).
+        // and a reaction starts only while the read's budget lasts: one end,
+        // sampled here at the start of the turn, bounds both. A reaction that
+        // cannot finish never keeps this pass's changes unread, and none starts
+        // once that budget is spent. A read that throws skips the re-drive for
+        // this pass (#1287).
         let readEnd = Self.changeReadEnd(turnStart: changeReadClock(), callerDeadline: deadline)
         let outcome = try await readAndApplyChanges(
-            account: account, provider: provider, scope: inboxOnly ? .inboxOnly : .all, deadline: deadline, pass: pass)
+            account: account, provider: provider, scope: inboxOnly ? .inboxOnly : .all, readEnd: readEnd,
+            deadline: deadline, pass: pass)
         await redriveArmedTurnovers(accountId: account.id, until: readEnd)
         return outcome ?? ChangePassOutcome()
     }
