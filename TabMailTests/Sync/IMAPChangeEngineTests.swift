@@ -376,7 +376,105 @@ struct IMAPChangeEngineTests {
             #expect(finished, "the change pass did not finish within its bound: its re-drive waited on the turn it holds")
             let row = try await w.pool.read { db in try Folder.fetchOne(db, key: armedId) }
             let armed = try #require(row)
+            let armedUIDs = Set(try await w.pool.read { db in
+                try String.fetchAll(db, sql: "SELECT messageId FROM messageHeader WHERE folderId = ?", arguments: [armedId])
+            })
             #expect(armed.uidValidityResetPendingAt == nil, "the pass's re-drive did not complete the reaction")
+            #expect(armed.lastKnownUidValidity == Self.epoch + 1)
+            // The reaction's resync listing ran inside the pass, in its turn: the
+            // new numbering's messages are stored by the time the pass finishes.
+            #expect(armedUIDs == ["201", "202"], "the reaction's resync listing did not run in the pass's turn")
+        }
+    }
+
+    /// Red if the re-drive's end were sampled again after the read: the clock
+    /// moves to the request's read end while the inbox's STATUS is held, so the
+    /// budget ends during the read and no reaction may start after it, though a
+    /// second sample would give the re-drive a whole new budget. The next pass,
+    /// with a budget of its own, completes the folder.
+    @Test("A read budget that ends during the pass's read starts no turnover after that read")
+    func budgetEndingDuringTheReadStartsNoRedrive() async throws {
+        let clock = StillClock(Date())
+        try await Self.withWorld("eng-redrive-midread", capabilities: Self.condstoreOnly,
+                                 serverUIDs: [1, 2, 3], localUIDs: [1, 2, 3], armedPaths: [Self.armedPath],
+                                 changeReadClock: { clock.read() }) { w in
+            let start = Date()
+            clock.set(start)
+            // A pass with no caller deadline: its read budget ends this long after it starts.
+            let end = start.addingTimeInterval(SyncConfig.changeReadBudgetSeconds)
+            let armedId = "\(w.account.id):\(Self.armedPath)"
+            let pool = w.pool
+            let reacted = Mutex(false)
+            AccountManager.uidValidityResetCheckpointHooksForTesting.withLock {
+                $0[.afterPurgeBeforeStamp(folderId: armedId)] = { reacted.withLock { $0 = true } }
+            }
+            defer { AccountManager.uidValidityResetCheckpointHooksForTesting.withLock { $0 = [:] } }
+            let engine = w.engine
+            let account = w.account
+            let provider = w.provider
+            let server = w.server
+
+            server.holdNextCommand(containing: "STATUS")
+            var readReturned = false
+            try await TestProviderRegistry.withRegisteredProvider(accountId: account.id, provider: provider) {
+                let pass = Task { () -> Bool in
+                    do {
+                        _ = try await engine.performChangePass(account: account, provider: provider)
+                        return true
+                    } catch {
+                        return false
+                    }
+                }
+                try await IMAPChangeTurnAndGuardTests.waitUntil { server.isHoldingCommand(containing: "STATUS") }
+                clock.set(end)
+                server.releaseHeldCommand(containing: "STATUS")
+                readReturned = await pass.value
+            }
+            let row = try await pool.read { db in try Folder.fetchOne(db, key: armedId) }
+            let afterPass = try #require(row)
+            let keptUIDs = Set(try await pool.read { db in
+                try String.fetchAll(db, sql: "SELECT messageId FROM messageHeader WHERE folderId = ?", arguments: [armedId])
+            })
+            let startedReaction = reacted.withLock { $0 }
+            #expect(readReturned, "the pass threw: it would skip the re-drive whatever its end")
+            #expect(!startedReaction, "a reaction started after the read budget ended during the read")
+            #expect(afterPass.uidValidityResetPendingAt != nil)
+            #expect(afterPass.lastKnownUidValidity == Self.epoch)
+            #expect(keptUIDs == ["1", "2", "3"], "the folder past the budget was purged")
+
+            await TestProviderRegistry.withRegisteredProvider(accountId: account.id, provider: provider) {
+                _ = try? await engine.performChangePass(account: account, provider: provider)
+            }
+            let nextRow = try await pool.read { db in try Folder.fetchOne(db, key: armedId) }
+            let afterNext = try #require(nextRow)
+            #expect(afterNext.uidValidityResetPendingAt == nil, "the next pass did not re-drive the folder left armed")
+            #expect(afterNext.lastKnownUidValidity == Self.epoch + 1)
+        }
+    }
+
+    /// A read in which one folder fails but another is read does not throw, and
+    /// the pass re-drives after it: the archive's commands are refused, the
+    /// inbox's new message is stored, and the armed folder's reaction completes.
+    @Test("A pass whose read fails in one folder but reads another still re-drives the armed folders")
+    func partialReadFailureStillRedrives() async throws {
+        try await Self.withWorld("eng-redrive-partial", capabilities: Self.condstoreOnly,
+                                 serverUIDs: [1, 2, 3, 4], localUIDs: [1, 2, 3], armedPaths: [Self.armedPath],
+                                 withArchive: true) { w in
+            let armedId = "\(w.account.id):\(Self.armedPath)"
+            w.server.failEveryCommand(containing: Self.archivePath, message: "Mailbox unavailable")
+            var threw = false
+            await TestProviderRegistry.withRegisteredProvider(accountId: w.account.id, provider: w.provider) {
+                do {
+                    _ = try await w.engine.performChangePass(account: w.account, provider: w.provider)
+                } catch {
+                    threw = true
+                }
+            }
+            let row = try await w.pool.read { db in try Folder.fetchOne(db, key: armedId) }
+            let armed = try #require(row)
+            #expect(!threw, "a pass that read the inbox threw because the archive's read failed")
+            #expect(try w.uids().contains("4"), "the pass did not store the inbox's new mail")
+            #expect(armed.uidValidityResetPendingAt == nil, "a pass whose read partly failed did not re-drive the armed folder")
             #expect(armed.lastKnownUidValidity == Self.epoch + 1)
         }
     }

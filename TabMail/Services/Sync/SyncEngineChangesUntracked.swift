@@ -31,8 +31,9 @@ extension SyncEngine {
     /// deadline). A reaction already running at `end` runs on until it completes
     /// or its pass is cancelled (the caller's timeout). One stopped before it
     /// stamps the new epoch leaves the folder armed for a later re-drive; one
-    /// stopped after the stamp leaves it unarmed and empty under the new epoch
-    /// until its next listing fills it.
+    /// stopped after the stamp leaves it unarmed under the new epoch, its old
+    /// rows purged and the new ones not yet listed (unless the listing committed
+    /// some before it stopped), until its next listing fills it.
     func redriveArmedTurnovers(accountId: String, until end: Date) async {
         let armed = ((try? await dbPool.read { db in
             try Folder

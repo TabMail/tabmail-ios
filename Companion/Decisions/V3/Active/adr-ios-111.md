@@ -1262,14 +1262,17 @@ re-drive. Gmail and Outlook accounts were unaffected.
 at the start of the turn). The request samples the end of the pass's read budget once, after its folder snapshot
 and before the first request (`changeReadEnd(turnStart:callerDeadline:)` on `changeReadClock`, in the request's
 `ChangeContext`). The pass reads and applies with that request (`readAndApplyChanges(account:provider:request:
-deadline:pass:)`), then calls `redriveArmedTurnovers(accountId:until:)` with the same end. The end is a start
+deadline:pass:)`), then calls `redriveArmedTurnovers(accountId:until:)` with the same end. The end belongs to
+the attempt: a pass that retries its read after a connection error (the foreground and per-account passes) builds
+a new request for the retry, and its first attempt, which threw, re-drove nothing. The end is a start
 cutoff: a reaction starts only before it; the armed folders not reached stay armed for a later pass. A pass that
 throws before the re-drive skips it: a failed request snapshot, a cancelled pass, a database failure, or a read in
 which every folder the pass read failed (the apply then throws; the IMAP reader itself records a lost or refused
 connection per folder and does not throw). A reaction already running at the end runs on until it completes or
 its pass is cancelled by the caller's timeout. A reaction that stops before it stamps the new epoch (step 5)
 leaves the flag set, and a later re-drive retries it (unchanged). One that stops after the stamp, during its resync
-listing (step 6), leaves the folder unarmed under its new epoch with its old rows purged; a later listing fills it
+listing (step 6), leaves the folder unarmed under its new epoch with its old rows purged (and none of the new ones
+yet, unless the listing committed some before it stopped); a later listing fills it
 (the change pass's listing of an untracked folder it reads and finds changed, the full sync for a syncable folder,
 opening the folder, or the catch-up crawl, since the purge reset `backfillComplete`). A pass cancelled before the
 end may still start the next folder's reaction; that reaction's first database read fails (a cancelled task's
@@ -1281,7 +1284,10 @@ that reaction left armed is retried by the same pass's re-drive while the budget
 outside the turn (its in-transaction armed check and binding epoch check), and the trigger handler spawns one
 that way. But every reaction disconnects the provider's sessions (step 5's connection hygiene), and a re-drive
 running beside the change read would cut that read's session once per armed folder. Inside the turn, after the
-read, a re-drive never cuts a change read of its own account. A pass waiting for the turn behind a re-drive waits
+read, a re-drive never cuts a change read of its own account. This covers the re-drive's own loop. A re-check that
+a reaction spawns when it ends (`releaseUidValidityReaction`) and the trigger handler's reaction run in tasks of
+their own: they can do their work before the listing beside a change read, as before, and their listing waits for
+the turn. A pass waiting for the turn behind a re-drive waits
 for the rest of the holder's turn: its read budget, the one reaction running at the budget's end, and whatever
 the holder does after its change pass (a foreground pass's full sync and catch-up start). That reaction is
 bounded by its caller's timeout (10 s per-account pass, 60 s foreground pass) and then by how long its cancelled
