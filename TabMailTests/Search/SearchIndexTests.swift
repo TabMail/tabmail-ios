@@ -442,12 +442,6 @@ struct SearchIndexCRUDTests {
 
     // needsBodyUpdate, emptyBodyCount, totalIndexedCount removed — flags live in GRDB only
 
-    @Test("documentCount returns non-negative count")
-    func documentCount() async throws {
-        let count = try await index.documentCount()
-        #expect(count >= 0)
-    }
-
     // headerIdsWithEmptyBodies, headerIdsWithNonEmptyBodies, emptyBodyCount(accountId:) removed — flags live in GRDB only
 
     // totalIndexedCount removed — flags live in GRDB only
