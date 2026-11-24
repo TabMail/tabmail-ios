@@ -796,24 +796,25 @@ extension SyncEngine {
     ///
     /// Gmail duplicate-label safety: if the same rfc822MessageId still
     /// exists in inbox, the tag is legitimate (Gmail shows the same
-    /// message in both Inbox and All Mail) and we skip it.
-    func sweepStaleActionTags(account: Account, provider _: any EmailProvider) async {
+    /// message in both Inbox and All Mail) and we skip it. Each candidate
+    /// (a tagged non-inbox row past the TTL with a Message-ID) is checked on
+    /// its own with `inboxCopySQL`, a seek on the Message-ID index; a sweep
+    /// with no candidate reads no inbox row at all (#1404). A check that
+    /// fails keeps that tag; the next full sync's sweep checks it again.
+    ///
+    /// `inboxCopyExists` replaces that check (tests); nil reads `inboxCopySQL`.
+    func sweepStaleActionTags(
+        account: Account,
+        provider _: any EmailProvider,
+        inboxCopyExists: (@Sendable (_ rfc822MessageId: String, _ accountId: String) async throws -> Bool)? = nil
+    ) async {
         let maxPerSweep = SyncConfig.pruneChunkSize
-
-        // Collect inbox rfc822MessageIds for the duplicate-label guard.
-        let inboxRfc822Ids: Set<String> = (try? await dbPool.read { db in
-            let inboxHeaders = try MessageHeader
-                .filter(Column("accountId") == account.id && Column("isInInbox") == true)
-                .limit(SyncConfig.maxLoadedMessages)
-                .fetchAll(db)
-            var ids = Set<String>()
-            for msg in inboxHeaders {
-                if let rfc = msg.rfc822MessageId, !rfc.isEmpty {
-                    ids.insert(rfc)
-                }
+        let pool = dbPool
+        let inboxCopyExists = inboxCopyExists ?? { rfc822MessageId, accountId in
+            try await pool.read { db in
+                try Self.inboxCopyExists(db, rfc822MessageId: rfc822MessageId, accountId: accountId)
             }
-            return ids
-        }) ?? []
+        }
 
         let folders = (try? await dbPool.read { db in
             try Folder.filter(Column("accountId") == account.id && Column("role") != FolderRole.inbox.rawValue).fetchAll(db)
@@ -838,11 +839,6 @@ extension SyncEngine {
             for msg in msgs where msg.actionTag != nil {
                 guard cleared < maxPerSweep else { break }
 
-                // Gmail safety: if this rfc822MessageId is still in inbox, skip.
-                if let rfc = msg.rfc822MessageId, !rfc.isEmpty, inboxRfc822Ids.contains(rfc) {
-                    continue
-                }
-
                 // TTL guard: only reclaim once the tag is older than
                 // SyncConfig.actionTagTTLSeconds. A NULL `actionTagSetAt`
                 // (legacy pre-migration row, or a writer that failed to stamp
@@ -853,6 +849,15 @@ extension SyncEngine {
                 // timestamp is likewise treated as expired (ADR-IOS-008).
                 if let setAt = msg.actionTagSetAt, setAt > cutoff {
                     continue
+                }
+
+                // Gmail safety: if this rfc822MessageId is still in inbox, skip.
+                // Checked after the TTL so a young tag costs no read; a failed
+                // check keeps the tag (fail closed).
+                if let rfc = msg.rfc822MessageId, !rfc.isEmpty {
+                    guard let inInbox = try? await inboxCopyExists(rfc, account.id), !inInbox else {
+                        continue
+                    }
                 }
 
                 // Clear local state — action tags are local-only (ADR-IOS-036),
@@ -876,6 +881,27 @@ extension SyncEngine {
         if cleared > 0 {
             BackgroundSyncLogger.logDebug("[StaleTagSweep] Swept \(cleared) stale tags for \(account.emailAddress)")
         }
+    }
+
+    /// Whether `accountId` has an inbox row with this Message-ID: the stale-tag
+    /// sweep's Gmail duplicate guard, read once per candidate.
+    ///
+    /// It names its index, as `aiCacheInInboxSQL` does, so it always seeks the
+    /// Message-ID (the few copies of one message) whatever the planner statistics
+    /// hold. Left to the planner, the read walks `messageHeader_isInInbox_date`
+    /// (every inbox row of every account) with no statistics, and scans the whole
+    /// table with statistics recorded while `messageHeader` held a row or two (a
+    /// fresh install's first maintenance pass); nothing re-analyzes the table
+    /// while its schema is unchanged. `messageHeader_rfc822MessageId` is built by
+    /// the migrations, never deferred.
+    nonisolated static let inboxCopySQL = """
+        SELECT 1 FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE rfc822MessageId = ? AND accountId = ? AND isInInbox = 1
+        LIMIT 1
+        """
+
+    nonisolated static func inboxCopyExists(_ db: Database, rfc822MessageId: String, accountId: String) throws -> Bool {
+        try Int.fetchOne(db, sql: inboxCopySQL, arguments: [rfc822MessageId, accountId]) != nil
     }
 
     // MARK: - Chat Session Eviction
