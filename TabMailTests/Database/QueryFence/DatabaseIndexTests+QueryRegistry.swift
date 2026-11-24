@@ -167,7 +167,7 @@ extension DatabaseIndexTests {
     // MARK: - Verdicts are from the vocabulary
 
     static let verdictGrammar = QueryPlanRules.regex(
-        #"^(SEEK|NOT-A-QUERY|SCAN #[0-9]+|STOPS: [A-Za-z_]\w*\.[A-Za-z_]\w*|(BOUNDED|N\+1|SIM): \S.*|EXEMPT:(wipe|user rebuild|debug/test scene|debug tool|demo|test-only|search by method|shipped migration|(inherent|shipped one-shot): \S.*))$"#)
+        #"^(SEEK|NOT-A-QUERY|SCAN #[0-9]+|STOPS: [A-Za-z_]\w*\.[A-Za-z_]\w*|(BOUNDED|N\+1|SIM): \S.*|EXEMPT: (wipe|user rebuild|debug/test scene|debug tool|demo|test-only|search by method|shipped migration|(inherent|shipped one-shot): \S.*))$"#)
 
     static func isWellFormed(_ verdict: String) -> Bool { QueryPlanRules.matches(verdictGrammar, verdict) }
 

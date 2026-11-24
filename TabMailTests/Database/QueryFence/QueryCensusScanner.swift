@@ -894,23 +894,6 @@ enum QueryCensusScanner {
     /// `SQL(`, `Column(`, the request types. A call of a request helper is added per scan.
     static let requestTokens = #"\.(?:filter|order|select|limit|all|none|including|joining|group|having|annotated|matching|distinct|aliased|orderByPrimaryKey)\s*\(|\b(?:SQLRequest|QueryInterfaceRequest|SQLExpression|SQL|Column)\b"#
 
-    /// The code from `from` up to `to` with every brace group left out.
-    private static func outsideClosures(_ from: Int, _ to: Int, _ code: Code) -> String {
-        var out = ""
-        var segment = from
-        var p = from
-        while p < to {
-            if code.u[p] == Code.openBrace, code.partner[p] > p {
-                out += code.substring(segment, p) + " "
-                p = code.partner[p] + 1
-                segment = p
-                continue
-            }
-            p += 1
-        }
-        return out + code.substring(segment, max(segment, min(to, code.u.count)))
-    }
-
     /// The words of a code text.
     private static func names(in text: String) -> [String] {
         text.split { !($0.isLetter || $0.isNumber || $0 == "_" || $0 == "$") }.map(String.init)
@@ -941,12 +924,12 @@ enum QueryCensusScanner {
     /// ` ⟨name = …⟩` for the request bindings a call reads, so an edit of the request it
     /// runs, wherever it was built, changes the key: its receiver's binding (whatever it
     /// holds, as a record a write persists), and each binding read as an argument's leading
-    /// name (`readNames`) that builds a request: outside its closures it has a
-    /// `requestTokens` match or reads a binding that builds one, and names no database handle
-    /// (one that does runs a query, a site of its own, and holds its result). Each comes with
-    /// its plain reassignments before the call, then the same for the request bindings those
-    /// read. A binding is the last one of its name before the use, in the use's declaration or
-    /// one enclosing it. A binding that only holds a value (`accountId`, fetched rows) is not
+    /// name (`readNames`) that builds a request: it has a `requestTokens` match or reads a
+    /// binding that builds one, and names no database handle (one that does runs a query, a
+    /// site of its own, and holds its result; a closure's query needs a handle too). Each
+    /// comes with its plain reassignments before the call, then the same for the request
+    /// bindings those read. A binding is the last one of its name before the use, in the use's
+    /// declaration or one enclosing it. A binding that only holds a value (`accountId`, fetched rows) is not
     /// carried: its edits change no query.
     private static func bindingSuffix(_ start: Int, _ end: Int, _ code: Code, _ lexed: Lexed, _ handles: Set<String>,
                                       _ bindings: Bindings, _ builds: NSRegularExpression) -> String {
@@ -956,9 +939,9 @@ enum QueryCensusScanner {
             let binding = defined.binding
             if let known = memo[binding] { return known }
             guard !visiting.contains(binding) else { return false }
-            // Each definition outside its closures (their queries are sites of their own); one
-            // that names a handle runs a query and holds its result, a value.
-            let texts = defined.definitions.map { outsideClosures($0.from, $0.end, code) }
+            // A definition that names a handle runs a query (a site of its own) and holds its
+            // result, a value.
+            let texts = defined.definitions.map { code.substring($0.from, $0.end) }
             let result = !texts.contains { names(in: $0).contains { handles.contains($0) } }
                 && zip(defined.definitions, texts).contains { definition, text in
                     builds.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)) != nil
