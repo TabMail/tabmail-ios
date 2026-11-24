@@ -546,9 +546,13 @@ struct DatabaseIndexTests {
 /// here is vacuous); the pass DOES; the pass is idempotent; and a second pass over
 /// the converged state does nothing.
 ///
-/// `.serialized` because `runRefreshPlannerStatisticsIfStale` carries a
-/// process-wide single-flight latch, and the ordering test drives it.
-@Suite("Deferred index builds — v83 moved off the launch path", .serialized)
+/// `.serialized` and `.processGlobalState` because `runRefreshPlannerStatisticsIfStale`
+/// carries a process-wide single-flight latch, and the ordering test drives it:
+/// `.serialized` orders this suite's own tests, and `.processGlobalState` keeps another
+/// suite that drives the same latch (`PlannerStatisticsRefreshTests`,
+/// `InboxNotificationObserverSeedReadTests`) from holding it at the same moment, which
+/// would answer `.alreadyRunning` instead of analyzing.
+@Suite("Deferred index builds — v83 moved off the launch path", .serialized, .processGlobalState)
 struct DeferredIndexBuildTests {
 
     private struct Fixture {

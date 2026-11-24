@@ -26,8 +26,10 @@ import GRDB
 ///     (`SyncEngine.deferredIndexes`): until the background maintenance pass has
 ///     built it and refreshed the planner statistics, the same statement reads
 ///     the plain `(isInInbox, date)` index `messageHeader_isInInbox_date` plus one
-///     table row per inbox message. Same rows either way. The `1` stays a literal:
-///     a partial index serves only a WHERE that matches its own.
+///     table row per inbox message. Same rows either way. The `1` stays a literal,
+///     so the WHERE matches the index's own `isInInbox = 1` term for term. SQLite
+///     can also match a bound `1` when it plans with the bound value, but nothing
+///     here relies on that.
 ///   - Callbacks fire on the GRDB writer queue (background). Never main.
 ///   - Notification clear is called synchronously on the writer queue.
 ///     `UNUserNotificationCenter.removeDeliveredNotifications` is documented
