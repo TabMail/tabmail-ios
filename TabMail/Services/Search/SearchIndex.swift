@@ -2912,6 +2912,24 @@ actor SearchIndex {
         BackgroundSyncLogger.logDebug("[SearchIndex] VACUUM complete")
     }
 
+    /// The search database's pages and empty pages (`StorageEstimator.PageTotals`),
+    /// whose data the Email Index Limit's measure counts together with the email
+    /// database's (#1437). nil when the database cannot be opened or read.
+    func pageTotals() -> StorageEstimator.PageTotals? {
+        ensureReady()
+        guard let dbPool else { return nil }
+        return (try? dbPool.read { db in try StorageEstimator.PageTotals.read(db) }) ?? nil
+    }
+
+    /// The allocated size of the search database file and its WAL file, in bytes
+    /// (#1437): the storage measure counts the database's data instead
+    /// (`StorageEstimator.SpaceMeter`), as it does the email database's.
+    func databaseFileBytes() -> Int64 {
+        ensureReady()
+        guard let dbPool else { return 0 }
+        return StorageEstimator.databaseFileBytes(ofDatabaseAt: dbPool.path)
+    }
+
 
 
     /// Whether the FTS database pool is initialized and ready for queries.

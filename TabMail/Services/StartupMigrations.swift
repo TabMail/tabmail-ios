@@ -48,10 +48,10 @@ enum StartupMigrations {
     /// and the Debug menu's "Clear All Logs" no longer knows they exist — so
     /// their bytes sit in Application Support forever. That is not merely
     /// untidy: `StorageEstimator.totalSizeMB()` measures Application Support
-    /// recursively, `isOverBudget()` compares it to the user's budget, and
+    /// recursively, `isOverBudget()` (the check before #1437) compared it to the user's budget, and
     /// `SyncEngine.runPruneIfOverBudget` responds by deleting `MessageBody` and
     /// header rows. Orphaned log bytes can therefore buy their size in pruned
-    /// mail — CONDITIONALLY, not categorically: `isOverBudget()` short-circuits
+    /// mail — CONDITIONALLY, not categorically: `isOverBudget()` short-circuited
     /// on `budgetMB != Int.max` and `defaultBudgetMB` is `Int.max`, so it bites
     /// only once a user has configured a finite budget and usage reaches it.
     ///

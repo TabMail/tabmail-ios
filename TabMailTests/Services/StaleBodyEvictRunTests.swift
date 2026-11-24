@@ -194,7 +194,7 @@ struct StaleBodyEvictRunTests {
         let indexName = SyncEngine.staleBodyIndexName
 
         await SyncEngine.runWALMaintenance(
-            dbPool: dbPool, includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
+            dbPool: dbPool, prune: nil, undoProtectedBodyIds: [], pruneOrder: [:])
         let afterFirstPass = try Hold.bodyIds(fixture)
         let built = try await fixture.pool.read { db in
             try Int.fetchOne(
@@ -212,7 +212,7 @@ struct StaleBodyEvictRunTests {
         #expect(analyzedRows == archived.count, "setup: the first pass analyzed every body: \(statistics)")
 
         await SyncEngine.runWALMaintenance(
-            dbPool: dbPool, includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
+            dbPool: dbPool, prune: nil, undoProtectedBodyIds: [], pruneOrder: [:])
         let afterSecondPass = try Hold.bodyIds(fixture)
         let statisticsAfterSecondPass = try await fixture.pool.read { db in
             try String.fetchAll(db, sql: "SELECT stat FROM sqlite_stat1 WHERE idx = ?", arguments: [indexName])

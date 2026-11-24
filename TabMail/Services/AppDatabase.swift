@@ -2552,7 +2552,7 @@ final class AppDatabase: Sendable {
             //   device — needs ≈3× the table free at peak, and leaves the file at
             //   ≈2× until a `VACUUM` the app never runs outside `AppDataWiper`.
             //   That permanent growth feeds `StorageEstimator.totalSizeMB()` →
-            //   `isOverBudget()` → `SyncEngine.runPruneIfOverBudget`, which deletes
+            //   `isOverBudget()` (the check before #1437) → `SyncEngine.runPruneIfOverBudget`, which deletes
             //   `MessageHeader` ROWS oldest-first: a schema-only migration causing
             //   MESSAGE pruning. `StorageEstimator.defaultBudgetMB == Int.max`, so
             //   this table is unbounded and multi-GB is normal. On a device without

@@ -7,9 +7,10 @@ import GRDB
 import Testing
 @testable import TabMail
 
-/// #1402 on the production pass itself: `SyncEngine.runPruneIfOverBudget`, with the
-/// store over its limit for the whole pass, so the body pass and the header pass both
-/// run to the floor in a large and a small folder of one account. Every statement the
+/// #1402 on the production pass itself: `SyncEngine.runPruneIfOverBudget`, with
+/// the space used above its target for the whole pass (a measure the test passes in), so the
+/// body pass and the header pass both run to the floor in a large and a small folder
+/// of one account. Every statement the
 /// passes run on the readers costs, in the large folder, what it costs in the small one.
 /// Before #1402 the body pass counted the whole folder and paged it with `OFFSET`, and
 /// the header pass counted the whole folder before every chunk: each of those costs
@@ -19,8 +20,9 @@ import Testing
 /// the pass reads through them and through nothing that grows with the folder.
 ///
 /// `.serialized` and `.processGlobalState`: the test sets the storage limit in the
-/// standard defaults and writes a padding file into Application Support, as the prune
-/// tests of `IMAPMissingByUIDTests` do.
+/// standard defaults, as the prune tests of `IMAPMissingByUIDTests` do. Until #1437 it
+/// also wrote a padding file into Application Support, to put the walk of its files
+/// over the limit.
 @Suite("Storage prune pass: no read grows with the folder", .serialized, .processGlobalState, .timeLimit(.minutes(3)))
 struct StoragePrunePassReadTests {
     private typealias Paging = StoragePrunePagingTests
@@ -28,10 +30,9 @@ struct StoragePrunePassReadTests {
     /// Rows in the small folder, whose reads are each statement's baseline.
     static let smallFolder = 200
 
-    /// A 1 MB limit and a 2 MB padding file: the store is over its limit whatever
-    /// else it holds, so both passes run to the floor.
+    /// Any limit: the prune runs only under one. The measure the test passes in is
+    /// above every level of it, so both passes run to the floor.
     static let budgetMB = 1
-    static let paddingBytes = 2 * 1024 * 1024
 
     /// The statements the passes read headers with: the body pass's page and check,
     /// each first and after a cursor, and the header pass's batch (its check is the
@@ -40,10 +41,10 @@ struct StoragePrunePassReadTests {
 
     @Test("Every header read of the body and the header pass costs the same in a large folder as in a small one",
           arguments: [StaleWindowMode.uid, .date])
-    func noPassReadGrowsWithTheFolder(_ mode: StaleWindowMode) throws {
+    func noPassReadGrowsWithTheFolder(_ mode: StaleWindowMode) async throws {
         let fixture = try Paging.makeFixture()
-        // A deferred close: the header pass hands each chunk's content release to a
-        // detached task, which can still be running when the test returns.
+        // A deferred close, kept from before #1437, when the header pass handed each
+        // chunk's content release to a detached task it did not wait for.
         defer { TestDatabaseTeardown.retire(pool: fixture.pool, directory: fixture.directory) }
         // The small folder is the one the pass reaches first (it reads an account's
         // folders through `folder(accountId, role)`, so the archive before the inbox).
@@ -65,18 +66,13 @@ struct StoragePrunePassReadTests {
         let savedBudget = UserDefaults.standard.object(forKey: StorageEstimator.storageBudgetKey)
         defer { UserDefaults.standard.set(savedBudget, forKey: StorageEstimator.storageBudgetKey) }
         StorageEstimator.budgetMB = Self.budgetMB
-        let appSupport = try #require(FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
-        try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
-        let padding = appSupport.appendingPathComponent("prune-test-padding-\(UUID().uuidString)")
-        try Data(count: Self.paddingBytes).write(to: padding)
-        defer { try? FileManager.default.removeItem(at: padding) }
-        let overBudget = StorageEstimator.isOverBudget()
-        try #require(overBudget, "setup: the store is over the limit, so both passes run to the floor")
 
         // Opens the reader the pass reads on, so its schema load is not counted.
-        _ = try fixture.pool.read { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM sqlite_master") }
-        let run = fixture.meter.headerReads {
-            SyncEngine.runPruneIfOverBudget(dbPool: fixture.database, pruneOrder: [fixture.accountId: mode])
+        _ = try Paging.readNow(fixture) { db in try Int.fetchOne(db, sql: "SELECT count(*) FROM sqlite_master") }
+        let run = await fixture.meter.asyncHeaderReads {
+            await SyncEngine.runPruneIfOverBudget(
+                dbPool: fixture.database, pruneOrder: [fixture.accountId: mode],
+                gate: .foreground, space: .constant(Int64.max), afterEachBatch: {})
         }
 
         // Each statement's costliest run in each folder, told apart by the folder id it binds.
@@ -89,7 +85,7 @@ struct StoragePrunePassReadTests {
                 smallCost[read.sql] = max(smallCost[read.sql] ?? 0, read.pages)
             }
         }
-        let left = try fixture.pool.read { db in
+        let left = try Paging.readNow(fixture) { db in
             (large: try MessageHeader.filter(Column("folderId") == large).fetchCount(db),
              small: try MessageHeader.filter(Column("folderId") == small).fetchCount(db))
         }
