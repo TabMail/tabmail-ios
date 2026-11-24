@@ -81,7 +81,9 @@ enum BodyAssetMaintenance {
             // suspension is a `0xdead10cc` kill that `Database.suspendNotification`
             // can't abort mid-`pread`. Foreground-only; re-runs next foreground poll.
             guard DatabaseSuspension.isAppActive && !DatabaseSuspension.isSuspended else { break }
-            let batch = BodyAssetStore.oldestAccessedMessages(limit: evictionBatchSize)
+            let batch = BodyAssetStore.evictionVictims(
+                coveringBytes: current - target, limit: evictionBatchSize
+            )
             if batch.isEmpty { break }
 
             for victim in batch {
