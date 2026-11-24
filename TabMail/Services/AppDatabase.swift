@@ -563,6 +563,13 @@ final class AppDatabase: Sendable {
     /// production caller (`createNSEStagingDBIfNeeded`) gates the version marker
     /// on this so a failed open/write retries on the next launch instead of being
     /// permanently skipped.
+    ///
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query,
+    /// index, table or column added here, and every query that reads them, must be as
+    /// cheap as the data allows. It must not add a new table or index scan unless no
+    /// index or plainer query can avoid it; then state why at the query. Prove a query
+    /// or index change on a mail-sized database with the DBProof harness
+    /// (TabMailTests/Helpers/DBProofHarness.swift).
     @discardableResult
     static func createNSEStagingDB(atPath path: String) -> Bool {
         var config = Configuration()
@@ -829,6 +836,13 @@ final class AppDatabase: Sendable {
     /// The identifier strings and bodies below are what GRDB records in
     /// `grdb_migrations`: **immutable once applied**. Never edit an applied
     /// migration — add a new one.
+    ///
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query,
+    /// index, table or column added here, and every query that reads them, must be as
+    /// cheap as the data allows. It must not add a new table or index scan unless no
+    /// index or plainer query can avoid it; then state why at the query. Prove a query
+    /// or index change on a mail-sized database with the DBProof harness
+    /// (TabMailTests/Helpers/DBProofHarness.swift).
     static func registerAllMigrations(on migrator: inout DatabaseMigrator) {
         migrator.registerTimedMigration("v1_createTables") { db in
             // Account
