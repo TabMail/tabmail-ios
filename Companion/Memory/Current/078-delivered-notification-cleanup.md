@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Amendment (2026-11-24, #1385): the startup populate's index.** The "served by index `messageHeader_isInInbox_date`" sentence below describes every launch before #1385. The seed's `WHERE isInInbox = 1` (inside the write that registers the observer) is now a covering read of the deferred partial index `messageHeader_inboxMembers` (`(accountId, messageId) WHERE isInInbox = 1`, built by the background maintenance pass, `SyncEngine.deferredIndexes`). Until that pass has built it and run its `ANALYZE`, the same statement still reads `messageHeader_isInInbox_date` plus one table row per inbox message (`IOS-PERF-005`'s window class: slower, same rows). The `1` must stay a literal: a bound value cannot use a partial index.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## Delivered-Notification Cleanup
 

@@ -19,8 +19,15 @@ import GRDB
 ///   - No full table reads at steady state. Per-commit cost is one rowid
 ///     B-tree `SELECT … WHERE rowid IN (touched rowids)` scoped to the write
 ///     batch.
-///   - One-time startup populate: `SELECT … WHERE isInInbox = 1`, served by
-///     the partial index `messageHeader_isInInbox_date`.
+///   - One-time startup populate (`seed`): `SELECT … WHERE isInInbox = 1`, a
+///     covering read of the partial index `messageHeader_inboxMembers`
+///     (`(accountId, messageId) WHERE isInInbox = 1`), which holds exactly the
+///     inbox rows, so it reads no table rows. That index is a deferred index
+///     (`SyncEngine.deferredIndexes`): until the background maintenance pass has
+///     built it and refreshed the planner statistics, the same statement reads
+///     the plain `(isInInbox, date)` index `messageHeader_isInInbox_date` plus one
+///     table row per inbox message. Same rows either way. The `1` stays a literal:
+///     a partial index serves only a WHERE that matches its own.
 ///   - Callbacks fire on the GRDB writer queue (background). Never main.
 ///   - Notification clear is called synchronously on the writer queue.
 ///     `UNUserNotificationCenter.removeDeliveredNotifications` is documented

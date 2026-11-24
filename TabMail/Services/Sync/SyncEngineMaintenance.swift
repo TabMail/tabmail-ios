@@ -832,6 +832,28 @@ extension SyncEngine {
                 CREATE INDEX IF NOT EXISTS messageHeader_bodyRepopulateV2
                 ON messageHeader(isInInbox, headerComplete, bodyComplete,
                                  bodyEmptyConfirmed, bodyMetadataOversized, date)
+                """),
+        // #1385: `InboxNotificationObserver.seed`, which runs at every database open
+        // inside the write that registers the observer, reads `rowid, accountId,
+        // messageId` of every inbox row. Through `messageHeader_isInInbox_date` (a plain
+        // `(isInInbox, date)` index) that is one index entry plus one table row per inbox
+        // message. This index holds exactly the inbox rows and carries both columns and
+        // the rowid, so once it exists and this pass's statistics refresh
+        // (`runRefreshPlannerStatisticsIfStale`) has run, the planner reads it alone (a
+        // covering read, no table rows). SQLite maintains it
+        // with the row, so it cannot drift. No existing index can serve that read:
+        // `(isInInbox, date)` and the body-queue composites carry neither column, and
+        // `(accountId, messageId)` holds every message of every folder with no
+        // `isInInbox`. Deferred rather than built in a migration because its absence
+        // degrades performance and nothing else: the seed returns the same rows through
+        // `messageHeader_isInInbox_date`, which is every launch's plan before this
+        // index, and nothing names it in an `INDEXED BY` clause.
+        DeferredIndex(
+            name: "messageHeader_inboxMembers",
+            sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_inboxMembers
+                ON messageHeader(accountId, messageId)
+                WHERE isInInbox = 1
                 """)
     ]
 
