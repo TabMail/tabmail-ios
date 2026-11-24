@@ -130,6 +130,11 @@ enum BodyAssetStore {
     /// rows. `evictionVictims` walks it in access order, so it never aggregates and sorts every
     /// message to find the oldest few. It replaces `idx_bodyAsset_lru (lastAccessedAt)`, which is
     /// its prefix: an existing manifest builds the new index once, then drops the old one.
+    ///
+    /// `idx_bodyAsset_headerAccess (headerId, lastAccessedAt)` gives the walk each message's latest
+    /// access in one seek of the index, without reading the message's rows. It replaces
+    /// `idx_bodyAsset_header (headerId)`, which is its prefix and serves every other `headerId`
+    /// lookup the same way, in the same build-then-drop order.
     static func migrateManifestSchema(_ db: Database) throws {
         try db.execute(sql: """
             CREATE TABLE IF NOT EXISTS bodyAsset (
@@ -147,7 +152,8 @@ enum BodyAssetStore {
             """)
         try migratePreparationSchema(db)
         try migrateAttachmentIdentitySchema(db)
-        try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_header ON bodyAsset (headerId)")
+        try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_headerAccess ON bodyAsset (headerId, lastAccessedAt)")
+        try db.execute(sql: "DROP INDEX IF EXISTS idx_bodyAsset_header")
         try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_lruSize ON bodyAsset (lastAccessedAt, headerId, sizeBytes)")
         try db.execute(sql: "DROP INDEX IF EXISTS idx_bodyAsset_lru")
         try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_attachmentLookup ON bodyAsset (headerId, kind, attachmentSection)")
@@ -1024,16 +1030,21 @@ enum BodyAssetStore {
     /// message can differ, because an asset published after the message's last bump starts NULL.
     ///
     /// It walks `idx_bodyAsset_lruSize` in access order and stops as soon as it has enough
-    /// (ios#1382), instead of aggregating and sorting every message that has assets. A row that
-    /// is not its message's most recent access is passed over: the message is met again at that
-    /// later row, which is its place. Each message's totals come from one `headerId` lookup, so the
-    /// order is exactly the aggregate's, with no value kept outside the rows. Messages whose
-    /// assets add up to 0 bytes are skipped, as before: dropping them reclaims nothing.
+    /// (ios#1382), instead of aggregating and sorting every message that has assets. At each row
+    /// of a message not yet decided, one seek of `idx_bodyAsset_headerAccess` reads the message's
+    /// latest access without touching its rows. A row older than that is passed over: the message
+    /// is met again at its latest row, which is its place. Only a message taken at its place has its
+    /// rows summed, so a message passed over is never aggregated, and the order is exactly the
+    /// aggregate's, with no value kept outside the rows.
+    ///
+    /// `COALESCE(MAX(lastAccessedAt), 0)` equals the aggregate's `MAX(COALESCE(lastAccessedAt, 0))`
+    /// because every stamp is a positive wall-clock time (`bumpMessageAccess`) or NULL (publish).
+    /// Messages whose assets add up to 0 bytes are skipped, as before: dropping them reclaims
+    /// nothing.
     static func evictionVictims(coveringBytes bytes: Int64, limit: Int) -> [VictimSummary] {
         guard bytes > 0, limit > 0, let queue = manifestQueue() else { return [] }
         do {
             return try queue.read { db in
-                var totals: [ContentKey: (victim: VictimSummary, lastAccess: Int64)] = [:]
                 var decided = Set<ContentKey>()
                 var victims: [VictimSummary] = []
                 var covered: Int64 = 0
@@ -1044,35 +1055,30 @@ enum BodyAssetStore {
                     let contentKey: ContentKey = row["headerId"]
                     guard !decided.contains(contentKey) else { continue }
                     let rowAccess: Int64 = row["lastAccessedAt"] ?? 0
-                    let message: (victim: VictimSummary, lastAccess: Int64)
-                    if let known = totals[contentKey] {
-                        message = known
-                    } else {
-                        guard let summary = try Row.fetchOne(
-                            db,
-                            sql: """
-                            SELECT COALESCE(SUM(sizeBytes), 0) AS totalBytes,
-                                   COALESCE(SUM(CASE WHEN kind = 0 THEN 1 ELSE 0 END), 0) AS inlineCount,
-                                   MAX(COALESCE(lastAccessedAt, 0)) AS lastAccess
-                            FROM bodyAsset WHERE headerId = ?
-                            """,
-                            arguments: [contentKey]
-                        ) else { continue }
-                        message = (
-                            VictimSummary(
-                                contentKey: contentKey,
-                                totalBytes: summary["totalBytes"],
-                                inlineCount: summary["inlineCount"]
-                            ),
-                            summary["lastAccess"] ?? 0
-                        )
-                        totals[contentKey] = message
-                    }
-                    guard rowAccess >= message.lastAccess else { continue }
+                    let latestAccess = try Int64.fetchOne(
+                        db,
+                        sql: "SELECT MAX(lastAccessedAt) FROM bodyAsset WHERE headerId = ?",
+                        arguments: [contentKey]
+                    ) ?? 0
+                    guard rowAccess >= latestAccess else { continue }
                     decided.insert(contentKey)
-                    guard message.victim.totalBytes > 0 else { continue }
-                    victims.append(message.victim)
-                    covered += message.victim.totalBytes
+                    guard let summary = try Row.fetchOne(
+                        db,
+                        sql: """
+                        SELECT COALESCE(SUM(sizeBytes), 0) AS totalBytes,
+                               COALESCE(SUM(CASE WHEN kind = 0 THEN 1 ELSE 0 END), 0) AS inlineCount
+                        FROM bodyAsset WHERE headerId = ?
+                        """,
+                        arguments: [contentKey]
+                    ) else { continue }
+                    let victim = VictimSummary(
+                        contentKey: contentKey,
+                        totalBytes: summary["totalBytes"],
+                        inlineCount: summary["inlineCount"]
+                    )
+                    guard victim.totalBytes > 0 else { continue }
+                    victims.append(victim)
+                    covered += victim.totalBytes
                     if covered >= bytes || victims.count >= limit { break }
                 }
                 return victims
